@@ -18,18 +18,45 @@ defpackage stz/ast-lang :
 
 ;======== PARSING STRUCTURES ========
 defstruct DefAst :
-   types: List<DefType>
-   nodes: List<DefNodes>
-defstruct DefType :
+   defs: List<Def>
+definterface Def
+defstruct DefType <: Def :
    name: Symbol
    parent
-   fields: List
-defstruct DefNodes :
+   fields: List<Field>
+defstruct DefMap <: Def :
+   f: Symbol
+   ftype
+   x: Symbol
+   xtype: Symbol
+   rettype
+   clauses:List<Clause>
+defstruct DefDo <: Def :
+   f: Symbol
+   ftype
+   x: Symbol
+   xtype: Symbol
+   rettype
+   clauses:List<Clause>
+defstruct DefNodes <: Def :
    type: Symbol
    nodes: List<Node>
 defstruct Node :
    name: Symbol
-   fields: List
+   fields: List<Field>
+defstruct Field :
+   name: Symbol
+   type
+   options: List
+
+definterface Clause
+defmulti type (c:Clause) -> ?
+defstruct TypeClause <: Clause :
+   x:Symbol
+   type with: (as-method => true)
+   body
+defstruct IgnoreClause <: Clause :
+   type with: (as-method => true)
 
 ;======== PARSING ========
 defsyntax stz/ast-lang :
@@ -40,49 +67,194 @@ defsyntax stz/ast-lang :
 
    defrule :
       sym = (?x) when sym?(x) : unwrap-token(x)
-      prefix-op = (defast : (?types:#deftype ... ?nodes:#defnode ...)) :
-         stz/langs/expande(compile(DefAst(types, nodes)))
-      deftype = (deftype ?name:#sym ?parent:#parent : (?fields ...)) :
+      prefix-op = (defast : (?defs:#def ... ?rest ...)) :
+         if not empty?(rest) :
+            error("Invalid syntax: The following forms are not defs: ~@" % [join(rest, " ")])
+         stz/langs/expande(compile(DefAst(defs)))
+
+      def = (deftype ?name:#sym ?parent:#parent : (?fields:#field ...)) :
          DefType(name, parent, fields)
-      deftype = (deftype ?name:#sym ?parent:#parent) :
-         DefType(name, parent, List())         
+      def = (deftype ?name:#sym ?parent:#parent) :
+         DefType(name, parent, List())
       parent = (<: ?t:#type) : t
       parent = () : false
-      defnode = (defnodes ?name:#sym : (?nodes:#node ...)) :
+
+      def = (defnodes ?name:#sym : (?nodes:#node ...)) :
          DefNodes(name, nodes)
-      node = (?name:#sym : (?fields ...)) :
+      node = (?name:#sym : (?fields:#field ...)) :
          Node(name, fields)
       node = (?name:#sym) :
          Node(name, List())
+      field = (?name:#sym : ?t:#type with : (?options ...)) :
+         Field(name, t, options)
+      field = (?name:#sym : ?t:#type) :
+         Field(name, t, List())
+
+      def = (defmap (?f:#sym : ?ft:#type , ?x:#sym : ?xt:#sym) -> ?rt:#type :
+                ?cs:#clause ...) :
+         DefMap(f, ft, x, xt, rt, cs)
+      def = (defdo (?f:#sym : ?ft:#type , ?x:#sym : ?xt:#sym) -> ?rt:#type :
+                ?cs:#clause ...) :
+         DefDo(f, ft, x, xt, rt, cs)
+      clause = ((?x:#sym : ?xt:#type) : ?body:#exp) :
+         TypeClause(x, xt, body)
+      clause = (ignore(?t:#type)) :
+         IgnoreClause(t)
 
 ;======== COMPILATION ========
+defn fill-each<?T> (f: T -> Streamable<KeyValue<Symbol,?>>, xs:Streamable<?T>) :
+   nested(stream(f, xs))
+
 defn compile (d:DefAst) :
+   ;Type Tables
+   val type-table = to-list $
+      for e in filter({_ typeof DefType}, defs(d)) stream :
+         val e* = e as DefType
+         name(e*) => e*
    defn typefields (n:Symbol) :
-      label<List> return :
-         for t in types(d) do :
-            if name(t) == n :
-               return(fields(t))
-         error("No type named ~." % [n])      
-   defn comp (d:DefType) :
+      fields(lookup!(type-table, n))
+
+   ;Node Table
+   val node-table = to-list $
+      for e in filter({_ typeof DefNodes}, defs(d)) stream :
+         val e* = e as DefNodes
+         type(e*) => nodes(e*)
+   defn nodes-of (n:Symbol) :
+      lookup!(node-table, n)
+
+   ;Compile DefType
+   defn compile (d:DefType) :
       val template = `(definterface name parent?{<: parent}{})
       fill-template(template, [
          `name => name(d)
          `parent? => choice(parent(d) != false)
-         `parent => parent(d)])         
-   defn comp (d:DefNodes) :
+         `parent => parent(d)])
+
+   ;Compile DefNodes
+   defn compile (d:DefNodes) :
       val tfs = typefields(type(d))
       defn comp (n:Node) :
          val template = `(defstruct name <: type : (fs tfs))
          fill-template(template, [
             `name => name(n),
             `type => type(d),
-            `fs => splice(fields(n)),
-            `tfs => splice(tfs)])
+            `fs => splice(stream-concat(comp, fields(n))),
+            `tfs => splice(stream-concat(comp, tfs))])
+      defn comp (f:Field) :
+         qquote(~ (name(f)) : ~ (type(f)) with : ~ (options(f)))
       map-append(comp, nodes(d))
-      
-   list(append(
-      map-append(comp, types(d))
-      map-append(comp, nodes(d))))
+
+   ;Create a type table
+   defn make-type-table (cs:List<Clause>) :
+      ;Map function table
+      val table = for c in cs map :
+         unwrap-all(type(c)) =>
+            match(c) :
+               (c:TypeClause) : gensym()
+               (c:IgnoreClause) : false
+      fn (type) :
+         val t = unwrap-all(type)
+         val e = for e in table find :
+            key(e) == t
+         if e == false :
+            error("Invalid syntax. No handler declared for type ~." % [type])
+         value(e as KeyValue<?,Symbol|False>)
+
+   ;Compiling type table
+   defn compile-type-functions (f, ftype, table: ? -> False|Symbol, cs:List<Clause>) :
+      val forms = Vector<?>()
+      for c* in filter({_ typeof TypeClause}, cs) do :
+         val c = c* as TypeClause
+         val template = `(defn #name (f:ftype, x:xtype) : body)
+         val filled = fill-template(template, [
+            `#name => table(type(c))
+            `f => f
+            `ftype => ftype
+            `x => x(c)
+            `xtype => type(c)
+            `body => body(c)])
+         add(forms, filled)
+      to-list(forms)   
+
+   ;Compile DefMap
+   defn compile (dm:DefMap) :
+      ;Map function table
+      val mapfunction = make-type-table(clauses(dm))
+      val mapfunctions = compile-type-functions(f(dm), ftype(dm), mapfunction, clauses(dm))
+
+      ;Compiling a field
+      defn compile (x:Symbol, f:Symbol, fd:Field) :
+         val template = `(ignore?{name(x)}{#f(f, name(x))})
+         val #f = mapfunction(type(fd))
+         fill-template(template, [
+            `name => name(fd)
+            `x => x
+            `f => f
+            `#f => #f
+            `ignore? => choice(#f == false)])
+
+      ;Compiling main map function
+      defn compile-map () :
+         val template = `(
+            defn map (f:ft, x:xt) -> rt :
+               match(x) :
+                  nodes{(x:Node) : Node(fs)})
+         fill-template(template, [
+            `f => f(dm)
+            `ft => ftype(dm)
+            `x => x(dm)
+            `xt => xtype(dm)
+            `rt => rettype(dm)
+            `nodes => for n in nodes-of(xtype(dm)) fill-each :
+               val fs = append(fields(n), typefields(xtype(dm)))
+               [`Node => name(n)
+                `fs => splice $ map(compile{x(dm), f(dm), _}, fs)]])
+
+      ;Bundle
+      list(mapfunctions, compile-map())
+
+   ;Compile DefDo
+   defn compile (dd:DefDo) :
+      ;do function table
+      val dofunction = make-type-table(clauses(dd))
+      val dofunctions = compile-type-functions(f(dd), ftype(dd), dofunction, clauses(dd))
+
+      ;Compiling a field
+      defn compile (x:Symbol, f:Symbol, fd:Field) :
+         val template = `(ignore?{}{#f(f, name(x))})
+         val #f = dofunction(type(fd))
+         fill-template(template, [
+            `name => name(fd)
+            `x => x
+            `f => f
+            `#f => #f
+            `ignore? => choice(#f == false)])
+
+      ;Compiling main map function
+      defn compile-do () :
+         val template = `(
+            defn do (f:ft, x:xt) -> rt :
+               match(x) :
+                  nodes{(x:Node) :
+                     fs
+                     false})
+         fill-template(template, [
+            `f => f(dd)
+            `ft => ftype(dd)
+            `x => x(dd)
+            `xt => xtype(dd)
+            `rt => rettype(dd)
+            `nodes => for n in nodes-of(xtype(dd)) fill-each :
+               val fs = append(fields(n), typefields(xtype(dd)))
+               [`Node => name(n)
+                `fs => splice $ map-append(compile{x(dd), f(dd), _}, fs)]])
+
+      ;Bundle
+      list(dofunctions, compile-do())
+
+   ;Driver
+   list $ for d in defs(d) map :
+      compile(d as DefType|DefMap|DefDo|DefNodes)
 
 ;============================================================
 ;================= defreader Lang ===========================
@@ -91,14 +263,14 @@ defpackage stz/reader-lang :
    import core
    import verse
    import core/macro-utils
-   
+
 defstruct DefReader :
    name: Symbol
    prods: List<Prod>
 defstruct Prod :
    name: Symbol
    type
-   forms: List<Form>   
+   forms: List<Form>
 definterface Form
 defstruct TagForm <: Form :
    tag: Symbol
@@ -116,7 +288,7 @@ defstruct Field :
 val STYPE = 0
 val LTYPE = 1
 val RTYPE = 2
-   
+
 defsyntax stz/reader-lang :
    defn sym? (x) :
       match(unwrap-token(x)) :
@@ -163,7 +335,7 @@ defmethod compile-body (f:TagForm, ret, prod-type: Symbol -> ?) :
          `name => name(f)
          `type => field-type(type(f), prod-type(prod(f)))
          `i => i]])
-   
+
 defmethod compile-body (f:SForm, ret, prod-type: Symbol -> ?) :
    val template = `(
       fn (x:Symbol, info:FileInfo) -> ret :
@@ -179,7 +351,7 @@ defmethod compile-body (f:VForm, ret, prod-type: Symbol -> ?) :
    fill-template(template, [
       `body => body(f),
       `ret => ret])
-      
+
 defn compile (f:Field) :
    val template = `(type{SField(`prod)}{LField(`prod)}{RField(`prod)})
    fill-template(template, [
@@ -337,7 +509,7 @@ defn compile (d:DefAstPrinter) :
             `Type => type(c)
             `body => compile(exp(d), form(c))]])
 
-               
+
 ;============================================================
 ;===================== defcheck Lang ========================
 ;============================================================
@@ -345,47 +517,221 @@ defpackage stz/check-lang :
    import core
    import verse
    import core/macro-utils
+   import stz/lexer
 
+;======== Parse Structures ========
 definterface CType
 defstruct SymType <: CType :
    type: Symbol
 defstruct RestType <: CType :
    type: Symbol
 defstruct ListType <: CType :
-   checkers: List<CType>
+   types: List<CType>
 
 definterface Checker
-defstruct FormChecker :
+defstruct FormChecker <: Checker :
    args: List<Symbol>
    types: List<CType>
-defstruct IfChecker :
+defstruct IfChecker <: Checker :
    pred
    conseq: Checker
    alt: Checker
-defstruct CustomChecker :
+defstruct CustomChecker <: Checker :
    exp
-defstruct SwitchChecker :
-   name: Symbol
-   clauses: List<KeyValue<Symbol, Checker>>
+defstruct SwitchChecker <: Checker :
+   pred
+   clauses: List<KeyValue<?, Checker>>
    else-clause: Checker
-defstruct BeginChecker :
+defstruct BeginChecker <: Checker :
    checkers: List<Checker>
 
 definterface Clause
-defstruct TypeClause :
+defstruct TypeClause <: Clause :
    type
    checker: Checker
-defstruct PlusClause :
-   name: Symbol
-defstruct AfterClause :
+defstruct PlusClause <: Clause :
+   type: Symbol
+defstruct AfterClause <: Clause :
    exp
 
 defstruct FormSpec :
-   name: Symbol
+   type: Symbol
    description: String
-   clauses: Clause
+   clauses: List<Clause>
 
 defstruct DefCheck :
+   name: Symbol
    exp: Symbol
    type
    specs: List<FormSpec>
+
+;======== Syntax Definition ========
+defsyntax stz/check-lang :
+   defn sym? (x) :
+      match(unwrap-token(x)) :
+         (x:Symbol) : x != `...
+         (x) : false
+
+   defrule :
+      sym = (?x) when sym?(x) : unwrap-token(x)
+      prefix-op = (defcheck ?name:#sym (?exp:#sym : ?type:#type) :
+                      ?fs:#spec ...) :
+         stz/langs/expande(compile(DefCheck(name, exp, type, fs)))
+      spec = (?name:#sym(?desc) :
+                 ?cs:#clause ...) :
+         FormSpec(name, unwrap-token(desc), cs)
+      clause = (after{?e:#exp}) :
+         AfterClause(e)
+      clause = (+ ?name:#sym) :
+         PlusClause(name)
+      clause = (?type:#type :
+                   ?cs:#checker ...) :
+         TypeClause(type, BeginChecker(cs))
+      clause = (?type:#type ?c:#checker) :
+         TypeClause(type, c)
+      checker = (if ?pred:#exp : ?conseq:#checker else : ?alt:#checker) :
+         IfChecker(pred, conseq, alt)
+      checker = (custom{?e:#exp}) :
+         CustomChecker(e)
+      checker = (switch ?pred:#exp :
+                    ((! else) ?keys:#exp : ?cs:#checker) @...
+                    else : ?ec:#checker) :
+         SwitchChecker(pred, map(KeyValue, keys, cs), ec)
+      checker = (((?ns:#sym : ?ts:#ctype) @...)) :
+         FormChecker(ns, ts)
+      ctype = (?type:#sym ~ ...) :
+         RestType(type)
+      ctype = (?type:#sym) :
+         SymType(type)
+      ctype = ((?ts:#ctype ...)) :
+         ListType(ts)
+
+
+;======== Compilation ========
+defn fill-each<?T> (f: T -> Streamable<KeyValue<Symbol,?>>, xs:Streamable<?T>) :
+   nested(stream(f, xs))
+
+defn compile (d:DefCheck) :
+   ;Create function names
+   val #types = map({type(_) => gensym()}, specs(d))
+   defn #type (n:Symbol) : lookup!(#types, n)
+   defn #type (s:FormSpec) : #type(type(s))
+   defn #type (t:SymType|RestType) : #type(type(t))
+
+   ;Retrieving all type and after clauses in a spec
+   val spec-table = map({type(_) => _}, specs(d), specs(d))
+   defn all-clauses (s:FormSpec) :
+      val tcs = Vector<TypeClause>()
+      val acs = Vector<AfterClause>()
+      for c in clauses(s) do :
+         match(c) :
+            (c:TypeClause) :
+               add(tcs, c)
+            (c:AfterClause) :
+               add(acs, c)
+            (c:PlusClause) :
+               val [tcs*, acs*] = all-clauses(lookup!(spec-table, type(c)))
+               do(add{tcs, _}, tcs*)
+               do(add{acs, _}, acs*)
+      [tcs, acs]
+
+   ;Compiling a CType
+   defn compile (pos:String, t:CType) :
+      match(t) :
+         (t:SymType) :
+            fill-template(`(lang/check/SymType(#t)), [
+               `#t => #type(t)])
+         (t:RestType) :
+            fill-template(`(lang/check/RestType(#t)), [
+               `#t => #type(t)])
+         (t:ListType) :
+            fill-template(`(lang/check/ListType(e, pos, [ts])), [
+               `e => exp(d)
+               `pos => pos
+               `ts => splice(map(compile{pos, _}, types(t)))])
+
+   ;Compiling a field check against a CType
+   defn compile-check (field:Symbol, t:CType) :
+      match(t) :
+         (t:ListType) :
+            fill-template(`(lang/check/check(field(e) as core/List, t)), [
+               `e => exp(d)
+               `field => field
+               `t => compile(to-string(field), t)])
+         (t) :
+            fill-template(`(lang/check/check(field(e), t)), [
+               `e => exp(d)
+               `field => field
+               `t => compile(to-string(field), t)])
+
+   ;Compiling a checker
+   defn compile (c:Checker) -> ? :
+      match(c) :
+         (c:FormChecker) :
+            map(compile-check, args(c), types(c))
+         (c:IfChecker) :
+            fill-template(`(if pred : conseq else : alt), [
+               `pred => pred(c)
+               `conseq => compile(conseq(c))
+               `alt => compile(alt(c))])
+         (c:CustomChecker) :
+            exp(c)
+         (c:SwitchChecker) :
+            val template = `(
+               switch pred :
+                  clauses{key : check}
+                  else : else-check)
+            fill-template(template, [
+               `pred => pred(c)
+               `clauses => for c in clauses(c) fill-each : [
+                  `key => key(c)
+                  `check => compile(value(c))]
+               `else-check => compile(else-clause(c))])
+         (c:BeginChecker) :
+            map(compile, checkers(c))
+
+   ;Compiling a form specification
+   defn compile (s:FormSpec) :
+      val template = `(
+         defn name (e:type) :
+            var pass? = true
+            match(e) :
+               type-clauses{
+                  (e:type) :
+                     check
+                     false}
+               (e) :
+                  lang/check/invalid-form(description, e)
+                  pass? = false
+            if pass? :
+               after-clauses{exp}
+               false)
+      val [type-clauses, after-clauses] = all-clauses(s)
+      fill-template(template, [
+         `name => #type(s)
+         `pass? => gensym()
+         `e => exp(d)
+         `type => type(d)
+         `description => description(s)
+         `type-clauses => for c in type-clauses fill-each : [
+            `type => type(c)
+            `check => compile(checker(c))]
+         `after-clauses => for c in after-clauses fill-each : [
+            `exp => exp(c)]])
+
+   ;Compiling the DefCheck
+   val template = `(
+      defn check (e:type) :
+         checkers
+         lang/check/run-check(check0, e))
+   val r = fill-template(template, [
+      `check => name(d)
+      `e => exp(d)
+      `type => type(d)
+      `checkers => splice(map(compile, specs(d)))
+      `check0 => #type(head(specs(d)))])
+
+   println("=== Compiling DefCheck ===")
+   println(r)
+   println("==========================")
+   r
