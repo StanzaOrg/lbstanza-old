@@ -65,7 +65,7 @@ defn to-exp (e:IExp) -> TExp :
          val [ns, body] = destructure-args(args(e), body(e))
          TFn(tail?(e), to-type(a1(e)), to-type(a2(e)), ns, body, TNone(), CNone())
       (e:IMulti) :
-         TMulti(to-exp(funcs(e)), TNone(), CNone())
+         TMulti(to-exp(funcs(e)) as List<TFn>, TNone(), CNone())
       (e:IBegin) :
          if empty?(tail(exps(e))) :
             to-exp(head(exps(e)))
@@ -235,6 +235,11 @@ defn n! (e:IExp) :
 ;Fresh Marker
 defstruct Fresh
 
+defn uncap (t:Type) :
+   match(t) :
+      (t:TCap) : TUVar(n(t))
+      (t) : map(uncap, t)
+
 public defn initialize-types (prog:TProg) :
    ;Environment
    val env = HashTable<Int,Type>({_})
@@ -323,7 +328,7 @@ public defn initialize-types (prog:TProg) :
             val v* = bexp(value(c), CExp(#or(type(c), #?)))
             TDefVar(n(c), env[n(c)], v*)
          (c:TDefn) :
-            set-env(args(c), env-a1(n(c)))
+            set-env(args(c), map(uncap, env-a1(n(c))))
             val body* = bexp(body(c), CExp(#or(a2(c), #?)))            
             TDefn(tail?(c), n(c), targs(c), cargs(c),
                   env-a1(n(c)), env-a2(n(c)),
@@ -332,7 +337,7 @@ public defn initialize-types (prog:TProg) :
             TDefmulti(n(c), targs(c), cargs(c),
                       env-a1(n(c)), env-a2(n(c)))
          (c:TDefmethod) :
-            set-env(args(c), env-a1(n(c)))
+            set-env(args(c), map(uncap, env-a1(n(c))))
             val body* = bexp(body(c), CExp(#or(a2(c), #?)))
             TDefmethod(tail?(c), n(c), bexp(multi(c), CExp(#?)), thisn(c), targs(c), cargs(c),
                        env-a1(n(c)), env-a2(n(c)),
@@ -375,7 +380,7 @@ public defn initialize-types (prog:TProg) :
             val body* = bexp(body(e), CExp(#or(a2(e), #fresh)))
             TFn(tail?(e), a1*, a2*, args(e), body*, TArrow(TTuple(a1*), a2*), c)
          (e:TMulti) :         
-            val funcs* = bexp(funcs(e), c)
+            val funcs* = bexp(funcs(e), c) as List<TFn>
             val type* = reduce(TAnd, types(funcs*))
             TMulti(funcs*, type*, c)
          (e:TSeq) :
@@ -453,12 +458,14 @@ defstruct TupleF : ()
 defstruct SubF : (ti:Type, t:Type)
 defstruct ArgsF : ()
 defstruct RetF : (n:Int)
+defstruct ConstraintError <: Exception
 
-defn generate-type-constraints (prog:TProg) :
+public defn generate-type-constraints (prog:TProg) :
    ;Expected environment
    val exp-env = HashTable<Int,Type>({_})
    defn expected (n:Int) : get?(exp-env, n, false)
    defn set-expected (n:Int, t:Type) : exp-env[n] = t
+   defn set-expected (ns:List<Int>, ts:List<Type>) : do(set-expected, ns, ts)
 
    ;Constraint vector
    val constraints = Vector<Constraint>()
@@ -504,8 +511,9 @@ defn generate-type-constraints (prog:TProg) :
          #cap(r, t, TArrow(#tuple-cap-i(r, i, n), #?))
 
    defn #downto (r:Type, t:Type, f:RetF) :
-      val t* = TTuple(to-list(stream({#?}, 0 to n(f))), TCap(n(r as TUVar)))
-      #cap(r, t, t*)
+      val a = TTuple(to-list(stream({#?}, 0 to n(f))))
+      val b = TCap(n(r as TUVar))
+      #cap(r, t, TArrow(a, b))
 
    defn #downto (rs:List<Type>, t:Type, f:TupleF) :
       val n = length(rs)
@@ -516,11 +524,20 @@ defn generate-type-constraints (prog:TProg) :
       match(a) :
          (a:TUVar) : addc(SuperConstraint(n(a), b))
          (a) : false
+
+   defn #super (a:False, b:Type) :
+      false
          
    defn #equal (a:Type, b:Type) :
       match(a) :
          (a:TUVar) : addc(EqualConstraint(n(a), b))
          (a) : false
+
+   defn #equal (ats:List<Type>, bts:List<Type>) :
+      do(#equal, ats, bts)
+      
+   defn #equal (ats:List<Type>, b:Type) :
+      do(#equal{_, b}, ats)
 
    defn #cap (r:Type, x:Type, y:Type) :
       addc(FlowConstraint(n(r as TUVar), x, y))
@@ -528,18 +545,36 @@ defn generate-type-constraints (prog:TProg) :
    defn #expect (c:Context, t:Type) :
       match(c) :
          (c:CDo) : #super(exp(c), t)
-         (c) : false      
+         (c) : false
 
    defn #targ-apply (t*:Type, targs*:List<Type>, cargs*:List<Type>) :
-      val t = t* as TPoly
-      if length(targs(t)) == length(targs*) :
-         val env = map(KeyValue, append(targs(t), cargs(t)), append(targs*, cargs*))
-         val a* = sub(a(func(t)), env)
-         val b* = TUVar(fresh-n())
-         addc(SubConstraint(n(b*), b(func(t)), env))
-         TArrow(a*, b*)
-      else :
-         TUVar(fresh-n())
+      match(t*) :
+         (t*:TPoly) :
+            if length(targs(t*)) != length(targs*) :
+               throw(ConstraintError())
+            val env = map(KeyValue, append(targs(t*), cargs(t*)),
+                                    append(targs*, cargs*))
+            defn repl (t:Type) :
+               match(t) :
+                  (t:TCap) : TCap(n(lookup!(env, n(t)) as TUVar))
+                  (t:TVar) : lookup(env, n(t), t)
+                  (t) : map(repl, t)
+            val a* = repl(a(func(t*)))
+            val b* = TUVar(fresh-n())
+            addc(SubConstraint(n(b*), b(func(t*)), env))
+            TArrow(a*, b*)
+         (t*) :
+            throw(ConstraintError())  
+
+   defn #flow (cs:List<Type>, at:Type, bt:Type) :
+      defn cap (tn:Int, t:Type) :
+         match(t) :
+            (t:TCap) :
+               if n(t) == tn : t
+               else : TUVar(n(t))
+            (t) : map(cap{tn, _}, t)   
+      for c in cs as List<TUVar> do :
+         addc(FlowConstraint(n(c), cap(n(c), at), bt))
 
    defn #select (s*:Selection, ats:List<Type>, bt:Type) :
       val s = s* as SVar
@@ -548,12 +583,14 @@ defn generate-type-constraints (prog:TProg) :
    defn #thresh (s:Selection) :
       val r = SVar(fresh-n())
       addc(ThresholdConstraint(n(r), n(s as SVar)))
+      r
 
    defn #mix (t:Type, s:Selection, ats:List<Type>) :
-      addc(n(t as TUVar), n(s as SVar), ats)
+      addc(MixConstraint(n(t as TUVar), n(s as SVar), ats))
 
-   defn ctxts (es:List<TExp>) :
-      map(ctxt, es)
+   defn ctxts (es:List<TExp>) : map(ctxt, es)      
+   defn etypes (es:List<TExp>) : map(type, es)
+   defn etypes (cs:List<CExp>) : map(type, cs)
 
    ;Constraint Generation for Commands
    defn gen-comm (c:TComm) :
@@ -623,7 +660,7 @@ defn generate-type-constraints (prog:TProg) :
                         #equal(a1(f), TBot())
                         gen-exp(body(f))
          (e:TNew) :
-            gen-comm(methods(e))
+            do(gen-comm, methods(e))
             #expect(ctxt(e), type(e))
          (e:TSet) :
             do(gen-exp, e)
@@ -633,8 +670,8 @@ defn generate-type-constraints (prog:TProg) :
             do(gen-exp, e)
             val fc = ctxt(func(e)) as CDo
             val argcs = ctxts(args(e)) as List<CExp>
-            #downto(types(argcs), exp(fc), ArgsF())
-            #downto(type(e), exp(fc), RetF())
+            #downto(etypes(argcs), exp(fc), ArgsF())
+            #downto(type(e), exp(fc), RetF(length(args(e))))
             #expect(ctxt(e), type(e))
          (e:TPrim) :
             do(gen-exp, e)
@@ -646,7 +683,7 @@ defn generate-type-constraints (prog:TProg) :
             do(gen-exp, exps(e))
             if ctxt(e) typeof CExp :
                val c = ctxt(e) as CExp
-               val ts = types(ctxts(exps(e)) as List<CExp>)
+               val ts = etypes(ctxts(exps(e)) as List<CExp>)
                #upto(ts, type(c), TupleF())
             #expect(ctxt(e), type(e))
          (e:TRef) :
@@ -659,16 +696,19 @@ defn generate-type-constraints (prog:TProg) :
             val w = match(ctxt(e)) :
                (c:CExp) : type(c)
                (c:CDo) : TArrow(TTuple(args(c)), #?)
-            #equal(type(e), #targ-apply(type(exp(e)), targs(e), cargs(e)))
-            #cap(cargs(e), type(e), w)
+            try :
+               val t* = #targ-apply(type(ref(e)), targs(e), cargs(e))
+               #equal(type(e), uncap(t*))
+               #flow(cargs(e), t*, w)
+            catch (e:ConstraintError) : false
             #expect(ctxt(e), type(e))
          (e:TMix) :
             val w = match(ctxt(e)) :
                (c:CExp) : type(c)
                (c:CDo) : TArrow(TTuple(args(c)), #?)
             do(gen-exp, e)
-            #select(sel(e), types(exps(e)), w)
-            #mix(type(e), s, types(exps(e))) where :
+            #select(sel(e), etypes(exps(e)), w)
+            #mix(type(e), s, etypes(exps(e))) where :
                val s = match(ctxt(e)) :
                   (c:CExp) : #thresh(sel(e))
                   (c:CDo) : sel(e)
@@ -676,7 +716,7 @@ defn generate-type-constraints (prog:TProg) :
          (e:TMatch) :
             do(gen-exp, args(e))
             do(gen-exp, branches(e))
-            #equal(type(e), reduce(TOr, types(branches(e))))         
+            #equal(type(e), reduce(TOr, etypes(branches(e))))         
          (e:TLet) :
             do(gen-exp, e)
          (e:TLetVar) :
@@ -688,7 +728,7 @@ defn generate-type-constraints (prog:TProg) :
             #downto(ntypes(e), type(value(e)), TupleF())
             do(gen-exp, e)
          (e:TLetRec) :
-            gen-comm(defns(e))
+            do(gen-comm, defns(e))
             gen-exp(body(e))
          (e:TSeq) : do(gen-exp, e)
          (e:TBranch) : do(gen-exp, e)
