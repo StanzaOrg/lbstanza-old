@@ -14,7 +14,9 @@ defpackage stz/type :
 public defn type-program (nm:NameMap, e:IExp) :
    val prog = to-tprog(nm, e)
    set-current-hierarchy(hier(prog))
-   infer-types(prog)
+   val prog* = infer-types(prog)
+   report-errors(nm, prog*)
+   prog*
 
 ;============================================================
 ;=============== Conversion to Type IR ======================
@@ -287,6 +289,7 @@ defn to-tprog (nm:NameMap, e:IExp) :
    #comm(e)
    TProg(hier, to-list(comms))   
 
+
 ;============================================================
 ;============== Generate Type Variables =====================
 ;============================================================
@@ -514,14 +517,14 @@ defstruct SubF : (ti:Type, t:Type)
 defstruct ArgsF : ()
 defstruct RetF : (n:Int)
 
-defn generate-type-constraints (prog:TProg) :
+defn infer-types (prog:TProg) :
    ;======== State ========
    val exp-env = HashTable<Int,Type>({_})
    val constraints = Vector<Constraint>()
    
    ;======== Utilities ========
    val #? = TGradual()
-   val #fresh = Fresh()   
+   val #fresh = Fresh()
    defn expected (n:Int) : get?(exp-env, n, false)
    defn set-expected (n:Int, t:Type) : exp-env[n] = t
    defn set-expected (ns:List<Int>, ts:List<Type>) : do(set-expected, ns, ts)
@@ -796,23 +799,13 @@ defn generate-type-constraints (prog:TProg) :
             false
          (e) :
             do(gen-exp, e)
-   
-   ;======== Driver ========
-   gen-comm(comms(prog))
-   constraints
 
-;============================================================
-;============= Solve Constraints and Fill ===================
-;============================================================
-
-public defn infer-types (prog:TProg) :
-   ;======== Results ========
-   val prog* = generate-type-vars(prog)
-   println("Type Variables:")
-   println(prog*)
-   val constraints = generate-type-constraints(prog*)
-   val results = solve(constraints)
-   val filled = TProg(hier(prog), map(fill, comms(prog))) where :
+   ;======== Fill Results =========
+   defn fill (prog:TProg, results:SolveResults) :
+      defn fill (s:Selection) -> Selection :
+         match(s) :
+            (s:SVar) : sels(results)[n(s)]
+            (s) : s
       defn fill (t:Type) -> Type :
          match(t) :
             (t:TUVar) : get?(types(results), n(t), t)
@@ -820,11 +813,442 @@ public defn infer-types (prog:TProg) :
       defn fill (e:TExp) -> TExp :
          val e2 = map(fill{_:Type}, e)
          val e3 = map(fill{_:TExp}, e2)
-         map(fill{_:TComm}, e3)
+         val e4 = map(fill{_:TComm}, e3)
+         map(fill{_:Selection}, e4)
       defn fill (c:TComm) -> TComm :
-         map(fill{_:TExp}, c)
+         val c2 = map(fill{_:TExp}, c)
+         map(fill{_:Type}, c2)
+      TProg(hier(prog),
+            map(fill, comms(prog)))
    
-   filled
+   ;======== Driver ========
+   val prog* = generate-type-vars(prog)
+   gen-comm(comms(prog*))
+   val results = solve(constraints)
+   fill(prog*, results)
+   
+;============================================================
+;=================== Report Errors ==========================
+;============================================================
+
+defn report-errors (nm:NameMap, prog:TProg) :
+   ;======== State ========
+   val errors = Vector<Vector<?>>()   
+
+   ;======== Utilities ========
+   defn unknown? (x:True|False|Maybe|Unknown) : x typeof Unknown
+   defn not-st? (x:Type, y:Type) : subtype?(x, y) == false
+   defn not-st? (x:TExp, y:Type) : not-st?(type(x), y)
+   defn not-st? (x:Type, y:TExp) : not-st?(x, type(y))
+   defn not-st? (x:TExp, y:TExp) : not-st?(type(x), type(y))
+   defn cms (xs:Streamable) : join(xs, ", ")
+   
+   defn add-error (p:Int, msg) :
+      while length(errors) < p + 1 :
+         add(errors, Vector<?>())
+      add(errors[p], msg)
+
+   defn unresolved? (t:Type) :
+      match(t) :
+         (t:TUVar) : true
+         (t) : any?(unresolved?, children(t))
+
+   defn resolved-pr (x) :
+      match(x) :
+         (xs:Streamable) : reduce(max{_, resolved-pr(_)}, 0, x)
+         (x:Type) : 1 when unresolved?(x) else 0
+         (x:TExp) : resolved-pr(type(x))
+
+   defn all-pairs<?T> (xs:Streamable<?T>) :
+      val xs* = to-array(xs)
+      generate<[T, T]> :
+         for i in 0 to length(xs*) do :
+            for j in (i + 1) to length(xs*) do :
+               yield([xs*[i], xs*[j]])
+
+   defn has-name? (n:Int) :
+      key?(nm,n) and (nm[n] typeof VarEntry)
+
+   defn #name (n:Int) :
+      name(nm[n] as VarEntry)
+      
+   ;======== Phase 1: Error Detection ========
+   defn check (c:TComm) :
+      match(c) :
+         (c:TDef) :
+            if unresolved?(type(c)) :
+               no-inferred-type(c)
+            else if not-st?(value(c), type(c)) :
+               bad-assign(c)
+         (c:TDefTuple) :
+            val t? = TTuple(map(TGradual{}, types(c)))
+            val t = TTuple(types(c))
+            if not-st?(value(c), t?) :
+               not-tuple(c)
+            else if any?(unresolved?, types(c)) :
+               no-inferred-type(c)
+            else if not-st?(value(c), t) :
+               bad-assign(c)
+         (c:TDefVar) :
+            if unresolved?(type(c)) :
+               no-inferred-type(c)
+            else if (value(c) not-typeof TElide) and
+                    not-st?(value(c), type(c)) :
+               bad-assign(c)
+         (c:TDefn) :
+            if unresolved?(a2(c)) :
+               no-inferred-ret(c)
+            else if not-st?(body(c), a2(c)) :
+               bad-ret(c)
+         (c:TDefmethod) :
+            if unresolved?(a2(c)) :
+               no-inferred-ret(c)
+            else if not-st?(body(c), a2(c)) :
+               bad-ret(c)
+         (c) :
+            false
+      do(check{_:TExp}, c)   
+
+   defn check (e:TExp) :
+      match(e) :
+         (e:TLet) :
+            if unresolved?(ntype(e)) :
+               no-inferred-type(e)
+            else if not-st?(value(e), ntype(e)) :
+               bad-assign(e)
+         (e:TLetVar) :
+            if unresolved?(ntype(e)) :
+               no-inferred-type(e)
+            else if value(e) not-typeof TElide and
+                    not-st?(value(e), ntype(e)) :
+               bad-assign(e)
+         (e:TLetTuple) :
+            val t? = TTuple(map(TGradual{}, ntypes(e)))
+            val t = TTuple(ntypes(e))
+            if not-st?(value(e), t?) :
+               not-tuple(e)
+            else if any?(unresolved?, ntypes(e)) :
+               no-inferred-type(e)
+            else if not-st?(value(e), t) :
+               bad-assign(e)
+         (e:TFn) :
+            if any?(unresolved?, a1(e)) :
+               no-inferred-args(e)
+            if unresolved?(a2(e)) :
+               no-inferred-ret(e)
+            else if not-st?(body(e), a2(e)) :
+               bad-ret(e)
+         (e:TMatch) :
+            if none?(unresolved?{type(_)}, args(e)) :
+               for b in branches(e) do :               
+                  if any?({not overlap?(type(_), _)}, args(e), atypes(b)) :
+                     bad-branch(e, b)
+         (e:TCast) :
+            if not unresolved?(type(exp(e))) :
+               if not overlap?(type(exp(e)), type(e)) :
+                  bad-cast(e)
+         (e:TSet) :
+            if not-st?(value(e), ref(e)) :
+               bad-set(e)
+         (e:TDo) :
+            val t? = TArrow(TGradual(), TGradual())
+            val t = TArrow(TTuple(map(type, args(e))), TGradual())
+            if type(func(e)) not-typeof TNone :
+               if not-st?(func(e), t?) :
+                  not-function(e)
+               else if not-st?(func(e), t) :
+                  bad-call(e)
+         (e:TMix) :
+            val ss = sels(sel(e) as SSel)
+            if all?({_ typeof False}, ss) :
+               no-mix(e)
+            else if any?(unknown?, ss) :
+               amb-mix(e)
+            else :
+               val ts = to-list(stream(type, es)) where :
+                  val es = for (e in exps(e), s in ss) filter : s != false
+               val u = match(ctxt(e)) :
+                  (c:CExp) : type(c)
+                  (c:CDo) : TArrow(TTuple(args(c)), TGradual())
+               val dj = for [x, y] in all-pairs(ts) all? :
+                  disjoint?(x as TArrow, y as TArrow, u)
+               amb-mix(e) when not dj
+         (e:TArgExp) :
+            defn tarity (t:Type) :
+               match(t) :
+                  (t:TArrow) : 0
+                  (t:TPoly) : length(targs(t))
+            if tarity(type(ref(e))) != length(targs(e)) :
+               bad-tarity(e)
+            else if any?(unresolved?, cargs(e)) :
+               no-capture(e)
+         (e) :
+            false
+      if e not-typeof TMix :      
+         do(check{_:TExp}, e)
+      do(check{_:TComm}, e)
+
+   ;======== Phase 2: Report Creation ========
+   defn name? (x:Int|List<Int>, str:String, default:String) :
+      match(x) :
+         (xs:List<Int>) :
+            if all?(has-name?, xs) : str << [cms(stream(#name, xs))]
+            else : default
+         (x:Int) :
+            if has-name?(x) : str << [#name(x)]
+            else : default
+   defn def-name (c:TLetTuple|TLetVar|TLet|TDefTuple|TDefVar|TDef) :
+      match(c) :
+         (c:TDef) : name?(n(c), "global value ~", "global value")
+         (c:TDefVar) : name?(n(c), "global variable ~", "global variable")
+         (c:TDefTuple) : name?(ns(c), "global values ~@", "tuple elements")
+         (c:TLet) : name?(n(c), "value ~", "value")
+         (c:TLetVar) : name?(n(c), "variable ~", "variable")
+         (c:TLetTuple) : name?(ns(c), "values ~@", "tuple elements")         
+   defn no-inferred-type (c:TLetTuple|TLetVar|TLet|TDefTuple|TDefVar|TDef) :
+      val p = resolved-pr(type(value(c)))
+      add-error(p, "Could not infer type of ~." << [def-name(c)])
+
+   defn def-type (c:TLetTuple|TLetVar|TLet|TDefTuple|TDefVar|TDef) :
+      match(c) :
+         (c:TLetVar|TLet) : ntype(c)
+         (c:TDef|TDefVar) : type(c)
+         (c:TLetTuple) : TTuple(ntypes(c))
+         (c:TDefTuple) : TTuple(types(c))
+   defn bad-assign (c:TDef|TDefVar|TLet|TLetVar|TLetTuple|TDefTuple) :
+      val name = def-name(c)
+      val t = def-type(c)
+      val p = resolved-pr([t, value(c)])
+      add-error(p, "Cannot assign expression of type ~ to ~ with declared type ~." <<
+         [type(value(c)), name, t])
+
+   defn not-tuple (c:TDefTuple|TLetTuple) :
+      val n = length(ns(c))
+      val p = resolved-pr(value(c))
+      add-error(p, "Cannot deconstruct expression of type ~ into tuple of length ~." <<
+         [type(value(c)), n])
+
+   defn no-inferred-args (e:TFn) :
+      val w = match(ctxt(e)) :
+         (c:CExp) : type(c)
+         (c:CDo) : TArrow(TTuple(args(c)), TGradual())
+      val p = resolved-pr(w)
+      for (a in args(e), t in a1(e), i in 0 to false) do :
+         if unresolved?(t) :
+            val name = name?(a, "argument ~", "argument ~" % [i])
+            add-error{p, _} $
+               if unresolved?(w) : "Could not infer type for ~." << [name]
+               else : "Could not infer type for ~. Function used in context expecting type ~." << [name, w]
+
+   defn no-inferred-ret (e:TFn|TDefn|TDefmethod) :
+      val p = resolved-pr([a1(e), body(e)])
+      val name = match(e) :
+         (e:TFn) : "anonymous function"
+         (e:TDefn) : name?(n(e), "function ~", "function")
+         (e:TDefmethod) : "method"
+      add-error(p, "Could not infer return type for ~." << [name])
+
+   defn bad-ret (f:TDefn|TDefmethod|TFn) :
+      val name = match(f) :
+         (f:TDefn) : name?(n(f), "function ~", "function")
+         (f:TDefmethod) : "method"
+         (f:TFn) : "anonymous function"
+      defn loop (e:TExp) :
+         match(e) :
+            (e:TLet|TLetVar|TLetTuple|TLetRec|TBranch) : loop(body(e))
+            (e:TMatch) : do(loop, branches(e))
+            (e) : 
+               val p = resolved-pr([a2(f), e])
+               if not-st?(e, a2(f)) :
+                  add-error(p, "Cannot return an expression of type ~ for ~ with declared return type ~." << [
+                     type(e), name, a2(f)])
+      loop(body(f))
+
+   defn bad-branch (e:TMatch, b:TBranch) :
+      val bargs = stream({[_, _]}, args(b), atypes(b))
+      for (a in args(e), [ba, bt] in bargs, i in 0 to false) do :
+         if not overlap?(type(a), bt) :
+            val name = name?(ba, "argument ~", "argument ~" % [i])
+            add-error(0, "Branch type ~ for ~ cannot match against match argument of type ~." << [
+               t, name, type(a)])
+
+   defn bad-cast (e:TCast) :
+      add-error(0, "Cannot cast expression of type ~ to type ~." << [
+         type(exp(e)), type(e)])
+
+   defn bad-set (e:TSet) :
+      val p = resolved-pr([ref(e), value(e)])
+      val name = name?(n(ref(e)), "variable ~", "variable")
+      add-error(p, "Cannot assign expression of type ~ to ~ with declared type ~." << [
+         type(value(e)), name, type(ref(e))])
+
+   defn not-function (e:TDo) :
+      val p = resolved-pr(func(e))
+      val name = match(func(e)) :
+         (f:TRef) : name?(n(f), "Value ~", "Value")
+         (f) : "Expression"
+      add-error(p, "~ of type ~ cannot be called as a function." << [
+         name, type(func(e))])
+
+   defn bad-call (e:TDo) :
+      val p = resolved-pr([func(e), args(e)])
+      val name = get-name(func(e)) where :
+         defn get-name (e:TExp) :
+            match(e) :
+               (e:TRef) : name?(n(e), "function ~", "function")
+               (e:TMix) : get-name(head(exps(e)))
+               (e) : "expression"
+      add-error(p, "Cannot call ~ of type ~ with arguments of type ~@" << [
+         name, type(func(e)), cms(map(type, args(e)))])
+
+   defn get-ref (e:TExp) :
+      match(e) :
+         (e:TRef) : e
+         (e:TArgExp) : ref(e)
+   defn possibilities (exps:Streamable<TExp>) :      
+      join{_, "\n"} $ for e in exps stream :
+         val r = get-ref(e)
+         "~: ~" << [#name(n(r)), type(r)]                        
+   defn no-mix (e:TMix) :
+      val name = #name(n(r)) where :
+         val r = get-ref(head(exps(e)))
+      match(ctxt(e)) :
+         (c:CDo) :
+            val p = resolved-pr([map(get-ref, exps(e)), args(c)])
+            add-error(p, "No appropriate function ~ for arguments of type ~@. Possibilities are:\n~@" << [
+               name, args(c), possibilities(exps(e))])
+         (c:CExp) :
+            val p = resolved-pr([map(get-ref, exps(e)), type(c)])
+            add-error(p, "No appropriate function ~ for expected type ~. Possibilities are:\n~@" << [
+               name, type(c), possibilities(exps(e))])
+   defn amb-mix (e:TMix) :
+      val exps* = to-list $
+         for (e in exps(e), s in sels(sel(e) as SSel)) filter :
+            s != false
+      val name = #name(n(r)) where :
+         val r = get-ref(head(exps*))
+      match(ctxt(e)) :
+         (c:CDo) :
+            val p = resolved-pr([map(get-ref, exps*), args(c)])
+            add-error(p, "Ambiguous call to overloaded function ~ with arguments of type ~@. Possibilities are:\n~@" << [
+               name, args(c), possibilities(exps*)])
+         (c:CExp) :      
+            val p = resolved-pr([map(get-ref, exps*), type(c)])
+            add-error(p, "Ambiguous reference to overloaded function ~ for expected type ~. Possibilities are:\n~@" << [
+               name, type(c), possibilities(exps*)])
+
+   defn bad-tarity (e:TArgExp) :
+      match(type(ref(e))) :
+         (t:TPoly) :
+            add-error(0, "Function ~ of type ~ requires ~ type arguments, but received ~@." << [
+               #name(n(ref(e))), type(ref(e)), targs(e)])
+         (t:TArrow) :
+            add-error(0, "Function ~ of type ~ does not accept type arguments, but received ~@." << [
+               #name(n(ref(e))), type(ref(e)), targs(e)])
+
+   defn no-capture (e:TArgExp) :
+      val rt = type(ref(e)) as TPoly
+      for (a in cargs(rt), t in cargs(e)) do :
+         if unresolved?(t) :
+            val a-name = name?(a, "argument ~", "argument")
+            val r-name = #name(n(ref(e)))
+            match(ctxt(e)) :
+               (c:CExp) :
+                  val p = resolved-pr([type(c)])
+                  add-error(p, "Could not capture ~ for function ~ of type ~. Expected type is ~." << [
+                     a-name, r-name, rt, type(c)])
+               (c:CDo) :
+                  val p = resolved-pr([args(c)])
+                  add-error(p, "Could not capture ~ for function ~ of type ~. Called with arguments of type ~@." << [
+                     a-name, r-name, rt, args(c)])
+
+   ;======== Driver ========
+   do(check, comms(prog))
+   if not empty?(errors) :
+      for i in 0 to length(errors) do :
+         do(println, errors[i])
+         throw(TypeError())
+
+
+   
+
+;============================================================
+;===================== Assertions ===========================
+;============================================================
+;definterface Assertion
+;defstruct TypeWellFormed <: Assertion : (type:Type)
+;defstruct ValueTypeInferred <: Assertion : (n:Int, type:Type)
+;defstruct TypeDefined <: Assertion : (
+;
+;defmulti test (a:Assertion) -> False
+;
+;;======== Test if a type is wellformed ========
+;defmethod test (a:TypeWellFormed) :
+;   defn loop (t:Type) :
+;      do(loop, children(t))
+;      if t typeof TOf :
+;         val t = t as TOf
+;         val arity = length(args(entry)) where :
+;            val entry = current-hierarchy()[n(t)]
+;         match(type(t)) :
+;            (at:TTuple) :
+;               if length(types(at)) != arity :
+;                  assert-fail(0, TYPE-ILLFORMED << [n(t), arity, join(types(at), ", ")])
+;            (at:TGradual) :
+;               false
+;   loop(type(a))
+;val TYPE-ILLFORMED = "Parametric type ~ requires ~ arguments, but given ~@."
+;
+;;======== Test if a type has been inferred =========
+;defmethod test (a:ValueTypeInferred) :
+;   if not resolved?(type(a)) :
+;      assert-fail(0, VALUE-TYPE-NOT-INFERRED << [n(a)])
+;
+;val VALUE-TYPE-NOT-INFERRED = "Could not infer type for value ~."
+;
+;;======== 
+
+;Wellformedness:
+;   Parametric type ~ requires ~ arguments, but given ~@.
+;TDef:
+;   Could not infer type of global value.
+;   Could not infer type of global value ~.
+;   Cannot assign an expression of type ~ to value ~ of type ~.
+;   Cannot assign an expression of type ~ to value of type ~.
+;TDefTuple :
+;   Cannot deconstruct an expression of type ~ into tuple of length ~.
+;   Could not infer type of tuple element ~.
+;TDefVar :
+;   Could not infer type of variable ~.
+;   Could not infer type of variable.
+;   Cannot assign an expression of type ~ to variable ~ of type ~.
+;   Cannot assign an expression of type ~ to variable of type ~.
+;TDefn :
+;   Could not infer return type of function ~.
+;   Could not infer return type of function.
+;   Cannot return an expression of type ~ from function ~ with declared return type ~.
+;   Cannot return an expression of type ~ from function with declared return type ~.
+;TDefmethod :
+;   Could not infer return type of method.
+;   Cannot return an expression of type ~ from method with declared return type ~.
+;TLet :
+;   Could not infer type of value.
+;   Could not infer type of value ~.
+;TFn :
+;   Could not infer type for argument ~. Function called with arguments ~@.
+;   Could not infer type for argument ~. Expected type is ~.
+;   Could not infer type for argument number ~. Function called with arguments ~@.
+;   Could not infer type for argument number ~. Expected type is ~.
+;   Could not infer return type of anonymous function.
+;TMatch :
+;   Branch type ~ for argument ~ cannot match against match argument of type ~.
+;   Branch type ~ for argument number ~ cannot match against match argument of type ~.
+;TCast :
+;   Expression of type ~ cannot be cast to type ~.
+;TDo :
+;   Cannot call value ~ of type ~ as a function.
+;   Cannot call expression ~ of type ~ as a function.
+;   Cannot call value ~ of type ~ with arguments 
    
 
 ;============================================================
@@ -833,6 +1257,7 @@ public defn infer-types (prog:TProg) :
 defstruct Fresh
 
 defstruct ConstraintError <: Exception
+defstruct TypeError <: Exception
 
 defn uncap (t:Type) :
    match(t) :
