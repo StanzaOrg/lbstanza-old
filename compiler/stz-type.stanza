@@ -586,6 +586,11 @@ defn generate-type-vars (prog:TProg) :
 
 
 ;============================================================
+;============================================================
+;============================================================
+
+
+;============================================================
 ;============== Generate Type Constraints ===================
 ;============================================================
 defstruct TupleF : ()
@@ -1377,6 +1382,284 @@ defn report-errors (nm:NameMap, prog:TProg) :
       if not empty?(errors[i]) :
          do(println, errors[i])
          throw(TypeError())
+
+;============================================================
+;============== LoStanza Type Inference =====================
+;============================================================
+
+defn infer-lostanza-types (nm:NameMap, prog:TProg) :
+   ;====== State ======
+   val env = HashTable<Int,False|LSType>({_})
+   val structs = HashTable<Int,LSDefStruct>({_})
+
+   ;====== Utilities ======
+   defn do-ls (f:LSTComm -> ?, prog:TProg) :
+      for c in comms(prog) do :
+         match(c) :
+            (c:TLoStanza) : f(comm(c))
+            (c) : false
+
+   ;====== Phase 1: Build Global Environment ======
+   defn build-env (c:LSTComm) :
+      match(c) :
+         (c:LSDefVar) : env[n(c)] = type(c)
+         (c:LSDefStruct) : structs[n(c)] = c
+         (c:LSExtern) : env[n(c)] = type(c)
+         (c:LSExternFn) : env[n(c)] = type(c)
+         (c:LSDefn) : env[n(c)] = FnT(a1(c), false, a2(c))
+         (c) : false
+
+   ;====== Phase 2: Inference ======
+   defn infer-tc (c:LSTComm) -> LSTComm :
+      match(c) :
+         (c:LSDefVar) :
+            val c* = map(infer-e, c)
+            attempt :
+               val tau = type!(value!(c*))
+               bad-def(c*) when not subtype?(tau, type(c*))
+            c*
+         (c:LSDefn) :
+            for (a in args(c), t in a1(c)) do : env[a] = t
+            map(infer-c{_, a2(c)}, c)
+         (c:LSTopComm) :
+            map(infer-c{_, false}, c)
+         (c:LSDefStruct|LSExtern|LSExternFn) :
+            c
+
+   defn infer-c (c:LSComm, ret:False|Type) -> LSComm :
+      defn ret! () : ret as Type            
+      match(c) :
+         (#c:LSTCall) :
+            val c = map(infer-e, #c)
+            attempt :
+               val tau = type!(exp(c))
+               bad-ret(c) when not subtype?(tau, ret!())
+            c            
+         (#c:LSSet) :
+            val c = map(infer-e, #c)
+            attempt :
+               val tau = type!(exp(c))
+               not-lvalue(c) when not lvalue?(exp(c))
+               val tau* = type!(value(c))               
+               bad-set(c) when not subtype?(tau*, tau)
+            c
+         (#c:LSReturn) :
+            val c = map(infer-e, #c)
+            attempt :
+               val tau = type!(exp(c))
+               bad-ret(c) when not subtype?(tau, ret!())
+            c   
+         (c:LSLetVar) :
+            val v* = infer-e(value(c))
+            val type* = match(type(c)) :
+               (t:LSType) : t
+               (t:False) : type(v*)
+            env[n(c)] = type*   
+            val body* = infer-c(body(c), ret)
+            val c* = LSLetVar(n(c), type*, v*, body*)
+            attempt :
+               val tau = type!(exp!(v*))
+               bad-let(c*) when not subtype?(tau, type!(c))
+            c*
+         (c:LSSeq) :
+            map(infer-c{_, ret}, c)
+         (#c:LSIf) :
+            val c = map(infer-c{_, ret}, map(infer-e, #c))
+            attempt :
+               val tau = type!(pred(e))
+               bad-pred(c) when not subtype?(tau, LongT())
+            c
+         (c:LSMatch) :
+            val arg* = infer-e(arg(c))
+            val br* = for b in branches(c) map :
+               env[n(b)] = type(b)
+               val body* = infer-c(body(b), ret)
+               LSBranch(n(b), type(b), body*)
+            val c* = LSMatch(arg*, br*)
+            attempt :
+               val t = type!(arg*)
+               val reft = RefT(UnknownT())
+               bad-match(c*) when not subtype?(t, reft)
+            c*
+         (c:LSCall|LSLabel|LSGoto) :
+            map(infer-e, c)
+
+   defn infer-e (e:TExp) -> TExp :
+      match(map(infer-e, e)) :
+         (e:LSVar) :
+            LSVar(n(e), env[n(e)])
+         (e:LSRef) :
+            LSRef(n(e), args(e), RefT(StructT(n(e))))
+         (e:LSRefArray) :
+            attempt :
+               val tau = type!(length(e))
+               bad-index(e) when not subtype?(tau, LongT())
+            LSRefArray(n(e), length(e), RefT(StructT(n(e))))
+         (e:LSStruct) :
+            LSStruct(n(e), args(e), StructT(n(e)))
+         (e:LSPtr) :
+            val type* = attempt :
+               val tau = type!(exp(e))
+               not-lvalue(e) when not lvalue?(exp(e))
+               PtrT(tau)
+            LSPtr(exp(e), type*)
+         (e:LSDeref) :
+            val type* = attempt :
+               match(type!(exp(e))) :
+                  (t:RefT) : type(t)
+                  (t:PtrT) : type(t)
+                  (t) : (bad-deref(e), fail())
+            LSDeref(exp(e), type*)
+         (e:LSSlot) :
+            val type* = attempt :
+               match(type!(exp(e))) :
+                  (t:PtrT) : type(t)
+                  (t) : (bad-slot(e), fail())
+            attempt :
+               val tau = type!(index(e))
+               bad-index(e) when not subtype?(tau, LongT())
+            LSSlot(exp(e), index(e), type*)      
+         (e:LSField) :
+            val exp* = deref(exp(e))               
+            val type* = attempt :
+               val tau = type!(exp*)
+               match(tau) :
+                  (tau:StructT) :
+                     attempt : struct-type!(tau, name(e))
+                     else : (no-field(e), fail())
+                  (tau) : (bad-field(e), fail())
+            LSField(exp*, name(e), type*)
+         (e:LSDo) :
+            val type* = attempt :
+               match(type!(func(e))) :
+                  (tau:FnT) :
+                     val ts = map(type!, args(e))
+                     bad-call(e) when not ex-subtype?(ts, a(tau), r(tau))
+                     b(tau)
+                  (tau) :
+                     not-func(e)
+                     fail()
+            LSDo(func(e), args(e), type*)         
+         (e:LSCallC) :
+            val type* = attempt :
+               match(type!(func(e))) :
+                  (tau:FnT) :
+                     val ts = map(type!, args(e))
+                     bad-call(e) when not ex-subtype?(ts, a(tau), r(tau))
+                     b(tau)
+                  (tau) :
+                     not-func(e)
+                     fail()
+            LSCallC(func(e), args(e), type*)                     
+         (e:LSSizeof) :
+            LSSizeof(argtype(e), LongT())
+         (e:LSTagof) :
+            LSTagof(n(e), LongT())
+         (e:LSAs) :
+            attempt :
+               val tau = type!(exp(e))
+               bad-as(e) when not as-cast?(tau, type(e))
+            e
+         (e:LSSExtend) :
+            attempt :
+               val tau = type!(exp(e))
+               bad-extend(e) when not extend?(tau, type(e))
+            e   
+         (e:LSZExtend) :
+            attempt :
+               val tau = type!(exp(e))
+               bad-extend(e) when not extend?(tau, type(e))
+            e   
+         (e:LSCast) :
+            attempt :
+               val tau = type!(exp(e))
+               bad-extend(e) when not cast?(tau, type(e))
+            e               
+         (e:LSValue) :
+            e
+         (e:LSAnd) :
+            defn long? (e:TExp) : subtype?(type!(a(e)), LongT())
+            attempt: bad-and-a(e) when not long?(a(e))
+            attempt: bad-and-b(e) when not long?(b(e))            
+            LSAnd(a(e), b(e), LongT())
+         (e:LSOr) :
+            defn long? (e:TExp) : subtype?(type!(a(e)), LongT())
+            attempt: bad-or-a(e) when not long?(a(e))
+            attempt: bad-or-b(e) when not long?(b(e))            
+            LSOr(a(e), b(e), LongT())
+
+   ;====== Phase 3: Predicates ========
+   defn lvalue? (e:LSExp) :
+      match(e) :
+         (e:LSVar|LSDeref|LSSlot) : true
+         (e:LSField) : lvalue?(exp(e))
+
+   ;====== Phase 3: Report Generation ======
+   defn name? (e:LSExp, format:String, default:String) :
+      match(e) :
+         (e:LSVar) : format << [name(n(e))]
+         (e) : default
+         
+   defn bad-index (e:LSRefArray|LSSlot) :
+      add(errors, "Expression of type ~ cannot be used as index." << [type(index(e))])
+
+   defn not-lvalue (e:LSPtr) :
+      add(errors, "Cannot create pointer to non-lvalue expression.")
+
+   defn not-lvalue (c:LSSet) :
+      add(errors, "Cannot assign to non-lvalue expression.")
+
+   defn bad-deref (e:LSDeref) :
+      add(errors, "Cannot dereference expression of type ~." << [type(exp(e))])
+
+   defn bad-slot (e:LSSlot) :
+      add(errors, "Cannot access indexed slot in express of type ~." << [type(exp(e))])
+
+   defn no-field (e:LSField) :
+      val t = deref(type(exp(e))) as StructT
+      add(errors, "Expression of type ~ has no field named ~." << [t, name(e)])
+
+   defn bad-field (e:LSField) :
+      add(errors, "Cannot access named field ~ in expression of type ~." << [name(e), type(exp(e))])
+
+   defn bad-call (e:LSDo|LSCallC) :
+      val name = name?(func(e), "Function ~", "Function")
+      add(errors, "~ of type ~ cannot be called with arguments of type ~@." << [
+         name, type(func(e)), cms(map(type, args(e)))])
+
+   defn not-func (e:LSDo|LSCallC) :
+      val name = name?(func(e), "Value ~", "Expression")
+      add(errors, "~ of type ~ cannot be called as a function." << [
+         name, type(func(e))])
+
+   defn bad-as (e:LSAs) :
+      add(errors, "Expression of type ~ cannot be reinterpreted as ~." << [
+         type(exp(e)), type(e)])
+ 
+   defn bad-extend (e:LSSExtend|LSZExtend) :
+      add(errors, "Expression of type ~ cannot be extended to ~." << [
+         type(exp(e)), type(e)])
+
+   defn bad-cast (e:LSCast) :
+      add(errors, "Expression of type ~ cannot be cast to ~." << [
+         type(exp(e)), type(e)])
+
+   defn bad-and-a (e:LSAnd) :
+      add(errors, "Expression of type ~ cannot be used as operand to and." << [
+         type(a(e))])
+         
+   defn bad-and-b (e:LSAnd) :
+      add(errors, "Expression of type ~ cannot be used as operand to and." << [
+         type(b(e))])
+
+   defn bad-or-a (e:LSOr) :
+      add(errors, "Expression of type ~ cannot be used as operand to or." << [
+         type(a(e))])
+         
+   defn bad-or-b (e:LSOr) :
+      add(errors, "Expression of type ~ cannot be used as operand to or." << [
+         type(b(e))])
+
 
 ;============================================================
 ;=============== General Utilities ==========================
