@@ -1,0 +1,649 @@
+defpackage stz/kform :
+   import core
+   import verse
+   import stz/tl-ir
+   import stz/kform
+   import stz/namemap
+   import stz/type-calculus
+   import stz/kl-ir
+
+;============================================================
+;=================== KType Subtyping ========================
+;============================================================
+
+;Is y a parent of x?
+defn parent? (x:Int, y:Int) -> True|False :
+   defn loop (t:Type) :
+      match(t) :
+         (t:TOf) : parent?(n(t), y)
+         (t:TAnd) : loop(a(t)) or loop(b(t))
+         (t:TNone) : false
+   if x == y : true
+   else : loop(parent(current-hierarchy()[x]))
+
+defn subtype? (x:KType, y:KType) -> True|False :
+   match(x, y) :
+      ;1. Fast Paths
+      (x:KBot, y) : true
+      (x, y:KTop) : true
+      ;2. Combinatory Types
+      (x:KOr, y) : subtype?(a(x), y) and subtype?(b(x), y)
+      (x, y:KOr) : subtype?(x, a(y)) or subtype?(x, b(y))
+      (x, y:KAnd) : subtype?(x, a(y)) and subtype?(x, b(y))
+      (x:KAnd, y) : subtype?(a(x), y) or subtype?(b(x), y)
+      ;3. Unitary Types
+      (x:KOf, y:KOf) : parent?(n(x), n(y))
+      (x:KTVar, y:KTVar) : n(x) == n(y)
+      (x:KFnT, y:KFnT) : true
+      ;4. Fall through
+      (x, y) : false
+
+;============================================================
+;================ Solve Method Captures =====================
+;============================================================
+
+defn apply?<?T> (f:T -> ?T, x:T|False) :
+   match(x) :
+      (x:False) : false
+      (x:T) : f(x)
+
+defn invert (vs:List<Int>, env: List<KeyValue<Int, KType>>) :
+   val table = HashTable<Int,KType>({_})
+   for v in vs do :      
+      var vk = KTop()
+      var vt = KTop()
+      for e in env do :
+         var ek = KTVar(key(e))
+         var et = value(e)
+         if subtype?(KTVar(v), et) and subtype?(et, vt) :
+            vk = ek
+            vt = et
+      table[v] = vk
+   to-list(table)
+
+defn fill-method-caps (func:KFn, caps:List<KType>) :
+   val targs* = map(fresh-n{}, caps)
+   val env = invert(targs*, map(KeyValue, targs*, caps))
+
+   defn fill-type (t:KType) :
+      match(t) :
+         (t:KTVar) : lookup(env, n(t), t)
+         (t) : map(fill-type, t)
+
+   KFn(tail?(func), targs*, a1*, a2*, args(func), body*) where :
+      val a1* = map(fill-type, a1(func))
+      val a2* = apply?(fill-type, a2(func))
+      val body* = mapr(fill-type, body(func))
+
+;============================================================
+;================ Conversion to KForm =======================
+;============================================================
+
+defn to-kform (prog:TProg) :
+   ;====== State ======
+   val commands = Vector<KComm>()
+   val readvars = HashTable<Int,True|False>({_})
+
+   ;====== Utilities ======
+   defn addc (c:KComm) : add(commands, c)
+   defn read! (n:Int, check?:True|False) : readvars[n] = check?
+
+   defn #let (return: KVar -> KExp, v:KExp) :
+      match(v) :
+         (v:KVar) :
+            return(v)
+         (v) :
+            val n* = fresh-n()
+            KLet(KDef(n*, v),
+                 return(KVar(n*, false)),
+                 false)
+   
+   defn #cast (v:KExp, t:KType) :
+      #let(KCast{_, t, false}, v)
+      
+   defn #check-len (v:KExp, len:Int) :
+      #let(KCheckLength{_, len, false}, v)
+
+   defn #ktuple () :
+      to-ktype(TTuple(List()))
+
+   ;====== Discover Global ReadVars ======
+   defn find-readvars (c:TComm) :
+      match(c) :
+         (c:TDef) : read!(n(c), true)
+         (c:TDefTuple) : do(read!{_, true}, ns(c))
+         (c:TDefVar) : read!(n(c), true)
+         (c) : false
+
+   ;====== Transformers ======
+   defn add-kcomm (c:TComm) -> False :
+      match(c) :
+         (c:TDef) :
+            addc $ KDef(n(c), #cast(v, t)) where :
+               val v = to-kexp(value(c), false)
+               val t = to-ktype(type(c))
+         (c:TDefTuple) :
+            val n* = fresh-n()
+            addc $ KDef(n*, #check-len(#cast(v, t), len)) where :
+               val len = length(ns(c))
+               val v = to-kexp(value(c), false)
+               val t = #ktuple()
+            for (n in ns(c), t in types(c), i in 0 to false) do :
+               addc $ KDef(n, v*) where :
+                  val v* = #let{_, KRead(n*, false)} $ fn* (v) :
+                     #let{_, KTupleGet(v, i, false)} $ fn* (v) :
+                        KCast(v, to-ktype(t), false)
+         (c:TDefVar) :
+            addc $ KDefVar(n(c), v*) where :
+               val v* = match(value(c)) :
+                  (v:TElide) : false   
+                  (v:TExp) : #cast(to-kexp(v, false), to-ktype(type(c)))
+         (c:TDefn) :
+            addc $ KDefn(n(c), to-kfn(c))
+         (c:TDefmulti) :
+            addc $ KDefmulti(n(c), a1*, false) where :
+               val a1* = map(to-ktype, a1(c))
+         (c:TDefmethod) :
+            addc $ to-kmethod(c)
+         (c:TExpComm) :
+            addc $ KExpComm(to-kexp(exp(c), false))
+         (c:TLoStanza) :
+            false
+
+   defn to-kmulti (e:TExp) -> [Int, List<KType>] :
+      match(e) :
+         (e:TRef) :
+            [n(e), List()]
+         (e:TArgExp) :
+            [n(ref(e)), ts] where :
+               val ts = map(to-ktype, append(targs(e), cargs(e)))
+         (e:TMix) :
+            val e* = {_ as TExp} $
+               for (e in exps(e), s in sels(sel(e) as SSel)) find :
+                  s != false
+            to-kmulti(e*)      
+
+   defn to-kmethod (c:TDefmethod) :
+      KDefmethod(n(c), m, thisn(c), f) where :
+         val [m, caps] = to-kmulti(multi(c))
+         val f = fill-method-caps(to-kfn(c), caps)
+
+   defn to-kfn (c:TDefn|TDefmethod) :
+      KFn(tail?(c), targs*, a1*, false, args(c), body*) where :
+         val targs* = append(targs(c), cargs(c))
+         val a1* = map(to-ktype, a1(c))
+         val body* = to-kexp(body(c), tail?(c))
+         
+   defn to-kfn (c:TFn) :
+      KFn(tail?(c), List(), a1*, false, args(c), body*) where :
+         val a1* = map(to-ktype, a1(c))
+         val body* = to-kexp(body(c), tail?(c))
+
+   defn to-ktype (t:Type) :
+      match(t) :
+         (t:TOf) : KOf(n(t))
+         (t:TTuple) : KOf(Tuple(current-hierarchy()))
+         (t:TOr) : KOr(to-ktype(a(t)), to-ktype(b(t)))
+         (t:TAnd) : KAnd(to-ktype(a(t)), to-ktype(b(t)))
+         (t:TVar) : KTVar(n(t))
+         (t:TArrow) : KFnT()
+         (t:TGradual) : KTop()
+         (t:TBot) : KBot()        
+
+   defn to-kexp (e:TExp, tail?:True|False) :
+      val bindings = Vector<KDef>()
+
+      defn bind (e:KExp) :
+         var body = e
+         for def in bindings do :
+            body = KLet(def, body, false)
+         body
+
+      defn tail-cast (e:KExp, t:KType) :
+         defn tc (e:KExp) : tail-cast(e, t)
+         defn tc (b:KBranch) : KBranch(args(b), types(b), tc(body(b)))
+         defn tc (bs:List<KBranch>) : map(tc, bs)
+         match(e) :
+            (e:KLet) : KLet(def(e), tc(body(e)), type(e))
+            (e:KLetRec) : KLetRec(defns(e), tc(body(e)), type(e))
+            (e:KSeq) : KSeq(a(e), tc(b(e)), type(e))
+            (e:KDispatch) : KDispatch(args(e), tc(branches(e)), type(e))
+            (e:KMatch) : KMatch(args(e), tc(branches(e)), type(e))
+            (e:KDo) : e
+            (e) : KCast(to-kvar(e), t, false)         
+
+      defn to-kvar (e:TExp) :
+         to-kvar(to-kexp(e, false))
+               
+      defn to-kvar (e:KExp) :
+         match(e) :
+            (e:KVar) :
+               e
+            (e:KExp) :
+               val n = fresh-n()
+               add(bindings, KDef(n, e))
+               KVar(n, false)
+
+      defn to-kdo (fs:List<TExp>, args:List<KVar>) :
+         val brs = for f in fs map :
+            KBranch(ns, a1, body) where :
+               val ns = map(fresh-n{}, args)
+               val at = a(type(e) as TArrow) as TTuple
+               val a1 = map(to-ktype, types(at))
+               val body = to-kdo(f, map(KVar{_, false}, ns))
+         KDispatch(args, brs, false)      
+
+      defn to-kdo (f:TExp, args:List<KVar>) :
+         match(f) :
+            (f:TMix) :
+               error("Select applicable expressions.")
+               to-kdo(exps(f), args)
+            (f:TArgExp) :
+               KDo(f*, targs*, args, false) where :
+                  val f* = to-kvar(ref(f))
+                  val targs* = map(to-ktype, append(targs(f), cargs(f)))
+            (f) :
+               KDo(to-kvar(f), List(), args, false)
+
+      defn arity! (e:TExp) :
+         val t = type(e) as TArrow
+         val at = types(a(t) as TTuple)
+         length(at)
+
+      defn wrap-call (fs:List<TExp>) :
+         val ns = map(fresh-n{}, 0 to arity!(head(fs)))
+         val a1 = map(KTop{}, ns)
+         val body = to-kdo(fs, map(KVar{_, false}, ns))
+         KFn(true, List(), a1, false, ns, body)
+
+      defn wrap-call (f:TExp) :
+         match(f) :
+            (f:TMix) :
+               val arrows = HashTable<Int,List<TExp>>({_})
+               for (e in exps(f), s in sels(sel(f) as SSel)) do :
+                  if s != false :
+                     val n = arity!(e)
+                     arrows[n] = List(e, get?(arrows, n, List()))
+               val funcs = for ar in values(arrows) stream :
+                  if length(ar) == 1 : wrap-call(head(ar))
+                  else : wrap-call(ar)
+               KMultifn(to-list(funcs) as List<KFn>)   
+            (f) :
+               KFn(true, List(), a1, false, ns, body) where :
+                  val ns = map(fresh-n{}, 0 to arity!(f))
+                  val a1 = map(KTop{}, ns)
+                  val body = to-kdo(f, map(KVar{_, false}, ns))
+
+      bind $ match(e) :
+         (e:TLet) :
+            KLet(KDef(n(e), KCast(v*, t*, false)), body*, false) where :
+               val v* = to-kvar(value(e))
+               val t* = to-ktype(ntype(e))
+               val body* = to-kexp(body(e), tail?)
+         (e:TLetVar) :
+            read!(n(e), value(e) typeof TElide)
+            KLet(KDefVar(n(e), v*), body*, false) where :
+               val v* = match(value(e)) :
+                  (v:TElide) : false
+                  (v:TExp) : KCast(to-kvar(v), to-ktype(ntype(e)), false)
+               val body* = to-kexp(body(e), tail?)
+         (e:TLetTuple) :
+            val n* = fresh-n()
+            var body* = to-kexp(body(e), tail?)
+            for (n in ns(e), t in ntypes(e), i in 0 to false) do :
+               body* = KLet(KDef(n, KCast(v*, t*, false)), body*, false) where :
+                  val v* = to-kvar(KTupleGet(KVar(n*, false), i, false))
+                  val t* = to-ktype(t)
+            KLet(KDef(n*, KCheckLength(v*, len, false)), body*, false) where :
+               val len = length(ns(e))
+               val v = to-kvar(value(e))
+               val v* = to-kvar(KCast(v, #ktuple(), false))
+         (e:TLetRec) :
+            KLetRec(defns*, body*, false) where :
+               val defns* = for d in defns(e) map :
+                  KDefn(n(d), to-kfn(d))
+               val body* = to-kexp(body(e), tail?)   
+         (e:TFn) :
+            KLet(KDefn(n*, func*), KVar(n*, false), false) where :
+               val n* = fresh-n()
+               val func* = to-kfn(e)
+         (e:TMulti) :
+            KLet(KDefn(n*, func*), KVar(n*, false), false) where :
+               val n* = fresh-n()
+               val func* = KMultifn(map(to-kfn, funcs(e)))
+         (e:TSeq) :
+            KSeq(a*, b*, false) where :
+               val a* = to-kexp(a(e), false)
+               val b* = to-kexp(b(e), tail?)
+         (e:TMatch) :
+            KMatch(args*, brs*, false) where :
+               val args* = map(to-kvar, args(e))
+               val brs* = for b in branches(e) map :
+                  val ts = map(to-ktype, atypes(b))
+                  val bd = to-kexp(body(b), tail?)
+                  KBranch(args(b), ts, bd)
+         (e:TNew) :
+            KNew(t*, ms*, false) where :
+               val t* = to-ktype(type(e))
+               val ms* = map(to-kmethod, methods(e))
+         (e:TRef) :
+            if key?(readvars, n(e)) :
+               if readvars[n(e)] : KCheckVoid(to-kvar(KRead(n(e), false)), false)
+               else : KRead(n(e), false)
+            else : KVar(n(e), false)
+         (e:TCast) :
+            val t = to-ktype(type(e))
+            if tail? : tail-cast(to-kexp(exp(e), true), t)
+            else : KCast(to-kvar(exp(e)), t, false)
+         (e:TSet) :
+            KSet(n, v, false) where :
+               val n = n(ref(e))
+               val t = to-ktype(type(ref(e)))
+               val v = to-kvar(KCast(to-kvar(value(e)), t, false))
+         (e:TDo) :
+            val exp* = to-kdo(func(e), args*) where :
+               val args* = map(to-kvar, args(e))
+            val t = to-ktype(type(e))
+            if tail? : exp*
+            else : KCast(to-kvar(exp*), t, false)                  
+;         (e:TPrim) :
+;            error("Not yet implemented.")
+         (e:TCallLS) :
+            KDoLS(function(e), targs*, args*, false) where :
+               val targs* = map(to-ktype, targs(e))
+               val args* = map(to-kvar, args(e))
+         (e:TLiteral) :
+            KLiteral(value(e), to-ktype(type(e)))
+         (e:TTupleExp) :
+            KTuple(args*, false) where :
+               val args* = map(to-kvar, exps(e))
+         (e:TArgExp|TMix) :
+            KLet(KDefn(n*, func), KVar(n*, false), false) where :
+               val n* = fresh-n()
+               val func = wrap-call(e)
+
+   ;====== Driver ======
+   do(find-readvars, comms(prog))
+   do(add-kcomm, comms(prog))
+   KProg(hier(prog), Vector<?>(), to-list(commands))
+
+;============================================================
+;=================== Constant Lifting =======================
+;============================================================
+
+defn lift-constants (prog:KProg) :
+   val consts = Vector<?>()
+   defn addc (v:KLiteral) :
+      add(consts, value(v))
+      val n = length(consts) - 1
+      KConst(n, type(v))
+
+   defn lifted-const? (v) :
+      match(v) :
+         (v:Int|Char|True|False) : false
+         (v) : true
+
+   defn lift (e:KExp) :
+      match(e) :
+         (e:KLiteral) :
+            if lifted-const?(value(e)) : addc(e)
+            else : e
+         (e) :
+            mapr(lift, e)
+   defn lift (c:KComm) :
+      map(lift, c)
+
+   val comms* = map(lift, comms(prog))
+   KProg(hier(prog), consts, comms*)
+
+;============================================================
+;===================== Box Mutables =========================
+;============================================================
+
+defn box-mutables (prog:KProg) :
+   val mtable = HashTable<Int,True>({_})
+   defn box! (n:Int) : mtable[n] = true
+   defn box? (n:Int) : get?(mtable, n, false)
+
+   defn #let (return: KVar -> KExp, v:KExp) :
+      match(v) :
+         (v:KVar) :
+            return(v)
+         (v) :
+            val n* = fresh-n()
+            KLet(KDef(n*, v),
+                 return(KVar(n*, false)),
+                 false)
+
+   defn boxe (e:KExp) :
+      match(e) :
+         (e:KLet) :
+            val def* = match(def(e)) :
+               (d:KDefVar) :
+                  box!(n(d))
+                  KDef{n(d), _} $ match(value(d)) :
+                     (v:KExp) : #let(KBox{_, false}, v)
+                     (v:False) : KBox(false, false)
+               (d) :
+                  map(boxe, d)
+            val body* = boxe(body(e))
+            KLet(def*, body*, false)
+         (e:KSet) :
+            if box?(n(e)) : KBoxSet(KVar(n(e), false), value(e), false)
+            else : e
+         (e:KRead) :
+            if box?(n(e)) : KBoxGet(KVar(n(e), false), false)
+            else : e
+         (e) :
+            mapr(boxe, e)
+
+   defn boxc (c:KComm) : map(boxe, c)
+   val comms* = map(boxc, comms(prog))
+   KProg(hier(prog), consts(prog), comms*)
+
+
+;============================================================
+;================= Compute Freevars =========================
+;============================================================
+
+defn call?<T> (f:T -> False, x:T|False) :
+   match(x) :
+      (x:False) : false
+      (x:T) : f(x)
+
+defstruct FVEntry :
+   calls: List<Int>
+   args: List<Int>
+   targs: List<Int>
+
+defn EmptyFVEntry () : FVEntry(List(), List(), List())
+defn ArgFVEntry (n:Int) : FVEntry(List(), list(n), List())
+defn CallFVEntry (n:Int) : FVEntry(list(n), List(), List())
+defn TArgFVEntry (n:Int) : FVEntry(List(), List(), list(n))
+defn plus (a:List<Int>, b:List<Int>) : append(a, b)
+defn minus (a:List<Int>, b:Streamable<Int>) : to-list(filter({not contains?(b, _)}, a))
+defn sum (xs:Streamable<List<Int>>) : reduce(plus, List(), xs)
+defn minus (a:List<Int>, b:Int) : to-list(filter({_ != b}, a))
+defn plus (a:FVEntry, b:FVEntry) :
+   FVEntry(calls(b) + calls(a), args(b) + args(a), targs(b) + targs(a))
+defn sum (xs:Streamable<FVEntry>) : reduce(plus, EmptyFVEntry(), xs)
+defn minus (a:FVEntry, b:Int) :
+   FVEntry(calls(a) - b, args(a) - b, targs(a) - b)
+defn minus (a:FVEntry, bs:Streamable<Int>) :
+   FVEntry(calls(a) - bs, args(a) - bs, targs(a) - bs)
+
+defn compute-freevars (prog:KProg) :
+   ;====== State ======
+   val fv-table = HashTable<Int,FVEntry>({_})
+   val globals = HashTable<Int,True>({_})
+
+   defn global? (n:Int) : key?(globals, n)         
+   defn find-globals (c:KComm) :
+      match(c) :
+         (c:KDef|KDefn|KDefVar) : globals[n(c)] = true
+         (c) : false
+
+   ;All sub types in type
+   defn sub-types (t:KType) :
+      val ts = Vector<KType>()
+      do(add{ts, _}, t)
+      ts
+
+   ;All sub types in expression
+   defn sub-types (e:KExp) :
+      val ts = Vector<KType>()
+      defn addt (t:KType) : add(ts, t)
+      defn addt (ts:List<KType>) : do(addt, ts)
+      defn addt (b:KBranch) : addt(types(b))
+      match(e) :
+         (e:KDispatch|KMatch) : do(addt, branches(e))
+         (e:KDo) : addt(targs(e))
+         (e:KDoLS) : addt(targs(e))
+         (e:KCast) : addt(targ(e))
+         (e) : false
+      ts
+
+   ;All sub expressions in expression (does not recurse into Funcs)
+   defn sub-exps (e:KExp) :
+      val es = Vector<KExp>()
+      defn adde (e:KExp) : add(es, e)
+      defn adde (d:KDef|KDefVar) : do(adde, d)
+      defn adde (d:KDefn) : false
+      match(e) :
+         (e:KLet) :
+            adde(def(e))
+            adde(body(e))
+         (e:KLetRec) : adde(body(e))
+         (e:KNew) : false
+         (e) : dor(adde, e)
+      es   
+
+   ;All sub definitions in expression
+   defn sub-ns (e:KExp) :
+      val accum = Vector<Int>()
+      defn addn (n:Int) : add(accum, n)
+      defn addn (ns:List<Int>) : do(addn, ns)
+      defn addn (d:KDef|KDefVar|KDefn) : addn(n(d))
+      defn addn (d:KBranch) : addn(args(d))
+      match(e) :
+         (e:KLet) : addn(def(e))
+         (e:KLetRec) : do(addn, defns(e))
+         (e:KDispatch|KMatch) : do(addn, branches(e))
+         (e) : false
+      accum
+
+   ;All funcs in expression
+   defn sub-funcs (e:KExp) :
+      val accum = Vector<KeyValue<Int,Func>>()
+      defn addf (e:KeyValue<Int,Func>) : add(accum, e)
+      defn addf (d:KDef|KDefVar) : false
+      defn addf (d:KDefn) : addf(n(d) => value(d))
+      defn addf (d:KDefmethod) : addf(n(d) => func(d))
+      match(e) :
+         (e:KLet) : addf(def(e))
+         (e:KLetRec) : do(addf, defns(e))
+         (e:KNew) : do(addf, methods(e))
+         (e) : false
+      accum
+
+   ;====== Freevar Calculations ======
+   defn fv (f:False) : EmptyFVEntry()
+   defn fv (xs:Streamable<KExp>) : sum(stream(fv, xs))
+   defn fv (xs:Streamable<KType>) : sum(stream(fv, xs))
+
+   defn fv (n:Int, f:Func) :
+      val vs = match(f) :
+         (f:KFn) : fv(a1(f)) + fv(a2(f)) + fv(body(f)) - targs(f) - args(f)
+         (f:KMultifn) : sum(stream(fv{fresh-n(), _}, funcs(f)))
+      fv-table[n] = vs
+      vs
+
+   defn fv (e:KExp) -> FVEntry :
+      match(e) :
+         (e:KVar) :
+            if global?(n(e)) : EmptyFVEntry()
+            else : ArgFVEntry(n(e))
+         (e:KDo) :
+            val vs = fv(args(e)) + fv(targs(e))
+            match(func(e)) :
+               (f:KVar) : vs + CallFVEntry(n(f))
+               (f) : vs + fv(f)
+         (e) :
+            val fs = sub-funcs(e)
+            val fvs = sum(for f in fs stream : fv(key(f), value(f)))
+            fvs + fv(sub-exps(e)) + fv(sub-types(e)) - sub-ns(e)
+
+   defn fv (t:KType) -> FVEntry :
+      match(t) :
+         (t:KTVar) : TArgFVEntry(n(t))
+         (t) : fv(sub-types(t))
+
+   ;====== Driver ======
+   do(find-globals, comms(prog))
+   for c in comms(prog) do :
+      match(c) :
+         (c:KDefn) : fv(n(c), value(c))
+         (c:KDefmethod) : fv(n(c), func(c))
+         (c) : do(fv, c)
+   fv-table
+
+
+;============================================================
+;=================== Object Lifting =========================
+;============================================================
+
+defn lift-objects (prog:KProg, fv-table:HashTable<Int,FVEntry>) :
+   ;====== State ======
+   val class-table = Vector<KClass>()
+
+   ;====== Pseudo code ======
+   defn free (e:KNew) :
+      val fv = sum $ for d in methods(e) stream :
+         fv-table[n(d)]
+      [ts, xs] where :
+         val ts = unique(targs(fv))
+         val xs = unique(concat(calls(fv), args(fv)))
+
+   defn make-class (c:KType, ts:List<Int>, xs:List<Int>) :
+      val n* = fresh-n()
+      add(class-table, KClass(n*, c, nts, nxs)) where :
+         val nts = length(ts)
+         val nxs = length(xs)
+      n*   
+         
+   defn lifte (e:KExp) :
+      match(e) :
+         (e:KNew) :
+            val [ts, xs] = free(e)
+            val n* = make-class(class(e), ts, xs)
+            for m in methods(e) do :
+               lift-method(m, n*, ts, xs)
+            KObject(n*, ts*, xs*, false) where :
+               val ts* = map(KTVar, ts)
+               val xs* = map(KVar{_, false}, xs)
+         (e) :
+            mapr(lifte, e)
+
+   defn lift-method (m:KDefmethod, n:Int, ts:List<Int>, xs:List<Int>) :
+      error("Lift method.")
+      ;val ts* = map(fresh-n{}, ts)
+      ;val xs* = map(fresh-n{}, xs)
+      ;var body* = <replace variables and type variables>(body(m), ts => ts*, xs => xs*)
+      ;for (x in xs*, t in <replaced a1>) do :
+      ;   body* = KSeq(KCast(x, t), body*)
+      ;for (x in xs*, i in 0 to false) do :
+      ;   body* = KLet(KDef(x, KObjectGet(this-arg, i, false)), body*, false)
+      ;for (t in ts*, i in 0 to false) do :
+      ;   body* = KLet(KDefObjectType(t, this-arg, i), body*, false)
+      ;val a1* = assoc-this(args(m), a1(m), KOf(n))
+      ;add(method-list, <KDefmethod with same multi, thisn now false, a1*, false a2, new body>)   
+
+   error("Unimplemented.")
+      
+
+;============================================================
+;=============== General Utilities ==========================
+;============================================================
+
+defn map<?T> (f:Int -> ?T, r:Range) :
+   to-list(stream(f, r))
