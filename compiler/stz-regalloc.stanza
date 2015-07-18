@@ -1,0 +1,516 @@
+#include<"core/stringeater.stanza">
+#include<"compiler/stz-algorithms.stanza">
+#include<"compiler/stz-lexer.stanza">
+#include<"compiler/stz-parser.stanza">
+
+defpackage regalloc :
+   import core
+   import verse
+   import stz/lexer
+   import stz/parser
+   import stz/algorithms
+
+;========================================
+definterface Loc
+defstruct Stack <: Loc
+defstruct Reg <: Loc
+defstruct AnyLoc <: Loc
+defstruct Dead <: Loc
+
+definterface Ref
+defmulti name (r:Ref) -> Symbol
+defstruct Var <: Ref :
+   name: Symbol with : (as-method => true)
+defstruct LVar <: Ref :
+   name: Symbol with : (as-method => true)
+   loc: Loc
+
+definterface Exp
+defstruct Args <: Exp :
+   xs: List<Symbol>
+defstruct Set <: Exp :
+   x: Ref
+   y: Ref
+defstruct Op <: Exp :
+   xs: List<Ref>
+   ys: List<Ref>
+defstruct Do <: Exp :
+   xs: List<Ref>
+   ys: List<Ref>
+
+definterface Block
+defmulti name (b:Block) -> Symbol
+defmulti exps (b:Block) -> List<Exp>
+defmulti next (b:Block) -> List<Symbol>
+
+defstruct SBlock <: Block :
+   name: Symbol with : (as-method => true)
+   exps: List<Exp> with : (as-method => true)
+   next: List<Symbol> with : (as-method => true)
+
+defstruct LBlock <: Block :
+   name: Symbol with : (as-method => true)
+   exps: List<Exp> with : (as-method => true)
+   next: List<Symbol> with : (as-method => true)
+   live-in: List<Ref>
+   live-out: List<Ref>
+
+defstruct Program :
+   blocks: List<Block>
+
+;========================================
+
+defstruct Save <: Exp :
+   x: Ref
+defstruct Load <: Exp :
+   x: Ref
+
+;========================================
+defn cms (xs) : join(xs, ", ")
+
+defmethod print (o:OutputStream, p:Program) :
+   for b in join(blocks(p), "\n") do :
+      print(o, b)
+
+defmethod print (o:OutputStream, b:SBlock) :
+   print(o, "block ~ :" << [name(b)])
+   for e in exps(b) do :
+      print(o, "\n   ~" << [e])
+   print(o, "\n   goto (~@)" << [cms(next(b))])
+
+defmethod print (o:OutputStream, b:LBlock) :
+   print(o, "lblock ~ :" << [name(b)])
+   for e in exps(b) do :
+      print(o, "\n   ~" << [e])
+   print(o, "\n   goto (~@)" << [cms(next(b))])
+   print(o, "\n   live-in: (~@)" << [cms(live-in(b))])
+   print(o, "\n   live-out: (~@)" << [cms(live-out(b))])
+
+defmethod print (o:OutputStream, e:Exp) :
+   print{o, _} $ match(e) :
+      (e:Args) : "(~@) = args" << [cms(xs(e))]
+      (e:Set) : "~ = ~" << [x(e), y(e)]
+      (e:Op) : "(~@) = op(~@)" << [cms(xs(e)), cms(ys(e))]
+      (e:Do) : "(~@) = f(~@)" << [cms(xs(e)), cms(ys(e))]
+      (e:Save) : "save ~" << [x(e)]
+      (e:Load) : "load ~" << [x(e)]
+
+defmethod print (o:OutputStream, r:Ref) :
+   print{o, _} $ match(r) :
+      (r:Var) : name(r)
+      (r:LVar) : "~:~" << [name(r), loc(r)]
+
+defmethod print (o:OutputStream, l:Loc) :
+   print{o, _} $ match(l) :
+      (l:Stack) : "stack"
+      (l:Reg) : "reg"
+      (l:Dead) : "dead"
+      (l:AnyLoc) : "any"
+
+;========== Parser =====================
+defsyntax regir :
+   val ut = unwrap-token
+
+   defrule :
+      sym = (?x) when ut(x) typeof Symbol : ut(x)
+
+      exp = ((?xs:#sym ...) = args) :
+         Args(xs)
+      exp = (?x:#sym = ?y:#sym) :
+         Set(Var(x), Var(y))
+      exp = ((?xs:#sym ...) = op(?ys:#sym ...)) :
+         Op(map(Var, xs), map(Var, ys))
+      exp = ((?xs:#sym ...) = f(?ys:#sym ...)) :
+         Do(map(Var, xs), map(Var, ys))
+
+      block = (block ?name:#sym :
+                  ?es:#exp ...
+                  goto (?ns:#sym ...)) :
+         SBlock(name, es, ns)
+
+      prog = (?bs:#block ...) :
+         Program(bs)
+
+defn parse-regir (filename:String) -> Program :
+   val lexed = lex-file(filename)
+   with-syntax(regir) :
+      match-syntax(lexed) :
+         (?p:#prog) : p
+
+
+;======== Liveness Analysis ============
+;Block based liveness analysis
+defstruct BlockLiveness :
+   live-in: HashTable<Symbol,List<Symbol>>
+   live-out: HashTable<Symbol,List<Symbol>>
+   defs: HashTable<Symbol,List<Symbol>>
+
+defmethod print (o:OutputStream, x:BlockLiveness) :
+   defn ptable (name:String, t:HashTable) :
+      print(o, "~: " << [name])
+      for entry in t do :
+         print(o, "\n   ~ : (~@)" << [key(entry), cms(value(entry))])
+   ptable("Live In", live-in(x))
+   ptable("\nLive Out", live-out(x))
+   ptable("\nDefs", defs(x))
+
+defn liveness-analysis (p:Program) :
+   val live-in = HashTable<Symbol, List<Symbol>>(symbol-hash)
+   val live-out = HashTable<Symbol, List<Symbol>>(symbol-hash)
+   val defs = HashTable<Symbol,List<Symbol>>(symbol-hash)
+
+   ;Base case analysis of a block
+   defn analyze (b:Block) :
+      val live-in-accum = Vector<Symbol>()
+      val defs-accum = Vector<Symbol>()
+
+      defn defed (x:Symbol) : add(defs-accum, x)
+      defn defed (x:Ref) : defed(name(x))
+      defn used (x:Symbol) : add(live-in-accum, x) when not contains?(defs-accum, x)
+      defn used (x:Ref) : used(name(x))
+
+      defn analyze-exp (e:Exp) :
+         match(e) :
+            (e:Args) :
+               do(defed, xs(e))
+            (e:Set) :
+               used(y(e))
+               defed(x(e))
+            (e:Op) :
+               do(used, ys(e))
+               do(defed, xs(e))
+            (e:Do) :
+               do(used, ys(e))
+               do(defed, xs(e))
+
+      do(analyze-exp, exps(b))
+      live-in[name(b)] = unique(live-in-accum)
+      defs[name(b)] = unique(defs-accum)
+      live-out[name(b)] = List()
+
+   ;Propagation analysis of a block
+   defn propagate () :
+      fixpoint $ fn (progress) :
+         defn add-live-out (b:Symbol, v:Symbol) :
+            if not contains?(live-out[b], v) :
+               live-out[b] = List(v, live-out[b])
+               progress()
+         defn add-live-in (b:Symbol, v:Symbol) :
+            if not contains?(live-in[b], v) :
+               live-in[b] = List(v, live-in[b])
+               progress()
+         for b in blocks(p) do :
+            for s in next(b) do :
+               for v in live-in[s] do :
+                  add-live-out(name(b), v)
+         for b in blocks(p) do :
+            for v in live-out[name(b)] do :
+               if not contains?(defs[name(b)], v) :
+                  add-live-in(name(b), v)
+
+   ;Wrap in result
+   defn wrap-results (b:Block) :
+      LBlock(name(b),
+             exps(b),
+             next(b),
+             map(Var, live-in[name(b)]),
+             map(Var, live-out[name(b)]))
+
+   ;Driver
+   do(analyze, blocks(p))
+   propagate()
+   Program(map(wrap-results, blocks(p)))
+
+;============ Save Emission =================
+defn emit-saves (b:LBlock) :
+   val dsts = HashTable<Symbol,Loc>(symbol-hash)
+   defn init-dsts () :
+      for v in live-out(b) do :
+         dsts[name(v)] = AnyLoc()
+   defn mark-dead (x:Ref) :
+      dsts[name(x)] = Dead()
+   defn mark-reg (x:Ref) :
+      dsts[name(x)] = Reg()
+   defn mark-stack-if-live (x:Symbol) :
+      if dsts[x] not-typeof Dead :
+         dsts[x] = Stack()
+
+   defn emit-saves (es:List<Exp>) :
+      val accum = Vector<Exp>()
+      defn save-if-stack (x:Ref) :
+         if get?(dsts, name(x), false) typeof Stack :
+            add(accum, Save(x))
+
+      for e in reverse(es) do :
+         match(e) :
+            (e:Args) :
+               do(save-if-stack, map(Var, xs(e)))
+               do(mark-dead, map(Var, xs(e)))
+               add(accum, e)
+            (e:Set) :
+               save-if-stack(x(e))
+               save-if-stack(y(e))
+               add(accum, e)
+               mark-dead(x(e))
+               mark-reg(y(e))
+            (e:Op) :
+               do(save-if-stack, xs(e))
+               do(save-if-stack, ys(e))
+               add(accum, e)
+               do(mark-dead, xs(e))
+               do(mark-reg, ys(e))
+            (e:Do) :
+               do(save-if-stack, xs(e))
+               add(accum, e)
+               do(mark-dead, xs(e))
+               do(mark-stack-if-live, keys(dsts))
+               do(mark-reg, ys(e))
+
+      reverse(to-list(accum))
+
+   defn live-in-locs (xs:List<Ref>) :
+      for x in xs map :
+         LVar(name(x), dsts[name(x)])
+
+   init-dsts()
+   val exps* = emit-saves(exps(b))
+   LBlock(name(b),
+          exps*,
+          next(b),
+          live-in-locs(live-in(b)),
+          live-out(b))
+
+defn emit-saves (p:Program) :
+   val bs = blocks(p) as List<LBlock>
+   Program(map(emit-saves, bs))
+
+;=========== Load Emission ================
+defn emit-loads (b:LBlock) :
+   val locs = HashTable<Symbol,Loc>(symbol-hash)
+   defn init-locs () :
+      for v in live-in(b) as List<LVar> do :
+         locs[name(v)] = loc(v)
+         
+   defn mark-reg (x:Ref) :
+      locs[name(x)] = Reg()
+   defn mark-stack (x:Ref) :
+      locs[name(x)] = Stack()
+      
+   defn emit-loads (es:List<Exp>) :
+      val accum = Vector<Exp>()      
+      defn load-if-stack (x:Ref) :
+         if locs[name(x)] typeof Stack :
+            add(accum, Load(x))
+            
+      for e in es do :
+         match(e) :
+            (e:Args) :
+               add(accum, e)
+               do(mark-reg{Var(_)}, xs(e))
+            (e:Set) :
+               load-if-stack(y(e))
+               add(accum, e)
+               mark-reg(x(e))
+               mark-reg(y(e))
+            (e:Op) :
+               do(load-if-stack, ys(e))
+               add(accum, e)
+               do(mark-reg, xs(e))
+               do(mark-reg, ys(e))
+            (e:Do) :
+               do(load-if-stack, ys(e))
+               add(accum, e)
+               do(mark-reg, xs(e))
+            (e:Save) :
+               mark-stack(x(e))
+      to-list(accum)
+
+   defn live-out-locs (xs:List<Ref>) :
+      for x in xs map :
+         LVar(name(x), locs[name(x)])
+
+   init-locs()
+   val exps* = emit-loads(exps(b))
+   LBlock(name(b),
+          exps*,
+          next(b),
+          live-in(b),
+          live-out-locs(live-out(b)))
+
+defn emit-loads (p:Program) :
+   val bs = blocks(p) as List<LBlock>
+   Program(map(emit-loads, bs))
+
+;========= LastUse =====================
+defn compute-last-use (b:LBlock) :
+   val last-uses = Vector<List<Symbol>>()
+   val dsts = HashTable<Symbol,Loc>(symbol-hash)
+
+   defn init-dsts () :
+      for v in live-out(b) as List<LVar> do :
+         dsts[name(v)] = loc(v)
+         
+   defn scan-exps (es:List<Exp>) :
+      for e in reverse(es) do :
+         ;Accumulate last use variables
+         var last = List<Symbol>()
+         defn mark-use (x:Ref) :
+            if get?(dsts, name(x), Dead()) typeof Dead :
+               last = List(name(x), last)
+            dsts[name(x)] = Reg()
+         defn mark-dead (x:Ref) :
+            dsts[name(x)] = Dead()
+            
+         match(e) :
+            (e:Args) :
+               do(mark-dead{Var(_)}, xs(e))
+            (e:Set) :
+               mark-dead(x(e))
+               mark-use(y(e))
+            (e:Op) :
+               do(mark-use, ys(e))
+               do(mark-dead, xs(e))
+            (e:Do) :
+               do(mark-use, ys(e))
+               do(mark-dead, xs(e))
+            (e:Save) :
+               mark-use(x(e))
+            (e:Load) :
+               mark-dead(x(e))
+
+         add(last-uses, last)
+
+   init-dsts()
+   scan-exps(exps(b))
+   reverse(to-list(last-uses))
+
+;========== Next Use ====================
+defn compute-uses (b:LBlock) :
+   val next-uses = Vector<List<Symbol>>()
+
+   defn scan-exps (es:List<Exp>) :
+      var uses = map(name, live-out(b))
+      defn mark-use (x:Ref) :
+         uses = List(name(x), uses)
+      for e in reverse(es) do :
+         add(next-uses, uses)
+         match(e) :
+            (e:Args) : false
+            (e:Set) : mark-use(y(e))
+            (e:Op) : do(mark-use, ys(e))
+            (e:Do) : do(mark-use, ys(e))
+            (e:Save) : mark-use(x(e))
+            (e:Load) : false
+
+   scan-exps(exps(b))
+   reverse(to-list(next-uses))
+
+defn find-next-uses (xs:List<Symbol>) :
+   val t = HashTable<Symbol,True>(symbol-hash)
+   defn loop (xs:List<Symbol>) :
+      if empty?(xs) : List()
+      else if key?(t, head(xs)) : loop(tail(xs))
+      else : List(head(xs), loop(tail(xs)))
+   loop(xs)
+
+;========== Spill Registers =============
+defn spill-registers (b:LBlock, N:Int) :
+   val last-uses = compute-last-use(b)
+   val next-uses = compute-uses(b)
+
+   ;Kill and Birth
+   var n:Int = 0
+   val live = HashTable<Symbol,True|False>(symbol-hash)
+   defn kill (x:Ref) :
+      if live[name(x)] :         
+         live[name(x)] = false
+         n = n - 1
+   defn birth (x:Ref) :
+      if get?(live, name(x), false) :
+         live[name(x)] = true
+         n = n + 1
+
+   ;Spilling and Loading
+   val accum = Vector<Exp>()
+   defn spill (x:Ref) :
+      add(accum, Save(x))
+      kill(x)
+   defn load (x:Ref) :
+      add(accum, Load(x))
+      birth(x)
+         
+   defn spill (es:List<Exp>) :
+      for (e in es, killed in last-uses, uses in next-uses) do :         
+         ;Marking and Ensuring Live
+         defn reserve-reg () :
+            if n >= N :
+               val uses* = reverse(find-next-uses(uses))
+               val v = for v in uses* find :
+                  get?(live, v, false)
+               spill(Var(v as Symbol))
+         defn mark-live (x:Ref) :
+            reserve-reg()
+            birth(x)
+         defn ensure-live (x:Ref) :
+            if not live[name(x)] :
+               reserve-reg()
+               load(x)
+               
+         match(e) :
+            (e:Args) :
+               do(mark-live{Var(_)}, xs(e))
+               add(accum, e)
+            (e:Set) :
+               ensure-live(y(e))
+               do(kill, killed)
+               mark-live(x(e))
+               add(accum, e)
+            (e:Op) :
+               do(ensure-live, ys(e))
+               do(kill, killed)
+               do(mark-live, xs(e))
+               add(accum, e)               
+;            (e:Do) :
+;               do(
+;
+;
+;               do(mark-use, ys(e)) ;;asdfasdf
+            (e:Save) :
+               kill(x(e))
+               add(accum, e)
+            (e:Load) :
+               mark-live(x(e))
+               add(accum, e)
+      
+
+defn compute-last-use (p:Program) :
+   for b in blocks(p) as List<LBlock> do :
+      println("Block ~:" << [name(b)])
+      val lu = compute-last-use(b)
+      val us = compute-uses(b)
+      for (e in exps(b), u in lu, us in us) do :
+         if empty?(u): println("   ~ USES(~@)" << [e, cms(us)])
+         else : println("   ~  KILLED(~@) USES(~@)" << [e, cms(u), cms(us)])
+               
+
+
+
+;========= Driver ======================
+defn main () :
+   val filename = commandline-arguments()[1]
+   val prog = parse-regir(filename)
+   println(prog)
+
+   val lp = liveness-analysis(prog)
+   println(lp)
+
+   val ap = emit-saves(lp)
+   println(ap)
+
+   val ap2 = emit-loads(ap)
+   println(ap2)
+
+   println("\n\n")
+   compute-last-use(ap2)
+
+main()
