@@ -90,6 +90,8 @@ defstruct Save <: Exp :
    x: Ref
 defstruct Load <: Exp :
    x: Ref
+defstruct Release <: Exp :
+   x: Ref
 
 defstruct LBlock <: Block :
    name: Symbol with: (as-method => true)
@@ -142,6 +144,7 @@ defmethod print (o:OutputStream, e:Exp) :
       (e:Do) : "(~@) = f(~@)" << [cms(xs(e)), cms(ys(e))]
       (e:Save) : "save ~" << [x(e)]
       (e:Load) : "load ~" << [x(e)]
+      (e:Release) : "release ~" << [x(e)]
 
 defmethod print (o:OutputStream, r:Ref) :
    print{o, _} $ match(r) :
@@ -153,6 +156,7 @@ defmethod print (o:OutputStream, l:Loc) :
    print{o, _} $ match(l) :
       (l:Stack) : "stk"
       (l:Reg) : "reg"
+
 
 ;======== Critical Edge Removal ==========
 defn remove-critical-edges (p:Program) :
@@ -371,11 +375,17 @@ defn finite-allocation (b:LBlock) :
 
    defn emit (e:Exp) :
       add(exp-list, e)
+
+   defn release (x:Symbol) :
+      emit(Release(Var(x)))
+
+   defn release (xs:Streamable<Symbol>) :
+      do(release, xs)
    
    defn save (x:Symbol) :
       emit(Save(Var(x)))
 
-   defn save (xs:Stream<Symbol>) :
+   defn save (xs:Streamable<Symbol>) :
       do(save, xs)
 
    defn unload-all () :
@@ -384,6 +394,9 @@ defn finite-allocation (b:LBlock) :
 
    defn loaded? (x:Symbol) :
       get?(loaded, x, false)
+      
+   defn loaded? (x:Ref) :
+      loaded?(name(x))
 
    defn loaded-vars () :
       filter(loaded?, keys(loaded))
@@ -403,43 +416,48 @@ defn finite-allocation (b:LBlock) :
       if x not-typeof Dead :
          set-loaded(name(x), v)
 
-   defn set-loaded (xs:List<Ref>, v:True|False) :
+   defn set-loaded (xs:List<Ref|Symbol>, v:True|False) :
       do(set-loaded{_, v}, xs)
 
-   defn spill (p:Pos) :
-      defn farthest (a:Symbol, b:Symbol) :
-         val ta = lookup(usage-table[p], a)
-         val tb = lookup(usage-table[p], b)
-         match(ta, tb) :
-            (ta:False, tb) : true
-            (ta, tb:False) : false
-            (ta:Int, tb:Int) : ta > tb
-      val v = maximum(loaded-vars(), farthest)
-      match(lookup(usage-table[p], v)) :
-         (d:Int) : emit(Save(Var(v)))
-         (d:False) : false
-      set-loaded(v, false)
+   ;Find the variables used farthest from position p
+   defn farthest-var (p:Pos) -> [List<Symbol>, Int|False] :
+      val es = to-list $
+         for v in loaded-vars() stream :
+            v => lookup(usage-table[p], v)
+      val dead = to-list $
+         for e in es filter :
+            value(e) == false
+      if empty?(dead) :
+         val e = maximum-by-key(es, value)
+         [list(key(e)), value(e)]
+      else :
+         [map(key,dead), false]
 
-   defn live-vars (p:Pos) :
-      stream(key, usage-table[p])
-
-   defn alloc (p:Pos, n:Int) :
+   ;Ensure n registers are free, spilling if necessary.
+   defn alloc-reg (p:Pos, n:Int) :
       while num-reg + n > N :
-         spill(p)
-         
-   defn alloc (p:Pos, x:Ref) :
-      alloc(p, 1)
+         val [vs, d] = farthest-var(p)
+         save(vs) when d != false
+         release(vs)
+         set-loaded(vs, false)
 
-   defn alloc (p:Pos, xs:List<Ref>) :
-      alloc(p, length(xs))
+   ;Load as many of xs as possible. Keep nearest used values in registers.
+   defn load-nearest (p:Pos, xs:List<Ref>) :
+      set-loaded(xs, true)
+      alloc-reg(p, 0)
 
+   ;Ensure that x is loaded at position p
    defn load (p:Pos, x:Ref) :
-      alloc(p, 1) when not loaded?(name(x))         
+      alloc-reg(p, 1) when not loaded?(x)         
       emit(Load(x))
       set-loaded(x, true)
 
    defn load (p:Pos, xs:List<Ref>) :
       do(load{p, _}, xs)
+
+   ;Get all live variables at position p
+   defn live-vars (p:Pos) :
+      stream(key, usage-table[p])
 
    defn keep-live (p:Pos, xs:List<Ref>) :
       val live = to-list(live-vars(p))
@@ -447,30 +465,27 @@ defn finite-allocation (b:LBlock) :
          if contains?(live, name(x)) : x
          else : Dead()
 
-   set-loaded(live-in(b), true)
-   alloc(Pos(0, false), 0)
+   load-nearest(Pos(0, false), live-in(b))
    for (e in exps(b), i in 0 to false) do :
       match(e) :
          (e:Args) :
             emit(Args(keep-live(Pos(i + 1, false), xs(e))))
-            set-loaded(xs(e), true)
-            alloc(Pos(i + 1, false), 0)            
+            load-nearest(Pos(i + 1, false), xs(e))
          (e:Set) :
             load(Pos(i,false), y(e))
-            alloc(Pos(i,true), x(e))
+            alloc-reg(Pos(i,true), 1)
             emit(e)
             set-loaded(x(e), true)
          (e:Op) :
             load(Pos(i,false), ys(e))
-            alloc(Pos(i,true), xs(e))
+            alloc-reg(Pos(i,true), length(xs(e)))
             emit(e)
             set-loaded(xs(e), true)
          (e:Do) :
             save(live-vars(Pos(i,true)))
             emit(Do(keep-live(Pos(i + 1, false), xs(e)), ys(e)))
             unload-all()
-            set-loaded(xs(e), true)
-            alloc(Pos(i + 1, false), 0)
+            load-nearest(Pos(i + 1, false), xs(e))
 
    LBlock(name(b),
           to-list(exp-list),
@@ -583,6 +598,11 @@ defn save-load-elision (b:LBlock) :
                   (l:True) : elide(rest)
                   (l:False) : (mark-loaded(x(e), true), List(e, elide(rest)))
                   (l:Any) : (assume(e), mark-loaded(x(e), true), elide(rest))
+            (e:Release) :
+               match(loaded-ref?(x(e))) :
+                  (l:True) : (mark-loaded(x(e), false), List(e, elide(rest)))
+                  (l:False) : elide(rest)
+                  (l:Any) : (mark-loaded(x(e), false), elide(rest))
 
    mark-saved(live-in(b), Any())
    mark-loaded(live-in(b), Any())
