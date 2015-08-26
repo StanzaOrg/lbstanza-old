@@ -192,6 +192,9 @@ defstruct Save <: Exp&Working :
 defstruct Load <: Exp&Working :
    x: Var
 
+defstruct Unload <: Exp&Working :
+   x: Var
+
 defmethod print (o:OutputStream, e:Exp&Working) :
    print{o, _} $ match(e) :
       (e:WArgs) : "(~@) = Args" << [cms(xs(e))]
@@ -201,6 +204,7 @@ defmethod print (o:OutputStream, e:Exp&Working) :
             (f:Var) : "(~@) = [~](~@)" << [f, cms(xs(e)), cms(ys(e))]
       (e:Save) : "save ~" << [x(e)]
       (e:Load) : "load ~" << [x(e)]
+      (e:Unload) : "unload ~" << [x(e)]
 
 defstruct Any
 defmethod print (o:OutputStream, x:Any) :
@@ -601,119 +605,192 @@ defn release-table (b:WBlock) -> Array<KeyValue<Pos,Symbol>> :
    release-array   
 
 
-;;============================================================
-;;=================== Class Allocation =======================
-;;============================================================
-;
-;;Make a Var just from its name
-;defn Var (x:Symbol) -> Var :
-;   Var(x, NoLoc(), NoLoc(), NoLoc())
-;
-;defn class-allocation (b:Block, bl:BlockLive) :
-;   ;The resulting expression list
-;   val exp-list = Vector<Exp>()
-;   defn emit (e:Exp) :
-;      add(exp-list, e)
-;
-;   ;Tracks the number of loaded registers
-;   val max-reg = 8
-;   var num-reg = 0
-;
-;   ;Records for each variable whether a register is reserved for it
-;   val reserved = HashTable<Symbol,True|False>(symbol-hash)
-;   
-;   defn reserved? (x:Symbol) :
-;      get?(reserved, x, false)
-;
-;   defn free (x:Symbol) :
-;      if not reserved?(x) :
-;         error("~ is already free." % [x])
-;      reserved[x] = false
-;      num-reg = num-reg - 1
-;
-;   defn reserve (x:Symbol) :
-;      if reserved?(x) :
-;         error("~ is already reserve." % [x])
-;      reserved[x] = true
-;      num-reg = num-reg + 1
-;
-;   ;Tracks when variables are used
-;   val ut = usage-table(b, bl)
-;   val use-cache = HashTable<Symbol,Int>(symbol-hash)
-;   defn load-use-cache (p:Pos) :
-;      clear(use-cache)
-;      for use in ut[p] do :
-;         use-cache[key(use)] = value(use)   
-;
-;   ;Tracks the spilling of variables
-;   val spill-cache = Vector<Symbol>()
-;   defn load-spill-cache () :
-;      clear(spill-cache)
-;      for e in reserved do :
-;         add(spill-cache, key(e)) when value(e)
-;      sort-by-key!(spill-cache, {use-cache[_]})
-;   defn spill-next () :
-;      val x = pop(spill-cache)
-;      free(x)
-;      emit $ Save(Var(x))
-;
-;   ;Tracks the release of variables
-;   val rt = release-table(b, bl)
-;   var release-n = 0
-;   defn* release-up-to (p:Pos) :
-;      if release-n < length(rt) :
-;         val r = rt[release-n]
-;         if key(r) <= p :
-;            free(value(r))
-;            release-n = release-n + 1
-;            release-up-to(p)
-;
-;   ;Reserve registers for variable xs at position p
-;   defn reserve-registers (p:Pos, xs:List<Var>) :
-;      var cached = false
-;      defn spill () :
-;         if not cached :
-;            load-use-cache(p)
-;            load-spill-cache()
-;            cached = true
-;         spill-next()
-;      
-;      for x in xs do :
-;         if not reserved?(name(x)) :
-;            spill() when num-reg >= max-reg               
-;            reserve(name(x))
-;
-;   ;Reserve registers for as many live-in variables as possible
-;   defn reserve-live-in () :
-;      do(reserve, in(bl))
-;      if num-reg > max-reg :
-;         load-use-cache(Pos(0,false))
-;         load-spill-cache()
-;         while num-reg > max-reg :
-;            spill-next()
-;         
-;   ;Allocate location classes for expressions
-;   defn allocate () :
-;      for (e in exps(b), i in 0 to false) do :
-;         match(e) :
-;            (e:Op) :
-;               release-up-to(Pos(i,false))
-;               reserve-registers(Pos(i,false), ys(e))
-;               do(emit{Load(_)}, ys(e))
-;               release-up-to(Pos(i,true))
-;               reserve-registers(Pos(i,true), xs(e))
-;               emit(e)
-;            (e:Save) :
-;               emit(e)
-;            (e:Load) :
-;               error("Unreachable")
-;            (e) :
-;               error("Class Allocation: Handle other constructs.")
-;
-;   ;Driver
-;   reserve-live-in()
-;   allocate()
-;   Block(name(b), to-list(exp-list), next(b))
+;============================================================
+;=================== Class Allocation =======================
+;============================================================
+
+;Make a Var just from its name
+defn Var (x:Symbol) -> Var :
+   Var(x, NoLoc())
+
+defn class-allocation (b:WBlock) :
+   ;The resulting expression list
+   val exp-list = Vector<Exp>()
+   defn emit (e:Exp) :
+      add(exp-list, e)
+
+   ;Tracks the number of free registers
+   var num-free-reg = 8
+
+   ;Spill function
+   var spill-next: () -> ? = error{"No Spill function."}
+
+   ;Save/Load Status
+   val saved = HashTable<Symbol,True|False|Any|None>(symbol-hash)
+   val loaded = HashTable<Symbol,True|False|Any|None>(symbol-hash)
+
+   defn clear-regs () :
+      num-free-reg = 8
+      clear(saved)
+      clear(loaded)
+
+   defn save (x:Symbol) :
+      match(get?(saved, x, None())) :
+         (s:True) : false
+         (s:False) : emit(Save(Var(x)))
+         (s:Any) : emit(Save(Var(x)))
+         (s:None) : error("~ not live." % [x])
+      saved[x] = true
+
+   defn load (x:Symbol) :
+      match(get?(loaded, x, None())) :
+         (l:True) :
+            false
+         (l:False) :
+            spill-next() when num-free-reg <= 0
+            emit(Load(Var(x)))
+            num-free-reg = num-free-reg - 1
+         (l:Any) :
+            emit(Load(Var(x)))
+         (l:None) :
+            error("~ not live." % [x])
+      loaded[x] = true
+
+   defn unload (x:Symbol) :
+      match(get?(loaded, x, None())) :
+         (l:True) :
+            emit(Unload(Var(x)))
+            num-free-reg = num-free-reg + 1
+         (l:False) :
+            false
+         (l:Any) :
+            emit(Unload(Var(x)))
+            num-free-reg = num-free-reg + 1
+         (l:None) :
+            error("~ is not live." % [x])
+      loaded[x] = false
+
+   defn die (x:Symbol) :
+      match(get?(loaded, x, None())) :
+         (l:True) : num-free-reg = num-free-reg + 1
+         (l:False) : false
+         (l:Any) : error("~ should not be loaded." % [x])
+         (l:None) : error("~ is not live." % [x])
+      loaded[x] = None()
+
+   defn def (x:Var) :
+      match(get?(loaded, name(x), None())) :
+         (l:True) : error("~ has not been released." % [name(x)])
+         (l:False) : num-free-reg = num-free-reg - 1
+         (l:Any) : error("~ has not been released." % [name(x)])
+         (l:None) : num-free-reg = num-free-reg - 1
+      loaded[name(x)] = true
+      saved[name(x)] = false
+
+   defn def (x:Port) :
+      match(x) :
+         (x:LivePort) :
+            if get?(loaded, name(x), None()) not-typeof None :
+               error("~ should not be live." % [name(x)])
+            match(loaded?(x)) :
+               (l:True) : error("~ cannot be loaded." % [name(x)])
+               (l:False) :
+                  loaded[name(x)] = false
+               (l:Any) :
+                  loaded[name(x)] = Any()
+                  num-free-reg = num-free-reg - 1
+            match(saved?(x)) :
+               (l:True) : saved[name(x)] = true
+               (l:Any) : saved[name(x)] = Any()
+               (l:False) : error("~ cannot be not saved." % [name(x)])
+         (x:DeadPort) :
+            false
+
+   ;Spilling Calculations
+   val ut = usage-table(b)
+   val use-cache = HashTable<Symbol,Int>(symbol-hash)
+   val spill-cache = Vector<Symbol>()
+   defn spill-at (p:Pos, f: () -> ?) :
+      var cached = false
+      defn spill () :
+         if not cached :
+            ;Reload the use cache
+            clear(use-cache)
+            for use in ut[p] do :
+               use-cache[key(use)] = value(use)
+            ;Reload the spill cache
+            clear(spill-cache)
+            for e in loaded do :
+               add(spill-cache, key(e)) when value(e) typeof True|Any
+            sort-by-key!(spill-cache, {use-cache[_]})
+            ;Mark as cached
+            cached = true
+         
+         val x = pop(spill-cache)
+         save(x)
+         unload(x)         
+      let-var spill-next = spill :
+         f()
+         
+   ;Tracks the release of variables
+   val rt = release-table(b)
+   var release-n = 0
+   defn* release-up-to (p:Pos) :
+      if release-n < length(rt) :
+         val r = rt[release-n]
+         if key(r) <= p :
+            die(value(r))
+            release-n = release-n + 1
+            release-up-to(p)
+
+   ;Ensure variable's xs are loaded for position p
+   defn ensure-loaded (p:Pos, xs:List<Var>) :
+      spill-at{p, _} $ fn () :
+         do(load{name(_)}, xs)
+
+   ;Ensure enough registers are free for defining xs at position p
+   defn defined (p:Pos, xs:List<Var>) :
+      spill-at{p, _} $ fn () :
+         while num-free-reg < length(xs) :
+            spill-next()
+      do(def, xs)      
+
+   ;Reserve registers for as many live-in variables as possible
+   defn defined (p:Pos, xs:List<Port>) :
+      do(def, xs)
+      spill-at{p, _} $ fn () :
+         while num-free-reg < 0 :
+            spill-next()
+         
+   ;Allocate location classes for expressions
+   defn allocate () :
+      for (e in exps(b), i in 0 to false) do :
+         release-up-to(Pos(i,false))
+         match(e) :
+            (e:Op) :
+               ensure-loaded(Pos(i,false), ys(e))
+               release-up-to(Pos(i,true))
+               defined(Pos(i,true),xs(e))
+               emit(e)
+            (e:Save) :
+               save(name(x(e)))
+            (e:Load) :
+               error("Unreachable")
+            (e:WArgs) :
+               emit(e)
+               defined(Pos(i + 1, false), xs(e))
+            (e:WDo) :
+               emit(e)
+               clear-regs()
+               defined(Pos(i + 1, false), xs(e))
+            (e) :
+               error("Class Allocation: Handle other constructs.")
+
+   ;Driver
+   defined(Pos(0,false), in(b))
+   allocate()
+   WBlock(name(b), to-list(exp-list), next(b),
+          in(b), out(b), dist(b))
 
 
 
@@ -1688,16 +1765,16 @@ defn test (p:Unit) :
    println("====== Liveness Analysis ======")
    val p2 = liveness-analysis(p)
    println(p2)
-   println("====== Save Semantics ======")
    for b in blocks(p2) do :
+      println("==== Block ~ ====" << [name(b)])
+      println("Save Semantics:")
       val b* = save-semantics(b as WBlock)
       println(b*)
-      println("Usage table:")
-      val ut = usage-table(b*)
-      println(ut)
-      println("Release table:")
-      val rt = release-table(b*)
-      do(println, rt)
+      val b** = class-allocation(b*)
+      println("Class Allocation:")
+      println(b**)
+
+      
 
    
 ;   println("====== Allocation ======")
