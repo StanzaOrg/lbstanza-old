@@ -327,100 +327,6 @@ defn liveness-analysis (u:Unit) :
                 map(to-port, get?(in-lists, name(b), List()))
                 map(to-port, get?(out-lists, name(b), List()))
                 get?(dist-lists, name(b), List()))
-
-
-;============================================================
-;==================== Save Emission =========================
-;============================================================
-
-defn save-semantics (b:WBlock) :
-   ;State of the future
-   val requires-saved = HashTable<Symbol,True|False>(symbol-hash)
-   val is-live = HashTable<Symbol,True|False>(symbol-hash)
-   val prefer-loaded = HashTable<Symbol,True|False>(symbol-hash)
-
-   ;Output
-   val exp-list = Vector<Exp>()
-
-   ;Initialize state
-   for x in out(b) do :
-      is-live[name(x)] = true
-      prefer-loaded[name(x)] = true
-      requires-saved[name(x)] = false
-
-   ;Summarize current variable statistics as port
-   defn as-port (x:Symbol) :
-      val lv = get?(is-live, x, false)
-      val sv = get?(requires-saved, x, false)
-      val ld = get?(prefer-loaded, x, true)
-      match(lv, sv, ld) :
-         (lv:False, sv, ld) : DeadPort()
-         (lv:True, sv:False, ld:False) : LivePort(x, Any(), false, NoLoc())
-         (lv:True, sv:False, ld:True) : LivePort(x, Any(), Any(), NoLoc())
-         (lv:True, sv:True, ld:False) : LivePort(x, true, false, NoLoc())
-         (lv:True, sv:True, ld:True) : LivePort(x, true, Any(), NoLoc())
-
-   defn as-port (x:Var) :
-      as-port(name(x))
-
-   ;Insert saves to expressions
-   for e in reverse(exps(b)) do :
-
-      defn defd (x:Var) :
-         is-live[name(x)] = false
-         requires-saved[name(x)] = false
-         prefer-loaded[name(x)] = false
-
-      defn used (x:Var) :
-         is-live[name(x)] = true
-         prefer-loaded[name(x)] = true
-
-      defn lived (x:Symbol) :
-         requires-saved[x] = true
-         prefer-loaded[x] = false
-
-      defn currently-live () :
-         stream(key, filter(value, is-live))
-         
-      match(e) :
-         (e:Op) :
-            for x in xs(e) do :
-               if get?(requires-saved, name(x), false) :
-                  add(exp-list, Save(x))
-            add(exp-list, e)
-            do(defd, xs(e))
-            do(used, ys(e))
-            
-         (e:Do) :
-            val xp = map(as-port, xs(e))
-            add(exp-list, WDo(f(e), xp, ys(e)))
-            do(defd, xs(e))
-            do(lived, currently-live())
-            do(used, ys(e))
-            used(f(e) as Var) when f(e) != false
-            
-         (e:Args) :
-            val xp = map(as-port, xs(e))
-            add(exp-list, WArgs(xp))
-            do(defd, xs(e))
-
-         (e) :
-            error("Save semantics: Handle other constructs.")
-
-   val in* = for x in in(b) map :
-      as-port(name(x)) as LivePort
-
-   ;Return results
-   defn in-reverse<?T> (xs:Vector<?T>) :
-      for i in (length(xs) - 1) through 0 by -1 stream :
-         xs[i]
-   
-   WBlock(name(b),
-          to-list(in-reverse(exp-list)),
-          next(b),
-          in*,
-          out(b),
-          dist(b))
           
 ;============================================================
 ;==================== Usage Table ===========================
@@ -532,26 +438,36 @@ defn usage-table (b:WBlock) :
 ;================== Release Table ===========================
 ;============================================================
 
-defn release-table (b:WBlock) -> Array<KeyValue<Pos,Symbol>> :
+defclass ReleaseTable
+defmulti releases-up-to (r:ReleaseTable, p:Pos) -> Stream<Symbol>
+
+defn release-table (b:WBlock) :
    val live-table = HashTable<Symbol,True|False>(symbol-hash)
    val release-list = Vector<KeyValue<Pos,Symbol>>()
 
    ;Utilities
+   ;Clear the live-table. No variables are live.
    defn clear-live () :
       clear(live-table)
+
+   ;Mark a variable as live or not.
+   ;Mark a port as live only if it is loaded.
    defn mark-live (x:Symbol, v:True|False) :
       live-table[x] = v
    defn mark-live (x:Var, v:True|False) :
       mark-live(name(x), v)
    defn mark-live (x:Port, v:True|False) :
       match(x) :
-         (x:LivePort) : mark-live(name(x), v)
+         (x:LivePort) :
+            if loaded?(x) not-typeof False :
+               mark-live(name(x), v)
          (x) : false
    defn mark-live (x:False, v:True|False) :
       false
    defn mark-live (xs:List<Var|Port>, v:True|False) :
       do(mark-live{_, v}, xs)
-      
+
+   ;Record variable x as being released at position p
    defn release-if-not-live (p:Pos, x:Symbol) :
       if not get?(live-table, x, false) :
          add(release-list, p => x)
@@ -583,7 +499,7 @@ defn release-table (b:WBlock) -> Array<KeyValue<Pos,Symbol>> :
             mark-live(x(e), true)
          (e:Load) :
             release-if-not-live(Pos(i + 1, false), x(e))
-            mark-live(x(e), false)
+            mark-live(x(e), false)            
          (e:WArgs) :
             release-if-not-live(Pos(i + 1, false), xs(e))
             mark-live(xs(e), false)
@@ -597,13 +513,112 @@ defn release-table (b:WBlock) -> Array<KeyValue<Pos,Symbol>> :
          (e) :
             error("Release Table: Handle other constructs")
 
-   ;Return reversed array
-   val n = length(release-list)
-   val release-array = Array<KeyValue<Pos,Symbol>>(n)
-   for (r in release-list, i in 0 to false) do :
-      release-array[n - 1 - i] = r
-   release-array   
+   ;Return release table
+   new ReleaseTable :
+      defmethod releases-up-to (this, p:Pos) :
+         generate<Symbol> :
+            defn* loop () :
+               if not empty?(release-list) :
+                  val r = peek(release-list)
+                  if key(r) <= p :
+                     yield(value(r))
+                     pop(release-list)
+                     loop()
+            loop()         
 
+
+;============================================================
+;==================== Save Emission =========================
+;============================================================
+
+defn save-semantics (b:WBlock) :
+   ;State of the future
+   val requires-saved = HashTable<Symbol,True|False>(symbol-hash)
+   val is-live = HashTable<Symbol,True|False>(symbol-hash)
+   val prefer-loaded = HashTable<Symbol,True|False>(symbol-hash)
+
+   ;Output
+   val exp-list = Vector<Exp>()
+
+   ;Initialize state
+   for x in out(b) do :
+      is-live[name(x)] = true
+      prefer-loaded[name(x)] = true
+      requires-saved[name(x)] = false
+
+   ;Summarize current variable statistics as port
+   defn as-port (x:Symbol) :
+      val lv = get?(is-live, x, false)
+      val sv = get?(requires-saved, x, false)
+      val ld = get?(prefer-loaded, x, true)
+      match(lv, sv, ld) :
+         (lv:False, sv, ld) : DeadPort()
+         (lv:True, sv:False, ld:False) : LivePort(x, Any(), false, NoLoc())
+         (lv:True, sv:False, ld:True) : LivePort(x, Any(), Any(), NoLoc())
+         (lv:True, sv:True, ld:False) : LivePort(x, true, false, NoLoc())
+         (lv:True, sv:True, ld:True) : LivePort(x, true, Any(), NoLoc())
+
+   defn as-port (x:Var) :
+      as-port(name(x))
+
+   ;Insert saves to expressions
+   for e in reverse(exps(b)) do :
+
+      defn defd (x:Var) :
+         is-live[name(x)] = false
+         requires-saved[name(x)] = false
+         prefer-loaded[name(x)] = false
+
+      defn used (x:Var) :
+         is-live[name(x)] = true
+         prefer-loaded[name(x)] = true
+
+      defn lived (x:Symbol) :
+         requires-saved[x] = true
+         prefer-loaded[x] = false
+
+      defn currently-live () :
+         stream(key, filter(value, is-live))
+         
+      match(e) :
+         (e:Op) :
+            for x in xs(e) do :
+               if get?(requires-saved, name(x), false) :
+                  add(exp-list, Save(x))
+            add(exp-list, e)
+            do(defd, xs(e))
+            do(used, ys(e))
+            
+         (e:Do) :
+            val xp = map(as-port, xs(e))
+            add(exp-list, WDo(f(e), xp, ys(e)))
+            do(defd, xs(e))
+            do(lived, currently-live())
+            do(used, ys(e))
+            used(f(e) as Var) when f(e) != false
+            
+         (e:Args) :
+            val xp = map(as-port, xs(e))
+            add(exp-list, WArgs(xp))
+            do(defd, xs(e))
+
+         (e) :
+            error("Save semantics: Handle other constructs.")
+
+   val in* = for x in in(b) map :
+      as-port(name(x)) as LivePort
+
+   ;Return results
+   defn in-reverse<?T> (xs:Vector<?T>) :
+      for i in (length(xs) - 1) through 0 by -1 stream :
+         xs[i]
+   
+   WBlock(name(b),
+          to-list(in-reverse(exp-list)),
+          next(b),
+          in*,
+          out(b),
+          dist(b))
 
 ;============================================================
 ;=================== Class Allocation =======================
@@ -729,14 +744,8 @@ defn class-allocation (b:WBlock) :
          
    ;Tracks the release of variables
    val rt = release-table(b)
-   var release-n = 0
    defn* release-up-to (p:Pos) :
-      if release-n < length(rt) :
-         val r = rt[release-n]
-         if key(r) <= p :
-            die(value(r))
-            release-n = release-n + 1
-            release-up-to(p)
+      do(die, releases-up-to(rt, p))
 
    ;Ensure variable's xs are loaded for position p
    defn ensure-loaded (p:Pos, xs:List<Var>) :
@@ -769,16 +778,12 @@ defn class-allocation (b:WBlock) :
                emit(e)
             (e:Save) :
                save(name(x(e)))
-            (e:Load) :
-               error("Unreachable")
             (e:WArgs) :
                emit(e)
                defined(Pos(i + 1, false), xs(e))
             (e:WDo) :
                emit(e)
-               for e in loaded do :
-                  if value(e) typeof True|Any :
-                     error("~ should have been released." % [key(e)])
+               release-up-to(Pos(i,true))
                defined(Pos(i + 1, false), xs(e))
             (e) :
                error("Class Allocation: Handle other constructs.")
@@ -797,31 +802,30 @@ defn class-allocation (b:WBlock) :
 defn propagate-assumptions (b:WBlock) :
    ;Utilities
    defn mark-port (x:Port,
-                   saved:HashTable<Symbol,True|False>,
-                   loaded:HashTable<Symbol,True|False>) :
+                   saved:HashTable<Symbol,True|False|Any>,
+                   loaded:HashTable<Symbol,True|False|Any>) :
       match(x) :
          (x:LivePort) :
-            if loaded?(x) not-typeof Any :
-               loaded[name(x)] = loaded?(x) as True|False
-            if saved?(x) not-typeof Any :
-               saved[name(x)] = saved?(x) as True|False
-         (x:DeadPort) : false
+            loaded[name(x)] = loaded?(x)
+            saved[name(x)] = saved?(x)
+         (x:DeadPort) :
+            false
 
    defn read-port (x:Port,
-                   saved:HashTable<Symbol,True|False>,
-                   loaded:HashTable<Symbol,True|False>) :
+                   saved:HashTable<Symbol,True|False|Any>,
+                   loaded:HashTable<Symbol,True|False|Any>) :
       match(x) :
          (x:LivePort) :
             LivePort(name(x),
-                     get?(saved, name(x), Any())
-                     get?(loaded, name(x), Any())
+                     saved[name(x)]
+                     get?(loaded, name(x), false)
                      loc(x))
          (x:DeadPort) :
             x
 
    ;Save/Load Status
-   val saved = HashTable<Symbol,True|False>(symbol-hash)
-   val loaded = HashTable<Symbol,True|False>(symbol-hash)
+   val saved = HashTable<Symbol,True|False|Any>(symbol-hash)
+   val loaded = HashTable<Symbol,True|False|Any>(symbol-hash)
 
    ;Output Expression List
    val exp-list = Vector<Exp>()
@@ -831,20 +835,26 @@ defn propagate-assumptions (b:WBlock) :
    defn propagate<?T> (ports:List<Port>, es:List<Exp>,
                        return:List<Port> -> ?T) -> T :
       ;Port status               
-      val port-saved = HashTable<Symbol,True|False>(symbol-hash)
-      val port-loaded = HashTable<Symbol,True|False>(symbol-hash)
+      val port-saved = HashTable<Symbol,True|False|Any>(symbol-hash)
+      val port-loaded = HashTable<Symbol,True|False|Any>(symbol-hash)
       defn save (x:Var) :
-         if key?(port-saved, name(x)) : emit(Save(x))            
-         else : port-saved[name(x)] = true
+         match(get?(port-saved, name(x), None())) :
+            (s:Any) : port-saved[name(x)] = true
+            (s:False) : emit(Save(x))
+            (s:None) : emit(Save(x))
          saved[name(x)] = true   
       defn load (x:Var) :
-         if key?(port-loaded, name(x)) : emit(Load(x))            
-         else : port-loaded[name(x)] = true
+         match(get?(port-loaded, name(x), None())) :
+            (l:Any) : port-loaded[name(x)] = true
+            (l:False) : emit(Load(x))
+            (l:None) : emit(Load(x))
          loaded[name(x)] = true   
       defn unload (x:Var) :
-         if not key?(port-loaded, name(x)) :
-            port-loaded[name(x)] = false
-         loaded[name(x)] = false   
+         match(get?(port-loaded, name(x), None())) :
+            (l:Any) : port-loaded[name(x)] = false
+            (l:True) : false
+            (l:None) : false
+         loaded[name(x)] = false         
       defn defined (x:Var) :
          saved[name(x)] = false
          loaded[name(x)] = true
@@ -898,13 +908,7 @@ defn propagate-assumptions (b:WBlock) :
              next(b),
              in* as List<LivePort>,
              out* as List<LivePort>,
-             dist(b))
-      
-   
-
-
-   
-
+             dist(b))   
 
 
 ;============================================================
@@ -1870,23 +1874,34 @@ defn propagate-assumptions (b:WBlock) :
 defn test (p:Unit) :
    println("====== Test ======")
    println(p)
+
+   println("====== Class Allocation ======")
+   val p2 = liveness-analysis(p)
+   val bs = for b in blocks(p2) map :
+      propagate-assumptions $
+      class-allocation $
+      save-semantics $
+      b as WBlock
+   val p3 = Unit(defs(p2), bs)
+   println(p3)
+
 ;   println("====== Remove critical edges ======")
 ;   val p1 = remove-critical-edges(p)
 ;   println(p1)
-   println("====== Liveness Analysis ======")
-   val p2 = liveness-analysis(p)
-   println(p2)
-   for b in blocks(p2) do :
-      println("==== Block ~ ====" << [name(b)])
-      println("Save Semantics:")
-      var b* = save-semantics(b as WBlock)
-      println(b*)
-      b* = class-allocation(b*)
-      println("Class Allocation:")
-      println(b*)
-      b* = propagate-assumptions(b*)
-      println("Assumption Propagation:")
-      println(b*)
+;   println("====== Liveness Analysis ======")
+;   val p2 = liveness-analysis(p)
+;   println(p2)
+;   for b in blocks(p2) do :
+;      println("==== Block ~ ====" << [name(b)])
+;      println("Save Semantics:")
+;      var b* = save-semantics(b as WBlock)
+;      println(b*)
+;      b* = class-allocation(b*)
+;      println("Class Allocation:")
+;      println(b*)
+;      b* = propagate-assumptions(b*)
+;      println("Assumption Propagation:")
+;      println(b*)
       
 
       
