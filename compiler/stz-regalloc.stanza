@@ -2,7 +2,6 @@
 #include<"compiler/stz-algorithms.stanza">
 #include<"compiler/stz-lexer.stanza">
 #include<"compiler/stz-parser.stanza">
-#include("compiler/stz-asm-ir.stanza")
 
 defpackage regalloc :
    import core
@@ -10,7 +9,6 @@ defpackage regalloc :
    import stz/lexer
    import stz/parser
    import stz/algorithms
-   import stz/asm-ir with: (prefix => asm#)
 
 ;=============================================
 ;============== Input IR =====================
@@ -27,6 +25,10 @@ defstruct RefType <: Type
 defstruct FloatType <: Type
 defstruct DoubleType <: Type
 
+definterface OpClass
+defstruct ComOp <: OpClass
+defstruct BinDivOp <: OpClass
+
 definterface Loc
 defstruct NoLoc <: Loc
 defstruct Reg <: Loc :
@@ -41,7 +43,7 @@ defstruct Set <: Exp :
    x: Var
    y: Var
 defstruct Op <: Exp :
-   op: asm#AsmOp
+   op: OpClass
    xs: List<Var>
    ys: List<Var>
 defstruct Do <: Exp :
@@ -90,8 +92,10 @@ defsyntax regir :
          Args(xs)
       exp = (?x:#var = ?y:#var) :
          Set(x, y)
-      exp = ((?xs:#var ...) = op(?ys:#var ...)) :
-         Op(asm#ADD-OP, xs, ys)
+      exp = ((?xs:#var ...) = com(?ys:#var ...)) :
+         Op(ComOp(), xs, ys)
+      exp = ((?xs:#var ...) = bindiv(?ys:#var ...)) :
+         Op(BinDivOp(), xs, ys)
       exp = ((?xs:#var ...) = f(?ys:#var ...)) :
          Do(false, xs, ys)
       exp = ((?xs:#var ...) = [?f:#var](?ys:#var ...)) :
@@ -153,6 +157,11 @@ defmethod print (o:OutputStream, t:Type) :
       (t:FloatType) : "float"
       (t:DoubleType) : "double"
 
+defmethod print (o:OutputStream, c:OpClass) :
+   print{o, _} $ match(c) :
+      (c:ComOp) : "com"
+      (c:BinDivOp) : "bindiv"
+
 defmethod print (o:OutputStream, l:Loc) :
    print{o, _} $ match(l) :
       (l:NoLoc) : "NoLoc"
@@ -198,6 +207,11 @@ defstruct Load <: Exp&Working :
 defstruct Unload <: Exp&Working :
    x: Var
 
+defstruct Xchg <: Exp&Working :
+   x: Var
+   y: Var
+   swap: Reg|False
+
 defmethod print (o:OutputStream, e:Exp&Working) :
    print{o, _} $ match(e) :
       (e:WArgs) : "(~@) = Args" << [cms(xs(e))]
@@ -208,6 +222,7 @@ defmethod print (o:OutputStream, e:Exp&Working) :
       (e:Save) : "save ~" << [x(e)]
       (e:Load) : "load ~" << [x(e)]
       (e:Unload) : "unload ~" << [x(e)]
+      (e:Xchg) : "xchg ~ ~ through ~" << [x(e), y(e), swap(e)]
 
 defstruct Any
 defmethod print (o:OutputStream, x:Any) :
@@ -686,9 +701,9 @@ defn class-allocation (b:WBlock) :
    defn die (x:Symbol) :
       match(get?(loaded, x, None())) :
          (l:True) : num-free-reg = num-free-reg + 1
-         (l:False) : false
          (l:Any) : error("~ should not be loaded." % [x])
-         (l:None) : error("~ is not live." % [x])
+         (l:False) : false
+         (l:None) : false
       loaded[x] = None()
 
    defn def (x:Var) :
@@ -918,20 +933,61 @@ defn propagate-assumptions (b:WBlock) :
 ;================ Register Assignment =======================
 ;============================================================
 
+defn to-array<?T> (n:Int, xs:Streamable<?T>) -> Array<T> :
+   val ys = Array<T>(n)
+   val strx = to-stream(xs)
+   for i in 0 to n do :
+      ys[i] = next(strx)
+   ys   
+
+defn to-array<?T> (n:Int, f: Int -> ?T) -> Array<T> :
+   val xs = Array<T>(n)
+   for i in 0 to n do :
+      xs[i] = f(i)
+   xs   
+
+defn find!<?T> (f: T -> True|False, xs:Streamable<?T>) -> T :
+   find(f, xs) as T
+
 defn register-assignment (b:WBlock, ports-in: List<LivePort>) :
    val locs = HashTable<Symbol,Loc>(symbol-hash)
    val reg-slots = Array<False|Symbol>(8, false)
+
+   ;What is in register i after releases
+   defn reg-slot (i:Int, rs:List<Symbol>) :
+      match(reg-slots[i]) :
+         (r:False) : r
+         (r:Symbol) : r when not contains?(rs, r)
+
+   ;What register is free after releases
+   defn free-reg (rs:List<Symbol>) :
+      Reg{_ as Int} $
+         for i in 0 to length(reg-slots) find :
+            contains?(rs, reg-slots[i]) or
+            (reg-slots[i] typeof False)
+
+   defn free-reg-without (rs:Tuple<Int>) :
+      val i = for i in 0 to length(reg-slots) find :
+         (not contains?(rs, i)) and
+         (reg-slots[i] == false)
+      match(i) :
+         (i:Int) : Reg(i)
+         (i:False) : false
+
+   defn free-reg-prefer (rs:List<Reg>) :
+      val r = for r in rs find :
+         reg-slots[n(r)] == false
+      match(r) :
+         (r:Reg) : r
+         (r:False) : free-reg()
+
+   defn free-reg () :
+      free-reg(List())
 
    ;Output expression list
    val exp-list = Vector<Exp>()
    defn emit (e:Exp) :
       add(exp-list, e)
-
-   ;Retrieve a free register
-   defn free-reg () :
-      Reg{_ as Int} $
-      for i in 0 to length(reg-slots) find :
-         reg-slots[i] typeof False
 
    ;Assign variable to a location
    defn assign (x:Symbol, l:Loc) :
@@ -942,7 +998,7 @@ defn register-assignment (b:WBlock, ports-in: List<LivePort>) :
             locs[x] = l
             reg-slots[n(l)] = x
          (l:Stack) :
-            locs[x] = l
+            locs[x] = l      
 
    ;Free the variable from the register
    defn free (x:Symbol) :
@@ -982,6 +1038,76 @@ defn register-assignment (b:WBlock, ports-in: List<LivePort>) :
                (ld:False) : assign(name(x), Stack(0))
          (x:DeadPort) : false
 
+   ;Ensure that given registers are free after release
+   defn ensure-free-after-release (regs:List<Int>, rels:List<Symbol>) :
+      defn occupied-after-release (rels:List<Symbol>) :      
+         val n = length(reg-slots)
+         to-array(n, {reg-slot(_, rels) != false})
+         
+      defn pick-free (occupied:Array<False|True>, pref:List<Int>) :
+         val prefs* = for p in pref map :
+            if not occupied[p] :
+               occupied[p] = true
+               p
+         for p in prefs* map :
+            match(p) :
+               (p:False) :
+                  val i = for i in 0 to length(occupied) find! :
+                     not occupied[i]
+                  occupied[i] = true      
+                  i
+               (p:Int) :
+                  p
+
+      defn swap-reg-contents (old-reg:Int, new-reg:Int) :
+         if old-reg != new-reg :
+            if reg-slots[new-reg] == false :
+               val v = reg-slots[old-reg] as Symbol
+               emit(Set(new-var, old-var)) where :
+                  val new-var = Var(v, Reg(new-reg))
+                  val old-var = Var(v, Reg(old-reg))
+               free(v)
+               assign(v, Reg(new-reg))
+            else :
+               val v1 = reg-slots[old-reg] as Symbol
+               val v2 = reg-slots[new-reg] as Symbol
+               emit(Xchg(var1, var2, swap)) where :
+                  val var1 = Var(v1, Reg(old-reg))
+                  val var2 = Var(v2, Reg(new-reg))
+                  val swap = free-reg-without([old-reg, new-reg])
+               free(v1)
+               free(v2)
+               assign(v1, Reg(new-reg))
+               assign(v2, Reg(old-reg))
+   
+      val free? = for r in regs all? :
+         reg-slot(r, rels) == false
+      if not free? :
+         val regs* = pick-free(occupied-after-release(rels), regs)
+         do(swap-reg-contents, regs, regs*)
+
+   ;Ensure that the given value is assigned to a register
+   defn ensure-assignment (x:Symbol, r:Reg) :
+      val oldr = locs[x] as Reg
+      if oldr != r :
+         val v = reg-slots[n(r)]
+         match(v) :
+            (v:False) :
+               emit(Set(old-var, new-var)) where :
+                  val old-var = Var(x, oldr)
+                  val new-var = Var(x, r)
+               free(x)
+               assign(x, r)
+            (v:Symbol) :
+               emit(Xchg(var1, var2, swap)) where :
+                  val var1 = Var(x, oldr)
+                  val var2 = Var(v, r)
+                  val swap = free-reg-without([n(r), n(oldr)])
+               free(x)
+               free(v)
+               assign(x, r)
+               assign(v, oldr)
+
    ;Initial locations
    defn port-loc (x:Symbol) :
       {_ as Loc} $
@@ -1012,11 +1138,22 @@ defn register-assignment (b:WBlock, ports-in: List<LivePort>) :
             assign(name(x(e)), free-reg())
             emit(Load(assoc-loc(x(e))))
          (e:Op) :
-            val ys* = assoc-loc(ys(e))
-            free(releases-up-to(rt, Pos(i,true)))
-            do(assign{name(_), free-reg()}, xs(e))
-            val xs* = assoc-loc(xs(e))
-            emit(Op(op(e), xs*, ys*))
+            match(op(e)) :
+               (op:BinDivOp) :
+                  val rs = to-list(releases-up-to(rt, Pos(i, true)))
+                  ensure-free-after-release(list(0), rs)
+                  val ys* = assoc-loc(ys(e))
+                  free(rs)
+                  assign(name(xs(e)[0]), Reg(0))
+                  val xs* = assoc-loc(xs(e))
+                  emit(Op(op, xs*, ys*))
+               (op:ComOp) :
+                  val ys* = assoc-loc(ys(e))
+                  free(releases-up-to(rt, Pos(i,true)))
+                  val pref-x = map({loc(_) as Reg}, ys*)
+                  assign(name(head(xs(e))), free-reg-prefer(pref-x))
+                  val xs* = assoc-loc(xs(e))
+                  emit(Op(op, xs*, ys*))
          (e:WArgs) :
             do(assign-port-reg, xs(e))
             val xs* = assoc-loc(xs(e))
@@ -1039,6 +1176,8 @@ defn register-assignment (b:WBlock, ports-in: List<LivePort>) :
           in* as List<LivePort>
           out* as List<LivePort>
           dist(b))
+
+
 
 defn register-assignment (p:Unit) :
    ;Table of blocks
@@ -1066,267 +1205,6 @@ defn register-assignment (p:Unit) :
    Unit(defs(p), bs)
    
 
-;defn register-assignment (b:Block, bl:BlockLive, locs-in:List<Loc>) :
-;   val locs = HashTable<Symbol,Loc>(symbol-hash)
-;   val reg-slots = Array<False|Symbol>(8, false)
-;
-;   ;Release a variable
-;   defn free (x:Symbol) :
-;      match(locs[x]) :
-;         (x:Reg) :
-;            locs[x] = Stack(0)
-;            reg-slots[n(x)] = false
-;         (x) : error("~ is not in a register." % [x])
-;
-;   ;Assign a variable to a register
-;   defn assign (x:Symbol, r:Reg) :
-;      if reg-slots[n(r)] != false :
-;         error("Register ~ is already holding ~." % [n(r), reg-slots[n(r)]])         
-;      locs[x] = r
-;      reg-slots[n(r)] = x         
-;
-;   ;Tracks the release of variables
-;   val rt = release-table(b, bl)
-;   var release-n = 0
-;   defn* release-up-to (p:Pos) :
-;      if release-n < length(rt) :
-;         val r = rt[release-n]
-;         if key(r) <= p :
-;            free(value(r))
-;            release-n = release-n + 1
-;            release-up-to(p)
-;
-;   ;Tracks whether a variable has been saved
-;   val saved = HashTable<Symbol,True|False>(symbol-hash)
-;   defn saved? (x:Symbol) :
-;      get?(saved, x, false)
-;   defn save (x:Symbol) :
-;      saved[x] = true
-;   defn unsave (x:Symbol) :
-;      saved[x] = false
-;
-;   ;Next free register
-;   defn next-free () :
-;      val i = {_ as Int} $
-;         for i in 0 to length(reg-slots) find :
-;            reg-slots[i] == false
-;      Reg(i)
-;
-;   ;Note incoming assignments
-;   for (x in in(bl), l in locs-in) do :
-;      match(l) :
-;         (l:Reg) : assign(x, l)
-;         (l:Stack) : locs[x] = l
-;         (l) : error("Incorrect live-in location.")
-;
-;   ;Assign registers
-;   for (e in exps(b), i in 0 to false) do :
-;      match(e) :
-;         (e:Op) :
-;            release-up-to(Pos(i,false))
-;            
-;         (e) :
-;            error("Register Assignment: Handle other constructs.")
-         
-
-
-   
-   
-
-;============================================================
-;============== Register Class Allocation ===================
-;============================================================
-
-;;Utilities
-;;First n items from a list
-;defn first-n<?T> (n, xs:List<?T>) :
-;   if length(xs) < n : xs
-;   else : to-list(take-n(n, xs))
-;
-;;Sort a list by a given key
-;defn sort-by-key<?V> (xs:List<?V>, key: V -> Int) -> List<V> :
-;   val v = Vector<V>()
-;   for x in xs do : add(v, x)
-;   sort-by-key!(v, key)
-;   to-list(v)
-;
-;;Make a Var just from its name
-;defn Var (x:Symbol) -> Var :
-;   Var(x, NoLoc(), NoLoc(), NoLoc())
-;
-;defn class-allocation (b:Block, bl:BlockLive) :
-;   ;Compute usage table
-;   val usage-table = usage-table(b, bl)
-;
-;   ;Number of registers
-;   val max-reg = 15
-;   var num-reg = 0
-;
-;   ;Loaded table
-;   val load-table = HashTable<Symbol,True|False>(symbol-hash)
-;
-;   ;New expression list
-;   val exp-list = Vector<Exp>()
-;
-;   ;Distance table
-;   defn dist-table = HashTable<Symbol,Int>(symbol-hash)
-;   val loaded-vec = Vector<Symbol>()
-;   defn fill-dist-table (p:Pos) :
-;      clear(dist-table)
-;      for e in usage-table[p] do :
-;         dist-table[key(e)] = value(e)
-;   defn fill-loaded-vec () :
-;      clear(loaded-vec)
-;      for e in filter(value, load-table) do :
-;         add(loaded-vec, key(e))
-;         
-;
-;   defn loaded? (x:Symbol) :
-;      get?(load-table, x, false)
-;      
-;   defn mark-loaded (x:Symbol, v:True|False) :
-;      match(loaded?(x), v) :
-;         (l:False, v:True) :
-;            load-table[x] = v
-;            num-reg = num-reg + 1
-;         (l:True, v:False) :
-;            load-table[x] = v
-;            num-reg = num-reg - 1
-;         (l, v) :
-;            false
-;
-;   defn mark-loaded (xs:List<Var>, v:True|False) :
-;      for x in xs do : mark-loaded(name(x), v)
-;
-;   ;Release all non-live values.
-;   defn release (p:Pos) :
-;      val xs = stream(key, filter(value, load-table))
-;      val ys = map(key, usage-table[p])
-;      for x in xs do :
-;         mark-loaded(x, false) when not contains?(ys, x)            
-;
-;   ;Spill values according to liveness at position p, to reserve n registers.
-;   defn spill (n:Int, p:Pos) :
-;      release(p)
-;      if num-reg + n > max-reg :
-;         val es = reverse $
-;            sort-by-key(usage-table[p], value)
-;         for e in es do :
-;            if num-reg + n > max-reg :
-;               if loaded?(key(e)) :
-;                  add(exp-list, Save(Var(key(e))))
-;                  mark-loaded(key(e), false)
-;
-;   ;Ensure that x is loaded at position p
-;   defn ensure-loaded (x:Var, p:Pos) :
-;      if not loaded?(name(x)) :
-;         spill(1, p) ;Spill enough space for it
-;         mark-loaded(name(x), true)
-;      add(exp-list, Load(Var(name(x))))
-;         
-;   defn ensure-loaded (xs:List<Var>, p:Pos) :
-;      for x in xs do : ensure-loaded(x, p)
-;
-;   ;Load as many live-in registers as possible
-;   defn load-live-in () :
-;      for x in in(bl) do : mark-loaded(x, true)
-;      spill(0, Pos(0,false))
-;
-;   ;Allocate registers and emit save and loads         
-;   defn allocate () :
-;      for (e in exps(b), i in 0 to false) do :
-;         match(e) :
-;            (e:Op) :
-;               ensure-loaded(ys(e), Pos(i,false))
-;               spill(length(xs(e)), Pos(i, true))
-;               add(exp-list, e)
-;               mark-loaded(xs(e), true)
-;            (e) :
-;               error("Allocation: Handle other constructs.")
-;
-;   ;Driver
-;   load-live-in()
-;   allocate()
-;   Block(name(b), to-list(exp-list), next(b))
-
-   
-
-;;========== Working IR ==================
-;definterface Loc
-;defstruct Stack <: Loc
-;defstruct Reg <: Loc
-;defstruct RegN <: Loc :
-;   n: Int
-;
-;defstruct Status :
-;   saved?: True|False
-;   loaded?: True|False
-;
-;defstruct Dead <: Ref
-;defstruct LVar <: Ref :
-;   name: Symbol with : (as-method => true)
-;   loc: Loc
-;
-;defstruct Save <: Exp :
-;   x: Ref
-;defstruct Load <: Exp :
-;   x: Ref
-;defstruct Release <: Exp :
-;   x: Ref
-;defstruct ParSet <: Exp :
-;   xs: List<Ref>
-;   ys: List<Ref>
-;
-;defstruct LBlock <: Block :
-;   name: Symbol with: (as-method => true)
-;   exps: List<Exp> with: (as-method => true)
-;   next: List<Symbol> with: (as-method => true)
-;   live-in: List<Ref>
-;   status-in: List<Status>
-;   live-out: List<Ref>
-;   status-out: List<Status>
-;   dist-out: List<Int>
-;
-;============================================================
-;==================== Printing ==============================
-;============================================================
-
-;defmethod print (o:OutputStream, e:Exp) :
-;      (e:Save) : "save ~" << [x(e)]
-;      (e:Load) : "load ~" << [x(e)]
-;      (e:Release) : "release ~" << [x(e)]
-;      (e:ParSet) : "(~@) = (~@)" << [cms(xs(e)), cms(ys(e))]
-      
-
-;defmethod print (o:OutputStream, s:Status) :
-;   print{o, _} $ match(saved?(s), loaded?(s)) :
-;      (s:True, l:True) : "SL"
-;      (s:True, l:False) : "S"
-;      (s:False, l:True) : "L"
-;      (s:False, l:False) : "?"
-
-;defmethod print (o:OutputStream, b:LBlock) :
-;   defn ps (x:Ref, s:Status) : "~:~" << [x, s]
-;   defn ps (xs:List<Ref>, ss:List<Status>) : stream(ps, xs, ss)
-;   print(o, "lblock ~ :" << [name(b)])
-;   for e in exps(b) do :
-;      print(o, "\n   ~" << [e])
-;   print(o, "\n   goto (~@)" << [cms(next(b))])
-;   print(o, "\n   live-in: (~@)" << [cms(ps(live-in(b), status-in(b)))])
-;   print(o, "\n   live-out: (~@)" << [cms(ps(live-out(b), status-out(b)))])
-;   print(o, "\n   dist-out: (~@)" << [cms(dist-out(b))])
-
-;defmethod print (o:OutputStream, r:Ref) :
-;   print{o, _} $ match(r) :
-;      (r:Var) : name(r)
-;      (r:Dead) : "dead"
-;      (r:LVar) : "~:~" << [name(r), loc(r)]
-
-;defmethod print (o:OutputStream, l:Loc) :
-;   print{o, _} $ match(l) :
-;      (l:Stack) : "stk"
-;      (l:Reg) : "reg"
-;      (l:RegN) : "reg~" << [n(l)]
 
 
 ;;======== Critical Edge Removal ==========
@@ -1369,423 +1247,6 @@ defn register-assignment (p:Unit) :
 ;
 ;
 
-;;====== Finite Register Allocation ======
-;defn finite-allocation (b:LBlock) :
-;   var num-reg = 0
-;   val N = 8
-;   val loaded = HashTable<Symbol,True|False>(symbol-hash)
-;   val exp-list = Vector<Exp>()
-;   val usage-table = compute-usage-table(b)
-;
-;   defn emit (e:Exp) :
-;      add(exp-list, e)
-;
-;   defn release (x:Symbol) :
-;      emit(Release(Var(x)))
-;
-;   defn release (xs:Streamable<Symbol>) :
-;      do(release, xs)
-;   
-;   defn save (x:Symbol) :
-;      emit(Save(Var(x)))
-;
-;   defn save (xs:Streamable<Symbol>) :
-;      do(save, xs)
-;
-;   defn unload-all () :
-;      clear(loaded)
-;      num-reg = 0
-;
-;   defn loaded? (x:Symbol) :
-;      get?(loaded, x, false)
-;      
-;   defn loaded? (x:Ref) :
-;      loaded?(name(x))
-;
-;   defn loaded-vars () :
-;      filter(loaded?, keys(loaded))
-;
-;   defn set-loaded (x:Symbol, v:True|False) :
-;      match(get?(loaded, x, false), v) :
-;         (l:False, v:True) :
-;            loaded[x] = v
-;            num-reg = num-reg + 1
-;         (l:True, v:False) :
-;            loaded[x] = v
-;            num-reg = num-reg - 1
-;         (l, v) :
-;            false            
-;
-;   defn set-loaded (x:Ref, v:True|False) :
-;      if x not-typeof Dead :
-;         set-loaded(name(x), v)
-;
-;   defn set-loaded (xs:List<Ref|Symbol>, v:True|False) :
-;      do(set-loaded{_, v}, xs)
-;
-;   ;Find the variables used farthest from position p
-;   defn farthest-var (p:Pos) -> [List<Symbol>, Int|False] :
-;      val es = to-list $
-;         for v in loaded-vars() stream :
-;            v => lookup(usage-table[p], v)
-;      val dead = to-list $
-;         for e in es filter :
-;            value(e) == false
-;      if empty?(dead) :
-;         val e = maximum-by-key(es, value)
-;         [list(key(e)), value(e)]
-;      else :
-;         [map(key,dead), false]
-;
-;   ;Ensure n registers are free, spilling if necessary.
-;   defn alloc-reg (p:Pos, n:Int) :
-;      while num-reg + n > N :
-;         val [vs, d] = farthest-var(p)
-;         save(vs) when d != false
-;         release(vs)
-;         set-loaded(vs, false)
-;
-;   ;Load as many of xs as possible. Keep nearest used values in registers.
-;   defn load-nearest (p:Pos, xs:List<Ref>) :
-;      set-loaded(xs, true)
-;      alloc-reg(p, 0)
-;
-;   ;Ensure that x is loaded at position p
-;   defn load (p:Pos, x:Ref) :
-;      alloc-reg(p, 1) when not loaded?(x)         
-;      emit(Load(x))
-;      set-loaded(x, true)
-;
-;   defn load (p:Pos, xs:List<Ref>) :
-;      do(load{p, _}, xs)
-;
-;   ;Get all live variables at position p
-;   defn live-vars (p:Pos) :
-;      stream(key, usage-table[p])
-;
-;   defn keep-live (p:Pos, xs:List<Ref>) :
-;      val live = to-list(live-vars(p))
-;      for x in xs map :
-;         if contains?(live, name(x)) : x
-;         else : Dead()
-;
-;   load-nearest(Pos(0, false), live-in(b))
-;   for (e in exps(b), i in 0 to false) do :
-;      match(e) :
-;         (e:Args) :
-;            val xs* = keep-live(Pos(i + 1, false), xs(e))
-;            emit(Args(xs*))
-;            load-nearest(Pos(i + 1, false), xs*)
-;         (e:Set) :
-;            load(Pos(i,false), y(e))
-;            alloc-reg(Pos(i,true), 1)
-;            emit(e)
-;            set-loaded(x(e), true)
-;         (e:Op) :
-;            load(Pos(i,false), ys(e))
-;            alloc-reg(Pos(i,true), length(xs(e)))
-;            emit(e)
-;            set-loaded(xs(e), true)
-;         (e:Do) :
-;            save(live-vars(Pos(i,true)))
-;            val xs* = keep-live(Pos(i + 1, false), xs(e))
-;            emit(Do(xs*, ys(e)))
-;            unload-all()
-;            load-nearest(Pos(i + 1, false), xs*)
-;
-;   LBlock(name(b),
-;          to-list(exp-list),
-;          next(b),
-;          live-in(b),
-;          status-in(b),
-;          live-out(b),
-;          status-out(b),
-;          dist-out(b))
-;
-;
-;
-;;====== Save/Load Elision ======
-;defstruct Any
-;defn save-load-elision (b:LBlock) :
-;   val saved = HashTable<Symbol,True|False|Any>(symbol-hash)
-;   val loaded = HashTable<Symbol,True|False|Any>(symbol-hash)
-;   var assumptions = Vector<Exp>()
-;
-;   val save-buffer = HashTable<Symbol,True|False>(symbol-hash)
-;   val load-buffer = HashTable<Symbol,True|False>(symbol-hash)
-;   defn status (assumptions:Vector<Exp>, xs:List<Ref>) :
-;      clear(save-buffer)
-;      clear(load-buffer)
-;      for e in assumptions do :
-;         match(e) :
-;            (e:Save) : save-buffer[name(x(e))] = true
-;            (e:Load) : load-buffer[name(x(e))] = true
-;      for x in xs map :
-;         match(x) :
-;            (x:Dead) :
-;               Status(false, false)
-;            (x) :
-;               Status(get?(save-buffer, name(x), false)
-;                      get?(load-buffer, name(x), false))
-;
-;   defn mark-loaded (x:Ref, v:True|False|Any) :
-;      if x not-typeof Dead :
-;         loaded[name(x)] = v
-;
-;   defn mark-loaded (xs:List<Ref>, v:True|False|Any) :
-;      do(mark-loaded{_, v}, xs)
-;      
-;   defn mark-saved (x:Ref, v:True|False|Any) :
-;      if x not-typeof Dead :
-;         saved[name(x)] = v
-;
-;   defn mark-saved (xs:List<Ref>, v:True|False|Any) :
-;      do(mark-saved{_, v}, xs)
-;
-;   defn assume (e:Exp) :
-;      add(assumptions, e)
-;
-;   defn saved-ref? (x:Ref) :
-;      get?(saved, name(x), false)
-;      
-;   defn loaded-ref? (x:Ref) :
-;      get?(loaded, name(x), false)
-;
-;   defn elide (es:List<Exp>) -> List<Exp> :
-;      defn elide-and-gather (xs:List<Ref>, es:List<Exp>) :
-;         let-var assumptions = Vector<Exp>() :
-;            clear(loaded)
-;            mark-saved(xs, Any())
-;            mark-loaded(xs, Any())
-;            var body = elide(es)
-;            val ss = status(assumptions, xs)
-;            val xs* = for (x in xs, s in ss) map :
-;               match(x, saved?(s), loaded?(s)) :
-;                  (x:Dead, s, l) : x
-;                  (x, s:True, l:False) :
-;                     LVar(name(x), Stack())
-;                  (x, s:False, l:True) :
-;                     LVar(name(x), Reg())
-;                  (x, s:False, l:False) :
-;                     mark-loaded(x, true)
-;                     LVar(name(x), Reg())
-;                  (x, s:True, l:True) :
-;                     body = List(Save(x), body)
-;                     LVar(name(x), Reg())
-;            [xs*, body]
-;
-;      if empty?(es) :
-;         List()
-;      else :   
-;         val e = head(es)
-;         val rest = tail(es)
-;         match(e) :
-;            (e:Args) :
-;               val [xs*, rest*] = elide-and-gather(xs(e), rest)
-;               List(Args(xs*), rest*)
-;            (e:Set) :
-;               mark-loaded(x(e), true)
-;               mark-saved(x(e), false)
-;               List(e, elide(rest))
-;            (e:Op) :           
-;               mark-loaded(xs(e), true)
-;               mark-saved(xs(e), false)
-;               List(e, elide(rest))
-;            (e:Do) :
-;               val [xs*, rest*] = elide-and-gather(xs(e), rest)
-;               List(Do(xs*, ys(e)), rest*)
-;            (e:Save) :
-;               match(saved-ref?(x(e))) :
-;                  (s:True) : elide(rest)
-;                  (s:False) : (mark-saved(x(e), true), List(e, elide(rest)))
-;                  (s:Any) : (assume(e), mark-saved(x(e), true), elide(rest))
-;            (e:Load) :
-;               match(loaded-ref?(x(e))) :
-;                  (l:True) : elide(rest)
-;                  (l:False) : (mark-loaded(x(e), true), List(e, elide(rest)))
-;                  (l:Any) : (assume(e), mark-loaded(x(e), true), elide(rest))
-;            (e:Release) :
-;               match(loaded-ref?(x(e))) :
-;                  (l:Any) : elide(rest)
-;                  (l) : List(e, elide(rest))
-;
-;   mark-saved(live-in(b), Any())
-;   mark-loaded(live-in(b), Any())
-;   val exps* = elide(exps(b))
-;   val status-in* = status(assumptions, live-in(b))
-;   val status-out* = for x in live-out(b) map :
-;      val s = get?(saved, name(x), false) typeof True
-;      val l = get?(loaded, name(x), false) typeof True
-;      Status(s, l)
-;      
-;   LBlock(name(b),
-;          exps*,
-;          next(b),
-;          live-in(b),
-;          status-in*,
-;          live-out(b),
-;          status-out*,
-;          dist-out(b))
-;
-;defn save-load-elision (p:Program) :
-;   Program(
-;      map(save-load-elision, blocks(p) as List<LBlock>))
-;
-;
-;;======== Register Assignment ========
-;defstruct Free
-;defn assign-registers (b:LBlock, locs-in:List<Loc>) :
-;   val N = 8
-;   val locations = HashTable<Symbol,Loc>(symbol-hash)
-;   val reg-free = Array<True|False>(N, true)
-;   val reg-values = Array<False|Symbol>(N, false)
-;   val exp-list = Vector<Exp>()
-;   val #free = Free()
-;
-;   ;Basic Operations
-;   defn free-reg () :
-;      RegN(index-of(reg-free, true) as Int)
-;      
-;   defn free-reg (loc:Loc) :
-;      match(loc) :
-;         (loc:RegN) :
-;            if reg-free[n(loc)] : loc
-;            else : free-reg()
-;         (loc:Stack) : free-reg()
-;
-;   defn assign-loc (ref:Ref, loc:Loc) :
-;      if loc typeof RegN :
-;         val loc = loc as RegN
-;         reg-free[n(loc)] = false
-;         val x = reg-values[n(loc)]
-;         if x typeof Symbol :
-;            locations[x as Symbol] = Stack()
-;         reg-values[n(loc)] = name(ref)
-;      locations[name(ref)] = loc   
-;      match(ref) :
-;         (ref:Var) : LVar(name(ref), loc)
-;         (ref:LVar) : LVar(name(ref), loc)
-;
-;   defn assign-loc (refs:List<Ref>, f:Free) :
-;      for r in refs map :
-;         assign-loc(r, free-reg())
-;
-;   defn update-loc (ref:Ref) :
-;      match(ref) :
-;         (ref:Var) : LVar(name(ref), locations[name(ref)])
-;         (ref:LVar) : LVar(name(ref), locations[name(ref)])
-;         (ref:Dead) : ref
-;
-;   defn update-loc (refs:List<Ref>) :
-;      map(update-loc, refs)
-;
-;   defn emit (e:Exp) :
-;      add(exp-list, e)
-;
-;   ;Initial State
-;   val live-in* = for (x in live-in(b), s in status-in(b), l in locs-in) map :
-;      match(saved?(s), loaded?(s)) :
-;         (sv, ld:True) : assign-loc(x, free-reg(l))
-;         (sv:True, ld:False) : assign-loc(x, Stack())
-;         (sv:False, ld:False) : assign-loc(x, l)
-;
-;   ;Assigning locations to expressions
-;   for e in exps(b) do :
-;      defn assign-arg-locs (xs:List<Ref>) :
-;         val arg-regs = map(RegN, to-array([2 3 4 5 6 7]))
-;         defn preferred (i:Int) :
-;            if i < length(arg-regs) : arg-regs[i]
-;            else : free-reg()
-;         for (x in xs, i in 0 to false) map :
-;            match(x) :
-;               (x:Dead) : x
-;               (x:LVar) :
-;                  match(loc(x)) :
-;                     (loc:Stack) : assign-loc(x, loc)
-;                     (loc:Reg) : assign-loc(x, preferred(i))
-;
-;      match(e) :
-;         (e:Args) :
-;            val xs* = assign-arg-locs(xs(e))
-;            emit(Args(xs*))
-;         (e:Set) :
-;            val y* = update-loc(y(e))
-;            val x* = assign-loc(x(e), free-reg(loc(y* as LVar)))
-;            emit(Set(x*, y*))
-;         (e:Op) :         
-;            val ys* = update-loc(ys(e))
-;            val xs* = assign-loc(xs(e), #free)
-;            emit(Op(xs*, ys*))
-;         (e:Save) :
-;            val x* = update-loc(x(e))
-;            emit(Save(x*))
-;         (e:Load) :
-;            val x* = assign-loc(x(e), free-reg())
-;            emit(Load(x*))
-;         (e:Release) :
-;            val loc = locations[name(x(e))] as RegN
-;            reg-free[n(loc)] = true
-;         (e:Do) :
-;            val ys* = update-loc(ys(e))
-;            for v in keys(locations) do :
-;               locations[v] = Stack()
-;            do({reg-free[_] = true}, 0 to N)
-;            val xs* = assign-arg-locs(xs(e))
-;            emit(Do(xs*, ys*))
-;
-;   ;Assign locations to live-out
-;   val live-out* = update-loc(live-out(b))
-;
-;   ;Return filled block
-;   LBlock(name(b),
-;          to-list(exp-list),
-;          next(b),
-;          live-in*,
-;          status-in(b),
-;          live-out*,
-;          status-out(b),
-;          dist-out(b))
-;          
-;defn assign (p:Program) :
-;   ;Initialize Blocks
-;   val block-table = HashTable<Symbol,LBlock>(symbol-hash)
-;   val block-assigned? = HashTable<Symbol,True|False>(symbol-hash)
-;   for b in blocks(p) do :
-;      block-table[name(b)] = b as LBlock
-;      block-assigned?[name(b)] = false
-;
-;   ;Rearrange locations: Rearrange locations of a to match against b
-;   defn rearrange (a:List<Ref>, b:List<Ref>, ls:List<Loc>) :
-;      val table = HashTable<Symbol,Loc>(symbol-hash)
-;      for (r in a, l in ls) do : table[name(r)] = l
-;      for r in b map : table[name(r)]
-;
-;   defn get-loc (x:Ref) :
-;      loc(x as LVar)
-;      
-;   defn get-loc (xs:List<Ref>) :
-;      map(get-loc, xs)      
-;
-;   defn loop (b:LBlock, locs-in:List<Loc>) :
-;      if length(locs-in) != length(live-in(b)) :
-;         error("Number of locs-in does not match number of live-in.")
-;      val b* = assign-registers(b, locs-in)
-;      block-table[name(b)] = b*
-;      block-assigned?[name(b)] = true
-;      for n in next(b*) do :
-;         if not block-assigned?[n] :
-;            val nb = block-table[n]
-;            val locs = rearrange(live-out(b*),
-;                                 live-in(nb),
-;                                 get-loc(live-out(b*)))
-;            loop(nb, locs)
-;
-;   val entry = head(blocks(p)) as LBlock
-;   loop(entry, List())
-;
-;   ;Return new program
-;   Program(map({block-table[name(_)]}, blocks(p)))
-;      
 ;;======== Stack Interval Calculation ==========
 ;defn calculate-stack-intervals (p:Program) :
 ;   val block-table = HashTable<Symbol,LBlock>(symbol-hash)
