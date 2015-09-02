@@ -17,6 +17,8 @@ public defn compile (d:tgt-DefFn) :
    u = map(emit-early-saves, u)
    println("Allocate classes for:\n~" << [u])
    u = map(allocate-classes, u)
+   println("Propagate assumptions for:\n~" << [u])
+   u = map(propagate-assumptions, u)
    println(u)
 
 ;                          Various Utilities
@@ -912,97 +914,126 @@ defn allocate-classes (b:WBlock) -> WBlock :
 ;                    Assumption Propagation
 ;                    ======================
 
+definterface Assumption
+defstruct Accept <: Assumption 
+defstruct Assume <: Assumption : (value: True|False|Any)
+defstruct Reject <: Assumption
+
 defn propagate-assumptions (b:WBlock) :
+   ;     Algorithm State
+   ;     ---------------
+   val save-assumptions = HashTable<Symbol, Assumption>(symbol-hash)
+   val load-assumptions = HashTable<Symbol, Assumption>(symbol-hash)
+
    ;     Output State
    ;     ------------
    val accum = Vector<Ins>()
    defn emit (i:Ins) :
       add(accum, i)
 
+   ;     Analysis Helpers
+   ;     ----------------
+   defn mark-port (x:Port) :
+      match(x) :
+         (x:LivePort) :
+            load-assumptions[name(x)] = match(loaded?(x)) :
+               (l:Any) : Accept()
+               (l:True|False) : Assume(l)
+            save-assumptions[name(x)] = match(saved?(x)) :
+               (s:Any) : Accept()
+               (s:True|False) : Assume(s)
+         (x:DeadPort) :
+            false
+
+   defn get-port (x:Port) :
+      defn get-value (x:Assumption) :
+         match(x) :
+            (x:Assume) : value(x)
+            (x:Accept) : Any()            
+      match(x) :
+         (x:LivePort) :
+            LivePort(name(x),
+                     get-value(save-assumptions[name(x)]),
+                     get-value(load-assumptions[name(x)]),
+                     loc(x))
+         (x:DeadPort) :
+            x
+
+   defn clear-assumptions () :
+      clear(save-assumptions)
+      clear(load-assumptions)
+
+   defn save (x:Symbol) :
+      match(get?(save-assumptions, x, Reject())) :
+         (a:Accept) : save-assumptions[x] = Assume(true)
+         (a:Assume|Reject) : emit(Save(Var(x)))
+         
+   defn load (x:Symbol) :
+      match(get?(load-assumptions, x, Reject())) :
+         (a:Accept) : load-assumptions[x] = Assume(true)
+         (a:Assume|Reject) : emit(Load(Var(x)))
+
+   defn unload (x:Symbol) :
+      match(get?(load-assumptions, x, Reject())) :
+         (a:Accept) : load-assumptions[x] = Assume(false)
+         (a:Assume|Reject) : false
+
+   defn define (x:Symbol) :
+      if get?(load-assumptions, x, Reject()) typeof Accept :
+         load-assumptions[x] = Reject()
+      if get?(save-assumptions, x, Reject()) typeof Accept :
+         save-assumptions[x] = Reject()
+
+   ;Convenience
+   defn save (x:Var) : save(name(x))
+   defn load (x:Var) : load(name(x))
+   defn unload (x:Var) : unload(name(x))
+   defn define (x:Var) : define(name(x))
+   defn define (xs:List<Var>) : do(define, xs)
+
+
    ;     Analysis
-   ;     --------
-   defn propagate<?T> (ports:List<Port>, ins:Stream<Ins>, return:List<Port> -> ?T) -> T :
-   
-      ;     Port Status
-      ;     -----------
-      val saved = HashTable<Symbol, True|False|Any>(symbol-hash)
-      val loaded = HashTable<Symbol, True|False|Any>(symbol-hash)
+   ;     --------         
+   defn* scan (ins:Stream<Ins>, process-assumptions: () -> False) :
+      defn* continue () :
+         scan(ins, process-assumptions)
+         
+      defn* continue-with-ports (ports:List<Port>, return: (List<Port>) -> Ins) :
+         val i = length(accum)
+         emit(Args(List())) ;Emit placeholder
+         process-assumptions()
+         clear-assumptions()
+         do(mark-port, ports)
+         scan{ins, _} $ fn* () :
+            val ports* = map(get-port, ports)
+            accum[i] = return(ports*)
 
-      defn save (x:Symbol) :
-         if key?(saved, x) : emit(Save(Var(x)))
-         else : saved[x] = true
+      if more?(ins) :
+         match(next(ins)) :
+            (e:Set) : (define(x(e)), emit(e), continue())
+            (e:Op) : (define(xs(e)), emit(e), continue())
+            (e:Branch) : (emit(e), continue())
+            (e:Return) : (emit(e), continue())
+            (e:Save) : (save(x(e)), continue())
+            (e:Load) : (load(x(e)), continue())
+            (e:Unload) : (unload(x(e)), continue())
+            (e:WArgs) : continue-with-ports(xs(e), WArgs{_})
+            (e:WCall) : continue-with-ports(xs(e),
+                           WCall{arity(e), _, f(e), ys(e)})
+      else :
+         process-assumptions()
 
-      defn load (x:Symbol) :
-         if key?(loaded, x) : emit(Load(Var(x)))
-         else : loaded[x] = true
+   ;Scan and process input ports
+   do(mark-port, in(b))
+   var in*
+   scan{to-stream(ins(b)), _} $ fn* () :
+      in* = map(get-port, in(b)) as List<LivePort>
 
-      defn unload (x:Symbol) :
-         if not key?(loaded, x) : loaded[x] = false
-
-      defn define (x:Symbol) :
-         if not key?(saved, x) : saved[x] = Any()
-         if not key?(loaded, x) : loaded[x] = Any()
-
-      ;Convenience
-      defn save (x:Var) : save(name(x))
-      defn load (x:Var) : load(name(x))
-      defn unload (x:Var) : unload(name(x))
-      defn define (x:Var) : define(name(x))
-      defn define (xs:List<Var>) : do(define, xs)
-
-      ;     Analysis
-      ;     --------      
-      ;Entry ports
-      for x in ports do :
-         match(x) :
-            (x:LivePort) :
-               if loaded?(x) typeof True|False :
-                  loaded[name(x)] = loaded?(x)
-               if saved?(x) typeof True|False :   
-                  saved[name(x)] = saved?(x)
-            (x:DeadPort) :
-               false         
-
-      ;Sweep through instructions
-      defn* loop () :
-         if more?(ins) :
-            match(next(ins)) :
-               (e:Set) : (define(x(e)), emit(e), loop())
-               (e:Op) : (define(xs(e)), emit(e), loop())
-               (e:Branch) : (emit(e), loop())
-               (e:Return) : (emit(e), loop())
-               (e:Save) : (save(x(e)), loop())
-               (e:Load) : (load(x(e)), loop())
-               (e:Unload) : (unload(x(e)), loop())
-               (e:WArgs) :
-                  val i = length(accum)
-                  emit(e)
-                  propagate{xs(e), ins, _} $ fn* (xs*) :
-                     accum[i] = WArgs(xs*)                  
-               (e:WCall) :
-                  val i = length(accum)
-                  emit(e)
-                  propagate{xs(e), ins, _} $ fn* (xs*) :
-                     accum[i] = WCall(arity(e), xs*, f(e), ys(e))
-      loop()
-
-      ;Exit ports
-      return $ for x in ports map :
-         match(x) :
-            (x:LivePort) :
-               LivePort(name(x),
-                        get?(saved, name(x), Any()),
-                        get?(loaded, name(x), Any()),
-                        loc(x))
-            (x:DeadPort) :
-               x         
-
-   propagate{in(b), to-stream(ins(b)), _} $ fn* (in*) :
-      WBlock(name(b),
-             accum,
-             next(b),
-             in* as List<LivePort>,
-             out(b),
-             dist(b))
-               
-
+   ;     Return result
+   ;     -------------
+   WBlock(name(b),
+          accum,
+          next(b),
+          in*,
+          out(b),
+          dist(b))
