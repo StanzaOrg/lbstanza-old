@@ -20,6 +20,9 @@ public defn compile (d:tgt-DefFn) :
    println("Propagate assumptions for:\n~" << [u])
    u = map(propagate-assumptions, u)
    println(u)
+   println("Register assignment for:\n~" << [u])
+   u = register-assignment(u)
+   println("Finished:\n~" << [u])
 
 ;                          Various Utilities
 ;                          =================
@@ -40,6 +43,32 @@ defn reverse!<?T> (xs:Vector<?T>) :
       val xj = xs[j]
       xs[i] = xj
       xs[j] = xi
+
+defn reverse-post-order (bs:Vector<Block>) -> Vector<Block> :
+   ;Block Table
+   val block = HashTable<Symbol,Block>(symbol-hash)
+   for b in bs do : block[name(b)] = b
+   
+   ;Mark Table
+   val mark-table = HashTable<Symbol,True>(symbol-hash)
+   defn marked? (b:Block) : key?(mark-table, name(b))
+   defn mark (b:Block) : mark-table[name(b)] = true
+
+   ;Add blocks to ys
+   val ys = Vector<Block>()
+   defn* loop (b:Block) :
+      if not marked?(b) :
+         do(loop{block[_]}, next(b))
+         add(ys, b)            
+         mark(b)
+   loop(bs[0])
+
+   ;Return reversed
+   reverse!(ys)
+   ys
+
+defn find!<?T> (f: T -> True|False, xs:Streamable<?T>) -> T :
+   find(f, xs) as T
 
 
 ;                           Translation to IR
@@ -578,6 +607,11 @@ defn release-table (b:WBlock) :
                      pop(release-list)
                      loop()
             loop()
+      defmethod print (o:OutputStream, this) :
+         val io = IndentedStream(o, 3)
+         print(o, "Release Table:")
+         for e in in-reverse(release-list) do :
+            print(io, "\n~" << [e])
 
 
 
@@ -791,6 +825,7 @@ defn allocate-classes (b:WBlock) -> WBlock :
             emit(Unload(Var(x)))
             num-free-reg = num-free-reg + 1
          (l:False) : false
+      loaded[x] = false   
 
    defn define (x:Symbol) :
       loaded[x] = true
@@ -1035,3 +1070,201 @@ defn propagate-assumptions (b:WBlock) :
           in*,
           out(b),
           dist(b))
+
+
+
+;                      Register Assignment
+;                      ===================
+
+;     Assignment Mini-Language
+;     ------------------------
+defstruct FreeReg <: Loc
+defmethod print (o:OutputStream, f:FreeReg) :
+   print(o, "FreeReg")
+
+;     Algorithm
+;     ---------
+defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
+   ;     Utilities
+   ;     ---------
+   ;Convert list of liveports to a table of locations
+   defn ports-to-table (ports:List<LivePort>) :
+      val table = HashTable<Symbol,Loc>(symbol-hash)
+      for p in ports do :
+         table[name(p)] = loc(p)
+      table
+
+   ;Retrieve all the liveports in the given list
+   defn liveports (ports:List<Port>) :
+      val ports* = to-list $
+         for p in ports filter :
+            p typeof LivePort
+      ports* as List<LivePort>   
+
+   ;     Algorithm State
+   ;     ---------------
+   val locs = HashTable<Symbol,Loc>(symbol-hash)
+   val reg-slots = Array<False|Symbol>(8, false)
+   val rt = release-table(b)
+
+   ;     Helper Functions
+   ;     ----------------
+   defn assign (xs:List<Symbol>, ls:List<Loc>) :
+      ;Helper: Update locs and reg-slots table
+      defn set-loc (x:Symbol, l:Loc) :
+         locs[x] = l
+         if l typeof Reg : reg-slots[n(l as Reg)] = x
+         
+      ;Helper: Next free register
+      defn next-free-reg () :
+         val i = for i in 0 to length(reg-slots) find! :
+            reg-slots[i] == false
+         Reg(i)   
+         
+      ;First assign stacks and regs
+      for (x in xs, l in ls) do :
+         match(l) :
+            (l:Stack|Reg) : set-loc(x, l)
+            (l) : false
+            
+      ;Next assign free registers
+      for (x in xs, l in ls) do :
+         match(l) :
+            (l:FreeReg) : set-loc(x, next-free-reg())
+            (l) : false
+
+   defn assign (xs:List<Var>, ls:List<Loc>) :
+      assign(map(name, xs), ls)
+      
+   defn assign (xs:List<LivePort>, ls:List<Loc>) :
+      assign(map(name, xs), ls)
+
+   ;Update state by freeing the given variable
+   defn free (x:Symbol) :
+      match(locs[x]) :
+         (loc:Reg) :
+            reg-slots[n(loc)] = false
+            locs[x] = Stack(false)
+         (loc) : false
+
+   defn free (xs:Streamable<Symbol>) :
+      do(free, xs)
+
+   ;Fill the given immediate with its location
+   defn fill<?T> (x:?T&Imm) :
+      {_ as T&Imm} $ match(x) :
+         (x:Var) : Var(name(x), locs[name(x)])
+         (x:Val) : x
+   defn fill<?T> (xs:List<?T&Imm>) -> List<T> :
+      map(fill, xs)
+
+   ;Fill the given port with its location
+   defn fill<?T> (x:?T&Port) :
+      {_ as T&Port} $ match(x) :
+         (x:LivePort) : LivePort(name(x), saved?(x), loaded?(x), locs[name(x)])
+         (x:DeadPort) : x
+   defn fill<?T> (xs:List<?T&Port>) -> List<T> :
+      map(fill, xs)
+
+   ;     Output State
+   ;     ------------
+   val accum = Vector<Ins>()
+   defn emit (i:Ins) :
+      add(accum, i)      
+
+   ;     Analysis
+   ;     --------
+   
+   ;Assign initial registers   
+   val in* = let :
+      val pt = ports-to-table(ports-in)
+      val locs = for x in in(b) map :
+         match(loaded?(x), pt[name(x)]) :
+            (ld:True, loc:Reg) : loc
+            (ld:True, loc:Stack) : FreeReg()
+            (ld:False, loc) : Stack(false)
+            (ld:Any, loc) : loc
+      assign(in(b), locs)
+      fill(in(b))
+   
+   ;Assign concrete locations
+   for (e in ins(b), i in 0 to false) do :
+      free(releases-up-to(rt, Pos(i, false)))
+      match(e) :
+         (e:Set) :
+            val y* = fill(y(e))
+            free(releases-up-to(rt, Pos(i, true)))
+            assign(list(x(e)), list(FreeReg()))
+            emit(Set(fill(x(e)), y*))
+         (e:Op) :
+            val ys* = fill(ys(e))
+            free(releases-up-to(rt, Pos(i, true)))
+            assign(xs(e), map(FreeReg{}, xs(e)))
+            emit(Op(op(e), fill(xs(e)), ys*))
+         (e:Branch) :
+            emit(Branch(op(e), fill(xs(e))))
+         (e:Return) :
+            emit(Return(fill(xs(e))))
+         (e:Save) :
+            emit(Save(fill(x(e))))            
+         (e:Load) :
+            assign(list(x(e)), list(FreeReg()))
+            emit(Load(fill(x(e))))
+         (e:WArgs) :
+            val lxs = liveports(xs(e))
+            val locs = for x in lxs map :
+               match(loaded?(x)) :
+                  (l:True|Any) : FreeReg()
+                  (l:False) : Stack(false)
+            assign(lxs, locs)
+            emit(WArgs(fill(xs(e))))
+         (e:WCall) :
+            val f* = fill(f(e))
+            val ys* = fill(ys(e))
+            free(releases-up-to(rt, Pos(i, true)))
+            val lxs = liveports(xs(e))
+            val locs = for x in lxs map :
+               match(loaded?(x)) :
+                  (l:True|Any) : FreeReg()
+                  (l:False) : Stack(false)
+            assign(lxs, locs)
+            emit(WCall(arity(e), fill(xs(e)), f*, ys*))
+   
+   ;Output locations
+   val out* = fill(out(b))
+
+   ;     Return result
+   ;     -------------
+   WBlock(name(b), accum, next(b),
+          in*, out*, dist(b))
+
+
+defn register-assignment (p:Unit) :
+   ;Table of blocks
+   val block-table = HashTable<Symbol,WBlock>(symbol-hash)
+   for b in blocks(p) do : block-table[name(b)] = b as WBlock
+
+   ;Table of new blocks
+   val block-table* = HashTable<Symbol, WBlock>(symbol-hash)
+   defn assign-successors (b:WBlock) :
+      for n in next(b) do :
+         if not key?(block-table*, n) :
+            val b* = register-assignment(block-table[n], out(b))
+            block-table*[n] = b*
+            assign-successors(b*)
+
+   ;Process in depth-first order
+   let :
+      val b = blocks(p)[0] as WBlock
+      val b* = register-assignment(b, List())
+      block-table*[name(b)] = b*
+      assign-successors(b*)
+
+   ;Return results   
+   val bs = to-vector $
+      for b in blocks(p) stream-concat :
+         match(get?(block-table*, name(b), false)) :
+            (b:WBlock) : list(b)
+            (b:False) : list()
+   Unit(defs(p), bs)
+   
