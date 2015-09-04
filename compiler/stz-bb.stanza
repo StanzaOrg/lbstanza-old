@@ -25,6 +25,8 @@ public defn compile (d:tgt-DefFn) :
    println("Finished:\n~" << [u])
    println("Verify Register Assignment")
    do(verify-register-assignment, blocks(u) as Vector<WBlock>)
+   u = collapse-blocks(u)
+   println("Collapsed Blocks:\n~" << [u])
 
 ;                          Various Utilities
 ;                          =================
@@ -258,6 +260,18 @@ defstruct Xchg <: Ins&Working :
    x: Var
    y: Var
    swap: Reg|False
+defstruct Shuffle <: Ins&Working :
+   xs: List<Var>
+   ys: List<Var>
+defstruct Label <: Ins&Working :
+   name: Symbol
+defstruct Goto <: Ins&Working :
+   name: Symbol
+defstruct Break <: Ins&Working :
+   name: Symbol
+   op: BBOp
+   xs: List<Imm>
+   flip?: True|False
 
 defn cms (xs) : join(xs, ", ")
 defmethod print (o:OutputStream, i:Ins&Working) :
@@ -268,6 +282,10 @@ defmethod print (o:OutputStream, i:Ins&Working) :
       (i:Load) : "load ~" << [x(i)]
       (i:Unload) : "unload ~" << [x(i)]
       (i:Xchg) : "xchg ~ ~ through ~" << [x(i), y(i), swap(i)]
+      (i:Shuffle) : "shuffle (~@) = (~@)" << [cms(xs(i)), cms(ys(i))]
+      (i:Label) : "label<~>" << [name(i)]
+      (i:Goto) : "goto label<~>" << [name(i)]
+      (i:Break) : "break label<~> when ~(~@) (flip:~)" << [name(i), op(i), cms(xs(i)), flip?(i)]
 
 ;     Any Value
 ;     ---------
@@ -1670,5 +1688,142 @@ defn calculate-stack-locations (u:Unit) :
    ;     Return table
    ;     ------------
    var-locs
-            
+
+
+;                      Block Collapsing
+;                      ================
+
+defn collapse-blocks (u:Unit) :
+   ;     Utilities
+   ;     ---------
+   ;Convert list of liveports to a table of ports
+   defn ports-to-table (ports:List<LivePort>) :
+      val table = HashTable<Symbol,LivePort>(symbol-hash)
+      for p in ports do :
+         table[name(p)] = p
+      table
       
+   ;     Block Statistics
+   ;     ----------------
+   val block-table = HashTable<Symbol, WBlock>(symbol-hash)
+   val block-pos = HashTable<Symbol,Int>(symbol-hash)
+   val block-preds = HashTable<Symbol, List<Symbol>>(symbol-hash)
+   val glue-entry = HashTable<Symbol, True>(symbol-hash)
+   val glue-exit = HashTable<Symbol, True>(symbol-hash)
+
+   ;Retrieve the predecessors of a block
+   defn preds (b:WBlock) :
+      for p in get?(block-preds, name(b), List()) map :
+         block-table[p]
+
+   ;Retrieve the successors of a block
+   defn succs (b:WBlock) :
+      for n in next(b) map :
+         block-table[n]
+
+   ;Fill block statistics
+   for (b in blocks(u), i in 0 to false) do :
+      block-table[name(b)] = b as WBlock
+      block-pos[name(b)] = i
+      val multi-out? = length(next(b)) > 1
+      for n in next(b) do :
+         block-preds[n] = List(name(b), get?(block-preds, n, List()))
+         (glue-entry[n] = true) when multi-out?
+
+   ;Compute exit glue
+   for e in block-preds do :
+      val multi-in? = length(value(e)) > 1
+      if multi-in? :
+         for p in value(e) do :
+            glue-exit[p] = true
+
+   ;     Utilities
+   ;     ---------
+   defn follows? (b:Block, n:Symbol) :
+      block-pos[n] == block-pos[name(b)] + 1
+
+   ;     Output State
+   ;     ------------
+   val accum = Vector<Ins>()
+   defn emit (i:Ins) : add(accum, i)
+
+   ;     Algorithm
+   ;     ---------
+   ;Glue src ports to dst ports
+   defn glue (src:List<LivePort>, dst:List<LivePort>) :
+      ;Calculate dst table first
+      val dst-table = ports-to-table(dst)
+      val dst* = for s in src map :
+         dst-table[name(s)]
+      
+      ;Emit Required Saves
+      for (x in src, y in dst*) do :
+         match(saved?(x), saved?(y)) :
+            (sx:False, sy:True) :
+               emit(Save(Var(name(x), loc(x))))
+            (sx, sy) : false
+            
+      ;Emit Shuffle
+      val es = Vector<KeyValue<Var,Var>>()
+      for (x in src, y in dst*) do :
+         match(loc(x), loc(y)) :
+            (lx:Reg, ly:Reg) : add(es, Var(name(y), ly) => Var(name(x), lx))
+            (lx, ly) : false
+      emit(Shuffle(to-list(stream(key,es)),
+                   to-list(stream(value,es))))
+         
+      ;Emit Required Loads
+      for (x in src, y in dst*) do :
+         match(loaded?(x), loaded?(y)) :
+            (lx:False, ly:True) :
+               emit(Load(Var(name(y), loc(y))))
+            (sx, sy) : false
+            
+   ;Emit instructions needed to collapse the given block
+   defn collapse (b:WBlock, i:Int) :
+      ;Emit block label
+      emit(Label(name(b)))
+      
+      ;Emit entry glue
+      if key?(glue-entry, name(b)) :
+         val pred = head(preds(b))
+         glue(out(pred), in(b))
+
+      ;Emit instructions
+      for e in ins(b) do :
+         match(e) :
+            (e:Branch) :
+               val conseq = next(b)[0]
+               val alt = next(b)[1]
+               match(follows?(b, conseq), follows?(b, alt)) :
+                  (fc:True, fa:False) :
+                     emit(Break(alt, op(e), xs(e), true))
+                  (fc:False, fa:True) :
+                     emit(Break(conseq, op(e), xs(e), false))
+                  (fc:False, fa:False) :
+                     emit(Break(conseq, op(e), xs(e), false))
+                     emit(Goto(alt))
+            (e) :
+               emit(e)
+
+      ;Emit exit glue
+      if key?(glue-exit, name(b)) :
+         val succ = head(succs(b))
+         glue(out(b), in(succ))
+
+      ;Emit goto if necessary
+      if length(next(b)) == 1 :
+         val n = head(next(b))
+         emit(Goto(n)) when not follows?(b, n)
+
+   ;     Driver
+   ;     ------
+   for (b in blocks(u), i in 0 to false) do :
+      collapse(b as WBlock, i)
+   val blocks* = Vector<Block>()
+   add(blocks*, Block(gensym(), accum, List()))
+   Unit(defs(u), blocks*)
+      
+      
+            
+
