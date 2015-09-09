@@ -96,6 +96,7 @@ defn to-bb-ir (d:tgt-DefFn) -> Unit :
    ;     -----   
    val defs = Vector<tgt-DefVar>()
    val blocks = Vector<Block>()
+   val type-table = HashTable<Int,tgt-TgtType>({_})
 
    ;     Update State
    ;     ------------
@@ -104,49 +105,114 @@ defn to-bb-ir (d:tgt-DefFn) -> Unit :
    defn fresh-block (n:Int) :
       Block(n, Vector<Ins>(), List())
 
+   ;     Populate Defs and Type Table
+   ;     ----------------------------
+   defn add-def (d:tgt-DefVar) :
+      add(defs, d)
+      type-table[tgt-n(d)] = tgt-type(d)
+   defn var-type (v:tgt-Var) :
+      type-table[tgt-n(v)]
+   defn fresh-local (t:tgt-TgtType) :
+      val n = fresh-id()
+      add(defs, tgt-DefVar(n, t))
+      type-table[n] = t
+      Var(n)
+   do(add-def, tgt-args(d))
+   do(add-def, tgt-locals(d))
 
    ;     Find all blocks
    ;     ---------------   
    defn* scan-block (b:Block, str-i:Stream<tgt-Ins>) :
+      defn emit (i:Ins) :
+         add(ins(b), i)
       defn to-imm (x:tgt-Imm) :
          match(x) :
             (x:tgt-Var) : Var(tgt-n(x))
             (x) : Val(x)
       defn to-var (x:tgt-Var) :
          to-imm(x) as Var
+      defn force-var (t:tgt-TgtType, v:Imm) :
+         match(v) :
+            (v:Var) :
+               v
+            (v:Val) :
+               val x = fresh-local(t)
+               emit(Set(x, v))
+               x
       
       if more?(str-i) :
          match(next(str-i)) :
             (i:tgt-SetIns) :
                val x = to-var(tgt-x(i))
                val y = to-imm(tgt-y(i))
-               add(ins(b), Set(x, y))
+               emit(Set(x, y))
                scan-block(b, str-i)
             (i:tgt-BinOp) :
-               val x = to-var(tgt-x(i))
-               val ys = list(to-imm(tgt-y(i)), to-imm(tgt-z(i)))
+               ;     Classification
+               ;     --------------
+               defn com-op? (o:tgt-TgtOp) :
+                  contains?([tgt-ADD-OP, tgt-MUL-OP, tgt-AND-OP, tgt-OR-OP, tgt-XOR-OP], o)
+               defn ncom-op? (o:tgt-TgtOp) :
+                  o == tgt-SUB-OP
+               defn div-op? (o:tgt-TgtOp) :
+                  contains?([tgt-DIV-OP, tgt-MOD-OP], o)
+               defn cmp-op? (o:tgt-TgtOp) :
+                  contains?([tgt-EQ-OP, tgt-NE-OP, tgt-LT-OP, tgt-GT-OP, tgt-LE-OP,
+                             tgt-GE-OP, tgt-ULE-OP, tgt-ULT-OP, tgt-UGT-OP, tgt-UGE-OP], o)
+               defn shf-op? (o:tgt-TgtOp) :
+                  contains?([tgt-SHL-OP, tgt-SHR-OP, tgt-ASHR-OP], o)
+               defn int-type? (t:tgt-TgtType) :
+                  contains?([tgt-BYTE-TYPE, tgt-INT-TYPE, tgt-LONG-TYPE, tgt-REF-TYPE], t)
+               defn float-type? (t:tgt-TgtType) :
+                  contains?([tgt-FLOAT-TYPE, tgt-DOUBLE-TYPE], t)
+
+               ;     Convenience Translators
+               ;     -----------------------
+               val t = var-type(tgt-x(i))
                val top = tgt-op(i)
-               val op = switch contains?{_, top} :
-                  [tgt-ADD-OP, tgt-MUL-OP] :
-                     Op(ComOp(top), list(x), ys)
-                  [tgt-SUB-OP] :
-                     Op(NComOp(top), list(x), ys)
-                  [tgt-DIV-OP] :
-                     Op(Div2Op(top), list(x), ys)
-                  [tgt-EQ-OP, tgt-NE-OP, tgt-LT-OP, tgt-GT-OP, tgt-LE-OP,
-                   tgt-GE-OP, tgt-ULE-OP, tgt-ULT-OP, tgt-UGT-OP, tgt-UGE-OP] :
-                     Op(CmpOp(top), list(x), ys)
-               add(ins(b), op)
-               scan-block(b, str-i)
+               defn x-var () : list(to-var(tgt-x(i)))
+               defn y-imms () : list(to-imm(tgt-y(i)), to-imm(tgt-z(i)))
+               defn y-vars () : map(force-var{t, _}, y-imms())
+
+               ;     Dispatch on Operator Type
+               ;     -------------------------
+               if int-type?(t) :
+                  switch _{top} :
+                     com-op? : emit(Op(ComOp(top), x-var(), y-imms()))
+                     ncom-op? : emit(Op(NComOp(top), x-var(), y-imms()))
+                     div-op? :
+                        if t == tgt-BYTE-TYPE :
+                           emit(Op(DivOp(top), x-var(), y-vars()))
+                        else if top == tgt-DIV-OP :
+                           val tmp = fresh-local(t)
+                           val x = to-var(tgt-x(i))
+                           emit(Op(DivModOp(), list(x, tmp), y-vars()))
+                        else if top == tgt-MOD-OP :
+                           val tmp = fresh-local(t)
+                           val x = to-var(tgt-x(i))
+                           emit(Op(DivModOp(), list(tmp, x), y-vars()))
+                        else :
+                           error("Unreachable")                           
+                     cmp-op? : emit(Op(CmpOp(top), x-var(), y-imms()))
+                     shf-op? : emit(Op(ShfOp(top), x-var(), y-imms()))
+               else if float-type?(t) :
+                  switch _{top} :
+                     com-op? : emit(Op(ComOp(top), x-var(), y-imms()))
+                     ncom-op? : emit(Op(NComOp(top), x-var(), y-imms()))
+                     div-op? : emit(Op(NComOp(top), x-var(), y-imms()))
+                     cmp-op? : emit(Op(CmpOp(top), x-var(), y-imms()))
+               else :
+                  error("Unreachable")
+               scan-block(b, str-i)   
             (i:tgt-Call) :
                val xs = map(to-var, tgt-xs(i))
                val f = to-imm(tgt-f(i))
                val ys = map(to-imm, tgt-ys(i))
-               add(ins(b), Call(tgt-arity(i), xs, f, ys))
+               emit(Call(tgt-arity(i), xs, f, ys))
                scan-block(b, str-i)
             (i:tgt-Return) :
                val xs = map(to-imm, tgt-xs(i))
-               add(ins(b), Return(xs))
+               emit(Return(xs))
                close-block(b, List())
                scan-block(fresh-block(fresh-id()), str-i)            
             (i:tgt-Label) :
@@ -159,8 +225,7 @@ defn to-bb-ir (d:tgt-DefFn) -> Unit :
             (i:tgt-Branch) :
                val alt = fresh-id()
                val xs = list(to-imm(tgt-x(i)), to-imm(tgt-y(i)))
-               val i* = Branch(CmpOp(tgt-op(i)), xs)
-               add(ins(b), i*)
+               emit(Branch(CmpOp(tgt-op(i)), xs))
                close-block(b, list(tgt-n(i), alt))
                scan-block(fresh-block(alt), str-i)
 
@@ -1331,7 +1396,7 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
                   assign(head(xs(e)), FreeReg(regs-in(list(ys*[0])),
                                               regs-in(list(ys*[1]))))
                   ys*
-               (op:Div2Op) :
+               (op:DivOp) :
                   val rs = to-list(releases-up-to(rt, Pos(i, true)))
                   ensure-free(list(0), rs)
                   val ys* = fill(ys(e))
@@ -1531,7 +1596,7 @@ defn verify-register-assignment (b:WBlock) :
 
             ;OpClass post conditions
             match(op(e)) :
-               (op:Div2Op) : holds!(Reg(0), head(xs(e)))
+               (op:DivOp) : holds!(Reg(0), head(xs(e)))
                (op) : false
          (e:Branch) :
             for x in xs(e) do : (check!(x), reg!(x))
@@ -2075,7 +2140,7 @@ defn compile (ins:Vector<Ins>, stackmap:StackMap, output:Vector<asm-Ins>) :
             xchg(loc(x(e)), loc(y(e)))
          (e:Op) :
             emit $ match(op(e)) :
-               (opc:ComOp|NComOp|Div2Op|CmpOp) :
+               (opc:ComOp|NComOp|DivOp|CmpOp) :
                   val rx = reg(loc(xs(e)[0]))
                   val ry = imm(immloc(ys(e)[0]))
                   val rz = imm(immloc(ys(e)[1]))
