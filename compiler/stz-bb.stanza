@@ -20,8 +20,10 @@ public defn compile (d:tgt-DefFn, output:Vector<asm-Ins>) :
    u = remove-critical-edges(u)
    u = analyze-liveness(u)
    u = map(emit-early-saves, u)
+   println("Get type table")
+   val tt = type-table(u)
    println("Allocate classes for:\n~" << [u])
-   u = map(allocate-classes, u)
+   u = map(allocate-classes{tt, _}, u)
    println("Propagate assumptions for:\n~" << [u])
    u = map(propagate-assumptions, u)
    println(u)
@@ -37,8 +39,17 @@ public defn compile (d:tgt-DefFn, output:Vector<asm-Ins>) :
    println("Collapsed Instructions:\n~@" << [join(ins, "\n")])
    compile(ins, stack-map, output)
 
+
 ;                          Various Utilities
 ;                          =================
+
+defn make-table<?K,?V,?T> (xs:Streamable<?T>,
+                           k: T -> ?K,
+                           v: T -> ?V,
+                           hash: K -> Int) :
+   val table = HashTable<K,V>(hash)
+   for x in xs do : table[k(x)] = v(x)
+   table
 
 defn map (f: WBlock -> Block, u:Unit) :
    Unit(defs(u),
@@ -357,8 +368,9 @@ defstruct WCall <: Ins&Working :
    xs: List<Port>
    f: Imm
    ys: List<Imm>
+   tail?: True|False
 defstruct Save <: Ins&Working :
-   x: Var   
+   x: Var
 defstruct Load <: Ins&Working :
    x: Var
 defstruct Unload <: Ins&Working :
@@ -436,6 +448,11 @@ defmethod print (o:OutputStream, b:WBlock) :
    print(io, "\ndist: ~@" << [cms(dist(b))])
 
 
+;                         Type Table
+;                         ==========
+
+defn type-table (u:Unit) :
+   make-table(defs(u), tgt-n, tgt-type, {_})
 
 ;                       Block Liveness
 ;                       ==============
@@ -845,7 +862,7 @@ defn emit-early-saves (b:WBlock) :
             emit(WArgs(get-port(xs(e))))
             defd(xs(e))
          (e:Call) :
-            emit(WCall(arity(e), get-port(xs(e)), f(e), ys(e)))
+            emit(WCall(arity(e), get-port(xs(e)), f(e), ys(e), tail?(e)))
             defd(xs(e))
             lived-through-call(currently-live())
             used(f(e))
@@ -900,7 +917,7 @@ defn unique-vars (vs:List<Imm>) :
 
 ;     Allocate classes
 ;     ----------------
-defn allocate-classes (b:WBlock) -> WBlock :
+defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock) -> WBlock :
    println("TODO: Handle different types of registers.")
    println("TODO: Have the correct number of free registers.")
 
@@ -920,6 +937,7 @@ defn allocate-classes (b:WBlock) -> WBlock :
    val rt = release-table(b)
    val ut = usage-table(b)
    var num-free-reg = 8
+   var num-free-freg = 8
 
    ;     Output State
    ;     ------------
@@ -931,10 +949,24 @@ defn allocate-classes (b:WBlock) -> WBlock :
    ;     Analysis Helpers
    ;     ----------------
 
+   ;Querying what type of variable it is
+   defn int? (t:tgt-TgtType) :
+      contains?([tgt-BYTE-TYPE, tgt-INT-TYPE, tgt-LONG-TYPE, tgt-REF-TYPE], t)
+   defn float? (t:tgt-TgtType) :
+      contains?([tgt-FLOAT-TYPE, tgt-DOUBLE-TYPE], t)
+   defn int? (x:Int) : int?(tt[x])
+   defn float? (x:Int) : float?(tt[x])
+
+   ;Increment the number of free registers
+   defn inc-reg (n:Int, t:tgt-TgtType) :
+      if int?(t) : num-free-reg = num-free-reg + n
+      else if float?(t) : num-free-freg = num-free-freg + n
+      else : error("Unreachable")
+
    ;Saving / Loading / Defining / Killing
    defn kill (x:Int) :
       match(loaded[x]) :
-         (l:True|Any) : num-free-reg = num-free-reg + 1
+         (l:True|Any) : inc-reg(1, tt[x])
          (l:False) : false
       loaded[x] = false
       
@@ -949,7 +981,7 @@ defn allocate-classes (b:WBlock) -> WBlock :
          (l:True) : false
          (l:False) :
             emit(Load(Var(x)))
-            num-free-reg = num-free-reg - 1
+            inc-reg(-1, tt[x])
          (l:Any) :
             emit(Load(Var(x)))
       loaded[x] = true
@@ -958,14 +990,14 @@ defn allocate-classes (b:WBlock) -> WBlock :
       match(loaded[x]) :
          (l:True|Any) :
             emit(Unload(Var(x)))
-            num-free-reg = num-free-reg + 1
+            inc-reg(1, tt[x])
          (l:False) : false
       loaded[x] = false   
 
    defn define (x:Int) :
       loaded[x] = true
       saved[x] = false
-      num-free-reg = num-free-reg - 1
+      inc-reg(-1, tt[x])
 
    defn define (x:Port) :
       match(x) :
@@ -975,7 +1007,7 @@ defn allocate-classes (b:WBlock) -> WBlock :
                   loaded[n(x)] = false
                (l:Any) :
                   loaded[n(x)] = Any()
-                  num-free-reg = num-free-reg - 1
+                  inc-reg(-1, tt[n(x)])
             match(saved?(x)) :
                (s:True|Any) : saved[n(x)] = s
          (x:DeadPort) :
@@ -998,32 +1030,78 @@ defn allocate-classes (b:WBlock) -> WBlock :
    ;Computes the number of spills required given the variables used,
    ;the releases following, and then the number of variables defined.
    defn num-spills-required (used:List<Imm>, rs:List<Int>, defs:List<Var>) :
-      val num-loads = for u in unique-vars(used) count :
-         loaded[n(u)] == false
-      val num-released = for r in rs count :
-         loaded[r] != false
-      val num-results = length(defs)
-      val additional = num-loads + max(0, num-results - num-released)
-      max(0, additional - num-free-reg)
+      ;Count the number of each type of load
+      var num-loads = 0
+      var num-floads = 0
+      for u in unique-vars(used) do :
+         if loaded[n(u)] == false :
+            if int?(n(u)) : num-loads = num-loads + 1
+            else if float?(n(u)) : num-floads = num-floads + 1
+            else : error("Unreachable")
+            
+      ;Count the number of each type of release
+      var num-released = 0
+      var num-freleased = 0
+      for r in rs do :
+         if loaded[r] != false :
+            if int?(r) : num-released = num-released + 1
+            else if float?(r) : num-freleased = num-freleased + 1
+            else : error("Unreachable")
 
-   defn spill (p:Pos, n:Int) :
+      ;Count the number of each type of def
+      var num-defs = 0
+      var num-fdefs = 0
+      for d in defs do :
+         if int?(n(d)) : num-defs = num-defs + 1
+         else if float?(n(d)) : num-fdefs = num-fdefs + 1
+         else : error("Unreachable")
+
+      ;Compute number of spills of each type needed
+      val additional = num-loads + max(0, num-defs - num-released)
+      val fadditional = num-floads + max(0, num-fdefs - num-freleased)
+      val num-spills = max(0, additional - num-free-reg)
+      val num-fspills = max(0, fadditional - num-free-freg)
+      [num-spills, num-fspills]
+      
+
+   ;Spill the given number of regular and floating point registers
+   defn spill (p:Pos, n:Int, nf:Int) :
       defn save-and-unload (x:Int) : (save(x), unload(x))
       defn dist (x:Int) : ut[x, p]
-      if n == 1 :
-         save-and-unload(maximum-by-key(currently-loaded(), dist))
-      else if n > 1 :
-         val vs = to-vector(currently-loaded())
+      if (n > 1) or (nf > 1) :
+         ;Get sorted list of currently loaded variables
+         val vs = to-vector(currently-loaded())         
          sort-by-key!(vs, dist)
-         for i in 0 to n do :
-            save-and-unload(pop(vs))
+
+         ;Track the number of each type to spill
+         var n-rest = n
+         var nf-rest = nf
+         var total-rest = n + nf
+
+         ;Spill until we've spilled the total number
+         while total-rest > 0 :
+            val v = pop(vs)
+            if int?(v) and n-rest > 0 :
+               save-and-unload(v)
+               n-rest = n-rest - 1
+               total-rest = total-rest - 1
+            else if float?(v) and nf-rest > 0 :
+               save-and-unload(v)
+               nf-rest = nf-rest - 1
+               total-rest = total-rest - 1
 
    ;     Analysis
-   ;     --------   
+   ;     --------
+   ;Spill overcommitted registers
+   defn spill-overcommitted (p:Pos) :
+      val ns = max(0, neg(num-free-reg))
+      val fns = max(0, neg(num-free-freg))
+      spill(p, ns, fns)
+
    ;Live in variables
    let :
       define(in(b))
-      val ns = max(0, neg(num-free-reg))
-      spill(Pos(0,false), ns)
+      spill-overcommitted(Pos(0, false))
 
    ;Scan through instructions
    for (e in ins(b), i in 0 to false) do :      
@@ -1031,22 +1109,22 @@ defn allocate-classes (b:WBlock) -> WBlock :
       match(e) :
          (e:Set) :
             val rs = to-list(releases-up-to(rt, Pos(i, true)))
-            val ns = num-spills-required(List(), rs, list(x(e)))
-            spill(Pos(i,false), ns)
+            val [ns, fns] = num-spills-required(List(), rs, list(x(e)))
+            spill(Pos(i,false), ns, fns)
             kill(rs)
             define(x(e))
             emit(e)
          (e:Op) :
             val rs = to-list(releases-up-to(rt, Pos(i, true)))
-            val ns = num-spills-required(ys(e), rs, xs(e))
-            spill(Pos(i,false), ns)
+            val [ns, fns] = num-spills-required(ys(e), rs, xs(e))
+            spill(Pos(i,false), ns, fns)
             load(ys(e))
             kill(rs)
             define(xs(e))
             emit(e)
          (e:Branch) :
-            val ns = num-spills-required(xs(e), List(), List())
-            spill(Pos(i,false), ns)
+            val [ns, fns] = num-spills-required(xs(e), List(), List())
+            spill(Pos(i,false), ns, fns)
             load(xs(e))
             emit(e)
          (e:Return) :
@@ -1056,15 +1134,13 @@ defn allocate-classes (b:WBlock) -> WBlock :
          (e:WArgs) :
             emit(e)
             define(xs(e))
-            val ns = max(0, neg(num-free-reg))
-            spill(Pos(i + 1,false), ns)
+            spill-overcommitted(Pos(i + 1, false))
          (e:WCall) :
             emit(e)
             val rs = to-list(releases-up-to(rt, Pos(i, true)))
             kill(rs)
             define(xs(e))
-            val ns = max(0, neg(num-free-reg))
-            spill(Pos(i + 1, false), ns)
+            spill-overcommitted(Pos(i + 1, false))
 
    ;Live out variables
    val out* = for x in out(b) map :
@@ -1187,7 +1263,7 @@ defn propagate-assumptions (b:WBlock) :
             (e:Unload) : (unload(x(e)), continue())
             (e:WArgs) : continue-with-ports(xs(e), WArgs{_})
             (e:WCall) : continue-with-ports(xs(e),
-                           WCall{arity(e), _, f(e), ys(e)})
+                           WCall{arity(e), _, f(e), ys(e), tail?(e)})
       else :
          process-assumptions()
 
@@ -1230,10 +1306,7 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
    ;     ---------
    ;Convert list of liveports to a table of locations
    defn ports-to-table (ports:List<LivePort>) :
-      val table = HashTable<Int,Loc>({_})
-      for p in ports do :
-         table[n(p)] = loc(p)
-      table
+      make-table(ports, n, loc, {_})
 
    ;Retrieve all the liveports in the given list
    defn liveports (ports:List<Port>) :
@@ -1461,7 +1534,7 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
                   (l:True|Any) : FreeReg()
                   (l:False) : Stack(n(x))
             assign(lxs, locs)
-            emit(WCall(arity(e), fill(xs(e)), f*, ys*))
+            emit(WCall(arity(e), fill(xs(e)), f*, ys*, tail?(e)))
    
    ;Output locations
    val out* = fill(out(b))
