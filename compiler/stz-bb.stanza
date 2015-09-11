@@ -28,7 +28,7 @@ public defn compile (d:tgt-DefFn, output:Vector<asm-Ins>) :
    u = map(propagate-assumptions, u)
    println(u)
    println("Register assignment for:\n~" << [u])
-   u = register-assignment(u)
+   u = register-assignment(tt, u)
    println("Finished:\n~" << [u])
    println("Verify Register Assignment")
    do(verify-register-assignment, blocks(u) as Vector<WBlock>)
@@ -378,7 +378,7 @@ defstruct Unload <: Ins&Working :
 defstruct Xchg <: Ins&Working :
    x: Var
    y: Var
-   swap: Reg|False
+   swap: Reg|FReg|False
 defstruct Shuffle <: Ins&Working :
    xs: List<Var>
    ys: List<Var>
@@ -415,17 +415,20 @@ defmethod print (o:OutputStream, x:Any) :
 ;     Port Definition
 ;     ---------------
 definterface Port
+defmulti n (p:Port) -> Int
+
 defstruct LivePort <: Port :
-   n: Int
+   n: Int with: (as-method => true)
    saved?: True|False|Any
    loaded?: True|False|Any
    loc: Loc
-defstruct DeadPort <: Port
+defstruct DeadPort <: Port :
+   n: Int with: (as-method => true)
 
 defmethod print (o:OutputStream, p:Port) :
    print{o, _} $ match(p) :
       (p:LivePort) : "~ (s:~, l:~, at:~)" << [n(p), saved?(p), loaded?(p), loc(p)]
-      (p:DeadPort) : "dead"
+      (p:DeadPort) : "~ (dead)" << [n(p)]
 
 ;     Working Block
 ;     -------------
@@ -823,7 +826,7 @@ defn emit-early-saves (b:WBlock) :
       val ld = get?(prefers-load, x, true)
       val lv = get?(is-live, x, false)
       match(lv, sv, ld) :
-         (lv:False, sv, ld) : DeadPort()
+         (lv:False, sv, ld) : DeadPort(x)
          (lv:True, sv:False, ld:False) : LivePort(x, Any(), false, NoLoc())
          (lv:True, sv:False, ld:True) : LivePort(x, Any(), Any(), NoLoc())
          (lv:True, sv:True, ld:False) : LivePort(x, true, false, NoLoc())
@@ -1290,18 +1293,26 @@ defn propagate-assumptions (b:WBlock) :
 ;     Assignment Mini-Language
 ;     ------------------------
 defstruct FreeReg <: Loc :
+   type: tgt-TgtType
    prefer: List<Int>
    prefer-not: List<Int>
    
-defn FreeReg (p:List<Int>) : FreeReg(p, List())
-defn FreeReg () : FreeReg(List(), List())
+defn FreeReg (t:tgt-TgtType, p:List<Int>) : FreeReg(t, p, List())
+defn FreeReg (t:tgt-TgtType) : FreeReg(t, List(), List())
 
 defmethod print (o:OutputStream, f:FreeReg) :
-   print(o, "FreeReg(~@ not ~@)" << [cms(prefer(f)) cms(prefer-not(f))])
+   print(o, "FreeReg(~, ~@ not ~@)" << [type(f), cms(prefer(f)), cms(prefer-not(f))])
 
 ;     Algorithm
 ;     ---------
-defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
+defn register-assignment (tt:HashTable<Int,tgt-TgtType>, b:WBlock, ports-in:List<LivePort>) :
+   ;     Algorithm State
+   ;     ---------------
+   val locs = HashTable<Int,Loc>({_})
+   val reg-slots = Array<False|Int>(8, false)
+   val freg-slots = Array<False|Int>(8, false)
+   val rt = release-table(b)
+   
    ;     Utilities
    ;     ---------
    ;Convert list of liveports to a table of locations
@@ -1324,14 +1335,29 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
    ;Retrieve all Registers in given immediates
    defn regs-in (xs:List<Imm>) -> List<Int> :
       val locs = stream(loc, vars-in(xs))
-      val regs = filter({_ typeof Reg}, locs)
-      to-list(stream(n, regs as Stream<Reg>))
+      val regs = filter({_ typeof Reg|FReg}, locs)
+      to-list(stream(n, regs as Stream<Reg|FReg>))
 
-   ;     Algorithm State
-   ;     ---------------
-   val locs = HashTable<Int,Loc>({_})
-   val reg-slots = Array<False|Int>(8, false)
-   val rt = release-table(b)
+   ;Classify types
+   defn int? (t:tgt-TgtType) :
+      contains?([tgt-BYTE-TYPE, tgt-INT-TYPE, tgt-LONG-TYPE, tgt-REF-TYPE], t)
+   defn float? (t:tgt-TgtType) :
+      contains?([tgt-FLOAT-TYPE, tgt-DOUBLE-TYPE], t)
+
+   ;Get the type of a given variable or port
+   defn var-type (v:Var|Port) : tt[n(v)]
+
+   ;Get register slot array for the given type
+   defn slots (t:tgt-TgtType) :
+      if int?(t) : reg-slots
+      else if float?(t) : freg-slots
+      else : error("Unreachable")
+
+   ;Create the appropriate register            
+   defn XReg (t:tgt-TgtType, i:Int) :
+      if int?(t) : Reg(i)
+      else if float?(t) : FReg(i)
+      else : error("Unreachable")           
 
    ;     Output State
    ;     ------------
@@ -1342,28 +1368,35 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
    ;     State Updaters
    ;     --------------
    defn assign (x:Int, l:Loc) :
-      defn next-free-reg (pref:List<Int>, npref:List<Int>) :
-         label<Reg> return :
+      defn next-free-reg (t:tgt-TgtType, pref:List<Int>, npref:List<Int>) :      
+         label<Reg|FReg> return :
+            ;First determine which slot array is applicable
+            val slots = slots(t)           
             ;First try preferred registers
             for r in pref do :
                if not contains?(npref, r) :
-                  return(Reg(r)) when reg-slots[r] == false
+                  return(XReg(t,r)) when slots[r] == false
             ;Otherwise search for free register   
-            val i = for i in 0 to length(reg-slots) find! :
-               reg-slots[i] == false
-            Reg(i)
+            val i = index-of(slots, false) as Int
+            XReg(t,i)
 
       match(l) :
-         (l:FreeReg) : assign(x, next-free-reg(prefer(l), prefer-not(l)))
-         (l:Stack) : locs[x] = l
+         (l:FreeReg) :
+            val r = next-free-reg(type(l), prefer(l), prefer-not(l))
+            assign(x, r)
+         (l:Stack) :
+            locs[x] = l
          (l:Reg) :
             locs[x] = l
             reg-slots[n(l)] = x
+         (l:FReg) :
+            locs[x] = l
+            freg-slots[n(l)] = x
       
    defn assign (xs:List<Int>, ls:List<Loc>) :         
       ;First assign stacks and regs
       for (x in xs, l in ls) do :
-         assign(x, l) when l typeof Stack|Reg            
+         assign(x, l) when l typeof Stack|Reg|FReg            
       ;Next assign free registers
       for (x in xs, l in ls) do :
          assign(x, l) when l typeof FreeReg
@@ -1381,6 +1414,9 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
       match(locs[x]) :
          (loc:Reg) :
             reg-slots[n(loc)] = false
+            locs[x] = Stack(x)
+         (loc:FReg) :
+            freg-slots[n(loc)] = false
             locs[x] = Stack(x)
          (loc) : false
 
@@ -1405,7 +1441,7 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
                (sv:True) : sv
                (sv:False|Any) : false
             val loc = locs[n(x)]
-            val ld = loc typeof Reg
+            val ld = loc typeof Reg|FReg
             LivePort(n(x), sv, ld, loc)
          (x:DeadPort) : x
    defn fill<?T> (xs:List<?T&Port>) -> List<T> :
@@ -1415,51 +1451,55 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
    ;     ------------
    ;Find a register that is either free, or one of the given registers
    ;and is not vetoed.
-   defn swap-reg (free:List<Int>, veto:List<Int>) :
+   defn swap-reg (t:tgt-TgtType, free:List<Int>, veto:List<Int>) :
       label<Int> return :
+         ;Get the appropriate slots array
+         val slots = slots(t)
          ;Try to find a free register
          val i = for i in 0 to length(reg-slots) find :
             (not contains?(veto, i)) and
-            reg-slots[i] == false
+            slots[i] == false
          return(i as Int) when i typeof Int
          ;Find one of the given registers
-         for i in 0 to length(reg-slots) find! :
+         for i in 0 to length(slots) find! :
             (not contains?(veto, i)) and
-            contains?(free, reg-slots[i])
+            contains?(free, slots[i])
 
    ;Swap the two register contents
-   defn swap (src:Int, dst:Int) :
-      if reg-slots[dst] == false :
-         val x = reg-slots[src] as Int
-         emit(Set(Var(x, Reg(dst)), Var(x, Reg(src))))
+   defn swap (t:tgt-TgtType, src:Int, dst:Int) :
+      val slots = slots(t)
+      if slots[dst] == false :
+         val x = slots[src] as Int
+         emit(Set(Var(x, XReg(t,dst)), Var(x, XReg(t,src))))
          free(x)
-         assign(x, Reg(dst))
+         assign(x, XReg(t,dst))
       else :
-         val x = reg-slots[src] as Int
-         val y = reg-slots[dst] as Int
-         val swap = for i in 0 to length(reg-slots) search :
-            if (i != src) and (i != dst) and (reg-slots[i] == false) :
-               Reg(i)
-         emit(Xchg(Var(x, Reg(src)), Var(y, Reg(dst)), swap))
+         val x = slots[src] as Int
+         val y = slots[dst] as Int
+         val swap = for i in 0 to length(slots) search :
+            if (i != src) and (i != dst) and (slots[i] == false) :
+               XReg(t,i)
+         emit(Xchg(Var(x, XReg(t,src)), Var(y, XReg(t,dst)), swap))
          free(x)
          free(y)
-         assign(x, Reg(dst))
-         assign(y, Reg(src))
+         assign(x, XReg(t,dst))
+         assign(y, XReg(t,src))
             
-   ;Ensure that the following registers are free
-   defn ensure-free (reg:List<Int>, rs:List<Int>) :
+   ;Ensure that the following registers are free after release
+   defn ensure-free (t:tgt-TgtType, reg:List<Int>, rs:List<Int>) :
+      val slots = slots(t)
       defn* loop (reg:List<Int>, veto:List<Int>) :
          if not empty?(reg) :
             val r = head(reg)
-            if (reg-slots[r] != false) and not contains?(rs, reg-slots[r]) :
-               swap(r, swap-reg(rs, veto))
+            if (slots[r] != false) and not contains?(rs, slots[r]) :
+               swap(t, r, swap-reg(t, rs, veto))
             loop(tail(reg), List(r, veto))
       loop(reg, List())
 
    ;Ensure that the following value is in a certain register
-   defn ensure-reg (x:Int, r:Int) :
-      val src = n(locs[x] as Reg)
-      swap(src, r) when src != r
+   defn ensure-reg (t:tgt-TgtType, x:Int, r:Int) :
+      val src = n(locs[x] as Reg|FReg)
+      swap(t, src, r) when src != r
 
    ;     Analysis
    ;     --------
@@ -1469,8 +1509,8 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
       val pt = ports-to-table(ports-in)
       val locs = for x in in(b) map :
          match(loaded?(x), pt[n(x)]) :
-            (ld:True, loc:Reg) : loc
-            (ld:True, loc:Stack) : FreeReg()
+            (ld:True, loc:Reg|FReg) : loc
+            (ld:True, loc:Stack) : FreeReg(tt[n(x)])
             (ld:False, loc) : Stack(n(x))
             (ld:Any, loc) : loc
       assign(in(b), locs)
@@ -1483,28 +1523,32 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
          (e:Set) :
             val y* = fill(y(e))
             free(releases-up-to(rt, Pos(i, true)))
-            assign(x(e), FreeReg(regs-in(list(y*))))
+            assign(x(e), FreeReg(var-type(x(e)), regs-in(list(y*))))
             emit(Set(fill(x(e)), y*))
          (e:Op) :
             ;Implement different rules depending on operation type
             val ys* = match(op(e)) :
                (op:ComOp) :
+                  val x = head(xs(e))
                   val ys* = fill(ys(e))
-                  free(releases-up-to(rt, Pos(i, true)))
-                  assign(head(xs(e)), FreeReg(regs-in(ys*)))
+                  free(releases-up-to(rt, Pos(i, true)))                  
+                  assign(x, FreeReg(var-type(x), regs-in(ys*)))
                   ys*
                (op:NComOp) :
+                  val x = head(xs(e))
                   val ys* = fill(ys(e))
                   free(releases-up-to(rt, Pos(i, true)))
-                  assign(head(xs(e)), FreeReg(regs-in(list(ys*[0])),
-                                              regs-in(list(ys*[1]))))
+                  assign(x, FreeReg(var-type(x),
+                                    regs-in(list(ys*[0])),
+                                    regs-in(list(ys*[1]))))
                   ys*
                (op:DivOp) :
                   val rs = to-list(releases-up-to(rt, Pos(i, true)))
-                  ensure-free(list(0), rs)
+                  ensure-free(tgt-BYTE-TYPE, list(0), rs)
+                  val x = head(xs(e))
                   val ys* = fill(ys(e))
                   free(rs)
-                  assign(head(xs(e)), Reg(0))
+                  assign(x, Reg(0))
                   ys*
             emit(Op(op(e), fill(xs(e)), ys*))
          (e:Branch) :
@@ -1514,13 +1558,13 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
          (e:Save) :
             emit(Save(fill(x(e))))            
          (e:Load) :
-            assign(list(x(e)), list(FreeReg()))
+            assign(list(x(e)), list(FreeReg(var-type(x(e)))))
             emit(Load(fill(x(e))))
          (e:WArgs) :
             val lxs = liveports(xs(e))
             val locs = for x in lxs map :
                match(loaded?(x)) :
-                  (l:True|Any) : FreeReg()
+                  (l:True|Any) : FreeReg(tt[n(x)])
                   (l:False) : Stack(n(x))
             assign(lxs, locs)
             emit(WArgs(fill(xs(e))))
@@ -1531,7 +1575,7 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
             val lxs = liveports(xs(e))
             val locs = for x in lxs map :
                match(loaded?(x)) :
-                  (l:True|Any) : FreeReg()
+                  (l:True|Any) : FreeReg(var-type(x))
                   (l:False) : Stack(n(x))
             assign(lxs, locs)
             emit(WCall(arity(e), fill(xs(e)), f*, ys*, tail?(e)))
@@ -1545,7 +1589,7 @@ defn register-assignment (b:WBlock, ports-in:List<LivePort>) :
           in*, out*, dist(b))
 
 
-defn register-assignment (p:Unit) :
+defn register-assignment (tt:HashTable<Int,tgt-TgtType>, p:Unit) :
    ;     Algorithm State
    ;     ---------------
    val block-table = HashTable<Int,False|WBlock>({_})
@@ -1559,7 +1603,7 @@ defn register-assignment (p:Unit) :
 
    ;Assign registers to the given block   
    defn assign-regs (b:WBlock, ports-in:List<LivePort>) :
-      val b* = register-assignment(b, ports-in)
+      val b* = register-assignment(tt, b, ports-in)
       add(blocks*, b*)
       block-table[n(b*)] = false
       b*
