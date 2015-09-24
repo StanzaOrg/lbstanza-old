@@ -12,6 +12,7 @@ defpackage stz/kform :
    import stz/kl-ir
    import stz/utils
    import stz/lexer
+   import stz/padder
    import stz/tgt-ir with: (prefix => tgt-)
 
 
@@ -165,16 +166,210 @@ defn parse-kl-ir (file:String) -> KComm :
 ;                       Compiler
 ;                       ========
 
-;Used for compiling instructions with KLoc
-definterface LocType
-defstruct LocalLoc <: LocType :
-   base: tgt-Var   
-defstruct MemLoc <: LocType :
-   base: tgt-Mem
-   offset: Int
-defstruct PointerLoc <: LocType :
-   base: tgt-Var
-   offset: Int   
+
+;     Variable Management
+;     -------------------
+defclass VarTable <: Gettable<Int,List<tgt-Var>> &
+                     Settable<Int,List<tgt-Var>>
+defmethod make-var (v:VarTable, t:tgt-TgtType) -> tgt-Var
+
+defn VarTable () :
+   val defs = Vector<tgt-DefVar>()
+   val table = HashTable<Int,List<tgt-Var>>({_})
+   new VarTable :
+      defmethod make-var (this, t:tgt-TgtType) :
+         val n = fresh-id()
+         add(defs, tgt-DefVar(n, t))
+         tgt-Var(n)
+      defmethod set (this, n:Int, vs:List<tgt-Var>) :
+         table[n] = vs
+      defmethod get (this, n:Int) :
+         table[n]
+
+defn make-vars (v:VarTable, ts:List<tgt-TgtType>) :
+   for t in ts map :
+      make-var(v, t)
+
+
+;                     Type Analysis
+;                     =============
+
+;     Type Table Interface
+;     --------------------
+defclass TypeTable
+defmethod expand (t:TypeTable, t:KLSType) -> List<tgt-TgtType> 
+defmethod offsets (t:TypeTable, t:KLSType) -> List<Int>      
+defmethod size (t:TypeTable, t:KLSType) -> Int               
+defmethod field-offset (t:TypeTable, f:Int) -> Int           
+defmethod field-index (t:TypeTable, f:Int) -> Int            
+defmethod field-type (t:TypeTable, f:Int) -> KLSType         
+defmethod rfield (t:TypeTable, n:Int) -> Int                 
+defmethod tag (t:TypeTable, n:Int) -> Int                    
+
+;     Analysis
+;     --------
+defn analyze-types (prog:KComm) :
+   ;     Search through all types
+   ;     ------------------------
+   val lstypes = HashTable<Int, KLSDefType>({_})
+   val types = HashTable<Int, KDefType>({_})
+   defn find-types (c:KComm) :
+      match(c) :
+         (c:KDefType) : types[n(c)] = c
+         (c:KLSDefType) : lstypes[n(c)] = c
+         (c) : false
+   find-types(prog)
+
+   ;     Compute Alignments
+   ;     ------------------
+   defn prim-type-size (t:KLSType) :
+      match(t) :
+         (t:KByteT) : 1
+         (t:KIntT) : 4
+         (t:KLongT) : 8
+         (t:KFloatT) : 4
+         (t:KDoubleT) : 8
+         (t:KPtrT) : 8
+         (t:KRefT) : 8
+         (t:KUnknownT) : error("No size.")
+         (t:KFnT) : error("No size.")
+         (t:KStructT) : error("No size.")
+
+   val alignment-table = HashTable<Int,Int>({_})
+   defn alignment (t:KLSType) :
+      defn struct-alignment (t:KStructT) :
+         val def = lstypes[n(t)]
+         maximum{_, stream(alignment{type(_)}, fields(def))} $
+            match(rfield(def)) :
+               (rf:StructField) : alignment(type(rf))
+               (rf:False) : 0
+      match(t) :
+         (t:KUnknownT) : error("No alignment.")
+         (t:KFnT) : error("No alignment.")
+         (t:KStructT) :
+            if not key?(alignment-table, n(t)) :
+               alignment-table[n(t)] = struct-alignment(t)
+            alignment-table[n(t)]
+         (t) : prim-type-size(t)
+
+   ;     Compute Sizes, Offsets, Indices
+   ;     -------------------------------
+   val type-sizes = HashTable<Int,Int>({_})
+   val type-expansions = HashTable<Int,List<tgt-TgtType>>({_})
+   val field-offsets = HashTable<Int,Int>({_})
+   defn type-expansion (t:KLSType) -> [Int, List<tgt-TgtType>] :   
+      defn struct-expansion (t:KStructT) -> [Int, List<tgt-TgtType>] :
+         ;Helper: Assign field offsets according to padded items
+         defn assign-offsets (padded:Streamable<PadItem>) :
+            var accum = 0
+            val expansion = Vector<tgt-TgtType>()
+            for i in padded do :
+               match(i) :
+                  (i:Item) :
+                     val f = data(i) as StructField
+                     field-offsets[n(f)] = accum
+                     val [sz, ts] = type-expansion(type(f))
+                     do(add{expansion, _}, ts)
+                     accum = accum + sz
+                  (i:Padding) :
+                     accum = accum + size(i)
+            [accum, to-list(expansion)]
+            
+         val def = lstypes[n(t)]
+         match(rfield(def)) :
+            (rf:StructField) :
+               val padded = pad{_, alignment(type(rf))} $
+                  for f in fields(def) stream :
+                     Item(alignment(type(f)), f)
+               val [sz, ts] = assign-offsets(padded)
+               field-offsets[n(rf)] = sz
+               [sz, ts]
+            (rf:False) :
+               val padded = pad{_, 1} $
+                  for f in fields(def) stream :
+                     Item(alignment(type(f)), f)
+               assign-offsets(padded)          
+
+      defn prim-type-expansion (t:KLSType) :
+         list $ match(t) :
+            (t:KByteT) : tgt-BYTE-TYPE
+            (t:KIntT) : tgt-INT-TYPE
+            (t:KLongT) : tgt-LONG-TYPE
+            (t:KFloatT) : tgt-FLOAT-TYPE
+            (t:KDoubleT) : tgt-DOUBLE-TYPE
+            (t:KPtrT) : tgt-LONG-TYPE
+            (t:KRefT) : tgt-REF-TYPE
+         
+      match(t) :
+         (t:KUnknownT) :
+            error("No expansion.")
+         (t:KFnT) :
+            error("No expansion.")
+         (t:KStructT) :
+            if not key?(type-sizes, n(t)) :
+               val [sz, ts] = struct-expansion(t)
+               type-sizes[n(t)] = sz
+               type-expansions[n(t)] = ts
+            [type-sizes[n(t)], type-expansions[n(t)]]
+         (t) :
+            [prim-type-size(t), prim-type-expansion(t)]
+         
+   ;Force calculation for field-offsets
+   do(type-expansion{KStructT(_)}, keys(lstypes))
+
+   ;     Compute Field Types and Indices
+   ;     -------------------------------
+   val field-indices = HashTable<Int,Int>({_})
+   val field-types = HashTable<Int,KLSType>({_})
+   for def in values(lstypes) do :
+      for (f in fields(def), i in 0 to false) do :
+         field-indices[n(f)] = i
+         field-types[n(f)] = type(f)
+      if rfield(def) != false :
+         val f = rfield(def) as StructField
+         field-indices[n(f)] = length(fields(def))
+         field-types[n(f)] = type(f)
+
+   ;     Compute Struct Tags
+   ;     -------------------
+   val tag-table = HashTable<Int,Int>({_})
+   val tag-types = Vector<Int>()
+   for def in values(lstypes) do :
+      tag-table[n(def)] = length(tag-types)
+      add(tag-types, n(def))
+   for def in values(types) do :
+      tag-table[n(def)] = length(tag-types)
+      add(tag-types, n(def))
+
+   
+   ;     Return Table
+   ;     ------------
+   new TypeTable :
+      defmethod expand (this, t:KLSType) :
+         val [sz, ts] = type-expansion(t)
+         ts
+      defmethod offsets (this, t:KLSType) :
+         match(t) :
+            (t:KStructT) :
+               for f in fields(lstypes[n(t)]) map :
+                  field-offset(this, n(f))
+            (t) : list(0)
+      defmethod size (this, t:KLSType) :
+         val [sz, ts] = type-expansion(t)
+         sz
+      defmethod field-offset (this, f:Int) :
+         field-offsets[f]
+      defmethod field-type (this, f:Int) :
+         field-types[f]
+      defmethod field-index (this, f:Int) ;
+         field-indices[f]
+      defmethod rfield (this, s:Int) :
+         n(rfield(lstypes[s]) as StructField)
+      defmethod tag (this, n:Int) :
+         tag-table[n]
+
+
+
 
 defn compile (prog:KComm) -> tgt-Program :
    ;     Algorithm State
@@ -234,7 +429,10 @@ defn compile (prog:KComm) -> tgt-Program :
       ;     Layer 2
       ;     -------
       ;Compile function prelude
-      error("Compile function prelude.")      
+      let :
+         for (v in args(c), t in a1(c)) do :
+            environment[v] = make-vars(compile-types(t))
+         tgt-args(compile-vars(args(c)))
 
       ;Compile function body
       defn compile-comm (c:KLSComm) :
