@@ -1,3 +1,3 @@
-./estanza -i compiler/stz-tgt.stanza -o build/tgt
+./estanza -i verify/test-tgt.stanza -o build/tgt
 
 
