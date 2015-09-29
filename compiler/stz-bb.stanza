@@ -145,8 +145,8 @@ defn to-bb-ir (d:tgt-DefFn) -> [HashTable<Int,tgt-TgtType>, Unit] :
    ;Translate instructions
    for i in tgt-body(d) do :            
       match(i) :
-         (i:tgt-WArgs) :
-            val xs* = to-var(tgt-xs(i))
+         (i:tgt-ArgsIns) :
+            val xs* = map(to-var, tgt-xs(i))
             emit(Args(xs*))
          (i:tgt-SetIns) :
             val x* = to-var(tgt-x(i))
@@ -224,7 +224,7 @@ defn to-bb-ir (d:tgt-DefFn) -> [HashTable<Int,tgt-TgtType>, Unit] :
             val xs = map(to-var, tgt-xs(i))
             val f = to-imm(tgt-f(i))
             val ys = map(to-imm, tgt-ys(i))
-            emit(CallC(xs, f, ys))
+            emit(CallC(tgt-n(i), xs, f, ys))
          (i:tgt-TCall) :
              val f = to-imm(tgt-f(i))
              val ys = map(to-imm, tgt-ys(i))
@@ -333,7 +333,7 @@ defstruct Unload <: Ins&Working :
 defstruct Xchg <: Ins&Working :
    x: Var
    y: Var
-   swap: Reg|FReg|False
+   swap: Reg|False
 defstruct Glue <: Ins&Working :
    xs: List<Var>
    ys: List<Var>
@@ -483,7 +483,7 @@ defn analyze-liveness (u:Unit) :
 
    ;     Create results table
    ;     --------------------
-   defn to-port (x:Int) : LivePort(x, Any(), Any(), NoLoc())
+   defn to-port (x:Int) : Port(x, Any(), Any(), NoLoc())
    val in-lists = HashTable<Int,List<Int>>({_})
    val out-lists = HashTable<Int,List<Int>>({_})
    val dist-lists = HashTable<Int,List<Int>>({_})
@@ -594,7 +594,7 @@ defn usage-table (b:WBlock) :
       match(x) :
          (x:Int) : add(usages, x, u)
          (x:Var) : add-usage(n(x), u)
-         (x:LivePort) : add-usage(n(x), u)
+         (x:Port) : add-usage(n(x), u)
          (x) : false
 
    for (e in ins(b), i in 0 to false) do :
@@ -663,7 +663,7 @@ defn release-table (b:WBlock) :
 
    ;Initialize live-out as live
    for x in out(b) do :
-      mark-loaded(n(x)) when loaded?(x) != false
+      mark-loaded(n(x), true) when loaded?(x) != false
 
    ;Analyze expression list
    val n = length(ins(b))
@@ -971,11 +971,11 @@ defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock) -> WBlock :
          (e:Save) :
             kill(rt[Pos(i,false), Pos(i,true)])
             save(x(e))
-         (e:WArgs) :
+         (e:Args) :
             kill(rt[Pos(i,false), Pos(i,true)])
             emit(e)
             define(xs(e))
-         (e:WCall|WCallC) :
+         (e:Call|CallC) :
             val rs = rt[Pos(i,false), Pos(i,true)]
             val [nr,nf] = num-spills-required(List(f(e), ys(e)), rs, List())
             spill(Pos(i,false), nr, nf)
@@ -1011,96 +1011,51 @@ defn propagate-assumptions (b:WBlock) :
    defn emit (i:Ins) :
       add(output, i)
 
-   defn define-port (x:Port) :
-      match(x) :
-         (x:LivePort) :
-            load-assumptions[n(x)] = match(loaded?(x)) :
-               (l:Any) : Accept()
-               (l:True|False) : Assume(l)
-            save-assumptions[n(x)] = match(saved?(x)) :
-               (s:Any) : Accept()
-               (s:True|False) : Assume(s)            
-         (x:DeadPort) :
-            false
+   ;Incoming assumptions on ports
+   for x in in(b) do :
+      load-assumptions[n(x)] = match(loaded?(x)) :
+         (l:Any) : Accept()
+         (l:True|False) : Assume(l)
+      save-assumptions[n(x)] = match(saved?(x)) :
+         (s:Any) : Accept()
+         (s:True|False) : Assume(s)
 
-   defn assumed-port (x:Port) :
+   ;Process assumptions on each instruction
+   val instructions = to-stream(ins(b))
+   while more?(instructions) :
+      match(next(instructions)) :
+         (e:Save) :            
+            val x = n(x(e))
+            match(get?(save-assumptions, x, false)) :
+               (a:Accept) : save-assumptions[x] = Assume(true)
+               (a:Assume|False) : emit(Save(Var(x)))
+         (e:Load) :
+            val x = n(x(e))
+            match(get?(load-assumptions, x, false)) :
+               (a:Accept) : load-assumptions[x] = Assume(true)
+               (a:Assume|False) : emit(Load(Var(x)))
+         (e:Unload) :
+            val x = n(x(e))
+            match(get?(load-assumptions, x, false)) :
+               (a:Accept) : load-assumptions[x] = Assume(false)
+               (a:Assume|False) : false
+         (e:Args|Call|CallC) :
+            emit(e)
+            while more?(instructions) :
+               emit(next(instructions))
+         (e) :
+            emit(e)
+
+   ;Propagated assumptions on ports
+   val in* = for x in in(b) map :
       defn get-value (x:Assumption) :
          match(x) :
             (x:Assume) : value(x)
             (x:Accept) : Any()
-      match(x) :
-         (x:LivePort) :
-            LivePort(n(x),
-                     get-value(save-assumptions[n(x)]),
-                     get-value(load-assumptions[n(x)]),
-                     loc(x))
-         (x:DeadPort) :
-            x
-
-   ;Define all incoming ports
-   do(define-port, in(b))
-
-   ;Process assumptions on each instruction
-   val instructions = to-stream(ins(b))
-   defn* loop (process-assumptions: () -> False) :
-      if more?(instructions) :
-         val e = next(instructions)
-
-         defn fill-ports (f: List<Port> -> Ins, xs:List<Port>) :
-            val i = length(output)
-            emit(e) ;Placeholder
-            process-assumptions()
-            clear(save-assumptions)
-            clear(load-assumptions)
-            do(define-port, xs)
-            loop $ fn* () :
-               output[i] = f(map(assumed-port, xs))
-
-         match(e) :
-            (e:Save) :            
-               val x = n(x(e))
-               match(get?(save-assumptions, x, false)) :
-                  (a:Accept) : save-assumptions[x] = Assume(true)
-                  (a:Assume|False) : emit(Save(Var(x)))
-               loop(process-assumptions)
-            (e:Load) :
-               val x = n(x(e))
-               match(get?(load-assumptions, x, false)) :
-                  (a:Accept) : load-assumptions[x] = Assume(true)
-                  (a:Assume|False) : emit(Load(Var(x)))
-               loop(process-assumptions)
-            (e:Unload) :
-               val x = n(x(e))
-               match(get?(load-assumptions, x, false)) :
-                  (a:Accept) : load-assumptions[x] = Assume(false)
-                  (a:Assume|False) : false
-               loop(process-assumptions)
-            (e:WArgs) :
-               for xs* in xs(e) fill-ports :
-                  WArgs(xs*)
-            (e:WCall) :
-               for xs* in xs(e) fill-ports :
-                  WCall(arity(e), xs*, f(e), ys(e), tail?(e))
-            (e:WCallC) :
-               for xs* in xs(e) fill-ports :
-                  WCallC(xs*, f(e), ys(e))
-            (e) :
-               for vx in e do-defined :
-                  val x = n(vx)
-                  if get?(load-assumptions, x, false) typeof Accept :
-                     load-assumptions[x] = Assume(Any())
-                  if get?(save-assumptions, x, false) typeof Accept :
-                     save-assumptions[x] = Assume(Any())
-               emit(e)
-               loop(process-assumptions)
-      else :
-         process-assumptions()
-
-   ;Read out the assumptions on input ports
-   var in*
-   loop $ fn* () :
-      in* = for x in in(b) map :
-         assumed-port(x) as LivePort
+      Port(n(x),
+           get-value(save-assumptions[n(x)]),
+           get-value(load-assumptions[n(x)]),
+           loc(x))   
 
    ;Return result
    WBlock(n(b), output, next(b),
@@ -1190,13 +1145,8 @@ defn register-assignment (tt:HashTable<Int,tgt-TgtType>,
             locs[x] = l
             freg-slots[n(l)] = x
 
-   defn assign (x:Port, l:Loc) :
-      match(x) :
-         (x:LivePort) : assign(n(x), l)
-         (x) : false
-
-   defn assign (x:Var, l:Loc) :
-      assign(n(x), l)
+   defn assign (x:Port, l:Loc) : assign(n(x), l)
+   defn assign (x:Var, l:Loc) : assign(n(x), l)
 
    defn assign (xs:List<Var|Port>, ls:List<Loc>) :
       ;First assign stacks and regs
@@ -1380,7 +1330,7 @@ defn register-assignment (tt:HashTable<Int,tgt-TgtType>,
             val ys* = fill(ys(e))
             free(rt[Pos(i,false), Pos(i,true)])
             assign(xs(e), map(FreeReg{}, xs(e)))
-            emit(CallC(fill(xs(e)), f*, ys*))
+            emit(CallC(n(e), fill(xs(e)), f*, ys*))
 
       ;Free any unused defines
       free(rt[Pos(i,true), Pos(i,false)])
@@ -1399,7 +1349,7 @@ defn register-assignment (tt:HashTable<Int,tgt-TgtType>, p:Unit) :
    val blocks* = Vector<Block>()
 
    ;Assign registers to the given block
-   defn assign-regs (b:WBlock, ports-in:List<LivePort>) :
+   defn assign-regs (b:WBlock, ports-in:List<Port>) :
       val b* = register-assignment(tt, b, ports-in)
       add(blocks*, b*)
       block-table[n(b*)] = false
@@ -1702,7 +1652,7 @@ defn calculate-stack-map (tt:HashTable<Int,tgt-TgtType>, u:Unit) :
    ;     Compute Stack Offsets
    ;     ---------------------
    ;Pad stack items
-   val items* = let :
+   val [items*, aln] = let :
       val items = Vector<Item>()
       for (t in types, i in 0 to false) do :
          defn type-size (t:tgt-TgtType) :
@@ -1771,7 +1721,7 @@ defn collapse-blocks (u:Unit) :
    defn emit (i:Ins) :
       add(output, i)
 
-   defn glue-ports (xs:List<LivePort>, ys:List<LivePort>) :
+   defn glue-ports (xs:List<Port>, ys:List<Port>) :
       ;Variables needed to glue
       val xs* = Vector<Var>()
       val ys* = Vector<Var>()
@@ -1871,7 +1821,7 @@ defstruct MemAV <: AVal :
 defstruct ExMemAV <: AVal :
    name: Symbol
 defstruct Swap <: AVal :
-   type: asm-AsmType
+   type: asm-AsmType with: (as-method => true)
 
 defmethod type (x:RSPAV) : asm-LONG-TYPE
 defmethod type (x:MemAV) : asm-LONG-TYPE
@@ -2118,28 +2068,28 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
                else :
                   xs* = List(x, xs*)
                   ys* = List(y, ys*)
-            reg-shuffle(int?, xs*, ys*, nreg)
+            shuffle(int?, xs*, ys*, nreg)
             
             ;Load register 0
             for x in ld do :
-               if int? : av-load(RegAV(x,LT), Swap(LT))
-               else : av-load(FRegAV(x,DT), Swap(DT))
+               if int? : av-load(RegAV(x,LT), Swap(LT), 0)
+               else : av-load(FRegAV(x,DT), Swap(DT), 0)
                
-      defn shuffle (xs:List<AVal>, ys:List<AVal>) :
-         val rxs = Vector<Int>()
-         val rys = Vector<Int>()
-         val fxs = Vector<Int>()
-         val fys = Vector<Int>()
-         for (x in xs, y in ys) do :
-            match(x, y) :
-               (x:RegAV, y:RegAV) :
-                  add(rxs, n(x))
-                  add(rys, n(y))
-               (x:FRegAV, y:FRegAV) :
-                  add(fxs, n(x))
-                  add(fys, n(y))
-         shuffle(true, to-list(rxs), to-list(rys), 8)
-         shuffle(false, to-list(fxs), to-list(fys), 8)
+   defn shuffle (xs:List<AVal>, ys:List<AVal>) :
+      val rxs = Vector<Int>()
+      val rys = Vector<Int>()
+      val fxs = Vector<Int>()
+      val fys = Vector<Int>()
+      for (x in xs, y in ys) do :
+         match(x, y) :
+            (x:RegAV, y:RegAV) :
+               add(rxs, n(x))
+               add(rys, n(y))
+            (x:FRegAV, y:FRegAV) :
+               add(fxs, n(x))
+               add(fys, n(y))
+      shuffle(true, to-list(rxs), to-list(rys), 8)
+      shuffle(false, to-list(fxs), to-list(fys), 8)
 
 
    ;     Convert Instructions
@@ -2151,7 +2101,7 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
          (e:Return) :
             val xs* = map(aval, xs(e))
             val ts* = call-locations(xs*)
-            av-mov(ts*, xs*)
+            shuffle(ts*, xs*)
             av-return()
          (e:Op) :
             match(op(e)) :
@@ -2177,7 +2127,7 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
          (e:Args) :
             val xs* = map(aval, xs(e))
             val ts* = call-locations(xs*)
-            av-mov(xs*, ts*)
+            shuffle(xs*, ts*)
          (e:Call) :
             ;Convert to AVals
             val f* = aval(f(e))
@@ -2187,10 +2137,10 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
             match(f*) :
                (f*:MemAV|ExMemAV) :
                   val ts* = call-locations(ys*)
-                  av-mov(ts*, ys*)
+                  shuffle(ts*, ys*)
                (f*) :
                   val ts* = call-locations(f*, ys*)
-                  av-mov(ts*, List(f*,ys*))
+                  shuffle(ts*, List(f*,ys*))
 
             ;Call
             av-mov(av-arity(), av-long(arity(e)))
@@ -2201,7 +2151,7 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
             ;Move return values out from Args
             val xs* = map(aval, xs(e))
             val ts* = call-locations(xs*)
-            av-mov(xs*, ts*)
+            shuffle(xs*, ts*)
          (e:CallC) :
             ;Convert to AVals
             val f* = aval(f(e))
@@ -2211,22 +2161,23 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
             match(f*) :
                (f*:MemAV|ExMemAV) :
                   val ts* = callc-locations(ys*)
-                  av-mov(ts*, ys*)
+                  shuffle(ts*, ys*)
                (f*) :
                   val ts* = callc-locations(f*, ys*)
-                  av-mov(ts*, List(f*,ys*))
+                  shuffle(ts*, List(f*,ys*))
 
             ;Call
-            av-mov(MemAV(STACK-PTR-LBL), RSPAV())
-            av-load(RSPAV(), MemAV(C-RSP-LBL), 0)
+            val SPL = tgt-STACK-PTR-LBL
+            av-mov(MemAV(SPL), RSPAV())
+            av-load(RSPAV(), MemAV(tgt-C-RSP-LBL), 0)
             av-sub(RSPAV(), RSPAV(), av-long(8 * n(e)))
             av-call(f*)
-            av-load(RSPAV(), MemAV(STACK-PTR-LBL), 0)
+            av-load(RSPAV(), MemAV(SPL), 0)
 
             ;Move return values out from Args
             val xs* = map(aval, xs(e))
             val ts* = callc-ret-locations(xs*)
-            av-mov(xs*, ts*)
+            shuffle(xs*, ts*)
          (e:Save) :
             val x* = aval(x(e))
             val sx* = stack-aval(x(e))
@@ -2236,22 +2187,11 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
             val sx* = stack-aval(x(e))
             av-mov(x*, sx*)
          (e:Xchg) :
-            defn freg (n:Int) : FRegAV(n, asm-DOUBLE-TYPE)
-            match(loc(x(e)), loc(y(e)), swap(e)) :
-               (xl:Reg, yl:Reg, s) :
-                  av-xchg(aval(x(e)), aval(y(e)))
-               (xl:FReg, yl:FReg, s:FReg) :                 
-                  av-mov(freg(n(s)), freg(n(yl)))
-                  av-mov(freg(n(yl)), freg(n(xl)))
-                  av-mov(freg(n(xl)), freg(n(s)))
-               (xl:FReg, yl:FReg, s:False) :
-                  av-mov(FSwap(), freg(n(yl)))
-                  av-mov(freg(n(yl)), freg(n(xl)))
-                  av-mov(freg(n(xl)), FSwap())
+            av-xchg(aval(x(e)), aval(y(e)))
          (e:Glue) :
             val xs* = map(aval,xs(e))
             val ys* = map(aval,ys(e))
-            av-mov(xs*, ys*)
+            shuffle(xs*, ys*)
          (e:Label) :
             av-label(n(e))
          (e:Goto) :
