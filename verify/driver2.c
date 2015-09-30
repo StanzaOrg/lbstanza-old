@@ -15,8 +15,30 @@ int main () {
   return 0;
 }
 
-int helper (int x) {
+int print_int (int x) {
   printf("x = %d\n", x);
+  return 0;
+}
+
+int print_ints (int x1, int x2, int x3, int x4, int x5, int x6,
+                int x7, int x8, int x9, int x10, int x11, int x12,
+                int x13, int x14, int x15, int x16) {
+  printf("x1 = %d\n", x1);
+  printf("x2 = %d\n", x2);
+  printf("x3 = %d\n", x3);
+  printf("x4 = %d\n", x4);
+  printf("x5 = %d\n", x5);
+  printf("x6 = %d\n", x6);
+  printf("x7 = %d\n", x7);
+  printf("x8 = %d\n", x8);
+  printf("x9 = %d\n", x9);
+  printf("x10 = %d\n", x10);
+  printf("x11 = %d\n", x11);
+  printf("x12 = %d\n", x12);
+  printf("x13 = %d\n", x13);
+  printf("x14 = %d\n", x14);
+  printf("x15 = %d\n", x15);
+  printf("x16 = %d\n", x16);
   return 0;
 }
 
