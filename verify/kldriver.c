@@ -69,6 +69,28 @@ int print_floats (float x1, float x2, float x3, float x4, float x5, float x6,
   return 0;
 }
 
+int print_ints_floats (int x1, float x2, int x3, float x4, int x5, float x6,
+                       int x7, float x8, int x9, float x10, int x11, float x12,
+                       int x13, float x14, int x15, float x16) {
+  printf("x1 = %d\n", x1);
+  printf("x2 = %f\n", x2);
+  printf("x3 = %d\n", x3);
+  printf("x4 = %f\n", x4);
+  printf("x5 = %d\n", x5);
+  printf("x6 = %f\n", x6);
+  printf("x7 = %d\n", x7);
+  printf("x8 = %f\n", x8);
+  printf("x9 = %d\n", x9);
+  printf("x10 = %f\n", x10);
+  printf("x11 = %d\n", x11);
+  printf("x12 = %f\n", x12);
+  printf("x13 = %d\n", x13);
+  printf("x14 = %f\n", x14);
+  printf("x15 = %d\n", x15);
+  printf("x16 = %f\n", x16);
+  return 0;
+}
+
 //int helper (int x0, float y0,
 //            int x1, float y1,
 //            int x2, float y2,
