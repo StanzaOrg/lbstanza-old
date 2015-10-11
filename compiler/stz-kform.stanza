@@ -524,6 +524,7 @@ defn convert-calls (prog:KProg) :
    ;     --------
    val global-funcs = HashTable<Int, FSummary>({_})
    defn global-func? (n:Int) : key?(global-funcs, n)
+   
    for c in comms(prog) do :
       match(c) :
          (c:KDefn) :
@@ -532,27 +533,37 @@ defn convert-calls (prog:KProg) :
                   (f:KCode) : FuncSummary(arity(f), length(args(f)))
                   (f:KMultifn) : MultiSummary(map({to-summary(_) as FuncSummary}, funcs(f)))                  
             global-funcs[n(c)] = to-summary(value(c))
-         (c:KLSDefn) :
-            global-funcs[n(c)] = FuncSummary(length(args(c)), 0)
+         (c:KLSDefCode) :
+            global-funcs[n(c)] = FuncSummary(arity(c), length(args(c)))
          (c) : false
          
    ;     Transformation
    ;     --------------
    val accum = Vector<KComm>()
    val codetable = HashTable<Int,Int>({_})
-   val closure-cache = HashTable<Int,KVar>({_})
+   val closure-cache = HashTable<Int,Int>({_})
 
-   defn make-first-class (n:Int, f:FSummary) :
-      match(f) :
-         (f:FuncSummary) :
-            val args* = to-list(stream(fresh-id{}, 0 to num-args(f)))
-            val argvs = map(KVar{_, false}, args*)
-            val body* = KCall(true, arity(f), n, argvs, false)
-            KCode(0, arity(f), List(fresh-id(), args*), body*)
-         (f:MultiSummary) :
-            KMultifn $ for func in funcs(f) map :
-               make-first-class(n, func) as KCode
-   
+   defn make-closure (n:Int, f:FSummary) :
+      defn make-first-class (n:Int, f:FSummary) :
+         match(f) :
+            (f:FuncSummary) :
+               val args* = to-list(stream(fresh-id{}, 0 to num-args(f)))
+               val argvs = map(KVar{_, false}, args*)
+               val body* = KCall(true, arity(f), n, argvs, false)
+               KCode(0, arity(f), List(fresh-id(), args*), body*)
+            (f:MultiSummary) :
+               KMultifn $ for func in funcs(f) map :
+                  make-first-class(n, func) as KCode
+      if not key?(closure-cache, n) :            
+         val code = fresh-id()
+         add(accum, KDefn(code, make-first-class(n, f)))
+         val clo = fresh-id()
+         add(accum, KDef(clo, KClosure(code, List(), false)))
+         closure-cache[n] = clo
+      closure-cache[n]   
+
+   ;     Transforming HiStanza expressions
+   ;     ---------------------------------
    defn conv-exp (e:KExp) :
       defn record-code (d) :
          match(d) :
@@ -582,20 +593,51 @@ defn convert-calls (prog:KProg) :
             mapr(conv-exp, e)
          (e:KVar) :
             if global-func?(n(e)) :
-               if not key?(closure-cache, n(e)) :
-                  val n* = fresh-id()
-                  add(accum, KDefn(n*, make-first-class(n(e), global-funcs[n(e)])))
-                  closure-cache[n(e)] = KVar(n*,false)
-               closure-cache[n(e)]
+               val clo = make-closure(n(e), global-funcs[n(e)])
+               KVar(clo, false)
             else : e
          (e) :
             map(conv-exp, e)
 
-   ;Driver
+   ;     Transforming LoStanza expressions
+   ;     ---------------------------------
+   defn conv-ptr-loc (l:KLoc) :
+      match(l) :
+         (l:Value) : l
+         (l:Field) : Field(conv-ptr-loc(base(l)), n(l))
+         (l) : map(conv-ls-exp, l)      
+               
+   defn conv-ls-exp (e:KLSExp) :
+      match(e) :
+         (e:KLSPtr) :
+            KLSPtr(conv-ptr-loc(exp(e)))
+         (e:KLSVar) :
+            if global-func?(n(e)) :
+               val clo = make-closure(n(e), global-funcs[n(e)])
+               KVar(clo, false)
+            else : e
+         (e) : map(conv-ls-exp, e)
+
+   defn conv-ls-comm (c:KLSComm) :
+      mapr(conv-ls-exp, c)
+
+   ;     Driver
+   ;     ------
    for c in comms(prog) do :
-      val c* = map(conv-exp{normalize(_)}, c)
-      add(accum, c*)
-   KProg(to-list(accum))   
+      add{accum, _} $ match(c) :
+         (c:KDef|KDefVar|KDefn|KExpComm) :
+            for e in c map :
+               conv-exp(normalize(e))
+         (c:KLSDef|KLSDefCode|KLInit) :
+            map(conv-ls-comm, c)
+         (c) : c
+   KProg(to-list(accum))
+
+
+;============================================================
+;==================== Compilation ===========================
+;============================================================
+
 
 
 ;;                  Match Trie Conversion
@@ -659,200 +701,9 @@ defn convert-calls (prog:KProg) :
 ;   var accum:List<MTrie> = List()
 ;   for (b in branches, i in 0 to false) do :
 ;      add(accum, b, i)
-;   accum   
+;   accum
 
 
-;                     Type Analysis
-;                     =============
-
-;     Type Table Interface
-;     --------------------
-defclass TypeTable
-defmulti expand (tt:TypeTable, t:KLSType) -> List<tgt-TgtType> 
-defmulti pad+expand (tt:TypeTable, t:KLSType) -> List<tgt-TgtType> 
-defmulti offsets (tt:TypeTable, t:KLSType) -> List<Int>      
-defmulti size (tt:TypeTable, t:KLSType) -> Int               
-defmulti alignment (tt:TypeTable, t:KLSType) -> Int
-defmulti field-offset (tt:TypeTable, f:Int) -> Int           
-defmulti field-index (tt:TypeTable, f:Int) -> Int            
-defmulti field-type (tt:TypeTable, f:Int) -> KLSType         
-defmulti rfield (tt:TypeTable, n:Int) -> Int                 
-defmulti tag (tt:TypeTable, n:Int) -> Int                    
-
-;     Analysis
-;     --------
-defn type-table (prog:KProg) :
-   ;     Search through all types
-   ;     ------------------------
-   val lstypes = HashTable<Int, KLSDefType>({_})
-   val types = HashTable<Int, KDefType>({_})
-   for c in comms(prog) do :
-      match(c) :
-         (c:KDefType) :
-            error("Untested.")
-            types[n(c)] = c
-         (c:KLSDefType) : lstypes[n(c)] = c
-         (c) : false
-
-   ;     Compute Expansions
-   ;     ------------------
-   val struct-expansions = HashTable<Int, List<tgt-TgtType>>({_})
-   defn expand (t:KLSType) :
-      defn expand-struct (n:Int) :
-         for f in fields(lstypes[n]) map-append :
-            expand(type(f))
-      match(t) :
-         (t:KByteT) : list(tgt-BYTE-TYPE)
-         (t:KIntT) : list(tgt-INT-TYPE)
-         (t:KLongT) : list(tgt-LONG-TYPE)
-         (t:KFloatT) : list(tgt-FLOAT-TYPE)
-         (t:KDoubleT) : list(tgt-DOUBLE-TYPE)
-         (t:KPtrT) : list(tgt-LONG-TYPE)
-         (t:KRefT) : list(tgt-REF-TYPE)
-         (t:KStructT) :
-            if not key?(struct-expansions, n(t)) :
-               struct-expansions[n(t)] = expand-struct(n(t))
-            struct-expansions[n(t)]
-         (t) : error("No expansion for ~." % [t])
-
-   ;     Compute Field Types and Indices
-   ;     -------------------------------
-   val field-structs = HashTable<Int,Int>({_})
-   val field-indices = HashTable<Int,Int>({_})
-   val field-types = HashTable<Int,KLSType>({_})
-   for def in values(lstypes) do :
-      for (f in fields(def), i in 0 to false) do :
-         field-structs[n(f)] = n(def)
-         field-indices[n(f)] = i
-         field-types[n(f)] = type(f)
-      if rfield(def) != false :
-         val f = rfield(def) as StructField
-         field-structs[n(f)] = n(def)
-         field-indices[n(f)] = length(fields(def))
-         field-types[n(f)] = type(f)
-
-   ;     Compute Alignments, Padding, and Size
-   ;     -------------------------------------
-   val pad+expansions = HashTable<Int, List<tgt-TgtType>>({_})
-   val struct-alignments = HashTable<Int, Int>({_})
-   val type-sizes = HashTable<Int,Int>({_})
-   val field-offsets = HashTable<Int,Int>({_})
-
-   defn type-size (t:KLSType) :
-      match(t) :
-         (t:KByteT) : 1
-         (t:KIntT) : 4
-         (t:KLongT) : 8
-         (t:KFloatT) : 4
-         (t:KDoubleT) : 8
-         (t:KPtrT) : 8
-         (t:KRefT) : 8
-         (t:KUnknownT) : error("No size.")
-         (t:KFnT) : error("No size.")
-         (t:KStructT) :
-            compute-struct(n(t)) when not key?(type-sizes, n(t))
-            type-sizes[n(t)]
-
-   defn type-alignment (t:KLSType) :
-      match(t) :
-         (t:KStructT) :
-            compute-struct(n(t)) when not key?(struct-alignments, n(t))
-            struct-alignments[n(t)]
-         (t) : type-size(t)
-
-   defn pad+expand (t:KLSType) :
-      match(t) :
-         (t:KStructT) :
-            compute-struct(n(t)) when not key?(pad+expansions, n(t))
-            pad+expansions[n(t)]
-         (t) : expand(t)
-
-   defn field-offset (f:Int) :
-      if not key?(field-offsets, f) :
-         compute-struct(field-structs[f])
-      field-offsets[f]
-
-   defn compute-struct (sn:Int) :
-      ;Pad struct fields
-      val def = lstypes[sn]
-      val items = for f in fields(def) stream :
-         Item(type-alignment(type(f)), n(f))         
-      val [items*, aln] = match(rfield(def)) :
-         (rf:False) : pad(items, 1)
-         (rf:StructField) : pad(items, type-alignment(type(rf)))
-
-      ;Compute struct alignment, field offsets, type sizes, and padded expansions
-      var accum = 0
-      val expansion = Vector<tgt-TgtType>()
-      for x in items* do :
-         match(x) :
-            (x:Item) :
-               val f = data(x) as Int
-               val ft = field-types[f]
-               field-offsets[f] = accum
-               do(add{expansion, _}, pad+expand(ft))
-               accum = accum + type-size(ft)
-            (x:Padding) :
-               switch {size(x) == _} :
-                  1 : add(expansion, tgt-BYTE-TYPE)
-                  4 : add(expansion, tgt-INT-TYPE)
-               accum = accum + size(x)
-
-      ;Record Rest Field offset
-      if rfield(def) != false :
-         val rf = rfield(def) as StructField
-         field-offsets[n(rf)] = accum
-
-      ;Record Size, Expansion, and Alignment
-      type-sizes[sn] = accum         
-      pad+expansions[sn] = to-list(expansion)
-      struct-alignments[sn] = aln      
-
-
-   ;     Compute Struct Tags
-   ;     -------------------
-   val tag-table = HashTable<Int,Int>({_})
-   val tag-types = Vector<Int>()
-   for def in values(lstypes) do :
-      tag-table[n(def)] = length(tag-types)
-      add(tag-types, n(def))
-   for def in values(types) do :
-      tag-table[n(def)] = length(tag-types)
-      add(tag-types, n(def))
-
-   
-   ;     Return Table
-   ;     ------------
-   new TypeTable :
-      defmethod expand (this, t:KLSType) :
-         expand(t)
-      defmethod pad+expand (this, t:KLSType) :
-         pad+expand(t)
-      defmethod offsets (this, t:KLSType) :
-         match(t) :
-            (t:KStructT) :
-               for f in fields(lstypes[n(t)]) map :
-                  field-offset(n(f))
-            (t) : list(0)
-      defmethod size (this, t:KLSType) :
-         type-size(t)
-      defmethod alignment (this, t:KLSType) :
-         type-alignment(t)
-      defmethod field-offset (this, f:Int) :
-         field-offset(f)
-      defmethod field-type (this, f:Int) :
-         field-types[f]
-      defmethod field-index (this, f:Int) :
-         field-indices[f]
-      defmethod rfield (this, s:Int) :
-         n(rfield(lstypes[s]) as StructField)
-      defmethod tag (this, n:Int) :
-         tag-table[n]
-
-
-;============================================================
-;==================== Compilation ===========================
-;============================================================
 
 ;                   Command Buffer
 ;                   ==============
@@ -971,6 +822,7 @@ defn to-tgt-op (op:KLSOp) :
       ULE-OP : tgt-ULE-OP
       UGE-OP : tgt-UGE-OP
 
+
 ;                  Variable Management
 ;                  ===================
 
@@ -1003,12 +855,12 @@ defn VarTable () :
       defmethod defs (this) :
          defs
 
-defn get (v:VarTable, ns:List<Int>) :
-   map-append({v[_]}, ns)
-defn get (t:VarTable, v:KLSVar) :
-   t[n(v)]
-defn get (t:VarTable, vs:List<KLSVar>) :
-   t[map(n,vs)]
+;defn get (v:VarTable, ns:List<Int>) :
+;   map-append({v[_]}, ns)
+;defn get (t:VarTable, v:KLSVar) :
+;   t[n(v)]
+;defn get (t:VarTable, vs:List<KLSVar>) :
+;   t[map(n,vs)]
 
 defn make-vars (v:VarTable, ts:List<tgt-TgtType>) :
    for t in ts map :
@@ -1021,116 +873,77 @@ defn VAR-TABLE! () : VAR-TABLE as VarTable
 defn make-var (t:tgt-TgtType) : make-var(VAR-TABLE!(), t)
 defn make-vars (ts:List<tgt-TgtType>) : map(make-var, ts)
 defn tgt-vars (n:Int) : VAR-TABLE!()[n]
-defn tgt-vars (ns:List<Int>) : VAR-TABLE!()[ns]
-defn tgt-vars (v:KLSVar) : VAR-TABLE!()[v]
-defn tgt-vars (vs:List<KLSVar>) : VAR-TABLE!()[vs]
+;defn tgt-vars (ns:List<Int>) : VAR-TABLE!()[ns]
+;defn tgt-vars (v:KLSVar) : VAR-TABLE!()[v]
+;defn tgt-vars (vs:List<KLSVar>) : VAR-TABLE!()[vs]
 defn tgt-types (n:Int) : types(VAR-TABLE!(), n)
-defn tgt-types (v:KLSVar) : types(VAR-TABLE!(), n(v))
+;defn tgt-types (v:KLSVar) : types(VAR-TABLE!(), n(v))
 
 
-;                    Global Table
-;                    ============
 
-defclass GlobalTable
-defmulti global? (t:GlobalTable, n:Int) -> True|False
-defmulti global-lbl (t:GlobalTable, n:Int) -> Int|Symbol
-defmulti global-type (t:GlobalTable, n:Int) -> KLSType
-defmulti function? (t:GlobalTable, n:Int) -> True|False
-defmulti function-lbl (t:GlobalTable, n:Int) -> Int|Symbol
-
-defn global-table (prog:KProg) :
-   val globals = HashTable<Int, Int|Symbol>({_})
-   val global-types = HashTable<Int, KLSType>({_})
-   val functions = HashTable<Int,Int|Symbol>({_})
-   
-   for c in comms(prog) do :
-      defn mark-global (n:Int, lbl:Int|Symbol, t:KLSType) :
-         globals[n] = lbl
-         global-types[n] = t
-      defn mark-function (n:Int, lbl:Int|Symbol, t:KLSType) :
-         mark-global(n, lbl, t)
-         functions[n] = lbl
-      
-      match(c) :
-         (c:KDef) : mark-global(n(c), n(c), KRefT(KTop()))
-         (c:KDefVar) : mark-global(n(c), n(c), KRefT(KTop()))
-         (c:KDefn) : error("Not yet implemented.")
-         (c:KDefmulti) : error("Not yet implemented.")
-         (c:KLSDef) : mark-global(n(c), n(c), type(c))
-         (c:KLSDefn) : mark-function(n(c), n(c), KFnT(a1(c), false, a2(c)))
-         (c:KExtern) : mark-global(n(c), name(c), type(c))
-         (c:KExternFn) : mark-function(n(c), name(c), type(c))
-         (c) : false
-
-   new GlobalTable :
-      defmethod global? (this, n:Int) : key?(globals, n)
-      defmethod global-lbl (this, n:Int) : globals[n]
-      defmethod global-type (this, n:Int) : global-types[n]
-      defmethod function? (this, n:Int) : key?(functions, n)
-      defmethod function-lbl (this, n:Int) : functions[n]
 
 
 
 ;               LoStanza Function Normalization
 ;               ===============================
 
-defn in-reverse<?T> (xs:Vector<?T>) :
-   for i in (length(xs) - 1) through 0 by -1 stream :
-      xs[i]
-
-defn normalize (comm:KLSComm) :
-   val def-vector = Vector<KeyValue<Int,KLSExp|KLSType>>()
-   defn fresh-var (value:KLSExp) :
-      val n = fresh-id()
-      add(def-vector, n => value)
-      KLSVar(n)
-
-   defn force-var (e:KLSExp) :
-      match(e) :
-         (e:KLSVar) : e
-         (e:KLSExp) : fresh-var(norm-exp(e))
-
-   defn norm-exp (e:KLSExp) :
-      map(force-var, e)
-
-   defn norm-comm (c:KLSComm) :
-      match(c) :
-         (c:KLSCall) :
-            map(norm-exp, c)
-         (c:KLSTCall) :
-            map(norm-exp, c)
-         (c:KLSSet) :
-            KLSSet(map(force-var, exp(c)),
-                   force-var(value(c)))                     
-         (c:KLSReturn) :
-            map(force-var, c)
-         (c:KLSLet) :
-            add(def-vector, n(c) => norm-exp(value(c)))
-            norm-comm(body(c))
-         (c:KLSLetVar) :
-            add(def-vector, n(c) => type(c))
-            norm-comm(body(c))
-         (c:KLSSeq) :
-            KLSSeq(norm-comm(a(c))
-                   normalize(b(c)))
-         (c:KLSIf) :
-            KLSIf(force-var(pred(c))
-                  normalize(conseq(c))
-                  normalize(alt(c)))
-         (c:KLSMatch) :
-            error("Untested.")
-            KLSMatch(map(force-var, args(c)),
-                     map(map{normalize, _}, branches(c)))
-         (c:KLSPrimComm) :
-            map(force-var, c)
-         (c) : c
-
-   var ret = norm-comm(comm)
-   for entry in in-reverse(def-vector) do :
-      ret = match(value(entry)) :
-         (v:KLSExp) : KLSLet(key(entry), v, ret)
-         (t:KLSType) : KLSLetVar(key(entry), t, ret)
-   ret
+;defn in-reverse<?T> (xs:Vector<?T>) :
+;   for i in (length(xs) - 1) through 0 by -1 stream :
+;      xs[i]
+;
+;defn normalize (comm:KLSComm) :
+;   val def-vector = Vector<KeyValue<Int,KLSExp|KLSType>>()
+;   defn fresh-var (value:KLSExp) :
+;      val n = fresh-id()
+;      add(def-vector, n => value)
+;      KLSVar(n)
+;
+;   defn force-var (e:KLSExp) :
+;      match(e) :
+;         (e:KLSVar) : e
+;         (e:KLSExp) : fresh-var(norm-exp(e))
+;
+;   defn norm-exp (e:KLSExp) :
+;      map(force-var, e)
+;
+;   defn norm-comm (c:KLSComm) :
+;      match(c) :
+;         (c:KLSCall) :
+;            map(norm-exp, c)
+;         (c:KLSTCall) :
+;            map(norm-exp, c)
+;         (c:KLSSet) :
+;            KLSSet(map(force-var, exp(c)),
+;                   force-var(value(c)))                     
+;         (c:KLSReturn) :
+;            map(force-var, c)
+;         (c:KLSLet) :
+;            add(def-vector, n(c) => norm-exp(value(c)))
+;            norm-comm(body(c))
+;         (c:KLSLetVar) :
+;            add(def-vector, n(c) => type(c))
+;            norm-comm(body(c))
+;         (c:KLSSeq) :
+;            KLSSeq(norm-comm(a(c))
+;                   normalize(b(c)))
+;         (c:KLSIf) :
+;            KLSIf(force-var(pred(c))
+;                  normalize(conseq(c))
+;                  normalize(alt(c)))
+;         (c:KLSMatch) :
+;            error("Untested.")
+;            KLSMatch(map(force-var, args(c)),
+;                     map(map{normalize, _}, branches(c)))
+;         (c:KLSPrimComm) :
+;            map(force-var, c)
+;         (c) : c
+;
+;   var ret = norm-comm(comm)
+;   for entry in in-reverse(def-vector) do :
+;      ret = match(value(entry)) :
+;         (v:KLSExp) : KLSLet(key(entry), v, ret)
+;         (t:KLSType) : KLSLetVar(key(entry), t, ret)
+;   ret
 
 
 ;                 LoStanza Call Conversion
@@ -1155,143 +968,371 @@ defn convert-calls (c:KLSComm, gt:GlobalTable) :
    conv-comm(c)
 
 
-;                   LoStanza Global Access
-;                   ======================
+;                    Global Table
+;                    ============
 
-defn make-global-readers (c:KLSComm, gt:GlobalTable) :
-   defn add-loc-readers (l:KLoc) -> KLoc :
-      match(l) :
-         (l:Value) :
-            if exp(l) not-typeof KLSVar :
-               error("Not in normalized form.")
-            val n = n(exp-var(l))   
-            if global?(gt, n) : Global(n)
-            else : Local(n)
-         (l:Field) : Field(add-loc-readers(base(l)), n(l))
-         (l) : map(add-exp-readers, l)
-   defn add-exp-readers (e:KLSExp) :
-      match(e) :
-         (e:KLSVar) :
-            if global?(gt, n(e)) : KLSRead(Global(n(e)))
-            else : e
-         (e:KLSPtr) : KLSPtr(add-loc-readers(exp(e)))
-         (e:KLSRead) : KLSRead(add-loc-readers(exp(e)))
-         (e) : map(add-exp-readers, e)
-   defn add-comm-readers (c:KLSComm) :
-      match(c) :
-         (c:KLSSet) :
-            KLSSet(add-loc-readers(exp(c))
-                   add-exp-readers(value(c)))
-         (c) :
-            map(add-comm-readers, map(add-exp-readers, c))
+defclass GlobalTable <: Gettable<Int, GEntry>
+defmulti add-global (gt:GlobalTable, n:Int) -> False
+defmulti add-function (gt:GlobalTable, n:Int) -> False
+defmulti add-type-object (gt:GlobalTable, n:Int) -> False
+defmulti add-const (gt:GlobalTable, n:Int, v) -> False
+defmulti add-ls-global (gt:GlobalTable, n:Int, t:KLSType) -> False
+defmulti add-ls-function (gt:GlobalTable, n:Int) -> False
+defmulti add-ls-extern (gt:GlobalTable, n:Int, t:KLSType, lbl:Symbol) -> False
+defmulti add-ls-externfn (gt:GlobalTable, n:Int, lbl:Symbol) -> False
+defmulti global-var? (t:GlobalTable, n:Int) -> True|False
+defmulti global-lbl (t:GlobalTable, n:Int) -> Int|Symbol
+defmulti global-var-type (t:GlobalTable, n:Int) -> KLSType
+defmulti root-vars (t:GlobalTable) -> Streamable<Int>
+defmulti global-consts (t:GlobalTable) -> Streamable<Int>
 
-   normalize(add-comm-readers(c))
+;Values: Globals, Consts, Externs
+;Functions: Functions, Types
+definterface GEntry
+defstruct HiGlobal <: GEntry
+defstruct HiFunction <: GEntry
+defstruct HiType <: GEntry
+defstruct GConst <: GEntry : (value)
+defstruct LoGlobal <: GEntry : (type:KLSType)
+defstruct LoFunction <: GEntry
+defstruct GExtern <: GEntry : (type:KLSType, lbl:Symbol)
+defstruct GExternFn <: GEntry : (lbl:Symbol)
+
+defn global-table () :
+   val entries = HashTable<Int, GEntry>({_})
+   new GlobalTable :      
+      defmethod add-global (gt:GlobalTable, n:Int) -> False :
+         entries[n] = HiGlobal()
+      defmethod add-function (gt:GlobalTable, n:Int) -> False :
+         entries[n] = HiFunction()
+      defmethod add-type-object (gt:GlobalTable, n:Int) -> False :
+         entries[n] = HiType()
+      defmethod add-const (gt:GlobalTable, n:Int, v) -> False :
+         entries[n] = GConst(v)
+      defmethod add-ls-global (gt:GlobalTable, n:Int, t:KLSType) -> False :
+         entries[n] = LoGlobal(t)
+      defmethod add-ls-function (gt:GlobalTable, n:Int) -> False :
+         entries[n] = LoFunction()
+      defmethod add-ls-extern (gt:GlobalTable, n:Int, t:KLSType, lbl:Symbol) -> False :
+         entries[n] = GExtern(t, lbl)
+      defmethod add-ls-externfn (gt:GlobalTable, n:Int, lbl:Symbol) -> False :
+         entries[n] = GExternFn(lbl)
+      defmethod global-var? (t:GlobalTable, n:Int) -> True|False :
+         get?(entries, n, false) typeof HiGlobal|GConst|LoGlobal|GExtern
+      defmethod global-lbl (t:GlobalTable, n:Int) -> Int|Symbol :
+         match(entries[n]) :
+            (e:GExtern|GExternFn) : lbl(e)
+            (e) : n
+      defmethod global-var-type (t:GlobalTable, n:Int) -> KLSType :
+         match(entries[n]) :
+            (e:LoGlobal|GExtern) : type(e)
+            (e:HiGlobal|GConst) : KRefT(KTop())
+      defmethod get (this, n:Int) :
+         entries[n]      
+      defmethod root-vars (this) :
+         stream{key, _} $
+         for e in entries filter :
+            value(e) typeof HiGlobal|LoGlobal
+      defmethod global-consts (this) :
+         stream{key, _} $
+         for e in entries filter :
+            value(e) typeof GConst
 
 
-;                   Transformations
-;                   ===============
 
-defn transform (prog:KProg, gt:GlobalTable) :
-   val cs = for c in comms(prog) map :
-      match(c) :
-         (c:KLSDefn) :
-            var body* = convert-calls(body(c), gt)
-            body* = make-global-readers(body*, gt)
-            KLSDefn(n(c), targs(c), a1(c), a2(c), args(c), body*)
-         (c:KLSInit) :
-            var comm* = convert-calls(comm(c), gt)
-            comm* = make-global-readers(comm*, gt)
-            KLSInit(comm*)
-         (c) : c
-   KProg(cs)      
-      
+;                     Type Analysis
+;                     =============
+
+;     Type Table Interface
+;     --------------------
+defclass TypeTable
+defmulti add-type (tt:TypeTable, c:KDefType) -> False
+defmulti add-ls-type (tt:TypeTable, c:KLSDefType) -> False
+defmulti end-adds (tt:TypeTable) -> False
+
+defmulti expand (tt:TypeTable, t:KLSType) -> List<tgt-TgtType> 
+defmulti pad+expand (tt:TypeTable, t:KLSType) -> List<tgt-TgtType> 
+defmulti offsets (tt:TypeTable, t:KLSType) -> List<Int>      
+defmulti size (tt:TypeTable, t:KLSType) -> Int               
+defmulti alignment (tt:TypeTable, t:KLSType) -> Int
+defmulti field-offset (tt:TypeTable, f:Int) -> Int           
+defmulti field-index (tt:TypeTable, f:Int) -> Int            
+defmulti field-type (tt:TypeTable, f:Int) -> KLSType         
+defmulti rfield (tt:TypeTable, n:Int) -> Int                 
+defmulti tag (tt:TypeTable, n:Int) -> Int                    
+
+;     Analysis
+;     --------
+defn type-table (prog:KProg) :
+   ;     Search through all types
+   ;     ------------------------
+   val lstypes = HashTable<Int, KLSDefType>({_})
+   val types = HashTable<Int, KDefType>({_})
+
+   ;     Compute Expansions
+   ;     ------------------
+   val struct-expansions = HashTable<Int, List<tgt-TgtType>>({_})
+   defn expand (t:KLSType) :
+      defn expand-struct (n:Int) :
+         for f in fields(lstypes[n]) map-append :
+            expand(type(f))
+      match(t) :
+         (t:KByteT) : list(tgt-BYTE-TYPE)
+         (t:KIntT) : list(tgt-INT-TYPE)
+         (t:KLongT) : list(tgt-LONG-TYPE)
+         (t:KFloatT) : list(tgt-FLOAT-TYPE)
+         (t:KDoubleT) : list(tgt-DOUBLE-TYPE)
+         (t:KPtrT) : list(tgt-LONG-TYPE)
+         (t:KRefT) : list(tgt-REF-TYPE)
+         (t:KStructT) :
+            if not key?(struct-expansions, n(t)) :
+               struct-expansions[n(t)] = expand-struct(n(t))
+            struct-expansions[n(t)]
+         (t) : error("No expansion for ~." % [t])
+
+   ;     Compute Field Types and Indices
+   ;     -------------------------------
+   val field-structs = HashTable<Int,Int>({_})
+   val field-indices = HashTable<Int,Int>({_})
+   val field-types = HashTable<Int,KLSType>({_})
+   defn compute-field-stats () :
+      for def in values(lstypes) do :
+         for (f in fields(def), i in 0 to false) do :
+            field-structs[n(f)] = n(def)
+            field-indices[n(f)] = i
+            field-types[n(f)] = type(f)
+         if rfield(def) != false :
+            val f = rfield(def) as StructField
+            field-structs[n(f)] = n(def)
+            field-indices[n(f)] = length(fields(def))
+            field-types[n(f)] = type(f)
+
+   ;     Compute Struct Tags
+   ;     -------------------
+   defn compute-struct-tags () :
+      val tag-table = HashTable<Int,Int>({_})
+      val tag-types = Vector<Int>()
+      for def in values(lstypes) do :
+         tag-table[n(def)] = length(tag-types)
+         add(tag-types, n(def))
+      for def in values(types) do :
+         tag-table[n(def)] = length(tag-types)
+         add(tag-types, n(def))
+
+   ;     Compute Alignments, Padding, and Size
+   ;     -------------------------------------
+   val pad+expansions = HashTable<Int, List<tgt-TgtType>>({_})
+   val struct-alignments = HashTable<Int, Int>({_})
+   val type-sizes = HashTable<Int,Int>({_})
+   val field-offsets = HashTable<Int,Int>({_})
+
+   defn type-size (t:KLSType) :
+      match(t) :
+         (t:KByteT) : 1
+         (t:KIntT) : 4
+         (t:KLongT) : 8
+         (t:KFloatT) : 4
+         (t:KDoubleT) : 8
+         (t:KPtrT) : 8
+         (t:KRefT) : 8
+         (t:KUnknownT) : error("No size.")
+         (t:KFnT) : error("No size.")
+         (t:KStructT) :
+            compute-struct(n(t)) when not key?(type-sizes, n(t))
+            type-sizes[n(t)]
+
+   defn type-alignment (t:KLSType) :
+      match(t) :
+         (t:KStructT) :
+            compute-struct(n(t)) when not key?(struct-alignments, n(t))
+            struct-alignments[n(t)]
+         (t) : type-size(t)
+
+   defn pad+expand (t:KLSType) :
+      match(t) :
+         (t:KStructT) :
+            compute-struct(n(t)) when not key?(pad+expansions, n(t))
+            pad+expansions[n(t)]
+         (t) : expand(t)
+
+   defn field-offset (f:Int) :
+      if not key?(field-offsets, f) :
+         compute-struct(field-structs[f])
+      field-offsets[f]
+
+   defn compute-struct (sn:Int) :
+      ;Pad struct fields
+      val def = lstypes[sn]
+      val items = for f in fields(def) stream :
+         Item(type-alignment(type(f)), n(f))         
+      val [items*, aln] = match(rfield(def)) :
+         (rf:False) : pad(items, 1)
+         (rf:StructField) : pad(items, type-alignment(type(rf)))
+
+      ;Compute struct alignment, field offsets, type sizes, and padded expansions
+      var accum = 0
+      val expansion = Vector<tgt-TgtType>()
+      for x in items* do :
+         match(x) :
+            (x:Item) :
+               val f = data(x) as Int
+               val ft = field-types[f]
+               field-offsets[f] = accum
+               do(add{expansion, _}, pad+expand(ft))
+               accum = accum + type-size(ft)
+            (x:Padding) :
+               switch {size(x) == _} :
+                  1 : add(expansion, tgt-BYTE-TYPE)
+                  4 : add(expansion, tgt-INT-TYPE)
+               accum = accum + size(x)
+
+      ;Record Rest Field offset
+      if rfield(def) != false :
+         val rf = rfield(def) as StructField
+         field-offsets[n(rf)] = accum
+
+      ;Record Size, Expansion, and Alignment
+      type-sizes[sn] = accum         
+      pad+expansions[sn] = to-list(expansion)
+      struct-alignments[sn] = aln      
+
+   
+   ;     Return Table
+   ;     ------------
+   new TypeTable :
+      defmethod add-type (this, c:KDefType) :
+         types[n(c)] = c
+      defmethod add-ls-type (this, c:KDLSDefType) :
+         lstypes[n(c)] = c
+      defmethod end-adds (this) :
+         compute-field-stats()
+         compute-struct-tags()         
+      defmethod expand (this, t:KLSType) :
+         expand(t)
+      defmethod pad+expand (this, t:KLSType) :
+         pad+expand(t)
+      defmethod offsets (this, t:KLSType) :
+         match(t) :
+            (t:KStructT) :
+               for f in fields(lstypes[n(t)]) map :
+                  field-offset(n(f))
+            (t) : list(0)
+      defmethod size (this, t:KLSType) :
+         type-size(t)
+      defmethod alignment (this, t:KLSType) :
+         type-alignment(t)
+      defmethod field-offset (this, f:Int) :
+         field-offset(f)
+      defmethod field-type (this, f:Int) :
+         field-types[f]
+      defmethod field-index (this, f:Int) :
+         field-indices[f]
+      defmethod rfield (this, s:Int) :
+         n(rfield(lstypes[s]) as StructField)
+      defmethod tag (this, n:Int) :
+         tag-table[n]
+            
 
 ;                      Compilation
 ;                      ===========
 
-defn global-mem (t:GlobalTable, n:Int) :
-   match(global-lbl(t, n)) :
-      (l:Int) : mem(l)
-      (l:Symbol) : xmem(l)
-
-defn function-mem (t:GlobalTable, n:Int) :
-   match(function-lbl(t, n)) :
-      (l:Int) : mem(l)
-      (l:Symbol) : xmem(l)
-
 definterface CResult
 defmulti assign (xs:List<tgt-Var>, r:CResult) -> False
 defmulti imms (r:CResult) -> List<tgt-Imm>
-defmulti vars (r:CResult) -> List<tgt-Var>
+defmulti types (r:CResult) -> List<tgt-TgtType>
+defn vars (r:CResult) -> List<tgt-Var> :
+   val vs = make-vars(types(r))
+   assign(vs, r)
+   vs
 
 definterface CSResult
 defmulti assign (x:tgt-Var, r:CSResult) -> False
 defmulti imm (r:CSResult) -> tgt-Imm
-defmulti imm-var (r:CSResult) -> tgt-Var
+defn imm-var (r:CSResult) -> tgt-Var :
+   val x = make-var(tgt-REF-TYPE)
+   assign(x, r)
+   x
 
-defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
-   ;     Overall Compiler
-   ;     ----------------
-   val globals = Vector<KeyValue<Int,KLSType>>()
-   
-   defn compile (c:KComm) :
+defn compile (prog:KProg) -> tgt-Program :
+   ;     Analysis
+   ;     --------
+   val gt = GlobalTable()
+   val tt = TypeTable()
+
+   for c in comms(prog) do :
       match(c) :
-         (c:KDef) : error("Compile KDef command.")
-         (c:KDefVar) : error("Compile KDefVar command.")
-         (c:KDefn) : error("Compile KDefn command.")
-         (c:KDefType) : error("Compile KDefType command.")
-         (c:KExpComm) : false
-         (c:KLSDef) : add(globals, n(c) => type(c))
-         (c:KLSDefn) : compile-lsdefn(c)
-         (c:KLSDefType) : false
-         (c:KExtern) : false
-         (c:KExternFn) : false
+         (c:KDef) : add-global(gt, n(c))
+         (c:KDefVar) : add-global(gt, n(c))
+         (c:KDefn) : add-function(gt, n(c))
+         (c:KDefTypeObject) : add-type-object(gt, n(c))
+         (c:KDefConst) : add-const(gt, n(c), value(c))
+         (c:KDefType) : add-type(tt, c)
+         (c:KInit) : false
+         (c:KLSDef) : add-ls-global(gt, n(c), type(c))
+         (c:KLSDefCode) : add-ls-function(gt, n(c))
+         (c:KExtern) : add-ls-extern(gt, n(c), type(c))
+         (c:KExternFn) : add-ls-externfn(gt, n(c))
+         (c:KLSDefType) : add-ls-type(tt, c)
          (c:KLSInit) : false
+         
+   end-adds(tt)         
+
+   ;Retrieving the immediates for a global
+   defn global-mem (n:Int) :
+      match(global-lbl(gt, n)) :
+         (l:Int) : mem(l)
+         (l:Symbol) : xmem(l)
 
 
-   ;     Table Compiler
-   ;     --------------
-   defn compile-tables () :
+   ;     Compiling Tables
+   ;     ----------------
+   defn compile-machine-state () :
+      emit(tgt-DefData())
+      
       ;Floating Point Zeros
       emit(tgt-TLabel(FLOAT-ZERO-LBL))
       emit(tgt-DefFloat(0.0))
       emit(tgt-TLabel(DOUBLE-ZERO-LBL))
       emit(tgt-DefDouble(0.0))
+      
       ;Heap Labels
-      emit(tgt-DefData())
       emit(tgt-TLabel(HEAP-PTR-LBL))
       emit(tgt-DefLong(0))
       emit(tgt-TLabel(HEAP-LIM-LBL))
       emit(tgt-DefLong(0))
-      emit(tgt-DefText())
+      
       ;Stack Labels
-      emit(tgt-DefData())
       emit(tgt-TLabel(STACK-PTR-LBL))
       emit(tgt-DefLong(0))
       emit(tgt-TLabel(STACK-LIM-LBL))
       emit(tgt-DefLong(0))
-      emit(tgt-DefText())
-      
 
-   ;     Compile the Global Variables
-   ;     ----------------------------
+      emit(tgt-DefText())
+
+
+   ;     Compiling Globals
+   ;     -----------------
    defn compile-globals () :
       ;Sort all globals by alignment for packing
-      sort-by-key!(globals, alignment{tt, value(_)})
-      ;Pad all the items to ensure structures are aligned
-      val items = for e in globals stream :
-         Item(alignment(tt, value(e)), e)
-      val [items*, aln] = pad(items, 1)
+      val entries = Vector<Int>()
+      do(add{entries, _}, root-vars(gt))
+      sort-by-key!(entries, alignment{tt, global-var-type(gt, _)})
+
+      ;Pad all items to ensure structures are aligned
+      val items = let :      
+         val xs = for e in entries stream :
+            Item(alignment(tt, type(e)), e)
+         val [padded-xs, aln] = pad(xs, 1)
+         padded-xs
+         
       ;Start emission of table
       emit(tgt-DefData())
-      for x in items* do :
+      for x in items do :
          match(x) :
             (x:Item) :
-               val entry = data(x) as KeyValue<Int,KLSType>
-               val n = key(entry)
-               val type = value(entry)
-               emit(tgt-TLabel(n))
-               for t in pad+expand(tt, type) do :
+               val v = data(x) as Int
+               emit(tgt-TLabel(v))
+               for t in pad+expand(tt, global-var-type(gt, v)) do :
                   emit $ switch {t == _} :
                      tgt-BYTE-TYPE : tgt-DefByte(0)
                      tgt-INT-TYPE : tgt-DefInt(0)
@@ -1304,24 +1345,32 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
       emit(tgt-DefText())
    
 
-   ;     Compile the Entry Function
-   ;     --------------------------
+   ;     Compiling Entry Function
+   ;     ------------------------
    defn compile-entry () :
       val var-table = VarTable()
       val ins-vector = Vector<tgt-Ins>()
-      
       let-var INSTRUCTION-VECTOR = ins-vector :
          let-var VAR-TABLE = var-table :
-            ;Compile initializing expressions
             for c in comms(prog) do :
                match(c) :
-                  (c:KExpComm) : imm(compile-exp(exp(c)))
-                  (c:KLSInit) : compile-comm(comm(c))
-                  (c) : false
-            ;Return zero
+                  (c:KDef) :
+                     val exp = KSet(n(c), value(c))
+                     imm(compile-exp(exp))
+                  (c:KDefVar) :
+                     if value(c) != false :
+                        val exp = KSet(n(c), value(c) as KExp)
+                        imm(compile-exp(exp))
+                  (c:KInit) :
+                     imm(compile-exp(exp(c)))
+                  (c:KLSDef) :
+                     if value(c) != false :
+                        val comm = KLSSet(KValue(KLSVar(n(c))), value(c))
+                        compile-comm(comm)
+                  (c:KLSInit) :
+                     compile-comm(comm(c))
+                  (c) : false            
             return(list(long(0)))
-
-            ;Create entry function, and return label
             val n = fresh-id()
             emit(tgt-DefFn(n, defs(var-table), ins-vector))
             n
@@ -1332,20 +1381,11 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
       defn ret-imm (x:tgt-Imm) :
          new CSResult :
             defmethod imm (this) : x
-            defmethod assign (x:tgt-Var, this) :
-               set(x, imm(this))
-            defmethod imm-var (this) :
-               val x = make-var(tgt-REF-TYPE)
-               assign(x, this)
-               x
+            defmethod assign (x:tgt-Var, this) : set(x, imm(this))
       defn ret-to-var (f: tgt-Var -> False) :
          new CSResult :
             defmethod assign (x:tgt-Var, this) : f(x)
             defmethod imm (this) : imm-var(this)   
-            defmethod imm-var (this) :
-               val x = make-var(tgt-REF-TYPE)
-               assign(x, this)
-               x
             
       match(e) :
          (e:KSet) : error("Not yet implemented.")
@@ -1367,7 +1407,7 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
             ret-to-var $ fn* (x) :
                val ys = map(imm{compile-exp(_)}, args(e))
                val f = match(func(e)) :
-                  (f:Int) : function-mem(gt, f)
+                  (f:Int) : global-mem(f)
                   (f:KExp) : imm(compile-exp(f))
                call(arity(e), list(x), f, ys)
          (e:KVar) :
@@ -1396,10 +1436,11 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
       let-var INSTRUCTION-VECTOR = ins-vector :
          let-var VAR-TABLE = var-table :
          
-            ;Compile function prelude
+            ;Add arguments to var table
             for (v in args(c), t in a1(c)) do :
                var-table[v] = make-vars(expand(tt, t))
 
+            ;Compile function prelude
             println("Stack switching untested.")
             args(var-table[args(c)])
             
@@ -1420,8 +1461,54 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
             ;Compile function body
             compile-comm(body(c))
 
-      ;Emit function definition
-      emit(tgt-DefFn(n(c), defs(var-table), ins-vector))
+            ;Emit function definition
+            emit(tgt-DefFn(n(c), defs(var-table), ins-vector))
+
+   ;     Compile a LoStanza Location
+   ;     ---------------------------
+   defn compile-loc (loc:KLoc) :
+      defn loc-type (l:KLoc) :
+         match(l) :
+            (l:Value) :
+               if global?(gt, exp(l)) :
+                  val v = exp(l) as KLSVar
+                  global-type(gt, n(v))
+            (l:Deref|Deptr|Slot) : type(l)
+            (l:Field) : field-type(tt, n(l))
+            
+      defn loc-count (l:KLoc) :
+         match(loc-type(l)) :
+            (t:KLSType) : type-count(tt, t)
+            (t:False) : false
+            
+      defn* loop (l:KLoc, off:Int, idx:Int) :
+         match(l) :
+            (l:Value) :
+               if global?(gt, exp(l)) :
+                  val n = n(exp(l) as KLSVar)
+                  PtrLoc(global-mem(n), off, loc-type(loc))
+               else :
+                  match(loc-count(loc)) :
+                     (c:Int) : SubExpLoc(exp(l), idx, c)
+                     (c:False) : ExpLoc(exp(l))
+            (l:Deref) :
+               val p = head(vars(compile-exp(exp(l))))
+               PtrLoc(p, off + 8 - REF-TAG, loc-type(loc))               
+            (l:Deptr) :
+               val p = head(vars(compile-exp(exp(l))))
+               PtrLoc(p, off, loc-type(loc))               
+            (l:Slot) :
+               val b = head(vars(compile-exp(exp(l))))
+               val i = head(vars(compile-exp(index(l))))
+               val p = make-var(tgt-LONG-TYPE)
+               mul(p, long(size(tt, type(l))), i)
+               add(p, p, b)
+               PtrLoc(p, off, loc-type(loc))
+            (l:Field) :
+               loop(base(l),
+                    offset + field-offset(tt, n(l)),
+                    idx + field-index(tt, n(l)))
+      loop(loc, 0, 0)              
 
 
    ;     Compile a LoStanza Command
@@ -1432,56 +1519,25 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
             assign(List(), compile-exp(exp(c)))
          (c:KLSTCall) :
             compile-tail-exp(exp(c))
-         (c:KLSSet) :            
-            defn value-offsets () :
-               val t = match(exp(c)) :
-                  (l:Global) : global-type(gt, n(l))
-                  (l:Deref|Deptr|Slot) : type(l)
-                  (l:Field) : field-type(tt, n(l))
-               offsets(tt, t)
-                  
-            defn* loop (l:KLoc, off:Int, base-n:Int) :
-               match(l) :
-                  (l:Global) :
-                     val p = global-mem(gt, n(l))
-                     val ys = imms(compile-exp(value(c)))
-                     for (o in value-offsets(), y in ys) do :
-                        store(p, y, off + o)
-                  (l:Local) :
-                     val xs = tgt-vars(n(l))
-                     val r = compile-exp(value(c))
-                     assign(tailn(xs,base-n), r)
-                  (l:Deref) :
-                     error("Untested.")
-                     val p = head(tgt-vars(exp-var(l)))
-                     val ys = imms(compile-exp(value(c)))
-                     for (o in value-offsets(), y in ys) do :
-                        store(p, y, off + o + 8 - REF-TAG)
-                  (l:Deptr) :
-                     val p = head(tgt-vars(exp-var(l)))
-                     val ys = imms(compile-exp(value(c)))
-                     for (o in value-offsets(), y in ys) do :
-                        store(p, y, off + o)
-                  (l:Slot) :
-                     val i = head(tgt-vars(index-var(l)))
-                     val b = head(tgt-vars(exp-var(l)))
-                     val ys = imms(compile-exp(value(c)))
-                     val p = make-var(tgt-LONG-TYPE)
-                     mul(p, long(size(tt, type(l))), i)
-                     add(p, p, b)                        
-                     for (o in value-offsets(), y in ys) do :
-                        store(p, y, off + o)
-                  (l:Field) :
-                     loop(base(l),
-                          off + field-offset(tt, n(l)),
-                          base-n + field-index(tt, n(l)))
-            loop(exp(c), 0, 0)
+         (c:KLSSet) :
+            match(compile-loc(exp(c))) :
+               (loc:PtrLoc) :
+                  val ys = imms(compile-exp(value(c)))
+                  for (o in offsets(tt, type(loc)), y in ys) do :
+                     store(base(loc), y, offset(loc) + o)
+               (loc:SubExpLoc) :
+                  val xs = tgt-vars(n(exp(loc)) as KLSVar)
+                  val sub-xs = sublist(xs, index(loc), count(loc))
+                  assign(sub-xs, compile-exp(value(c)))
+               (loc:ExpLoc) :
+                  val xs = tgt-vars(n(exp(loc) as KLSVar))
+                  assign(xs, compile-exp(value(c)))
          (c:KLSLabel) :
             tlabel(n(c))
          (c:KLSGoto) :
             goto(n(c))
          (c:KLSReturn) :
-            return(tgt-vars(exp-var(c)))
+            return(imms(compile-exp(exp(c))))
          (c:KLSLet) :
             VAR-TABLE!()[n(c)] = vars(compile-exp(value(c)))
             compile-comm(body(c))
@@ -1501,7 +1557,7 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
          (c:KLSIf) :
             val altL = fresh-id()
             val endL = fresh-id()
-            val p = head(tgt-vars(pred-var(c)))
+            val p = head(imms(compile-exp(pred(c))))
             jeq(altL, p, long(0))
             compile-comm(conseq(c))
             goto(endL)
@@ -1516,14 +1572,13 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
          (c:KLSPrimComm) :
             switch {op(c) == _} :
                SET-HEAP-PTR :
-                  val x = head(tgt-vars(arg-vars(c)))
+                  val x = head(imms(compile-exp(head(args(c)))))
                   store(mem(HEAP-PTR-LBL), x, 0)
                SET-HEAP-LIM :
-                  val x = head(tgt-vars(arg-vars(c)))
+                  val x = head(imms(compile-exp(head(args(c)))))
                   store(mem(HEAP-LIM-LBL), x, 0)
          (c:KLSSkip) :
             false
-
 
    ;     Compile an Expression
    ;     ---------------------
@@ -1532,46 +1587,44 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
       defn ret-imms (ts:List<tgt-TgtType>, ys:List<tgt-Imm>) :
          new CResult :
             defmethod imms (this) : ys
-            defmethod assign (xs:List<tgt-Var>, this) : do(set, xs, ys)                  
-            defmethod vars (this) :
-               val xs = make-vars(ts)
-               assign(xs, this)
-               xs
-      ;Return single immediate y with type t         
+            defmethod assign (xs:List<tgt-Var>, this) : do(set, xs, ys)
+            defmethod types (this) : ts
       defn ret-imm (t:tgt-TgtType, y: tgt-Imm) :
          ret-imms(list(t), list(y))
-      ;Return value of LSType t
-      defn ret-type (t:KLSType, f: List<tgt-Var> -> False) :
-         new CResult :
-            defmethod imms (this) : vars(this)
-            defmethod assign (xs:List<tgt-Var>, this) : f(xs)
-            defmethod vars (this) :
-               val vs = make-vars(expand(tt, t))
-               assign(vs, this)
-               vs
-      ;Return value of Target type t
-      defn ret-prim (t:tgt-TgtType, f: tgt-Var -> False) :
+      defn ret-imms (t:KLSType, ys:List<tgt-Imm>) :
+         ret-imms(expand(tt, t), ys)
+
+      ;Return to variables with given types ts
+      defn ret-to-var (ts:List<tgt-TgtType>, f: List<tgt-Var> -> False) :
          new CResult :
             defmethod imms (this) : vars(this) 
-            defmethod assign (xs:List<tgt-Var>, this) : f(head(xs))
-            defmethod vars (this) :
-               val vs = list(make-var(t))
-               assign(vs, this)
-               vs
+            defmethod assign (xs:List<tgt-Var>, this) : f(xs)
+            defmethod types (this) : ts
+      defn ret-to-var (t:tgt-TgtType, f: tgt-Var -> False) :
+         ret-to-var(list(t), f{head(_)})
+      defn ret-to-var (t:KLSType, f: List<tgt-Var> -> False) :
+         ret-to-var(expand(tt, t), f)
                
       match(e) :
          (e:KLSVar) :
-            ret-imms(tgt-types(e), tgt-vars(e))
+            if global-var?(gt, n(e)) :
+               compile-exp(KLSRead(Value(e)))
+            else :
+               ret-imms(tgt-types(n(e)), tgt-vars(n(e)))
          (e:KLSRef) :
             val st = KStructT(n(e))
             val sz = 8 + ceil8(size(tt, st))
-            ret-prim{tgt-REF-TYPE, _} $ fn* (x) :
+            ret-to-var{tgt-REF-TYPE, _} $ fn* (x) :
                if sz > 0 :
+                  ;Compile arguments
+                  val args = map-append(imms{compile-exp(_)}, args(e))
+                  ;Extend heap
                   extend-heap(sz)
                   add(x, heap-ptr(), long(REF-TAG))
                   inc-heap-ptr(sz)
-                  store(x, long(tag(tt, n(e))), neg(REF-TAG))
-                  for (o in offsets(tt, st), v in tgt-vars(arg-vars(e))) do :
+                  ;Store into heap
+                  store(x, long(tag(tt, n(e))), neg(REF-TAG))                  
+                  for (o in offsets(tt, st), v in args) do :
                      store(x, v, o + 8 - REF-TAG)
                else :
                   error("Untested.")
@@ -1581,127 +1634,72 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
             val st = KStructT(n(e))
             val rf = rfield(tt, n(e))
             val rft = field-type(tt, rf)
-            ret-prim{tgt-REF-TYPE, _} $ fn* (x) :
-               ;Compute size and extend heap
-               val sz = make-var(tgt-LONG-TYPE)
-               val len = head(tgt-vars(length-var(e)))
+            ret-to-var{tgt-REF-TYPE, _} $ fn* (x) :
+               ;Compile length and arguments
+               val len = head(imms(compile-exp(length(e))))
+               val args = map-append(imms{compile-exp(_)}, args(e))               
+               ;Extend heap
+               val sz = make-var(tgt-LONG-TYPE)               
                mul(sz, long(size(tt, rft)), len)
                add(sz, sz, long(size(tt, st) + 8 + 7))
                bit-and(sz, sz, long(-8))
                extend-heap(sz)
-               ;Store into heap
                add(x, heap-ptr(), long(REF-TAG))
                inc-heap-ptr(sz)
+               ;Store into heap
                store(x, long(tag(tt, n(e))), neg(REF-TAG))
-               for (o in offsets(tt, st), v in tgt-vars(arg-vars(e))) do :
+               for (o in offsets(tt, st), v in args) do :
                   store(x, v, o + 8 - REF-TAG)
          (e:KLSStruct) :
-            ret-imms(expand(tt, KStructT(n(e))),
-                     tgt-vars(arg-vars(e)))
-         (e:KLSPtr) :            
-            ret-prim{tgt-LONG-TYPE, _} $ fn* (x) :
-               defn* loop (l:KLoc, off:Int) :
-                  match(l) :
-                     (l:Global) :
-                        val p = global-mem(gt, n(l))
-                        addr(x, p, off)
-                     (l:Local) :
-                        error("Untested.")
-                        val p = head(tgt-vars(n(l)))
-                        addr(x, p, off)                        
-                     (l:Deref) :
-                        val p = head(tgt-vars(exp-var(l)))
-                        add(x, p, long(off + 8 - REF-TAG))
-                     (l:Deptr) :
-                        val p = head(tgt-vars(exp-var(l)))
-                        if off > 0 : add(x, p, long(off))
-                        else : set(x, p)
-                     (l:Slot) :
-                        error("Untested.")
-                        val i = head(tgt-vars(index-var(l)))
-                        val p = head(tgt-vars(exp-var(l)))
-                        mul(x, long(size(tt, type(l))), i)
-                        add(x, x, p)
-                        add(x, x, long(off)) when off > 0
-                     (l:Field) :
-                        loop(base(l),
-                             off + field-offset(tt, n(l)))
-               loop(exp(e), 0)
-         (e:KLSRead) :            
-            ;Offsets to load from
-            defn value-offsets () :
-               val t = match(exp(e)) :
-                  (l:Global) : global-type(gt, n(l))
-                  (l:Deref|Deptr|Slot) : type(l)
-                  (l:Field) : field-type(tt, n(l))
-               offsets(tt, t)
-
-            ;Value type
-            val ts = match(exp(e)) :
-               (l:Global) : expand(tt, global-type(gt, n(l)))
-               (l:Local) : tgt-types(n(l))
-               (l:Deref|Deptr|Slot) : expand(tt, type(l))
-               (l:Field) : expand(tt, field-type(tt, n(l)))
-
-            ;Load into given variables
-            defn ret-load (p:tgt-Imm, off:Int) :
-               new CResult :
-                  defmethod imms (this) :
-                     vars(this)
-                  defmethod vars (this) :
-                     val xs = make-vars(ts)
-                     assign(xs, this)
-                     xs
-                  defmethod assign (xs:List<tgt-Var>, this) :
-                     for (x in xs, o in value-offsets()) do :
-                        load(x, p, off + o)
-               
-            defn* loop (l:KLoc, off:Int, base-n:Int) -> CResult :
-               match(l) :
-                  (l:Global) :
-                     val p = global-mem(gt, n(l))
-                     ret-load(p, off)
-                  (l:Local) :
-                     val ys = tgt-vars(n(l))
-                     val sub-ys = headn(tailn(ys, base-n), length(ts))
-                     ret-imms(ts, sub-ys)
-                  (l:Deref) :
-                     val p = head(tgt-vars(exp-var(l)))
-                     ret-load(p, off + 8 - REF-TAG)
-                  (l:Deptr) :
-                     val p = head(tgt-vars(exp-var(l)))
-                     ret-load(p, off)
-                  (l:Slot) :
-                     val b = head(tgt-vars(exp-var(l)))
-                     val i = head(tgt-vars(index-var(l)))
-                     val p = make-var(tgt-LONG-TYPE)
-                     mul(p, long(size(tt, type(l))), i)
-                     add(p, p, b)
-                     ret-load(p, off)
-                  (l:Field) :
-                     loop(base(l),
-                          off + field-offset(tt, n(l)),
-                          base-n + field-index(tt, n(l)))
-            loop(exp(e), 0, 0)
+            ;Compile arguments
+            val args = map-append(imms{compile-exp(_)}, args(e))
+            ret-imms(KStructT(n(e)), args)
+         (e:KLSPtr) :         
+            match(compile-loc(exp(e))) :
+               (loc:PtrLoc) :
+                  if offset(loc) == 0 :
+                     ret-imm(tgt-LONG-TYPE, base(loc))
+                  else :
+                     ret-to-var{tgt-LONG-TYPE, _} $ fn* (x) :
+                        add(x, base(loc), long(offset(loc)))                  
+               (loc:SubExpLoc) :
+                  val vs = tgt-vars(n(exp(loc) as KLSVar))
+                  val v = head(tailn(vs, index(loc)))
+                  addr(x, v, 0)
+               (loc:ExpLoc) :
+                  val vs = tgt-vars(n(exp(loc) as KLSVar))
+                  addr(x, head(vs), 0)
+         (e:KLSRead) :
+            match(compile-loc(exp(e))) :
+               (loc:PtrLoc) :
+                  ret-to-var{type(loc), _} $ fn* (xs) :
+                     for (x in xs, o in offsets(t, type(loc))) do :
+                        load(x, base(loc), offset(loc) + o)
+               (loc:SubExpLoc) :
+                  val xs = imms(compile-exp(exp(loc)))
+                  val sub-xs = sublist(xs, index(loc), count(loc))
+                  return-imms(type(loc), sub-xs)
+               (loc:ExpLoc) :
+                  compile-exp(exp(loc))
          (e:KLSWDo) :
-            ret-type{type(e), _} $ fn* (xs) :
-               val ys = tgt-vars(arg-vars(e))
-               val f = match(func-var(e)) :
-                  (f:Int) : function-mem(gt, f)
-                  (f:KLSVar) : head(tgt-vars(f))
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               val f = match(func(e)) :
+                  (f:Int) : global-mem(f)
+                  (f:KLSExp) : head(imms(compile-exp(f)))
                call(arity(e), xs, f, ys)
          (e:KLSWCallC) :
-            ret-type{type(e), _} $ fn* (xs) :
-               val ys = tgt-vars(arg-vars(e))
-               val f = match(func-var(e)) :
-                  (f:Int) : function-mem(gt, f)
-                  (f:KLSVar) : head(tgt-vars(f))
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               val f = match(func(e)) :
+                  (f:Int) : global-mem(f)
+                  (f:KLSExp) : head(imms(compile-exp(f)))
                ffi-call(xs, f, ys)
          (e:KLSWCallClosure) :
             error("Untested.")
-            ret-type{type(e), _} $ fn* (xs) :
-               val ys = tgt-vars(arg-vars(e))
-               val f = head(tgt-vars(func-var(e)))
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               val f = head(imms(compile-exp(func(e))))
                val code = make-var(tgt-LONG-TYPE)
                load(code, f, 8 - REF-TAG)
                call(arity(e), xs, code, List(f, ys))
@@ -1710,18 +1708,18 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
          (e:KLSTagof) :
             ret-imm(tgt-LONG-TYPE, long(tag(tt, n(e))))
          (e:KLSConv) :
-            ret-type{type(e), _} $ fn* (xs) :
-               val y = head(tgt-vars(exp-var(e)))
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val y = head(imms(compile-exp(exp(e))))
                conv(head(xs), y)
          (e:KLSPrim) :
-            ret-type{type(e), _} $ fn* (xs) :
+            ret-to-var{type(e), _} $ fn* (xs) :
                switch {op(e) == _} :
                   GET-HEAP-LIM :
                      load(head(xs), mem(HEAP-LIM-LBL), 0)
                   GET-HEAP-PTR :
                      load(head(xs), mem(HEAP-PTR-LBL), 0)
                   else :
-                     val ys = tgt-vars(arg-vars(e))
+                     val ys = map-append(imms{compile-exp(_)}, args(e))
                      val op = to-tgt-op(op(e))
                      binop(head(xs), op, ys[0], ys[1])
          (e:KLSLitByte) :
@@ -1731,13 +1729,13 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
          (e:KLSLitLong) :
             ret-imm(tgt-LONG-TYPE, long(value(e)))
          (e:KLSLitFloat) :
-            ret-prim{tgt-FLOAT-TYPE, _} $ fn* (x) :
+            ret-to-var{tgt-FLOAT-TYPE, _} $ fn* (x) :
                load(x, mem(float-lbl(value(e))), 0)
          (e:KLSLitDouble) :
-            ret-prim{tgt-DOUBLE-TYPE, _} $ fn* (x) :
+            ret-to-var{tgt-DOUBLE-TYPE, _} $ fn* (x) :
                load(x, mem(double-lbl(value(e))), 0)
          (e:KLSLitString) :
-            ret-prim{tgt-LONG-TYPE, _} $ fn* (x) :
+            ret-to-var{tgt-LONG-TYPE, _} $ fn* (x) :
                addr(x, mem(string-lbl(value(e))), 0)
          (e) :
             error("No branch defined for ~" % [e])
@@ -1748,18 +1746,15 @@ defn compile (prog:KProg, tt:TypeTable, gt:GlobalTable) -> tgt-Program :
    defn compile-tail-exp (e:KLSExp) -> False :
       match(e) :
          (e:KLSWDo) :
-            val ys = tgt-vars(arg-vars(e))
-            val f = match(func-var(e)) :
-               (f:Int) :
-                  match(function-lbl(gt, f)) :
-                     (f:Int) : mem(f)
-                     (f:Symbol) : xmem(f)
-               (f:KLSVar) : head(tgt-vars(f))
+            val ys = map-append(imms{compile-exp(_)}, args(e))
+            val f = match(func(e)) :
+               (f:Int) : global-mem(f)
+               (f:KLSExp) : head(imms(compile-exp(f)))
             tcall(arity(e), f, ys)
          (e:KLSWCallClosure) :
             error("Untested.")
-            val ys = tgt-vars(arg-vars(e))
-            val f = head(tgt-vars(func-var(e)))
+            val ys = map-append(imms{compile-exp(_)}, args(e))
+            val f = head(imms(compile-exp(func(e))))
             val code = make-var(tgt-LONG-TYPE)
             load(code, f, 8 - REF-TAG)
             tcall(arity(e), code, List(f, ys))
