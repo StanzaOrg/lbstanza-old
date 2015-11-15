@@ -9,6 +9,7 @@ defpackage stz/kform :
    import stz/tgt-ir with: (prefix => tgt-)
    import stz/tgt with: (prefix => tgt-)
 
+#use-overlay(stz/attempt-lang)
 
 ;                           Driver
 ;                           ======
@@ -106,31 +107,47 @@ public defn compile-lowered-form (program:KProg, filename:String) :
 ;================== Transformations =========================
 ;============================================================
 
+;                     Program Mappers
+;                     ===============
+
+defn map (f: KExp -> KExp, prog:KProg) :
+   KProg $ for c in comms(prog) map :
+      map(f, c)
+
+defn map (fe: KExp -> KExp, fle: KLSExp -> KLSExp, prog:KProg) :
+   defn flc (c:KLSComm) : mapr(fle, c)
+   KProg $ for c in comms(prog) map :
+      map{flc, _} $
+      map{fle, _} $
+      map(fe, c)
 
 ;                   Void Check Insertion
 ;                   ====================
 
 defn void-check-insertion (prog:KProg) :
-   val void-var = HashTable<Int,True>({_})
-
    ;Find all global variables that may be void.
+   val void-var = HashTable<Int,True>({_})
    for c in comms(prog) do :
       match(c) :
          (c:KDef) : void-var[n(c)] = true
          (c:KDefVar) : void-var[n(c)] = true
          (c:KLSDef) : void-var[n(c)] = true
          (c) : false
+   
+   ;Retrieve voidable variable if it exists
+   defn void-var-n (def:KComm) :
+      match(def) :
+         (def:KDefVar) :
+            match(value(def)) :
+               (v:KExp) : n(def)
+               (v:False) : fail()
+         (def) : fail()
 
-   ;Insert void checks when necessary
+   ;Insert void checks when necessary         
    defn check-void (e:KExp) :
       match(e) :
          (e:KLet) :
-            ;Note as voidable if no default value for variable
-            match(def(e)) :
-               (def:KDefVar) :
-                  if value(def) == false :
-                     void-var[n(def)] = true
-               (def) : false
+            attempt: void-var[void-var-n(def(e))] = true
             mapr(check-void, e)
          (e:KVar) :
             if key?(void-var, n(e)) : KCheckVoid(e, false)
@@ -139,9 +156,7 @@ defn void-check-insertion (prog:KProg) :
          (e) : mapr(check-void, e)
 
    ;Insert void checks for all HiStanza constructs
-   val comms* = for c in comms(prog) map :
-      map(check-void, c)
-   KProg(comms*)   
+   map(check-void, prog)
 
 
 ;                    Mutable Variables Boxing
@@ -177,8 +192,7 @@ defn box-mutables (prog:KProg) :
             mapr(box, e)
 
    ;Driver
-   KProg $ for c in comms(prog) map :
-      map(box, c)
+   map(box, prog)
 
 
 ;                     Constant Lifting
@@ -299,11 +313,11 @@ defn method-targ-mapping (prog:KProg) :
 ;                    ======================
 
 defn callsite-normalization (prog:KProg) :
-   defn normalizable? (e:KExp) :
-      e typeof KLet|KLetRec|KSeq|KDispatch|KMatch|KMix
+   defn normalizable? (e:KExp|KLSExp) :
+      e typeof KLet|KLetRec|KSeq|KDispatch|KMatch|KLSLet
 
-   defn normalize (f:KExp, targs:List<KType>, arg-vs:List<KExp>, a1:List<KType>, a2:KType) :
-      defn loop (f:KExp) -> KExp :
+   defn normalize-func (f:KExp, return:KExp -> KExp) :
+      defn loop (f:KExp) :
          match(f) :
             (f:KLet) :
                error("Untested.")
@@ -322,86 +336,79 @@ defn callsite-normalization (prog:KProg) :
                error("Untested.")
                val branches* = for b in branches(f) map : map(loop, b)
                KMatch(args(f), branches*, false)
-            (f) :
-               KDo(f, targs, arg-vs, a1, a2, false)
+            (f) : return(f)
       loop(f)
-         
+      
+   defn normalize-func (f:KLSExp, return:KLSExp -> KLSExp) :
+      defn loop (f:KLSExp) :
+         match(f) :
+            (f:KLSLet) :
+               error("Untested.")
+               KLSLet(comm(f), loop(exp(f)))
+            (f) : return(f)
+      loop(f)      
+
+   defn normalize-args (xs:List<KExp>, return:List<KExp> -> KExp) :
+      val defs = Vector<KDef>()
+      val xs* = for x in xs map :
+         match(x) :
+            (x:KVar|KLiteral) :
+               x
+            (x) :
+               val n = fresh-id()
+               add(defs, KDef(n, x))
+               KVar(n, false)
+               
+      var exp* = return(xs*)
+      for d in in-reverse(defs) do :
+         exp* = KLet(d, exp*, false)
+      exp*
+      
+   defn normalize-args (xs:List<KLSExp>, return:List<KLSExp> -> KLSExp) :
+      val defs = Vector<KLSDefLocal>()
+      val xs* = for x in xs map :
+         match(x) :
+            (x:KLSVar|KLSLitByte|KLSLitInt|KLSLitLong|KLSLitFloat|KLSLitDouble|KLSLitString|
+               KLSSizeof|KLSTagof|KLSCurry|KLSMix) :
+               x
+            (x) :
+               val n = fresh-id()
+               add(defs, KLSDefLocal(n, x))
+               KLSVar(n)
+      if empty?(defs) : return(xs*)
+      else : KLSLet(KLSSeq(defs), return(xs*))
+
    defn convert-exp (e:KExp) :
       match(mapr(convert-exp, e)) :
          (e:KDo) :
             if normalizable?(func(e)) :
-               error("Untested.")
-               ;Force arguments to immediate form
-               val defs = Vector<KDef>()
-               val args* = for a in args(e) map :
-                  match(a) :
-                     (a:KVar|KLiteral) :
-                        a
-                     (a) :
-                        val n = fresh-id()
-                        add(defs, KDef(n, a))
-                        KVar(n, false)
-               ;Normalize function using arguments         
-               var exp* = normalize(func(e), targs(e), args*, a1(e), a2(e))
-               for d in in-reverse(defs) do :
-                  exp* = KLet(d, exp*, false)
-               exp*   
+               normalize-args{args(e), _} $ fn* (args*) :
+                  normalize-func{func(e), _} $ fn* (func*) :
+                     KDo(func*, targs(e), args*, a1(e), a2(e), false)
             else : e
          (e) : e
 
-   defn normalizable? (e:KLSExp|Int) :
-      e typeof KLSLet
-
-   defn force-immediate (args:List<KLSExp>, return: List<KLSExp> -> KLSExp) :
-      val defs = Vector<KLSComm>()
-      val args* = for a in args map :
-         match(a) :
-            (a:KLSVar|KLSLitByte|KLSLitInt|KLSLitLong|KLSLitFloat|KLSLitDouble|KLSLitString|
-               KLSSizeof|KLSTagof|KLSCurry|KLSMix) :
-               a
-            (a) :
-               val n = fresh-id()
-               add(defs, KLSDefLocal(n, a))
-               KLSVar(n)
-      if empty?(defs) : return(args*)
-      else : KLSLet(KLSSeq(defs), return(args*))
-
-   defn normalize-func (f:KLSExp, return: KLSExp -> KLSExp) :
-      defn loop (f:KLSExp) :
-         match(f) :
-            (f:KLSLet) : KLSLet(comm(f), loop(exp(f)))
-            (f) : return(f)
-      loop(f)
-
-   defn convert-lsexp (e:KLSExp) :
-      match(mapr(convert-lsexp, e)) :
-         (e:KLSCall) :
-            if normalizable?(func(e)) :
-               force-immediate{args(e), _} $ fn* (args*) :
-                  normalize-func{func(e) as KLSExp, _} $ fn* (func*) :
-                     KLSCall(func*, targs(e), args*, type(e))
-            else : e
-         (e:KLSCallC) :
-            if normalizable?(func(e)) :
-               force-immediate{args(e), _} $ fn* (args*) :
-                  normalize-func{func(e) as KLSExp, _} $ fn* (func*) :
-                     KLSCallC(func*, args*, type(e))
-            else : e
-         (e:KLSCallClosure) :
-            if normalizable?(func(e)) :
-               force-immediate{args(e), _} $ fn* (args*) :
-                  normalize-func{func(e) as KLSExp, _} $ fn* (func*) :
-                     KLSCallClosure(func*, targs(e), args*, type(e))
-            else : e
-         (e) : e
-   defn convert-comm (c:KLSComm) :
-      mapr(convert-lsexp, c)
+   defn convert-ls-exp (e:KLSExp) :
+      defn norm-func-args (f:KLSExp, xs:List<KLSExp>, return: (KLSExp, List<KLSExp>) -> KLSExp) :
+         if normalizable?(f) :
+            normalize-args{xs, _} $ fn* (xs*) :
+               normalize-func{f, _} $ fn* (f*) :
+                  return(f*, xs*)
+         else : return(f, xs)
          
+      match(mapr(convert-ls-exp, e)) :
+         (e:KLSCall) :
+            norm-func-args{func(e) as KLSExp, args(e), _} $ fn* (func*, args*) :
+               KLSCall(func*, targs(e), args*, type(e))
+         (e:KLSCallC) :
+            norm-func-args{func(e) as KLSExp, args(e), _} $ fn* (func*, args*) :
+               KLSCallC(func*, args*, type(e))
+         (e:KLSCallClosure) :
+            norm-func-args{func(e) as KLSExp, args(e), _} $ fn* (func*, args*) :
+               KLSCallClosure(func*, targs(e), args*, type(e))
+         (e) : e      
 
-   KProg $ for c in comms(prog) map :
-      map{convert-comm, _} $
-      map{convert-lsexp, _} $
-      map(convert-exp, c)
+   map(convert-exp, convert-ls-exp, prog)
 
 
 ;                   Global Closure Conversion
