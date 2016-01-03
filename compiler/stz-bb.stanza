@@ -17,7 +17,11 @@ defpackage stz/bb :
 ;                            Main Driver
 ;                            ===========
 
-public defn compile (d:tgt-DefFn, backend:Backend, output:Vector<asm-Ins>) -> False :
+public defn compile (def:tgt-DefFn, backend:Backend, output:Vector<asm-Ins>) -> False :
+   headline("Spill call arguments")
+   val d = spill-call-args(def, backend)
+   println(d)
+
    headline("Compile to Basic Block IR")
    val [tt, bb-ir] = to-bb-ir(d)
    println(bb-ir)
@@ -49,7 +53,7 @@ public defn compile (d:tgt-DefFn, backend:Backend, output:Vector<asm-Ins>) -> Fa
    headline("Block Collapsing")
    do(println, ins)
 
-   compile(tt, backend, ins, stack-map, output)
+   compile(tgt-n(d), tt, backend, ins, stack-map, output)
 
 
 ;                          Various Utilities
@@ -89,6 +93,109 @@ defn reverse-post-order (bs:Vector<Block>) -> Vector<Block> :
    ;Return reversed
    reverse!(ys)
    ys
+
+
+;                         Spilling Call Arguments
+;                         =======================
+
+defn spill-call-args (def:tgt-DefFn, backend:Backend) :
+   ;     Type Layer
+   ;     ----------
+   val int-values = HashTable<Int,True|False>({_})
+   for d in tgt-defs(def) do :
+      int-values[tgt-n(d)] = tgt-int?(tgt-type(d))
+
+   defn int? (x:tgt-Imm) :
+      match(x) :
+         (x:tgt-Var) : int-values[tgt-n(x)]
+         (x) : true
+      
+   ;     Output State
+   ;     ------------
+   val output = Vector<tgt-Ins>()
+   val defvars = Vector<tgt-DefVar>()
+   do(add{defvars, _}, tgt-defs(def))
+   defn emit (i:tgt-Ins) :
+      add(output, i)
+   defn make-var (t:tgt-TgtType) :
+      val n = fresh-id()
+      add(defvars, tgt-DefVar(n, t))
+      tgt-Var(n)
+
+   ;     Split Locations
+   ;     ---------------
+   ;Split a group of values into which go into memory, and which go
+   ;into registers.
+   defn split-mem-locs<?T> (xs:List<?T&tgt-Imm>, nregs:Int, nfregs:Int) :
+      defn cms (xs) : join(xs, ", ")
+      val regs = to-stream(0 to nregs)
+      val fregs = to-stream(0 to nfregs)
+      val reg-xs = Vector<T&tgt-Imm>()
+      val mem-xs = Vector<T&tgt-Imm>()
+      for x in xs do :
+         if int?(x) :
+            if more?(regs) :
+               next(regs)
+               add(reg-xs, x)
+            else :
+               add(mem-xs, x)
+         else :
+            if more?(fregs) :
+               next(fregs)
+               add(reg-xs, x)
+            else :
+               add(mem-xs, x)
+      [to-list(reg-xs), to-list(mem-xs)]
+   defn split-call-locs<?T> (xs:List<?T&tgt-Imm>) :
+      split-mem-locs(xs, length(call-regs(backend)), length(call-fregs(backend)))
+   defn split-callc-locs<?T> (xs:List<?T&tgt-Imm>) :
+      split-mem-locs(xs, length(callc-regs(backend)), length(callc-fregs(backend)))
+
+   ;     Main Algorithm
+   ;     --------------
+   ;Convert calls
+   for e in tgt-body(def) do :
+      match(e) :
+         (e:tgt-ArgsIns) :
+            val [xs, mxs] = split-call-locs(tgt-xs(e))
+            emit(tgt-ArgsIns(xs))
+            for (x in mxs, o in 0 to false by 8) do :
+               emit(tgt-Load(x, tgt-Mem(ARG-LBL,0), o))
+         (e:tgt-Return) :
+            val [xs, mxs] = split-call-locs(tgt-xs(e))
+            for (x in mxs, o in 0 to false by 8) do :
+               emit(tgt-Store(x, tgt-Mem(ARG-LBL,0), o))
+            emit(tgt-Return(xs))   
+         (e:tgt-Call) :
+            val [ys, mys] = split-call-locs(tgt-ys(e))
+            val [xs, mxs] = split-call-locs(tgt-xs(e))
+            for (y in mys, o in 0 to false by 8) do :
+               emit(tgt-Store(tgt-Mem(ARG-LBL,0), y, o))
+            emit(tgt-Call(tgt-arity(e), xs, tgt-f(e), ys))
+            for (x in mxs, o in 0 to false by 8) do :
+               emit(tgt-Load(x, tgt-Mem(ARG-LBL,0), o))
+         (e:tgt-TCall) :
+            val [ys, mys] = split-call-locs(tgt-ys(e))
+            for (y in mys, o in 0 to false by 8) do :
+               emit(tgt-Store(tgt-Mem(ARG-LBL,0), y, o))
+            emit(tgt-TCall(tgt-arity(e), tgt-f(e), ys))            
+         (e:tgt-CallC) :
+            val [ys, mys] = split-callc-locs(tgt-ys(e))
+            if empty?(mys) :
+               emit(tgt-CallC(1, tgt-xs(e), tgt-f(e), ys))
+            else :
+               val n = if length(mys) % 2 == 0 : length(mys) + 1
+                       else : length(mys)
+               val p = make-var(tgt-LONG-TYPE)
+               emit(tgt-Load(p, tgt-Mem(C-RSP-LBL,0), 0))
+               for (y in mys, i in 0 to false) do :
+                  emit(tgt-Store(p, y, 8 * (i - n)))
+               emit(tgt-CallC(n, tgt-xs(e), tgt-f(e), ys))
+         (e) :
+            emit(e)
+
+   ;Return result   
+   tgt-DefFn(tgt-n(def), defvars, output)
 
 
 
@@ -1980,7 +2087,8 @@ defmethod print (o:OutputStream, v:AVal) :
 
 ;     Compilation
 ;     -----------
-defn compile (tt:HashTable<Int,tgt-TgtType>,
+defn compile (func-id:Int,
+              tt:HashTable<Int,tgt-TgtType>,
               backend:Backend,
               ins:Vector<Ins>,
               stackmap:StackMap,
@@ -2234,6 +2342,7 @@ defn compile (tt:HashTable<Int,tgt-TgtType>,
 
    ;     Convert Instructions
    ;     --------------------
+   av-label(func-id)
    for e in ins do :
       match(e) :
          (e:Set) :
