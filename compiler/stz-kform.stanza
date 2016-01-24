@@ -1,0 +1,3846 @@
+defpackage stz/kform :
+   import core
+   import verse
+   import stz/namemap
+   import stz/tl-ir
+   import stz/type-calculus
+   import stz/kl-ir
+   import stz/ids
+   import stz/utils
+   import stz/lexer
+   import stz/padder
+   import stz/tgt-ir with: (prefix => tgt-)
+   import stz/tgt with: (prefix => tgt-)
+   import stz/primitives with: (prefix => prim-)
+
+
+#use-overlay(stz/attempt-lang)
+
+;                           Driver
+;                           ======
+
+public defn compile (program:TProg, nm:NameMap, filename:String) :
+   headline("KForm Conversion")
+   var prog = to-kform(program, nm)
+   println(prog)
+
+   headline("Void Check Insertion")
+   prog = void-check-insertion(prog)
+   println(prog)
+   
+   headline("Box Mutables")
+   prog = box-mutables(prog)
+   println(prog)
+   
+   headline("Constant Lifting")
+   prog = constant-lifting(prog)
+   println(prog)
+   
+   headline("Method Mapping")
+   prog = method-targ-mapping(prog)
+   println(prog)
+   
+   headline("Callsite Normalization")
+   prog = callsite-normalization(prog)
+   println(prog)
+
+   headline("Closure Creation")
+   prog = closure-creation(prog)
+   println(prog)
+
+   headline("Mix Conversion")
+   prog = mix-conversion(prog)
+   println(prog)
+   
+   headline("Boundary Guard Insertion")
+   prog = boundary-guard-insertion(prog)
+   println(prog)
+
+   headline("Automatic Primitive Tagging")
+   prog = primitive-tagging(prog)
+   println(prog)
+   
+   headline("Type Reification")
+   prog = type-reification(prog)
+   println(prog)
+
+   headline("Freevar Calculation")
+   var freetable = freevar-table(prog)
+   println(freetable)
+   
+   headline("Object Lifting")
+   prog = lift-objects(prog, freetable)
+   println(prog)
+
+   headline("Freevar Calculation After Objects")
+   freetable = freevar-table(prog)
+   println(freetable)
+   
+   headline("Closure Lifting")
+   prog = lift-closures(prog, freetable)
+   println(prog)
+   
+   headline("Multi Conversion")
+   prog = convert-multis(prog)
+   println(prog)
+   
+   headline("Call Conversion")
+   prog = convert-calls(prog)
+   println(prog)
+   
+   headline("Code Conversion")
+   prog = convert-code(prog)
+   println(prog)
+   
+   headline("Cast Conversion")
+   prog = cast-conversion(prog)
+   println(prog)
+   
+   headline("Compilation")   
+   val compiled = compile(prog)
+   println(compiled)
+
+   headline("Assembly Generation")
+   tgt-compile(compiled, filename)
+
+public defn compile-lowered-form (program:KProg, filename:String) :
+   headline("Compilation")   
+   val compiled = compile(program)
+   println(compiled)
+
+   headline("Assembly Generation")
+   tgt-compile(compiled, filename)   
+
+
+;============================================================
+;=================== Conversion =============================
+;============================================================
+
+defn to-kform (prog:TProg, nm:NameMap) :
+   ;Track Expected Return Type
+   ;--------------------------
+   var current-return-type = NoneT()
+
+   ;Type Specific Conversion Functions
+   ;----------------------------------   
+   defn to-comm (c:TComm) -> KComm :
+      match(c) :
+         (c:TDef) :
+            val value* = KCast(to-exp(value(c)), to-type(type(c)), false)
+            KDef(n(c), value*)
+         (c:TDefVar) :
+            val v* = match(value(c)) :
+               (v:False) : false
+               (v:TExp) : KCast(to-exp(v), to-type(type(c)), false)
+            KDefVar(n(c), v*)
+         (c:TDefn) :
+            val f = KFn(
+               fresh-id(),
+               tail?(c),
+               append(targs(c), cargs(c)),
+               map(to-type, a1(c)),
+               to-type(a2(c)),
+               false,
+               args(c),
+               to-exp(body(c)))
+            KDefn(n(c), f)
+         (c:TDefmulti) :            
+            KDefmulti(
+               n(c),
+               append(targs(c), cargs(c)),
+               map(to-type, a1(c)),
+               to-type(a2(c)))
+         (c:TDefmethod) :
+            val f = KFn(
+               fresh-id(),
+               tail?(c),
+               append(targs(c), cargs(c))
+               map(to-type, a1(c))
+               to-type(a2(c))
+               false,
+               args(c),
+               to-exp(body(c)))
+            val [multi, multi-targs] = to-multi(multi(c))
+            KDefmethod(fresh-id(), multi, multi-targs, thisn(c), f)
+         (c:TInit) :
+            KInit(to-exp(exp(c)))
+         (c:TLDef) :
+            KLSDef(
+               n(c),
+               to-ls-type(type(c)),
+               to-ls-exp-upcast(value(c), type(c)))
+         (c:TLDefVar) :
+            KLSDefVar(
+               n(c),
+               to-ls-type(type(c)),
+               to-ls-exp-upcast(value(c), type(c)))
+         (c:TLDefn) :
+            let-var current-return-type = a2(c) :
+               KLSDefn(
+                  tail?(c),
+                  n(c),
+                  append(targs(c), cargs(c)),
+                  map(to-ls-type, a1(c)),
+                  to-ls-type(a2(c)),
+                  args(c),
+                  to-ls-comm(body(c)))
+         (c:TExtern) :
+            KExtern(
+               n(c),
+               to-ls-type(type(c)),
+               get-name(n(c)))
+         (c:TLInit) :
+            KLSInit(to-ls-comm(comm(c)))
+      
+   defn to-comms (c:TComm) -> List<KComm> :
+      match(c) :
+         (c:TDefTuple) :
+            val n* = fresh-id()
+            val arity = length(ns(c))
+            val value* = KCast(to-exp(value(c)), KOf(TUPLE-TYPE-ID), false)
+            val def1 = KDef(n*, KCheckLength(value*, arity, false))
+            val def2 = for (n in ns(c), t in types(c), i in 0 to arity) map :
+               KDef(n, KCast(KTupleGet(KVar(n*), i, false), to-type(t), false))
+            List(def1, def2)
+      
+   defn to-comms (h:THierarchy) -> List<KComm> :
+      defn to-parent (t:Type) :
+         to-type(t) when t not-typeof TNone
+      defn to-field (f:False) :
+         false
+      defn to-field (f:stz/tl-ir/Field) :
+         StructField(n(f), to-ls-type(type(f)))
+      
+      to-list $ for e in h stream :
+         match(e) :
+            (e:HSHEntry) :
+               KDefType(n(e), to-parent(parent(e)))
+            (e:LSHEntry) :
+               KLSDefType(
+                  n(e),
+                  to-parent(parent(e)),
+                  map(to-field, fields(e)),
+                  to-field(rfield(e)))
+
+   defn to-multi (e:TExp) -> [Int, List<KType>] :
+      match(e) :
+         (e:TRef) : [n(e), List()]
+         (e:TCurry) : [n(ref(e)), map(to-type, append(targs(e), cargs(e)))]
+         (e:TMix) : to-multi(select-1(sel(e), exps(e)))
+      
+   defn to-exp (e:TExp) -> KExp :
+      match(e) :
+         (e:TLet) :
+            val value* = KCast(to-exp(value(e)), to-type(ntype(e)), false)
+            KLet(
+               KDef(n(e), value*)
+               to-exp(body(e)),
+               false)
+         (e:TLetVar) :
+            val v* = match(value(e)) :
+               (v:TExp) : KCast(to-exp(v), to-type(ntype(e)), false)
+               (v) : false
+            KLet(
+               KDefVar(n(e), v*)
+               to-exp(body(e)),
+               false)
+         (e:TLetTuple) :
+            defn wrap (defs:List<KComm>) :
+               if empty?(defs) :
+                  to-exp(body(e))
+               else :
+                  val def = head(defs) as KDefn|KDef|KDefVar
+                  KLet(def, wrap(tail(defs)), false)
+            wrap(to-comms(TDefTuple(ns(e), ntypes(e), value(e))))
+         (e:TLetRec) :
+            KLetRec(
+               map(to-comm, defns(e)) as List<KDefn>,
+               to-exp(body(e)),
+               false)
+         (e:TSeq) :
+            KSeq(to-exp(a(e)), to-exp(b(e)), false)
+         (e:TMatch) :
+            val branches* = for b in branches(e) map :
+               KBranch(
+                  args(b),
+                  map(to-type, atypes(b))
+                  to-exp(body(b)))
+            KMatch(
+               map(to-exp, args(e))
+               branches*,
+               false)
+         (e:TFn|TMulti) :
+            defn to-fn (e:TFn) -> KFn :
+               KFn(fresh-id(),
+                   tail?(e),
+                   List(),
+                   map(to-type, a1(e)),
+                   to-type(a2(e)),
+                   false,
+                   args(e),
+                   to-exp(body(e)))                   
+            defn to-fn (e:TMulti) -> KMultifn :
+               KMultifn(fresh-id(), map(to-fn, funcs(e)))         
+            val n* = fresh-id()
+            KLet(KDefn(n*, to-fn(e)), KVar(n*), false)
+         (e:TNew) :
+            KNew(
+               to-type(class(e)),
+               map(to-comm, methods(e)) as List<KDefmethod>,
+               false)
+         (e:TRef) :
+            if global-fn?(n(e)) :
+               val a1 = types(a(type(e) as TArrow) as TTuple)
+               val a2 = b(type(e) as TArrow)
+               KCurry(n(e), List(), map(to-type, a1), to-type(a2), false)
+            else : KVar(n(e))
+         (e:TCast) :
+            KCast(
+               to-exp(exp(e)),
+               to-type(targ(e)),
+               false)            
+         (e:TSet) :
+            val t = to-type(type(ref(e)))
+            val value* = KCast(to-exp(value(e)), t, false)
+            KSet(n(ref(e)), value*, false)
+         (e:TDo) :
+            val a1* = map(to-type{type(ctxt(_) as CExp)}, args(e))
+            val a2* = to-type(type(e))
+            val f* = to-exp(func(e))
+            val args* = map(to-exp, args(e))
+            KDo(f*, args*, a1*, a2*, false)
+         (e:TPrim) :
+            error("Not yet implemented.")
+         (e:TLiteral) :
+            KLiteral(value(e), false)
+         (e:TTupleExp) :
+            KTuple(map(to-exp, exps(e)), false)
+         (e:TMix) :
+            val exps* = map({to-exp(_) as KCurry}, select-all(sel(e), exps(e)))
+            if length(exps*) == 1 : head(exps*)
+            else : KMix(exps*, false)
+         (e:TCurry) :
+            val a1 = types(a(type(e) as TArrow) as TTuple)
+            val a2 = b(type(e) as TArrow)
+            val targs = append(targs(e), cargs(e))
+            KCurry(
+               n(ref(e)),
+               map(to-type, targs),
+               map(to-type, a1),
+               to-type(a2)
+               false)
+      
+   defn to-type (t:Type) -> KType :
+      match(t) :
+         (t:TCap) : KTVar(n(t))
+         (t:TOf) : KOf(n(t))
+         (t:TTuple) : KOf(TUPLE-TYPE-ID)
+         (t:TOr) : KOr(to-type(a(t)), to-type(b(t)))
+         (t:TAnd) : KAnd(to-type(a(t)), to-type(b(t)))
+         (t:TVar) : KTVar(n(t))
+         (t:TArrow) : KOf(FN-TYPE-ID)
+         (t:TGradual) : KTop()
+         (t:TBot) : KBot()
+         (t) : error("Type cannot be converted to KType: ~" % [t])
+         
+   defn to-ls-type (t:LSType) -> KLSType :
+      match(t) :
+         (t:ByteT) : KByteT()
+         (t:IntT) : KIntT()
+         (t:LongT) : KLongT()
+         (t:FloatT) : KFloatT()
+         (t:DoubleT) : KDoubleT()
+         (t:UnknownT) : KUnknownT()
+         (t:PtrT) : KPtrT(to-ls-type(type(t)))
+         (t:RefT) : KRefT(to-type(type(t)))
+         (t:FnT) :
+            defn to-rest-type (t:LSType) :
+               to-ls-type(t) when t not-typeof NoneT
+            KFnT(map(to-ls-type,a(t)), to-rest-type(r(t)), to-ls-type(b(t)))
+         (t:StructT) : KStructT(n(t))
+         (t) : error("Type cannot be converted to KLSType: ~" % [t])
+
+   defn to-ls-exp (e:LSExp) -> KLSExp :
+      match(e) :
+         (e:LSVar) :
+            if global-fn?(n(e)) :
+               val a1 = a(type(e) as FnT)
+               val a2 = b(type(e) as FnT)
+               KLSCurry(n(e), List(), map(to-ls-type, a1), to-ls-type(a2))
+            else :
+               KLSVar(n(e))
+         (e:LSNew) :
+            val fts = field-types!(n(e), targ(e))               
+            KLSRef(n(e), map(to-ls-exp-upcast, args(e), fts))
+         (e:LSArray) :
+            val fts = field-types!(n(e), targ(e))
+            KLSRefArray(
+               n(e),
+               to-ls-exp-upcast(length(e), LongT()),
+               map(to-ls-exp-upcast, args(e), fts))
+         (e:LSStruct) :
+            val fts = field-types!(n(e), targ(e))               
+            KLSStruct(n(e), map(to-ls-exp-upcast, args(e), fts))
+         (e:LSAddr) :
+            KLSPtr(to-loc(exp(e)))
+         (e:LSDeref|LSSlot|LSField) :
+            match(to-loc(e)) :
+               (v:Value) : exp(v)
+               (v) : KLSRead(v)
+         (e:LSDo) :
+            val f* = to-ls-exp(func(e))
+            val ft = type(func(e)) as FnT
+            val args* = to-ls-args(args(e), ft)
+            KLSCall(f*, args*, to-ls-type(type(e)), false)
+         (e:LSDoInStack) :
+            val f* = to-ls-exp(func(e))
+            val ft = type(func(e)) as FnT
+            val args* = to-ls-args(args(e), ft)
+            KLSCall(f*, args*, to-ls-type(ret(e)), true)
+         (e:LSDoStack) :
+            val f* = to-ls-exp(func(e))
+            val arg* = to-ls-exp(arg(e))
+            KLSSwitchStack(f*, arg*, to-ls-type(ret(e)))            
+         (e:LSCallC) :
+            val f* = to-ls-exp(func(e))
+            val ft = type(func(e)) as FnT
+            val args* = to-ls-args(args(e), ft)
+            KLSCallC(f*, args*, to-ls-type(type(e)))
+         (e:LSPrim) :            
+            defn args-cast (t:LSType) :
+               list(to-ls-exp-upcast(head(args(e)), t))
+            defn args-any () :
+               map(to-ls-exp, args(e))
+            defn args-max () :
+               defn max-type (x:LSType, y:LSType) :
+                  y when implicit-upcast?(x, y) else x
+               val t = reduce(max-type, stream(type, args(e)))
+               map(to-ls-exp-upcast{_, t}, args(e))
+            defn args-max-or-ptr () :
+               if any?({type(_) typeof PtrT|RefT}, args(e)) :
+                  for a in args(e) map :
+                     match(type(a)) :
+                        (t:PtrT|RefT) : to-ls-exp(a)
+                        (t) : to-ls-exp-upcast(a, LongT())
+               else : args-max()
+            defn arg0-byte? (conseq:KLSOp, alt:KLSOp) :
+               match(type(head(args(e)))) :
+                  (t:ByteT) : conseq
+                  (t) : alt
+                  
+            val t* = to-ls-type(type(e))
+            val [op*, args*] = match(op(e)) :
+               (op:prim-GetterPrimitive|prim-SetterPrimitive) :
+                  [prim-op(op), args-any()]
+               (op) :
+                  switch {op == _} :
+                     prim-ADD-OP : [ADD-OP, args-max-or-ptr()]
+                     prim-SUB-OP : [SUB-OP, args-max-or-ptr()]
+                     prim-MUL-OP : [MUL-OP, args-max()]
+                     prim-DIV-OP : [DIV-OP, args-max()]
+                     prim-MOD-OP : [MOD-OP, args-max()]
+                     prim-AND-OP : [AND-OP, args-max()]
+                     prim-OR-OP : [OR-OP, args-max()]
+                     prim-XOR-OP : [XOR-OP, args-max()]
+                     prim-SHL-OP : [SHL-OP, args-max()]
+                     prim-SHR-OP : [SHR-OP, args-max()]
+                     prim-ASHR-OP : [ASHR-OP, args-max()]
+                     prim-EQ-OP : [EQ-OP, args-max-or-ptr()]
+                     prim-NE-OP : [NE-OP, args-max-or-ptr()]
+                     prim-LT-OP : [arg0-byte?(ULT-OP, LT-OP), args-max()]
+                     prim-GT-OP : [arg0-byte?(UGT-OP, GT-OP), args-max()]
+                     prim-LE-OP : [arg0-byte?(ULE-OP, LE-OP), args-max()]
+                     prim-GE-OP : [arg0-byte?(UGE-OP, GE-OP), args-max()]
+                     prim-ULT-OP : [ULT-OP, args-max()]
+                     prim-UGT-OP : [UGT-OP, args-max()]
+                     prim-ULE-OP : [ULE-OP, args-max()]
+                     prim-UGE-OP : [UGE-OP, args-max()]
+            KLSPrim(op*, args*, t*)            
+         (e:LSSizeof) :
+            KLSSizeof(to-ls-type(targ(e)))
+         (e:LSTagof) :
+            KLSTagof(n(e))
+         (e:LSCast) :
+            KLSConv(to-ls-exp(exp(e)), to-ls-type(targ(e)))
+         (e:LSLiteral) :
+            match(value(e)) :
+               (v:Int) : KLSLitInt(v)
+               (v:String) : KLSLitString(v)     
+         (e:LSAnd) :
+            val a* = to-ls-exp-upcast(a(e), LongT())
+            val b* = to-ls-exp-upcast(b(e), LongT())
+            val r = fresh-id()
+            val r-var = KLSVar(r)
+            KLSLet(
+               KLSSeq(
+                  KLSDefLocalVar(r, KLongT(), a*)
+                  KLSIf(r-var
+                        KLSSet(Value(r-var), b*)
+                        KLSSkip()))
+               r-var)
+         (e:LSOr) :
+            val a* = to-ls-exp-upcast(a(e), LongT())
+            val b* = to-ls-exp-upcast(b(e), LongT())
+            val r = fresh-id()
+            val r-var = KLSVar(r)
+            KLSLet(
+               KLSSeq(
+                  KLSDefLocalVar(r, KLongT(), a*)
+                  KLSIf(r-var
+                        KLSSkip()
+                        KLSSet(Value(r-var), b*)))
+               r-var)        
+         (e:LSLetExp) :
+            KLSLet(to-ls-comm(comm(e)), to-ls-exp(exp(e)))
+         (e:LSMix) :
+            val exps* = map({to-ls-exp(_) as KLSCurry}, select-all(sel(e), exps(e)))
+            if length(exps*) == 1 : head(exps*)
+            else : KLSMix(exps*)
+         (e:LSCurry) :
+            val a1 = a(type(e) as FnT)
+            val a2 = b(type(e) as FnT)
+            val targs = append(targs(e), cargs(e))
+            KLSCurry(
+               n(ref(e)),
+               map(to-type, targs)
+               map(to-ls-type, a1)
+               to-ls-type(a2))
+         (e:LSFn) :
+            KLSFn(to-exp(ref(e)))
+
+   defn to-ls-args (es:List<LSExp>, t:FnT) :
+      defn ex (ts:List<LSType>, r:LSType) : concat(ts, stream({r}, 0 to false))
+      map(to-ls-exp-upcast, es, ex(a(t), r(t)))
+      
+   defn to-ls-exp-upcast (f:False, t:LSType) :
+      false
+   defn to-ls-exp-upcast (e:LSExp, t:LSType) -> KLSExp :
+      val e* = to-ls-exp(e)
+      if implicit-upcast?(type(e), t) : KLSConv(e*, to-ls-type(t))
+      else : e*
+
+   defn to-ls-comm (c:LSComm) -> KLSComm :
+      match(c) :
+         (c:LSCall) :
+            KLSCallComm(to-ls-exp(exp(c)))
+         (c:LSSet) :
+            val et = type(exp(c))
+            KLSSet(
+               to-loc(exp(c))
+               to-ls-exp-upcast(value(c), et))
+         (c:LSLabels) :
+            to-ls-comm(body(c))
+         (c:LSLabel) :
+            KLSLabel(n(c))         
+         (c:LSGoto) :
+            KLSGoto(n(c))
+         (c:LSReturn) :
+            KLSReturn(to-ls-exp-upcast(exp(c), current-return-type))
+         (c:LSDef) :
+            KLSDefLocal(n(c), to-ls-exp-upcast(value(c), type(c)))
+         (c:LSDefVar) :
+            KLSDefLocalVar(
+               n(c),
+               to-ls-type(type(c))
+               to-ls-exp-upcast(value(c), type(c)))            
+         (c:LSSeq) :
+            KLSSeq(
+               to-ls-comm(a(c))
+               to-ls-comm(b(c)))
+         (c:LSIf) :
+            defn loop (pred:LSExp, conseq:KLSComm, alt:KLSComm) :
+               match(pred) :
+                  (pred:LSAnd) :
+                     val alt-lbl = fresh-id()
+                     loop(
+                        a(pred),
+                        loop(b(pred), conseq, KLSGoto(alt-lbl))
+                        KLSSeq(KLSLabel(alt-lbl), alt))
+                  (pred:LSOr) :
+                     val con-lbl = fresh-id()
+                     loop(a(pred),
+                          KLSSeq(KLSLabel(con-lbl), conseq)
+                          loop(b(pred), KLSGoto(con-lbl), alt))
+                  (pred) :
+                     KLSIf(to-ls-exp-upcast(pred, LongT()), conseq, alt)
+            loop(pred(c), to-ls-comm(conseq(c)), to-ls-comm(alt(c)))
+         (c:LSMatch) :
+            val branches* = for b in branches(c) map :
+               val ts = map(type{_ as RefT}, atypes(b))
+               KLSBranch(args(b),
+                         map(to-type, ts)
+                         to-ls-comm(body(b)))
+            KLSMatch(map(to-ls-exp, args(c)), branches*)
+         (c:LSSkip) :
+            KLSSkip()
+      
+   defn to-loc (e:LSExp) -> KLoc :
+      match(e) :
+         (e:LSVar) :
+            Value(KLSVar(n(e)))
+         (e:LSDeref) :
+            match(type(exp(e))) :
+               (et:PtrT) : Deptr(to-ls-exp(exp(e)), to-ls-type(type(e)))
+               (et:RefT) : Deref(to-ls-exp(exp(e)), to-ls-type(type(e)))
+         (e:LSSlot) :
+            Slot(to-ls-exp(exp(e)),
+                 to-ls-type(type(e)),
+                 to-ls-exp-upcast(index(e), LongT()))
+         (e:LSField) :
+            val base = deref-all(exp(e))
+            val n = n(type(base) as StructT)
+            val f = Field(to-loc(base), field-n(n, name(e)))
+            if rest-field?(n, name(e)) : Value(KLSPtr(f))
+            else : f
+
+   ;Utilities
+   ;---------
+   defn global-fn? (n:Int) :
+      val e = nm[n]
+      (type(e) typeof FnE|MultiE|LFnE) and
+      (visibility(e) not-typeof Local)
+
+   defn* deref-all (e:LSExp) :
+      match(type(e)) :
+         (et:PtrT) :
+            deref-all(LSDeref(e, type(et), NoneT(), CNone()))
+         (et:RefT) :
+            val t = type(et) as TOf
+            val t* = StructT(n(t), type(t))
+            deref-all(LSDeref(e, t*, NoneT(), CNone()))
+         (et) : e
+
+   defn field-n (sn:Int, fname:Symbol) :
+      label<Int> return :
+         val e = current-hierarchy()[sn] as LSHEntry
+         for f in fields(e) do :
+            return(n(f)) when name(f) == fname
+         match(rfield(e)) :
+            (rf:stz/tl-ir/Field) : return(n(rf)) when name(rf) == fname
+            (rf) : false
+         error("No field ~ in struct ~." % [fname, sn])
+
+   defn get-name (n:Int) :
+      name(nm[n])
+
+   defn select-1<?T> (s:Selection, xs:List<?T>) -> T :
+      val ss = sels(s as SSel)
+      for (x in xs, s in ss) find! :
+         s != false
+         
+   defn select-all<?T> (s:Selection, xs:List<?T>) -> List<T> :
+      val ss = sels(s as SSel)
+      to-list $
+      for (x in xs, s in ss) filter :
+         s != false
+
+   ;Driver
+   ;------
+   val comm-list = Vector<KComm>()
+   set-current-hierarchy(hier(prog))
+   do(add{comm-list, _}, to-comms(current-hierarchy()))
+   for c in comms(prog) do :
+      match(c) :
+         (c:TDefTuple) : do(add{comm-list, _}, to-comms(c))
+         (c) : add(comm-list, to-comm(c))
+   KProg(to-list(comm-list))
+
+
+;============================================================
+;=================== Normalization ==========================
+;============================================================
+defn callsite-normalization (prog:KProg) :
+   ;     HiStanza Normalization
+   ;     ----------------------
+   defn normalizable? (e:KExp) :
+      e typeof KLet|KLetRec|KSeq|KDispatch|KMatch|KMix
+      
+   defn normalize-func (f:KExp, return:KExp -> KExp) :
+      defn loop (f:KExp) :
+         match(f) :
+            (f:KLet) :
+               KLet(def(f), loop(body(f)), false)
+            (f:KLetRec) :
+               KLetRec(defs(f), loop(body(f)), false)
+            (f:KSeq) :
+               KSeq(a(f), loop(b(f)), false)
+            (f:KDispatch) :
+               val branches* = for b in branches(f) map : map(loop, b)
+               KDispatch(args(f), branches*, false)
+            (f:KMatch) :
+               val branches* = for b in branches(f) map : map(loop, b)
+               KMatch(args(f), branches*, false)
+            (f) :
+               return(f)
+      loop(f)         
+
+   defn normalize-args (xs:List<KExp>, return:List<KExp> -> KExp) :
+      if empty?(xs) :
+         return(List())
+      else if head(xs) typeof KVar|KLiteral :
+         normalize-args{tail(xs), _} $ fn* (xs*) :
+            return(List(head(xs), xs*))
+      else :
+         val n = fresh-id()
+         val body = normalize-args{tail(xs), _} $ fn* (xs*) :
+            return(List(KVar(n), xs*))
+         KLet(KDef(n, head(xs)), body, false)
+         
+   defn convert-exp (e:KExp) :
+      match(mapr(convert-exp, e)) :
+         (e:KDo) :
+            if normalizable?(func(e)) :
+               normalize-args{args(e), _} $ fn* (args*) :
+                  normalize-func{func(e), _} $ fn* (func*) :
+                     KDo(func*, args*, a1(e), a2(e), false)
+            else : e
+         (e) : e
+
+   ;     LoStanza Expression Normalization
+   ;     ---------------------------------
+   defn normalizable? (e:KLSExp) :
+      e typeof KLSLet|KLSMix
+
+   defn normalize-func (f:KLSExp, return:KLSExp -> KLSExp) -> KLSExp :
+      match(f) :
+         (f:KLSLet) : KLSLet(comm(f), normalize-func(exp(f), return))
+         (f) : return(f)
+
+   defn normalize-args (xs:List<KLSExp>, return:List<KLSExp> -> KLSExp) -> KLSExp :
+      if empty?(xs) :
+         return(List())
+      else if head(xs) typeof KLSVar|KLSLitByte|KLSLitInt|KLSLitLong|
+                              KLSLitFloat|KLSLitDouble|KLSLitString|KLSSizeof|KLSTagof :
+         normalize-args{tail(xs), _} $ fn* (xs*) :
+            return(List(head(xs), xs*))
+      else :
+         val n = fresh-id()
+         val body = normalize-args{tail(xs), _} $ fn* (xs*) :
+            return(List(KLSVar(n), xs*))
+         KLSLet(KLSDefLocal(n, head(xs)), body)
+
+   defn convert-ls-exp (e:KLSExp) -> KLSExp :      
+      match(map(convert-ls-comm, map(convert-ls-comm, e))) :
+         (e:KLSCall) :
+            if normalizable?(func(e)) :
+               normalize-args{args(e), _} $ fn* (args*) :
+                  normalize-func{func(e), _} $ fn* (func*) :
+                     KLSCall(func*, args*, type(e), new-stack?(e))
+            else : e
+         (e:KLSCallC) :
+            if normalizable?(func(e)) :
+               normalize-args{args(e), _} $ fn* (args*) :
+                  normalize-func{func(e), _} $ fn* (func*) :
+                     KLSCallC(func*, args*, type(e))
+            else : e         
+         (e) : e
+
+   ;     LoStanza Command Normalization
+   ;     ------------------------------
+   defn normalize-exp (e:KLSExp, return:KLSExp -> KLSComm) -> KLSComm :
+      match(e) :
+         (e:KLSLet) :
+            KLSSeq(comm(e), return(exp(e)))
+         (e) : return(e)
+   defn normalize-exp (f:False, return:False -> KLSComm) -> KLSComm :
+      return(false)
+
+   defn convert-ls-comm (c:KLSComm) -> KLSComm :
+      match(map(convert-ls-comm, map(convert-ls-comm, c))) :
+         (c:KLSCallComm) : normalize-exp(exp(c), KLSCallComm)
+         (c:KLSReturn) : normalize-exp(exp(c), KLSReturn)
+         (c:KLSDefLocal) : normalize-exp(value(c), KLSDefLocal{n(c), _})
+         (c:KLSDefLocalVar) : normalize-exp(value(c), KLSDefLocalVar{n(c), type(c), _:False|KLSExp})
+         (c) : c
+
+   ;     Driver
+   ;     ------
+   map(convert-exp, convert-ls-exp, prog)
+
+
+
+;============================================================
+;================== Transformations =========================
+;============================================================
+
+;                     Program Mappers
+;                     ===============
+
+defn map (f: KExp -> KExp, prog:KProg) :
+   KProg $ for c in comms(prog) map :
+      map(f, c)
+
+defn map (fle: KLSExp -> KLSExp, prog:KProg) :
+   defn flc (c:KLSComm) : mapr(fle, c)
+   KProg $ for c in comms(prog) map :
+      map{flc, _} $
+      map(fle, c)   
+
+defn map (fe: KExp -> KExp, fle: KLSExp -> KLSExp, prog:KProg) :
+   defn flc (c:KLSComm) : mapr(fle, c)
+   KProg $ for c in comms(prog) map :
+      map{flc, _} $
+      map{fle, _} $
+      map(fe, c)
+
+defn map (fe: KExp -> KExp, flc: KLSComm -> KLSComm, prog:KProg) :
+   defn fle (e:KLSExp) : mapr(flc, e)
+   KProg $ for c in comms(prog) map :
+      map{flc, _} $
+      map{fle, _} $
+      map(fe, c)
+
+defn map (fe: KExp -> KExp, fle: KLSExp -> KLSExp, flc: KLSComm -> KLSComm, prog:KProg) :
+   KProg $ for c in comms(prog) map :
+      map{flc, _} $
+      map{fle, _} $
+      map(fe, c)
+
+defn prepend (cs: Streamable<KComm>, p:KProg) :
+   KProg(to-list(concat(cs, comms(p))))
+
+;                   Void Check Insertion
+;                   ====================
+
+defn void-check-insertion (prog:KProg) :
+   ;Find all global variables that may be void.
+   val void-var = HashTable<Int,True>({_})
+   for c in comms(prog) do :
+      match(c) :
+         (c:KDef) : void-var[n(c)] = true
+         (c:KDefVar) : void-var[n(c)] = true
+         (c:KLSDef) : void-var[n(c)] = true
+         (c) : false
+   
+   ;Retrieve voidable variable if it exists
+   defn void-var-n (def:KComm) :
+      match(def) :
+         (def:KDefVar) :
+            match(value(def)) :
+               (v:KExp) : n(def)
+               (v:False) : fail()
+         (def) : fail()
+
+   ;Insert void checks when necessary         
+   defn check-void (e:KExp) :
+      match(e) :
+         (e:KLet) :
+            attempt: void-var[void-var-n(def(e))] = true
+            mapr(check-void, e)
+         (e:KVar) :
+            if key?(void-var, n(e)) : KCheckVoid(e, false)
+            else : e
+         (e:KTupleGet) : KCheckVoid(mapr(check-void, e), false)
+         (e) : mapr(check-void, e)
+
+   ;Insert void checks for all HiStanza constructs
+   map(check-void, prog)
+
+
+;                    Mutable Variables Boxing
+;                    ========================
+
+defn box-mutables (prog:KProg) :
+   val mtable = HashTable<Int, True>({_})
+   defn box! (v:Int) : mtable[v] = true
+   defn box? (v:Int) : get?(mtable, v, false)
+
+   defn box (e:KExp) :
+      match(e) :
+         (e:KLet) :
+            match(def(e)) :
+               (d:KDefVar) :
+                  box!(n(d))
+                  val d* = map(box, d) as KDefVar
+                  val body* = box(body(e))
+                  KLet(KDef(n(d), KBox(value(d*), false)),
+                       body*,
+                       false)
+               (d) :
+                  mapr(box, e)
+         (e:KSet) :
+            val v* = box(value(e))
+            if box?(n(e)) : KBoxSet(KVar(n(e), false), v*, false)
+            else : KSet(n(e), v*, false)
+         (e:KVar) :
+            if box?(n(e)) :
+               KBoxGet(KVar(n(e), false), false)
+            else : e
+         (e) :
+            mapr(box, e)
+
+   ;Driver
+   map(box, prog)
+
+
+;                     Constant Lifting
+;                     ================
+
+defn constant-lifting (prog:KProg) :
+   ;Conversion
+   val accum = Vector<KComm>()
+   defn make-const (v) :
+      val n = fresh-id()
+      add(accum, KDefConst(n, v))
+      KVar(n)
+
+   defn conv-exp (e:KExp) :
+      match(mapr(conv-exp, e)) :
+         (e:KLiteral) :
+            match(value(e)) :
+               (v:Long|Float|String|Symbol|List) : make-const(v)
+               (v) : e
+         (e) : e
+
+   ;Driver
+   for c in comms(prog) do :
+      add{accum, _} $
+      map(conv-exp, c)
+   KProg(to-list(accum))
+
+
+;                    Method TArg Mapping
+;                    ===================
+
+defn sub (t:KType, env:List<KeyValue<Int,KType>>) :
+   match(t) :
+      (t:KTVar) :
+         val e = for e in env find : key(e) == n(t)
+         match(e) :
+            (e:KeyValue<Int,KType>) : value(e)
+            (e) : t
+      (t) :
+         map(sub{_, env}, t)
+
+defn method-targ-mapping (prog:KProg) :
+   ;Compute current type table, and multi types
+   val tt = TypeTable()
+   val multis = HashTable<Int, KDefmulti>({_})
+   for c in comms(prog) do :
+      match(c) :
+         (c:KDefType) : add-type(tt, c)
+         (c:KLSDefType) : add-ls-type(tt, c)
+         (c:KDefmulti) : multis[n(c)] = c
+         (c) : false
+   end-adds(tt)      
+   
+   ;Solve: xs = ts(ys) for ys
+   defn solve-inverse (xs:List<Int>, ys:List<Int>, ts:List<KType>) :
+      ;Find solutions
+      val xs-table = HashTable<Int, KType>({_})
+      val solns = HashTable<Int, List<Int>>({_})
+      defn find-soln (x:Int, t:KType) :
+         match(t) :
+            (t:KTVar) : solns[n(t)] = List(x, get?(solns,n(t),List()))
+            (t:KOr) : (find-soln(x, a(t)), find-soln(x, b(t)))
+            (t) : false
+      for (x in xs, t in ts) do :
+         xs-table[x] = t
+         find-soln(x, t)
+         
+      ;Find minimal solutions
+      for y in ys map :
+         if key?(solns, y) :
+            val xs = minima(solns[y], subtype?{tt, xs-table[_], xs-table[_]})
+            reduce(KAnd, stream(KTVar, xs))
+         else : KTop()
+
+   ;Replace type arguments in function
+   defn replace-targs (f:KFn, targs*:List<Int>, env:List<KeyValue<Int, KType>>) :
+      val a1* = for t in a1(f) map : sub(t, env)
+      val a2* = sub(a2(f), env)
+      val body* = mapr(sub{_, env}, body(f))
+      KFn(n(f), tail?(f), targs*, a1*, a2*, closure(f), args(f), body*)
+
+   ;Map methods over commands
+   defn map-methods-comm (c:KComm) :
+      match(map(map-methods-exp, c)) :
+         (c:KDefmethod) :
+            if empty?(targs(c)) :
+               c
+            else :
+               error("Untested.")
+               ;Compute appropriate mapping to method type arguments
+               var func* = let :
+                  val targs* = map(fresh-id{}, targs(c))
+                  val mapping = solve-inverse(targs*, targs(func(c)), targs(c))
+                  val env = map(KeyValue, targs(func(c)), mapping)
+                  replace-targs(func(c), targs*, env)
+               ;Inherit multi guards
+               func* = let :
+                  val m = multis[multi(c)]
+                  val env = map({_ => KTVar(_)}, targs(m), targs(func*))
+                  val a1* = for (x in a1(m), y in a1(func*)) map :
+                     KAnd(sub(x, env), y)
+                  val a2* = KAnd(sub(a2(m), env), a2(func*))
+                  KFn(n(func*), tail?(func*), targs(func*), a1*, a2*, closure(func*), args(func*), body(func*))
+               ;Return new defmethod
+               KDefmethod(n(c), multi(c), targs(c), thisn(c), func*)            
+         (c) : c
+   defn map-methods-exp (e:KExp) :
+      map(map-methods-exp, map(map-methods-comm, e))
+
+   ;Driver
+   KProg $ for c in comms(prog) map :
+      map-methods-comm(c)
+
+
+;============================================================
+;================ Closure Creation ==========================
+;============================================================
+
+defn closure-creation (prog:KProg) :
+   defn create-closures (e:KExp) :
+      defn afn (f:Func) :
+         val n = fresh-id()
+         KLet(KDefn(n, f), KVar(n), false)
+      match(e) :
+         (e:KMix) :
+            afn(mix-fn(exps(e)))
+         (e:KCurry) : 
+            afn(mix-fn(list(e)))
+         (e:KDo) :
+            match(func(e)) :
+               (f:KMix|KCurry) :
+                  KDo(func(e),
+                      map(create-closures,args(e)),
+                      a1(e), a2(e), type(e))
+               (f) : mapr(create-closures, e)
+         (e) : mapr(create-closures, e)
+
+   defn create-closures (e:KLSExp) :
+      match(e) :
+         (e:KLSFn) :
+            FuncExp $ match(ref(e)) :
+               (r:KCurry) : mix-fn(list(r))
+               (r:KMix) : mix-fn(exps(r))
+         (e) : mapr(create-closures, e)
+               
+   defn mix-fn (fs:List<KCurry>) :
+      ;Group by arity
+      val groups = HashTable<Int, List<KCurry>>({_})
+      for f in fs do :
+         val n = length(a1(f))
+         groups[n] = List(f, get?(groups, n, List()))
+
+      ;Make multi function
+      val funcs* = to-list $ for entry in groups stream :
+         defn KTops (n:Int) : map(KTop{}, 0 to n)
+         val [n, fs] = [key(entry), value(entry)]
+         val args* = map(fresh-id{}, 0 to n)         
+         val f = head(fs) when length(fs) == 1 else KMix(fs,false)
+         val body = KDo(f, map(KVar,args*), KTops(n), KTop(), false)
+         KFn(fresh-id(), true, List(), KTops(n), KTop(), false, args*, body)
+
+      ;Group functions
+      if length(funcs*) == 1 : head(funcs*)
+      else : KMultifn(fresh-id(), funcs*)
+
+   map(create-closures, create-closures, prog)
+
+;============================================================
+;================ KMix/KCurry Conversion ====================
+;============================================================
+
+definterface AbsCall
+defmulti func (x:AbsCall) -> KLSMix
+defmulti args (x:AbsCall) -> List<KLSExp>
+defmulti call (x:AbsCall, f:KLSExp, args:List<KLSExp>) -> KLSComm
+
+defn mix-conversion (prog:KProg) :
+   ;     Remove mixed calls from expression position
+   ;     ===========================================
+   defn mixed-call? (e:KLSExp) :
+      match(e) :
+         (e:KLSCall|KLSCallC) : func(e) typeof KLSMix
+         (e) : false
+   defn mixed-call? (f:False) :
+      false
+      
+   defn move-mixed-calls-comm (c:KLSComm) :
+      defn recur (c:KLSComm) :
+         map(move-mixed-calls-comm, map(move-mixed-calls-exp, c))
+      match(c) :
+         (c:KLSDefLocal) :
+            if mixed-call?(value(c)) :
+               val t = type(value(c) as KLSCall|KLSCallC)
+               KLSSeq(
+                  KLSDefLocalVar(n(c), t, false)
+                  KLSSet(Value(KLSVar(n(c))), value(c)))
+            else : recur(c)
+         (c:KLSDefLocalVar) :
+            if mixed-call?(value(c)) :
+               KLSSeq(
+                  KLSDefLocalVar(n(c), type(c), false)
+                  KLSSet(Value(KLSVar(n(c))), value(c) as KLSExp))
+            else : recur(c)
+         (c:KLSSet) :
+            if mixed-call?(value(c)) :
+               val exp* = mapr(move-mixed-calls-exp, exp(c))
+               KLSSet(exp*, value(c))
+            else : recur(c)
+         (c) :
+            recur(c)
+            
+   defn move-mixed-calls-exp (e:KLSExp) :
+      defn recur (e:KLSExp) :
+         map(move-mixed-calls-comm, map(move-mixed-calls-exp, e))
+      if mixed-call?(e) :
+         val n = fresh-id()
+         val t = type(e as KLSCall|KLSCallC)
+         KLSLet(
+            KLSSeq(
+               KLSDefLocalVar(n, t, false)
+               KLSSet(Value(KLSVar(n)), e))
+            KLSVar(n))
+      else : recur(e)
+
+   ;     Generating the dispatch branches for a mixed call
+   ;     =================================================
+   defn mix-call (e:KDo) :
+      val fs = exps(func(e) as KMix)
+      val branches* = for f in fs map :
+         val branch-args = map(fresh-id{}, args(e))
+         val body = KDo(f, map(KVar, branch-args), a1(f), a2(f), false)
+         KBranch(branch-args, a1(f), body)
+      KDispatch(args(e), branches*, false)
+
+   defn mix-call (c:AbsCall) :
+      val fs = exps(func(c))
+      val match-arg? = map({_ typeof KRefT}, a1(head(fs)))
+      val match-args = select(match-arg?, args(c))
+      val branches* = for f in fs map :
+         val branch-args = map(fresh-id{}, match-args)
+         val branch-types = map(type, select(match-arg?, a1(f)) as List<KRefT>)
+         val call-args = select(match-arg?, map(KLSVar, branch-args), args(c))
+         KLSBranch(branch-args, branch-types, call(c, f, call-args))
+      KLSDispatch(match-args, branches*)
+
+   ;     Conversion to Abstract Calls
+   ;     ============================
+   defn AbsCall (e:KLSExp, return: KLSExp -> KLSComm) :
+      fail() when not mixed-call?(e)
+      match(e) :
+         (e:KLSCall) :
+            new AbsCall :
+               defmethod func (this) : func(e) as KLSMix
+               defmethod args (this) : args(e)
+               defmethod call (this, f:KLSExp, args:List<KLSExp>) :
+                  return(KLSCall(f, args, type(e), new-stack?(e)))
+         (e:KLSCallC) :
+            new AbsCall :
+               defmethod func (this) : func(e) as KLSMix
+               defmethod args (this) : args(e)
+               defmethod call (this, f:KLSExp, args:List<KLSExp>) :
+                  return(KLSCallC(f, args, type(e)))
+         
+   defn AbsCall (c:KLSComm) :
+      match(c) :
+         (c:KLSCallComm) : AbsCall(exp(c), KLSCallComm)
+         (c:KLSSet) : AbsCall(value(c), KLSSet{exp(c), _})
+         (c:KLSReturn) : AbsCall(exp(c), KLSReturn)
+         (c) : fail()
+
+   ;     Mix Calls
+   ;     =========
+   defn mix-exp (e:KExp) :
+      match(mapr(mix-exp, e)) :
+         (e:KDo) :
+            if func(e) typeof KMix : mix-call(e)
+            else : e
+         (e) : e
+
+   defn mix-ls-exp (e:KLSExp) :
+      map(mix-exp, map(mix-comm, map(mix-exp,e)))
+      
+   defn mix-comm (c:KLSComm) :
+      val c* = map(mix-comm, map(mix-ls-exp, c))
+      attempt : mix-call(AbsCall(c*))
+      else : c*
+         
+   ;     Driver
+   ;     ======
+   val prog2 = map({_}, move-mixed-calls-exp, move-mixed-calls-comm, prog)
+   map(mix-exp, mix-comm, prog2)
+
+
+defn select<?T> (ps:List<True|False>, xs:List<?T>) -> List<T> :
+   if empty?(ps) : List()
+   else if head(ps) : List(head(xs), select(tail(ps), tail(xs)))
+   else : select(tail(ps), tail(xs))
+
+defn select<?T,?S> (ps:List<True|False>, xs:List<?T>, ys:List<?S>) -> List<T|S> :
+   if empty?(ps) : List()
+   else if head(ps) : List(head(xs), select(tail(ps), tail(xs), tail(ys)))
+   else : List(head(ys), select(tail(ps), tail(xs), tail(ys)))
+
+
+;                       Boundary Guards
+;                       ===============
+                     
+defn boundary-guard-insertion (prog:KProg) :
+   ;Which functions have guards?
+   val functions = HashTable<Int, True>({_})
+   val args-guarded = HashTable<Int, True>({_})
+   val ret-guarded = HashTable<Int, True>({_})
+   val multi-guarded = HashTable<Int, True|False>({_})
+   defn function! (n:Int) : functions[n] = true
+   defn function? (n:Int) : key?(functions, n)
+   defn args-guarded! (n:Int) : args-guarded[n] = true
+   defn args-guarded? (n:Int) : key?(args-guarded, n)
+   defn ret-guarded! (n:Int) : ret-guarded[n] = true
+   defn ret-guarded? (n:Int) : key?(ret-guarded, n)
+   defn multi-guarded! (n:Int, v:True|False) :
+      multi-guarded[n] = v and get?(multi-guarded, n, true)
+
+   ;     Annotate all Guard Information
+   ;     ------------------------------
+   defn annotate-exp (e:KExp) :
+      do(annotate-exp, e)
+      do(annotate-comm, e)
+         
+   defn annotate-comm (c:KComm) :
+      match(c) :
+         (c:KDefn) :
+            function!(n(c))
+            args-guarded!(n(c))
+            match(value(c)) :
+               (f:KFn) : ret-guarded!(n(c)) when not tail?(f)
+               (f:KMultifn) : ret-guarded!(n(c)) when none?(tail?, funcs(f) as List<KFn>)
+         (c:KDefmulti) :
+            function!(n(c))
+            multi-guarded!(n(c), true)
+         (c:KDefmethod) :
+            multi-guarded!(multi(c), not tail?(func(c)))
+         (c:KLSDefn) :
+            function!(n(c))            
+         (c) : false
+      do(annotate-exp, c)
+
+   ;Scan through top-level functions
+   do(annotate-comm, comms(prog))
+   for entry in multi-guarded do :
+      args-guarded!(key(entry))
+      ret-guarded!(key(entry)) when value(entry)
+
+   ;     Map over Calls and Functions
+   ;     ----------------------------
+   defn map-conv (fe:KDo -> KExp, ff:KFn -> KFn, prog:KProg) :
+      defn conv-fn<?T> (func:?T&Func) :
+         {_ as T&Func} $ match(map(conv-exp, func)) :
+            (func:KFn) :
+               ff(func)
+            (func:KMultifn) :
+               val fs = for f in funcs(func) map :
+                  ff(f as KFn)
+               KMultifn(n(func), fs)
+      defn conv-exp (e:KExp) :
+         match(map(conv-exp, map(conv-comm, e))) :
+            (e:KDo) : fe(e)
+            (e) : e
+      defn conv-ls-exp (e:KLSExp) :
+         match(e) :
+            (e:FuncExp) : FuncExp(conv-fn(func(e)))
+            (e) : mapr(conv-ls-exp, e)
+      defn conv-ls-comm (c:KLSComm) :
+         mapr(conv-ls-exp, c)
+      defn conv-comm (c:KComm) :
+         match(c) :
+            (c:KDefn) :
+               KDefn(n(c), conv-fn(value(c)))
+            (c:KDefmethod) :
+               KDefmethod(n(c), multi(c), targs(c), thisn(c), conv-fn(func(c)))
+            (c) : map(conv-ls-comm, map(conv-exp, c))            
+      KProg(map(conv-comm, comms(prog)))
+
+   ;     Guard Insertion
+   ;     ---------------
+   ;Cast expression to type
+   defn cast (e:KExp, t:KType) :
+      match(t) :
+         (t:KTop) : e
+         (t) : KCast(e, t, false)
+
+   defn guard-call (e:KDo) :
+      defn guard-func () :
+         cast(func(e), KOf(FN-TYPE-ID))
+      defn guard-args (f:KExp) :
+         val args* = map(cast, args(e), a1(e))
+         KDo(f, args*, a1(e), a2(e), false)   
+      defn guard-ret (exp:KExp) :
+         cast(exp, a2(e))
+         
+      match(func(e)) :
+         (f:KVar|KCurry) :
+            val n = n(f)
+            val e* = if function?(n) :
+                        if args-guarded?(n) : e
+                        else : guard-args(f)
+                     else : guard-args(guard-func())
+            if ret-guarded?(n) : e*
+            else : guard-ret(e*)
+         (f) :
+            guard-ret(guard-args(guard-func()))
+
+   defn guard-fn (f:KFn) :
+      defn tail-cast (b:KBranch, t:KType) :
+         KBranch(args(b), types(b), tail-cast(body(b), t))
+      defn tail-cast (e:KExp, t:KType) :
+         match(e) :
+            (e:KCast) : cast(exp(e), type-intersection(t, targ(e)))
+            (e:KLet) : KLet(def(e), tail-cast(body(e), t), false)
+            (e:KLetRec) : KLetRec(defs(e), tail-cast(body(e), t), false)
+            (e:KSeq) : KSeq(a(e), tail-cast(b(e), t), false)
+            (e:KMatch) : KMatch(args(e), map(tail-cast{_, t}, branches(e)), false)
+            (e:KDispatch) : KDispatch(args(e), map(tail-cast{_, t}, branches(e)), false)
+            (e) : cast(e, t)
+            
+      ;Guard arguments
+      var body*:KExp = body(f)
+      for (a in args(f), t in a1(f)) do :
+         body* = KSeq(cast(KVar(a), t), body*, false)
+         
+      ;Guard return
+      body* =
+         if tail?(f) : tail-cast(body*, a2(f))
+         else : cast(body*, a2(f))
+         
+      ;Return new function   
+      KFn(n(f), tail?(f), targs(f), a1(f), a2(f), closure(f), args(f), body*)                  
+
+   ;Map over entire program
+   map-conv(guard-call, guard-fn, prog)
+
+
+;============================================================
+;================== PRIMITIVE TAGGING =======================
+;============================================================
+
+defstruct Detag :
+   value: KLSExp
+   type: Int
+   
+defstruct Tag :
+   value: KLSExp
+   type: Int
+
+defn primitive-tagging (prog:KProg) :
+   ;Pattern match KLSExp against [e].value
+   defn detag? (e:KLSExp) :
+      val loc = match(e) :
+         (e:KLSRead) : exp(e)
+         (e) : fail()
+      val [base, field] = match(loc) :
+         (loc:stz/kl-ir/Field) : [base(loc), n(loc)]
+         (loc) : fail()
+      val value = match(base) :
+         (base:Deref) : exp(base)
+         (base) : fail()
+      val type = switch {field == _} :
+         INT-VALUE-FIELD-ID : INT-TYPE-ID
+         FLOAT-VALUE-FIELD-ID : FLOAT-TYPE-ID
+         else : fail()
+      Detag(value, type)
+
+   ;Pattern match KLSExp against ref<T>(e)
+   defn tag? (e:KLSExp) :
+      val [type, args] = match(e) :
+         (e:KLSRef) : [n(e), args(e)]
+         (e) : fail()
+      if type != INT-TYPE-ID and
+         type != FLOAT-TYPE-ID :
+         fail()
+      Tag(head(args), type)   
+      
+   ;Convert Detag 
+   defn detag (e:Detag) :
+      val v = value(e)
+      val shf-v = KLSPrim(ASHR-OP, list(v, KLSLitLong(3)), KLongT())
+      val type = switch {type(e) == _} :
+         INT-TYPE-ID : KIntT()
+         FLOAT-TYPE-ID : error("Not yet supported.")
+      KLSConv(shf-v, type)
+
+   ;Convert tag
+   defn tag (e:Tag) :
+      switch {type(e) == _} :
+         INT-TYPE-ID :
+            val long-v = KLSConv(value(e), KLongT())
+            val shf-v = KLSPrim(SHL-OP, list(long-v, KLSLitLong(3)), KLongT())
+            KLSPrim(ADD-OP, list(shf-v, KLSLitLong(INT-TAG-BITS)), KLongT())
+         else : error("Not yet supported.")
+
+   ;Convert all LSExpressions
+   defn conv-ls-exp (e:KLSExp) :
+      val e* =
+         attempt :
+            detag(detag?(e))
+         else attempt :
+            tag(tag?(e))
+         else :
+            e
+      mapr(conv-ls-exp, e*)   
+
+   ;Driver
+   map(conv-ls-exp, prog)
+
+      
+;                    Type Reification
+;                    ================
+
+defn type-reification (prog:KProg) :
+   ;Create type objects
+   val accum = Vector<KComm>()
+
+   defn def-type-obj (t:KType, vs:List<Int>) :
+      val n = fresh-id()
+      val vs* = map(fresh-id{}, vs)
+      val t* = sub(t, map({_ => KTVar(_)}, vs, vs*))
+      add(accum, KDefTypeObject(n, vs*, t*))
+      n
+
+   defn make-type-obj (t:KType) :
+      defn freevars (t:KType) :
+         generate<Int> :
+            defn loop (t:KType) :
+               match(t) :
+                  (t:KTVar) : yield(n(t))
+                  (t) : do(loop, t)
+            loop(t)
+      val vs = unique $ freevars(t)
+      val n = def-type-obj(t, vs)
+      [n, vs]
+   defn type-obj (t:KType) :
+      val [n, vs] = make-type-obj(t)
+      KTypeObject(n, map(KVar, vs), false)
+   defn ls-type-obj (t:KType) :
+      val [n, vs] = make-type-obj(t)
+      KLSTypeObject(n, map(KLSVar, vs))
+
+   ;Convert all expressions
+   defn conv-exp (e:KExp) :
+      match(mapr(conv-exp, e)) :
+         (e:KDo) :
+            val arity = length(args(e))
+            match(func(e)) :
+               (f:KCurry) :
+                  val args* = append(map(type-obj, targs(f)), args(e))
+                  KCall(false, arity, n(f), args*, false)
+               (f) :
+                  KCallDeref(false, arity, f, args(e), false)
+         (e) : e
+
+   ;Convert all lostanza expressions
+   defn conv-ls-exp (e:KLSExp) :
+      match(mapr(conv-ls-exp, e)) :
+         (e:FuncExp) :
+            val f* = map(conv-exp, func(e))
+            FuncExp(f*)
+         (e:KLSCall) :
+            val arity = length(args(e))
+            match(func(e)) :
+               (f:KLSCurry) :
+                  val args* = append(map(ls-type-obj, targs(f)), args(e))
+                  KLSWCall(false, arity, n(f), args*, type(e), new-stack?(e))
+               (f:KLSRead) :
+                  match(exp(f)) :
+                     (f:Deref) : KLSWCallDeref(false, arity, exp(f), args(e), type(e), new-stack?(e))
+                     (f:Deptr) : KLSWCallDeptr(false, arity, exp(f), args(e), type(e), new-stack?(e))
+         (e:KLSCallC) :
+            match(func(e)) :
+               (f:KLSCurry) :
+                  KLSWCallC(n(f), args(e), type(e))
+               (f:KLSRead) :
+                  val f* = exp(f) as Deptr
+                  KLSWCallCDeptr(exp(f*), args(e), type(e))
+         (e:KLSSwitchStack) :
+            KLSWSwitchStack(false, func(e), list(arg(e)), type(e))
+         (e) :
+            e
+
+   val prog* = map(conv-exp, conv-ls-exp, prog)
+   prepend(accum, prog*)
+
+
+;                    Free Variable Computation
+;                    =========================
+
+defstruct FVEntry :
+   args: List<Int>
+
+defmethod print (o:OutputStream, fv:FVEntry) :
+   defn cms (xs) : join(xs, ", ")
+   print(o, "FV{~@}" << [cms(args(fv))])
+
+defn freevar-table (prog:KProg) :
+   ;Scan globals
+   val globals = HashTable<Int, True>({_})
+   defn global? (n:Int) : key?(globals, n)
+   for c in comms(prog) do :
+      match(c) :
+         (c:KDef|KDefVar|KDefn|KDefmulti|KLSDef|KLSDefVar|KLSDefn|KDefConst) :
+            globals[n(c)] = true
+         (c) : false         
+
+   ;Table
+   val table = HashTable<Int, FVEntry>({_})
+
+   ;Get the freevars in a given function
+   defn freevars (f:Func) :
+      val arg-vars = HashTable<Int,True|False>({_})
+      
+      defn mark-free (t:KType) :
+         match(t) :
+            (t:KTVar) : arg-vars[n(t)] = true
+            (t) : do(mark-free, t)
+
+      defn mark-func (f:Func) :
+         for x in args(freevars(f)) do :
+            arg-vars[x] = true    
+      
+      defn mark-free (e:KExp) :
+         defn mark-branch (b:KBranch) :
+            mark-free(body(b))
+            for x in args(b) do :
+               arg-vars[x] = false               
+               
+         match(e) :
+            (e:KLet) :
+               mark-free(body(e))
+               match(def(e)) :
+                  (d:KDef|KDefVar) :
+                     do(mark-free, d)
+                     arg-vars[n(d)] = false
+                  (d:KDefn) :
+                     mark-func(value(d))
+                     arg-vars[n(d)] = false
+            (e:KLetRec) :
+               mark-free(body(e))
+               for d in defs(e) do :
+                  mark-func(value(d as KDefn))
+               for d in defs(e) do :
+                  arg-vars[n(d)] = false
+            (e:KDispatch) :
+               do(mark-free, args(e))
+               do(mark-branch, branches(e))
+            (e:KMatch) :
+               do(mark-free, args(e))
+               do(mark-branch, branches(e))
+            (e:KNew) :
+               for m in methods(e) do :
+                  mark-func(func(m))
+            (e:KVar) :
+               if not global?(n(e)) :
+                  arg-vars[n(e)] = true
+            (e:KCast) :
+               do(mark-free, e)
+               mark-free(targ(e))
+            (e) :
+               do(mark-free, e)
+
+      match(f) :
+         (f:KFn) :
+            mark-free(body(f))
+            for x in args(f) do : arg-vars[x] = false
+            for x in targs(f) do : arg-vars[x] = false
+            if closure(f) != false : arg-vars[closure(f) as Int] = false
+         (f:KMultifn) :
+            do(mark-func, funcs(f))
+
+      val fv = FVEntry $
+         to-list $
+         stream{key, _} $
+         filter(value, arg-vars)
+      table[n(f)] = fv
+      fv
+
+   ;Compute freevars for every expression
+   defn scan-exp (e:KExp) :
+      do(scan-comm, e)
+      do(scan-exp, e)
+   defn scan-comm (c:KComm) :
+      match(c) :
+         (c:KDefn) : freevars(value(c))
+         (c:KDefmethod) : freevars(func(c))
+         (c) : do(scan-exp, c)
+   defn scan-ls-exp (e:KLSExp) :   
+      match(e) :
+         (e:FuncExp) : freevars(func(e))
+         (e) : dor(scan-ls-exp, e)
+   defn scan-ls-comm (c:KLSComm) :
+      dor(scan-ls-exp, c)
+
+   ;Driver
+   for c in comms(prog) do :
+      do(scan-ls-comm, c)
+      do(scan-ls-exp, c)
+      do(scan-exp, c)
+   table
+
+
+;                     Object Lifting
+;                     ==============
+
+defn lift-objects (prog:KProg, freetable: HashTable<Int,FVEntry>) :
+   ;New top level forms
+   val accum = Vector<KComm>()
+   defn lift-top (c:KComm) : add(accum, c)
+   
+   defn lift (e:KExp) :
+      match(mapr(lift,e)) :
+         (e:KNew) :
+            ;Free variables
+            val fvs = unique $
+               for m in methods(e) stream-concat :
+                  args(freetable[n(func(m))])
+            ;Names of free variables      
+            val venv = map({_ => fresh-id()}, fvs)
+            ;Create struct for object
+            val newtype = fresh-id()
+            let :
+               val fs = for v in venv map :
+                  StructField(fresh-id(), KRefT(KTop()))
+               lift-top(KLSDefType(newtype, class(e), fs, false))
+            ;Pull methods out to top-level   
+            for m in methods(e) do :
+               ;Function in method
+               val f = func(m)
+               ;Argument name for object
+               val obj = thisn(m) as Int
+               ;Update body of method
+               var body* = alpha-rename(body(f), venv)
+               for (entry in venv, i in 0 to false) do :
+                  body* = KLet(KDef(value(entry), KObjectGet(KVar(obj), i, false)),
+                               body*,
+                               false)
+               ;Update types for method
+               val tenv = map({_ => KTop()}, fvs)
+               defn erase-free-type (t:KType) : sub(t, tenv)
+               ;Update input types of method
+               val a1* = for (t in a1(f), a in args(f)) map :
+                  if a == obj : KOf(newtype)
+                  else : erase-free-type(t)
+               val a2* = erase-free-type(a2(f))   
+               ;Pull out to top-level method
+               lift-top $ KDefmethod(n(m), multi(m), targs(m), false,
+                  KFn(fresh-id(), tail?(f), targs(f),
+                      a1*, a2*, closure(f), args(f), body*))
+            ;Change New to Object
+            KObject(newtype, map(KVar, fvs), false)
+         (e) :
+            e
+
+   ;Lift all object expressions and push to accum
+   for c in comms(prog) do :
+      lift-top(map(lift, c))
+
+   ;Return new program
+   KProg(to-list(accum))
+
+
+;                        Alpha Renaming
+;                        ==============
+
+defn alpha-rename (e:KExp, env:List<KeyValue<Int,Int>>) :
+   val table = HashTable<Int,Int>({_})
+   for e in env do : table[key(e)] = value(e)
+   alpha-rename(e, table)
+
+defn alpha-rename (e:KExp, table:HashTable<Int,Int>) :
+   match(mapr(alpha-rename{_, table}, e)) :
+      (e:KVar) :
+         val n* = get?(table, n(e), n(e))
+         KVar(n*, type(e))
+      (e) :
+         e
+
+;                   Closure Lifting
+;                   ===============
+
+defn lift-closures (prog:KProg, freetable:HashTable<Int,FVEntry>) :
+   val accum = Vector<KComm>()
+
+   ;     Lift a function to the top-level.
+   ;     ---------------------------------
+   ;Returns the identifier of the Defn representing the code for the function.
+   defn lift-func (f:Func) :
+      ;Lift function, given free variables fvs at indices idx
+      defn lift (f:KFn, fvs:List<Int>, idx:List<Int>) :
+         ;Names of free variables
+         val venv = for v in fvs map :
+            v => fresh-id()
+         ;Name of closure object
+         val clo = fresh-id()
+         ;Pull function to top-level
+         var body* = alpha-rename(body(f), venv)
+         for (entry in venv, i in idx) do :
+            val v* = value(entry)
+            body* = KLet(KDef(v*, KClosureGet(KVar(clo), i, false)),
+                         body*,
+                         false)
+         ;Update input types and arguments of method
+         val tenv = map({_ => KTop()}, fvs)
+         defn erase-free-type (t:KType) : sub(t, tenv)
+         val a1* = map(erase-free-type, a1(f))
+         val a2* = erase-free-type(a2(f))
+         ;Return updated func
+         KFn(fresh-id(), tail?(f), targs(f), a1*, a2*, clo, args(f), body*)
+
+      ;Lift function under default free variable mapping
+      defn lift (f:KFn) :
+         val fv = args(freetable[n(f)])
+         val idx = for (v in fv, i in 0 to false) map : i
+         lift(f, fv, idx)
+         
+      ;Lift multi function
+      defn lift (f:KMultifn) :
+         val mfv = args(freetable[n(f)])
+         val funcs* = for f in funcs(f) as List<KFn> map :
+            val fv = args(freetable[n(f)])
+            val idx = for v in fv map : index-of!(mfv, v)
+            lift(f, fv, idx)
+         KMultifn(n(f), funcs*)
+               
+      val f* = lift(f as KFn|KMultifn)
+      val n* = fresh-id()
+      add(accum, KDefn(n*, f*))
+      n*
+
+   ;     Lift all functions within expression
+   ;     ------------------------------------
+   defn lift-exp (e:KExp) :
+      defn lift-def (c:KDefn|KDef|KDefVar) :
+         match(c) :
+            (c:KDefn) :
+               val fvs = args(freetable[n(value(c))])
+               val code = lift-func(value(c))
+               KDef(n(c), KClosure(code, map(KVar, fvs), false))
+            (c) : c
+            
+      match(mapr(lift-exp, e)) :
+         (e:KLet) :
+            KLet(lift-def(def(e)), body(e), false)
+         (e:KLetRec) :
+            val defs* = map({lift-def(_) as KDef}, defs(e))
+            KLetRec(defs*, body(e), false)
+         (e) :
+            e
+            
+   ;     Lift all functions within ls expression
+   ;     ---------------------------------------
+   defn lift-ls-exp (e:KLSExp) :
+      match(mapr(lift-ls-exp, e)) :
+         (e:FuncExp) :
+            val f = func(e)
+            val fvs = args(freetable[n(f)])
+            error("Untested") when not empty?(fvs)
+            val code = lift-func(f)
+            KLSClosure(code, map(KLSVar, fvs))
+         (e) : e
+   defn lift-ls-comm (c:KLSComm) :
+      mapr(lift-ls-exp, c)
+
+   val prog* = map(lift-exp, lift-ls-exp, prog)
+   prepend(accum, prog*)
+
+
+;                   Multi Conversion
+;                   ================
+
+defn convert-multis (prog:KProg) :
+   ;Find all methods in program
+   val method-table = HashTable<Int, List<KDefmethod>>({_})
+   defn methods (n:Int) : get?(method-table, n, List<KDefmethod>())
+   defn find-methods (c:KComm) :
+      match(c) :
+         (c:KDefmethod) :
+            method-table[multi(c)] = List(c, methods(multi(c)))
+         (c) : false
+   do(find-methods, comms(prog))
+
+   ;Conversion
+   defn convert (c:KComm) :
+      match(c) :
+         (c:KDefmulti) :
+            val args* = map(fresh-id{}, a1(c))
+            val branches* = for m in methods(n(c)) map :
+               val xs = map(fresh-id{}, a1(c))
+               val ts = a1(func(m))
+               val args* = append(map(KVar, targs(c)), map(KVar, xs))
+               val body = KCall(false, length(a1(c)), n(m), args*, false)
+               KBranch(xs, ts, body)
+            val body* = KDispatch(map(KVar, args*), branches*, false)
+            val func* = KFn(fresh-id(), true, targs(c), a1(c), a2(c), false, args*, body*)
+            KDefn(n(c), func*)
+         (c:KDefmethod) :
+            KDefn(n(c), func(c))
+         (c) :
+            c
+
+   ;Return program
+   KProg(map(convert, comms(prog)))
+
+
+;                    Converting Calls
+;                    ================
+
+defn convert-calls (prog:KProg) :
+   val codetable = HashTable<Int,Int>({_})
+   defn conv-exp (e:KExp) :
+      defn recur (e:KExp) :
+         mapr(conv-exp, e)
+      defn record-code (d) :
+         match(d) :
+            (d:KDef) :
+               match(value(d)) :
+                  (v:KClosure) :
+                     codetable[n(d)] = n(v)
+                  (v) : false
+            (d) : false            
+      match(e) :
+         (e:KCallDeref) :
+            match(func(e)) :
+               (f:KVar) :
+                  val args* = map(conv-exp, args(e))
+                  if key?(codetable, n(f)) :
+                     KCall(tail?(e), arity(e), codetable[n(f)], List(f, args*), false)
+                  else : recur(e)
+               (f) : recur(e)
+         (e:KLet) :
+            record-code(def(e))
+            recur(e)
+         (e:KLetRec) :
+            do(record-code, defs(e))
+            recur(e)
+         (e) :
+            recur(e)
+
+   ;     Driver
+   ;     ------
+   KProg $ for c in comms(prog) map :
+      map(conv-exp, c)
+
+;                    Code Conversion
+;                    ===============
+
+defn convert-code (prog:KProg) :
+   ;Inserting tail calls
+   defn insert-tail-calls (e:KExp) :
+      match(e) :
+         (e:KLet) : KLet(def(e), insert-tail-calls(body(e)), false)
+         (e:KLetRec) : KLetRec(defs(e), insert-tail-calls(body(e)), false)
+         (e:KMatch) :
+            val branches* = for b in branches(e) map :
+               KBranch(args(b), types(b), insert-tail-calls(body(b)))
+            KMatch(args(e), branches*, false)
+         (e:KDispatch) :
+            val branches* = for b in branches(e) map :
+               KBranch(args(b), types(b), insert-tail-calls(body(b)))
+            KDispatch(args(e), branches*, false)   
+         (e:KCall) : KCall(true, arity(e), func(e), args(e), type(e))
+         (e:KCallDeref) : KCallDeref(true, arity(e), func(e), args(e), type(e))
+         (e) : e
+
+   defn insert-tail-calls (c:KLSComm) :
+      match(mapr(insert-tail-calls, c)) :
+         (c:KLSReturn) :
+            val e* = match(exp(c)) :
+               (e:KLSWCall) :
+                  KLSWCall(true, arity(e), func(e), args(e), type(e), new-stack?(e))
+               (e:KLSWCallDeptr) :
+                  KLSWCallDeptr(true, arity(e), func(e), args(e), type(e), new-stack?(e))
+               (e:KLSWCallDeref) :
+                  KLSWCallDeref(true, arity(e), func(e), args(e), type(e), new-stack?(e))
+               (e:KLSWSwitchStack) :
+                  KLSWSwitchStack(true, func(e), args(e), type(e))
+               (e) : e
+            KLSReturn(e*)
+         (c) : c
+
+   ;Convert functions
+   defn conv-fn (f:Func) :
+      match(f) :
+         (f:KFn) :
+            ;Create arguments
+            var args* = args(f)
+            ;Include reified type arguments
+            args* = append(targs(f), args*)
+            ;Include closure argument
+            if closure(f) != false :
+               args* = List(closure(f) as Int, args*)
+            ;Compute body with tailcalls
+            val body* = insert-tail-calls(body(f)) when tail?(f) else body(f)
+            ;Compute arity of function
+            val arity = length(args(f))
+            ;Create code
+            KCode(fresh-id(), arity, args*, body*)
+         (f:KMultifn) :
+            val fs* = map(conv-fn, funcs(f))
+            KMultifn(n(f), fs* as List<KCode>)
+
+   defn conv-ls-fn (f:KLSDefn) :
+      ;Create arguments
+      var args* = args(f)
+      var types* = a1(f)
+      ;Include reified type arguments
+      for t in targs(f) do :
+         args* = List(t, args*)
+         types* = List(KRefT(KTop()), types*)
+      ;Compute body with tailcalls   
+      val body* = insert-tail-calls(body(f)) when tail?(f) else body(f)
+      ;Compute arity of function
+      val arity = length(args(f))
+      ;Create code
+      KLSDefCode(n(f), arity, args*, types*, body*)
+
+   ;Driver
+   KProg $ for c in comms(prog) map :
+      match(c) :
+         (c:KDefn) : KDefn(n(c), conv-fn(value(c)))
+         (c:KLSDefn) : conv-ls-fn(c)
+         (c) : c
+
+;                    Cast Conversion
+;                    ===============
+
+defn cast-conversion (prog:KProg) :
+   defn conv-exp (e:KLSExp) :
+      match(mapr(conv-exp, e)) :
+         (e:KLSConv) :
+            match(type(e)) :
+               (t:KRefT) : KLSCast(exp(e), type(t))
+               (t) : e
+         (e) : e
+   defn conv-comm (c:KLSComm) :
+      mapr(conv-exp, c)
+
+   KProg $ for c in comms(prog) map :
+      map(conv-comm, c)
+
+
+;============================================================
+;==================== Compilation ===========================
+;============================================================
+
+
+;                    Tag Bit Utilities
+;                    =================
+
+defn tag-as-marker (n:Int) :
+   n << 3 + MARKER-TAG-BITS
+defn tag-as-int (n:Int) :
+   n << 3 + INT-TAG-BITS
+defn tag-as-tag (n:Int) :
+   n << 3 + TAG-TAG-BITS
+defn tag-as-header (n:Int) :
+   n << 3 + HEADER-TAG-BITS
+
+
+;                  Match Trie Conversion
+;                  =====================
+
+definterface MTrie
+defmulti type (t:MTrie) -> KType
+
+defstruct TrieArg <: MTrie :
+   type: KType with: (as-method => true)
+   children: List<MTrie>
+defstruct TrieEnd <: MTrie :
+   type: KType with: (as-method => true)
+   lbl: Int
+
+defmethod print (o:OutputStream, tr:MTrie) :
+   print{o,_} $
+   match(tr) :
+      (tr:TrieArg) : "(~ => ~@)" << [type(tr), join(children(tr), " or ")]
+      (tr:TrieEnd) : "(~ => ~)" << [type(tr), lbl(tr)]
+
+defn to-trie (branches:List<List<KType>>, lbls:List<Int>) -> List<MTrie> :
+   ;Add a list of types ending with a branch to the given list of tries
+   defn add (trs:List<MTrie>, types:List<KType>, branch-lbl:Int) -> List<MTrie> :
+      val [t, rest] = [head(types), tail(types)]
+      ;Case: Path is unreachable
+      if bottom?(t) :
+         trs
+      ;Case: There are currently no tries.
+      else if empty?(trs) :
+         if empty?(rest) : list(TrieEnd(t, branch-lbl))
+         else : list(TrieArg(t, add(trs, rest, branch-lbl)))
+      else :
+         val tr = head(trs)
+         ;Case: Head of trie is covered completely by path
+         if type-subset?(type(tr), t) :
+            val tr* = match(tr) :
+               (tr:TrieArg) : TrieArg(type(tr), add(children(tr), rest, branch-lbl))
+               (tr:TrieEnd) : tr
+            val types* = List(type-subtraction(t, type(tr)), tail(types))
+            List(tr*, add(tail(trs), types*, branch-lbl))
+         ;Case: Path is covered completely by head of trie   
+         else if type-subset?(t, type(tr)) :
+            match(tr) :
+               (tr:TrieArg) :
+                  List(TrieArg(t, add(children(tr), rest, branch-lbl))
+                  List(TrieArg(type-subtraction(type(tr), t), children(tr))
+                       tail(trs)))
+               (tr:TrieEnd) :
+                  List(TrieEnd(t, branch-lbl),
+                  List(TrieEnd(type-subtraction(type(tr), t), lbl(tr)),
+                       tail(trs)))
+         ;Case: Trie needs to be split more finely.
+         else :
+            val t1 = type-intersection(type(tr), t)
+            val t2 = type-subtraction(t, t1)
+            if bottom?(t1) :
+               List(head(trs),
+                    add(tail(trs), List(t2, tail(types)), branch-lbl))
+            else :
+               val trs* = add(trs, List(t1, tail(types)), branch-lbl)
+               add(trs*, List(t2, tail(types)), branch-lbl)
+         
+   ;Driver
+   var accum:List<MTrie> = List()
+   for (b in branches, lbl in lbls) do :
+      accum = add(accum, b, lbl)
+   accum
+
+
+;                    Dispatch Conversion
+;                    ===================
+
+defstruct DispatchTree :
+   branch: KBranch|KLSBranch
+   children: List<DispatchTree>
+
+defmethod print (o:OutputStream, t:DispatchTree) :
+   defn cms (xs) : join(xs, ", ")
+   if empty?(children(t)) :
+      print(o, "(~@ => END)" << [cms(types(branch(t)))])
+   else :
+      print(o, "(~@ => ~@)" << [cms(types(branch(t))), cms(children(t))])
+
+defn TreeList (tt:TypeTable, bs:List<KBranch|KLSBranch>) -> List<DispatchTree> :
+   ;Forming the Dispatch Tree
+   defn less-eq? (a:KBranch|KLSBranch, b:KBranch|KLSBranch) :
+      all?(subtype?{tt, _, _}, types(a), types(b))
+   defn cmp (a:KBranch|KLSBranch, b:KBranch|KLSBranch) :
+      match(a <= b, b <= a) :
+         (x:True, y:False) : -1
+         (x:False, y:True) : 1
+         (x, y) : 0
+   defn tlist (a:DispatchTree, bs:List<DispatchTree>) -> List<DispatchTree> :
+      if empty?(bs) :
+         list(a)
+      else :
+         val b = head(bs)
+         val r = cmp(branch(a), branch(b))
+         switch {r == _} :
+            -1 :
+               val b* = DispatchTree(branch(b), tlist(a, children(b)))
+               List(b*, tail(bs))
+            0 :
+               List(b, tlist(a, tail(bs)))
+            1 :
+               val a* = DispatchTree(branch(a), tlist(b, children(a)))
+               tlist(a*, tail(bs))
+
+   ;Driver
+   if empty?(bs) :
+      List()
+   else :
+      val t = DispatchTree(head(bs), List())
+      tlist(t, TreeList(tt, tail(bs)))
+
+defn dispatch-branches (tt: TypeTable,
+                        branches: List<KBranch|KLSBranch>
+                        AmbBranch: List<KType> -> KBranch|KLSBranch) :
+   ;Computing the ambiguity branches      
+   defn amb-branches (bs:List<KBranch|KLSBranch>) :
+      if length(bs) > 1 :
+         val ebs = Vector<KBranch|KLSBranch>()
+         var t1:List<KType> = map(dispatch-type{tt, _}, types(head(bs)))
+         for b in tail(bs) do :
+            val t2 = map(dispatch-type{tt, _}, types(b))
+            val ts = map(type-intersection, t1, t2)
+            if none?(bottom?, ts) :
+               add(ebs, AmbBranch(ts))
+            t1 = map(type-union, t1, t2)
+         to-list(ebs)
+      else : List()
+      
+   to-list $ generate<KBranch|KLSBranch> :
+      defn loop (ts:List<DispatchTree>) :
+         do(yield, amb-branches(map(branch, ts)))
+         for t in ts do :
+            loop(children(t))
+            yield(branch(t))
+      loop(TreeList(tt, branches))   
+                    
+defn convert-dispatch (tt:TypeTable, e:KDispatch) :
+   defn AmbBranch (ts:List<KType>) :
+      val xs = map(fresh-id{}, ts)
+      KBranch(xs, ts, KBranchError(false))
+   if empty?(branches(e)) :
+      KBranchError(false)
+   else if empty?(args(e)) :
+      if length(branches(e)) == 1 : body(head(branches(e)))
+      else : KBranchError(false)
+   else :
+      val bs = dispatch-branches(tt, branches(e), AmbBranch)
+      KMatch(args(e), bs as List<KBranch>, false)      
+
+defn convert-ls-dispatch (tt:TypeTable, e:KLSDispatch) :
+   defn AmbBranch (ts:List<KType>) :
+      val xs = map(fresh-id{}, ts)
+      KLSBranch(xs, ts, KLSBranchError())
+   if empty?(branches(e)) :
+      KLSBranchError()
+   else if empty?(args(e)) :
+      if length(branches(e)) == 1 : body(head(branches(e)))
+      else : KLSBranchError()
+   else :
+      val bs = dispatch-branches(tt, branches(e), AmbBranch)
+      KLSMatch(args(e), bs as List<KLSBranch>)
+
+
+;                   Command Buffer
+;                   ==============
+
+;     Emission of DefIns Structures
+;     -----------------------------
+var DEF-INS-VECTOR : False|Vector<tgt-DefIns> = false
+defn emit (i:tgt-DefIns) : add(DEF-INS-VECTOR as Vector<tgt-DefIns>, i)
+
+
+;     Emission of Ins Structures
+;     --------------------------
+var INSTRUCTION-VECTOR : False|Vector<tgt-Ins> = false
+defn emit (i:tgt-Ins) : add(INSTRUCTION-VECTOR as Vector<tgt-Ins>, i)
+defn args (xs:List<tgt-Var>) : emit(tgt-ArgsIns(xs))
+defn set (x:tgt-Var, y:tgt-Imm) : emit(tgt-SetIns(x, y))
+defn conv (x:tgt-Var, y:tgt-Imm) : emit(tgt-ConvertIns(x, y))
+defn binop (x:tgt-Var, op:tgt-TgtOp, y:tgt-Imm, z:tgt-Imm) : emit(tgt-BinOp(x, op, y, z))
+defn add (x:tgt-Var, y:tgt-Imm, z:tgt-Imm) : binop(x, tgt-ADD-OP, y, z)
+defn mul (x:tgt-Var, y:tgt-Imm, z:tgt-Imm) : binop(x, tgt-MUL-OP, y, z)
+defn shl (x:tgt-Var, y:tgt-Imm, z:tgt-Imm) : binop(x, tgt-SHL-OP, y, z)
+defn bit-and (x:tgt-Var, y:tgt-Imm, z:tgt-Imm) : emit(tgt-BinOp(x, tgt-AND-OP, y, z))
+defn load (x:tgt-Var, y:tgt-Imm, o:Int) : emit(tgt-Load(x, y, o))
+defn store (x:tgt-Imm, y:tgt-Imm, o:Int) : emit(tgt-Store(x, y, o))
+defn addr (x:tgt-Var, n:Int) : emit(tgt-Addr(x, n))
+defn call (a:Int, xs:List<tgt-Var>, f:tgt-Imm, ys:List<tgt-Imm>, ns?:True|False) : emit(tgt-Call(a, xs, f, ys, ns?))
+defn call (a:Int, xs:List<tgt-Var>, f:tgt-Imm, ys:List<tgt-Imm>) : call(a, xs, f, ys, false)
+defn callstack (xs:List<tgt-Var>, f:tgt-Imm, ys:List<tgt-Imm>) : emit(tgt-CallStack(xs, f, ys))
+defn ffi-call (xs:List<tgt-Var>, f:tgt-Imm, ys:List<tgt-Imm>) : emit(tgt-CallC(xs, f, ys))
+defn tcall (a:Int, f:tgt-Imm, ys:List<tgt-Imm>, ns?:True|False) : emit(tgt-TCall(a, f, ys, ns?))
+defn tcall (a:Int, f:tgt-Imm, ys:List<tgt-Imm>) : tcall(a, f, ys, false)
+defn tcallstack (f:tgt-Imm, ys:List<tgt-Imm>) : emit(tgt-TCallStack(f, ys))
+defn return (xs:List<tgt-Imm>) : emit(tgt-Return(xs))
+defn tlabel (n:Int) : emit(tgt-Label(n))
+defn goto (n:Int) : emit(tgt-Goto(n))
+defn jne (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-NE-OP, x, y))
+defn jeq (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-EQ-OP, x, y))
+defn jlt (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-LT-OP, x, y))
+defn jle (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-LE-OP, x, y))
+defn jult (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-ULT-OP, x, y))
+defn jule (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-ULE-OP, x, y))
+defn jgt (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-GT-OP, x, y))
+defn jge (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-GE-OP, x, y))
+defn jugt (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-UGT-OP, x, y))
+defn juge (n:Int, x:tgt-Imm, y:tgt-Imm) : emit(tgt-Branch(n, tgt-UGE-OP, x, y))
+defn byte (v:Int) : tgt-ByteImm(v)
+defn int (v:Int) : tgt-IntImm(v)
+defn long (v:Int) : tgt-LongImm(v)
+defn mem (n:Int, offset:Int) : tgt-Mem(n, offset)
+defn xmem (name:Symbol, offset:Int) : tgt-ExMem(name, offset)
+defn mem (n:Int) : tgt-Mem(n, 0)
+defn xmem (name:Symbol) : tgt-ExMem(name, 0)
+
+defn jstack-has-space (n:Int) : emit(tgt-SpecialBranch(n, tgt-STACK-HAS-SPACE))
+defn jarity-neq (n:Int, arity:Int) : emit(tgt-SpecialBranch(n, tgt-ArityNEqOp(arity)))
+defn switch-stack () : emit(tgt-SpecialOp(tgt-SWITCH-STACK-OP))
+
+;     Heap Instructions
+;     -----------------
+defn heap-ptr () :
+   val p = make-var(tgt-LONG-TYPE)
+   load(p, mem(HEAP-PTR-LBL), 0)
+   p
+
+defn heap-lim () :
+   val p = make-var(tgt-LONG-TYPE)
+   load(p, mem(HEAP-LIM-LBL), 0)
+   p
+   
+defn extend-heap (sz:tgt-Imm) :
+   val endL = fresh-id()
+   val p = heap-ptr()
+   add(p, p, sz)
+   jule(endL, p, heap-lim())
+   call(1, List(), mem(EXTEND-HEAP-ID), list(sz))
+   tlabel(endL)
+
+defn extend-heap (sz:Int) :
+   extend-heap(long(sz))
+
+defn inc-heap-ptr (sz:tgt-Imm) :
+   val p = heap-ptr()
+   add(p, p, sz)
+   store(mem(HEAP-PTR-LBL), p, 0)
+
+defn inc-heap-ptr (sz:Int) :
+   inc-heap-ptr(long(sz))
+
+;     Compound Value Instructions
+;     ---------------------------
+defn value-lbl (ins:tgt-DefIns) :
+   val n = fresh-id()
+   emit(tgt-TLabel(n))
+   emit(ins)
+   n   
+defn float-lbl (f:Float) : value-lbl(tgt-DefFloat(f))
+defn double-lbl (f:Float) : value-lbl(tgt-DefDouble(f))
+defn string-lbl (s:String) : value-lbl(tgt-DefString(s))
+
+;     Conversion of Primitive Operators
+;     ---------------------------------
+defn to-tgt-op (op:KLSOp) :
+   switch {op == _} :
+      ADD-OP : tgt-ADD-OP
+      SUB-OP : tgt-SUB-OP
+      MUL-OP : tgt-MUL-OP
+      DIV-OP : tgt-DIV-OP
+      MOD-OP : tgt-MOD-OP
+      AND-OP : tgt-AND-OP
+      OR-OP : tgt-OR-OP
+      XOR-OP : tgt-XOR-OP
+      SHL-OP : tgt-SHL-OP
+      SHR-OP : tgt-SHR-OP
+      ASHR-OP : tgt-ASHR-OP
+      EQ-OP : tgt-EQ-OP
+      NE-OP : tgt-NE-OP
+      LT-OP : tgt-LT-OP
+      GT-OP : tgt-GT-OP
+      LE-OP : tgt-LE-OP
+      GE-OP : tgt-GE-OP
+      ULT-OP : tgt-ULT-OP
+      UGT-OP : tgt-UGT-OP
+      ULE-OP : tgt-ULE-OP
+      UGE-OP : tgt-UGE-OP
+
+
+;                  Variable Management
+;                  ===================
+
+;     Definition of VarTable
+;     ----------------------
+defclass VarTable <: Gettable<Int,List<tgt-Var>> &
+                     Settable<Int,List<tgt-Var>>
+defmulti make-var (v:VarTable, t:tgt-TgtType) -> tgt-Var
+defmulti types (v:VarTable, n:Int) -> List<tgt-TgtType>
+defmulti defs (v:VarTable) -> Vector<tgt-DefVar>
+
+defn VarTable () :
+   val defs = Vector<tgt-DefVar>()
+   val table = HashTable<Int,List<tgt-Var>>({_})
+   val type-table = HashTable<Int,tgt-TgtType>({_})
+   
+   new VarTable :
+      defmethod make-var (this, t:tgt-TgtType) :
+         val n = fresh-id()
+         add(defs, tgt-DefVar(n, t))
+         type-table[n] = t
+         tgt-Var(n)
+      defmethod set (this, n:Int, vs:List<tgt-Var>) :
+         table[n] = vs
+      defmethod get (this, n:Int) :
+         table[n]
+      defmethod types (this, x:Int) :
+         for v in this[x] map :
+            type-table[tgt-n(v)]
+      defmethod defs (this) :
+         defs
+
+defn make-vars (v:VarTable, ts:List<tgt-TgtType>) :
+   for t in ts map :
+      make-var(v, t)
+
+;     Implicit VarTable
+;     -----------------
+var VAR-TABLE : False|VarTable = false
+defn VAR-TABLE! () : VAR-TABLE as VarTable
+defn make-var (t:tgt-TgtType) : make-var(VAR-TABLE!(), t)
+defn make-vars (ts:List<tgt-TgtType>) : map(make-var, ts)
+defn env-vars (n:Int) : VAR-TABLE!()[n]
+defn var-types (n:Int) : types(VAR-TABLE!(), n)
+
+
+;                    Global Table
+;                    ============
+
+defclass GlobalTable <: Gettable<Int, GEntry>
+defmulti add-global (gt:GlobalTable, n:Int) -> False
+defmulti add-function (gt:GlobalTable, n:Int) -> False
+defmulti add-type-object (gt:GlobalTable, n:Int) -> False
+defmulti add-const (gt:GlobalTable, n:Int, v) -> False
+defmulti add-ls-global (gt:GlobalTable, n:Int, t:KLSType) -> False
+defmulti add-ls-function (gt:GlobalTable, n:Int) -> False
+defmulti add-ls-extern (gt:GlobalTable, n:Int, t:KLSType, lbl:Symbol) -> False
+defmulti global-var? (t:GlobalTable, n:Int) -> True|False
+defmulti global-lbl (t:GlobalTable, n:Int) -> Int|Symbol
+defmulti global-var-type (t:GlobalTable, n:Int) -> KLSType
+defmulti root-vars (t:GlobalTable) -> Streamable<Int>
+defmulti global-consts (t:GlobalTable) -> Streamable<Int>
+
+defn global-var? (gt:GlobalTable, e:KLSExp) :
+   match(e) :
+      (e:KLSVar) : global-var?(gt, n(e))
+      (e) : false
+
+;Values: Globals, Consts, Externs
+;Functions: Functions, Types
+definterface GEntry
+defstruct HiGlobal <: GEntry
+defstruct HiFunction <: GEntry
+defstruct HiType <: GEntry
+defstruct GConst <: GEntry : (value)
+defstruct LoGlobal <: GEntry : (type:KLSType)
+defstruct LoFunction <: GEntry
+defstruct GExtern <: GEntry : (type:KLSType, lbl:Symbol)
+
+defn GlobalTable () :
+   val entries = HashTable<Int, GEntry>({_})
+   defn grab (p: GEntry -> True|False) :
+      stream(key, filter(p{value(_)}, entries))
+            
+   new GlobalTable :      
+      defmethod add-global (this, n:Int) -> False :
+         entries[n] = HiGlobal()
+      defmethod add-function (this, n:Int) -> False :
+         entries[n] = HiFunction()
+      defmethod add-type-object (this, n:Int) -> False :
+         entries[n] = HiType()
+      defmethod add-const (this, n:Int, v) -> False :
+         entries[n] = GConst(v)
+      defmethod add-ls-global (this, n:Int, t:KLSType) -> False :
+         entries[n] = LoGlobal(t)
+      defmethod add-ls-function (this, n:Int) -> False :
+         entries[n] = LoFunction()
+      defmethod add-ls-extern (this, n:Int, t:KLSType, lbl:Symbol) -> False :
+         entries[n] = GExtern(t, lbl)
+      defmethod global-var? (this, n:Int) -> True|False :
+         get?(entries, n, false) typeof HiGlobal|GConst|LoGlobal|GExtern
+      defmethod global-lbl (this, n:Int) -> Int|Symbol :
+         match(entries[n]) :
+            (e:GExtern) : symbol-join(["_", lbl(e)])
+            (e) : n
+      defmethod global-var-type (this, n:Int) -> KLSType :
+         match(entries[n]) :
+            (e:LoGlobal|GExtern) : type(e)
+            (e:HiGlobal|GConst) : KRefT(KTop())
+      defmethod get (this, n:Int) :
+         entries[n]      
+      defmethod root-vars (this) :
+;         concat(   
+;            grab({_ typeof GConst})   
+;            grab({_ typeof HiGlobal|LoGlobal}))
+         grab({_ typeof HiGlobal|LoGlobal})   
+      defmethod global-consts (this) :
+         grab({_ typeof GConst})
+
+
+;                     Type Analysis
+;                     =============
+
+;     Type Table Interface
+;     --------------------
+defclass TypeTable
+defmulti add-type (tt:TypeTable, c:KDefType) -> False
+defmulti add-ls-type (tt:TypeTable, c:KLSDefType) -> False
+defmulti end-adds (tt:TypeTable) -> False
+
+defmulti expand (tt:TypeTable, t:KLSType) -> List<tgt-TgtType> 
+defmulti pad+expand (tt:TypeTable, t:KLSType) -> List<tgt-TgtType> 
+defmulti offsets (tt:TypeTable, t:KLSType) -> List<Int>      
+defmulti size (tt:TypeTable, t:KLSType) -> Int
+defmulti count (tt:TypeTable, t:KLSType) -> Int
+defmulti alignment (tt:TypeTable, t:KLSType) -> Int
+defmulti field-offset (tt:TypeTable, f:Int) -> Int           
+defmulti field-index (tt:TypeTable, f:Int) -> Int            
+defmulti field-type (tt:TypeTable, f:Int) -> KLSType         
+defmulti rfield (tt:TypeTable, n:Int) -> Int                 
+defmulti tag (tt:TypeTable, n:Int) -> Int
+defmulti dispatch-type (tt:TypeTable, t:KType) -> KType
+defmulti cast-type (tt:TypeTable, t:KType) -> KType
+defmulti primitive? (tt:TypeTable, n:Int) -> True|False
+defmulti marker? (tt:TypeTable, n:Int) -> True|False
+defmulti subtype? (tt:TypeTable, a:KType, b:KType) -> True|False
+defmulti tagged-types (tt:TypeTable) -> Streamable<KLSDefType>
+
+
+;     Type Arithmetic
+;     ---------------
+defn set-subtraction (a:List<Int>, b:List<Int>) :
+   to-list(for x in a filter : not contains?(b, x))
+defn set-union (a:List<Int>, b:List<Int>) :
+   unique(append(a, b))
+defn set-intersection (a:List<Int>, b:List<Int>) :
+   to-list(for x in a filter : contains?(b, x))
+defn type-subtraction (a:KType, b:KType) :
+   match(a, b) :
+      (a:KTags, b:KTags) : KTags(set-subtraction(tags(a), tags(b)))
+      (a:KTags, b:KTop) : KTags(List())
+      (a:KTop, b:KTags) : a
+defn type-union (a:KType, b:KType) :
+   match(a, b) :
+      (a:KTags, b:KTags) : KTags(set-union(tags(a), tags(b)))
+      (a, b:KTop) : b
+      (a:KTop, b) : a
+      (a, b) :
+         if a == b : a
+         else : KOr(a, b)
+defn type-intersection (a:KType, b:KType) :
+   match(a, b) :
+      (a:KTags, b:KTags) : KTags(set-intersection(tags(a), tags(b)))
+      (a, b:KTop) : a
+      (a:KTop, b) : b
+      (a, b) :
+         if a == b : a
+         else : KAnd(a, b)
+defn type-subset? (a:KType, b:KType) :
+   match(a, b) :
+      (a:KTags, b:KTags) : for x in tags(a) all? : contains?(tags(b), x)
+      (a, b:KTop) : true
+      (a:KTop, b) : false         
+defn bottom? (t:KType) :
+   match(t) :
+      (t:KTags) : empty?(tags(t))
+      (t) : false
+
+;     Analysis
+;     --------
+defn TypeTable () :
+   ;     Search through all types
+   ;     ------------------------
+   val lstypes = HashTable<Int, KLSDefType>({_})
+   val types = HashTable<Int, KDefType>({_})
+
+   ;     Compute Expansions
+   ;     ------------------
+   val struct-expansions = HashTable<Int, List<tgt-TgtType>>({_})
+   defn expand (t:KLSType) :
+      defn expand-struct (n:Int) :
+         for f in fields(lstypes[n]) map-append :
+            expand(type(f))
+      match(t) :
+         (t:KByteT) : list(tgt-BYTE-TYPE)
+         (t:KIntT) : list(tgt-INT-TYPE)
+         (t:KLongT) : list(tgt-LONG-TYPE)
+         (t:KFloatT) : list(tgt-FLOAT-TYPE)
+         (t:KDoubleT) : list(tgt-DOUBLE-TYPE)
+         (t:KPtrT) : list(tgt-LONG-TYPE)
+         (t:KRefT) : list(tgt-REF-TYPE)
+         (t:KStructT) :
+            if not key?(struct-expansions, n(t)) :
+               struct-expansions[n(t)] = expand-struct(n(t))
+            struct-expansions[n(t)]
+         (t) : error("No expansion for ~." % [t])
+
+   ;     Compute Field Types and Indices
+   ;     -------------------------------
+   val field-structs = HashTable<Int,Int>({_})
+   val field-indices = HashTable<Int,Int>({_})
+   val field-types = HashTable<Int,KLSType>({_})
+   defn compute-field-stats () :
+      for def in values(lstypes) do :
+         for (f in fields(def), i in 0 to false) do :
+            field-structs[n(f)] = n(def)
+            field-indices[n(f)] = i
+            field-types[n(f)] = type(f)
+         if rfield(def) != false :
+            val f = rfield(def) as StructField
+            field-structs[n(f)] = n(def)
+            field-indices[n(f)] = length(fields(def))
+            field-types[n(f)] = type(f)
+
+   ;     Compute Struct Tags
+   ;     -------------------
+   val tag-table = HashTable<Int,Int>({_})
+   val tag-types = Vector<Int>()
+   defn compute-struct-tags () :
+      defn assign-next-tag (n:Int) :
+         if not key?(tag-table, n) :
+            println("Assigned tag ~ to ~" << [length(tag-types), n])
+            tag-table[n] = length(tag-types)
+            add(tag-types, n)      
+      assign-next-tag(FALSE-TYPE-ID)
+      assign-next-tag(TRUE-TYPE-ID)
+      for def in values(lstypes) do :
+         assign-next-tag(n(def))
+
+   ;     Compute All Concrete Subclasses
+   ;     -------------------------------
+   val subclass-table = HashTable<Int, List<Int>>({_})
+   defn class-parent (n:Int) -> False|KType :
+      if key?(lstypes, n) : parent(lstypes[n])
+      else if key?(types, n) : parent(types[n])
+      else : error("Not a type: ~" % [n])
+
+   defn subclasses (n:Int) :
+      get?(subclass-table, n, List<Int>())
+      
+   defn compute-subclasses () :
+      defn do-classes (f: Int -> ?, t:False|KType) :
+         match(t) :
+            (t:KOf) : f(n(t))
+            (t:KAnd) : (do-classes(f, a(t)), do-classes(f, b(t)))
+            (t:False) : false            
+      defn mark-child (p:Int, n:Int) :
+         subclass-table[p] = List(n, subclasses(p))
+         for p* in class-parent(p) do-classes :
+            mark-child(p*, n)
+      for t in values(lstypes) do :
+         mark-child(n(t), n(t))
+
+   defn dispatch-type (t:KType) :
+      match(t) :
+         (t:KOf) : KTags(subclasses(n(t)))
+         (t:KTVar) : KTop()
+         (t:KAnd) : type-intersection(dispatch-type(a(t)), dispatch-type(b(t)))
+         (t:KOr) : type-union(dispatch-type(a(t)), dispatch-type(b(t)))
+         (t:KTop) : t
+         (t:KBot) : KTags(List())
+         (t:KTags) : t
+
+   defn cast-type (t:KType) :
+      match(t) :
+         (t:KOf) : KTags(subclasses(n(t)))
+         (t:KTVar) : t
+         (t:KAnd) : type-intersection(cast-type(a(t)), cast-type(b(t)))
+         (t:KOr) : type-union(cast-type(a(t)), cast-type(b(t)))
+         (t:KTop) : t
+         (t:KBot) : KTags(List())
+         (t:KTags) : t
+
+   defn subtype? (x:False, y:KType) :
+      false
+   defn subtype? (x:KType, y:KType) :
+      match(x, y) :
+         ;3. Fast Path
+         (x:KBot, y) : true
+         (x, y:KTop) : true
+         ;2. Combinatory Types
+         (x:KOr, y) : subtype?(a(x), y) and subtype?(b(x), y)
+         (x, y:KOr) : subtype?(x, a(y)) or subtype?(x, b(y))
+         (x, y:KAnd) : subtype?(x, a(y)) and subtype?(x, b(y))
+         (x:KAnd, y) : subtype?(a(x), y) or subtype?(b(x), y)
+         ;1. Ground Types   
+         (x:KOf, y:KOf) :
+            if n(x) == n(y) : true
+            else : subtype?(class-parent(n(x)), y)
+         (x:KTVar, y:KTVar) :
+            n(x) == n(y)
+         ;4. Tag Types
+         (x:KTags, y:KTags) : type-subset?(x, y)
+         (x:KTags, y:KOf) : type-subset?(x, dispatch-type(y))
+         (x:KOf, y:KTags) : contains?(tags(y), n(x))
+         ;Fall Through
+         (x, y) : false            
+   
+
+   ;     Compute Alignments, Padding, and Size
+   ;     -------------------------------------
+   val pad+expansions = HashTable<Int, List<tgt-TgtType>>({_})
+   val struct-alignments = HashTable<Int, Int>({_})
+   val type-sizes = HashTable<Int,Int>({_})
+   val field-offsets = HashTable<Int,Int>({_})
+
+   defn type-size (t:KLSType) :
+      match(t) :
+         (t:KByteT) : 1
+         (t:KIntT) : 4
+         (t:KLongT) : 8
+         (t:KFloatT) : 4
+         (t:KDoubleT) : 8
+         (t:KPtrT) : 8
+         (t:KRefT) : 8
+         (t:KUnknownT) : error("No size.")
+         (t:KFnT) : error("No size.")
+         (t:KStructT) :
+            compute-struct(n(t)) when not key?(type-sizes, n(t))
+            type-sizes[n(t)]
+
+   defn type-alignment (t:KLSType) :
+      match(t) :
+         (t:KStructT) :
+            compute-struct(n(t)) when not key?(struct-alignments, n(t))
+            struct-alignments[n(t)]
+         (t) : type-size(t)
+
+   defn pad+expand (t:KLSType) :
+      match(t) :
+         (t:KStructT) :
+            compute-struct(n(t)) when not key?(pad+expansions, n(t))
+            pad+expansions[n(t)]
+         (t) : expand(t)
+
+   defn field-offset (f:Int) :
+      if not key?(field-offsets, f) :
+         compute-struct(field-structs[f])
+      field-offsets[f]
+
+   defn compute-struct (sn:Int) :
+      ;Pad struct fields
+      val def = lstypes[sn]
+      val items = for f in fields(def) stream :
+         Item(type-alignment(type(f)), n(f))         
+      val [items*, aln] = match(rfield(def)) :
+         (rf:False) : pad(items, 1)
+         (rf:StructField) : pad(items, type-alignment(type(rf)))
+
+      ;Compute struct alignment, field offsets, type sizes, and padded expansions
+      var accum = 0
+      val expansion = Vector<tgt-TgtType>()
+      for x in items* do :
+         match(x) :
+            (x:Item) :
+               val f = data(x) as Int
+               val ft = field-types[f]
+               field-offsets[f] = accum
+               do(add{expansion, _}, pad+expand(ft))
+               accum = accum + type-size(ft)
+            (x:Padding) :
+               val sz = size(x)
+               add(expansion, tgt-IntType(sz))
+               accum = accum + size(x)
+
+      ;Record Rest Field offset
+      if rfield(def) != false :
+         val rf = rfield(def) as StructField
+         field-offsets[n(rf)] = accum
+
+      ;Record Size, Expansion, and Alignment
+      type-sizes[sn] = accum         
+      pad+expansions[sn] = to-list(expansion)
+      struct-alignments[sn] = aln      
+
+   
+   ;     Return Table
+   ;     ------------
+   new TypeTable :
+      defmethod add-type (this, c:KDefType) :
+         types[n(c)] = c
+      defmethod add-ls-type (this, c:KLSDefType) :
+         lstypes[n(c)] = c
+      defmethod end-adds (this) :
+         compute-field-stats()
+         compute-struct-tags()
+         compute-subclasses()
+      defmethod expand (this, t:KLSType) :
+         expand(t)
+      defmethod count (this, t:KLSType) :
+         length(expand(t))
+      defmethod pad+expand (this, t:KLSType) :
+         pad+expand(t)
+      defmethod offsets (this, t:KLSType) :
+         match(t) :
+            (t:KStructT) :
+               for f in fields(lstypes[n(t)]) map :
+                  field-offset(n(f))
+            (t) : list(0)
+      defmethod size (this, t:KLSType) :
+         type-size(t)
+      defmethod alignment (this, t:KLSType) :
+         type-alignment(t)
+      defmethod field-offset (this, f:Int) :
+         field-offset(f)
+      defmethod field-type (this, f:Int) :
+         field-types[f]
+      defmethod field-index (this, f:Int) :
+         field-indices[f]
+      defmethod rfield (this, s:Int) :
+         n(rfield(lstypes[s]) as StructField)
+      defmethod tag (this, n:Int) :
+         tag-table[n]
+      defmethod dispatch-type (this, t:KType) :
+         dispatch-type(t)
+      defmethod cast-type (this, t:KType) :
+         cast-type(t)
+      defmethod primitive? (this, n:Int) :
+         contains?([INT-TYPE-ID], n)
+      defmethod marker? (this, n:Int) :
+         match(get?(lstypes, n, false)) :
+            (t:KLSDefType) : empty?(fields(t)) and (rfield(t) == false)
+            (t:False) : false
+      defmethod subtype? (this, a:KType, b:KType) :
+         subtype?(a, b)
+      defmethod tagged-types (this) :
+         for n in tag-types stream :
+            lstypes[n]
+
+;============================================================
+;====================== COMPILATION =========================
+;============================================================
+
+definterface CResult
+defmulti assign (xs:List<tgt-Var>, r:CResult) -> False
+defmulti imms (r:CResult) -> List<tgt-Imm>
+defmulti types (r:CResult) -> List<tgt-TgtType>
+defn vars (r:CResult) -> List<tgt-Var> :
+   val vs = make-vars(types(r))
+   assign(vs, r)
+   vs
+
+definterface CSResult
+defmulti assign (x:tgt-Var, r:CSResult) -> False
+defmulti imm (r:CSResult) -> tgt-Imm
+defmulti return (r:CSResult) -> False
+defmethod return (r:CSResult) :
+   return(list(imm(r)))
+   
+defn imm-var (r:CSResult) -> tgt-Var :
+   val x = make-var(tgt-REF-TYPE)
+   assign(x, r)
+   x
+
+definterface CLoc
+defstruct PtrLoc <: CLoc :
+   base: tgt-Imm
+   offset: Int
+   type: KLSType
+defstruct ExpLoc <: CLoc :
+   exp: KLSExp
+defstruct SubExpLoc <: CLoc :
+   exp: KLSExp
+   index: Int
+   count: Int
+   type: KLSType
+
+defn sublist<?T> (xs:List<?T>, i:Int, n:Int) :
+   headn(tailn(xs, i), n)
+
+defn compile (prog:KProg) -> tgt-Program :
+   ;     Analysis
+   ;     --------
+   val gt = GlobalTable()
+   val tt = TypeTable()
+
+   for c in comms(prog) do :
+      match(c) :
+         (c:KDef) : add-global(gt, n(c))
+         (c:KDefVar) : add-global(gt, n(c))
+         (c:KDefn) : add-function(gt, n(c))
+         (c:KDefTypeObject) : add-type-object(gt, n(c))
+         (c:KDefConst) : add-const(gt, n(c), value(c))
+         (c:KDefType) : add-type(tt, c)
+         (c:KInit) : false
+         (c:KLSDef) : add-ls-global(gt, n(c), type(c))
+         (c:KLSDefVar) : add-ls-global(gt, n(c), type(c))
+         (c:KLSDefCode) : add-ls-function(gt, n(c))
+         (c:KExtern) : add-ls-extern(gt, n(c), type(c), lbl(c))
+         (c:KLSDefType) : add-ls-type(tt, c)
+         (c:KLSInit) : false
+         
+   end-adds(tt)         
+
+   ;Retrieving the immediates for a global
+   defn global-mem (n:Int, offset:Int) :
+      match(global-lbl(gt, n)) :
+         (l:Int) : mem(l, offset)
+         (l:Symbol) : xmem(l, offset)
+   defn global-mem (n:Int) :
+      global-mem(n, 0)
+
+
+   ;     Compiling Tables
+   ;     ----------------
+   defn compile-machine-state () :
+      emit(tgt-DefData())
+      
+      ;Floating Point Zeros
+      emit(tgt-TLabel(FLOAT-ZERO-LBL))
+      emit(tgt-DefFloat(0.0))
+      emit(tgt-TLabel(DOUBLE-ZERO-LBL))
+      emit(tgt-DefDouble(0.0))
+      
+      ;Heap Labels
+      emit(tgt-TLabel(HEAP-PTR-LBL))
+      emit(tgt-DefLong(to-long(0)))
+      emit(tgt-TLabel(HEAP-LIM-LBL))
+      emit(tgt-DefLong(to-long(0)))
+      
+      ;Stack Labels
+      emit(tgt-TLabel(STACK-PTR-LBL))
+      emit(tgt-DefLong(to-long(0)))
+      emit(tgt-TLabel(STACK-LIM-LBL))
+      emit(tgt-DefLong(to-long(0)))
+      emit(tgt-TLabel(STACK-POOL-LBL))
+      emit(tgt-DefLong(to-long(0)))      
+      emit(tgt-TLabel(NUM-FREE-STACKS-LBL))
+      emit(tgt-DefLong(to-long(0)))
+      emit(tgt-TLabel(FREE-STACKS-LBL))
+      emit(tgt-DefLong(to-long(0)))
+      emit(tgt-TLabel(STACK-LBL))
+      emit(tgt-DefLong(to-long(0)))
+
+      emit(tgt-DefText())
+
+   ;     Compiling Object Tables
+   ;     -----------------------
+   defn compile-object-table () :
+      ;Create table
+      val obj-table = Vector<[Int, KLSDefType]>()
+      for t in tagged-types(tt) do :
+         add(obj-table, [fresh-id(), t])
+
+      ;Emit Table
+      emit(tgt-DefData())
+      emit(tgt-TLabel(OBJECT-TABLE-LBL))
+      for [lbl, t] in obj-table do :
+         emit(tgt-DefLabel(lbl))
+         
+      ;Emit Table Entries
+      for [lbl, t] in obj-table do :
+         ;Compute bit masks for base and tail
+         defn bitmask (t:KLSType) :
+            tgt-to-bitmask(tgt-ref-mask(pad+expand(tt, t)))            
+         val base-size = size(tt, KStructT(n(t)))
+         val base-bits = bitmask(KStructT(n(t)))
+         val [tail-size, tail-bits] = match(rfield(t)) :
+            (rf:False) :
+               [0, List()]
+            (rf:StructField) :
+               [size(tt, type(rf)),
+                bitmask(type(rf))]         
+                   
+         ;Emit mask entry
+         emit(tgt-TLabel(lbl))
+         emit(tgt-DefInt(base-size))
+         emit(tgt-DefInt(tail-size))
+         do(emit{tgt-DefLong(_)}, base-bits)
+         do(emit{tgt-DefLong(_)}, tail-bits)
+      emit(tgt-DefText())
+
+   ;     Compiling Globals
+   ;     -----------------
+   defn compile-globals () :
+      ;Sort all globals by alignment for packing
+      val entries = Vector<Int>()
+      do(add{entries, _}, root-vars(gt))
+      sort-by-key!(entries, alignment{tt, global-var-type(gt, _)})
+
+      ;Pad all items to ensure structures are aligned
+      val items = let :      
+         val xs = for e in entries stream :
+            Item(alignment(tt, global-var-type(gt, e)), e)
+         val [padded-xs, aln] = pad(xs, 8)
+         padded-xs
+
+      ;Compute the globals table
+      val globals = Vector<Int|tgt-TgtType>()               
+      for x in items do :
+         match(x) :
+            (x:Item) :
+               val v = data(x) as Int
+               val ts = pad+expand(tt, global-var-type(gt, v))
+               add(globals, v)
+               do(add{globals, _}, ts)
+            (x:Padding) :
+               add(globals, tgt-IntType(size(x)))   
+
+      ;Emit the globals mask table
+      ;[Length, Bits ...]
+      let :
+         val refs = tgt-ref-mask{_ as Streamable<tgt-TgtType>} $         
+            filter({_ typeof tgt-TgtType}, globals)
+         val mask = tgt-to-bitmask(refs)
+         emit(tgt-TLabel(GLOBAL-MAP-LBL))
+         emit(tgt-DefLong(to-long(length(refs))))
+         do(emit{tgt-DefLong(_)}, mask)
+
+      ;Emit the globals table
+      ;[Data ...]
+      emit(tgt-DefData())
+      emit(tgt-TLabel(GLOBAL-TABLE-LBL))
+      for g in globals do :
+         emit $ match(g) :
+            (g:Int) :
+               tgt-TLabel(g)
+            (g:tgt-TgtType) :
+               switch {g == _} :
+                  tgt-BYTE-TYPE : tgt-DefByte(0)
+                  tgt-INT-TYPE : tgt-DefInt(0)
+                  tgt-LONG-TYPE : tgt-DefLong(to-long(0))
+                  tgt-FLOAT-TYPE : tgt-DefFloat(0.0)
+                  tgt-DOUBLE-TYPE : tgt-DefDouble(0.0)
+                  tgt-REF-TYPE : tgt-DefLong(to-long(VOID-TAG))
+      emit(tgt-DefText())
+
+   ;     Compiling Constant Table
+   ;     ------------------------
+   defn compile-constant-table () :
+      defn emit-const (v) :
+         defn emit-tag (n:Int) :
+            emit(tgt-DefInt(tag(tt, n)))
+         match(v) :
+            (v:Long) :
+               emit-tag(LONG-TYPE-ID)
+               emit(tgt-DefLong(v))
+            (v:Float) :
+               emit-tag(FLOAT-TYPE-ID)
+               emit(tgt-DefFloat(v))
+            (v:String) :
+               val n = length(v)
+               val rem = ((n + 7) & -8) - n
+               emit-tag(STRING-TYPE-ID)
+               emit(tgt-DefInt(n))
+               emit(tgt-DefString(v))
+               emit(tgt-DefSpace(rem))
+            (v:Symbol) :
+               val chars = to-string(v)
+               val n = length(chars)
+               val rem = ((n + 7) & -8) - n
+               emit-tag(SYMBOL-TYPE-ID)
+               emit(tgt-DefInt(n))
+               emit(tgt-DefString(chars))
+               emit(tgt-DefSpace(rem))
+            (v:List) :
+               emit-tag(LIST-TYPE-ID)
+               emit(tgt-DefInt(length(v)))
+               do(emit-const, v)               
+            (v) :
+               error("Unrecognized constant: ~" % [v])
+               
+      ;Collect all constants
+      val consts = Vector<?>()
+      for n in global-consts(gt) do :
+         add(consts, value(gt[n] as GConst))
+
+      ;Emit constant table
+      emit(tgt-TLabel(CONSTANT-TABLE-LBL))
+      emit(tgt-DefInt(length(consts)))
+      do(emit-const, consts)         
+
+   ;     Compiling Entry Function
+   ;     ------------------------
+   defn compile-entry () :
+      val var-table = VarTable()
+      val ins-vector = Vector<tgt-Ins>()
+      let-var INSTRUCTION-VECTOR = ins-vector :
+         let-var VAR-TABLE = var-table :
+            args(List())
+            for c in comms(prog) do :
+               match(c) :
+                  (c:KDef) :
+                     val exp = KSet(n(c), value(c), false)
+                     imm(compile-exp(exp))
+                  (c:KDefVar) :
+                     if value(c) != false :
+                        val exp = KSet(n(c), value(c) as KExp, false)
+                        imm(compile-exp(exp))
+                  (c:KInit) :
+                     imm(compile-exp(exp(c)))
+                  (c:KLSDef) :
+                     val comm = KLSSet(Value(KLSVar(n(c))), value(c))
+                     compile-comm(comm)
+                  (c:KLSDefVar) :
+                     if value(c) != false :
+                        val comm = KLSSet(Value(KLSVar(n(c))), value(c) as KLSExp)
+                        compile-comm(comm)
+                  (c:KLSInit) :
+                     compile-comm(comm(c))
+                  (c) : false            
+            return(list(long(0)))
+            val n = fresh-id()
+            emit(tgt-DefFn(n, defs(var-table), ins-vector))
+            n
+
+   ;     Compiling a HiStanza Function
+   ;     -----------------------------
+   defn compile-func (c:KDefn) :
+      compile-function{n(c), _} $ fn* (compile-prelude) :
+         defn compile-codes (codes:List<KCode>) :
+            for code in codes do :
+               ;Check arity
+               val failL = fresh-id()
+               jarity-neq(failL, arity(code))
+               ;Define arguments
+               val vs = map(make-var{tgt-REF-TYPE}, args(code))
+               for (a in args(code), v in vs) do :
+                  VAR-TABLE!()[a] = list(v)
+               ;Compile prelude   
+               compile-prelude(vs)
+               ;Compile body
+               return(compile-exp(body(code)))
+               ;Failed arity check
+               tlabel(failL)
+               
+            ;Arity Error
+            compile-prelude(List())
+            call(0, List(), mem(ARITY-ERROR-ID), List())
+            return(List())
+
+         ;Dispatch based on arity of function
+         match(value(c)) :
+            (code:KCode) : compile-codes(list(code))
+            (code:KMultifn) : compile-codes(funcs(code) as List<KCode>)
+
+   ;     Compiling a Type Object
+   ;     -----------------------
+   defn compile-type-object (c:KDefTypeObject) :
+      compile-function{n(c), _} $ fn* (compile-prelude) :
+         ;Compile prelude
+         val t = make-var(tgt-REF-TYPE)
+         val x = make-var(tgt-REF-TYPE)
+         compile-prelude(list(t, x))
+         
+         ;Retrieve closed over type variables
+         for (a in args(c), i in 0 to false) do :
+            val v = make-var(tgt-REF-TYPE)
+            VAR-TABLE!()[a] = list(v)
+            load(v, t, 8 + 8 + (8 * i) - REF-TAG-BITS) ;TAG, CODE, TARGS ...    
+         
+         ;Compile body
+         val safeL = fresh-id()
+         val failL = fresh-id()
+         compile-typeof(x, type(c), safeL, failL)
+         tlabel(safeL)
+         return(list(long(1)))
+         tlabel(failL)
+         return(list(long(0)))       
+
+   ;     Compiling Typeof Operator
+   ;     -------------------------
+   defn compile-typeof (x:tgt-Imm, t:KType, true-lbl:Int, false-lbl:Int) :
+      defn* loop (t:KType, true-lbl:Int, false-lbl:Int) :
+         match(t) :
+            (t:KAnd) :
+               val next-lbl = fresh-id()
+               loop(a(t), next-lbl, false-lbl)
+               tlabel(next-lbl)
+               loop(b(t), true-lbl, false-lbl)
+            (t:KOr) :
+               val next-lbl = fresh-id()
+               loop(a(t), true-lbl, next-lbl)
+               tlabel(next-lbl)
+               loop(b(t), true-lbl, false-lbl)
+            (t:KTop) :
+               goto(true-lbl)
+            (t:KTags) :
+               compile-dispatch(list(t, KTop()), x, list(true-lbl, false-lbl))
+            (t:KTVar) :
+               val code = make-var(tgt-LONG-TYPE)
+               val r = make-var(tgt-LONG-TYPE)
+               val obj = head(VAR-TABLE!()[n(t)])
+               load(code, obj, 8 - REF-TAG-BITS)
+               call(1, list(r), code, list(obj, x))
+               jeq(false-lbl, r, long(0))
+               goto(true-lbl)
+      loop(cast-type(tt, t), true-lbl, false-lbl)
+
+   ;     Compiling a Trie
+   ;     ----------------
+   ;Compile a single dispatch
+   defn compile-dispatch (types:List<KType>, x:tgt-Imm, lbls:List<Int>) :
+      val prim-lbls = HashTable<Int,Int>({_})
+      val mark-lbls = HashTable<Int,Int>({_})
+      val ref-lbls = HashTable<Int,Int>({_})
+      var default = false
+
+      ;Update table
+      defn update (table:HashTable<Int,Int>, k:Int, v:Int) :
+         if not key?(table, k) : table[k] = v
+
+      ;Classify types
+      for (t in types, l in lbls) do :
+         match(t) :
+            (t:KTags) :
+               for tag in tags(t) do :
+                  update{_, tag, l} $
+                     if primitive?(tt, tag) : prim-lbls
+                     else if marker?(tt, tag) : mark-lbls
+                     else : ref-lbls
+            (t:KTop) :
+               if default == false :
+                  default = l
+                  
+      ;Convert type to bit tag
+      defn prim-bit-tag (n:Int) :
+         switch {n == _} :
+            INT-TYPE-ID : long(INT-TAG-BITS)
+            else : error("Not a primitive: ~" % [n])
+                  
+      ;Primitive Dispatch
+      val ptag = make-var(tgt-LONG-TYPE)
+      bit-and(ptag, x, long(7))
+      for entry in prim-lbls do :
+         jeq(value(entry), ptag, prim-bit-tag(key(entry)))
+
+      ;Marker Dispatch
+      val not-markerL = fresh-id()
+      jne(not-markerL, ptag, long(MARKER-TAG-BITS))
+      for entry in mark-lbls do :
+         val mark = tag-as-marker(tag(tt, key(entry)))
+         jeq(value(entry), x, long(mark))
+      tlabel(not-markerL)   
+
+      ;Reference Dispatch
+      val not-refL = fresh-id()
+      jne(not-refL, ptag, long(REF-TAG-BITS))
+      val classtag = make-var(tgt-LONG-TYPE)
+      load(classtag, x, 0 - REF-TAG-BITS)
+      for entry in ref-lbls do :
+         val c = tag-as-tag(tag(tt, key(entry)))
+         jeq(value(entry), classtag, long(c))
+      tlabel(not-refL)   
+
+      ;Default Branch
+      match(default) :
+         (default:False) : call(0, List(), mem(BRANCH-ERROR-ID), List())
+         (default:Int) : goto(default)
+
+   ;Compile a dispatch tree
+   defn compile-trie (tries:List<MTrie>, args:List<tgt-Imm>) :
+      val [x, rest] = [head(args), tail(args)]
+      if empty?(rest) :
+         val tries = tries as List<TrieEnd>
+         compile-dispatch(map(type, tries), x, map(lbl, tries))
+      else :
+         val tries = tries as List<TrieArg>
+         val lbls = map(fresh-id{}, tries)
+         compile-dispatch(map(type, tries), x, lbls)
+         for (lbl in lbls, trie in tries) do :
+            tlabel(lbl)
+            compile-trie(children(trie), tail(args))      
+
+   ;     Compiling a Function
+   ;     --------------------
+   defn compile-function (n:Int, compile-body: (List<tgt-Var> -> False) -> False) :
+      val var-table = VarTable()
+      val ins-vector = Vector<tgt-Ins>()
+      let-var INSTRUCTION-VECTOR = ins-vector :
+         let-var VAR-TABLE = var-table :
+            defn compile-prelude (vs:List<tgt-Var>) :
+               ;No stack extension
+               ;args(vs)
+               
+               ;Automatic stack extension
+               val defaultL = fresh-id()
+               val bodyL = fresh-id()
+               val num-free = make-var(tgt-LONG-TYPE)
+               jstack-has-space(defaultL)
+               switch-stack()
+               args(vs)
+               load(num-free, mem(NUM-FREE-STACKS-LBL), 0)
+               jgt(bodyL, num-free, long(2)) ;Running GC requires two stacks (One for GC, one for handling stack overflow)
+               call(0, List(), mem(EXTEND-STACK-ID), List())
+               goto(bodyL)
+               tlabel(defaultL)
+               args(vs)
+               tlabel(bodyL)
+               
+            ;Compile function body   
+            compile-body(compile-prelude)
+            
+            ;Emit function definition
+            emit(tgt-DefFn(n, defs(var-table), ins-vector))            
+
+
+   ;     Allocating Objects
+   ;     ------------------
+   defn make-object (x:tgt-Var, n:Int, args:List<tgt-Imm>) :
+      ;Increment heap
+      val sz = 8 + 8 * length(args)
+      extend-heap(sz)
+      add(x, heap-ptr(), long(REF-TAG-BITS))
+      inc-heap-ptr(sz)
+      ;Store into heap
+      val tagword = tag-as-tag(tag(tt, n))
+      store(x, long(tagword), neg(REF-TAG-BITS))
+      for (i in 0 to false, v in args) do :
+         store(x, v, 8 + (8 * i) - REF-TAG-BITS)
+         
+   defn store-array-object (x:tgt-Var, n:Int, len:Int, args:List<tgt-Imm>) :
+      ;Store length word
+      val lenword = tag-as-header(len)
+      store(x, long(lenword), -8 - REF-TAG-BITS)
+      ;Store tag word
+      val tagword = tag-as-tag(tag(tt, n))
+      store(x, long(tagword), 0 - REF-TAG-BITS)         
+      ;Store items
+      for (i in 0 to false, v in args) do :
+         store(x, v, 8 + (8 * i) - REF-TAG-BITS)
+         
+   defn make-array-object (x:tgt-Var, n:Int, len:Int, args:List<tgt-Imm>) :
+      ;Increment heap
+      val sz = 8 + 8 + 8 * length(args)
+      extend-heap(sz)
+      add(x, heap-ptr(), long(8 + REF-TAG-BITS))
+      inc-heap-ptr(sz)
+      ;Store object
+      store-array-object(x, n, len, args)
+            
+
+   ;     Compiling a Stanza Expression
+   ;     -----------------------------
+   defn compile-exp (e:KExp) -> CSResult :
+      defn ret-imm (x:tgt-Imm) :
+         new CSResult :
+            defmethod imm (this) : x
+            defmethod assign (x:tgt-Var, this) : set(x, imm(this))
+      defn ret-to-var (f: tgt-Var -> False) :
+         new CSResult :
+            defmethod assign (x:tgt-Var, this) : f(x)
+            defmethod imm (this) : imm-var(this)
+      defn tail-call (f: () -> False) :
+         new CSResult :
+            defmethod return (this) : f()
+
+      match(e) :
+         (e:KSet) :
+            if global-var?(gt, n(e)) :
+               store(global-mem(n(e)), imm(compile-exp(value(e))), 0)
+            else :
+               val x = head(env-vars(n(e)))
+               assign(x, compile-exp(value(e)))
+            ret-imm(long(tag-as-marker(tag(tt, FALSE-TYPE-ID))))
+         (e:KCast) :
+            val safeL = fresh-id()
+            val failL = fresh-id()
+            val x = imm(compile-exp(exp(e)))
+            compile-typeof(x, targ(e), safeL, failL)
+            tlabel(failL)
+            call(0, List(), mem(CAST-ERROR-ID), List())
+            tlabel(safeL)
+            ret-imm(x)
+         (e:KCheckVoid) :
+            val safeL = fresh-id()
+            val e* = imm(compile-exp(exp(e)))
+            jne(safeL, e*, long(VOID-TAG))
+            call(0, List(), mem(VARIABLE-UNINITIALIZED-ERROR-ID), List())
+            tlabel(safeL)
+            ret-imm(e*)
+         (e:KCheckLength) :
+            val safeL = fresh-id()
+            val e* = imm(compile-exp(exp(e)))
+            val len = make-var(tgt-LONG-TYPE)
+            load(len, e*, -8 - REF-TAG-BITS)
+            jeq(safeL, len, long(tag-as-header(length(e))))
+            call(0, List(), mem(TUPLE-LENGTH-ERROR-ID), List())
+            tlabel(safeL)
+            ret-imm(e*)
+         (e:KLet) :
+            val def = def(e) as KDef
+            val [n, v] = [n(def), value(def)]
+            VAR-TABLE!()[n] = list(imm-var(compile-exp(v)))
+            compile-exp(body(e))
+         (e:KLetRec) :
+            ;Create variables representing closures
+            val defs = defs(e) as List<KDef>
+            val xs = map(make-var{tgt-REF-TYPE}, defs)
+            ;Register variables in environment
+            val ns = map(n, defs)            
+            for (n in ns, x in xs) do :
+               VAR-TABLE!()[n] = list(x)
+            ;Compile closure arguments
+            val clos = map({value(_) as KClosure}, defs)
+            val clo-args = for c in clos map :
+               map(imm{compile-exp(_)}, args(c))
+            ;Increment heap
+            val szs = for c in clos map :
+               8 + 8 + 8 * length(args(c))
+            val sz = sum(szs)
+            extend-heap(sz)
+            ;Get pointers to closures
+            var accum = 0
+            for (x in xs, s in szs) do :
+               add(x, heap-ptr(), long(accum + 8 + REF-TAG-BITS))
+               accum = accum + s
+            inc-heap-ptr(sz)
+            ;Store closures
+            for (x in xs, c in clos, args in clo-args) do :
+               val code = mem(n(c))
+               val len = length(args)
+               store-array-object(x, FN-TYPE-ID, len, List(code, args))
+            ;Compile body
+            compile-exp(body(e))
+         (e:KSeq) :
+            imm(compile-exp(a(e)))
+            compile-exp(b(e))
+         (e:KMatch) :
+            ;Compile arguments
+            val vs = map(imm-var{compile-exp(_)}, args(e))
+            ;Compile dispatch
+            val lbls = map(fresh-id{}, branches(e))
+            val branch-types = for b in branches(e) map :
+               map(dispatch-type{tt, _}, types(b))               
+            compile-trie(to-trie(branch-types, lbls), vs)
+            ;Compile branches
+            ret-to-var $ fn* (x) :
+               val endL = fresh-id()
+               for (lbl in lbls, b in branches(e)) do :
+                  tlabel(lbl)
+                  for (n in args(b), v in vs) do :
+                     VAR-TABLE!()[n] = list(v)
+                  assign(x, compile-exp(body(b)))   
+                  goto(endL)
+               tlabel(endL)
+         (e:KDispatch) :
+            compile-exp(convert-dispatch(tt, e))
+         (e:KObject) :
+            if marker?(tt, n(e)) :
+               val mark = tag-as-marker(tag(tt, n(e)))
+               ret-imm(long(mark))
+            else :
+               ret-to-var $ fn* (x) :
+                  val vs = map(imm{compile-exp(_)}, args(e))
+                  make-object(x, n(e), vs)
+         (e:KObjectGet) :
+            ret-to-var $ fn* (x) :
+               val o = imm(compile-exp(object(e)))
+               load(x, o, 8 + 8 * index(e) - REF-TAG-BITS)
+         (e:KTypeObject) : 
+            ret-to-var $ fn* (x) :
+               val code = mem(n(e))
+               val vs = map(imm{compile-exp(_)}, args(e))               
+               val len = length(args(e))
+               make-array-object(x, TYPE-TYPE-ID, len, List(code,vs))
+         (e:KCall) :
+            if tail?(e) :
+               tail-call $ fn* () :
+                  val ys = map(imm{compile-exp(_)}, args(e))
+                  tcall(arity(e), global-mem(func(e)), ys)
+            else :      
+               ret-to-var $ fn* (x) :
+                  val ys = map(imm{compile-exp(_)}, args(e))
+                  call(arity(e), list(x), global-mem(func(e)), ys)
+         (e:KCallDeref) :
+            if tail?(e) :
+               tail-call $ fn* () :
+                  val ys = map(imm{compile-exp(_)}, args(e))
+                  val code = make-var(tgt-LONG-TYPE)
+                  val c = imm(compile-exp(func(e)))
+                  load(code, c, 8 - REF-TAG-BITS)
+                  tcall(arity(e), code, List(c, ys))
+            else :
+               ret-to-var $ fn* (x) :
+                  val ys = map(imm{compile-exp(_)}, args(e))
+                  val code = make-var(tgt-LONG-TYPE)
+                  val c = imm(compile-exp(func(e)))
+                  load(code, c, 8 - REF-TAG-BITS)
+                  call(arity(e), list(x), code, List(c, ys))
+         (e:KVar) :
+            if global-var?(gt, n(e)) :
+               ret-to-var $ fn* (x) :
+                  load(x, global-mem(n(e)), 0)
+            else :
+               val vs = VAR-TABLE!()[n(e)]
+               ret-imm(head(vs))
+         (e:KPrim) :
+            defn cmp-op (x:tgt-Var, op:tgt-TgtOp, v1:tgt-Imm, v2:tgt-Imm) :
+               val y1 = make-var(tgt-LONG-TYPE)
+               val y2 = make-var(tgt-LONG-TYPE)
+               binop(y1, op, v1, v2)
+               binop(y2, tgt-SHL-OP, y1, long(3))
+               binop(x, tgt-ADD-OP, y2, long(MARKER-TAG-BITS))
+            
+            ret-to-var $ fn* (x) :
+               val vs = map(imm{compile-exp(_)}, args(e))
+               switch {op(e) == _} :
+                  INT-ADD-OP :
+                     binop(x, tgt-ADD-OP, vs[0], vs[1])
+                  INT-SUB-OP :
+                     binop(x, tgt-SUB-OP, vs[0], vs[1])
+                  INT-MUL-OP :
+                     val y = make-var(tgt-LONG-TYPE)
+                     binop(y, tgt-ASHR-OP, vs[0], long(3))
+                     binop(x, tgt-MUL-OP, y, vs[1])
+                  INT-DIV-OP :
+                     binop(x, tgt-DIV-OP, vs[0], vs[1])
+                     binop(x, tgt-SHL-OP, x, long(3))
+                  INT-MOD-OP :
+                     binop(x, tgt-MOD-OP, vs[0], vs[1])
+                  INT-AND-OP :
+                     binop(x, tgt-AND-OP, vs[0], vs[1])
+                  INT-OR-OP :
+                     binop(x, tgt-OR-OP, vs[0], vs[1])
+                  INT-XOR-OP :
+                     binop(x, tgt-XOR-OP, vs[0], vs[1])
+                  INT-SHL-OP :
+                     val y = make-var(tgt-LONG-TYPE)
+                     binop(y, tgt-ASHR-OP, vs[1], long(3))
+                     binop(x, tgt-SHL-OP, vs[0], y)
+                  INT-SHR-OP :
+                     val y1 = make-var(tgt-LONG-TYPE)
+                     val y2 = make-var(tgt-LONG-TYPE)
+                     binop(y1, tgt-ASHR-OP, vs[1], long(3))
+                     binop(y2, tgt-SHR-OP, vs[0], y1)
+                     binop(x, tgt-AND-OP, y2, long(-7))
+                  INT-ASHR-OP :
+                     val y1 = make-var(tgt-LONG-TYPE)
+                     val y2 = make-var(tgt-LONG-TYPE)
+                     binop(y1, tgt-ASHR-OP, vs[1], long(3))
+                     binop(y2, tgt-ASHR-OP, vs[0], y1)
+                     binop(x, tgt-AND-OP, y2, long(-7))
+                  INT-EQ-OP : cmp-op(x, tgt-EQ-OP, vs[0], vs[1])
+                  INT-NE-OP : cmp-op(x, tgt-NE-OP, vs[0], vs[1])
+                  INT-LE-OP : cmp-op(x, tgt-LE-OP, vs[0], vs[1])
+                  INT-LT-OP : cmp-op(x, tgt-LT-OP, vs[0], vs[1])
+                  INT-GT-OP : cmp-op(x, tgt-GT-OP, vs[0], vs[1])
+                  INT-GE-OP : cmp-op(x, tgt-GE-OP, vs[0], vs[1])                  
+         (e:KLiteral) :
+            match(value(e)) :
+               (v:Int) : ret-imm(long(tag-as-int(v)))
+               (v:True) : ret-imm(long(tag-as-marker(tag(tt, TRUE-TYPE-ID))))
+               (v:False) : ret-imm(long(tag-as-marker(tag(tt, FALSE-TYPE-ID))))
+               (v) : error("Other literal types not yet implemented.")
+         (e:KTuple) :
+            ret-to-var $ fn* (x) :
+               val vs = map(imm{compile-exp(_)}, exps(e))
+               val len = length(exps(e))
+               make-array-object(x, TUPLE-TYPE-ID, len, vs)
+         (e:KTupleGet) :
+            ret-to-var $ fn* (x) :
+               val t = imm(compile-exp(exp(e)))
+               load(x, t, 8 + 8 * index(e) - REF-TAG-BITS)
+         (e:KBox) :
+            ret-to-var $ fn* (x) :
+               match(value(e)) :
+                  (v:KExp) :
+                     val v* = imm(compile-exp(v))
+                     make-object(x, BOX-TYPE-ID, list(v*))
+                  (v:False) :
+                     make-object(x, BOX-TYPE-ID, list(long(VOID-TAG)))
+         (e:KBoxGet) :
+            ret-to-var $ fn* (x) :
+               val b = imm(compile-exp(box(e)))
+               load(x, b, 8 - REF-TAG-BITS)
+         (e:KBoxSet) :
+            val b = imm(compile-exp(box(e)))
+            val v = imm(compile-exp(value(e)))
+            store(b, v, 8 - REF-TAG-BITS)            
+            ret-imm(long(tag-as-marker(tag(tt, FALSE-TYPE-ID))))
+         (e:KClosure) :
+            ret-to-var $ fn* (x) :
+               val code = mem(n(e))
+               val vs = map(imm{compile-exp(_)}, args(e))               
+               val len = length(args(e))
+               make-array-object(x, FN-TYPE-ID, len, List(code,vs))
+         (e:KClosureGet) :
+            ret-to-var $ fn* (x) :
+               val c = imm(compile-exp(exp(e)))
+               load(x, c, 8 + 8 + 8 * index(e) - REF-TAG-BITS)
+         (e:KBranchError) :
+            call(0, List(), mem(BRANCH-ERROR-ID), List())
+            ret-imm(long(0))
+
+   ;     Compiling a LoStanza Function
+   ;     -----------------------------
+   defn compile-ls-func (c:KLSDefCode) :
+      compile-function{n(c), _} $ fn* (compile-prelude) :
+         ;Create argument variables
+         val arg-vs = Vector<tgt-Var>()
+         for (a in args(c), t in types(c)) do :
+            val vs = make-vars(expand(tt, t))
+            VAR-TABLE!()[a] = vs
+            do(add{arg-vs, _}, vs)
+         ;Compile the prelude   
+         compile-prelude(to-list(arg-vs))
+         ;Compile the body
+         compile-comm(body(c))
+
+   ;     Compile a LoStanza Location
+   ;     ---------------------------
+   defn compile-loc (loc:KLoc) :
+      defn loc-type (l:KLoc) :
+         match(l) :
+            (l:Value) :
+               if global-var?(gt, exp(l)) :
+                  val v = exp(l) as KLSVar
+                  global-var-type(gt, n(v))
+            (l:Deref|Deptr|Slot) : type(l)
+            (l:stz/kl-ir/Field) : field-type(tt, n(l))
+            
+      defn* loop (l:KLoc, off:Int, idx:Int) :
+         match(l) :
+            (l:Value) :
+               if global-var?(gt, exp(l)) :
+                  val n = n(exp(l) as KLSVar)
+                  PtrLoc(global-mem(n,off), 0, loc-type(loc) as KLSType)
+               else :
+                  match(loc-type(loc)) :
+                     (t:KLSType) : SubExpLoc(exp(l), idx, count(tt, t), t)
+                     (t:False) : ExpLoc(exp(l))
+            (l:Deref) :
+               val p = head(imms(compile-exp(exp(l))))
+               PtrLoc(p, off + 8 - REF-TAG-BITS, loc-type(loc) as KLSType)               
+            (l:Deptr) :
+               val p = head(imms(compile-exp(exp(l))))
+               PtrLoc(p, off, loc-type(loc) as KLSType)               
+            (l:Slot) :
+               val b = head(imms(compile-exp(exp(l))))
+               val i = head(imms(compile-exp(index(l))))
+               val p = make-var(tgt-LONG-TYPE)
+               mul(p, long(size(tt, type(l))), i)
+               add(p, p, b)
+               PtrLoc(p, off, loc-type(loc) as KLSType)
+            (l:stz/kl-ir/Field) :
+               loop(base(l),
+                    off + field-offset(tt, n(l)),
+                    idx + field-index(tt, n(l)))
+      loop(loc, 0, 0)              
+
+
+   ;     Compile a LoStanza Command
+   ;     --------------------------
+   defn compile-comm (c:KLSComm) :      
+      match(c) :
+         (c:KLSCallComm) :
+            assign(List(), compile-exp(exp(c)))
+         (c:KLSSet) :
+            defn n! (e:KLSExp) : n(e as KLSVar)
+            match(compile-loc(exp(c))) :
+               (loc:PtrLoc) :
+                  val ys = imms(compile-exp(value(c)))
+                  for (o in offsets(tt, type(loc)), y in ys) do :
+                     store(base(loc), y, offset(loc) + o)
+               (loc:SubExpLoc) :
+                  val xs = env-vars(n!(exp(loc)))
+                  val sub-xs = sublist(xs, index(loc), count(loc))
+                  assign(sub-xs, compile-exp(value(c)))
+               (loc:ExpLoc) :
+                  val xs = env-vars(n!(exp(loc)))
+                  assign(xs, compile-exp(value(c)))
+         (c:KLSLabel) :
+            tlabel(n(c))
+         (c:KLSGoto) :
+            goto(n(c))
+         (c:KLSReturn) :
+            match(exp(c)) :
+               (exp:KLSWCall|KLSWCallDeptr|KLSWCallDeref|KLSWSwitchStack) :
+                  if tail?(exp) : compile-tail-exp(exp)
+                  else : return(imms(compile-exp(exp)))
+               (exp) : return(imms(compile-exp(exp)))
+         (c:KLSDefLocal) :
+            VAR-TABLE!()[n(c)] = vars(compile-exp(value(c)))
+         (c:KLSDefLocalVar) :
+            match(value(c)) :
+               (v:KLSExp) :
+                  compile-comm(KLSDefLocal(n(c), v))
+               (v:False) :   
+                  val ts = expand(tt, type(c))
+                  val vs = make-vars(ts)
+                  for (v in vs, t in ts) do :
+                     switch {t == _} :
+                        tgt-BYTE-TYPE : set(v, byte(0))
+                        tgt-INT-TYPE : set(v, int(0))
+                        tgt-LONG-TYPE : set(v, long(0))
+                        tgt-FLOAT-TYPE : load(v, mem(FLOAT-ZERO-LBL), 0)
+                        tgt-DOUBLE-TYPE : load(v, mem(DOUBLE-ZERO-LBL), 0)
+                        tgt-REF-TYPE : set(v, long(VOID-TAG))                  
+                  VAR-TABLE!()[n(c)] = vs
+         (c:KLSIf) :
+            val altL = fresh-id()
+            val endL = fresh-id()
+            val p = head(imms(compile-exp(pred(c))))
+            jeq(altL, p, long(0))
+            compile-comm(conseq(c))
+            goto(endL)
+            tlabel(altL)
+            compile-comm(alt(c))
+            tlabel(endL)
+         (c:KLSSeq) :
+            compile-comm(a(c))
+            compile-comm(b(c))
+         (c:KLSMatch) :
+            ;Compile arguments
+            val vs = map(head{vars(compile-exp(_))}, args(c))
+            ;Compile dispatch
+            val lbls = map(fresh-id{}, branches(c))
+            val branch-types = for b in branches(c) map :
+               map(dispatch-type{tt, _}, types(b))
+            compile-trie(to-trie(branch-types, lbls), vs)   
+            ;Compile branches
+            val endL = fresh-id()
+            for (lbl in lbls, b in branches(c)) do :
+               for (n in args(b), v in vs) do :
+                  VAR-TABLE!()[n] = list(v)
+               tlabel(lbl)   
+               compile-comm(body(b))
+               goto(endL)               
+            tlabel(endL)
+         (c:KLSDispatch) :
+            compile-comm(convert-ls-dispatch(tt, c))
+         (c:KLSSkip) :
+            false
+         (c:KLSBranchError) :
+            call(0, List(), mem(BRANCH-ERROR-ID), List())
+
+   ;     Compile an Expression
+   ;     ---------------------
+   defn compile-exp (e:KLSExp) -> CResult :
+      ;Return immediates ys with given types ts
+      defn ret-imms (ts:List<tgt-TgtType>, ys:List<tgt-Imm>) :
+         new CResult :
+            defmethod imms (this) : ys
+            defmethod assign (xs:List<tgt-Var>, this) : do(set, xs, ys)
+            defmethod types (this) : ts
+      defn ret-imm (t:tgt-TgtType, y: tgt-Imm) :
+         ret-imms(list(t), list(y))
+      defn ret-imms (t:KLSType, ys:List<tgt-Imm>) :
+         ret-imms(expand(tt, t), ys)
+
+      ;Return to variables with given types ts
+      defn ret-to-var (ts:List<tgt-TgtType>, f: List<tgt-Var> -> False) :
+         new CResult :
+            defmethod imms (this) : vars(this) 
+            defmethod assign (xs:List<tgt-Var>, this) : f(xs)
+            defmethod types (this) : ts
+      defn ret-to-var (t:tgt-TgtType, f: tgt-Var -> False) :
+         ret-to-var(list(t), f{head(_)})
+      defn ret-to-var (t:KLSType, f: List<tgt-Var> -> False) :
+         ret-to-var(expand(tt, t), f)
+               
+      match(e) :
+         (e:KLSVar) :
+            if global-var?(gt, n(e)) :
+               compile-exp(KLSRead(Value(e)))
+            else :
+               ret-imms(var-types(n(e)), env-vars(n(e)))
+         (e:KLSLet) :
+            compile-comm(comm(e))
+            compile-exp(exp(e))
+         (e:KLSRef) :
+            if marker?(tt, n(e)) :
+               val mark = tag-as-marker(tag(tt, n(e)))
+               ret-imm(tgt-REF-TYPE, long(mark))
+            else :
+               ret-to-var{tgt-REF-TYPE, _} $ fn* (x) :
+                  ;Compile arguments
+                  val args = map-append(imms{compile-exp(_)}, args(e))
+                  ;Extend heap
+                  val st = KStructT(n(e))
+                  val sz = 8 + ceil8(size(tt, st))
+                  extend-heap(sz)
+                  add(x, heap-ptr(), long(REF-TAG-BITS))
+                  inc-heap-ptr(sz)
+                  ;Store into heap
+                  val tagword = tag-as-tag(tag(tt, n(e)))
+                  store(x, long(tagword), neg(REF-TAG-BITS))                  
+                  for (o in offsets(tt, st), v in args) do :
+                     store(x, v, o + 8 - REF-TAG-BITS)
+         (e:KLSRefArray) :
+            val st = KStructT(n(e))
+            val rf = rfield(tt, n(e))
+            val rft = field-type(tt, rf)
+            ret-to-var{tgt-REF-TYPE, _} $ fn* (x) :
+               ;     Compile length and arguments
+               ;     ----------------------------
+               val len = head(imms(compile-exp(length(e))))
+               val args = map-append(imms{compile-exp(_)}, args(e))
+
+               ;     Allocate on heap
+               ;     ----------------
+               val zeroL = fresh-id()
+               val endL = fresh-id()
+               ;Case: Length is not zero
+               jeq(zeroL, len, long(0))
+               let :
+                  val sz = make-var(tgt-LONG-TYPE)
+                  mul(sz, long(size(tt, rft)), len)
+                  add(sz, sz, long(8 + 8 + size(tt, st) + 7)) ;Len | Tag | Size | Items ...
+                  bit-and(sz, sz, long(-8))
+                  extend-heap(sz)
+                  add(x, heap-ptr(), long(8 + REF-TAG-BITS))
+                  inc-heap-ptr(sz)
+                  goto(endL)
+               ;Case : Length is zero
+               tlabel(zeroL)
+               let :
+                  val sz = 8 + 8 + max(8, ceil8(size(tt, st)))
+                  extend-heap(sz)
+                  add(x, heap-ptr(), long(8 + REF-TAG-BITS))
+                  inc-heap-ptr(sz)
+                  tlabel(endL)
+
+               ;     Store Object
+               ;     ------------
+               ;Store length word
+               val lenword = make-var(tgt-LONG-TYPE)
+               shl(lenword, len, long(3))
+               add(lenword, lenword, long(HEADER-TAG-BITS))
+               store(x, lenword, -8 - REF-TAG-BITS)
+               ;Store tagword               
+               val tagword = tag-as-tag(tag(tt, n(e)))
+               store(x, long(tagword), 0 - REF-TAG-BITS)
+               ;Store items               
+               for (o in offsets(tt, st), v in args) do :
+                  store(x, v, o + 8 - REF-TAG-BITS)
+         (e:KLSStruct) :
+            ;Compile arguments
+            val args = map-append(imms{compile-exp(_)}, args(e))
+            ret-imms(KStructT(n(e)), args)
+         (e:KLSPtr) :         
+            match(compile-loc(exp(e))) :
+               (loc:PtrLoc) :
+                  if offset(loc) == 0 :
+                     ret-imm(tgt-LONG-TYPE, base(loc))
+                  else :
+                     ret-to-var{tgt-LONG-TYPE, _} $ fn* (x) :
+                        add(x, base(loc), long(offset(loc)))                  
+               (loc:SubExpLoc) :
+                  val vs = env-vars(n(exp(loc) as KLSVar))
+                  val v = head(tailn(vs, index(loc)))
+                  ret-to-var{tgt-LONG-TYPE, _} $ fn* (x) :
+                     addr(x, tgt-n(v))
+               (loc:ExpLoc) :
+                  val vs = env-vars(n(exp(loc) as KLSVar))
+                  ret-to-var{tgt-LONG-TYPE, _} $ fn* (x) :
+                     addr(x, tgt-n(head(vs)))
+         (e:KLSRead) :
+            match(compile-loc(exp(e))) :
+               (loc:PtrLoc) :
+                  ret-to-var{type(loc), _} $ fn* (xs) :
+                     for (x in xs, o in offsets(tt, type(loc))) do :
+                        load(x, base(loc), offset(loc) + o)
+               (loc:SubExpLoc) :
+                  val xs = imms(compile-exp(exp(loc)))
+                  val sub-xs = sublist(xs, index(loc), count(loc))
+                  ret-imms(type(loc), sub-xs)
+               (loc:ExpLoc) :
+                  compile-exp(exp(loc))
+         (e:KLSWCall) :
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               call(arity(e), xs, global-mem(func(e)), ys, new-stack?(e))
+         (e:KLSWCallDeptr) :
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               val f = head(imms(compile-exp(func(e))))
+               call(arity(e), xs, f, ys, new-stack?(e))               
+         (e:KLSWCallDeref) :
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               val f = head(imms(compile-exp(func(e))))
+               val code = make-var(tgt-LONG-TYPE)
+               load(code, f, 8 - REF-TAG-BITS)
+               call(arity(e), xs, code, List(f, ys), new-stack?(e))
+         (e:KLSWSwitchStack) :
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               val f = head(imms(compile-exp(func(e))))
+               callstack(xs, f, ys)
+         (e:KLSWCallC) :
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               ffi-call(xs, global-mem(func(e)), ys)
+         (e:KLSWCallCDeptr) :
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val ys = map-append(imms{compile-exp(_)}, args(e))
+               val f = head(imms(compile-exp(func(e))))
+               ffi-call(xs, f, ys)               
+         (e:KLSSizeof) :
+            ret-imm(tgt-LONG-TYPE, long(size(tt, type(e))))
+         (e:KLSTagof) :
+            ret-imm(tgt-LONG-TYPE, long(tag(tt, n(e))))
+         (e:KLSConv) :
+            ret-to-var{type(e), _} $ fn* (xs) :
+               val y = head(imms(compile-exp(exp(e))))
+               conv(head(xs), y)
+         (e:KLSCast) :
+            val safeL = fresh-id()
+            val failL = fresh-id()
+            val x = head(imms(compile-exp(exp(e))))
+            compile-typeof(x, type(e), safeL, failL)
+            tlabel(failL)
+            call(0, List(), mem(CAST-ERROR-ID), List())
+            tlabel(safeL)
+            ret-imm(tgt-REF-TYPE, x)
+         (e:KLSTypeObject) :   
+            ret-to-var{tgt-REF-TYPE, _} $ fn* (x) :
+               val code = mem(n(e))
+               val vs = map-append(imms{compile-exp(_)}, args(e))               
+               val len = length(args(e))
+               make-array-object(x, TYPE-TYPE-ID, len, List(code,vs))               
+         (e:KLSPrim) :
+            match(op(e)) :
+               (op:GetAddrOp) :
+                  ret-to-var{type(e), _} $ fn* (xs) :
+                     addr(head(xs), lbl(op)) when not empty?(xs)
+               (op:GetterOp) :
+                  ret-to-var{type(e), _} $ fn* (xs) :
+                     load(head(xs), mem(lbl(op)), 0) when not empty?(xs)
+               (op:SetterOp) :
+                  val x = head(imms(compile-exp(head(args(e)))))
+                  store(mem(lbl(op)), x, 0)
+                  ret-imm(tgt-LONG-TYPE, long(0))
+               (op) :
+                  ret-to-var{type(e), _} $ fn* (xs) :
+                     val ys = map-append(imms{compile-exp(_)}, args(e))
+                     binop(head(xs), to-tgt-op(op), ys[0], ys[1]) when not empty?(xs)
+         (e:KLSLitByte) :
+            ret-imm(tgt-BYTE-TYPE, byte(value(e)))
+         (e:KLSLitInt) :
+            ret-imm(tgt-INT-TYPE, int(value(e)))
+         (e:KLSLitLong) :
+            ret-imm(tgt-LONG-TYPE, long(value(e)))
+         (e:KLSLitFloat) :
+            ret-to-var{tgt-FLOAT-TYPE, _} $ fn* (x) :
+               load(x, mem(float-lbl(value(e))), 0)
+         (e:KLSLitDouble) :
+            ret-to-var{tgt-DOUBLE-TYPE, _} $ fn* (x) :
+               load(x, mem(double-lbl(value(e))), 0)
+         (e:KLSLitString) :
+            ret-imm(tgt-LONG-TYPE, mem(string-lbl(value(e))))
+         (e:KLSClosure) :
+            ret-to-var{tgt-REF-TYPE, _} $ fn* (x) :
+               val code = mem(n(e))
+               val vs = map-append(imms{compile-exp(_)}, args(e))
+               val len = length(args(e))
+               make-array-object(x, FN-TYPE-ID, len, List(code,vs))
+         (e) :
+            error("No branch defined for ~" % [e])
+
+   ;     Compile a Tail Call
+   ;     -------------------
+   defn compile-tail-exp (e:KLSExp) -> False :
+      match(e) :
+         (e:KLSWCall) :
+            val ys = map-append(imms{compile-exp(_)}, args(e))
+            tcall(arity(e), global-mem(func(e)), ys, new-stack?(e))
+         (e:KLSWCallDeptr) :
+            val ys = map-append(imms{compile-exp(_)}, args(e))
+            val f = head(imms(compile-exp(func(e))))
+            tcall(arity(e), f, ys, new-stack?(e))
+         (e:KLSWCallDeref) :
+            val ys = map-append(imms{compile-exp(_)}, args(e))
+            val f = head(imms(compile-exp(func(e))))
+            val code = make-var(tgt-LONG-TYPE)
+            load(code, f, 8 - REF-TAG-BITS)
+            tcall(arity(e), code, List(f, ys), new-stack?(e))
+         (e:KLSWSwitchStack) :
+            val ys = map-append(imms{compile-exp(_)}, args(e))
+            val f = head(imms(compile-exp(func(e))))
+            tcallstack(f, ys)
+         (e) :
+            error("Not a legal tail expression: ~" % [e])
+
+   ;     Compile Functions
+   ;     -----------------
+   defn compile-functions () :
+      for c in comms(prog) do :
+         match(c) :
+            (c:KDefn) : compile-func(c)
+            (c:KDefTypeObject) : compile-type-object(c)
+            (c:KLSDefCode) : compile-ls-func(c)
+            (c) : false      
+
+   ;     Driver
+   ;     ------
+   val def-ins-vector = Vector<tgt-DefIns>()
+   let-var DEF-INS-VECTOR = def-ins-vector :
+      compile-machine-state()
+      compile-globals()      
+      compile-object-table()
+      ;compile-constant-table()
+      val entry = compile-entry()
+      compile-functions()
+      tgt-Program(def-ins-vector, entry)
