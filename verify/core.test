@@ -98,49 +98,77 @@ lostanza defn variable-uninitialized-error () -> int :
    call-c exit(-1)
    return 0
 
-;Extend heap
+;============================================================
+;=============== GARBAGE COLLECTOR ==========================
+;============================================================
+
+;              Generated Entry Points
+;              ======================
+
+;Called when attempting to allocate beyond the heap limit.
 lostanza defn extend-heap (sz:long) -> int :
-   call-c printf("Extend heap\n")   
    new-stack<int>{run-garbage-collector()}
    if call-prim heap() + sz > call-prim heap-limit() :
       call-c printf("Out of heap memory.\n")
       call-c exit(-1)
    return 0
 
+;Called when the number of free stacks is 2 or less.
+;Running extend-stack uses two stacks (1 for GC, 1 for handling extend-stack during GC).
+lostanza defn extend-stack () -> int :   
+   if gc-running :
+      call-c printf("Stack Overflow in Garbage Collector\n")
+      call-c exit(-1)
+      return 0
+   else :
+      new-stack<int>{run-garbage-collector()}
+      if call-prim num-free-stacks() <= 1 :
+         call-c printf("Out of stack segments.\n")
+         call-c exit(-1)
+      return 0
+
+;                   Main Function
+;                   =============
+
+;Main function for garbage collector
+lostanza var gc-running:long = 0
 lostanza defn run-garbage-collector () -> int :
-   ;Initialize free pointer
+   ;Mark GC as running to detect stack extension within GC
+   gc-running = 1
+
+   ;Initialize free pointer to point to beginning of free memory before copying starts.
    free-ptr = free-mem
 
-   ;=== ? What happens if the garbage collector requires more stacks ? ===
-
-   ;Mark collection stack
+   ;Current stack is the collection stack, the stack that the GC runs in.
+   ;Set its mark bit to indicate that it is active.
    val collection-stack = call-prim stack()
    collection-stack.mark = 1
 
-   call-c printf("Print out the root set\n")
-   call-c printf("Scan Globals\n")
+   ;Scan roots
    scan-globals()
-   
-   call-c printf("Scan Parent of Collection Stack\n")
    scan-stack(collection-stack.parent as ref<Stack>)
 
-   call-c printf("Scan heap\n")
+   ;Scan internal pointers of all heap objects
    scan-heap()
 
-  ;Swap free memory with heap
-   call-c printf("Swap free with heap\n")
+   ;Swap free memory with heap
    val swap = heap-mem
    heap-mem = free-mem
    free-mem = swap
    call-prim set-heap(free-ptr)
    call-prim set-heap-limit(heap-mem + mem-size)
 
-   ;Free all unused stacks
-   call-c printf("Free all unused stacks\n")
+   ;All active stacks have their mark bits set.
    free-unmarked-stacks()
-   
+
+   ;Finish
+   gc-running = 0   
    return 0
 
+;                 Scanning Functions
+;                 ==================
+
+;Copy all global references to the free memory.
 lostanza defn scan-globals () -> int :
    ;Get tables
    val globals = call-prim globals() as ptr<long>
@@ -148,7 +176,8 @@ lostanza defn scan-globals () -> int :
    ;Scan globals
    scan-map-words(map.bits, map.length, globals)   
    return 0
-
+   
+;Copy all stack references in this and parent stacks to free memory.
 lostanza defn* scan-stack (s:ref<Stack>) -> int :
    if s.mark == 0 :
       s.mark = 1
@@ -159,10 +188,10 @@ lostanza defn* scan-stack (s:ref<Stack>) -> int :
    else :      
       return 0
 
+;Copy all internal references in heap to free memory.
 lostanza defn scan-heap () -> int :
    var p: ptr<long> = free-mem
    while p < free-ptr :
-      call-c printf("free-ptr = %p\n", free-ptr)
       val tagbits = [p] & 3
       if tagbits == 0 :
          p = scan-object(p)
@@ -174,14 +203,15 @@ lostanza defn scan-heap () -> int :
          return 0
    return 0      
 
+;Copy all internal references in object to free memory.
 lostanza defn scan-object (p:ptr<long>) -> ptr<long> :
    ;p is [tag-word, cells ...]
    val tag = p[0] >> 3
-   call-c printf("scan-object(%p) with tag %ld\n", p, tag)
    val map = object-map(tag)
    scan-map-words(base-bits(map), base-nwords(map), p + 8)
    return p + 8 + map.base-size
 
+;Copy all internal references in array to free memory.
 lostanza defn scan-array (p:ptr<long>) -> ptr<long> :
    ;p is [len-word, tag-word, cells ...]
    val len = p[0] >> 3
@@ -195,7 +225,8 @@ lostanza defn scan-array (p:ptr<long>) -> ptr<long> :
    ;Scan base of array
    scan-map-words(base-bits(map), base-nwords(map), p + 16)
    
-   ;Scan tail of array if word aligned. (Only word aligned tails can contain references).
+   ;Scan tail of array if word aligned.
+   ;Only word aligned tails can contain references.
    if map.tail-size & 3 == 0 :
       var tail:ptr<long> = p + 16 + map.base-size
       val tbits = tail-bits(map)
@@ -207,6 +238,7 @@ lostanza defn scan-array (p:ptr<long>) -> ptr<long> :
    ;Return end of array
    return p + 16 + bytes
 
+;Copy all internal references in stack frames, fs, until end pointer
 lostanza defn* scan-stack-frames (fs:ptr<StackFrame>, end:ptr<?>) -> int :
    if fs < end :
       val map = [fs].map
@@ -216,6 +248,7 @@ lostanza defn* scan-stack-frames (fs:ptr<StackFrame>, end:ptr<?>) -> int :
    else :   
       return 0
 
+;Scan n references (marked with a 1 bit) from the given pointer
 lostanza defn* scan-map-words (map:ptr<long>, n:long, refs:ptr<long>) -> int :
    if n > 64 :
       scan-map-word([map], 64, refs)
@@ -234,13 +267,14 @@ lostanza defn scan-map-word (map:long, n:long, refs:ptr<long>) -> int :
       ref-ptr = ref-ptr + sizeof(long)
    return 0
 
+;                Copying Functions
+;                =================
+
 lostanza defn post-gc-object (obj:long) -> long :
-   call-c printf("post-gc-object(%p)\n", obj)
    val tagbits = obj & 3
    if tagbits == 1 :
       val obj-ptr = (obj - tagbits) as ptr<long>
       val tag = obj-ptr[0] >> 3
-      call-c printf("object tag = %ld\n", tag)
       ;If broken heart, then return forwarding pointer
       if tag == -1 :
          return obj-ptr[1]
@@ -268,6 +302,31 @@ lostanza defn post-gc-object (obj:long) -> long :
             return obj*
    else :
       return obj
+      
+lostanza defn copy-object-to-free (obj:ptr<long>, size:long) -> long :
+   val ret = free-ptr
+   copy-bytes-to-free(obj, size + 8)
+   return ret as long
+
+lostanza defn copy-array-to-free (obj:ptr<long>, size:long, tail:long) -> long :
+   val ret = free-ptr + 8   ;Returned pointer points to the tag word
+   val length = obj[-1] >> 3   ;Retrieve length from header word
+   val bytes = ((size + tail * length) + 7) & -8   ;Calculate the total size of object, rounding up to nearest 8 bytes
+   copy-bytes-to-free(obj - 8, bytes + 16)   ;Copy the bytes to free including header
+   return ret as long
+
+lostanza defn copy-bytes-to-free (p:ptr<long>, n:long) -> int :
+   if n & 3 != 0 :
+      call-c printf("Copy bytes must take a multiple of 8.\n")
+      call-c exit(-1)
+   val nwords = n >> 3
+   for (var i:long = 0, i < nwords, i = i + 1) :
+      free-ptr[i] = p[i]
+   free-ptr = free-ptr + n
+   return 0
+
+;               Utilities for ObjectMap
+;               =======================
 
 lostanza deftype ObjectMap :
    base-size: int
@@ -293,28 +352,10 @@ lostanza defn tail-bits (m:ptr<ObjectMap>) -> ptr<long> :
 lostanza defn tail-nwords (m:ptr<ObjectMap>) -> long :
    return m.tail-size & 3
 
-lostanza defn copy-object-to-free (obj:ptr<long>, size:long) -> long :
-   val ret = free-ptr
-   copy-bytes-to-free(obj, size + 8)
-   return ret as long
+;                  Releasing Stacks
+;                  ================
 
-lostanza defn copy-array-to-free (obj:ptr<long>, size:long, tail:long) -> long :
-   val ret = free-ptr + 8   ;Returned pointer points to the tag word
-   val length = obj[-1] >> 3   ;Retrieve length from header word
-   val bytes = ((size + tail * length) + 7) & -8   ;Calculate the total size of object, rounding up to nearest 8 bytes
-   copy-bytes-to-free(obj - 8, bytes + 16)   ;Copy the bytes to free including header
-   return ret as long
-
-lostanza defn copy-bytes-to-free (p:ptr<long>, n:long) -> int :
-   if n & 3 != 0 :
-      call-c printf("Copy bytes must take a multiple of 8.\n")
-      call-c exit(-1)
-   val nwords = n >> 3
-   for (var i:long = 0, i < nwords, i = i + 1) :
-      free-ptr[i] = p[i]
-   free-ptr = free-ptr + n
-   return 0
-
+;Free an active stack, and add back to the free stack list.
 lostanza defn free-stack (s:ref<Stack>) -> long :
    ;Ensure s is the last active stack
    val stk-pool = call-prim stack-pool()
@@ -332,6 +373,7 @@ lostanza defn free-stack (s:ref<Stack>) -> long :
    call-prim set-free-stacks(call-prim free-stacks() - 8)   
    return 0
 
+;Free all unmarked stacks.
 lostanza defn free-unmarked-stacks () -> int :
    var stk-ptr:ptr<ref<Stack>> = call-prim stack-pool()
    while stk-ptr < call-prim free-stacks() :
@@ -343,12 +385,9 @@ lostanza defn free-unmarked-stacks () -> int :
       s.mark = 0
    return 0
 
-
-;Extend stack
-lostanza defn extend-stack () -> int :
-   call-c printf("Extend stack\n")
-   call-c exit(-1)
-   return 0
+;============================================================
+;====================== Scratch =============================
+;============================================================
 
 defpackage user :
    import core
