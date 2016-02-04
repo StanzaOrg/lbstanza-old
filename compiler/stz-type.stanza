@@ -777,6 +777,19 @@ defstruct SubF : (ti:Type, t:Type)
 defstruct ArgsF : ()
 defstruct RetF : (n:Int)
 
+definterface InstResult
+definterface LSInstResult
+defstruct Instantiated <: InstResult :
+   cargs: List<TUVar>
+   type: TArrow
+   exp-type: TArrow
+defstruct LSInstantiated <: LSInstResult :
+   cargs: List<TUVar>
+   type: FnT
+   exp-type: FnT
+defstruct WrongArity <: InstResult & LSInstResult
+defstruct NotPoly <: InstResult & LSInstResult
+
 defstruct Filler :
    fill-ctxt: Context -> Context
    fill-s: Selection -> Selection|False
@@ -1188,20 +1201,18 @@ defn infer-types (prog:TProg) :
          (e:TCurry) :
             val t = env[n(ref(e))]
             val e* = TRef(n(ref(e)), t, t, c, info(e))
-            attempt :
-               val [cargs*, t*, rt*] = #instantiate(t, targs(e), type(c))
-               TCurry(e*, targs(e), cargs*, t*, rt*, c, info(e))
-            else :
-               TCurry(e*, targs(e), List(), false, false, c, info(e))
+            match(#instantiate(t, targs(e), type(c))) :
+               (r:Instantiated) : TCurry(e*, targs(e), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : TCurry(e*, targs(e), List(), false, false, c, info(e))
          (e:TRef) :
             val t = env[n(e)]
             val e* = TRef(n(e), t, t, c, info(e))
             val rt = get?(req-env, n(e), false)
             #super(rt, type(c))
-            attempt :
-               val [cargs*, t*, rt*] = #instantiate(t, List(), type(c))
-               TCurry(e*, List(), cargs*, t*, rt*, c, info(e))
-            else : e*
+            match(#instantiate(t, List(), type(c))) :
+               (r:Instantiated) : TCurry(e*, List(), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : TCurry(e*, List(), List(), false, false, c, info(e))
+               (r:NotPoly) : e*
          (e:TCast) :
             val exp* = bexp(exp(e), CExp(#?))
             TCast(exp*, targ(e), targ(e), targ(e), c, info(e))
@@ -1260,10 +1271,10 @@ defn infer-types (prog:TProg) :
          (e:TRef) :
             val t = env[n(e)]
             val e* = TRef(n(e), t, t, c, info(e))
-            attempt :
-               val [cargs*, t*, rt*] = #instantiate(t, targs*, type(c))
-               TCurry(e*, targs*, cargs*, t*, rt*, c, info(e))
-            else : e*            
+            match(#instantiate(t, targs*, type(c))) :
+               (r:Instantiated) : TCurry(e*, targs*, cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : TCurry(e*, targs*, List(), false, false, c, info(e))
+               (r:NotPoly) : e*
          (e:TMix) :
             val sv = SVar(fresh-id())
             val exps* = map(bmulti{_, targs*, c}, exps(e))
@@ -1328,10 +1339,10 @@ defn infer-types (prog:TProg) :
          (e:LSVar) :
             val t = ls-env[n(e)]
             val e* = LSVar(n(e), t, t, c, info(e))
-            attempt :
-               val [cargs*, t*, rt*] = #instantiate(t, List(), type(c))
-               LSCurry(e*, List(), cargs*, t*, rt*, c, info(e))
-            else : e*
+            match(#instantiate(t, List(), type(c))) :
+               (r:LSInstantiated) : LSCurry(e*, List(), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : LSCurry(e*, List(), List(), false, false, c, info(e))
+               (r:NotPoly) : e*
          (e:LSNew) :
             val t = RefT(TOf(n(e), targ(e)))
             val args* = blsfields(n(e), targ(e), args(e))
@@ -1445,11 +1456,9 @@ defn infer-types (prog:TProg) :
          (e:LSCurry) :
             val t = ls-env[n(ref(e))]
             val e* = LSVar(n(ref(e)), t, t, c, info(e))
-            attempt :
-               val [cargs*, t*, exp-t*] = #instantiate(t, targs(e), type(c))
-               LSCurry(e*, targs(e), cargs*, t*, exp-t*, c, info(e))
-            else :
-               LSCurry(e*, targs(e), List(), false, false, c, info(e))
+            match(#instantiate(t, targs(e), type(c))) :
+               (r:LSInstantiated) : LSCurry(e*, targs(e), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : LSCurry(e*, targs(e), List(), false, false, c, info(e))
          (e:LSFn) :
             val ref* = bexp(ref(e), CExp(#ref-type(type(c))))
             defn reft (t:False|Type) : attempt: RefT(#V(t))
@@ -1548,9 +1557,11 @@ defn infer-types (prog:TProg) :
 
    ;Create capture constraint
    defn #cap (r:TUVar, x:Type, y:Type) :
+      error("Invalid cap(~, ~)" % [x, y]) when (x typeof TPoly) or (y typeof TPoly) ;DEBUG
       addc(FlowConstraint(n(r), x, y))
 
    defn #cap (r:TUVar, x:LSType, y:LSType) :
+      error("Invalid cap(~, ~)" % [x, y]) when (x typeof PolyT) or (y typeof PolyT) ;DEBUG
       addc(LSFlowConstraint(n(r), x, y))
 
    ;Create a partof constraint
@@ -1619,48 +1630,54 @@ defn infer-types (prog:TProg) :
    ;Returns [Instantiated Captured Args, Instantiated Type, Relaxed Type]
    ;Instantiated type contains unification variables for captured args.
    ;Relaxed type contains graduals in place of captured args
-   defn #instantiate (t:Type, targs*:List<Type>, w:False|Type) :
+   defn #instantiate (t:Type, targs*:List<Type>, w:False|Type) -> InstResult :
       match(t) :
          (t:TPoly) :
-            fail() when length(targs(t)) != length(targs*)
-            val cargs* = #freshv(length(cargs(t)))
-            val env = map(KeyValue,
-                          append(targs(t), cargs(t))
-                          append(targs*, cargs*))
-            val a1* = sub(uncap(a(func(t))), env)
-            val a2* = #sub(b(func(t)), env)
-            val t* = TArrow(a1*, a2*)
-            val cap-a1* = sub(a(func(t)), env)
-            val cap-t* = TArrow(cap-a1*, a2*)
-            if w != false :
-               for v in cargs* do :
-                  #cap(v, isolate-cap(n(v), cap-t*), w as Type)
-            [cargs*, t*, relax-cap(cap-t*)]
-         (t) : fail()
+            if length(targs(t)) == length(targs*) :
+               val cargs* = #freshv(length(cargs(t)))
+               val env = map(KeyValue,
+                             append(targs(t), cargs(t))
+                             append(targs*, cargs*))
+               val a1* = sub(uncap(a(func(t))), env)
+               val a2* = #sub(b(func(t)), env)
+               val t* = TArrow(a1*, a2*)
+               val cap-a1* = sub(a(func(t)), env)
+               val cap-t* = TArrow(cap-a1*, a2*)
+               if w != false :
+                  for v in cargs* do :
+                     #cap(v, isolate-cap(n(v), cap-t*), w as Type)
+               Instantiated(cargs*, t*, relax-cap(cap-t*) as TArrow)
+            else : WrongArity()
+         (t) :
+            if empty?(targs*) : NotPoly()
+            else : WrongArity()
 
-   defn #instantiate (t:LSType, targs*:List<Type>, w:False|LSType) :
+   defn #instantiate (t:LSType, targs*:List<Type>, w:False|LSType) -> LSInstResult :
       match(t) :
          (t:PolyT) :
-            fail() when length(targs(t)) != length(targs*)
-            val cargs* = #freshv(length(cargs(t)))
-            val env = map(KeyValue,
-                          append(targs(t), cargs(t))
-                          append(targs*, cargs*))
-            val a* = map(sub{uncap(_), env}, a(func(t)))
-            val r* = attempt: sub(uncap(#V(r(func(t)))), env)
-            val b* = sub(b(func(t)), env)
-            val t* = FnT(a*, r*, b*)
-            val cap-a* = map(sub{_, env}, a(func(t)))
-            val cap-r* = attempt: sub(#V(r(func(t))), env)
-            val cap-t* = FnT(cap-a*, cap-r*, b*)
-            if w != false :
-               for v in cargs* do :
-                  #cap(v, isolate-cap(n(v), cap-t*), w as LSType)
-            [cargs*, t*, relax-cap(cap-t*)]
-         (t) : fail()
+            if length(targs(t)) != length(targs*) :
+               val cargs* = #freshv(length(cargs(t)))
+               val env = map(KeyValue,
+                             append(targs(t), cargs(t))
+                             append(targs*, cargs*))
+               val a* = map(sub{uncap(_), env}, a(func(t)))
+               val r* = attempt: sub(uncap(#V(r(func(t)))), env)
+               val b* = sub(b(func(t)), env)
+               val t* = FnT(a*, r*, b*)
+               val cap-a* = map(sub{_, env}, a(func(t)))
+               val cap-r* = attempt: sub(#V(r(func(t))), env)
+               val cap-t* = FnT(cap-a*, cap-r*, b*)
+               if w != false :
+                  for v in cargs* do :
+                     #cap(v, isolate-cap(n(v), cap-t*), w as LSType)
+               LSInstantiated(cargs*, t*, relax-cap(cap-t*) as FnT)
+            else : WrongArity()
+         (t) :
+            if empty?(targs*) : NotPoly()
+            else : WrongArity()
 
    defn #instantiate (t:False, targs*:List<Type>, w:False|LSType|Type) :
-      fail()
+      NotPoly()
 
    ;Create an arguments constraint
    defn #arg (r:UVarT, t:False|LSType, i:Int, arity:Int) :
@@ -1703,9 +1720,8 @@ defn infer-types (prog:TProg) :
             (t) : all?(in-scope?, children(t))
       defn with-targs<?T> (c:TComm, f: () -> ?T) :
          defn use-targs (xs:List<Int>) :
-            indented $ fn () :
-               let-var tvars-in-scope = append(xs, tvars-in-scope) :
-                  f()
+            let-var tvars-in-scope = append(xs, tvars-in-scope) :
+               f()
          match(c) :
             (c:TDefn|TDefmethod|TLDefn|TLDefmethod) :
                use-targs(append(targs(c), cargs(c)))
@@ -2800,7 +2816,7 @@ defn report-errors (nm:NameMap,
    defn bad-method (c:TExp) :
       val name = function-name(c)
       val t = type(ctxt(c) as CMulti)
-      add-error("~: Cannot attach method of type ~ to multi ~ of type ~." << [
+      add-error("~: Cannot attach method of type ~ to ~ of type ~." << [
          info(c), #pr(t), name, #pr(type(c))])
 
    defn bad-tarity (e:TCurry|LSCurry) :
