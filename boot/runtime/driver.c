@@ -13,3 +13,4 @@ int main () {
 FILE* get_stdout () {return stdout;}
 FILE* get_stderr () {return stderr;}
 FILE* get_stdin () {return stdin;}
+int get_eof () {return EOF;}
