@@ -6,6 +6,7 @@
                    boot/compiler/stz-parser.stanza \
                    boot/compiler/stz-core-macros.stanza \
                    boot/compiler/lang-read.stanza \
+                   boot/compiler/lang-check.stanza \
                    boot/compiler/stz-il-ir.stanza \
                    boot/compiler/stz-input.stanza \
                    boot/tests/tests.stanza \
