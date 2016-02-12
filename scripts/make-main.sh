@@ -31,8 +31,11 @@
              compiler/stz-asm-emitter.stanza  \
              compiler/stz-compiler.stanza  \
              boot/compiler/stz-langs.stanza  \
+             boot/compiler/lang-renamer.stanza \
              compiler/stz-main.stanza  \
           -o build/stanzac
+
+
 
 
 

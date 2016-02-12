@@ -9,8 +9,11 @@
                    boot/compiler/lang-check.stanza \
                    boot/compiler/stz-il-ir.stanza \
                    boot/compiler/stz-input.stanza \
+                   boot/compiler/stz-ids.stanza \
+                   boot/compiler/stz-namemap.stanza \
+                   boot/compiler/stz-renamer.stanza \
                    boot/tests/tests.stanza \
                 -o test.s
 
 gcc test.s boot/runtime/driver.c -o prog
-#./prog
+
