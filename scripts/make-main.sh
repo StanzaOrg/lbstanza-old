@@ -32,7 +32,7 @@
              compiler/stz-compiler.stanza  \
              boot/compiler/stz-langs.stanza  \
              compiler/stz-main.stanza  \
-          -o build/stanzac \
-          -flags OPTIMIZE
+          -o build/stanzac
+
 
 
