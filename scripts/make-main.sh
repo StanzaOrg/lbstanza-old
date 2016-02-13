@@ -32,6 +32,7 @@
              compiler/stz-compiler.stanza  \
              boot/compiler/stz-langs.stanza  \
              boot/compiler/lang-renamer.stanza \
+             boot/compiler/lang-resolver.stanza \
              compiler/stz-main.stanza  \
           -o build/stanzac
 
