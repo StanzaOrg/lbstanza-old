@@ -34,7 +34,9 @@
              boot/compiler/lang-renamer.stanza \
              boot/compiler/lang-resolver.stanza \
              compiler/stz-main.stanza  \
-          -o build/stanzac 
+          -o build/stanzac \
+          -flags OPTIMIZE
+
 
 
 
