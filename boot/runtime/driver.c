@@ -2,9 +2,15 @@
 #include<stdio.h>
 
 long stanza_entry (char* stack_mem);
-long stanza_stack_size;
+extern long stanza_stack_size;
 
-int main () {
+//Command line arguments
+long input_argc;
+char** input_argv;
+
+int main (int argc, char* argv[]) {
+  input_argc = argc;
+  input_argv = argv;
   char* stack_mem = malloc(stanza_stack_size);
   stanza_entry(stack_mem);
   return 0;
