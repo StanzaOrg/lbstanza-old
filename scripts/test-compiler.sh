@@ -16,6 +16,8 @@
                    boot/compiler/stz-kl-ir.stanza \
                    boot/compiler/stz-tgt-ir.stanza \
                    boot/compiler/stz-bb-ir.stanza \
+                   boot/compiler/stz-asm-ir.stanza \
+                   boot/compiler/stz-backend.stanza \
                    boot/compiler/stz-input.stanza \
                    boot/compiler/stz-namemap.stanza \
                    boot/compiler/stz-renamer.stanza \
@@ -24,6 +26,8 @@
                    boot/compiler/stz-type-calculus.stanza \
                    boot/compiler/stz-type.stanza \
                    boot/compiler/stz-kform.stanza \
+                   boot/compiler/stz-tgt.stanza \
+                   boot/compiler/stz-bb.stanza \
                    boot/tests/tests.stanza \
                 -o test.s
 
