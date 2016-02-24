@@ -6,6 +6,7 @@
                    boot/compiler/stz-padder.stanza \
                    boot/compiler/stz-utils.stanza \
                    boot/compiler/stz-parser.stanza \
+                   boot/compiler/stz-params.stanza \
                    boot/compiler/stz-core-macros.stanza \
                    boot/compiler/stz-ids.stanza \
                    boot/compiler/lang-read.stanza \
@@ -30,8 +31,9 @@
                    boot/compiler/stz-bb.stanza \
                    boot/compiler/stz-asm-emitter.stanza \
                    boot/compiler/stz-compiler.stanza \
-                   boot/tests/tests.stanza \
+                   boot/compiler/stz-arg-parser.stanza \
+                   boot/compiler/stz-main.stanza \
                 -o test.s
 
-gcc test.s boot/runtime/driver.c -o prog
+gcc test.s boot/runtime/driver.c -o bstanzac
 
