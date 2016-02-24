@@ -29,6 +29,7 @@
                    boot/compiler/stz-tgt.stanza \
                    boot/compiler/stz-bb.stanza \
                    boot/compiler/stz-asm-emitter.stanza \
+                   boot/compiler/stz-compiler.stanza \
                    boot/tests/tests.stanza \
                 -o test.s
 
