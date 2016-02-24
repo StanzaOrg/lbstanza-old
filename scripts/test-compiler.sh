@@ -28,6 +28,7 @@
                    boot/compiler/stz-kform.stanza \
                    boot/compiler/stz-tgt.stanza \
                    boot/compiler/stz-bb.stanza \
+                   boot/compiler/stz-asm-emitter.stanza \
                    boot/tests/tests.stanza \
                 -o test.s
 
