@@ -31,7 +31,10 @@
                    boot/compiler/stz-bb.stanza \
                    boot/compiler/stz-asm-emitter.stanza \
                    boot/compiler/stz-compiler.stanza \
-                   boot/compiler/stz-arg-parser.stanza \
+                   boot/compiler/stz-arg-parser.stanza \                   
+                   boot2/compiler/stz-langs.stanza  \
+                   boot2/compiler/lang-renamer.stanza \
+                   boot2/compiler/lang-resolver.stanza \                   
                    boot/compiler/stz-main.stanza \
                 -o test.s
 
