@@ -32,8 +32,12 @@
            boot2/compiler/stz-asm-emitter.stanza \
            boot2/compiler/stz-compiler.stanza \
            boot2/compiler/stz-arg-parser.stanza \
+           boot2/compiler/stz-langs.stanza  \
+           boot2/compiler/lang-renamer.stanza \
+           boot2/compiler/lang-resolver.stanza \
            boot2/compiler/stz-main.stanza \
-        -s boot.s
+        -s boot2.s
 
-#gcc test.s boot/runtime/driver.c -o bstanzac
+
+gcc boot2.s boot/runtime/driver.c -o bstanzac2
 
