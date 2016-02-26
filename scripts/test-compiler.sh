@@ -36,6 +36,7 @@
                    boot/compiler/lang-renamer.stanza \
                    boot/compiler/lang-resolver.stanza \
                    boot/compiler/stz-main.stanza \
-                -o test.s
+                -o test.s \
+                -optimize 
 
 gcc test.s boot/runtime/driver.c -o bstanzac
