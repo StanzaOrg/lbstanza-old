@@ -69,8 +69,8 @@ public defn compile (program:TProg, nm:NameMap, filename:String) :
    prog = elide-casts(prog)
    println(prog)
 
-   headline("Test copying")
-   prog = test-copy(prog)
+   headline("Inlining")
+   prog = inline(prog)
    println(prog)
 
    ;headline("Automatic Primitive Tagging")
@@ -153,12 +153,14 @@ defn to-kform (prog:TProg, nm:NameMap) :
       match(c) :
          (c:TDef) :
             val value* = KCast(to-exp(value(c)), to-type!(type(c)), info(c), false)
+            ;TODO: Cast should be moved to boundary insertion.
             KDef(n(c), value*)
          (c:TDefVar) :
+            val t* = to-type!(type(c))
             val v* = match(value(c)) :
                (v:False) : false
-               (v:TExp) : KCast(to-exp(v), to-type!(type(c)), info(c), false)
-            KDefVar(n(c), v*)
+               (v:TExp) : KCast(to-exp(v), t*, info(c), false)
+            KDefVar(n(c), t*, v*) ;TODO: Cast should be moved to boundary insertion
          (c:TDefn) :
             val f = KFn(
                fresh-id(),
@@ -282,11 +284,12 @@ defn to-kform (prog:TProg, nm:NameMap) :
                to-exp(body(e)),
                false)
          (e:TLetVar) :
+            val t* = to-type!(ntype(e))
             val v* = match(value(e)) :
-               (v:TExp) : KCast(to-exp(v), to-type!(ntype(e)), info(e), false)
+               (v:TExp) : KCast(to-exp(v), t*, info(e), false)
                (v) : false
             KLet(
-               KDefVar(n(e), v*)
+               KDefVar(n(e), t*, v*)
                to-exp(body(e)),
                false)
          (e:TLetTuple) :
@@ -353,6 +356,7 @@ defn to-kform (prog:TProg, nm:NameMap) :
          (e:TSet) :
             val t = to-type!(type(ref(e)))
             val value* = KCast(to-exp(value(e)), t, info(e), false)
+            ;TODO: Cast should be moved to boundary insertion
             KSet(n(ref(e)), value*, false)
          (e:TDo) :
             val a1* = map(to-type!{type(ctxt(_) as CExp)}, args(e))
@@ -945,16 +949,17 @@ defn void-check-insertion (prog:KProg) :
 ;                    ========================
 
 defn box-mutables (prog:KProg) :
-   val mtable = HashTable<Int, True>({_})
-   defn box! (v:Int) : mtable[v] = true
-   defn box? (v:Int) : get?(mtable, v, false)
+   val mtable = HashTable<Int, KType>({_})
+   defn box! (v:Int, t:KType) : mtable[v] = t
+   defn box? (v:Int) : key?(mtable, v)
+   defn var-type (v:Int) : mtable[v]
 
    defn box (e:KExp) :
       match(e) :
          (e:KLet) :
             match(def(e)) :
                (d:KDefVar) :
-                  box!(n(d))
+                  box!(n(d), type(d))
                   val d* = map(box, d) as KDefVar
                   val body* = box(body(e))
                   KLet(KDef(n(d), KBox(value(d*), false)),
@@ -967,7 +972,7 @@ defn box-mutables (prog:KProg) :
             if box?(n(e)) : KBoxSet(KVar(n(e)), v*, false)
             else : KSet(n(e), v*, false)
          (e:KVar) :
-            if box?(n(e)) : KBoxGet(e, false)
+            if box?(n(e)) : KBoxGet(e, var-type(n(e)))
             else : e
          (e) :
             mapr(box, e)
@@ -1476,6 +1481,56 @@ defn boundary-guard-insertion (prog:KProg) :
 
 
 ;============================================================
+;================= KForm Utilities ==========================
+;============================================================
+
+;               Return Calculated Type
+;               ======================
+
+defn type! (e:KExp) :
+   type(e) as KType
+
+;                 Type Argument Substitution
+;                 ==========================
+
+defn sub-targs (body:KExp, xs:List<Int>, vs:List<KType>) :
+   if empty?(xs) :
+      body
+   else :
+      val env = map(KeyValue, xs, vs)
+      mapr(sub{_, env}, body)
+
+;                     Alpha Renaming
+;                     ==============
+
+defn alpha-rename (e:KExp, env:List<KeyValue<Int,Int>>) -> KExp :
+   val table = HashTable<Int,Int>({_})
+   for e in env do : table[key(e)] = value(e)
+   alpha-rename(e, table)
+
+defn alpha-rename (exp:KExp, table:HashTable<Int,Int>) -> KExp :
+   val e = map(alpha-rename{_:KType, table}, exp)
+   match(e) :
+      (e:KVar) : KVar(get?(table, n(e), n(e)), info(e), type(e))
+      (e) : mapr(alpha-rename{_:KExp, table}, e)
+
+defn alpha-rename (t:KType, table:HashTable<Int,Int>) -> KType :
+   match(t) :
+      (t:KTVar) : KTVar(get?(table, n(t), n(t)))
+      (t) : map(alpha-rename{_, table}, t)
+
+;                     Parallel KLet
+;                     =============
+
+defn KLet (xs:List<Int>, vs:List<KExp>, body:KExp) -> KExp :
+   if empty?(xs) :
+      body
+   else :
+      KLet(KDef(head(xs), head(vs)),
+           KLet(tail(xs), tail(vs), body),
+           type(body))
+
+;============================================================
 ;================= Simple Inlining ==========================
 ;============================================================
 
@@ -1493,14 +1548,6 @@ defn count-usages (block:KExp) -> IntTable<Int> :
 
    count-exp(block)
    num-usages
-
-defn KLet (xs:List<Int>, vs:List<KExp>, body:KExp) -> KExp :
-   if empty?(xs) :
-      body
-   else :
-      KLet(KDef(head(xs), head(vs)),
-           KLet(tail(xs), tail(vs), body),
-           false)
 
 defn simple-inlining (block:KExp) -> KExp :
 
@@ -1526,12 +1573,6 @@ defn simple-inlining (block:KExp) -> KExp :
          (f) : false
 
    defn inline-call (f:Func, c-targs:List<KType>, c-args:List<KExp>) -> KExp|False :
-      defn sub-targs (body:KExp, xs:List<Int>, vs:List<KType>) :
-         if empty?(xs) :
-            body
-         else :
-            val env = map(KeyValue, xs, vs)
-            mapr(sub{_, env}, body)
       match(f) :
          (f:KFn) :
             if (length(c-args) == length(args(f))) and
@@ -1719,9 +1760,6 @@ defn gen-constraints (tt:TypeTable, prog:KProg) :
    defn hs-type? (t:KLSType) :
       t typeof KRefT
 
-   defn type! (e:KExp) :
-      type(e) as KType
-
    defn env-type? (e:KExp) -> IType|False :
       match(e) :
          (e:KVar) : get?(env, n(e), false)
@@ -1775,7 +1813,7 @@ defn gen-constraints (tt:TypeTable, prog:KProg) :
    defn build-environment (c:KComm) :
       match(c) :
          (c:KDef) : env[n(c)] = IGround(fresh-uvar()) ;TODO: Should include types in KDef
-         (c:KDefVar) : env[n(c)] = IGround(KTop())    ;TODO: Should include types in KDefVar
+         (c:KDefVar) : env[n(c)] = IGround(type(c))
          (c:KDefn) : env[n(c)] = fn-type(c)
          (c:KDefmulti) : env[n(c)] = fn-type(c)
          (c:KDefmethod) : fn-type(c)
@@ -1832,8 +1870,8 @@ defn gen-constraints (tt:TypeTable, prog:KProg) :
             val func* = gen-exp(func(e))
             val args* = map(gen-exp, args(e))
             val a2* = match(env-type?(func(e))) :
-               (f:IType) : gen-call(f, func(e), length(args*))
-               (f:False) : KTop()
+               (f:IArrow|IMulti) : gen-call(f, func(e), length(args*))
+               (f) : KTop()
             KDo(func*, args*, a1(e), a2(e), info(e), a2*)
          (e:KVar) :
             val t* = to-ktype(env[n(e)])
@@ -1880,8 +1918,7 @@ defn gen-constraints (tt:TypeTable, prog:KProg) :
             KBox(value*, t*)
          (e:KBoxGet) :
             val box* = gen-exp(box(e))
-            val t* = KOf(BOX-TYPE-ID)
-            KBoxGet(box*, t*)
+            KBoxGet(box*, type(e))
          (e:KBoxSet) :
             val box* = gen-exp(box(e))
             val val* = gen-exp(value(e))
@@ -1929,7 +1966,7 @@ defn gen-constraints (tt:TypeTable, prog:KProg) :
             KDef(n(c), val*)
          (c:KDefVar) :
             match(value(c)) :
-               (v:KExp) : KDefVar(n(c), gen-exp(v))
+               (v:KExp) : KDefVar(n(c), type(c), gen-exp(v))
                (v:False) : c
          (c:KDefn) :
             val func* = gen-func(value(c))
@@ -2052,12 +2089,50 @@ defn infer-types (prog:KProg) :
 
 defn elide-casts (prog:KProg) :
    val tt = get-type-table(prog)
+
+   ;Branch filtering
+   defn subtypes? (xs:List<KType>, ys:List<KType>) :
+      all?(subtype?{tt, _, _}, xs, ys)
+   defn overlaps? (xs:List<KType>, ys:List<KType>) :
+      all?(overlap?{tt, _, _}, xs, ys)      
+   defn selected-branches (bs:List<KBranch>, ts:List<KType>) -> List<KBranch> :
+      if empty?(bs) :
+         List()
+      else :
+         val b = head(bs)
+         if subtypes?(ts, types(b)) : list(b)
+         else if overlaps?(ts, types(b)) : overlapping-branches(bs, ts)
+         else : selected-branches(tail(bs), ts)
+   defn overlapping-branches (bs:List<KBranch>, ts:List<KType>) -> List<KBranch> :
+      to-list $ for b in bs filter :
+         overlaps?(ts, types(b))
+
    defn elide-exp (e:KExp) :
       match(mapr(elide-exp, e)) :
          (e:KCast) :
             val et = type(exp(e)) as KType
             if subtype?(tt, et, targ(e)) : exp(e)
             else : e
+         (e:KMatch) :
+            val arg-ts = map(type!, args(e))
+            val branches* = selected-branches(branches(e), arg-ts)
+            if empty?(branches*) :
+               KBranchError(false, info(e), KBot())
+            else if empty?(tail(branches*)) :
+               val b = head(branches*)
+               KLet(args(b), args(e), body(b))
+            else :
+               KMatch(args(e), branches*, info(e), type(e))
+         (e:KDispatch) :
+            val arg-ts = map(type!, args(e))
+            val branches* = overlapping-branches(branches(e), arg-ts)
+            if empty?(branches*) :
+               KBranchError(false, info(e), KBot())
+            else if empty?(tail(branches*)) :
+               val b = head(branches*)
+               KLet(args(b), args(e), body(b))
+            else :
+               KDispatch(args(e), branches*, info(e), type(e))
          (e) : e
    map(elide-exp, prog)
 
@@ -2097,8 +2172,9 @@ defn copy-rename (e:KExp) :
             val v* = copy-exp(value(c))
             KDef(env[n(c)], v*)
          (c:KDefVar) :
+            val t* = copy-type(type(c))
             val v* = copy-exp(value(c))
-            KDefVar(env[n(c)], v*)
+            KDefVar(env[n(c)], t*, v*)
          (c:KDefn) :
             val func* = copy-func(value(c))
             KDefn(env[n(c)], func*)
@@ -2135,9 +2211,6 @@ defn copy-rename (e:KExp) :
             KMultifn(copy-id(n(f)), funcs*, info(f))
    copy-exp(e)         
 
-defn test-copy (p:KProg) :
-   map(copy-rename, p)
-
 ;============================================================
 ;======================= Inlining ===========================
 ;============================================================
@@ -2159,8 +2232,9 @@ defn size (e:ILEntry) :
    defn exp-size (e:KExp) :
       ;Count number of subexpressions
       var sz:Int = 0
-      for se in e dor :
-         sz = sz + exp-size(se)
+      defn add-size (se:KExp) :
+         sz = sz + exp-size(se) ;not an issue with the new type system
+      dor(add-size, e)
       ;Decide whether current expression counts
       match(e) :
          (e:KLet|KLetRec|KSeq|KDispatch|KMatch) : sz
@@ -2168,6 +2242,169 @@ defn size (e:ILEntry) :
    if cached-size(e) typeof False :
       set-cached-size(e, exp-size(body(e)))
    cached-size(e) as Int
+
+defmethod print (o:OutputStream, il:ILEntry) :
+   defn cms (xs) : join(xs, ", ")
+   val [ta, xs, b] = [targs(il), args(il), body(il)]
+   if empty?(ta) : print(o, "[~] (~@) : ~" << [size(il), xs, b])
+   else : print(o, "[~] <~@> . (~@) : ~" << [size(il), cms(ta), cms(xs), b])
+
+;               Type Directed Inline Entry
+;               ==========================
+
+defstruct ILMEntry :
+   types: List<List<KType>>
+   entries: List<ILEntry>
+with :
+   constructor => #ILMEntry
+
+defn ILMEntry (types:List<List<KType>>, entries:List<ILEntry>) :
+   for ts in types do :
+      if any?(contains-vars?, ts) :
+         error("ILMEntry assumes no type variables in match types.")
+   #ILMEntry(types, entries)
+
+defn get (e:ILMEntry, tt:TypeTable, arg-ts:List<KType>, tarity:Int) -> False|ILEntry :
+   defn subtypes? (xs:List<KType>, ys:List<KType>) :
+      all?(subtype?{tt, _, _}, xs, ys)
+   defn overlaps? (xs:List<KType>, ys:List<KType>) :
+      all?(overlap?{tt, _, _}, xs, ys)
+   label<False|ILEntry> return :
+      for (e in entries(e), ts in types(e)) do :
+         if subtypes?(arg-ts, ts) : return(e when length(targs(e)) == tarity)
+         else if overlaps?(arg-ts, ts) : return(false)
+
+defmethod print (o:OutputStream, il:ILMEntry) :
+   print{o, "(~@)" << [join(_, " ")]} $
+   for (ts in types(il), e in entries(il)) stream :
+      "((~@) => ~)" << [join(ts, ", "), e]
+
+;                      ILTable
+;                      =======
+
+defclass ILTable
+defmulti get (t:ILTable, tt:TypeTable, n:Int, ts:List<KType>, tarity:Int) -> False|ILEntry
+defmulti set (t:ILTable, n:Int, e:ILEntry|ILMEntry) -> False
+
+defn ILTable () :
+   ;table[n, arity]
+   val table = DualIntTable<ILMEntry|ILEntry>()
+   new ILTable :
+      defmethod get (this, tt:TypeTable, n:Int, ts:List<KType>, tarity:Int) :
+         val arity = length(ts)
+         match(get?(table, n, arity, false)) :
+            (e:ILEntry) : e when length(targs(e)) == tarity
+            (e:ILMEntry) : e[tt, ts, tarity]
+            (e:False) : false
+      defmethod set (this, n:Int, e:ILEntry|ILMEntry) :
+         val arity = match(e) :
+            (e:ILEntry) : length(args(e))
+            (e:ILMEntry) : length(args(head(entries(e))))
+         table[n, arity] = e
+      defmethod print (o:OutputStream, this) :
+         val lines = for entry in table stream :
+            val [n,arity] = key(entry)
+            val e = value(entry)
+            "ENTRY ~ : ~" << [n, e]
+         print-all(o, join(lines, "\n"))   
+
+;                 Building ILTable
+;                 ================
+
+defn get-il-entry (f:KFn) :
+   ;Does xs refer to the arguments of f?
+   defn args? (xs:List<KExp>) :
+      if all?({_ typeof KVar}, xs) :
+         val xs = xs as List<KVar>
+         if length(xs) == length(args(f)) :
+            for (x in xs, a in args(f)) all? :
+               n(x) == a
+   ;Is e a match expression on the arguments of f?         
+   defn dispatch? (e:KExp) :
+      match(e) :
+         (e:KMatch) : args?(args(e))
+         (e) : false
+   ;Create appropriate inline entry      
+   if dispatch?(body(f)) :
+      val bs = branches(body(f) as KMatch)
+      val ts = map(types, bs)
+      val es = for b in bs map :
+         ILEntry(targs(f), args(b), body(b))
+      ILMEntry(ts, es)
+   else :
+      ILEntry(targs(f), args(f), body(f))   
+
+defn build-il-table (prog:KProg) :
+   val table = ILTable()
+   defn scan-comm (c:KComm) :
+      dor(scan-comm, c)
+      match(c) :
+         (c:KDefn) :
+            match(value(c)) :
+               (f:KFn) :
+                  table[n(c)] = get-il-entry(f)
+               (f:KMultifn) :
+                  for f in funcs(f) do :
+                     table[n(c)] = get-il-entry(f as KFn)
+         (c) : false
+   do(scan-comm, comms(prog))
+   table
+
+
+;                Perform Inlining
+;                ================
+
+defn inline (prog:KProg, tt:TypeTable, progress: () -> ?) :
+   ;Build inline table
+   val il-table = build-il-table(prog)
+   
+   ;Retrieve calling function, arguments, and type arguments if possible
+   defn do-params (e:KExp) :
+      match(e) :
+         (e:KDo) :
+            match(func(e)) :
+               (f:KVar) : [n(f), args(e), List()]
+               (f:KCurry) : [n(f), args(e), targs(f)]
+               (f) : false
+         (e) : false
+         
+   ;Inline a single call
+   defn inline-call (e:ILEntry, arg-exps:List<KExp>, targ-exps:List<KType>) :
+      var body* = copy-rename(body(e))
+      body* = sub-targs(body*, targs(e), targ-exps)
+      val args* = map(fresh-id{}, args(e))
+      body* = alpha-rename(body*, map(KeyValue, args(e), args*))
+      KLet(args*, arg-exps, body*)
+
+   ;Inline all opportunities within given expression
+   defn il-exp (#e:KExp) :
+      val e = mapr(il-exp, #e)
+      match(do-params(e)) :
+         ([n, args, targs]:[Int, List<KExp>, List<KType>]) :
+            val ts = map(type!, args)
+            match(il-table[tt, n, ts, length(targs)]) :
+               (ile:ILEntry) :
+                  if size(ile) <= 10 :
+                     progress()
+                     inline-call(ile, args, targs)
+                  else : e
+               (f:False) : e
+         (f:False) : e
+            
+   ;Driver
+   map(il-exp, prog)
+
+defn inline (prog:KProg) :
+   val tt = get-type-table(prog)
+   var prog* = prog
+   var num-iter = 0
+   fixpoint $ fn (progress) :
+      if num-iter < 5 :
+         prog* = inline(prog*, tt, progress)
+         prog* = infer-types(prog*)
+         prog* = elide-casts(prog*)
+         num-iter = num-iter + 1
+   prog*
 
 ;============================================================
 ;================== PRIMITIVE TAGGING =======================
@@ -2556,26 +2793,6 @@ defn lift-objects (prog:KProg, freetable: HashTable<Int,FVEntry>) :
 
    ;Return new program
    KProg(to-list(accum))
-
-
-;                        Alpha Renaming
-;                        ==============
-
-defn alpha-rename (e:KExp, env:List<KeyValue<Int,Int>>) -> KExp :
-   val table = HashTable<Int,Int>({_})
-   for e in env do : table[key(e)] = value(e)
-   alpha-rename(e, table)
-
-defn alpha-rename (exp:KExp, table:HashTable<Int,Int>) -> KExp :
-   val e = map(alpha-rename{_:KType, table}, exp)
-   match(e) :
-      (e:KVar) : KVar(get?(table, n(e), n(e)), info(e), type(e))
-      (e) : mapr(alpha-rename{_:KExp, table}, e)
-
-defn alpha-rename (t:KType, table:HashTable<Int,Int>) -> KType :
-   match(t) :
-      (t:KTVar) : KTVar(get?(table, n(t), n(t)))
-      (t) : map(alpha-rename{_, table}, t)
 
 ;                   Closure Lifting
 ;                   ===============
@@ -3343,6 +3560,7 @@ defmulti cast-type (tt:TypeTable, t:KType) -> KType
 defmulti primitive? (tt:TypeTable, n:Int) -> True|False
 defmulti marker? (tt:TypeTable, n:Int) -> True|False
 defmulti subtype? (tt:TypeTable, a:KType, b:KType) -> True|False
+defmulti overlap? (tt:TypeTable, a:KType, b:KType) -> True|False
 defmulti tagged-types (tt:TypeTable) -> Streamable<KLSDefType>
 
 
@@ -3502,6 +3720,16 @@ defn TypeTable () :
       else if key?(types, n) : parent(types[n])
       else : error("Not a type: ~" % [n])
 
+   defn class-parents (t:KOf, class:Int) -> List<KOf> :
+      defn loop (t:False|KType) -> List<KOf> :
+         match(t) :
+            (t:KOf) :
+               if n(t) == class : list(t)
+               else : loop(class-parent(n(t)))
+            (t:KAnd) : append(loop(a(t)), loop(b(t)))
+            (t:False) : List()
+      loop(t)      
+
    defn subclasses (n:Int) :
       get?(subclass-table, n, List<Int>())
 
@@ -3555,7 +3783,7 @@ defn TypeTable () :
          ;1. Ground Types
          (x:KOf, y:KOf) :
             if n(x) == n(y) : true
-            else : subtype?(class-parent(n(x)), y)
+            else : any?(subtype?{_, y}, class-parents(x, n(y)))
          (x:KTVar, y:KTVar) : n(x) == n(y)
          ;5. Unification Variables
          (x:KUVar, y:KUVar) : n(x) == n(y)
@@ -3566,6 +3794,27 @@ defn TypeTable () :
          ;Fall Through
          (x, y) : false
 
+   ;Two types overlap if there exists a value that is a subtype of both x and y
+   defn overlap? (x:KType, y:KType) :
+      error("Invalid type: ~" % [x]) when x not-typeof KBot|KTop|KOr|KAnd|KOf|KTVar
+      error("Invalid type: ~" % [y]) when y not-typeof KBot|KTop|KOr|KAnd|KOf|KTVar
+      match(x, y) :
+         ;1. Bottom fast path
+         (x:KBot, y) : false
+         (x, y:KBot) : false
+         ;2. Top fast path
+         (x:KTop|KTVar, y) : true
+         (x, y:KTop|KTVar) : true
+         ;3. Combinatory types
+         (x:KOr|KAnd, y) : overlap?(a(x), y) or overlap?(b(x), y)
+         (x, y:KOr|KAnd) : overlap?(x, a(y)) or overlap?(x, b(y))
+         ;4. Ground types
+         (x:KOf, y:KOf) :
+            if n(x) == n(y) : true
+            else : any?(overlap?{_, y}, class-parents(x, n(y))) or
+                   any?(overlap?{x, _}, class-parents(y, n(x)))
+         ;5. Fall through          
+         (x, y) : false
 
    ;     Compute Alignments, Padding, and Size
    ;     -------------------------------------
@@ -3693,6 +3942,8 @@ defn TypeTable () :
             (t:False) : false
       defmethod subtype? (this, a:KType, b:KType) :
          subtype?(a, b)
+      defmethod overlap? (this, a:KType, b:KType) :
+         overlap?(a, b)
       defmethod tagged-types (this) :
          for n in tag-types stream :
             lstypes[n]
