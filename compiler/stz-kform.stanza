@@ -66,13 +66,17 @@ public defn compile (program:TProg, nm:NameMap, filename:String) :
    prog = infer-types(prog)
    ;println(prog)
 
-   headline("Cast Elision")
+   ;headline("Cast Elision")
    prog = elide-casts(prog)
-   println(prog)
+   ;println(prog)
 
    if flag-defined?(`OPTIMIZE) :
       headline("Inlining")
       prog = inline(prog)
+      println(prog)
+
+      headline("Lambda Lift")
+      prog = lambda-lift(prog)
       println(prog)
 
    ;headline("Automatic Primitive Tagging")
@@ -80,7 +84,7 @@ public defn compile (program:TProg, nm:NameMap, filename:String) :
    ;println(prog)
 
    ;headline("Type Reification")
-   prog = type-reification(prog, nm)
+   prog = type-reification(prog)
    ;println(prog)
 
    ;headline("Freevar Calculation")
@@ -111,11 +115,11 @@ public defn compile (program:TProg, nm:NameMap, filename:String) :
    prog = convert-code(prog)
    ;println(prog)
 
-   ;headline("Cast Conversion")
+   headline("Cast Conversion")
    prog = cast-conversion(prog)
-   ;println(prog)
+   println(prog)
 
-   ;headline("Compilation")
+   headline("Compilation")
    val compiled = compile(prog)
    println(compiled)
 
@@ -2142,7 +2146,7 @@ defn elide-casts (prog:KProg) :
 ;==================== Copy Rename ===========================
 ;============================================================
 
-defn copy-rename (e:KExp) :
+defn copy-rename<?T> (e:?T&(KExp|KComm|Func|KType)) -> T :
    val env = HashTable<Int,Int>({_})
    defn copy-id (n:Int) :
       val n* = fresh-id()
@@ -2211,7 +2215,12 @@ defn copy-rename (e:KExp) :
          (f:KMultifn) :
             val funcs* = map(copy-func, funcs(f))
             KMultifn(copy-id(n(f)), funcs*, info(f))
-   copy-exp(e)         
+
+   {_ as T&(KExp|KComm|Func|KType)} $ match(e) :
+      (e:KExp) : copy-exp(e)
+      (e:KComm) : copy-comm(e)
+      (e:KType) : copy-type(e)
+      (e:Func) : copy-func(e)
 
 ;============================================================
 ;======================= Inlining ===========================
@@ -2408,6 +2417,184 @@ defn inline (prog:KProg) :
          num-iter = num-iter + 1
    prog*
 
+
+;============================================================
+;================== Closure Usage Table =====================
+;============================================================
+
+defn usage-table (prog:KProg) -> HashTable<Int,True> :
+   ;                Scan for Globals
+   ;                ================
+   val globals = HashTable<Int, True>({_})
+   defn global? (n:Int) : key?(globals, n)
+
+   for c in comms(prog) do :
+      match(c) :
+         (c:KDef|KDefVar|KDefn|KDefmulti|KLSDef|KLSDefVar|KLSDefn|KDefConst) :
+            globals[n(c)] = true
+         (c) : false
+         
+   ;           Calculate Closure Usages
+   ;           ========================
+   val used = HashTable<Int,True>({_})
+   
+   defn scan-exp (e:KExp) :
+      match(e) :
+         (e:KVar) :
+            used[n(e)] = true
+         (e:KDo) :
+            scan-exp(func(e)) when func(e) not-typeof KVar
+            do(scan-exp, args(e))
+         (e) :
+            dor(scan-exp, e)   
+
+   for c in comms(prog) do :
+      do(scan-exp, c)
+
+   ;Return computed table
+   used      
+
+;============================================================
+;================== Lambda Lifting ==========================
+;============================================================
+
+;                  Compute Lifts
+;                  =============
+
+defstruct LiftEntry :
+   targs: List<Int>
+   args: List<Int>
+
+defmethod print (o:OutputStream, le:LiftEntry) :
+   defn commas (xs) : join(xs, ", ")
+   print(o, "<~@> (~@)" << [commas(targs(le)), commas(args(le))])
+
+defn compute-lifts (fvtable:HashTable<Int,FVEntry>, usage-table:HashTable<Int,True>) :
+   ;Anchors are functions that cannot be lifted.
+   ;Initially empty.
+   val anchors = HashTable<Int,True>({_})
+   val lift-args = fixpoint $ fn (progress) :
+      ;Compute lifting args
+      val argss = bipartite-closure $
+         for entry in fvtable stream-concat :
+            val [f, fv] = [key(entry), value(entry)]
+            if key?(anchors, f) : List()
+            else : list(f => args(fv))
+      ;Lifting args
+      for entry in argss map :
+         val [f, args] = [key(entry), value(entry)]
+         val fv = fvtable[f]
+         if key?(usage-table, f) :
+;            if not empty?(free(fv)) :      TODO: This is just for testing.
+               anchors[f] = true
+               progress()
+         f => LiftEntry(targs(fv), args)
+       
+   ;Store in table
+   val lift-table = HashTable<Int,LiftEntry>({_})
+   for e in lift-args do :
+      val fv = value(e)
+      lift-table[key(e)] = LiftEntry(targs(fv), args(fv))
+   lift-table
+
+
+;                   Lambda Lifting
+;                   ==============
+
+defn lambda-lift (prog:KProg, lift-table:HashTable<Int,LiftEntry>) :
+   val bindings = Vector<KDefn>()
+   
+   defn lift? (f:Int) :
+      key?(lift-table, f)
+      
+   defn lift-fn<?T> (le:LiftEntry, func:?T&Func) -> T :
+      {_ as T&Func} $ match(func) :
+         (func:KFn) :
+            val body* = lift-exp(body(func))
+            val targs* = append(targs(le), targs(func))
+            val args* = append(args(le), args(func))
+            val a1* = append(stream(KTop{}, args(le)), a1(func))
+            copy-rename(KFn(n(func), tail?(func), targs*, a1*, a2(func), closure(func), args*, body*, info(func)))
+         (func:KMultifn) :
+            val funcs* = map(lift-fn{le, _}, funcs(func))
+            KMultifn(n(func), funcs*, info(func))
+
+   defn lift-fn (def:KDefn) :
+      val [n,f] = [n(def), value(def)]
+      val f* = lift-fn(lift-table[n], f)
+      add(bindings, KDefn(n, f*))
+      
+   defn lift-call (n:Int, type-args:List<KType>, call-args:List<KExp>, inf:FileInfo) :
+      val le = lift-table[n]
+      val targs* = append(stream(KTVar,targs(le)), type-args)
+      val args* = append(stream(KVar,args(le)), call-args)
+      val f* = if empty?(targs*) : KVar(n)
+               else : KCurry(n, targs*, map(KTop{}, args*), KTop(), inf, false)
+      KDo(f*, args*, map(KTop{}, args*), KTop(), inf, false)
+      
+   ;Retrieve calling function, arguments, and type arguments if possible
+   defn do-params (e:KExp) -> False|[Int, List<KExp>, List<KType>, FileInfo] :
+      match(e) :
+         (e:KDo) :
+            match(func(e)) :
+               (f:KVar) : [n(f), args(e), List(), info(e)]
+               (f:KCurry) : [n(f), args(e), targs(f), info(e)]
+               (f) : false
+         (e) : false
+         
+   defn lift-exp (e:KExp) -> KExp :
+      match(e) :
+         (e:KLetRec) :
+            val defs* = Vector<KDefn>()
+            for def in defs(e) as List<KDefn> do :
+               if lift?(n(def)) : lift-fn(def)
+               else : add(defs*, map(lift-exp, def))
+            val body* = lift-exp(body(e))
+            if empty?(defs*) : body*
+            else : KLetRec(to-list(defs*), body*, info(e), type(body*))
+         (e:KLet) :
+            match(def(e)) :
+               (def:KDefn) :
+                  if lift?(n(def)) :
+                     lift-fn(def)
+                     lift-exp(body(e))
+                  else :
+                     mapr(lift-exp, e)
+               (def) :
+                  mapr(lift-exp, e)
+         (e) :
+            match(do-params(e)) :
+               ([n, args, targs, inf]:[Int, List<KExp>, List<KType>, FileInfo]) :
+                  if lift?(n) :
+                     val args* = map(lift-exp, args)
+                     lift-call(n, targs, args*, inf)
+                  else : mapr(lift-exp, e)
+               (f:False) :
+                  mapr(lift-exp, e)
+
+   val comms* = for c in comms(prog) map :
+      map(lift-exp, c)
+   println("=== bindings ===")
+   println(bindings)
+   println("================")
+   KProg(append(bindings, comms*))
+
+;                   Driver
+;                   ======
+
+defn lambda-lift (prog:KProg) :
+   val fv-table = freevar-table(prog)
+   println("=== free table ===")
+   println(fv-table)
+   val usage-table = usage-table(prog)
+   println("=== usage table ===")
+   do(println, usage-table)   
+   val lift-table = compute-lifts(fv-table, usage-table)
+   println("=== lift table ===")
+   do(println, lift-table)
+   println("=== lifting ===")
+   lambda-lift(prog, lift-table)
+
 ;============================================================
 ;================== PRIMITIVE TAGGING =======================
 ;============================================================
@@ -2508,7 +2695,17 @@ defn type-hash (t:KType) :
       (x:KBot) : 6 * 31
       (x:KTags) : 7 * 31 + list-hash(tags(x))
 
-defn type-reification (prog:KProg, nm:NameMap) :
+defn type-reification (prog:KProg) :
+   ;            Scan for Global Functions
+   ;            =========================
+   val global-fns = HashTable<Int, True>({_})
+   defn global-fn? (n:Int) : key?(global-fns, n)
+
+   for c in comms(prog) do :
+      match(c) :
+         (c:KDefn|KDefmulti|KLSDefn) :
+            global-fns[n(c)] = true
+         (c) : false
 
    ;              Create type objects
    ;              ===================
@@ -2572,9 +2769,13 @@ defn type-reification (prog:KProg, nm:NameMap) :
             match(func(e)) :
                (f:KCurry) :
                   val args* = append(map(type-obj{info(e), _}, targs(f)), args(e))
-                  if global-fn?(nm, n(f)) : KCall(false, arity, n(f), args*, info(e), false)
+                  if global-fn?(n(f)) : KCall(false, arity, n(f), args*, info(e), false)
                   else : KCallDeref(false, arity, KVar(n(f)), args*, info(e), false)
-               (f) : KCallDeref(false, arity, f, args(e), info(e), false)
+               (f:KVar) :
+                  if global-fn?(n(f)) : KCall(false, arity, n(f), args(e), info(e), false)
+                  else : KCallDeref(false, arity, KVar(n(f)), args(e), info(e), false)
+               (f) :
+                  KCallDeref(false, arity, f, args(e), info(e), false)
          (e) : e
 
    ;      Convert all lostanza expressions
@@ -2618,10 +2819,14 @@ defn type-reification (prog:KProg, nm:NameMap) :
 
 defstruct FVEntry :
    args: List<Int>
+   targs: List<Int>
+
+defn free (e:FVEntry) :
+   append(args(e), targs(e))
 
 defmethod print (o:OutputStream, fv:FVEntry) :
    defn cms (xs) : join(xs, ", ")
-   print(o, "FV{~@}" << [cms(args(fv))])
+   print(o, "FV<~@>{~@}" << [cms(targs(fv)), cms(args(fv))])
 
 defn freevar-table (prog:KProg) :
 
@@ -2642,17 +2847,21 @@ defn freevar-table (prog:KProg) :
    val table = HashTable<Int, FVEntry>({_})
 
    ;Get the freevars in a given function
-   defn freevars (f:Func) :
+   defn freevars (f:Func) -> FVEntry :
       val arg-vars = HashTable<Int,True|False>({_})
+      val targ-vars = HashTable<Int,True|False>({_})
 
       defn mark-free (t:KType) :
          match(t) :
-            (t:KTVar) : arg-vars[n(t)] = true
+            (t:KTVar) : targ-vars[n(t)] = true
             (t) : do(mark-free, t)
 
       defn mark-func (f:Func) :
-         for x in args(freevars(f)) do :
+         val fv = freevars(f)
+         for x in args(fv) do :
             arg-vars[x] = true
+         for x in targs(fv) do :
+            targ-vars[x] = true
 
       defn mark-free (e:KExp) :
          defn mark-branch (b:KBranch) :
@@ -2688,6 +2897,10 @@ defn freevar-table (prog:KProg) :
             (e:KVar) :
                if not global?(n(e)) :
                   arg-vars[n(e)] = true
+            (e:KCurry) :
+               if not global?(n(e)) :
+                  arg-vars[n(e)] = true
+               do(mark-free, targs(e))   
             (e:KCast) :
                do(mark-free, e)
                mark-free(targ(e))
@@ -2697,16 +2910,21 @@ defn freevar-table (prog:KProg) :
       match(f) :
          (f:KFn) :
             mark-free(body(f))
-            for x in args(f) do : arg-vars[x] = false
-            for x in targs(f) do : arg-vars[x] = false
+            ;Bound arguments are not free
+            for x in args(f) do :
+               arg-vars[x] = false
+            ;Bound type arguments are not free.
+            ;Affects arg-vars because of reified type variables.
+            for x in targs(f) do :
+               arg-vars[x] = false
+               targ-vars[x] = false
             if closure(f) != false : arg-vars[closure(f) as Int] = false
          (f:KMultifn) :
             do(mark-func, funcs(f))
 
-      val fv = FVEntry $
-         to-list $
-         stream{key, _} $
-         filter(value, arg-vars)
+      defn grab (t:HashTable<Int, True|False>) :
+         to-list(stream(key, filter(value, t)))
+      val fv = FVEntry(grab(arg-vars), grab(targ-vars))
       table[n(f)] = fv
       fv
 
@@ -2717,8 +2935,8 @@ defn freevar-table (prog:KProg) :
       do(scan-exp, e)
    defn scan-comm (c:KComm) :
       match(c) :
-         (c:KDefn) : freevars(value(c))
-         (c:KDefmethod) : freevars(func(c))
+         (c:KDefn) : table[n(c)] = freevars(value(c))
+         (c:KDefmethod) : table[n(c)] = freevars(func(c))
          (c) : do(scan-exp, c)
    defn scan-ls-exp (e:KLSExp) :
       match(e) :
@@ -2751,7 +2969,7 @@ defn lift-objects (prog:KProg, freetable: HashTable<Int,FVEntry>) :
             ;Free variables
             val fvs = unique $
                for m in methods(e) stream-concat :
-                  args(freetable[n(func(m))])
+                  free(freetable[n(func(m))])
             ;Names of free variables
             val venv = map({_ => fresh-id()}, fvs)
             ;Create struct for object
@@ -2830,15 +3048,15 @@ defn lift-closures (prog:KProg, freetable:HashTable<Int,FVEntry>) :
 
       ;Lift function under default free variable mapping
       defn lift (f:KFn) :
-         val fv = args(freetable[n(f)])
+         val fv = free(freetable[n(f)])
          val idx = for (v in fv, i in 0 to false) map : i
          lift(f, fv, idx)
 
       ;Lift multi function
       defn lift (f:KMultifn) :
-         val mfv = args(freetable[n(f)])
+         val mfv = free(freetable[n(f)])
          val funcs* = for f in funcs(f) as List<KFn> map :
-            val fv = args(freetable[n(f)])
+            val fv = free(freetable[n(f)])
             val idx = for v in fv map : index-of!(mfv, v)
             lift(f, fv, idx)
          KMultifn(n(f), funcs*, info(f))
@@ -2854,7 +3072,7 @@ defn lift-closures (prog:KProg, freetable:HashTable<Int,FVEntry>) :
       defn lift-def (c:KDefn|KDef|KDefVar) :
          match(c) :
             (c:KDefn) :
-               val fvs = args(freetable[n(value(c))])
+               val fvs = free(freetable[n(value(c))])
                val code = lift-func(value(c))
                println("Lifted closure ~ to ~" << [n(c), code])
                KDef(n(c), KClosure(code, map(KVar, fvs), info(value(c)), false))
@@ -2875,7 +3093,7 @@ defn lift-closures (prog:KProg, freetable:HashTable<Int,FVEntry>) :
       match(mapr(lift-ls-exp, e)) :
          (e:FuncExp) :
             val f = func(e)
-            val fvs = args(freetable[n(f)])
+            val fvs = free(freetable[n(f)])
             error("Untested") when not empty?(fvs)
             val code = lift-func(f)
             KLSClosure(code, map(KLSVar, fvs), info(f))
@@ -3620,9 +3838,7 @@ defn remove-vars (t:KType) :
       (t:KTVar) : KTop()
       (t) : map(remove-vars, t)
 defn remove-vars (t:KLSType) :
-   match(t) :
-      (t:KRefT) : KRefT(remove-vars(type(t)))
-      (t) : t
+   map(remove-vars{_:KType}, t)
 defn contains-vars? (t:KType) :
    match(t) :
       (t:KTVar) : true
