@@ -3,6 +3,7 @@
            boot2/tests/tests2.stanza \
         -s bootprog.s
 
+
 #./bstanzac boot2/core/core.stanza \
 #           boot2/core/collections.stanza \
 #           boot2/core/reader.stanza \
