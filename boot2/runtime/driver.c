@@ -1,6 +1,7 @@
 #include<stdlib.h>
 #include<stdio.h>
 #include<sys/time.h>
+#include<limits.h>
 
 //     Stanza Defined Entities
 //     =======================
@@ -14,7 +15,7 @@ char** input_argv;
 
 //     Main Driver
 //     ===========
-int main (int argc, char* argv[]) {
+int main (int argc, char* argv[]) {  
   input_argc = argc;
   input_argv = argv;
   char* stack_mem = malloc(stanza_stack_size);
@@ -28,6 +29,7 @@ FILE* get_stdout () {return stdout;}
 FILE* get_stderr () {return stderr;}
 FILE* get_stdin () {return stdin;}
 int get_eof () {return EOF;}
+int get_PATH_MAX () {return PATH_MAX;}
 
 //     Time of Day
 //     ===========
