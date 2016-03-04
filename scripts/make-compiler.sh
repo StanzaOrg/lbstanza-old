@@ -1,12 +1,56 @@
-./build/stanza3 boot2/core/core.stanza \
-                boot2/core/collections.stanza \
-                boot2/core/reader.stanza \
-                boot2/core/macro-utils.stanza \
-                boot2/compiler/stz-params.stanza \
-                boot2/compiler/stz-algorithms.stanza \
-                boot2/compiler/stz-parser.stanza \
-                boot2/compiler/stz-arg-parser.stanza \
-                boot2/compiler/stz-main.stanza \
-             -s test.s
+./stanza boot2/core/core.stanza \
+         boot2/core/collections.stanza \
+         boot2/core/reader.stanza \
+         boot2/core/macro-utils.stanza \
+         boot2/compiler/stz-algorithms.stanza \
+         boot2/compiler/stz-padder.stanza \
+         boot2/compiler/stz-utils.stanza \
+         boot2/compiler/stz-parser.stanza \
+         boot2/compiler/stz-params.stanza \
+         boot2/compiler/stz-core-macros.stanza \
+         boot2/compiler/stz-ids.stanza \
+         boot2/compiler/lang-read.stanza \
+         boot2/compiler/lang-check.stanza \
+         boot2/compiler/stz-primitives.stanza \
+         boot2/compiler/stz-il-ir.stanza \
+         boot2/compiler/stz-tl-ir.stanza \
+         boot2/compiler/stz-kl-ir.stanza \
+         boot2/compiler/stz-tgt-ir.stanza \
+         boot2/compiler/stz-bb-ir.stanza \
+         boot2/compiler/stz-asm-ir.stanza \
+         boot2/compiler/stz-backend.stanza \
+         boot2/compiler/stz-input.stanza \
+         boot2/compiler/stz-namemap.stanza \
+         boot2/compiler/stz-renamer.stanza \
+         boot2/compiler/stz-resolver.stanza \
+         boot2/compiler/stz-infer.stanza \
+         boot2/compiler/stz-type-calculus.stanza \
+         boot2/compiler/stz-type.stanza \
+         boot2/compiler/stz-kform.stanza \
+         boot2/compiler/stz-tgt.stanza \
+         boot2/compiler/stz-bb.stanza \
+         boot2/compiler/stz-asm-emitter.stanza \
+         boot2/compiler/stz-compiler.stanza \
+         boot2/compiler/stz-arg-parser.stanza \
+         boot2/compiler/stz-langs.stanza  \
+         boot2/compiler/lang-renamer.stanza \
+         boot2/compiler/lang-resolver.stanza \
+         boot2/compiler/stz-main.stanza \
+      -s stanza4.s \
+      -o build/stanza4 \
+      -optimize
 
-gcc test.s boot2/runtime/driver.c -o test
+#gcc stanza.s boot2/runtime/driver.c -o build/stanza3
+
+#./build/stanza3 boot2/core/core.stanza \
+#                boot2/core/collections.stanza \
+#                boot2/core/reader.stanza \
+#                boot2/core/macro-utils.stanza \
+#                boot2/compiler/stz-params.stanza \
+#                boot2/compiler/stz-algorithms.stanza \
+#                boot2/compiler/stz-parser.stanza \
+#                boot2/compiler/stz-arg-parser.stanza \
+#                boot2/compiler/stz-main.stanza \
+#             -s test.s
+#
+#gcc test.s boot2/runtime/driver.c -o test
