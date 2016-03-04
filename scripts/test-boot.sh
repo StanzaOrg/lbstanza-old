@@ -39,7 +39,7 @@
         -s bootprog.s \
         -optimize
 
-gcc bootprog.s boot/runtime/driver.c -o bootprog
+gcc bootprog.s boot2/runtime/driver.c -o bootprog
 
 
 
