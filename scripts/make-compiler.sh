@@ -1,4 +1,4 @@
-./stanza core/reader.stanza \
+./bin/stanza1 core/reader.stanza \
          core/macro-utils.stanza \
          compiler/stz-algorithms.stanza \
          compiler/stz-padder.stanza \
