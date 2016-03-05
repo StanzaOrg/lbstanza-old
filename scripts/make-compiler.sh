@@ -36,6 +36,6 @@
          compiler/lang-renamer.stanza \
          compiler/lang-resolver.stanza \
          compiler/stz-main.stanza \
-      -o bin/stanza2 \
+      -o bin/stanza \
       -optimize
 
