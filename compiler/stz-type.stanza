@@ -1,0 +1,3257 @@
+defpackage stz/type :
+   import core
+   import collections
+   import stz/il-ir
+   import stz/tl-ir
+   import stz/namemap
+   import stz/infer
+   import stz/type-calculus
+   import stz/algorithms
+   import stz/utils
+   import stz/ids
+   import stz/primitives
+
+;============================================================
+;====================== Driver ==============================
+;============================================================
+
+public defn type-program (nm:NameMap, e:IExp) -> TProg :
+   val prog = to-tprog(nm, e)
+   set-current-hierarchy(hier(prog))
+   val [prog*, env, ls-env] = infer-types(prog)
+   report-errors(nm, prog*, env, ls-env)
+   prog*
+
+;============================================================
+;=============== Conversion to Type IR ======================
+;============================================================
+
+deftype Assert
+defstruct CorrectTArity <: Assert: (info:False|FileInfo, n:Int, targs:List<Type>)
+
+defstruct DefChild :
+   n: Int
+   args: List<Int>
+   parent: Type
+
+defn to-tprog (nm:NameMap, e:IExp) :
+   ;     State
+   ;     =====
+   val accum = Vector<TComm>()
+   val asserts = Vector<Assert>()
+   val errors = Vector<?>()
+   val hier = THierarchy()
+   val defchilds = Vector<DefChild>()
+
+   defn add-error (e) :
+      add(errors, to-string(e))
+
+   ;     Utilities
+   ;     =========
+   val #IN = INone(false)
+   defn #name (n:Int) : name(nm[n])
+   defn #info (n:Int) : info(nm[n])
+   defn #pr (t:Type) : printable(nm, t)
+   defn #pr (ts:Seqable<Type>) : seq(#pr, ts)
+   defn cms (xs:Seqable) : join(xs, ", ")
+   defn add-comm (c:TComm) : add(accum, c)
+   defn add-comm (cs:List<TComm>) : do(add-comm, cs)
+   defn name! (e:IExp) : name(e as IVar)
+   defn n! (e:IExp) : n(e as VarN)
+   defn n! (es:List<IExp>) : map(n!, es)
+   defn #comm (es:List<IExp>) : do(#comm, es)
+   defn #type (es:List<IExp>) : map(#type, es)
+   defn #lstype (es:List<IExp>) : map(#lstype, es)
+   defn #exp (es:List<IExp>) : map(#exp, es)
+   defn #lsexp (es:List<IExp>) : map(#lsexp, es)
+   defn #lscomm (es:List<IExp>) : map(#lscomm, es)
+   defn #defn (defs:List<IDefn>) : map(#defn, defs)
+   defn #defmethod (defs:List<IDefmethod>) : map(#defmethod, defs)
+
+   defn split-targs (es:List<IExp>) :
+      val targs = Vector<Int>()
+      val cargs = Vector<Int>()
+      for e in es do :
+         match(e) :
+            (e:VarN) : add(targs, n(e))
+            (e:ICap) : add(cargs, n!(name(e)))
+      [to-list(targs), to-list(cargs)]
+
+   ;     Transformers
+   ;     ============
+   defn #comm (e:IExp) -> False :
+      match(e) :
+         (e:IBegin) :
+            #comm(exps(e))
+         (e:IPublic) :
+            #comm(exp(e))
+         (e:IProtected) :
+            #comm(exp(e))
+         (e:IDefType) :
+            add(hier, HSHEntry(c, args*, p)) where :
+               val c = n!(class(e))
+               val args* = n!(args(e))
+               val p = #type(parent(e))
+            for c in children(e) do :
+               add(defchilds, #child(c as IDefChild))
+         (e:IDef) :
+            add-comm(destructure-def(e))
+         (e:IDefVar) :
+            add-comm(TDefVar(n, t, v, info(e))) where :
+               val n = n!(name(e))
+               val t = #type(type(e))
+               val v = #exp(value(e)) when value(e) not-typeof INone
+         (e:IDefn) :
+            add-comm(#defn(e))
+         (e:IDefmulti) :
+            add-comm(TDefmulti(n, targs, cargs, a1*, a2*, inf)) where :
+               val n = n!(name(e))
+               val inf = info(e)
+               val [targs, cargs] = split-targs(targs(e))
+               val a1* = #type(a1(e))
+               val a2* = #type(a2(e))
+         (e:IDefmethod) :
+            add-comm(#defmethod(e))
+         (e:IFn|IMulti|IBegin|IMatch|IBranch|INew|
+            VarN|ICast|IUpCast|ISet|IDo|IPrim|ILiteral|ITuple|ILet)  :
+            add-comm(TInit(#exp(e), info(e)))
+         (e:ILSDef) :
+            val t = #lstype(type(e)) as LSType
+            val exp = #lsexp(exp(e))
+            add-comm(TLDef(n!(name(e)), t, exp, info(e)))
+         (e:ILSDefVar) :
+            val t = #lstype(type(e)) as LSType
+            val v = #lsexp(exp(e)) when exp(e) not-typeof INone
+            add-comm(TLDefVar(n!(name(e)), t, v, info(e)))
+         (e:ILSDefType) :
+            add(hier, LSHEntry(c, args*, p, fs, rf)) where :
+               val c = n!(name(e))
+               val args* = n!(args(e))
+               val p = #type(parent(e))
+               val fs = map(#field, fields(e), types(e))
+               val rf = #field?(rfield(e), rtype(e))
+         (e:ILSExtern) :
+            val t = #lstype(type(e)) as LSType
+            add-comm(TExtern(n!(name(e)), t, info(e)))
+         (e:ILSDefn) :
+            val [targs, cargs] = split-targs(targs(e))
+            val a1* = #lstype(a1(e)) as List<LSType>
+            val a2* = #lstype(a2(e)) as LSType
+            val body* = #lscomm(body(e))
+            val inf = info(e)
+            add-comm(TLDefn(tail?(e), n!(name(e)), targs, cargs, a1*, a2*, n!(args(e)), body*, inf))
+         (e:ILSDefmethod) :
+            val [targs, cargs] = split-targs(targs(e))
+            val m = #exp(multi(e))
+            val a1* = #lstype(a1(e)) as List<LSType>
+            val a2* = #lstype(a2(e)) as LSType
+            val body* = #lscomm(body(e))
+            val inf = info(e)
+            add-comm(TLDefmethod(tail?(e), fresh-id(), m, targs, cargs, a1*, a2*, n!(args(e)), body*, inf))
+         (e:ILSSet|ILSLabels|ILSLabel|ILSGoto|ILSReturn|ILSLet|
+            ILSIf|ILSMatch|ILSBranch|ILSDef|ILSDefVar|
+            ILSDo|ILSDoInStack|ILSDoStack|ILSPrim|ILSCallC) :
+            add-comm(TLInit(#lscomm(e), info(e)))
+         (e) :
+            fatal("Unsupported form: %~" % [e])
+
+   defn #child (e:IDefChild) :
+      val n = n!(name(e))
+      val args = n!(args(e))
+      add(asserts, CorrectTArity(info(e), n, map(TVar, args)))
+      DefChild(n, args, #type(parent(e)) as Type)
+
+   defn #field (name:IExp, type:IExp) :
+      val n = n!(name)
+      val t = #lstype(type) as LSType
+      Field(n!(name), #name(n), t)
+   defn #field? (name:IExp, type:IExp) :
+      #field(name, type) when name not-typeof INone
+
+   defn #type (e:IExp) -> False|Type :
+      defn #type! (e:IExp) : #type(e) as Type
+      defn #type! (es:List<IExp>) : #type(es) as List<Type>
+      match(e) :
+         (e:ITuple) : TTuple(#type!(exps(e)))
+         (e:IOf) :
+            val n = n!(class(e))
+            val targs = #type!(args(e))
+            add(asserts, CorrectTArity(info(e), n, targs))
+            TOf(n, TTuple(targs))
+         (e:IAnd) : TAnd(#type!(a(e)), #type!(b(e)))
+         (e:IOr) : TOr(#type!(a(e)), #type!(b(e)))
+         (e:IArrow) : TArrow(TTuple(#type!(a1(e))), #type!(a2(e)))
+         (e:ICap) : TCap(n!(name(e)))
+         (e:IGradual) : TGradual()
+         (e:IVoid) : TBot()
+         (e:VarN) : TVar(n(e))
+         (e:Raw) : TOf(n!(class(e)), TGradual())
+         (e:INone) : false
+
+   defn #exp (e:IExp) -> TExp :
+      match(e) :
+         (e:IFn) :
+            TFn(tail?(e), a1*, a2*, ns, body, false, false, false, inf) where :
+               val a1* = #type(a1(e))
+               val a2* = #type(a2(e))
+               val inf = info(e)
+               val [ns, body] = destructure-args(args(e), body(e))
+         (e:IMulti) :
+            TMulti(fs, false, false, false, inf) where :
+               val fs = #exp(funcs(e)) as List<TFn>
+               val inf = info(e)
+         (e:IBegin) :
+            if empty?(tail(exps(e))) :
+               #exp(head(exps(e)))
+            else :
+               TSeq(a*, b*, false, false, false, info(e)) where :
+                  val a* = #exp(head(exps(e)))
+                  val binfo = info(exps(e)[1])
+                  val b* = #exp(IBegin(tail(exps(e)), binfo))
+         (e:IMatch) :
+            TMatch(args*, brs*, false, false, false, inf) where :
+               val args* = #exp(args(e))
+               val inf = info(e)
+               val brs* = #exp(branches(e)) as List<TBranch>
+         (e:IBranch) :
+            TBranch(ns, ts, body, false, false, false, inf) where :
+               val ts = #type(types(e))
+               val inf = info(e)
+               val [ns, body] = destructure-args(args(e), body(e))
+         (e:INew) :
+            TNew(c, ms, false, false, false, inf) where :
+               val c = #type(class(e)) as Type
+               val inf = info(e)
+               val ms = #defmethod(methods(e) as List<IDefmethod>)
+         (e:ICast) :
+            TCast(e*, t*, false, false, false, inf) where :
+               val e* = #exp(exp(e))
+               val inf = info(e)
+               val t* = #type(type(e)) as Type
+         (e:IUpCast) :
+            TUpCast(e*, t*, false, false, false, inf) where :
+               val e* = #exp(exp(e))
+               val inf = info(e)
+               val t* = #type(type(e)) as Type
+         (e:ISet) :
+            TSet(r, v, false, false, false, inf) where :
+               val r = #exp(name(e)) as TRef
+               val inf = info(e)
+               val v = #exp(value(e))
+         (e:IDo) :
+            TDo(f*, args*, false, false, false, inf) where :
+               val f* = #farg(func(e))
+               val inf = info(e)
+               val args* = #exp(args(e))
+         (e:IPrim) :
+            TPrim(op, args*, false, false, false, inf) where :
+               val op = primitive!(name!(op(e)))
+               val inf = info(e)
+               val args* = #exp(args(e))
+         (e:ILiteral) :
+            TLiteral(value(e), false, false, false, info(e))
+         (e:ITuple) :
+            TTupleExp(#exp(exps(e)), false, false, false, info(e))
+         (e:ILet) :
+            #exp(exp(e))
+         (e:VarN) :
+            TRef(n(e), false, false, false, info(e))
+         (e:Mix) :
+            TMix(false, #exp(exps(e)), false, false, false, info(e))
+         (e:Let) :
+            destructure-let(e)
+         (e:LetRec) :
+            TLetRec(defns*, body*, false, false, false, inf) where :
+               val defns* = #defn(defns(e) as List<IDefn>)
+               val body* = #exp(body(e))
+               val inf = info(e)
+         (e:ISet) :
+            TSet(#exp(name(e)) as TRef, #exp(value(e)), false, false, false, info(e))
+         (e) :
+            fatal("Unsupported expression: %~" % [e])
+
+   defn #farg (e:IExp) -> TExp :
+      match(e) :
+         (e:IOf) :
+            if empty?(args(e)) :
+               #exp(class(e))
+            else :
+               val ts = #type(args(e)) as List<Type>
+               defn #mix (e:IExp) :
+                  match(e) :
+                     (e:VarN) :
+                        val ref = TRef(n(e), false, false, false, info(e))
+                        TCurry(ref, ts, List(), false, false, false, info(e))
+                     (e:Mix) :
+                        TMix(false, map(#mix, exps(e)), false, false, false, info(e))
+               #mix(class(e))
+         (e) :
+            #exp(e)
+
+   defn #defn (def:IDefn) :
+      TDefn(tail?(def), n, targs, cargs, a1*, a2*, args*, body*, inf) where :
+         val n = n!(name(def))
+         val inf = info(def)
+         val [targs, cargs] = split-targs(targs(def))
+         val a1* = #type(a1(def))
+         val a2* = #type(a2(def))
+         val [args*, body*] = destructure-args(args(def), body(def))
+
+
+   defn #defmethod (def:IDefmethod) :
+      TDefmethod(tail?(def), fresh-id(), m, thisn(def), targs, cargs, a1*, a2*, args*, body*, inf) where :
+         val m = #exp(multi(def))
+         val inf = info(def)
+         val a1* = #type(a1(def))
+         val a2* = #type(a2(def))
+         val [targs, cargs] = split-targs(targs(def))
+         val [args*, body*] = destructure-args(args(def), body(def))
+
+   defn #lsexp (e:IExp) -> LSExp :
+      match(e) :
+         (e:ILSNew) :
+            val [n, targ] = #lsclass(type(e))
+            val inf = info(e)
+            LSNew(n, targ, #lsexp(args(e)), false, false, false, inf)
+         (e:ILSArray) :
+            val [n, targ] = #lsclass(type(e))
+            val inf = info(e)
+            LSArray(n, targ, #lsexp(args(e)), #lsexp(length(e)), false, false, false, inf)
+         (e:ILSStruct) :
+            val [n, targ] = #lsclass(type(e))
+            val inf = info(e)
+            LSStruct(n, targ, #lsexp(args(e)), false, false, false, inf)
+         (e:ILSAddr) :
+            val inf = info(e)
+            LSAddr(#lsexp(exp(e)), false, false, false, inf)
+         (e:ILSDeref) :
+            val inf = info(e)
+            LSDeref(#lsexp(exp(e)), false, false, false, inf)
+         (e:ILSSlot) :
+            val inf = info(e)
+            LSSlot(#lsexp(exp(e)), #lsexp(index(e)), false, false, false, inf)
+         (e:ILSField) :
+            val inf = info(e)
+            LSField(#lsexp(exp(e)), name!(name(e)), false, false, false, inf)
+         (e:ILSDo) :
+            LSDo(f*, args*, false, false, false, inf) where :
+               val f* = #lsfarg(func(e))
+               val args* = #lsexp(args(e))
+               val inf = info(e)
+         (e:ILSDoInStack) :
+            LSDoInStack(f*, args*, ret*, false, false, false, inf) where :
+               val f* = #lsfarg(func(e))
+               val args* = #lsexp(args(e))
+               val ret* = #lstype(ret(e)) as LSType
+               val inf = info(e)
+         (e:ILSDoStack) :
+            LSDoStack(f*, arg*, ret*, false, false, false, inf) where :
+               val f* = #lsexp(func(e))
+               val arg* = #lsexp(arg(e))
+               val ret* = #lstype(ret(e)) as LSType
+               val inf = info(e)
+         (e:ILSCallC) :
+            val inf = info(e)
+            LSCallC(#lsexp(func(e)), #lsexp(args(e)), false, false, false, inf)
+         (e:ILSPrim) :
+            val op = ls-primitive!(name!(op(e)))
+            val inf = info(e)
+            LSPrim(op, #lsexp(args(e)), false, false, false, inf)
+         (e:ILSSizeof) :
+            val inf = info(e)
+            val t = #lstype(type(e)) as LSType
+            LSSizeof(t, false, false, false, inf)
+         (e:ILSTagof) :
+            val inf = info(e)
+            LSTagof(n!(name(e)), false, false, false, inf)
+         (e:ILSAs) :
+            val inf = info(e)
+            val t = #lstype(type(e)) as LSType
+            LSCast(#lsexp(exp(e)), t, false, false, false, inf)
+         (e:ILSAnd) :
+            val inf = info(e)
+            LSAnd(#lsexp(a(e)), #lsexp(b(e)), false, false, false, inf)
+         (e:ILSOr) :
+            val inf = info(e)
+            LSOr(#lsexp(a(e)), #lsexp(b(e)), false, false, false, inf)
+         (e:ILSLetExp) :
+            val inf = info(e)
+            LSLetExp(#lscomm(comm(e)), #lsexp(exp(e)), false, false, false, inf)
+         (e:ILSFn) :
+            val inf = info(e)
+            LSFn(#exp(ref(e)), false, false, false, inf)
+         (e:VarN) :
+            val inf = info(e)
+            LSVar(n!(e), false, false, false, inf)
+         (e:ILiteral) :
+            val inf = info(e)
+            LSLiteral(value(e), false, false, false, inf)
+         (e:Mix) :
+            val inf = info(e)
+            LSMix(false, map(#lsexp, exps(e)), false, false, false, inf)
+         (e) :
+            fatal("Not a LoStanza expression: %~" % [e])
+
+   defn #lscomm (e:IExp) -> LSComm :
+      match(e) :
+         (e:IBegin) :
+            if empty?(exps(e)) :
+               LSSkip(info(e))
+            else if empty?(tail(exps(e))) :
+               #lscomm(head(exps(e)))
+            else :
+               val inf = info(exps(e)[1])
+               LSSeq(
+                  #lscomm(head(exps(e)))
+                  #lscomm(IBegin(tail(exps(e)), inf))
+                  info(e))
+         (e:ILSSet) :
+            val inf = info(e)
+            LSSet(#lsexp(exp(e)), #lsexp(value(e)), inf)
+         (e:ILSLabels) :
+            val inf = info(e)
+            LSLabels(n!(names(e)), #lscomm(body(e)), inf)
+         (e:ILSLabel) :
+            val inf = info(e)
+            LSLabel(n!(name(e)), inf)
+         (e:ILSGoto) :
+            val inf = info(e)
+            LSGoto(n!(name(e)), inf)
+         (e:ILSReturn) :
+            val inf = info(e)
+            LSReturn(#lsexp(exp(e)), inf)
+         (e:ILSLet) :
+            #lscomm(comm(e))
+         (e:ILSIf) :
+            val inf = info(e)
+            LSIf(#lsexp(pred(e)), #lscomm(conseq(e)), #lscomm(alt(e)), inf)
+         (e:ILSMatch) :
+            val args* = #lsexp(args(e))
+            val bs = #lscomm(branches(e)) as List<LSBranch>
+            val inf = info(e)
+            LSMatch(args*, bs, inf)
+         (e:ILSBranch) :
+            val inf = info(e)
+            LSBranch(n!(args(e)), #lstype(types(e)), #lscomm(body(e)), inf)
+         (e:ILSDef) :
+            val inf = info(e)
+            LSDef(n!(name(e)), #lstype(type(e)), #lsexp(exp(e)), inf)
+         (e:ILSDefVar) :
+            val inf = info(e)
+            val v = #lsexp(exp(e)) when exp(e) not-typeof INone
+            val t = #lstype(type(e)) as LSType
+            LSDefVar(n!(name(e)), t, v, inf)
+         (e:ILSDo|ILSDoInStack|ILSDoStack|ILSPrim|ILSCallC) :
+            val inf = info(e)
+            LSCall(#lsexp(e), inf)
+
+   defn #lsclass (e:IExp) :
+      match(e) :
+         (e:ILSOfT) : [n!(class(e)), TTuple(#type(args(e)) as List<Type>)]
+         (e:Raw) : [n!(class(e)), TGradual()]
+
+   defn #lsfarg (e:IExp) :
+      match(e) :
+         (e:ILSOfT) :
+            if empty?(args(e)) :
+               #lsexp(class(e))
+            else :
+               val ts = #type(args(e)) as List<Type>
+               defn #mix (e:IExp) :
+                  match(e) :
+                     (e:VarN) :
+                        val inf = info(e)
+                        val ref = LSVar(n(e), false, false, false, inf)
+                        LSCurry(ref, ts, List(), false, false, false, inf)
+                     (e:Mix) :
+                        val inf = info(e)
+                        LSMix(false, map(#mix, exps(e)), false, false, false, inf)
+               #mix(class(e))
+         (e) :
+            #lsexp(e)
+
+   defn #lstype (e:IExp) -> False|LSType :
+      defn #lstype! (e:IExp) : #lstype(e) as LSType
+      defn #lstype! (es:List<IExp>) : #lstype(es) as List<LSType>
+      defn #type! (e:IExp) : #type(e) as Type
+      defn #type! (es:List<IExp>) : #type(es) as List<Type>
+      match(e) :
+         (e:ILSByteT) : ByteT()
+         (e:ILSIntT) : IntT()
+         (e:ILSLongT) : LongT()
+         (e:ILSFloatT) : FloatT()
+         (e:ILSDoubleT) : DoubleT()
+         (e:ILSUnknownT) : UnknownT()
+         (e:ILSOfT) :
+            val n = n!(class(e))
+            val targs = #type!(args(e))
+            add(asserts, CorrectTArity(info(e), n, targs))
+            StructT(n, TTuple(targs))
+         (e:ILSPtrT) : PtrT(#lstype!(type(e)))
+         (e:ILSRefT) : RefT(#type!(type(e)))
+         (e:ILSFnT) : FnT(#lstype!(a1(e)), #lstype(ar(e)), #lstype!(a2(e)))
+         (e:Raw) : StructT(n!(class(e)), TGradual())
+         (e:INone) : false
+         (e) : fatal("Not a LoStanza type: %~" % [e])
+
+   ;     Nested Tuple Destructuring
+   ;     ==========================
+   defn destructure (args:List<IExp>, value:TExp) -> List<KeyValue<List<Int>, TExp>> :
+      val [ns, bs] = destructure(args)
+      cons(ns => value, bs)
+
+   defn destructure (args:List<IExp>) -> [List<Int>, List<KeyValue<List<Int>, TExp>>] :
+      var bindings = List()
+      defn #n (x:IExp) -> Int :
+         match(x) :
+            (x:ITuple) :
+               val n = fresh-id()
+               bindings = cons(entry, bindings) where :
+                  val exps* = map(#n, exps(x))
+                  val entry = exps* => TRef(n, false, false, false, info(x))
+               n
+            (x) :
+               n!(x)
+      val ns = map(#n, args)
+      [ns, bindings]
+
+   defn destructure-args (args:List<IExp>, fbody:IExp) -> [List<Int>, TExp] :
+      val [ns, bs] = destructure(args)
+      var body = #exp(fbody)
+      for b in bs do :
+         body = TLetTuple(ns, ts, v, body, false, false, false, inf) where :
+            val [ns, v] = [key(b), value(b)]
+            val ts = map({false}, ns)
+            val inf = info(v)
+      [ns, body]
+
+   defn destructure-def (def:IDef) -> List<TDef|TDefTuple> :
+      match(name(def), type(def), value(def)) :
+         (name:ITuple, type:INone, v) :
+            val bs = destructure(exps(name), #exp(v))
+            for b in bs map :
+               TDefTuple(ns, ts, v, inf) where :
+                  val [ns, v] = [key(b), value(b)]
+                  val ts = map({false}, ns)
+                  val inf = info(v)
+         (name:ITuple, type, v) :
+            val tmp = VarN(fresh-id(), info(name))
+            append(
+               destructure-def(IDef(tmp, type, v, info(name)))
+               destructure-def(IDef(name, #IN, tmp, info(name))))
+         (name, type, v) :
+            List(TDef(n, t*, v*, inf)) where :
+               val n = n!(name)
+               val t* = #type(type)
+               val v* = #exp(v)
+               val inf = info(v)
+
+   defn destructure-let (lete:Let) -> TExp :
+      match(def(lete)) :
+         (def:IDefVar) :
+            val n = n!(name(def))
+            val t = #type(type(def))
+            val e = #exp(value(def)) when value(def) not-typeof INone
+            val b = #exp(body(lete))
+            val inf = info(def)
+            TLetVar(n, t, e, b, false, false, false, inf)
+         (def:IDef) :
+            defn loop (defs:List<TDef|TDefTuple>) :
+               if empty?(defs) :
+                  #exp(body(lete))
+               else :
+                  val body = loop(tail(defs))
+                  match(head(defs)) :
+                     (e:TDef) : TLet(n(e), type(e), value(e), body, false, false, false, info(e))
+                     (e:TDefTuple) : TLetTuple(ns(e), types(e), value(e), body, false, false, false, info(e))
+            loop(destructure-def(def))
+
+   ;     Error Reporting
+   ;     ===============
+   ;Check hierarchical cycles
+   defn check-cycles () :
+      defn classes (t:False|Type) -> List<Int> :
+         match(t) :
+            (t:TOf) : List(n(t))
+            (t:TAnd) : append(classes(a(t)), classes(b(t)))
+            (t:False) : List()
+      val components = strong-components $
+         for entry in hier seq :
+            n(entry) => classes(parent(entry))
+      val cycles =
+         {_ as Seq<List<Int>>} $
+         filter({_ typeof List}, components)
+      for c in cycles do :
+         defn msg (ns:List<Int>) :
+            join{_, "\n"} $
+            for n in ns seq :
+               "   %~ at %~" % [#name(n), #info(n)]
+         add-error("Illegal cycle in type hierarchy. The following types are parents of each other.\n%*" % [
+            msg(c)])
+
+   ;Check type arities
+   defn check-arities () :
+      for assert in asserts do :
+         match(assert) :
+            (a:CorrectTArity) :
+               val arity = length(args(hier[n(a)]))
+               if length(targs(a)) != arity :
+                  add-error("%_: Incorrect number of type parameters for type %~. Expecting %~ but given %,." % [
+                     info(a), #name(n(a)), arity, #pr(targs(a))])
+
+   ;Report errors
+   defn report-errors () :
+      check-cycles()
+      check-arities()
+      if not empty?(errors) :
+         do(println, errors)
+         throw(new TypeError)
+
+   ;     Processing Children
+   ;     ===================
+   defn process-children () :
+      defn tand (a:False|Type, b:Type) :
+         match(a) :
+            (a:False) : b
+            (a:Type) : TAnd(a, b)
+      defn add-parent (e:HEntry, p:Type) :
+         match(e) :
+            (e:HSHEntry) : HSHEntry(n(e), args(e), tand(parent(e), p))
+            (e:LSHEntry) : LSHEntry(n(e), args(e), tand(parent(e), p), fields(e), rfield(e))
+      for c in defchilds do :
+         val e = hier[n(c)]
+         val env = map({_ => TVar(_)}, args(c), args(e))
+         val p = sub(parent(c), env)
+         add(hier, add-parent(e, p))
+
+   ;     Driver
+   ;     ======
+   #comm(e)
+   report-errors()
+   process-children()
+   TProg(hier, to-list(accum))
+
+;============================================================
+;================= Primitives Types  ========================
+;============================================================
+
+;              HiStanza Callable Relation
+;              ==========================
+
+defn callable? (p:Primitive, args:List<Type>) -> True|False :
+   val int = TOf(INT-TYPE-ID, TTuple(List()))
+   val array = TOf(ARRAY-TYPE-ID, TGradual())
+   val carray = TOf(CHAR-ARRAY-TYPE-ID, TTuple(List()))
+   val string = TOf(STRING-TYPE-ID, TTuple(List()))
+   val any = TGradual()
+
+   defn args? (ts:Tuple<Type>) :
+      if length(args) == length(ts) :
+         for (a in args, t in ts) all? :
+            subtype?(a, t) as True|False
+
+   switch {p == _} :
+      ADD-OP : args?([int int])
+      SUB-OP : args?([int int])
+      MUL-OP : args?([int int])
+      DIV-OP : args?([int int])
+      MOD-OP : args?([int int])
+      AND-OP : args?([int int])
+      OR-OP : args?([int int])
+      XOR-OP : args?([int int])
+      SHL-OP : args?([int int])
+      SHR-OP : args?([int int])
+      ASHR-OP : args?([int int])
+      EQ-OP : args?([int int])
+      NE-OP : args?([int int])
+      LT-OP : args?([int int])
+      GT-OP : args?([int int])
+      LE-OP : args?([int int])
+      GE-OP : args?([int int])
+      NOT-OP : args?([int])
+      NEG-OP : args?([int])
+      IDENTICAL-OP : args?([any any])
+      AGET-OP : args?([array int])
+      ASET-OP : args?([array int any])
+      ALEN-OP : args?([array])
+      CHAR-AGET-OP : args?([carray int])
+      CHAR-ASET-OP : args?([carray int any])
+      STRING-GET-OP : args?([string int])
+      STRING-LEN-OP : args?([string])
+
+;              LoStanza Callable Relation
+;              ==========================
+
+defn callable? (p:LSPrimitive, args:List<LSType>) -> True|False :
+   defn matching-nums? () :
+      match(args[0], args[1]) :
+         (x:ByteT|IntT|LongT|FloatT|DoubleT, y:ByteT|IntT|LongT|FloatT|DoubleT) :
+            (assignable?(x, y) typeof True) or (assignable?(y, x) typeof True)
+         (x, y) : false
+   defn matching-ints? () :
+      match(args[0], args[1]) :
+         (x:ByteT|IntT|LongT, y:ByteT|IntT|LongT) :
+            (assignable?(x, y) typeof True) or (assignable?(y, x) typeof True)
+         (x, y) : false
+   defn binop-nums? () :
+      (length(args) == 2) and
+      matching-nums?()
+   defn binop-ints? () :
+      (length(args) == 2) and
+      matching-ints?()
+   defn binop-cmp? () :
+      if length(args) == 2 :
+         match(args[0], args[1]) :
+            (x:PtrT, y:PtrT) : true
+            (x, y) : matching-nums?()
+   defn one-snum? () :
+      if length(args) == 1 :
+         args[0] typeof IntT|LongT|FloatT|DoubleT
+   defn one-int? () :
+      if length(args) == 1 :
+         args[0] typeof ByteT|IntT|LongT
+   defn one-fnum? () :
+      if length(args) == 1 :
+         args[0] typeof FloatT|DoubleT
+   defn one-sint? () :
+      if length(args) == 1 :
+         args[0] typeof IntT|LongT
+
+   match(p) :
+      (p:GetterPrimitive) :
+         empty?(args)
+      (p:SetterPrimitive) :
+         (length(args) == 1) and
+         assignable?(head(args), type(p)) typeof True
+      (p) :
+         switch {p == _} :
+            LS-ADD-OP :
+               if length(args) == 2 :
+                  match(args[0], args[1]) :
+                     (x:PtrT, y) : assignable?(y, LongT()) typeof True
+                     (x, y) : matching-nums?()
+            LS-SUB-OP :
+               if length(args) == 2 :
+                  match(args[0], args[1]) :
+                     (x:PtrT, y:PtrT) : true
+                     (x:PtrT, y) : assignable?(y, LongT()) typeof True
+                     (x, y) : matching-nums?()
+            LS-MUL-OP : binop-nums?()
+            LS-DIV-OP : binop-nums?()
+            LS-MOD-OP : binop-ints?()
+            LS-AND-OP : binop-ints?()
+            LS-OR-OP : binop-ints?()
+            LS-XOR-OP : binop-ints?()
+            LS-SHL-OP : binop-ints?()
+            LS-SHR-OP : binop-ints?()
+            LS-ASHR-OP : binop-ints?()
+            LS-EQ-OP :
+               if length(args) == 2 :
+                  match(args[0], args[1]) :
+                     (x:PtrT, y:PtrT) : true
+                     (x:RefT, y:RefT) : true
+                     (x, y) : matching-nums?()
+            LS-NE-OP :
+               if length(args) == 2 :
+                  match(args[0], args[1]) :
+                     (x:PtrT, y:PtrT) : true
+                     (x:RefT, y:RefT) : true
+                     (x, y) : matching-nums?()
+            LS-LT-OP : binop-cmp?()
+            LS-GT-OP : binop-cmp?()
+            LS-LE-OP : binop-cmp?()
+            LS-GE-OP : binop-cmp?()
+            LS-ULT-OP : binop-ints?()
+            LS-UGT-OP : binop-ints?()
+            LS-ULE-OP : binop-ints?()
+            LS-UGE-OP : binop-ints?()
+            LS-NOT-OP : one-int?()
+            LS-NEG-OP : one-snum?()
+            LS-BITS-OP : one-fnum?()
+            LS-FNUM-OP : one-sint?()
+
+
+;============================================================
+;============== Generate Type Variables =====================
+;============================================================
+defstruct TupleF : ()
+defstruct SubF : (ti:Type, t:Type)
+defstruct ArgsF : ()
+defstruct RetF : (n:Int)
+
+deftype InstResult
+deftype LSInstResult
+defstruct Instantiated <: InstResult :
+   cargs: List<TUVar>
+   type: TArrow
+   exp-type: TArrow
+defstruct LSInstantiated <: LSInstResult :
+   cargs: List<TUVar>
+   type: FnT
+   exp-type: FnT
+defstruct WrongArity <: InstResult & LSInstResult
+defstruct NotPoly <: InstResult & LSInstResult
+
+defstruct Filler :
+   fill-ctxt: Context -> Context
+   fill-s: Selection -> Selection
+   fill-t: Type -> Type
+   fill-lt: LSType -> LSType
+   fill-lc: LSComm -> LSComm
+   fill-le: LSExp -> LSExp
+   fill-e: TExp -> TExp
+   fill-c: TComm -> TComm
+   fill-prog: TProg -> TProg
+
+
+defn infer-types (prog:TProg) :
+   ;======== Environment ========
+   val env = HashTable<Int,False|Type>()
+   val ls-env = HashTable<Int, False|LSType>()
+   val req-env = HashTable<Int, TUVar>()
+   val constraints = Vector<Constraint>()
+   var current-return-type : False|LSType = false
+
+   ;          ==================================
+   ;          ==   Type Variable Generation   ==
+   ;          ==================================
+
+   val #? = TGradual()
+   val #ls? = UnknownT()
+   val #fresh = Fresh()
+   defn addc (c:Constraint) : add(constraints, c)
+   defn #freshv () : TUVar(fresh-id())
+   defn #freshv (n:Int) : map(#freshv{}, 0 to n)
+   defn #ls-freshv () : UVarT(fresh-id())
+   defn #ls-freshv (n:Int) : map(#ls-freshv{}, 0 to n)
+   defn #or (x:False, y:False) : false
+   defn #or (x:False, y:Type) : y
+   defn #or (x:False, y:LSType) : y
+   defn #or (x:False, y:Fresh) : #freshv()
+   defn #or (x:Type, y:False) : y when x typeof TUVar else x
+   defn #or (x:Type, y:Type) : y when x typeof TUVar else x
+   defn #or (x:Type, y:Fresh) : #freshv() when x typeof TUVar else x
+   defn #or (x:LSType, y:False) : y when x typeof UVarT else x
+   defn #or (x:LSType, y:LSType) : y when x typeof UVarT else x
+   defn #or (x:LSType, y:Fresh) : #freshv() when x typeof UVarT else x
+   defn #or (xs:List<False|Type>, y:False) : map(#or{_, y}, xs)
+   defn #or (xs:List<False|Type>, y:Type|Fresh) : map(#or{_, y}, xs)
+   defn #or (xs:List<False|Type>, ys:List<False|Type>) : map(#or, xs, ys)
+   defn #or (xs:List<False|LSType>, ys:List<False|LSType>) : map(#or, xs, ys)
+   defn set-req-env (n:Int, t:TUVar) : req-env[n] = t
+   defn set-env (n:Int, t:False|Type) : env[n] = t
+   defn set-env (ns:List<Int>, y:False|Type) : do(set-env{_, y}, ns)
+   defn set-env (ns:List<Int>, ts:List<False|Type>) : do(set-env, ns, ts)
+   defn set-ls-env (n:Int, t:False|LSType) : ls-env[n] = t
+   defn set-ls-env (ns:List<Int>, ts:List<False|LSType>) : do(set-ls-env, ns, ts)
+   defn bexp (es:List<TExp>, c:Context) : map(bexp{_, c}, es)
+   defn bcomm<?T> (cs:List<?T&TComm>) : map(bcomm, cs)
+   defn #types (es:List<TExp>) : map(type, es)
+   defn #types (es:List<LSExp>) : map(type, es)
+   defn #exp-types (es:List<TExp>) : map(exp-type, es)
+   defn #exp-types (es:List<LSExp>) : map(exp-type, es)
+   defn #V (t:False) : fail()
+   defn #V (t:LSType) : t
+   defn #V (t:Type) : t
+
+   defn env-a1 (n:Int) :
+      defn* loop (t:False|Type) :
+         match(t) :
+            (t:TPoly) : loop(func(t))
+            (t:TArrow) : types(a(t) as TTuple)
+      loop(env[n])
+
+   defn env-a2 (n:Int) :
+      defn* loop (t:False|Type) :
+         match(t) :
+            (t:TPoly) : loop(func(t))
+            (t:TArrow) : b(t)
+      loop(env[n])
+
+   defn wrap-poly (t:TArrow, targs:List<Int>, cargs:List<Int>) :
+      if empty?(targs) and empty?(cargs) : t
+      else : TPoly(targs, cargs, t)
+
+   defn fn-type (c:TDefmethod, thist:Type) :
+      val a1* = for (t in a1(c), x in args(c)) map :
+         if x == thisn(c) : #or(t, thist)
+         else : #or(t, #?)
+      val a2* = #or(a2(c), #fresh)
+      val t = TArrow(TTuple(a1*), a2*)
+      wrap-poly(t, targs(c), cargs(c))
+
+   defn fn-type (c:TDefn|TDefmethod) :
+      val t = TArrow(TTuple(a1*), a2*) where :
+         val a1* = #or(a1(c), #?)
+         val a2* = #or(a2(c), #fresh)
+      wrap-poly(t, targs(c), cargs(c))
+
+   defn fn-type (c:TDefmulti) :
+      val t = TArrow(TTuple(a1*), a2*) where :
+         val a1* = #or(a1(c), #?)
+         val a2* = #or(a2(c), #?)
+      wrap-poly(t, targs(c), cargs(c))
+
+   defn fn-type (c:TLDefn|TLDefmethod) :
+      val t = FnT(a1(c), false, a2(c))
+      if empty?(targs(c)) and empty?(cargs(c)) : t
+      else : PolyT(targs(c), cargs(c), t)
+
+   defn to-hs-type (t:LSType) :
+      match(t) :
+         (t:RefT) : type(t)
+         (t) : false
+
+   ;======== Specialized Type Constructors ========
+   defn lit-type (v) :
+      defn base (n:Int) : TOf(n, TTuple(List()))
+      defn raw (n:Int) : TOf(n, TGradual())
+      match(v) :
+         (v:Byte) : base(BYTE-TYPE-ID)
+         (v:Char) : base(CHAR-TYPE-ID)
+         (v:Int) : base(INT-TYPE-ID)
+         (v:Long) : base(LONG-TYPE-ID)
+         (v:Float) : base(FLOAT-TYPE-ID)
+         (v:Double) : base(DOUBLE-TYPE-ID)
+         (v:String) : base(STRING-TYPE-ID)
+         (v:Symbol) : base(SYMBOL-TYPE-ID)
+         (v:List) : raw(LIST-TYPE-ID)
+         (v:True) : base(TRUE-TYPE-ID)
+         (v:False) : base(FALSE-TYPE-ID)
+         (v) : fatal("Unsupported literal type %~." % [v])
+
+   defn ls-lit-type (v) :
+      defn base (n:Int) : RefT(TOf(n, TTuple(List())))
+      match(v) :
+         (v:Byte) : ByteT()
+         (v:Char) : ByteT()
+         (v:Int) : IntT()
+         (v:Long) : LongT()
+         (v:Float) : FloatT()
+         (v:Double) : DoubleT()
+         (v:String) : PtrT(ByteT())
+         (v:True) : base(TRUE-TYPE-ID)
+         (v:False) : base(FALSE-TYPE-ID)
+         (v) : fatal("Unsupported LoStanza literal %~." % [v])
+
+   defn prim-type (op:Primitive) :
+      defn base (n:Int) : TOf(n, TTuple(List()))
+      val int-type = base(INT-TYPE-ID)
+      val char-type = base(CHAR-TYPE-ID)
+      val bool-type = TOr(base(TRUE-TYPE-ID), base(FALSE-TYPE-ID))
+      val false-type = base(FALSE-TYPE-ID)
+      switch {op == _} :
+         ADD-OP : int-type
+         SUB-OP : int-type
+         MUL-OP : int-type
+         DIV-OP : int-type
+         MOD-OP : int-type
+         AND-OP : int-type
+         OR-OP : int-type
+         XOR-OP : int-type
+         SHL-OP : int-type
+         SHR-OP : int-type
+         ASHR-OP : int-type
+         NOT-OP : int-type
+         NEG-OP : int-type
+         EQ-OP : bool-type
+         NE-OP : bool-type
+         LT-OP : bool-type
+         GT-OP : bool-type
+         LE-OP : bool-type
+         GE-OP : bool-type
+         IDENTICAL-OP : bool-type
+         AGET-OP : TGradual()
+         ASET-OP : false-type
+         ALEN-OP : int-type
+         CHAR-AGET-OP : char-type
+         CHAR-ASET-OP : false-type
+         STRING-GET-OP : char-type
+         STRING-LEN-OP : int-type
+         else : fatal("Unrecognized primitive: %~" % [op])
+
+   ;====== Environment Queries ======
+   ;Return all possible types in e
+   defn all-types (e:TExp) -> List<Type> :
+      match(e) :
+         (e:TLet) : all-types(body(e))
+         (e:TLetVar) : all-types(body(e))
+         (e:TLetTuple) : all-types(body(e))
+         (e:TLetRec) : all-types(body(e))
+         (e:TSeq) : all-types(b(e))
+         (e:TBranch) : all-types(body(e))
+         (e:TMatch) : seq-append(all-types, branches(e))
+         (e:TMix) : List(TMixed(seq-append(all-types, exps(e)) as List<TArrow>))
+         (e) :
+            match(exp-type(e)) :
+               (t:False) : List()
+               (t:Type) : List(t)
+
+   defn all-types (e:LSExp) -> List<LSType> :
+      match(e) :
+         (e:LSLetExp) : all-types(exp(e))
+         (e:LSMix) : seq-append(all-types, exps(e))
+         (e:LSFn) : map(RefT, all-types(ref(e)))
+         (e) :
+            match(exp-type(e)) :
+               (t:False) : List()
+               (t:LSType) : List(t)
+
+   ;======== Build top level environment ========
+   defn build-environment () :
+      for c in comms(prog) do :
+         match(c) :
+            (c:TDef) :
+               val t = #or(type(c), #fresh)
+               set-env(n(c), t)
+               set-ls-env(n(c), RefT(t))
+            (c:TDefTuple) :
+               val ts = map(#freshv{}, ns(c))
+               set-env(ns(c), ts)
+               set-ls-env(ns(c), map(RefT, ts))
+            (c:TDefVar) :
+               val t = #or(type(c), #fresh)
+               set-env(n(c), t)
+               set-ls-env(n(c), RefT(t))
+            (c:TDefn) :
+               val t = fn-type(c)
+               set-env(n(c), t)
+               set-ls-env(n(c), to-ls-fn(t))
+            (c:TDefmulti) :
+               val t = fn-type(c)
+               set-env(n(c), t)
+               set-ls-env(n(c), to-ls-fn(t))
+            (c:TDefmethod) :
+               set-env(n(c), fn-type(c))
+            (c:TInit) :
+               false
+            (c:TLDef) :
+               set-ls-env(n(c), type(c))
+               set-env(n(c), to-hs-type(type(c)))
+            (c:TLDefVar) :
+               set-ls-env(n(c), type(c))
+               set-env(n(c), to-hs-type(type(c)))
+            (c:TLDefn) :
+               val t = fn-type(c)
+               set-ls-env(n(c), t)
+               set-env(n(c), to-hs-fn(t))
+            (c:TLDefmethod) :
+               val t = fn-type(c)
+               set-ls-env(n(c), t)
+               set-env(n(c), to-hs-fn(t))
+            (c:TExtern) :
+               set-ls-env(n(c), type(c))
+            (c:TLInit) :
+               false
+
+   ;======== Productions ========
+   defn bcomm<?T> (c:?T&TComm) -> T :
+      {_ as T&TComm} $ match(c) :
+         (c:TDef) :
+            val v* = bexp(value(c), CExp(#or(type(c), #?)))
+            val t* = env[n(c)]
+            #equal(t*, type(v*))
+            TDef(n(c), t*, v*, info(c))
+         (c:TDefTuple) :
+            val v* = bexp(value(c), CExp(#?))
+            val ts* = map({env[_] as TUVar}, ns(c))
+            #downto(ts*, type(v*), TupleF())
+            TDefTuple(ns(c), ts*, v*, info(c))
+         (c:TDefVar) :
+            val t* = env[n(c)]
+            match(value(c)) :
+               (v:False) :
+                  TDefVar(n(c), t*, false, info(c))
+               (v:TExp) :
+                  val v* = bexp(v, CExp(#or(type(c), #?)))
+                  #super(t*, type(v*))
+                  TDefVar(n(c), t*, v*, info(c))
+         (c:TDefn) :
+            val a1* = env-a1(n(c))
+            val a2* = env-a2(n(c))
+            set-env(args(c), map(uncap, a1*))
+            val body* = bexp(body(c), CExp(#or(a2(c), #?)))
+            #equal(a2*, type(body*))
+            TDefn(tail?(c), n(c), targs(c), cargs(c), a1*, a2*, args(c), body*, info(c))
+         (c:TDefmulti) :
+            val a1* = env-a1(n(c))
+            val a2* = env-a2(n(c))
+            TDefmulti(n(c), targs(c), cargs(c), a1*, a2*, info(c))
+         (c:TDefmethod) :
+            val a1* = env-a1(n(c))
+            val a2* = env-a2(n(c))
+            val t* = TArrow(uncap(TTuple(a1*)), a2*)
+            val m* = bmulti(multi(c), map(TVar, targs(c)), CMulti(t*))
+            set-env(args(c), map(uncap, a1*))
+            val body* = bexp(body(c), CExp(#or(a2(c), #?)))
+            #equal(a2*, type(body*))
+            TDefmethod(tail?(c), n(c), m*, thisn(c), targs(c), cargs(c), a1*, a2*, args(c), body*, info(c))
+         (c:TInit) :
+            TInit(bexp(exp(c), CExp(#?)), info(c))
+         (c:TLDef) :
+            val e* = blsexp(value(c), CLSExp(type(c)))
+            TLDef(n(c), type(c), e*, info(c))
+         (c:TLDefVar) :
+            val e* = blsexp(value(c) as LSExp, CLSExp(type(c))) when value(c) not-typeof False
+            TLDefVar(n(c), type(c), e*, info(c))
+         (c:TLDefn) :
+            set-ls-env(args(c), map(uncap, a1(c)))
+            val body* = let-var current-return-type = a2(c) :
+               blscomm(body(c))
+            TLDefn(tail?(c), n(c), targs(c), cargs(c), a1(c), a2(c), args(c), body*, info(c))
+         (c:TLDefmethod) :
+            val m* = match(env[n(c)]) :
+               (t:False) :
+                  multi(c)
+               (t) :
+                  val a1* = env-a1(n(c))
+                  val a2* = env-a2(n(c))
+                  val t* = TArrow(uncap(TTuple(a1*)), a2*)
+                  bmulti(multi(c), map(TVar, targs(c)), CMulti(t*))
+            set-ls-env(args(c), map(uncap, a1(c)))
+            val body* = let-var current-return-type = a2(c) :
+               blscomm(body(c))
+            TLDefmethod(tail?(c), n(c), m*, targs(c), cargs(c), a1(c), a2(c), args(c), body*, info(c))
+         (c:TExtern) :
+            c
+         (c:TLInit) :
+            TLInit(blscomm(comm(c)), info(c))
+
+   defn bfn (e:TFn, c:Context) -> TFn :
+      ;Type variables for arguments
+      val a1* = #or(a1(e), #fresh)
+      val req-a1* = #or(a1(e), #fresh)
+      set-env(args(e), a1*)
+      for (x in args(e), t* in req-a1*) do :
+         set-req-env(x, t* as TUVar) when t* typeof TUVar
+      ;Type variables for return
+      val a2* = #or(a2(e), #freshv())
+      val t* = TArrow(TTuple(a1*), a2*)
+      val exp-t* = TArrow(TTuple(req-a1*), a2*)
+      val body* = bexp(body(e), CExp(#or(a2(e), #freshv())))
+      ;Constraints
+      #equal(a2*, type(body*))
+      ;Return new struct
+      TFn(tail?(e), a1*, a2*, args(e), body*, t*, exp-t*, c, info(e))
+
+   defn capfn (f:TFn, c:Context, ft:Type) :
+      match(c) :
+         (c:CExp) :
+            ;Expected return type
+            val exp-a2 = type(ctxt(body(f)) as CExp)
+            #upto(exp-a2, type(c), SubF(a2(f) as Type, ft))
+            ;Infer argument types
+            for t in a1(f) do :
+               #upto(t, type(c), SubF(t as Type, ft))
+         (c:CDo) :
+            ;Expected return type
+            val exp-a2 = type(ctxt(body(f)) as CExp)
+            #equal(exp-a2, ret(c))
+            ;Infer argument types
+            if length(args(f)) == length(args(c)) :
+               #equal(a1(f), args(c))
+
+   defn bexp (e:TExp, ctxt:Context) -> TExp :
+      val c = ctxt as CDo|CExp
+      match(e) :
+         (e:TLet) :
+            val v* = bexp(value(e), CExp(#or(ntype(e), #?)))
+            val t* = #or(ntype(e), type(v*))
+            set-env(n(e), t*)
+            val body* = bexp(body(e), c)
+            TLet(n(e), t*, v*, body*, type(body*), exp-type(body*), c, info(e))
+         (e:TLetVar) :
+            val t* = #or(ntype(e), #fresh)
+            set-env(n(e), t*)
+            val body* = bexp(body(e), c)
+            match(value(e)) :
+               (v:False) :
+                  TLetVar(n(e), t*, false, body*, type(body*), exp-type(body*), c, info(e))
+               (v:TExp) :
+                  val v* = bexp(v, CExp(t*))
+                  #super(t*, type(v*))
+                  TLetVar(n(e), t*, v*, body*, type(body*), exp-type(body*), c, info(e))
+         (e:TLetTuple) :
+            val ts* = #freshv(length(ns(e)))
+            val v* = bexp(value(e), CExp(#?))
+            set-env(ns(e), ts*)
+            val body* = bexp(body(e), c)
+            #downto(ts*, type(v*), TupleF())
+            TLetTuple(ns(e), ts*, v*, body*, type(body*), exp-type(body*), c, info(e))
+         (e:TLetRec) :
+            ;Define types for functions
+            for def in defns(e) do :
+               set-env(n(def), fn-type(def))
+            val defns* = map(bcomm, defns(e))
+            val body* = bexp(body(e), c)
+            TLetRec(defns*, body*, type(body*), exp-type(body*), c, info(e))
+         (e:TFn) :
+            val f = bfn(e, c)
+            capfn(f, c, type(f) as Type)
+            f
+         (e:TMulti) :
+            val fs = map(bfn{_, c}, funcs(e))
+            val mt = reduce(TAnd, #types(fs) as List<Type>)
+            val exp-mt = reduce(TAnd, #exp-types(fs) as List<Type>)
+            for f in fs do : capfn(f, c, mt)
+            TMulti(fs, mt, exp-mt, c, info(e))
+         (e:TSeq) :
+            val a* = bexp(a(e), CExp(#?))
+            val b* = bexp(b(e), c)
+            TSeq(a*, b*, type(b*), exp-type(b*), c, info(e))
+         (e:TMatch) :
+            val args* = bexp(args(e), CExp(#?))
+            val branches* = for b in branches(e) map :
+               TBranch(args(b), atypes*, body*, type(body*), exp-type(body*), c, info(b)) where :
+                  val atypes* = #or(atypes(b), #types(args*))
+                  set-env(args(b), atypes*)
+                  val body* = bexp(body(b), c)
+            val t* = attempt: reduce(TOr, map(#V, #types(branches*)))
+            val exp-t* = attempt: reduce(TOr, map(#V, #exp-types(branches*)))
+            TMatch(args*, branches*, t*, exp-t*, c, info(e))
+         (e:TNew) :
+            ;Define types for methods
+            for m in methods(e) do :
+               set-env(n(m), fn-type(m, class(e)))
+            val ms* = bcomm(methods(e))
+            TNew(class(e), ms*, class(e), class(e), c, info(e))
+         (e:TCurry) :
+            val t = env[n(ref(e))]
+            val e* = TRef(n(ref(e)), t, t, c, info(e))
+            match(#instantiate(t, targs(e), type(c))) :
+               (r:Instantiated) : TCurry(e*, targs(e), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : TCurry(e*, targs(e), List(), false, false, c, info(e))
+         (e:TRef) :
+            val t = env[n(e)]
+            val e* = TRef(n(e), t, t, c, info(e))
+            val rt = get?(req-env, n(e), false)
+            #super(rt, type(c))
+            match(#instantiate(t, List(), type(c))) :
+               (r:Instantiated) : TCurry(e*, List(), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : TCurry(e*, List(), List(), false, false, c, info(e))
+               (r:NotPoly) : e*
+         (e:TCast) :
+            val exp* = bexp(exp(e), CExp(#?))
+            TCast(exp*, targ(e), targ(e), targ(e), c, info(e))
+         (e:TUpCast) :
+            val exp* = bexp(exp(e), CExp(targ(e)))
+            TUpCast(exp*, targ(e), targ(e), targ(e), c, info(e))
+         (e:TSet) :
+            val ref* = bexp(ref(e), CExp(#?)) as TRef
+            val v* = bexp(value(e), CExp(type(ref*)))
+            #super(type(ref*), type(v*))
+            TSet(ref*, v*, lit-type(false), lit-type(false), c, info(e))
+         (e:TDo) :
+            ;Variables
+            val exp-a1* = #freshv(length(args(e)))
+            val args* = map(bexp{_, CExp(_)}, args(e), exp-a1*)
+            val fc = CDo(#types(args*), type(c), map(all-types, args*))
+            val f* = bexp(func(e), fc)
+            ;Expected argument types
+            #downto(exp-a1*, exp-type(f*), ArgsF())
+            ;Infer return type
+            val a2* = #freshv()
+            #downto(a2*, type(f*), RetF(length(args(e))))
+            TDo(f*, args*, a2*, a2*, c, info(e))
+         (e:TPrim) :
+            val args* = bexp(args(e), CExp(#?))
+            val t* = prim-type(op(e))
+            TPrim(op(e), args*, t*, t*, c, info(e))
+         (e:TLiteral) :
+            val vt = lit-type(value(e))
+            TLiteral(value(e), vt, vt, c, info(e))
+         (e:TTupleExp) :
+            val exp-ts* = #freshv(length(exps(e)))
+            val exps* = map(bexp{_, CExp(_)}, exps(e), exp-ts*)
+            val t* = attempt: TTuple(map(#V, #types(exps*)))
+            val exp-t* = attempt: TTuple(map(#V, #exp-types(exps*)))
+            #upto(exp-ts*, type(c), TupleF())
+            TTupleExp(exps*, t*, exp-t*, c, info(e))
+         (e:TMix) :
+            val sv = SVar(fresh-id())
+            val exps* = map(bexp{_, c}, exps(e))
+            val t* = #freshv()
+            val et* = #freshv()
+            match(c) :
+               (c:CExp) :
+                  #partof(sv, #exp-types(exps*) as List<False|TArrow>, type(c))
+                  #mix(t*, sv, #types(exps*) as List<False|TArrow>)
+                  #mix(et*, sv, #exp-types(exps*) as List<False|TArrow>)
+               (c:CDo) :
+                  #callable(sv, #exp-types(exps*) as List<False|TArrow>, all-args(c))
+                  #mix(t*, sv, #types(exps*) as List<False|TArrow>)
+                  #mix(et*, sv, #exp-types(exps*) as List<False|TArrow>)
+            TMix(sv, exps*, t*, et*, c, info(e))
+
+   defn bmulti (e:TExp, targs*:List<TVar>, c:CMulti) -> TExp :
+      match(e) :
+         (e:TRef) :
+            val t = env[n(e)]
+            val e* = TRef(n(e), t, t, c, info(e))
+            match(#instantiate(t, targs*, type(c))) :
+               (r:Instantiated) : TCurry(e*, targs*, cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : TCurry(e*, targs*, List(), false, false, c, info(e))
+               (r:NotPoly) : e*
+         (e:TMix) :
+            val sv = SVar(fresh-id())
+            val exps* = map(bmulti{_, targs*, c}, exps(e))
+            #select-multi(sv, type(c), #types(exps*) as List<False|TArrow>)
+            TMix(sv, exps*, false, false, c, info(e))
+
+   defn blscomm (c:LSComm) -> LSComm :
+      match(c) :
+         (c:LSCall) :
+            LSCall(blsexp(exp(c), CLSExp(#ls?)), info(c))
+         (c:LSSet) :
+            LSSet(exp*, v*, info(c)) where :
+               val exp* = blsexp(exp(c), CLSExp(#ls?))
+               val v* = blsexp(value(c), CLSExp(type(exp*)))
+         (c:LSLabels) :
+            LSLabels(ns(c), blscomm(body(c)), info(c))
+         (c:LSLabel) :
+            c
+         (c:LSGoto) :
+            c
+         (c:LSReturn) :
+            val ret = current-return-type as LSType
+            LSReturn(blsexp(exp(c), CLSExp(ret)), info(c))
+         (c:LSDef) :
+            LSDef(n(c), t*, v*, info(c)) where :
+               val v* = blsexp(value(c), CLSExp(#or(type(c), #ls?)))
+               val t* = #or(type(c), type(v*))
+               set-ls-env(n(c), t*)
+         (c:LSDefVar) :
+            LSDefVar(n(c), type(c), v*, info(c)) where :
+               val v* = blsexp(value(c) as LSExp, CLSExp(type(c))) when value(c) not-typeof False
+               set-ls-env(n(c), type(c))
+         (c:LSSeq) :
+            LSSeq(blscomm(a(c)), blscomm(b(c)), info(c))
+         (c:LSIf) :
+            LSIf(pred*, conseq*, alt*, info(c)) where :
+               val pred* = blsexp(pred(c), CLSExp(LongT()))
+               val conseq* = blscomm(conseq(c))
+               val alt* = blscomm(alt(c))
+         (c:LSMatch) :
+            val args* = map(blsexp{_, CLSExp(#ls?)}, args(c))
+            val bs* = for b in branches(c) map :
+               LSBranch(args(b), atypes*, body*, info(c)) where :
+                  val atypes* = #or(atypes(b), #types(args*))
+                  set-ls-env(args(b), atypes*)
+                  val body* = blscomm(body(b))
+            LSMatch(args*, bs*, info(c))
+         (c:LSSkip) :
+            c
+
+   defn blsfields (n:Int, targ:Type, es:List<LSExp>) :
+      val fts = match(field-types(n, targ)) :
+         (fts:List<LSType>) : fts when length(fts) == length(es)
+         (fts:False) : false
+      match(fts) :
+         (fts:List<LSType>) : map(blsexp{_, CLSExp(_)}, es, fts)
+         (fts:False) : map(blsexp{_, CLSExp(false)}, es)
+
+   defn blsexp (e:LSExp, ctxt:Context) -> LSExp :
+      val c = ctxt as CLSDo|CLSExp
+      match(e) :
+         (e:LSVar) :
+            val t = ls-env[n(e)]
+            val e* = LSVar(n(e), t, t, c, info(e))
+            match(#instantiate(t, List(), type(c))) :
+               (r:LSInstantiated) : LSCurry(e*, List(), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : LSCurry(e*, List(), List(), false, false, c, info(e))
+               (r:NotPoly) : e*
+         (e:LSNew) :
+            val t = RefT(TOf(n(e), targ(e)))
+            val args* = blsfields(n(e), targ(e), args(e))
+            LSNew(n(e), targ(e), args*, t, t, c, info(e))
+         (e:LSArray) :
+            val t = RefT(TOf(n(e), targ(e)))
+            val args* = blsfields(n(e), targ(e), args(e))
+            val len* = blsexp(length(e), CLSExp(LongT()))
+            LSArray(n(e), targ(e), args*, len*, t, t, c, info(e))
+         (e:LSStruct) :
+            val t = StructT(n(e), targ(e))
+            val args* = blsfields(n(e), targ(e), args(e))
+            LSStruct(n(e), targ(e), args*, t, t, c, info(e))
+         (e:LSAddr) :
+            val c = CLSExp(#deptr(type(c)))
+            val exp* = blsexp(exp(e), c)
+            val t* = attempt: PtrT(#V(type(exp*)))
+            val exp-t* = attempt: PtrT(#V(exp-type(exp*)))
+            LSAddr(exp*, t*, exp-t*, c, info(e))
+         (e:LSDeref) :
+            val c = CLSExp(#ls?)
+            val exp* = blsexp(exp(e), c)
+            LSDeref(exp*, #deref(type(exp*)), #deref(exp-type(exp*)), c, info(e))
+         (e:LSSlot) :
+            val ptr-t = attempt: PtrT(#V(type(c)))
+            val exp* = blsexp(exp(e), CLSExp(ptr-t))
+            val ind* = blsexp(index(e), CLSExp(LongT()))
+            LSSlot(exp*, ind*, #deptr(type(exp*)), #deptr(exp-type(exp*)), c, info(e))
+         (e:LSField) :
+            val exp* = blsexp(exp(e), CLSExp(#ls?))
+            val t* = #field(type(exp*), name(e))
+            LSField(exp*, name(e), t*, t*, c, info(e))
+         (e:LSDo) :
+            ;Variables
+            val exp-a1* = #ls-freshv(length(args(e)))
+            val args* = map(blsexp{_, CLSExp(_)}, args(e), exp-a1*)
+            val fc = CLSDo(#types(args*), type(c), map(all-types, args*))
+            val f* = blsexp(func(e), fc)
+            ;Expected argument types
+            #args(exp-a1*, exp-type(f*))
+            ;Infer return type
+            val t* = #ret(type(f*))
+            LSDo(f*, args*, t*, t*, c, info(e))
+         (e:LSDoInStack) :
+            ;Variables
+            val exp-a1* = #ls-freshv(length(args(e)))
+            val args* = map(blsexp{_, CLSExp(_)}, args(e), exp-a1*)
+            val fc = CLSDo(#types(args*), type(c), map(all-types, args*))
+            val f* = blsexp(func(e), fc)
+            ;Expected argument types
+            #args(exp-a1*, exp-type(f*))
+            ;Return type is given
+            val t* = ret(e)
+            LSDoInStack(f*, args*, ret(e), t*, t*, c, info(e))
+         (e:LSDoStack) :
+            val stack-type = RefT(TOf(STACK-TYPE-ID, TTuple(List())))
+            val f* = blsexp(func(e), CLSExp(stack-type))
+            val arg* = blsexp(arg(e), CLSExp(#ls?))
+            val t* = ret(e)
+            LSDoStack(f*, arg*, ret(e), t*, t*, c, info(e))
+         (e:LSCallC) :
+            ;Variables
+            val exp-a1* = #ls-freshv(length(args(e)))
+            val args* = map(blsexp{_, CLSExp(_)}, args(e), exp-a1*)
+            val fc = CLSDo(#types(args*), type(c), map(all-types, args*))
+            val f* = blsexp(func(e), fc)
+            ;Expected argument types
+            #args(exp-a1*, exp-type(f*))
+            ;Infer return type
+            val t* = #ret(type(f*))
+            LSCallC(f*, args*, t*, t*, c, info(e))
+         (e:LSPrim) :
+            val args* = map(blsexp{_, CLSExp(UnknownT())}, args(e))
+            val ret = #prim(op(e), #types(args*))
+            LSPrim(op(e), args*, ret, ret, c, info(e))
+         (e:LSSizeof) :
+            LSSizeof(targ(e), LongT(), LongT(), c, info(e))
+         (e:LSTagof) :
+            LSTagof(n(e), LongT(), LongT(), c, info(e))
+         (e:LSCast) :
+            val exp* = blsexp(exp(e), CLSExp(#ls?))
+            LSCast(exp*, targ(e), targ(e), targ(e), c, info(e))
+         (e:LSLiteral) :
+            val t = ls-lit-type(value(e))
+            LSLiteral(value(e), t, t, c, info(e))
+         (e:LSAnd) :
+            defn blong (e:LSExp) : blsexp(e, CLSExp(LongT()))
+            LSAnd(blong(a(e)), blong(b(e)), LongT(), LongT(), c, info(e))
+         (e:LSOr) :
+            defn blong (e:LSExp) : blsexp(e, CLSExp(LongT()))
+            LSOr(blong(a(e)), blong(b(e)), LongT(), LongT(), c, info(e))
+         (e:LSLetExp) :
+            val comm* = blscomm(comm(e))
+            val exp* = blsexp(exp(e), c)
+            LSLetExp(comm*, exp*, type(exp*), exp-type(exp*), c, info(e))
+         (e:LSMix) :
+            val sv = SVar(fresh-id())
+            val exps* = map(blsexp{_, c}, exps(e))
+            val ts* = #types(exps*) as List<False|FnT>
+            val exp-ts* = #exp-types(exps*) as List<False|FnT>
+            val t* = #ls-freshv()
+            val ct* = #ls-freshv()
+            match(c) :
+               (c:CLSExp) :
+                  #select(sv, exp-ts*, type(c))
+                  #pick(t*, sv, ts*)
+                  #pick(ct*, sv, exp-ts*)
+               (c:CLSDo) :
+                  #callable(sv, exp-ts*, all-args(c))
+                  #mix(t*, sv, ts*)
+                  #mix(ct*, sv, exp-ts*)
+            LSMix(sv, exps*, t*, ct*, c, info(e))
+         (e:LSCurry) :
+            val t = ls-env[n(ref(e))]
+            val e* = LSVar(n(ref(e)), t, t, c, info(e))
+            match(#instantiate(t, targs(e), type(c))) :
+               (r:LSInstantiated) : LSCurry(e*, targs(e), cargs(r), type(r), exp-type(r), c, info(e))
+               (r:WrongArity) : LSCurry(e*, targs(e), List(), false, false, c, info(e))
+         (e:LSFn) :
+            val ref* = bexp(ref(e), CExp(#ref-type(type(c))))
+            defn reft (t:False|Type) : attempt: RefT(#V(t))
+            LSFn(ref*, reft(type(ref*)), reft(exp-type(ref*)), c, info(e))
+
+
+   ;             ===============================
+   ;             ==   Constraint Generation   ==
+   ;             ===============================
+
+   ;===== Constraint Upward and Downward Propagators =====
+   ;Propagate type upwards towards a subform
+   defn #upto (r:False|Type, w:False|Type, f:SubF) :
+      ;Substitute TUVar(n*) with t*, and all other TUVar with ?
+      defn sub (t:Type, n*:Int, t*:Type) :
+         match(t) :
+            (t:TUVar) :
+               if n(t) == n* : t*
+               else : #?
+            (t) : map(sub{_, n*, t*}, t)
+      match(r, w, ti(f)) :
+         (r:TUVar, w:Type, ti:TUVar) :
+            val t* = sub(t(f), n(ti), TCap(n(r)))
+            #cap(r, t*, w)
+         (r, w, ti) :
+            false
+
+   ;Propagate type upwards towards elements of tuple form
+   defn #upto (rs:List<TUVar>, w:False|Type, f:TupleF) :
+      if w not-typeof False :
+         val n = length(rs)
+         for (r in rs, i in 0 to n) do :
+            #cap(r, #tuple-cap(r, i, n), w as Type)
+
+   ;Propagate type downwards towards elements of tuple form
+   defn #downto (rs:List<TUVar>, w:False|Type, f:TupleF) :
+      if w not-typeof False :
+         val n = length(rs)
+         for (r in rs, i in 0 to n) do :
+            #cap(r, w as Type, #tuple-cap(r, i, n))
+
+   ;Propagate type downwards towards arguments of function
+   defn #downto (rs:List<TUVar>, w:False|Type, f:ArgsF) :
+      if w not-typeof False :
+         val n = length(rs)
+         for (r in rs, i in 0 to n) do :
+            val a1 = #tuple-cap(r, i, n)
+            #cap(r, w as Type, TArrow(a1, #?))
+
+   ;Propagate type downwards towards return of function
+   defn #downto (r:TUVar, w:False|Type, f:RetF) :
+      if w not-typeof False :
+         val a = TTuple(map({#?}, 0 to n(f)))
+         val b = TCap(n(r))
+         #cap(r, w as Type, TArrow(a, b))
+
+   ;===== Constraint Generation Utilities =====
+   ;Create a new constraint variables
+   defn make-ls-constraint-var (Constraint: Int -> Constraint) :
+      val r = #ls-freshv()
+      addc(Constraint(n(r)))
+      r
+   defn make-constraint-var (Constraint: Int -> Constraint) :
+      val r = #freshv()
+      addc(Constraint(n(r)))
+      r
+
+   ;Capture i'th element in m element tuple
+   defn #tuple-cap (t:TUVar, i:Int, m:Int) :
+      TTuple $ for j in 0 to m map :
+         if j == i : TCap(n(t))
+         else : #?
+
+   ;Create supertype constraint
+   defn #super (a:False|Type, b:False|Type) :
+      match(a, b) :
+         (a:TUVar, b:Type) : addc(SuperConstraint(n(a), b))
+         (a, b) : false
+
+   ;Create equality constraint
+   defn #equal (ats:List<False|Type>, bts:List<False|Type>) :
+      do(#equal, ats, bts)
+
+   defn #equal (a:Type, b:False|Type) :
+      match(a, b) :
+         (a:TUVar, b:Type) : addc(EqualConstraint(n(a), b))
+         (a, b) : false
+
+   defn #equal (a:LSType, b:False|LSType) :
+      match(a, b) :
+         (a:UVarT, b:LSType) : addc(LSEqualConstraint(n(a), b))
+         (a, b) : false
+
+   defn #equal (a:False, b:False|LSType) :
+      false
+
+   ;Create capture constraint
+   defn #cap (r:TUVar, x:Type, y:Type) :
+      addc(FlowConstraint(n(r), x, y))
+
+   defn #cap (r:TUVar, x:LSType, y:LSType) :
+      addc(LSFlowConstraint(n(r), x, y))
+
+   ;Create a partof constraint
+   defn #partof (s:SVar, ats:List<False|TArrow>, bt:False|Type) :
+      if bt not-typeof False :
+         addc(PartofConstraint(n(s), ats, bt as Type))
+
+   ;Create a callable constraint
+   defn #callable (s:SVar, ats:List<False|TArrow>, args:List<List<Type>>) :
+      addc(CallableConstraint(n(s), ats, args))
+
+   defn #callable (s:SVar, ats:List<False|FnT>, args:List<List<LSType>>) :
+      addc(LSCallableConstraint(n(s), ats, args))
+
+   ;Create a selection constraint
+   defn #select (s:SVar, ats:List<False|FnT>, bt:False|LSType) :
+      if bt not-typeof False :
+         addc(LSSelConstraint(n(s), ats, bt as LSType))
+
+   ;Create a multi selection constraint
+   defn #select-multi (s:SVar, at:False|TArrow, bts:List<False|TArrow>) :
+      if at not-typeof False :
+         addc(SelMultiConstraint(n(s), at as TArrow, bts))
+
+   ;Create a substitution constraint
+   defn #sub (t:Type, env:List<KeyValue<Int,Type>>) :
+      make-constraint-var(SubConstraint{_, t, env})
+
+   defn #sub (t:LSType, env:List<KeyValue<Int,Type>>) :
+      make-ls-constraint-var(LSSubConstraint{_, t, env})
+
+   ;Create a mixture constraint
+   defn #mix (t:TUVar, s:SVar, ats:List<False|TArrow>) :
+      addc(MixConstraint(n(t), n(s), ats))
+
+   defn #mix (t:UVarT, s:SVar, ats:List<False|FnT>) :
+      addc(LSMixConstraint(n(t), n(s), ats))
+
+   ;Create a pick constraint
+   defn #pick (t:UVarT, s:SVar, xs:List<False|FnT>) :
+      addc(LSPickConstraint(n(t), n(s), xs))
+
+   ;Isolate a single capture variable
+   defn isolate-cap (n*:Int, t:Type) :
+      match(t) :
+         (t:TCap) :
+            if n(t) == n* : t
+            else : TUVar(n(t))
+         (t) : map(isolate-cap{n*, _}, t)
+   defn isolate-cap (n*:Int, t:LSType) :
+      mapr(isolate-cap{n*, _}, t)
+
+   ;Relax captures in a type
+   defn relax-cap (t:Type) :
+      match(t) :
+         (t:TCap) : TGradual()
+         (t) : map(relax-cap, t)
+   defn relax-cap (t:LSType) :
+      mapr(relax-cap, t)
+
+   ;Instantiate a polymorphic type with the given type arguments
+   ;Returns [Instantiated Captured Args, Instantiated Type, Relaxed Type]
+   ;Instantiated type contains unification variables for captured args.
+   ;Relaxed type contains graduals in place of captured args
+   defn #instantiate (t:Type, targs*:List<Type>, w:False|Type) -> InstResult :
+      match(t) :
+         (t:TPoly) :
+            if length(targs(t)) == length(targs*) :
+               val cargs* = #freshv(length(cargs(t)))
+               val env = map(KeyValue,
+                             append(targs(t), cargs(t))
+                             append(targs*, cargs*))
+               val a1* = sub(uncap(a(func(t))), env)
+               val a2* = #sub(b(func(t)), env)
+               val t* = TArrow(a1*, a2*)
+               val cap-a1* = sub(a(func(t)), env)
+               val cap-t* = TArrow(cap-a1*, a2*)
+               if w not-typeof False :
+                  for v in cargs* do :
+                     #cap(v, isolate-cap(n(v), cap-t*), w as Type)
+               Instantiated(cargs*, t*, relax-cap(cap-t*) as TArrow)
+            else : WrongArity()
+         (t) :
+            if empty?(targs*) : NotPoly()
+            else : WrongArity()
+
+   defn #instantiate (t:LSType, targs*:List<Type>, w:False|LSType) -> LSInstResult :
+      match(t) :
+         (t:PolyT) :
+            if length(targs(t)) == length(targs*) :
+               val cargs* = #freshv(length(cargs(t)))
+               val env = map(KeyValue,
+                             append(targs(t), cargs(t))
+                             append(targs*, cargs*))
+               val a* = map(sub{uncap(_), env}, a(func(t)))
+               val r* = attempt: sub(uncap(#V(r(func(t)))), env)
+               val b* = #sub(b(func(t)), env)
+               val t* = FnT(a*, r*, b*)
+               val cap-a* = map(sub{_, env}, a(func(t)))
+               val cap-r* = attempt: sub(#V(r(func(t))), env)
+               val cap-t* = FnT(cap-a*, cap-r*, b*)
+               if w not-typeof False :
+                  for v in cargs* do :
+                     #cap(v, isolate-cap(n(v), cap-t*), w as LSType)
+               LSInstantiated(cargs*, t*, relax-cap(cap-t*) as FnT)
+            else : WrongArity()
+         (t) :
+            if empty?(targs*) : NotPoly()
+            else : WrongArity()
+
+   defn #instantiate (t:False, targs*:List<Type>, w:False|LSType|Type) :
+      NotPoly()
+
+   ;Create an arguments constraint
+   defn #arg (r:UVarT, t:False|LSType, i:Int, arity:Int) :
+      if t not-typeof False :
+         addc(ArgConstraint(n(r), t as LSType, i, arity))
+   defn #args (rs:List<UVarT>, t:False|LSType) :
+      val n = length(rs)
+      for (r in rs, i in 0 to false) do :
+         #arg(r, t, i, n)
+
+   ;LS Constraints
+   defn #deptr (t:False|LSType) :
+      attempt: make-ls-constraint-var(DeptrConstraint{_, #V(t)})
+   defn #deref (t:False|LSType) :
+      attempt: make-ls-constraint-var(DerefConstraint{_, #V(t)})
+   defn #field (t:False|LSType, name:Symbol) :
+      attempt: make-ls-constraint-var(FieldConstraint{_, #V(t), name})
+   defn #ret (t:False|LSType) :
+      attempt: make-ls-constraint-var(RetConstraint{_, #V(t)})
+   defn #prim (op:LSPrimitive, args:List<False|LSType>) :
+      attempt: make-ls-constraint-var(LSPrimConstraint{_, op, map(#V,args)})
+   defn #ref-type (t:False|LSType) :
+      attempt: make-constraint-var(RefTypeConstraint{_, #V(t)})
+
+
+   ;               Fill Results
+   ;               ============
+   defn filler (results:SolveResults) :
+      ;   Track the type variables currently in scope
+      ;   -------------------------------------------
+      var tvars-in-scope:List<Int> = List()
+      defn in-scope? (t:Type) :
+         match(t) :
+            (t:TVar) : contains?(tvars-in-scope, n(t))
+            (t) : all?(in-scope?, children(t))
+      defn in-scope? (t:LSType) :
+         match(t) :
+            (t:RefT) : in-scope?(type(t))
+            (t:StructT) : in-scope?(type(t))
+            (t) : all?(in-scope?, children(t))
+      defn with-targs<?T> (c:TComm, f: () -> ?T) :
+         defn use-targs (xs:List<Int>) :
+            let-var tvars-in-scope = append(xs, tvars-in-scope) :
+               f()
+         match(c) :
+            (c:TDefn|TDefmethod|TLDefn|TLDefmethod) :
+               use-targs(append(targs(c), cargs(c)))
+            (c) : f()
+
+      ;   Filling Functions
+      ;   -----------------
+      defn fill-ctxt (c:Context) -> Context :
+         map(fill-lt, map(fill-t, c))
+      defn fill-s (s:Selection) -> Selection :
+         match(s) :
+            (s:SVar) : get?(sels(results), n(s), s)
+            (s) : s
+      defn #fill-t (t:Type) -> Type :
+         match(t) :
+            (t:TUVar) :
+               match(get?(types(results), n(t), false)) :
+                  (t*:Type) : t* when in-scope?(t*) else t
+                  (t*:False) : t
+            (t) : map(#fill-t, t)
+      defn #fill-lt (t:LSType) -> LSType :
+         match(t) :
+            (t:UVarT) :
+               match(get?(lstypes(results), n(t), false)) :
+                  (t*:LSType) : t* when in-scope?(t*) else t
+                  (t*:False) : t
+            (t) : map(#fill-lt, map(#fill-t, t))
+      defn fill-t (t:Type) -> Type :
+         simplify(#fill-t(t))
+      defn fill-lt (t:LSType) -> LSType :
+         simplify(#fill-lt(t))
+      defn fill-lc (c:LSComm) :
+         map{fill-lt, _} $
+         map{fill-lc, _} $
+         map{fill-le, _} $
+         c
+      defn fill-le (e:LSExp) :
+         map{fill-t, _} $
+         map{fill-lc, _} $
+         map{fill-le, _} $
+         map{fill-lt, _} $
+         map{fill-e, _} $
+         map{fill-s, _} $
+         map{fill-ctxt, _} $
+         e
+      defn fill-e (e:TExp) -> TExp :
+         map{fill-t, _} $
+         map{fill-e, _} $
+         map{fill-c, _} $
+         map{fill-ctxt, _} $
+         map{fill-s, _} $
+         e
+      defn fill-c (c:TComm) -> TComm :
+         with-targs{c, _} $ fn* () :
+            map{fill-le, _} $
+            map{fill-lc, _} $
+            map{fill-e, _} $
+            map{fill-t, _} $
+            c
+      defn fill-prog (p:TProg) :
+         TProg(hier(p),
+               map(fill-c, comms(p)))
+
+      Filler(fill-ctxt, fill-s, fill-t, fill-lt,
+             fill-lc, fill-le, fill-e, fill-c, fill-prog)
+
+   ;                 Driver
+   ;                 ======
+   build-environment()
+   val prog* = TProg(hier(prog), bcomm(comms(prog)))
+   val f = filler(solve(constraints))
+   val fprog = fill-prog(f)(prog*)
+   for entry in env do :
+      attempt: env[key(entry)] = fill-t(f)(#V(value(entry)))
+   for entry in ls-env do :
+      attempt: ls-env[key(entry)] = fill-lt(f)(#V(value(entry)))
+   [fprog, env, ls-env]
+
+;============================================================
+;=================== Print a Type ===========================
+;============================================================
+defn cms (xs:Seqable) : join(xs, ", ")
+
+defn printable (nm:NameMap, t:Type) :
+   defn #name (n:Int) : name(nm[n])
+   defn #carg (n:Int) : "?%_" % [#name(n)]
+   defn lvl (t:Type) :
+      match(t) :
+         (t:TArrow|TPoly) : 0
+         (t:TOr) : 1
+         (t) : 2
+
+   defn p0 (t:Type) : pt(t, 0)
+   defn p0 (ts:List<Type>) : seq(p0, ts)
+   defn pt (t:Type, l:Int) :
+      defn pn (t2:Type) : pt(t2, lvl(t))
+      defn p+ (t2:Type) : pt(t2, lvl(t) + 1)
+
+      val r = match(t) :
+         (t:TArrow) :
+            match(a(t)) :
+               (a:TTuple) :
+                  if length(types(a)) == 1 : "%_ -> %_" % [p+(head(types(a))), pn(b(t))]
+                  else : "(%,) -> %_" % [p0(types(a)), pn(b(t))]
+               (a:TGradual) : "(? ...) -> %_" % [pn(b(t))]
+         (t:TPoly) :
+            val ts = cat(seq(#name, targs(t)), seq(#carg, cargs(t)))
+            val f = pn(func(t))
+            "<%,> . %_" % [ts, f]
+         (t:TOr) :
+            "%_|%_" % [pn(a(t)), pn(b(t))]
+         (t:TAnd) :
+            "%_&%_" % [pn(a(t)), pn(b(t))]
+         (t:TOf) :
+            match(type(t)) :
+               (ta:TTuple) :
+                  if empty?(types(ta)) : #name(n(t))
+                  else : "%_<%,>" % [#name(n(t)), cms(p0(types(ta)))]
+               (ta:TGradual) :
+                  #name(n(t))
+         (t:TGradual|TUVar) :
+            "?"
+         (t:TBot) :
+            "Void"
+         (t:TVar) :
+            #name(n(t))
+         (t:TCap) :
+            #carg(n(t))
+         (t:TTuple) :
+            "[%,]" % [p0(types(t))]
+      if lvl(t) < l : "(%_)" % [r]
+      else : r
+   p0(t)
+
+defn printable (nm:NameMap, t:LSType) :
+   defn #pr (t:LSType) : printable(nm, t)
+   defn #pr (t:Type) : printable(nm, t)
+   defn #pr (ts:Seqable<LSType>) : seq(#pr, ts)
+   defn #pr (ts:Seqable<Type>) : seq(#pr, ts)
+   defn #ap (ts:Seqable<LSType>, t:LSType) : cat(ts, [t])
+   defn #name (n:Int) : name(nm[n])
+   defn #carg (n:Int) : "?%_" % [#name(n)]
+   match(t) :
+      (t:ByteT) : "byte"
+      (t:IntT) : "int"
+      (t:LongT) : "long"
+      (t:FloatT) : "float"
+      (t:DoubleT) : "double"
+      (t:UnknownT|UVarT) : "?"
+      (t:PtrT) : "ptr<%_>" % [#pr(type(t))]
+      (t:RefT) : "ref<%_>" % [#pr(type(t))]
+      (t:FnT) :
+         match(r(t)) :
+            (r:False) : "(%,) -> %_" % [#pr(a(t)), #pr(b(t))]
+            (r:LSType) : "(%, ...) -> %_" % [#pr(#ap(a(t), r)), #pr(b(t))]
+      (t:PolyT) :
+         val ts = cat(seq(#name, targs(t)), seq(#carg, cargs(t)))
+         "<%,> . %_" % [ts, #pr(func(t))]
+      (t:StructT) :
+         match(type(t)) :
+            (ta:TTuple) :
+               if empty?(types(ta)) : #name(n(t))
+               else : "%_<%,>" % [#name(n(t)), #pr(types(ta))]
+            (ta:TGradual) :
+               #name(n(t))
+
+
+;============================================================
+;=================== Report Errors ==========================
+;============================================================
+
+defn report-errors (nm:NameMap,
+                    prog:TProg,
+                    env:HashTable<Int,False|Type>,
+                    ls-env:HashTable<Int, False|LSType>) :
+
+   ;              Error Buffer
+   ;              ============
+   val errors = Vector<TypeError>()
+   defn E! (e:TypeError) : add(errors, e)
+
+   ;         Track Current Scope Information
+   ;         ===============================
+   var current-return-type : False|LSType = false
+   var current-new-type : False|Type = false
+
+   ;               Error Predicates
+   ;               ================
+   defn #C (f:False) : fatal("Cast Error")
+   defn #C (t:Type) : t
+   defn #C (t:LSType) : t
+   defn #C (t:List<False|Type>) : t as List<Type>
+   defn #C (t:List<False|LSType>) : t as List<LSType>
+
+   defn not-resolved? (x:False|Type|LSType|Selection) :
+      match(x) :
+         (x:False) : false
+         (x:Type) : not resolved?(x)
+         (x:LSType) : not resolved?(x)
+         (x:SSel) : any?({_ typeof Unknown}, sels(x))
+         (x:SVar) : true
+
+   defn not-st? (x:False|Type|LSType, y:False|Type|LSType) :
+      match(x, y) :
+         (x:False, y) : false
+         (x, y:False) : false
+         (x:Type, y:Type) : subtype?(x, y) typeof False
+         (x:LSType, y:LSType) : subtype?(x, y) typeof False
+
+   defn not-sm? (x:TArrow, y:False|Type) :
+      match(y) :
+         (y:TArrow) : submethod?(x, y) typeof False
+         (y) : false
+
+   defn not-overlap? (x:False|Type|LSType, y:False|Type|LSType) :
+      match(x, y) :
+         (x:False, y) : false
+         (x, y:False) : false
+         (x:Type, y:Type) : overlap?(x, y) typeof False
+         (x:RefT, y:RefT) : overlap?(x, y) typeof False
+         (x:LSType, y:LSType) : false
+
+   defn not-tuple? (t:False|Type) :
+      val tuple-t = TOf(TUPLE-TYPE-ID, TTuple(List(TGradual())))
+      not-st?(t, tuple-t)
+
+   defn not-tuple? (t:False|Type, arity:Int) :
+      val tuple-t = TTuple(map(TGradual{}, 0 to arity))
+      not-st?(t, tuple-t)
+
+   defn not-func? (t:False|Type) :
+      val func-t = TArrow(TGradual(), TGradual())
+      not-st?(t, func-t)
+
+   defn not-assign? (x:False|LSType, y:False|LSType) :
+      match(x, y) :
+         (x:False, y) : false
+         (x, y:False) : false
+         (x:LSType, y:LSType) : assignable?(x, y) typeof False
+
+   defn not-bounded? (t:False|LSType) :
+      (t not-typeof False) and bounded?(#C(t)) typeof False
+
+   defn cant-call? (t:False|Type, ats:List<False|Type>) :
+      if none?({_ typeof False}, ats) :
+         val func-t = TArrow(TTuple(#C(ats)), TGradual())
+         not-st?(t, func-t)
+
+   defn cant-ls-call? (t:False|LSType, ats:List<False|LSType>) :
+      if (t not-typeof False) and none?({_ typeof False}, ats) :
+         callable?(t as FnT, #C(ats)) typeof False
+
+   defn cant-call? (op:Primitive, ats:List<False|Type>) :
+      if none?({_ typeof False}, ats) :
+         not callable?(op, #C(ats))
+
+   defn cant-call? (op:LSPrimitive, ats:List<False|LSType>) :
+      if none?({_ typeof False}, ats) :
+         not callable?(op, #C(ats))
+
+   defn cant-cast? (x:False|LSType, y:LSType) :
+      match(x) :
+         (x:LSType) : castable?(x, y) typeof False
+         (x:False) : false
+
+   defn not-ref? (t:False|LSType) :
+      (t not-typeof False) and (t not-typeof RefT)
+
+   defn cant-deref? (t:False|LSType) :
+      (t not-typeof False) and (deref(#C(t)) typeof False)
+
+   defn cant-deptr? (t:False|LSType) :
+      (t not-typeof False) and (deptr(#C(t)) typeof False)
+
+   defn cant-field? (t:False|LSType, f:Symbol) :
+      (t not-typeof False) and (field(#C(t), f) typeof False)
+
+   defn not-func? (t:LSType) :
+      t not-typeof FnT
+
+   defn not-stack? (t:False|LSType) :
+      val stack-t = RefT(TOf(STACK-TYPE-ID, TTuple(List())))
+      not-assign?(t, stack-t)
+
+   defn not-long? (t:False|LSType) :
+      not-assign?(t, LongT())
+
+   defn not-longs? (x:False|LSType, y:False|LSType) :
+      match(x, y) :
+         (x:False, y) : false
+         (x, y:False) : false
+         (x:LSType, y:LSType) : not-assign?(x, LongT()) or not-assign?(y, LongT())
+
+   defn no-size? (t:LSType) :
+      t typeof UnknownT|FnT
+
+   defn all-pairs<?T> (xs:Seqable<?T>) :
+      val xs* = to-array<T>(xs)
+      generate<[T, T]> :
+         for i in 0 to length(xs*) do :
+            for j in (i + 1) to length(xs*) do :
+               yield([xs*[i], xs*[j]])
+
+   defn not-disjoint? (ts:List<TArrow>, u:False|Type) :
+      val u* = TGradual() when u typeof False else #C(u)
+      for [x, y] in all-pairs(ts) any? :
+         not disjoint-fns?(x, y, u*)
+
+   defn not-disjoint? (ts:List<FnT>, u:False|LSType) :
+      val u* = UnknownT() when u typeof False else #C(u)
+      for [x, y] in all-pairs(ts) any? :
+         not disjoint-fns?(x, y, u*)
+
+   defn wrong-poly-tarity? (t:False|Type|LSType, type-args:List<Type>|List<LSType>) :
+      match(t) :
+         (t:TArrow|FnT) : not empty?(type-args)
+         (t:TPoly|PolyT) : length(type-args) != length(targs(t))
+         (t:False) : false
+
+   defn ls-def? (n:Int) :
+      key?(nm, n) and (type(nm[n]) typeof LFnE|LVarE|LValE)
+
+   defn mutable? (n:Int) :
+      key?(nm, n) and type(nm[n]) typeof VarE|LVarE
+
+   defn not-lvalue? (e:LSExp) :
+      match(e) :
+         (e:LSVar) :
+            not mutable?(n(e))
+         (e:LSDeref|LSSlot) :
+            false
+         (e:LSField) :
+            ;Does it expand to an addr(...) expression?
+            defn addr? (t:False|Unknown|LSType) :
+               match(t) :
+                  (t:StructT) : rest-field?(n(t), name(e))
+                  (t:PtrT) : addr?(type(t))
+                  (t:RefT) : addr?(to-ls-type(type(t)))
+                  (t) : false
+            if addr?(type(exp(e))) :
+               true
+            else :
+               match(type(exp(e))) :
+                  (t:PtrT|RefT) : false
+                  (t:StructT) : not-lvalue?(exp(e))
+                  (t) : false
+         (e) : false
+
+   defn wrong-tarity? (n:Int, targ:Type) :
+      match(targ) :
+         (targ:TGradual) : false
+         (targ:TTuple) : length(types(targ)) != type-tarity(n)
+
+   defn select<?T> (xs:List<?T>, ss:SSel) :
+      to-list $ for (x in xs, s in sels(ss)) filter :
+         s not-typeof False
+
+   ;               Tree Walker
+   ;               ===========
+
+   defn check (c:TComm) :
+      check(c, false)
+
+   defn check (c:TComm, top?:True|False) :
+      ;Continue recursion
+      defn check-subexps () :
+         do(check{_:TExp}, c)
+         do(check{_:LSExp}, c)
+         do(check{_:LSComm}, c)
+
+      match(c) :
+         (c:TDef) :
+            check-subexps()
+            if not-st?(type(value(c)), type(c)) :
+               E!(BadAssign(info(c), c))
+            if top? and not-resolved?(type(c)) :
+               E!(NoInferredType(info(c), c))
+         (c:TDefTuple) :
+            check-subexps()
+            ;Check detupling
+            val t = type(value(c))
+            val arity = length(ns(c))
+            E!(NotTuple(info(c), #C(t))) when not-tuple?(t) else
+            E!(BadDetuple(info(c), #C(t), arity)) when not-tuple?(t, arity)
+            ;Check inferred
+            if top? and any?(not-resolved?, types(c)) :
+               E!(NoInferredType(info(c), c))
+         (c:TDefVar) :
+            check-subexps()
+            if value(c) not-typeof False :
+               val vt = type(value(c) as TExp)
+               E!(BadAssign(info(c), c)) when not-st?(vt, type(c))
+            E!(NoInferredType(info(c), c)) when not-resolved?(type(c))
+         (c:TDefn) :
+            check-subexps()
+            ;Check Return
+            val bt = type(body(c))
+            check-ret(c) when not-st?(bt, a2(c))
+            ;Check inferred ret
+            E!(NoInferredRet(info(c), c)) when not-resolved?(a2(c))
+         (c:TDefmethod) :
+            ;Check method overriding
+            val mt = type(ctxt(multi(c)) as CMulti) as TArrow
+            check-multi(multi(c), mt)
+            ;Check body
+            check(body(c))
+            ;Check this type
+            if current-new-type not-typeof False :
+               val i = index-of(args(c), thisn(c) as Int) as Int
+               val this-t = a1(c)[i] as Type
+               val obj-t = current-new-type as Type
+               if not this-type?(this-t, obj-t) :
+                  E!(BadThisType(info(c), this-t, obj-t))
+            ;Check return type
+            val bt = type(body(c))
+            check-ret(c) when not-st?(bt, a2(c))
+         (c:TLDef) :
+            check-subexps()
+            val vt = type(value(c))
+            E!(BadAssign(info(c),c)) when not-assign?(vt, type(c))
+            E!(UnboundedDef(info(c),c)) when not-bounded?(type(c))
+         (c:TLDefVar) :
+            check-subexps()
+            ;Check initial value
+            if value(c) not-typeof False :
+               val vt = type(value(c) as LSExp)
+               E!(BadAssign(info(c),c)) when not-assign?(vt, type(c))
+            ;Check boundedness
+            E!(UnboundedDef(info(c),c)) when not-bounded?(type(c))
+         (c:TLDefmethod) :
+            ;Check method overriding
+            if ctxt(multi(c)) not-typeof False :
+               val mt = type(ctxt(multi(c)) as CMulti) as TArrow
+               check-multi(multi(c), mt)
+            ;Check type signature
+            if env[n(c)] typeof False :
+               E!(BadLSMethod(info(c), ls-env[n(c)] as LSType))
+            ;Check body
+            let-var current-return-type = a2(c) :
+               check(body(c))
+         (c:TLDefn) :
+            let-var current-return-type = a2(c) :
+               check(body(c))
+         (c) :
+            check-subexps()
+
+   defn check-ret (def:TDefn|TDefmethod|TFn) :
+      val ret = #C(a2(def))
+      defn loop (e:TExp) :
+         match(e) :
+            (e:TLet|TLetVar|TLetTuple|TLetRec|TBranch) : loop(body(e))
+            (e:TMatch) : do(loop, branches(e))
+            (e:TSeq) : loop(b(e))
+            (e) :
+               if not-st?(type(e), ret) :
+                  E!(BadRet(info(e), def, #C(type(e))))
+      loop(body(def))
+
+   defn check-multi (e:TExp, mt:TArrow) :
+      match(e) :
+         (e:TRef) :
+            match(type(e)) :
+               (t:TArrow) : E!(BadMethod(info(e), e, mt)) when not-sm?(mt, t)
+               (t:Type) : E!(BadMethod(info(e), e, mt))
+               (t:False) : false
+         (e:TMix) :
+            val exps* = select(exps(e), sel(e) as SSel)
+            val n = length(exps*)
+            switch {n == _} :
+               0 : E!(NoMulti(info(e), exps(e), mt))
+               1 : check-multi(head(exps*), mt)
+               else : E!(AmbMulti(info(e), exps*, mt))
+         (e:TCurry) :
+            ;Check submethod
+            if not-sm?(mt, type(e)) :
+               E!(BadMethod(info(e), e, mt))
+            ;Check targ arity
+            if wrong-poly-tarity?(type(ref(e)), targs(e)) :
+               E!(WrongTypeArity(info(e), e))
+            ;Check carg captures
+            if ctxt(e) not-typeof False :
+               if any?(not-resolved?, cargs(e) as List<Type>) :
+                  E!(BadCapture(info(e), e, ctxt(e) as CMulti))
+
+   defn check (e:TExp) :
+      ;Check subexpressions
+      defn check-subexps () :
+         do(check{_:TExp}, e)
+         do(check{_:TComm}, e)
+
+      ;Check constraints
+      match(e) :
+         (e:TLet) :
+            check-subexps()
+            ;Check assign
+            val vt = type(value(e))
+            E!(BadAssign(info(e),e)) when not-st?(vt, ntype(e))
+         (e:TLetVar) :
+            check-subexps()
+            E!(NoInferredType(info(e),e)) when not-resolved?(ntype(e))
+            if value(e) not-typeof False :
+               val vt = type(value(e) as TExp)
+               E!(BadAssign(info(e),e)) when not-st?(vt, ntype(e))
+         (e:TLetTuple) :
+            check-subexps()
+            val t = type(value(e))
+            val arity = length(ns(e))
+            E!(NotTuple(info(e), t as Type)) when not-tuple?(t) else
+            E!(BadDetuple(info(e), t as Type, arity)) when not-tuple?(t, arity)
+         (e:TFn) :
+            ;Check inferred arguments
+            for (a in args(e), t in a1(e)) do :
+               E!(NoInferredArg(info(e), a, ctxt(e) as Context)) when not-resolved?(t)
+            ;Check body
+            check-subexps()
+            ;Check return type
+            val bt = type(body(e))
+            check-ret(e) when not-st?(bt, a2(e))
+         (e:TMatch) :
+            val arg-ts = map(type, args(e))
+            for b in branches(e) do :
+               for (a in args(b), at in arg-ts, bt in atypes(b)) do :
+                  if not-overlap?(at, bt) :
+                     E!(BadBranchArg(info(e), a, bt as Type, at as Type))
+            check-subexps()
+         (e:TCast) :
+            check-subexps()
+            val et = type(exp(e))
+            E!(BadCast(info(e), et as Type, targ(e))) when not-overlap?(et, targ(e))
+         (e:TUpCast) :
+            check-subexps()
+            val et = type(exp(e))
+            E!(BadUpcast(info(e), et as Type, targ(e))) when not-st?(et, targ(e))
+         (e:TSet) :
+            check-subexps()
+            val vt = type(value(e))
+            val rt = type(ref(e))
+            E!(BadSet(info(e), n(ref(e)), vt as Type)) when not-st?(vt, rt)
+         (e:TDo) :
+            check-subexps()
+            val ft = type(func(e))
+            if not-func?(ft) :
+               E!(NotFunction(info(e), func(e)))
+            else :
+               val ats = map(type, args(e))
+               E!(BadCall(info(e), func(e), ats as List<Type>)) when cant-call?(ft, ats)
+         (e:TPrim) :
+            check-subexps()
+            val ats = map(type, args(e))
+            E!(BadPrimitive(info(e), op(e), ats as List<Type>)) when cant-call?(op(e), ats)
+         (e:TMix) :
+            val exps* = select(exps(e), sel(e) as SSel)
+            val n = length(exps*)
+            val c = ctxt(e) as CExp|CDo
+            switch {n == _} :
+               0 :
+                  ;Selection is all false
+                  E!(NoMix(info(e), exps(e), c))
+               1 :
+                  ;Selection has exactly one non-false
+                  check(head(exps*))
+               else :
+                  ;Selection contains unknowns
+                  if not-resolved?(sel(e)) :
+                     E!(AmbMix(info(e), exps*, c))
+                  ;Selection contains multiple trues
+                  else :
+                     val ts = map({type(_) as TArrow}, exps*)
+                     if not-disjoint?(ts, type(c)) : E!(AmbMix(info(e), exps*, c))
+                     else : do(check, exps*)
+         (e:TCurry) :
+            ;Check ref
+            check-subexps()
+            ;Check targ arity
+            if wrong-poly-tarity?(type(ref(e)), targs(e)) :
+               E!(WrongTypeArity(info(e),e))
+            ;Check carg captures
+            val c = ctxt(e) as Context
+            E!(BadCapture(info(e), e, c)) when any?(not-resolved?, cargs(e))
+         (e:TRef) :
+            if ls-def?(n(e)) :
+               E!(BadLSRef(info(e), n(e))) when type(e) typeof False
+         (e:TNew) :
+            let-var current-new-type = class(e) :
+               check-subexps()
+         (e) :
+            check-subexps()
+
+
+   defn check (c:LSComm) :
+      defn check-subexps () :
+         do(check{_:LSExp}, c)
+         do(check-bounded, c)
+         do(check{_:LSComm}, c)
+
+      match(c) :
+         (c:LSSet) :
+            check-subexps()
+            E!(BadLValue(info(c),exp(c))) when not-lvalue?(exp(c))
+            val et = type(exp(c))
+            val vt = type(value(c))
+            E!(BadLSSet(info(c),exp(c),vt as LSType)) when not-assign?(vt, et)
+         (c:LSReturn) :
+            check-subexps()
+            val et = type(exp(c))
+            val ret = current-return-type as LSType
+            E!(BadLSRet(info(c), et as LSType, ret)) when not-assign?(et, ret)
+         (c:LSDef) :
+            check-subexps()
+            val vt = type(value(c))
+            val dt = type(c)
+            E!(BadAssign(info(c),c)) when not-assign?(vt, dt)
+            E!(UnboundedDef(info(c),c)) when not-bounded?(dt)
+         (c:LSDefVar) :
+            E!(UnboundedDef(info(c),c)) when not-bounded?(type(c))
+            check-subexps()
+            if value(c) not-typeof False :
+               val vt = type(value(c) as LSExp)
+               E!(BadAssign(info(c),c)) when not-assign?(vt, type(c))
+         (c:LSIf) :
+            val pt = type(pred(c))
+            E!(BadPred(info(c), pt as LSType)) when not-long?(pt)
+            check-subexps()
+         (c:LSMatch) :
+            val arg-ts = map(type, args(c))
+            if any?(not-ref?, arg-ts) :
+               for (a in args(c), t in arg-ts) do :
+                  E!(BadMatchArg(info(a), t as LSType)) when not-ref?(t)
+            else :
+               val ats = arg-ts as List<RefT>
+               for b in branches(c) do :
+                  val bts = atypes(b)
+                  for (x in args(b), at in ats, bt in bts) do :
+                     E!(BadBranchArg(info(b), x, #C(bt), at)) when not-overlap?(at, bt)
+            check-subexps()
+         (c) :
+            check-subexps()
+
+   defn check (e:LSExp) -> False :
+      ;Check subexpressions
+      defn check-subexps () :
+         do(check{_:LSExp}, e)
+         do(check{_:LSComm}, e)
+         do(check{_:TExp}, e)
+
+      match(e) :
+         (e:LSNew) :
+            check-subexps()
+            ;Check bounded
+            val t = StructT(n(e), targ(e))
+            E!(NewWithRest(info(e), t)) when not bounded-type?(n(e))
+            ;Check arities
+            if wrong-tarity?(n(e), targ(e)) :
+               E!(ObjectWrongTypeArity(info(e), n(e), targ(e)))
+            else :
+               val fts = field-types!(n(e), targ(e))
+               val actual = length(fts)
+               val given = length(args(e))
+               E!(ObjectWrongFieldArity(info(e), n(e), given, actual)) when given != actual
+               ;Check initialization types
+               val ats = map(type, args(e))
+               E!(BadNew(info(e), e, #C(ats))) when any?(not-assign?, ats, fts)
+         (e:LSArray) :
+            check-subexps()
+            ;Check bounded
+            val t = StructT(n(e), targ(e))
+            E!(ArrayWithoutRest(info(e), t)) when bounded-type?(n(e))
+            ;Check arities
+            if wrong-tarity?(n(e), targ(e)) :
+               E!(ObjectWrongTypeArity(info(e), n(e), targ(e)))
+            else :
+               val fts = field-types!(n(e), targ(e))
+               val actual = length(fts)
+               val given = length(args(e))
+               E!(ObjectWrongFieldArity(info(e), n(e), given, actual)) when given != actual
+               ;Check initialization types
+               val ats = map(type, args(e))
+               E!(BadNew(info(e), e, #C(ats))) when any?(not-assign?, ats, fts)
+            ;Check length
+            val lt = type(length(e))
+            E!(BadLength(info(e), #C(lt))) when not-long?(lt)
+         (e:LSStruct) :
+            check-subexps()
+            ;Check bounded
+            val t = StructT(n(e), targ(e))
+            E!(StructWithRest(info(e), t)) when not bounded-type?(n(e))
+            ;Check arities
+            if wrong-tarity?(n(e), targ(e)) :
+               E!(ObjectWrongTypeArity(info(e), n(e), targ(e)))
+            else :
+               val fts = field-types!(n(e), targ(e))
+               val actual = length(fts)
+               val given = length(args(e))
+               E!(ObjectWrongFieldArity(info(e), n(e), given, actual)) when given != actual
+               ;Check initialization types
+               val ats = map(type, args(e))
+               E!(BadNew(info(e), e, #C(ats))) when any?(not-assign?, ats, fts)
+         (e:LSDeref) :
+            check-subexps()
+            val t = type(exp(e))
+            E!(BadDeref(info(e), #C(t))) when cant-deref?(t)
+         (e:LSSlot) :
+            check-subexps()
+            ;Check index
+            val it = type(index(e))
+            E!(BadIndex(info(e), #C(it))) when not-long?(it)
+            ;Check expression
+            val t = type(exp(e))
+            E!(BadSlot(info(e), #C(t))) when cant-deptr?(t)
+         (e:LSField) :
+            check-subexps()
+            val t = type(exp(e))
+            E!(BadField(info(e),#C(t),name(e))) when cant-field?(t, name(e))
+         (e:LSDo|LSDoInStack) :
+            check-subexps()
+            val ft = type(func(e))
+            if not-func?(ft) :
+               E!(NotLSFunction(info(e),func(e)))
+            else :
+               val ats = map(type, args(e))
+               E!(BadLSCall(info(e),func(e),#C(ats))) when cant-ls-call?(ft, ats)
+         (e:LSDoStack) :
+            check-subexps()
+            val st = type(func(e))
+            E!(NotStack(info(e), #C(st))) when not-stack?(st)
+         (e:LSAddr) :
+            check-subexps()
+            E!(BadAddr(info(e), exp(e))) when not-lvalue?(exp(e))
+         (e:LSCallC) :
+            check-subexps()
+            val ft = type(func(e))
+            if not-func?(ft) :
+               E!(NotLSFunction(info(e),func(e)))
+            else :
+               ;Check if closure
+               match(func(e)) :
+                  (f:LSDeref) :
+                     val ft = type(exp(f))
+                     E!(BadLSCallClosure(info(e),exp(f))) when ft typeof RefT
+                  (f) : false
+               ;Check call
+               val ats = map(type, args(e))
+               E!(BadLSCall(info(e),func(e),#C(ats))) when cant-ls-call?(ft, ats)
+         (e:LSPrim) :
+            check-subexps()
+            val ats = map(type, args(e))
+            E!(BadPrimitive(info(e),op(e),#C(ats))) when cant-call?(op(e), ats)
+         (e:LSSizeof) :
+            E!(BadSizeof(info(e),targ(e))) when no-size?(targ(e))
+         (e:LSCast) :
+            check-subexps()
+            val et = type(exp(e))
+            E!(BadCast(info(e),#C(et),targ(e))) when cant-cast?(et, targ(e))
+         (e:LSAnd) :
+            check-subexps()
+            val at = type(a(e))
+            val bt = type(b(e))
+            E!(BadAnd(info(e),#C(at),#C(bt))) when not-longs?(at,bt)
+         (e:LSOr) :
+            check-subexps()
+            val at = type(a(e))
+            val bt = type(b(e))
+            E!(BadOr(info(e),#C(at),#C(bt))) when not-longs?(at,bt)
+         (e:LSMix) :
+            val exps* = select(exps(e), sel(e) as SSel)
+            val n = length(exps*)
+            val c = ctxt(e) as CLSExp|CLSDo
+            switch {n == _} :
+               0 :
+                  ;Selection is all false
+                  E!(NoMix(info(e), exps(e), c))
+               1 :
+                  ;Selection has exactly one non-false
+                  check(head(exps*))
+               else :
+                  ;Selection contains unknowns
+                  if not-resolved?(sel(e)) :
+                     E!(AmbMix(info(e), exps*, c))
+                  ;Selection contains multiple trues
+                  else :
+                     val ts = map({type(_) as FnT}, exps*)
+                     if not-disjoint?(ts, type(c)) : E!(AmbMix(info(e), exps*, c))
+                     else : do(check, exps*)
+         (e:LSCurry) :
+            check-subexps()
+            ;Check targ arity
+            if wrong-poly-tarity?(type(ref(e)), targs(e)) :
+               E!(WrongTypeArity(info(e),e))
+            ;Check carg captures
+            val c = ctxt(e) as Context
+            E!(BadCapture(info(e), e, c)) when any?(not-resolved?, cargs(e))
+         (e) :
+            check-subexps()
+
+   defn check-bounded (e:LSExp) :
+      defn check-exp (e:LSExp, bounded-exp?:True|False) -> False :
+         if bounded-exp? :
+            if not-bounded?(type(e)) :
+               E!(UnboundedExp(info(e),#C(type(e))))
+         match(e) :
+            (e:LSDo|LSDoInStack|LSCallC) :
+               check-exp(func(e), false)
+               do(check-exp{_, true}, args(e))
+            (e:LSAddr) : check-exp(exp(e), false)
+            (e:LSField) : check-exp(exp(e), false)
+            (e:LSMix|LSCurry) : false
+            (e:LSLetExp) : check-exp(exp(e), bounded-exp?)
+            (e) : do(check-exp{_:LSExp, true}, e)
+      check-exp(e, true)
+
+   ;======== Driver ========
+   do(check, comms(prog))
+   if not empty?(errors) :
+      ;Filter out low priority errors
+      val filtered-errors = let :
+         val hp = filter(high-priority{_, env, ls-env}, errors)
+         errors when empty?(hp) else hp
+      ;Print Errors
+      for e in filtered-errors do :
+         println(to-printable(e, nm, env, ls-env))
+      ;Throw
+      throw(new TypeError)
+
+;============================================================
+;================== Error Messages ==========================
+;============================================================
+deftype TypeError <: Exception
+
+defstruct NoInferredType <: TypeError :
+   info: False|FileInfo
+   def: TDef|TDefTuple|TDefVar|TLetVar
+
+defstruct BadAssign <: TypeError :
+   info: False|FileInfo
+   def: TDef|TDefVar|TLDef|TLDefVar|TLet|TLetVar|LSDef|LSDefVar
+
+defstruct BadLSMethod <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct UnboundedDef <: TypeError :
+   info: False|FileInfo
+   def: TLDef|TLDefVar|LSDef|LSDefVar
+
+defstruct UnboundedExp <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct NewWithRest <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct StructWithRest <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct ArrayWithoutRest <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct ObjectWrongTypeArity <: TypeError :
+   info: False|FileInfo
+   n: Int
+   targ: Type
+
+defstruct ObjectWrongFieldArity <: TypeError :
+   info: False|FileInfo
+   n: Int
+   given: Int
+   actual: Int
+
+defstruct BadNew <: TypeError :
+   info: False|FileInfo
+   exp: LSNew|LSArray|LSStruct
+   types: List<LSType>
+
+defstruct NotTuple <: TypeError :
+   info: False|FileInfo
+   type: Type
+
+defstruct BadDetuple <: TypeError :
+   info: False|FileInfo
+   type: Type
+   n: Int
+
+defstruct NoInferredArg <: TypeError :
+   info: False|FileInfo
+   n: Int
+   ctxt: Context
+
+defstruct NoInferredRet <: TypeError :
+   info: False|FileInfo
+   def: TDefn
+
+defstruct BadThisType <: TypeError :
+   info: False|FileInfo
+   this-type: Type
+   obj-type: Type
+
+defstruct BadRet <: TypeError :
+   info: False|FileInfo
+   def: TDefn|TDefmethod|TFn
+   type: Type
+
+defstruct BadLSRet <: TypeError :
+   info: False|FileInfo
+   type: LSType
+   expected: LSType
+
+defstruct BadBranchArg <: TypeError :
+   info: False|FileInfo
+   n: Int
+   type: Type|LSType
+   match-type: Type|LSType
+
+defstruct BadCast <: TypeError :
+   info: False|FileInfo
+   type: Type|LSType
+   targ: Type|LSType
+
+defstruct BadUpcast <: TypeError :
+   info: False|FileInfo
+   type: Type
+   targ: Type
+
+defstruct BadSet <: TypeError :
+   info: False|FileInfo
+   n: Int
+   type: Type
+
+defstruct BadLSSet <: TypeError :
+   info: False|FileInfo
+   loc: LSExp
+   type: LSType
+
+defstruct BadLValue <: TypeError :
+   info: False|FileInfo
+   loc: LSExp
+
+defstruct BadAddr <: TypeError :
+   info: False|FileInfo
+   loc: LSExp
+
+defstruct NotFunction <: TypeError :
+   info: False|FileInfo
+   func: TExp
+
+defstruct NotLSFunction <: TypeError :
+   info: False|FileInfo
+   func: LSExp
+
+defstruct BadCall <: TypeError :
+   info: False|FileInfo
+   func: TExp
+   arg-types: List<Type>
+
+defstruct BadLSCall <: TypeError :
+   info: False|FileInfo
+   func: LSExp
+   arg-types: List<LSType>
+
+defstruct BadLSCallClosure <: TypeError :
+   info: False|FileInfo
+   func: LSExp
+
+defstruct NotStack <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct BadLSRef <: TypeError :
+   info: False|FileInfo
+   n: Int
+
+defstruct NoMix <: TypeError :
+   info: False|FileInfo
+   exps: List<TExp>|List<LSExp>
+   ctxt: Context
+
+defstruct AmbMix <: TypeError :
+   info: False|FileInfo
+   exps: List<TExp>|List<LSExp>
+   ctxt: Context
+
+defstruct NoMulti <: TypeError :
+   info: False|FileInfo
+   exps: List<TExp>
+   method-type: Type
+
+defstruct AmbMulti <: TypeError :
+   info: False|FileInfo
+   exps: List<TExp>
+   method-type: Type
+
+defstruct BadMethod <: TypeError :
+   info: False|FileInfo
+   multi: TExp
+   method-type: Type
+
+defstruct WrongTypeArity <: TypeError :
+   info: False|FileInfo
+   exp: TCurry|LSCurry
+
+defstruct BadPrimitive <: TypeError :
+   info: False|FileInfo
+   op: Primitive|LSPrimitive
+   arg-types: List<Type>|List<LSType>
+
+defstruct BadCapture <: TypeError :
+   info: False|FileInfo
+   func: TCurry|LSCurry
+   ctxt: Context
+
+defstruct BadPred <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct BadMatchArg <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct BadLength <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct BadDeref <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct BadIndex <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct BadSlot <: TypeError :
+   info: False|FileInfo
+   type: LSType
+
+defstruct BadField <: TypeError :
+   info: False|FileInfo
+   type: LSType
+   name: Symbol
+
+defstruct BadSizeof <: TypeError :
+   info: False|FileInfo
+   targ: LSType
+
+defstruct BadAnd <: TypeError :
+   info: False|FileInfo
+   atype: LSType
+   btype: LSType
+
+defstruct BadOr <: TypeError :
+   info: False|FileInfo
+   atype: LSType
+   btype: LSType
+
+
+;============================================================
+;=============== Error Message Printing =====================
+;============================================================
+
+defn to-printable (e:TypeError,
+                   nm:NameMap,
+                   env:HashTable<Int,False|Type>,
+                   ls-env:HashTable<Int,False|LSType>) :
+   ;Utilities
+   defn cms (xs:Seqable) : join(xs, ", ")
+   defn #pr (t:Type) : printable(nm, t)
+   defn #pr (t:LSType) : printable(nm, t)
+   defn #pr (ts:Seqable<Type|LSType>) : cms(seq(#pr, ts))
+
+   defn #V (f:False) : fail()
+   defn #V (t:Type) : t
+   defn #V (t:LSType) : t
+
+   ;Properties at definition
+   defn has-name? (n:Int) : key?(nm,n)
+   defn #name (n:Int) : name(nm[n])
+   defn #info (n:Int) : info(nm[n])
+   defn #type (n:Int) -> Type|LSType :
+      match(env[n], ls-env[n]) :
+         (t:Type, lt) : t
+         (t:False, lt:LSType) : lt
+
+   defn #inf? (x:False|FileInfo) :
+      match(x) :
+         (x:False) : ""
+         (x:FileInfo) : "%_: " % [x]
+
+   defn name? (x:Int|List<Int>, str:String, default:String) :
+      match(x) :
+         (xs:List<Int>) :
+            if all?(has-name?, xs) : str % [cms(seq(#name, xs))]
+            else : default
+         (x:Int) :
+            if has-name?(x) : str % [#name(x)]
+            else : default
+
+   defn def-name (c:TLetTuple|TLetVar|TLet|TDefTuple|TDefVar|TDef|TLDef|TLDefVar|LSDef|LSDefVar) :
+      match(c) :
+         (c:TDef|TLDef) : name?(n(c), "global value %~", "global value")
+         (c:TDefVar|TLDefVar) : name?(n(c), "global variable %~", "global variable")
+         (c:TDefTuple) : name?(ns(c), "global values %*", "tuple elements")
+         (c:TLet|LSDef) : name?(n(c), "value %~", "value")
+         (c:TLetVar|LSDefVar) : name?(n(c), "variable %~", "variable")
+         (c:TLetTuple) : name?(ns(c), "values %*", "tuple elements")
+
+   defn def-type (c:TLetTuple|TLetVar|TLet|TDefTuple|TDefVar|TDef|TLDef|TLDefVar|LSDef|LSDefVar) :
+      match(c) :
+         (c:TLetVar|TLet) : ntype(c) as Type
+         (c:LSDef|LSDefVar) : type(c) as LSType
+         (c:TDef|TDefVar) : type(c) as Type
+         (c:TLetTuple) : TTuple(ntypes(c) as List<Type>)
+         (c:TDefTuple) : TTuple(types(c) as List<Type>)
+         (c:TLDef|TLDefVar) : type(c) as LSType
+
+   defn defined-function-name (c:TDefn|TDefmethod|TFn) :
+      match(c) :
+         (c:TDefn) : name?(n(c), "function %~", "function")
+         (c:TDefmethod) : "method"
+         (c:TFn) : "anonymous function"
+
+   defn variable-name (e:LSExp) :
+      match(e) :
+         (e:LSVar) : name?(n(e), "variable %~", "variable")
+         (e) : "location"
+
+   defn value-name (e:TExp|LSExp) :
+      match(e) :
+         (e:TRef) : name?(n(e), "Value %~", "Value")
+         (e:LSVar) : name?(n(e), "Value %~", "Value")
+         (e) : "Expression"
+
+   defn function-name (e:TExp|LSExp) :
+      match(e) :
+         (e:TRef) : name?(n(e), "function %~", "function")
+         (e:TMix) : function-name(head(exps(e)))
+         (e:TCurry) : function-name(ref(e))
+         (e:LSVar) : name?(n(e), "function %~", "function")
+         (e:LSMix) : function-name(head(exps(e)))
+         (e:LSCurry) : function-name(ref(e))
+         (e) : "expression"
+
+   defn multi-name (e:TExp) :
+      match(e) :
+         (e:TRef) : name?(n(e), "multi %~", "multi")
+         (e:TMix) : multi-name(head(exps(e)))
+         (e:TCurry) : multi-name(ref(e))
+
+   defn ref-n (e:TExp|LSExp) :
+      match(e) :
+         (e:TRef) : n(e)
+         (e:TCurry) : ref-n(ref(e))
+         (e:LSVar) : n(e)
+         (e:LSCurry) : ref-n(ref(e))
+
+   defn possibilities (exps:Seqable<TExp|LSExp>) :
+      join{_, "\n"} $ for e in exps seq :
+         val n = ref-n(e)
+         "   %~: %~ at %~" % [#name(n), #pr(#type(n)), #info(n)]
+
+   match(e) :
+      (e:NoInferredType) :
+         "%_Could not infer type of %~." % [
+            #inf?(info(e)), def-name(def(e))]
+      (e:BadAssign) :
+         val v = value(def(e)) as TExp|LSExp
+         "%_Cannot assign expression of type %~ to %~ with declared type %~." % [
+            #inf?(info(e)), #pr(type(v) as Type|LSType), def-name(def(e)), #pr(def-type(def(e)))]
+      (e:BadLSMethod) :
+         "%_Cannot define LoStanza method with type %~." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:UnboundedDef) :
+         "%_Cannot define %~ with unbounded type %~." % [
+            #inf?(info(e)), def-name(def(e)), #pr(def-type(def(e)))]
+      (e:UnboundedExp) :
+         "%_Expression has unbounded type %~." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:NewWithRest) :
+         "%_Cannot use new operator to create object of type %~ containing rest field." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:StructWithRest) :
+         "%_Cannot create struct of type %~ containing rest field." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:ArrayWithoutRest) :
+         "%_Cannot use array operator to create object of type %~ without rest field." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:ObjectWrongTypeArity) :
+         val actual = type-tarity(n(e))
+         val given = types(targ(e) as TTuple)
+         val name = name?(n(e), "Type %~", "Type")
+         "%_%~ requires %~ type arguments, but given (%*)." % [
+            #inf?(info(e)), name, actual, #pr(given)]
+      (e:ObjectWrongFieldArity) :
+         val name = name?(n(e), "Type %~", "Type")
+         "%_%~ requires %~ fields, but given %~." % [
+            #inf?(info(e)), name, actual(e), given(e)]
+      (e:BadNew) :
+         val t = StructT(n(exp(e)), targ(exp(e)))
+         val construct = match(exp(e)) :
+            (e:LSNew) : "object"
+            (e:LSArray) : "array"
+            (e:LSStruct) : "struct"
+         "%_Cannot create %~ of type %~ with fields of type (%*)." % [
+            #inf?(info(e)), construct, #pr(t), #pr(types(e))]
+      (e:NotTuple) :
+         "%_Cannot detuple expression of type %~." %
+            [#inf?(info(e)), #pr(type(e))]
+      (e:BadDetuple) :
+         "%_Cannot deconstruct expression of type %~ into tuple of length %~." %
+            [#inf?(info(e)), #pr(type(e)), n]
+      (e:NoInferredArg) :
+         val ctxt = match(ctxt(e)) :
+            (c:CDo) :
+               attempt :
+                  val ats = map(#V, args(c))
+                  "Called with arguments (%*)." % [#pr(ats)]
+               else : ""
+            (c:CExp) :
+               attempt :
+                  val t = #V(type(c))
+                  "Context expecting type %~." % [#pr(t)]
+               else : ""
+         val name = name?(n(e), "argument %~", "argument")
+         "%_Could not infer type for %~.%~" % [
+            #inf?(info(e)), name, ctxt]
+      (e:NoInferredRet) :
+         "%_Could not infer return type for %~." % [
+            #inf?(info(e)), defined-function-name(def(e))]
+      (e:BadThisType) :
+         "%_Cannot define this argument with type %~ when constructing object of type %~." % [
+            #inf?(info(e)), #pr(this-type(e)), #pr(obj-type(e))]
+      (e:BadRet) :
+         val name = defined-function-name(def(e))
+         val ret = a2(def(e)) as Type
+         "%_Cannot return an expression of type %~ for %~ with declared return type %~." % [
+            #inf?(info(e)), #pr(type(e)), name, #pr(ret)]
+      (e:BadLSRet) :
+         "%_Cannot return expression of type %~ from function with declared return type %~." % [
+            #inf?(info(e)), #pr(type(e)), #pr(expected(e))]
+      (e:BadBranchArg) :
+         val name = name?(n(e), "argument %~", "argument")
+         "%_Branch type %~ for %~ cannot match against match argument of type %~." % [
+            #inf?(info(e)), #pr(type(e)), name, #pr(match-type(e))]
+      (e:BadCast) :
+         "%_Cannot cast expression of type %~ to type %~." % [
+            #inf?(info(e)), #pr(type(e)), #pr(targ(e))]
+      (e:BadUpcast) :
+         "%_Cannot upcast expression of type %~ to type %~." % [
+            #inf?(info(e)), #pr(type(e)), #pr(targ(e))]
+      (e:BadSet) :
+         val name = name?(n(e), "variable %~", "variable")
+         "%_Cannot assign expression of type %~ to %~ with declared type %~." % [
+            #inf?(info(e)), #pr(type(e)), name, #pr(#type(n(e)))]
+      (e:BadLSSet) :
+         val name = variable-name(loc(e))
+         val loct = type(loc(e)) as LSType
+         "%_Cannot assign expression of type %~ to %~ with declared type %~." % [
+            #inf?(info(e)), #pr(type(e)), name, #pr(loct)]
+      (e:BadLValue) :
+         "%_Cannot assign to non-assignable %~." % [
+            #inf?(info(e)), variable-name(loc(e))]
+      (e:BadAddr) :
+         "%_Cannot get address of %~." % [
+            #inf?(info(e)), variable-name(loc(e))]
+      (e:NotFunction) :
+         val name = value-name(func(e))
+         val ft = type(func(e)) as Type
+         "%_%~ of type %~ cannot be called as a function." % [
+            #inf?(info(e)), name, #pr(ft)]
+      (e:NotLSFunction) :
+         val name = value-name(func(e))
+         val ft = type(func(e)) as LSType
+         "%_%~ of type %~ cannot be called as a function." % [
+            #inf?(info(e)), name, #pr(ft)]
+      (e:BadCall) :
+         val name = function-name(func(e))
+         val ft = type(func(e)) as Type
+         "%_Cannot call %~ of type %~ with arguments of type (%*)." % [
+            #inf?(info(e)), name, #pr(ft), #pr(arg-types(e))]
+      (e:BadLSCall) :
+         val name = function-name(func(e))
+         val ft = type(func(e)) as LSType
+         "%_Cannot call %~ of type %~ with arguments of type (%*)." % [
+            #inf?(info(e)), name, #pr(ft), #pr(arg-types(e))]
+      (e:BadLSCallClosure) :
+         val ft = type(func(e)) as LSType
+         "%_Cannot call closure of type %~ using C calling convention." % [
+            #inf?(info(e)), #pr(ft)]
+      (e:NotStack) :
+         "%_Cannot call switch stack on value of type %~." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:BadLSRef) :
+         val name =
+            match(type(nm[n(e)])) :
+               (t:LVarE) : name?(n(e), "variable %~", "variable")
+               (t:LValE) : name?(n(e), "value %~", "value")
+               (t:LFnE) : name?(n(e), "function %~", "function")
+         "%_LoStanza %~ of type %~ can only be referred to from LoStanza." % [
+            #inf?(info(e)), name, #pr(#type(n(e)))]
+      (e:NoMix) :
+         val name = #name(ref-n(head(exps(e))))
+         match(ctxt(e)) :
+            (c:CDo|CLSDo) :
+               attempt :
+                  val ats = map(#V, args(c))
+                  "%_No appropriate function %~ for arguments of type (%*). Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, #pr(ats), possibilities(exps(e))]
+               else :
+                  "%_No appropriate function %~ for this context. Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, possibilities(exps(e))]
+            (c:CExp|CLSExp) :
+               attempt :
+                  val t = #V(type(c))
+                  "%_No appropriate function %~ for expected type %~. Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, #pr(t), possibilities(exps(e))]
+               else :
+                  "%_No appropriate function %~ for this context. Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, possibilities(exps(e))]
+      (e:AmbMix) :
+         val name = #name(ref-n(head(exps(e))))
+         match(ctxt(e)) :
+            (c:CDo|CLSDo) :
+               attempt :
+                  val ats = map(#V, args(c))
+                  "%_Ambiguous call to overloaded function %~ with arguments of type (%*). Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, #pr(ats), possibilities(exps(e))]
+               else :
+                  "%_Ambiguous call to overloaded function %~. Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, possibilities(exps(e))]
+            (c:CExp|CLSExp) :
+               attempt :
+                  val t = #V(type(c))
+                  "%_Ambiguous reference to overloaded function %~ for expected type %~. Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, #pr(t), possibilities(exps(e))]
+               else :
+                  "%_Ambiguous reference to overloaded function %~. Possibilities are:\n%*" % [
+                     #inf?(info(e)), name, possibilities(exps(e))]
+      (e:NoMulti) :
+         val name = #name(ref-n(head(exps(e))))
+         "%_No appropriate multi %~ for method of type %~. Possibilities are:\n%*" % [
+            #inf?(info(e)), name, #pr(method-type(e)), possibilities(exps(e))]
+      (e:AmbMulti) :
+         val name = #name(ref-n(head(exps(e))))
+         "%_Multiple appropriate multis %~ for method of type %~. Possibilities are:\n%*" % [
+            #inf?(info(e)), name, #pr(method-type(e)), possibilities(exps(e))]
+      (e:BadMethod) :
+         val name = multi-name(multi(e))
+         val multi-t = type(multi(e)) as Type
+         "%_Cannot attach method of type %~ to %~ of type %~." % [
+            #inf?(info(e)), #pr(method-type(e)), name, #pr(multi-t)]
+      (e:WrongTypeArity) :
+         val name = #name(n(ref(exp(e))))
+         val ft = type(ref(exp(e))) as Type|LSType
+         match(ft) :
+            (t:TPoly|PolyT) :
+               if empty?(targs(exp(e))) :
+                  "%_Function %~ of type %~ requires %~ type arguments." % [
+                     #inf?(info(e)), name, #pr(t), length(targs(t))]
+               else :
+                  "%_Function %~ of type %~ requires %~ type arguments, but received (%*)." % [
+                     #inf?(info(e)), name, #pr(t), length(targs(t)), #pr(targs(exp(e)))]
+            (t:TArrow|FnT) :
+               "%_Function %~ of type %~ does not accept type arguments, but received (%*)." % [
+                  #inf?(info(e)), name, #pr(t), #pr(targs(exp(e)))]
+      (e:BadPrimitive) :
+         "%_Cannot call primitive %~ with arguments of type (%*)." % [
+            #inf?(info(e)), op(e), #pr(arg-types(e))]
+      (e:BadCapture) :
+         val func-t = type(ref(func(e))) as TPoly|PolyT
+         val func-name = #name(n(ref(func(e))))
+         val arg-vars = to-list $
+            for (a in cargs(func-t), t in cargs(func(e))) filter :
+               not resolved?(t as Type)
+         val arg-names =
+            if length(arg-vars) == 1 : "type argument %~" % [#name(head(arg-vars))]
+            else : "type arguments %*" % [cms(map(#name, arg-vars))]
+         match(ctxt(e)) :
+            (c:CDo|CLSDo) :
+               attempt :
+                  val ats = map(#V, args(c))
+                  "%_Could not capture %~ for function %~ of type %~. Called with arguments of type (%*)." % [
+                     #inf?(info(e)), arg-names, func-name, #pr(func-t), #pr(ats)]
+               else :
+                  "%_Could not capture %~ for function %~ of type %~." % [
+                     #inf?(info(e)), arg-names, func-name, #pr(func-t)]
+            (c:CExp|CLSExp|CMulti) :
+               attempt :
+                  val t = #V(type(c))
+                  "%_Could not capture %~ for function %~ of type %~. Expected type is %~." % [
+                     #inf?(info(e)), arg-names, func-name, #pr(func-t), #pr(t)]
+               else :
+                  "%_Could not capture %~ for function %~ of type %~." % [
+                     #inf?(info(e)), arg-names, func-name, #pr(func-t)]
+      (e:BadPred) :
+         "%_Expression of type %~ cannot be used as predicate in if statement. Must be a long." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:BadMatchArg) :
+         "%_Expression of type %~ cannot be used as argument to match expression. Must be a ref type." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:BadLength) :
+         "%_Expression of type %~ cannot be used as length for array. Must be a long." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:BadDeref) :
+         "%_Expression of type %~ cannot be dereferenced." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:BadIndex) :
+         "%_Expression of type %~ cannot be used as index. Must be a long." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:BadSlot) :
+         "%_Cannot access indexed slot in expression of type %~." % [
+            #inf?(info(e)), #pr(type(e))]
+      (e:BadField) :
+         "%_Cannot access field %~ in expression of type %~." % [
+            #inf?(info(e)), name(e), #pr(type(e))]
+      (e:BadSizeof) :
+         "%_Cannot compute the size of type %~." % [
+            #inf?(info(e)), #pr(targ(e))]
+      (e:BadAnd) :
+         "%_And operator cannot be applied to argument of type %~ and %~. Must be longs." % [
+            #inf?(info(e)), #pr(atype(e)), #pr(btype(e))]
+      (e:BadOr) :
+         "%_Or operator cannot be applied to argument of type %~ and %~. Must be longs." % [
+            #inf?(info(e)), #pr(atype(e)), #pr(btype(e))]
+
+
+;============================================================
+;============== Error Message Priority ======================
+;============================================================
+
+defn high-priority (e:TypeError, env:HashTable<Int,False|Type>, ls-env:HashTable<Int,False|LSType>) -> True|False :
+   defn #R! (f:False) : fail()
+   defn #R! (t:Type) : fail() when not resolved?(t)
+   defn #R! (t:LSType) : fail() when not resolved?(t)
+   defn #R! (e:TExp) : #R!(type(e))
+   defn #R! (e:LSExp) : #R!(type(e))
+
+   defn #type (n:Int) -> Type|LSType :
+      match(env[n], ls-env[n]) :
+         (t:Type, lt) : t
+         (t:False, lt:LSType) : lt
+
+   defn def-type (c:TLetTuple|TLetVar|TLet|TDefTuple|TDefVar|TDef|TLDef|TLDefVar|LSDef|LSDefVar) :
+      match(c) :
+         (c:TLetVar|TLet) : ntype(c) as Type
+         (c:LSDef|LSDefVar) : type(c) as LSType
+         (c:TDef|TDefVar) : type(c) as Type
+         (c:TLetTuple) : TTuple(ntypes(c) as List<Type>)
+         (c:TDefTuple) : TTuple(types(c) as List<Type>)
+         (c:TLDef|TLDefVar) : type(c) as LSType
+
+   attempt :
+      match(e) :
+         (e:NoInferredType) : false
+         (e:BadAssign) : (#R!(value(def(e))), #R!(def-type(def(e))))
+         (e:BadLSMethod) : #R!(type(e))
+         (e:UnboundedDef) : false
+         (e:UnboundedExp) : #R!(type(e))
+         (e:NewWithRest) : false
+         (e:StructWithRest) : false
+         (e:ArrayWithoutRest) : false
+         (e:ObjectWrongTypeArity) : false
+         (e:ObjectWrongFieldArity) : false
+         (e:BadNew) : do(#R!, types(e))
+         (e:NotTuple) : #R!(type(e))
+         (e:BadDetuple) : #R!(type(e))
+         (e:NoInferredArg) : #R!(type(ctxt(e) as CDo|CExp))
+         (e:NoInferredRet) : false
+         (e:BadThisType) : false
+         (e:BadRet) : (#R!(type(e)), #R!(a2(def(e))))
+         (e:BadLSRet) : #R!(type(e))
+         (e:BadBranchArg) : (#R!(match-type(e)), #R!(type(e)))
+         (e:BadCast) : #R!(type(e))
+         (e:BadUpcast) : #R!(type(e))
+         (e:BadSet) : (#R!(type(e)), #R!(#type(n(e))))
+         (e:BadLSSet) : (#R!(loc(e)), #R!(type(e)))
+         (e:BadLValue) : false
+         (e:BadAddr) : #R!(loc(e))
+         (e:NotFunction) : #R!(func(e))
+         (e:NotLSFunction) : #R!(func(e))
+         (e:BadCall) : (#R!(func(e)), do(#R!, arg-types(e)))
+         (e:BadLSCall) : (#R!(func(e)), do(#R!, arg-types(e)))
+         (e:BadLSCallClosure) : #R!(func(e))
+         (e:NotStack) : #R!(type(e))
+         (e:BadLSRef) : false
+         (e:NoMix) :
+            match(ctxt(e)) :
+               (c:CDo|CLSDo) : do(#R!, args(c))
+               (c:CExp|CLSExp) : #R!(type(c))
+         (e:AmbMix) :
+            match(ctxt(e)) :
+               (c:CDo|CLSDo) : do(#R!, args(c))
+               (c:CExp|CLSExp) : #R!(type(c))
+         (e:NoMulti) : #R!(method-type(e))
+         (e:AmbMulti) : #R!(method-type(e))
+         (e:BadMethod) : (#R!(multi(e)), #R!(method-type(e)))
+         (e:WrongTypeArity) : #R!(ref(exp(e)))
+         (e:BadPrimitive) : do(#R!, arg-types(e))
+         (e:BadCapture) :
+            #R!(ref(func(e)))
+            match(ctxt(e)) :
+               (c:CDo|CLSDo) : do(#R!, args(c))
+               (c:CExp|CLSExp|CMulti) : #R!(type(c))
+         (e:BadPred) : #R!(type(e))
+         (e:BadMatchArg) : #R!(type(e))
+         (e:BadLength) : #R!(type(e))
+         (e:BadDeref) : #R!(type(e))
+         (e:BadIndex) : #R!(type(e))
+         (e:BadSlot) : #R!(type(e))
+         (e:BadField) : #R!(type(e))
+         (e:BadSizeof) : false
+         (e:BadAnd) : (#R!(atype(e)), #R!(btype(e)))
+         (e:BadOr) : (#R!(atype(e)), #R!(btype(e)))
+      ;Return true
+      true
+
+
+;============================================================
+;=============== General Utilities ==========================
+;============================================================
+defstruct Fresh
