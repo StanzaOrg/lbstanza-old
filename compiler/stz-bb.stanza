@@ -142,7 +142,13 @@ defn spill-call-args (def:tgt-DefFn, backend:Backend) :
    defn make-var (t:tgt-TgtType) :
       val n = fresh-id()
       add(defvars, tgt-DefVar(n, t))
-      tgt-Var(n)
+      tgt-Var(n)      
+
+   var cached-c-rsp : False|tgt-Var = false
+   defn saved-c-rsp () :
+      if cached-c-rsp is False :
+         cached-c-rsp = make-var(tgt-LONG-TYPE)
+      cached-c-rsp as tgt-Var   
 
    ;     Split Locations
    ;     ---------------
@@ -191,9 +197,18 @@ defn spill-call-args (def:tgt-DefFn, backend:Backend) :
                emit(tgt-Store(x, tgt-Mem(ARG-LBL,0), o))
             emit(tgt-Return(xs))
          (e:tgt-CArgsIns) :
-            fatal("Not yet implemented.")
+            val sp = make-var(tgt-LONG-TYPE)
+            val [xs, mxs] = split-callc-locs(tgt-xs(e))
+            emit(tgt-CArgsIns(cons(sp, xs)))
+            for (x in mxs, i in 0 to false) do :
+               emit(tgt-Load(x, sp, 8 * (i + 1)))
+            emit(tgt-Load(saved-c-rsp(), tgt-Mem(C-RSP-LBL,0), 0))
+            emit(tgt-Store(tgt-Mem(C-RSP-LBL,0), sp, 0))
          (e:tgt-CReturn) :
-            fatal("Not yet implemented.")
+            val sp = make-var(tgt-LONG-TYPE)
+            emit(tgt-Load(sp, tgt-Mem(C-RSP-LBL,0), 0))
+            emit(tgt-Store(tgt-Mem(C-RSP-LBL,0), saved-c-rsp(), 0))
+            emit(tgt-CReturn(cons(sp, tgt-xs(e))))
          (e:tgt-Call) :
             val [ys, mys] = split-call-locs(tgt-ys(e))
             val [xs, mxs] = split-call-locs(tgt-xs(e))
@@ -227,8 +242,7 @@ defn spill-call-args (def:tgt-DefFn, backend:Backend) :
             if empty?(mys) :               
                emit(tgt-CallC(1, tgt-xs(e), tgt-f(e), ys))               
             else :
-               val n = if length(mys) % 2 == 0 : length(mys) + 1
-                       else : length(mys)
+               val n = length(mys) | 1
                val sp = make-var(tgt-LONG-TYPE)
                emit(tgt-Load(sp, tgt-Mem(C-RSP-LBL,0), 0))
                for (y in mys, i in 0 to false) do :
@@ -402,7 +416,10 @@ defn to-bb-ir (d:tgt-DefFn) -> [HashTable<Int,tgt-TgtType>, Unit] :
       match(i) :
          (i:tgt-ArgsIns) :
             val xs* = map(to-var, tgt-xs(i))
-            emit(Args(xs*))
+            emit(Args(xs*, StanzaContext()))
+         (i:tgt-CArgsIns) :
+            val xs* = map(to-var, tgt-xs(i))
+            emit(Args(xs*, CContext()))
          (i:tgt-SetIns) :
             val x* = to-var(tgt-x(i))
             val y* = to-imm(tgt-y(i))
@@ -572,7 +589,12 @@ defn to-bb-ir (d:tgt-DefFn) -> [HashTable<Int,tgt-TgtType>, Unit] :
             active-block = fresh-block(fresh-id())
          (i:tgt-Return) :
             val xs = map(to-imm, tgt-xs(i))
-            emit(Return(xs))
+            emit(Return(xs, StanzaContext()))
+            close-block(List())
+            active-block = fresh-block(fresh-id())
+         (i:tgt-CReturn) :
+            val xs = map(to-imm, tgt-xs(i))
+            emit(Return(xs, CContext()))
             close-block(List())
             active-block = fresh-block(fresh-id())
          (i:tgt-Label) :
@@ -1858,12 +1880,13 @@ defn register-assignment (tt:HashTable<Int,tgt-TgtType>,
                      tgt-CONV-OP : x-prefers-any()
                      tgt-INTERPRET-OP : x-prefers-any()
                      tgt-SWITCH-STACK-OP : no-xs()
+                     tgt-ENTER-FROM-C : no-xs()
                      tgt-NO-OP : ignore()
          (e:Branch) :
             emit(Branch(op(e), fill(xs(e))))
             free(rt[Pos(i,false), Pos(i,true)])
          (e:Return) :
-            emit(Return(fill(xs(e))))
+            emit(Return(fill(xs(e)), ctxt(e)))
             free(rt[Pos(i,false), Pos(i,true)])
          (e:Save) :
             emit(Save(fill(x(e))))
@@ -1875,7 +1898,7 @@ defn register-assignment (tt:HashTable<Int,tgt-TgtType>,
          (e:Args) :
             free(rt[Pos(i,false), Pos(i,true)])
             assign(xs(e), map(FreeReg{}, xs(e)))
-            emit(Args(fill(xs(e))))
+            emit(Args(fill(xs(e)), ctxt(e)))
          (e:Call) :
             val f* = fill(f(e))
             val ys* = fill(ys(e))
@@ -2485,6 +2508,11 @@ defn compile (func-id:Int,
          if int?(x) : RegAV(0, type(x))
          else : FRegAV(0, type(x))
 
+   defn carg-locations (xs:List<AVal>) :
+      val [sp, args] = [head(xs), tail(xs)]
+      cons(RegAV(6, type(sp))
+           callc-locations(args))
+
    ;     Value Engine
    ;     ------------
    defn aval (x:Imm|Port) :
@@ -2682,9 +2710,17 @@ defn compile (func-id:Int,
             av-mov(aval(x(e)), aval(y(e)))
          (e:Return) :
             val xs* = map(aval, xs(e))
-            val ts* = call-locations(xs*)
-            shuffle(ts*, xs*)
-            av-return()
+            match(ctxt(e)) :
+               (c:StanzaContext) :
+                  val ts* = call-locations(xs*)
+                  shuffle(ts*, xs*)
+                  av-return()
+               (c:CContext) :
+                  val [sp, rets] = [head(xs*), tail(xs*)]
+                  val ts* = callc-ret-locations(rets)
+                  av-mov(RSPAV(), sp)
+                  shuffle(ts*, rets)
+                  av-return()                  
          (e:Op) :
             match(op(e)) :
                (op:tgt-LoadOp) :
@@ -2746,6 +2782,29 @@ defn compile (func-id:Int,
                      ;Intercept return code
                      av-mov(R1, MemAV(RETRACT-STACK-LBL,0))
                      av-store(RSP, R1, 0)
+                     
+                  else if op == tgt-ENTER-FROM-C :
+                     val RSP = RSPAV()
+                     val R1 = RegAV(1, asm-LONG-TYPE)
+                     val R6 = RegAV(6, asm-LONG-TYPE)
+                     val R11 = RegAV(11, asm-LONG-TYPE)
+                     val R12 = RegAV(12, asm-LONG-TYPE)
+                     val R13 = RegAV(13, asm-LONG-TYPE)
+                     val R14 = RegAV(14, asm-LONG-TYPE)
+
+                     ;Store C preserved registers
+                     av-store(RSP, R1, -8)
+                     av-store(RSP, R6, -16)
+                     av-store(RSP, R11, -24)
+                     av-store(RSP, R12, -32)
+                     av-store(RSP, R13, -40)
+                     av-store(RSP, R14, -48)
+                     
+                     ;Move RSP to R6 for CArgs
+                     av-mov(R6, RSP)
+
+                     ;Restore Stanza context
+                     av-load(RSP, MemAV(STACK-PTR-LBL,0), 0)
 
                   else if length(ys(e)) == 2 :
                      val [x, y, z] = [xs(e)[0], ys(e)[0], ys(e)[1]]
@@ -2770,7 +2829,9 @@ defn compile (func-id:Int,
 
             ;Save argument values
             val xs* = map(aval, xs(e))
-            val ts* = call-locations(xs*)
+            val ts* = match(ctxt(e)) :
+               (c:StanzaContext) : call-locations(xs*)
+               (c:CContext) : carg-locations(xs*)
             shuffle(xs*, ts*)
          (e:Call) :
             match(type(e)) :
