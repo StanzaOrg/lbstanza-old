@@ -73,6 +73,3 @@
       -o bin/$1 \
       -optimize
 
-
-
-
