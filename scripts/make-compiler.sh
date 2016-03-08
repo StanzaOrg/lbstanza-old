@@ -34,7 +34,7 @@
 #
 
 
-./bin/stanzab core/reader.stanza \
+./stanza core/reader.stanza \
          core/macro-utils.stanza \
          compiler/stz-algorithms.stanza \
          compiler/stz-padder.stanza \
@@ -71,8 +71,8 @@
          compiler/lang-resolver.stanza \
          compiler/stz-main.stanza \
       -o bin/$1 \
-      -optimize \
-      -verbose
+      -optimize
+
 
 
 
