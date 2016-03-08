@@ -1,7 +1,6 @@
 #include<stdlib.h>
 #include<stdio.h>
 #include<sys/time.h>
-#include<limits.h>
 #include<errno.h>
 
 //     Stanza Defined Entities
@@ -30,7 +29,6 @@ FILE* get_stdout () {return stdout;}
 FILE* get_stderr () {return stderr;}
 FILE* get_stdin () {return stdin;}
 int get_eof () {return EOF;}
-int get_PATH_MAX () {return PATH_MAX;}
 int get_errno () {return errno;}
 
 //     Time of Day
