@@ -274,53 +274,50 @@ lostanza defn tuple-length-error () -> ref<Void> :
 ;============================================================
 ;================== Stack Traces ============================
 ;============================================================
-
-lostanza var trace-buffer:ptr<ptr<FileInfoEntry>>
-lostanza var trace-size:int
 lostanza val null:ptr<?> = 0 as long as ptr<?>
 
 lostanza defn print-stack-trace (end:ptr<?>) -> ref<False> :
    ;Allocate space for storing trace
    ;No trace can be larger than the size of a stack
-   trace-buffer = call-c clib/malloc(stanza_stack_size)
+   val trace-buffer:ptr<ptr<FileInfoEntry>> = call-c clib/malloc(stanza_stack_size) 
 
    ;Print trace starting from current stack
-   print-stack-trace(call-prim stack(), end)
+   labels :
+      begin :
+         goto loop(call-prim stack(), end)
+      loop (s:ref<Stack>, end:ptr<?>) :
+         labels :
+            ;Start with frame past intercepted return frame
+            begin :
+               val f0 = addr!(s.frames)
+               goto store(f0 + frame-size(f0), 0)
+               
+            ;Store trace into buffer   
+            store (s:ptr<StackFrame>, i:int) :
+               ;Store the return address into trace buffer
+               trace-buffer[i] = info-entry(s.ret)
+               ;Continue tracing next frame unless end is reached.
+               if s == end : goto print(i)
+               else : goto store(s + frame-size(s), i + 1)
+               
+            ;Print trace backwards   
+            print (i:int) :
+               if i >= 0 :
+                  val e = trace-buffer[i]
+                  if e == null :
+                     call-c clib/fprintf(stderr, "   at [Unknown Source Location]\n")
+                  else :
+                     call-c clib/fprintf(stderr, "   at %s:%d.%d\n", e.file, e.line, e.column)
+                  goto print(i - 1)   
+
+         ;Print parent stack trace
+         match(s.parent) :
+            (p:ref<Stack>) : goto loop(p, p.sp)
+            (p:ref<False>) : ()
 
    ;Free trace buffer and return
    call-c clib/free(trace-buffer)
    return false
-
-lostanza defn* print-stack-trace (s:ref<Stack>, end:ptr<?>) -> int :
-   ;Store trace into buffer
-   trace-size = 0
-   val f0 = addr!(s.frames) + frame-size(addr!(s.frames)) ;Skip intercepted return frame
-   store-stack-trace(f0, end)
-
-   ;Print out trace
-   for (var i:int = trace-size - 1, i >= 0, i = i - 1) :
-      val e = trace-buffer[i]
-      if e == null :
-         call-c clib/fprintf(stderr, "   at [Unknown Source Location]\n")
-      else :
-         call-c clib/fprintf(stderr, "   at %s:%d.%d\n", e.file, e.line, e.column)
-
-   ;Print parent stack trace
-   match(s.parent) :
-      (p:ref<Stack>) : return print-stack-trace(p, p.sp)
-      (p:ref<False>) : return 0
-
-lostanza defn* store-stack-trace (stacks:ptr<StackFrame>, end:ptr<?>) -> int :
-   ;Store the return address into trace buffer
-   trace-buffer[trace-size] = info-entry(stacks.ret)
-   trace-size = trace-size + 1
-
-   ;Continue tracing next frame unless end is reached.
-   if stacks == end :
-      return 0
-   else :
-      val sz = frame-size(stacks)
-      return store-stack-trace(stacks + sz, end)
 
 lostanza defn frame-size (s:ptr<StackFrame>) -> long :
    val map = s.map
@@ -482,13 +479,17 @@ lostanza defn post-gc-marker (marker:ref<False|Sentinel|LivenessMarker>) -> ref<
       if p[0] == -1 : return p[1] as ref<LivenessMarker>
       else : return false
 
-lostanza defn* scan-trackers (tracker:ref<False|LivenessTracker>) -> ref<False> :
-   match(tracker) :
-      (tracker:ref<LivenessTracker>) :
-         tracker.marker = post-gc-marker(tracker.marker)
-         return scan-trackers(tracker.next)
-      (tracker:ref<False>) :
-         return false
+lostanza defn scan-trackers (tracker:ref<False|LivenessTracker>) -> ref<False> :
+   labels :
+      begin :
+         goto loop(tracker)
+      loop (t:ref<False|LivenessTracker>) :      
+         match(t) :
+            (t:ref<LivenessTracker>) :
+               t.marker = post-gc-marker(t.marker)
+               goto loop(t.next)
+            (t:ref<False>) :
+               return false
 
 ;                 Scanning Functions
 ;                 ==================
@@ -503,35 +504,53 @@ lostanza defn scan-globals () -> int :
    return 0
 
 ;Copy all stack references in this and parent stacks to free memory.
-lostanza defn* scan-stack (s:ref<Stack>) -> int :
-   if s.mark == 0 :
-      s.mark = 1
-      scan-stack-frames(addr!(s.frames), s.sp)
-      match(s.parent) :
-         (p:ref<Stack>) : return scan-stack(p)
-         (p:ref<False>) : return 0
-   else :
-      return 0
+lostanza defn scan-stack (s:ref<Stack>) -> int :
+   labels :
+      begin :
+         goto loop(s)
+      loop (s:ref<Stack>) :
+         if s.mark == 0 :
+            s.mark = 1
+
+            ;Scan all stack frames
+            val sp = s.sp
+            labels :
+               begin :
+                  goto scan(addr!(s.frames))
+               scan (fs:ptr<StackFrame>) :
+                  if fs < sp :
+                     val map = fs.map
+                     scan-map-words(addr(map.bits), map.length, addr(fs.items))
+                     val next-fs = addr(fs.items[map.length])
+                     goto scan(next-fs as ptr<StackFrame>)
+
+            ;Scan stack parent if there is one
+            match(s.parent) :
+               (p:ref<Stack>) : goto loop(p)
+               (p:ref<False>) : ()
+   return 0
 
 ;Copy all internal references in heap to free memory.
 lostanza defn scan-heap () -> int :
-   var p: ptr<long> = free-mem   
-   while p < free-ptr :
-      val tagword = p[0]
-      val tagbits = tagword & 7
-      if tagbits == 0 :
-         val tag = tagword >>> 3
-         if tag == tagof(LivenessTracker) :
-            p = scan-liveness-tracker(p)            
-         else :
-            p = scan-object(p)
-      else if tagbits == 1 :
-         p = scan-array(p)
-      else :
-         call-c clib/fprintf(stderr, "Invalid tag bits in heap: %lx\n", tagbits)
-         call-c clib/exit(-1)
-         return 0
-   return 0
+   labels :
+      begin :
+         goto loop(free-mem)
+      loop (p:ptr<long>) :
+         if p < free-ptr :
+            val tagword = p[0]
+            val tagbits = tagword & 7
+            if tagbits == 0 :
+               val tag = tagword >>> 3
+               if tag == tagof(LivenessTracker) :
+                  goto loop(scan-liveness-tracker(p))            
+               else :
+                  goto loop(scan-object(p))
+            else if tagbits == 1 :
+               goto loop(scan-array(p))
+            else :
+               call-c clib/fprintf(stderr, "Invalid tag bits in heap: %lx\n", tagbits)
+               call-c clib/exit(-1)
+   return 0           
 
 ;Copy all internal references in object to free memory.
 lostanza defn scan-object (p:ptr<long>) -> ptr<long> :
@@ -566,26 +585,18 @@ lostanza defn scan-array (p:ptr<long>) -> ptr<long> :
    ;Return end of array
    return p + 16 + bytes
 
-;Copy all internal references in stack frames, fs, until end pointer
-lostanza defn* scan-stack-frames (fs:ptr<StackFrame>, end:ptr<?>) -> int :
-   if fs < end :
-      val map = fs.map
-      scan-map-words(addr(map.bits), map.length, addr(fs.items))
-      val next-fs = addr(fs.items[map.length]) as ptr<StackFrame>
-      return scan-stack-frames(next-fs, end)
-   else :
-      return 0
-
 ;Scan n references (marked with a 1 bit) from the given pointer
-lostanza defn* scan-map-words (map:ptr<long>, n:long, refs:ptr<long>) -> int :
-   if n > 64 :
-      scan-map-word([map], 64, refs)
-      return scan-map-words(addr(map[1]), n - 64, addr(refs[64]))
-   else if n > 0 :
-      scan-map-word([map], n, refs)
-      return 0
-   else :
-      return 0
+lostanza defn scan-map-words (map:ptr<long>, n:long, refs:ptr<long>) -> int :
+   labels :
+      begin :
+         goto loop(map, n, refs)
+      loop (map:ptr<long>, n:long, refs:ptr<long>) :
+         if n > 64 :
+            scan-map-word([map], 64, refs)
+            goto loop(map + sizeof(long), n - 64, addr(refs[64]))
+         else if n > 0 :
+            scan-map-word([map], n, refs)
+   return 0
 
 lostanza defn scan-map-word (map:long, n:long, refs:ptr<long>) -> int :
    var ref-ptr:ptr<long> = refs
@@ -924,7 +935,7 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
    current-coroutine.top = call-prim stack()
    current-coroutine.c-rsp = call-prim c-rsp()
    bottom(c).parent = false
-   detach(c, false)
+   detach(c)
 
    ;Return to resume
    val result = CoResult{x, windout(c), false}
@@ -939,7 +950,7 @@ lostanza defmethod* break (c:ref<RawCoroutine>, x:ref<?>) -> ref<Void> :
    ;Detach coroutine
    current-coroutine.top = call-prim stack()
    current-coroutine.c-rsp = call-prim c-rsp()
-   detach(c, false)
+   detach(c)
 
    ;Result to return to resume
    val result = CoResult{x, windout(c), true}
@@ -961,48 +972,64 @@ lostanza defmethod close (c:ref<RawCoroutine>) -> ref<False> :
    free(c)
    return false
 
-lostanza defn* attach (c:ref<RawCoroutine>) -> int :
-   val p = c.parent
-   c.parent = current-coroutine
-   c.status = COROUTINE-ACTIVE
-   current-coroutine = c
-   match(p) :
-      (p:ref<RawCoroutine>) : return attach(p)
-      (p:ref<False>) : return 0
+lostanza defn attach (c:ref<RawCoroutine>) -> int :
+   labels :
+      begin :
+         goto loop(c)
+      loop (c:ref<RawCoroutine>) :
+         val p = c.parent
+         c.parent = current-coroutine
+         c.status = COROUTINE-ACTIVE
+         current-coroutine = c
+         match(p) :
+            (p:ref<RawCoroutine>) : goto loop(p)
+            (p:ref<False>) : return 0
 
-lostanza defn* detach (c:ref<RawCoroutine>, tail:ref<RawCoroutine|False>) -> int :
-   val cc = current-coroutine
-   val ccp = current-coroutine.parent as ref<RawCoroutine>
-   cc.parent = tail
-   current-coroutine = ccp
-   if c == cc :
-      cc.status = COROUTINE-OPEN
-      return 0
-   else :
-      cc.status = COROUTINE-SUSPENDED
-      return detach(c, cc)
+lostanza defn detach (c:ref<RawCoroutine>) -> int :
+   labels :
+      begin :
+         goto loop(false)
+      loop (tail:ref<RawCoroutine|False>) :
+         val cc = current-coroutine
+         val ccp = current-coroutine.parent as ref<RawCoroutine>
+         cc.parent = tail
+         current-coroutine = ccp
+         if cc == c :
+            cc.status = COROUTINE-OPEN
+            return 0
+         else :
+            cc.status = COROUTINE-SUSPENDED
+            goto loop(cc)
 
-lostanza defn* free (c:ref<RawCoroutine>) -> int :
-   val parent = c.parent
-   c.status = COROUTINE-CLOSED
-   free-stacks(top(c), bottom(c))
-   c.top = false
-   c.bottom = false
-   c.parent = false
-   c.windin = false
-   c.windout = false
-   match(parent) :
-      (p:ref<RawCoroutine>) : return free(p)
-      (p:ref<False>) : return 0
+lostanza defn free (c:ref<RawCoroutine>) -> int :
+   labels :
+      begin :
+         goto loop(c)
+      loop (c:ref<RawCoroutine>) :   
+         val parent = c.parent
+         c.status = COROUTINE-CLOSED
+         free-stacks(top(c), bottom(c))
+         c.top = false
+         c.bottom = false
+         c.parent = false
+         c.windin = false
+         c.windout = false
+         match(parent) :
+            (p:ref<RawCoroutine>) : goto loop(p)
+            (p:ref<False>) : return 0
 
-lostanza defn* free-stacks (top:ref<Stack>, bottom:ref<Stack>) -> int :
-   if top == bottom :
-      free-stack(top)
-      return 0
-   else :
-      val p = parent(top)
-      free-stack(top)
-      return free-stacks(p, bottom)
+lostanza defn free-stacks (top:ref<Stack>, bottom:ref<Stack>) -> int :
+   labels :
+      begin :
+         goto free(top)
+      free (top:ref<Stack>) :      
+         if top == bottom :
+            free-stack(top)
+            return 0
+         else :
+            val p = parent(top)
+            free-stack(top)
+            goto free(p)
 
 defmethod print (o:OutputStream, c:RawCoroutine) :
    val s = switch {status(c) == _} :
@@ -2620,22 +2647,24 @@ lostanza defmethod equal? (a:ref<String>, b:ref<String>) -> ref<True|False> :
       return false
 
 lostanza defmethod compare (a:ref<String>, b:ref<String>) -> ref<Int> :
-   val c = compare-strings(a, b, 0, strlen(a), strlen(b))
-   return new Int{c}
-
-lostanza defn* compare-strings (a:ref<String>, b:ref<String>, i:long, na:long, nb:long) -> int :
-   if (i == na) and (i == nb) :
-      return 0
-   else if i == na :
-      return -1
-   else if i == nb :
-      return 1
-   else :
-      val ac = a.chars[i]
-      val bc = b.chars[i]
-      if ac < bc : return -1
-      else if ac > bc : return 1
-      else : return compare-strings(a, b, i + 1, na, nb)
+   val na = strlen(a)
+   val nb = strlen(b)
+   labels :
+      begin :
+         goto loop(0)
+      loop (i:long) :
+         if (i == na) and (i == nb) :
+            return new Int{0}
+         else if i == na :
+            return new Int{-1}
+         else if i == nb :
+            return new Int{1}
+         else :
+            val ac = a.chars[i]
+            val bc = b.chars[i]
+            if ac < bc : return new Int{-1}
+            else if ac > bc : return new Int{1}
+            else : goto loop(i + 1)
 
 defmethod do (f: Char -> ?, xs:String) :
    defn* loop (i:Int, n:Int) :
@@ -3482,12 +3511,12 @@ public lostanza defn to-float (s:ref<String>) -> ref<False|Float> :
 ;                        Utilities
 ;                        =========
 
-lostanza defn* prefix? (str:ref<String>, prefix:ptr<byte>) -> int :
+lostanza defn prefix? (str:ref<String>, prefix:ptr<byte>) -> int :
    for (var i:long = 0, 1, i = i + 1) :
       if prefix[i] == 0 : return 1
       else if str.chars[i] == 0 : return 0
       else if prefix[i] != str.chars[i] : return 0
-   return 0   
+   return 0
 
 lostanza defn digit (c:byte, radix:int) -> int :
    var d:int
