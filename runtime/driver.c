@@ -18,7 +18,7 @@ char** input_argv;
 int main (int argc, char* argv[]) {  
   input_argc = argc;
   input_argv = argv;
-  char* stack_mem = malloc(stanza_stack_size);
+  char* stack_mem = (char*)malloc(stanza_stack_size);
   stanza_entry(stack_mem);
   return 0;
 }
