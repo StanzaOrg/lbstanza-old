@@ -1,0 +1,817 @@
+;See License.txt for details about licensing.
+
+defpackage stz/parser :
+   import core with :
+      prefix(Seq) => C
+   import collections
+   import macro-utils
+   import stz/algorithms
+
+;============================================================
+;================== RULESET DEFINITION ======================
+
+defstruct RuleSet :
+   groups: List<RuleGroup>
+defstruct RuleGroup :
+   name: Symbol|False
+   rules: List<Rule>
+defstruct Rule :
+   name: Symbol
+   pattern: Pattern
+
+;===================== Printers =============================
+defmethod print (o:OutputStream, r:RuleSet) :
+   print-all(o, join(groups(r), "\n"))
+defmethod print (o:OutputStream, r:RuleGroup) :
+   print(o, "(defrule %_ %@)" % [name(r), rules(r)])
+defmethod print (o:OutputStream, r:Rule) :
+   print(o, "%_ = %~" % [name(r), pattern(r)])
+
+;============================================================
+;================== PATTERN DEFINITION ======================
+
+deftype Pattern
+defstruct Seq <: Pattern :
+   a: Pattern
+   b: Pattern
+defstruct Choice <: Pattern :
+   a: Pattern
+   b: Pattern
+defstruct Fail <: Pattern :
+   action: List<KeyValue<Symbol,?>> -> False
+   pattern: Pattern
+defstruct Terminal <: Pattern :
+   value
+defstruct Empty <: Pattern
+defstruct Form <: Pattern
+defstruct Production <: Pattern :
+   name: Symbol
+defstruct Repeat <: Pattern :
+   pattern: Pattern
+defstruct Combine <: Pattern :
+   bindings: List<Symbol>
+   pattern: Pattern
+defstruct Rest <: Pattern
+defstruct ListPat <: Pattern :
+   pattern: Pattern
+defstruct Binder <: Pattern :
+   name: Symbol
+   pattern: Pattern
+defstruct Action <: Pattern :
+   action: List<KeyValue<Symbol,?>> -> ?
+   pattern: Pattern
+defstruct DelayedAction <: Pattern :
+   index: Int
+   pattern: Pattern
+defstruct Guard <: Pattern :
+   predicate: List<KeyValue<Symbol,?>> -> True|False
+   pattern: Pattern
+defstruct NotPattern <: Pattern :
+   pattern: Pattern
+
+;=================== Constructors ===========================
+defn Seq (xs:Seqable<Pattern>) :
+   val s = to-seq(xs)
+   defn loop () :
+      if empty?(s) : Empty()
+      else : Seq(next(s), loop())
+   loop()
+
+defn Choice (ps:Seqable<Pattern>) :
+   val str = to-seq(ps)
+   defn loop () :
+      val x = next(str)
+      if empty?(str) : x
+      else : Choice(x, loop())
+   if empty?(str) : fatal("No patterns")
+   else : loop()
+
+defn Combine (p:Pattern) :
+   Combine(get-bindings(p), p)
+
+;====================== Mappers =============================
+defn map<?T> (f:Pattern -> Pattern, p:?T&Pattern) -> T :
+   {_ as Pattern&T} $ match(p) :
+      (p:Seq) : Seq(f(a(p)), f(b(p)))
+      (p:Choice) : Choice(f(a(p)), f(b(p)))
+      (p:Fail) : Fail(action(p), f(pattern(p)))
+      (p:Terminal) : p
+      (p:Empty) : p
+      (p:Form) : p
+      (p:Production) : p
+      (p:Repeat) : Repeat(f(pattern(p)))
+      (p:Combine) : Combine(bindings(p), f(pattern(p)))
+      (p:Rest) : p
+      (p:ListPat) : ListPat(f(pattern(p)))
+      (p:Binder) : Binder(name(p), f(pattern(p)))
+      (p:Action) : Action(action(p), f(pattern(p)))
+      (p:DelayedAction) : DelayedAction(index(p), f(pattern(p)))
+      (p:Guard) : Guard(predicate(p), f(pattern(p)))
+      (p:NotPattern) : NotPattern(f(pattern(p)))
+
+defn do (f:Pattern -> ?, p:Pattern) :
+   for sp in p map :
+      f(sp)
+      sp
+   false
+
+defn children (p:Pattern) :
+   val cs = Vector<Pattern>()
+   for sp in p do : add(cs, sp)
+   to-list(cs)
+   
+;======================= Utilities =========================
+defn get-bindings (p:Pattern) :
+   unique $ generate<Symbol> :
+      defn loop (p:Pattern) :
+         match(p) :
+            (p:Binder) : (yield(name(p)), loop(pattern(p)))
+            (p:Action|DelayedAction) : false
+            (p) : do(loop, p)
+      loop(p)
+
+defn flatten (p:Seq) :
+   generate<Pattern> :
+      defn loop (p:Pattern) :
+         match(p) :
+            (p:Seq) : (yield(a(p)), loop(b(p)))
+            (p:Empty) : false
+      loop(p)
+
+defn flatten (p:Choice) :
+   generate<Pattern> :
+      defn loop (p:Pattern) :
+         match(p) :
+            (p:Choice) : (loop(a(p)), loop(b(p)))
+            (p) : yield(p)
+      loop(p)
+      
+;===================== Printers ============================
+defmethod print (o:OutputStream, p:Pattern) :
+   print{o, _} $
+   match(p) :
+      (p:Seq) : "($seq %@)" % [flatten(p)]
+      (p:Choice) : "($or %@)" % [flatten(p)]
+      (p:Fail) : "($fail %~)" % [pattern(p)]
+      (p:Terminal) : value(p)
+      (p:Empty) : "eps"
+      (p:Form) : "_"
+      (p:Production) : "P#%_" % [name(p)]
+      (p:Repeat) : "($repeat %~)" % [pattern(p)]
+      (p:Combine) : "($combine %~)" % [pattern(p)]
+      (p:Rest) : "REST"
+      (p:ListPat) : "($list %~)" % [pattern(p)]
+      (p:Binder) : "($bind %~ %~)" % [name(p), pattern(p)]
+      (p:Action) : "A{%~}" % [pattern(p)]
+      (p:DelayedAction) : "A%_{%~}" % [index(p), pattern(p)]
+      (p:Guard) : "P{%~}" % [pattern(p)]
+      (p:NotPattern) : "!{%~}" % [pattern(p)]
+
+;============================================================
+;================= TOP LEVEL INTERFACE ======================
+public defstruct MatchGroup :
+   name: Symbol|False
+   rules: Seqable<MatchRule>
+public defstruct MatchRule :
+   name: Symbol
+   pattern: MatchPattern
+
+defn to-ruleset (groups:Seqable<MatchGroup>) :
+   RuleSet $ to-list $
+      for g in groups seq :
+         RuleGroup{name(g), to-list(_)} $
+         for r in rules(g) seq :
+            Rule(name(r), to-pattern(pattern(r)))
+   
+public deftype MatchPattern
+public defstruct MatchGuard <: MatchPattern :
+   predicate: List<KeyValue<Symbol,?>> -> True|False
+   pattern: MatchPattern
+public defstruct MatchFail <: MatchPattern :
+   action: List<KeyValue<Symbol,?>> -> False
+   pattern: MatchPattern
+public defstruct MatchAction <: MatchPattern :
+   action: List<KeyValue<Symbol,?>> -> ?
+   pattern: MatchPattern
+public defstruct MatchDelayAction <: MatchPattern :
+   index: Int
+   pattern: MatchPattern
+public defstruct MPattern <: MatchPattern :
+   pattern: List
+
+defn to-pattern (m:MatchPattern) :
+   match(m) :
+      (m:MatchFail) :
+         Fail(action(m), to-pattern(pattern(m)))
+      (m:MatchGuard) :
+         Guard(predicate(m), to-pattern(pattern(m)))
+      (m:MatchAction) :
+         Action(action(m), to-pattern(pattern(m)))
+      (m:MPattern) :
+         parse-pattern(pattern(m))
+
+;================ Pattern Bindings ==========================
+public defn pattern-bindings (pattern:List) -> List<Symbol> :
+   get-bindings(parse-pattern(pattern))
+
+;============= Duplicate Removing ===========================
+val DUPLICATE-TABLE = HashTable<Symbol,True>()
+defn remove-duplicates (xs:List<Symbol>) :
+   clear(DUPLICATE-TABLE)
+   defn rm (xs:List<Symbol>) :
+      if empty?(xs) :
+         xs
+      else :
+         val tail* = rm(tail(xs))
+         if key?(DUPLICATE-TABLE, head(xs)) :
+            tail*
+         else :
+            DUPLICATE-TABLE[head(xs)] = true
+            cons(head(xs), tail*)
+   rm(xs)      
+
+;================= Pattern Match Interface ==================
+val STORED-PATTERNS = HashTable<List<Symbol>,((List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> ?)>()
+public defn pattern-match (form:List,
+                           name:Symbol,
+                           patterns:List<List>,
+                           actions:Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> ? :
+                           
+   ;Compile pattern if not compiled
+   val k = cons(name, CURRENT-SYNTAX-PACKAGE)  
+   if not key?(STORED-PATTERNS, k) :
+      val p = Choice $
+         for (p in patterns, i in 0 to false) seq :
+            DelayedAction(i, parse-pattern(p))
+      STORED-PATTERNS[k] = compile-user-pattern(p, CURRENT-RULE-TABLE)      
+
+   ;Retrieve pattern and run
+   STORED-PATTERNS[k](form, actions)
+
+;=============== New Syntax Package Interface ===============
+val SYNTAX-PACKAGES = HashTable<Symbol, RuleSet>()
+public defn new-syntax-package (pname:Symbol, groups:Seqable<MatchGroup>) :
+   ensure-not-defined(pname)
+   SYNTAX-PACKAGES[pname] = to-ruleset(groups)
+
+defn ensure-not-defined (name:Symbol) :
+   if key?(SYNTAX-PACKAGES, name) :
+      throw $ PatternException $
+      "Cannot define syntax package %~. Package is already defined." % [name]
+   
+;============== Switching Packages Interface ================   
+val RULE-TABLES = HashTable<List<Symbol>, CRuleTable>()
+var CURRENT-RULE-TABLE = CRuleTable()
+var CURRENT-SYNTAX-PACKAGE:List<Symbol> = List()
+   
+public defn set-syntax-package (package-names:List<Symbol>) :
+   val names = remove-duplicates(package-names)
+   if not key?(RULE-TABLES, names) :
+      RULE-TABLES[names] = compile-patterns(build-rule-table(names))
+   CURRENT-SYNTAX-PACKAGE = names
+   CURRENT-RULE-TABLE = RULE-TABLES[names]
+
+public defn with-syntax-package<?T> (names:List<Symbol>, body: () -> ?T) -> T :
+   val old-table = CURRENT-RULE-TABLE
+   val old-package = CURRENT-SYNTAX-PACKAGE
+   dynamic-wind(
+      fn () :
+         set-syntax-package(names)
+      body
+      fn (f?) :
+         CURRENT-RULE-TABLE = old-table
+         CURRENT-SYNTAX-PACKAGE = old-package)
+
+public defn set-syntax-overlay (names:List<Symbol>) :
+   set-syntax-package(append(CURRENT-SYNTAX-PACKAGE, names))
+
+public defn with-syntax-overlay<?T> (names:List<Symbol>, body: () -> ?T) -> T :
+   with-syntax-package(append(CURRENT-SYNTAX-PACKAGE, names), body)
+   
+
+;================ Pattern Parsing ==========================
+defn subsymbol (x:Symbol, n:Int) :
+   to-symbol(to-string(x)[n to false])
+
+defn ensure-cap-form (form) :
+   val f = unwrap-token(form)
+   if length(f) != 2 :
+      throw $ PatternException $
+      "Invalid binding form %~. Cap form should have form (@cap name)." % [form]
+   if unwrap-token(f[1]) is-not Symbol :
+      throw $ PatternException $
+      "Invalid binding form %~. Cap form should have form (@cap name)." % [form]
+      
+defn ensure-binding-form (name:Symbol, p:Pattern) :
+   if p is-not Seq :
+      throw $ PatternException $
+      "Invalid binding pattern for binder %~." % [name]
+      
+defn ensure-escape-value (f:List) :
+   if empty?(f) :
+      throw $ PatternException $
+      "Expected escaped value, but reached end of list."
+      
+defn ensure-splice-list (form) :
+   if unwrap-token(form) is-not List :
+      throw $ PatternException $
+      "Splice repeat operator @... requires a list, but found %~." % [form]
+   
+defn parse-pattern (form:List) -> Pattern :
+   defn pseq (f:List) -> [Pattern, List] :
+      if empty?(f) :
+         [Empty(), List()]
+      else if tagged-list?(f, `|) :
+         [Empty(), f]
+      else if tagged-list?(head(f), `@cap) :
+         ensure-cap-form(head(f))
+         val name = unwrap-all(head(f))[1]
+         val [t, rest] = pseq $
+            if tagged-list?(tail(f), `:) : tailn(f,2)
+            else : cons(`_, tail(f))
+         ensure-binding-form(name, t)
+         val p = Seq(Binder(name, a(t as Seq)), b(t as Seq))
+         [p, rest]
+      else if tagged-list?(f, `~) :
+         ensure-escape-value(tail(f))
+         val h = Terminal(unwrap-all(f[1]))
+         pseq(cons(h, tailn(f, 2)))
+      else if tagged-list?(tail(f), `...) :
+         val [h, hrest] = pseq(List(head(f)))
+         val [t, rest] = pseq(tailn(f, 2))
+         [Seq(Combine(Repeat(h)), t), rest]
+      else if tagged-list?(tail(f), `@...) :
+         ensure-splice-list(head(f))
+         val h = pexp(unwrap-token(head(f)))
+         val [t, rest] = pseq(tailn(f, 2))
+         [Seq(Combine(Repeat(h)), t), rest]
+      else :
+         val [t, rest] = pseq(tail(f))
+         [Seq(pp(head(f)), t), rest]
+   defn pexp (f:List) -> Pattern :
+      val [h, rest] = pseq(f)
+      if tagged-list?(rest, `|) :
+         val t = pexp(tail(rest))
+         Choice(h, t)
+      else :
+         h
+   defn pform (f:List) -> Pattern :
+      if tagged-list?(f, `!) : NotPattern(pexp(tail(f)))
+      else : pexp(f)
+   defn pp (f) -> Pattern :
+      match(f) :
+         (f:Token) :
+            pp(item(f))
+         (f:Pattern) :
+            f
+         (f:List) :
+            match(pform(f)) :
+               (p:Seq|Empty) : ListPat(p)
+               (p) : p
+         (f:Symbol) :
+            if f == `_ : Form()
+            else if prefix(f)[0] == '#' : Production(subsymbol(f,1))
+            else : Terminal(f)
+         (f) :
+            Terminal(f)
+
+   ;Driver
+   val p = pform(form)
+   check(p)
+   p
+
+;=============== Pattern Optimization ======================
+defn optimize (p:Pattern) :
+   ;Rest Identification
+   defn rest? (p:Pattern) :
+      label<True|False> return :
+         val pseq = match(p) :
+                       (p:Seq) : p
+                       (p) : return(false)
+         return(false) when b(pseq) is-not Empty
+         a(pseq) is Form
+   defn optimize-repeat (p:Repeat) :
+      match(rest?(pattern(p))) :
+         (n:True) : Rest()
+         (n:False) : p
+
+   ;Driver
+   match(map(optimize, p)) :
+      (p:Repeat) :
+         optimize-repeat(p)
+      (p:Combine) :
+         if empty?(bindings(p)) : pattern(p)
+         else : p
+      (p) : p
+
+;================== Build Rule Table =======================
+deftype RuleTable <: Collection<KeyValue<Symbol,Pattern>>
+defmulti get (r:RuleTable, s:Symbol) -> Pattern
+defmulti set (r:RuleTable, s:Symbol, p:Pattern) -> False
+defmulti nullable? (r:RuleTable, p:Pattern) -> True|False
+defmulti resolve (r:RuleTable, p:Pattern) -> True|False
+
+defn RuleTable () :
+   RuleTable(HashTable<Symbol,Pattern>())
+
+defn RuleTable (rtable: HashTable<Symbol,Pattern>) :
+   ;Compute nullable productions
+   val nullable = HashTable<Symbol,True>()
+   defn nullable? (p:Pattern) :
+      match(p) :
+         (p:Seq) : nullable?(a(p)) and nullable?(b(p))
+         (p:Choice) : nullable?(a(p)) or nullable?(b(p))
+         (p:Terminal) : false
+         (p:Empty) : true
+         (p:Form) : false
+         (p:Production) : get?(nullable, name(p), false)
+         (p:Repeat) : true
+         (p:Rest) : true
+         (p:ListPat) : false
+         (p:Action|DelayedAction|Guard|Combine|Binder) : nullable?(pattern(p))
+         (p:NotPattern) : true
+         (p:Fail) : false
+   fixpoint $ fn (progress) :
+      for e in rtable do :
+         val [r, p] = [key(e), value(e)]
+         if not key?(nullable, r) :
+            if nullable?(p) :
+               nullable[r] = true
+               progress()
+
+   ;Resolve table patterns
+   defn resolve (p:Pattern) :
+      do(resolve, p)
+      match(p) :
+         (p:Production) :
+            if not key?(rtable, name(p)) :
+               throw $ PatternException $
+               "Production %~ is not defined." % [name(p)]
+         (p) : false
+
+   ;Create new rule table
+   val rt = new RuleTable :
+      defmethod get (this, n:Symbol) : rtable[n]
+      defmethod set (this, n:Symbol, p:Pattern) : rtable[n] = p
+      defmethod to-seq (this) : to-seq(rtable)
+      defmethod nullable? (this, p:Pattern) : nullable?(p)
+      defmethod resolve (this, p:Pattern) : resolve(p)
+
+   ;Check all rules
+   for e in rtable do :
+      check-against(rt, value(e))
+
+   rt
+
+defn syntax-package (name:Symbol) :
+   if not key?(SYNTAX-PACKAGES, name) :
+      throw $ PatternException $
+      "No syntax package with name %~." % [name]
+   SYNTAX-PACKAGES[name]
+
+defn build-rule-table (names:List<Symbol>) :
+   ;Evaluate ruleset expression
+   defn eval-ruleset-exp (names:List<Symbol>) :
+      val seen? = HashTable<Symbol,True>()
+      defn get-rules (groups:List<RuleGroup>) :
+         if empty?(groups) :
+            List()
+         else :
+            val [h,ts] = [head(groups), tail(groups)]
+            val rs = get-rules(ts)
+            match(name(h)) :
+               (n:False) :
+                  append(rules(h), rs)
+               (n:Symbol) :
+                  if key?(seen?, n) :
+                     rs
+                  else :
+                     seen?[n] = true
+                     append(rules(h), rs)
+      get-rules $
+      for n in names seq-append :
+         groups(syntax-package(n))
+      
+   ;Evaluate ruleset expression
+   defn get-rule-table (rules:List<Rule>) :
+      val table = HashTable<Symbol,Pattern>()
+      for r in rules do :
+         table[name(r)] =
+            match(get?(table, name(r), false)) :
+               (f:False) : pattern(r)
+               (p:Pattern) : Choice(p, pattern(r))
+      RuleTable(table)
+   val rtable = get-rule-table(eval-ruleset-exp(names))
+
+   ;Compute Productions in First Set
+   defn first-set (p:Pattern) :
+      to-list $ generate<Symbol> :
+         defn loop (p:Pattern) :
+            match(p) :
+               (p:Seq) :
+                  loop(a(p))
+                  loop(b(p)) when nullable?(rtable, a(p))
+               (p:Choice) :
+                  loop(a(p))
+                  loop(b(p))
+               (p:Production) : yield(name(p))
+               (p:Terminal|Empty|Form|Rest|ListPat) : false
+               (p:Action|DelayedAction|Guard|NotPattern|
+                  Repeat|Combine|Binder|Fail) : loop(pattern(p))
+         loop(p)
+
+   ;Disallow left recursive rules
+   defn disallow-left-recursion () :
+      val first-sets = to-list $
+         for e in rtable seq :
+            key(e) => first-set(value(e))
+      val errors = Vector<?>()
+      for c in strong-components(first-sets) do :
+         match(c) :
+            (c:List<Symbol>) :
+               add{errors, _} $
+                  if length(c) == 1 : "Illegal left recursion detected in production %~." % [head(c)]
+                  else : "Illegal mutual left recursion detected in productions %,." % [c]
+            (c:Symbol) : false
+      if not empty?(errors) :
+         throw $ PatternException $ "%*" % [join(errors, "\n")]
+   disallow-left-recursion()
+
+   ;Optimize Table
+   for e in rtable do :
+      rtable[key(e)] = optimize(value(e))
+
+   ;Return table
+   rtable
+
+;================= Pattern Checkers ========================
+defn check (p:Pattern) :
+   defn check-balanced (a:Pattern, b:Pattern) :
+      defn unbalanced (pa:Pattern, pb:Pattern, ba:List<Symbol>, bb:List<Symbol>) :
+         throw $ PatternException $ UNBALANCED-MSG % [pa, ba, pb, bb]
+      defn less-eq? (xs:List<Symbol>, ys:List<Symbol>) :
+         for x in xs all? : contains?(ys, x)
+      defn set-eqv? (xs:List<Symbol>, ys:List<Symbol>) :
+         (xs <= ys) and (ys <= xs)
+      val b1 = get-bindings(a)
+      val b2 = get-bindings(b)
+      if not set-eqv?(b1, b2) :
+         unbalanced(a, b, b1, b2)
+
+   do(check, p)
+   match(p) :
+      (p:Choice) : check-balanced(a(p), b(p))
+      (p) : false
+      
+defn check-against (r:RuleTable, p:Pattern) :
+   defn check-nullables (p:Pattern) :
+      do(check-nullables, p)
+      match(p) :
+         (p:Repeat) :
+            if nullable?(r, pattern(p)) :
+               throw $ PatternException $
+               "Nullable pattern %~ is not allowed inside a repetition pattern." % [pattern(p)]
+         (p) : false               
+
+   resolve(r, p)
+   check-nullables(p)
+
+
+;================= Pattern Compiler ========================
+defstruct CRuleTable :
+   rules: RuleTable
+   compiled: HashTable<Symbol, ((List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False)>
+
+defn CRuleTable () :
+   CRuleTable(RuleTable(), HashTable<Symbol, ((List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False)>())
+
+defstruct MResult :
+   bindings: List<KeyValue<Symbol,(() -> ?)>>
+   head: () -> ?
+   tail: List
+
+defn compile-pattern (
+      pat: Pattern
+      compiled: HashTable<Symbol, ((List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False)>
+      patch: (Symbol, ((List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False) -> False) -> False) :
+
+   defn eval-bindings (f:List, bs: List<KeyValue<Symbol,(() -> ?)>>) :
+      val h = `form => f
+      val bs* = for e in bs map : key(e) => value(e)()
+      cons(h, bs*)
+
+   defn memoize (f: () -> ?) :
+      var full? = false
+      var value = false
+      fn () :
+         if not full? :
+            value = f()
+            full? = true
+         value
+
+   ;Compilation of a Pattern
+   defn c (p:Pattern) -> (List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False :
+      match(p) :
+         (p:Seq) :
+            val ca = c(a(p))
+            val cb = c(b(p))
+            fn* (f, delays) :
+               match(ca(f, delays)) :
+                  (r1:MResult) :
+                     match(cb(tail(r1), delays)) :
+                        (r2:MResult) :
+                           val b* = append(bindings(r1), bindings(r2))
+                           val h* = fn* () : cons(head(r1)(), head(r2)())
+                           MResult(b*, h*, tail(r2))
+                        (r2:False) :
+                           false
+                  (r1:False) :
+                     false
+         (p:Choice) :
+            val ca = c(a(p))
+            val cb = c(b(p))
+            fn* (f, delays) :
+               match(ca(f, delays)) :
+                  (r1:MResult) : r1
+                  (r1:False) : cb(f, delays)
+         (p:Terminal) :
+            fn* (f, delays) :
+               if (not empty?(f)) and (unwrap-token(head(f)) == value(p)) :
+                  MResult(List(), head{f}, tail(f))
+         (p:Empty) :
+            fn* (f, delays) :
+               MResult(List(), List{}, f)
+         (p:Form) :
+            fn* (f, delays) :
+               if not empty?(f) :
+                  MResult(List(), head{f}, tail(f))
+         (p:Production) :
+            match(get?(compiled, name(p), false)) :
+               (cp: (List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False) :
+                  fn* (f, delays) :
+                     match(cp(f, delays)) :
+                        (r:MResult) : MResult(List(), head(r), tail(r))
+                        (r:False) : false
+               (f: False) :
+                  var cp
+                  patch(name(p), {cp = _})
+                  fn* (f, delays) :
+                     match(cp(f, delays)) :
+                        (r:MResult) : MResult(List(), head(r), tail(r))
+                        (r:False) : false
+         (p:Repeat) :
+            val cp = c(pattern(p))
+            defn* cr (f:List, delays:Tuple<(List<KeyValue<Symbol,?>> -> ?)>) :
+               if empty?(f) :
+                  MResult(List(), List{}, f)
+               else :
+                  match(cp(f, delays)) :
+                     (r1:MResult) :
+                        val r2 = cr(tail(r1), delays) as MResult
+                        val b* = append(bindings(r1), bindings(r2))
+                        val h* = fn* () : append(head(r1)(), head(r2)())
+                        MResult(b*, h*, tail(r2))
+                     (r1:False) :
+                        MResult(List(), List{}, f)
+            cr         
+         (p:Rest) :
+            fn* (f, delays) :
+               MResult(List(), {f}, List())
+         (p:Combine) :
+            val cp = c(pattern(p))
+            fn* (f, delays) :
+               match(cp(f, delays)) :
+                  (r:MResult) :
+                     var grouped = false
+                     defn group-bindings () :
+                        if grouped is False :
+                           val n = length(bindings(p))
+                           defn group (bs:List<KeyValue<Symbol, (() -> ?)>>) -> List<List> :
+                              if empty?(bs) :
+                                 to-list(seq(List{}, 0 to n))
+                              else :
+                                 val ts = group(tailn(bs, n))
+                                 val hs = for h in headn(bs, n) map : value(h)()
+                                 map(cons, hs, ts)
+                           grouped = group(bindings(r))
+                     defn var-bindings (i:Int) :
+                        group-bindings()
+                        (grouped as List<List>)[i]
+                     val b* = for (v in bindings(p), i in 0 to false) map :
+                                 v => var-bindings{i}
+                     MResult(b*, head(r), tail(r))
+                  (f:False) :
+                     false               
+         (p:ListPat) :
+            val cp = c(pattern(p))
+            fn* (f, delays) :
+               if (not empty?(f)) and (unwrap-token(head(f)) is List) :
+                  val r = cp(unwrap-token(head(f)), delays)
+                  if (r is MResult) and empty?(tail(r as MResult)) :
+                     val r = r as MResult
+                     MResult(bindings(r), head(r), tail(f))
+         (p:Binder) :
+            val cp = c(pattern(p))
+            fn* (f, delays) :
+               match(cp(f, delays)) :
+                  (r:MResult) :
+                     val h* = memoize(head(r))
+                     val b* = cons(name(p) => h*, bindings(r))
+                     MResult(b*, h*, tail(r))                  
+                  (r:False) :
+                     false
+         (p:Action) :
+            val cp = c(pattern(p))
+            val ap = action(p)
+            fn* (f, delays) :
+               match(cp(f, delays)) :
+                  (r:MResult) :
+                     defn head* () : ap(eval-bindings(f, bindings(r)))
+                     MResult(List(), head*, tail(r))   
+                  (r:False) :
+                     false
+         (p:DelayedAction) :
+            val cp = c(pattern(p))
+            val ip = index(p)
+            fn* (f, delays) :
+               match(cp(f, delays)) :
+                  (r:MResult) :
+                     defn head* () : delays[ip](eval-bindings(f, bindings(r)))
+                     MResult(List(), head*, tail(r))   
+                  (r:False) :
+                     false
+         (p:Guard) :
+            val cp = c(pattern(p))
+            val pp = predicate(p)
+            fn* (f, delays) :
+               match(cp(f, delays)) :
+                  (r:MResult) :
+                     val bindings* = eval-bindings(f, bindings(r))
+                     r when pp(bindings*)
+                  (r:False) :
+                     false
+         (p:Fail) :
+            val cp = c(pattern(p))
+            val ap = action(p)
+            fn* (f, delays) :
+               match(cp(f, delays)) :
+                  (r:MResult) :
+                     val bindings* = eval-bindings(f, bindings(r))
+                     ap(bindings*)
+                     throw $ PatternException $
+                     "Pattern failure from matching %~ against %~" % [p, f]
+                  (r:False) :
+                     false
+         (p:NotPattern) :
+            val cp = c(pattern(p))
+            fn* (f, delays) :
+               match(cp(f, delays)) :
+                  (r:MResult) : false
+                  (r:False) : MResult(List(), List{}, f)
+
+   ;Driver
+   c(pat)   
+         
+defn compile-patterns (patterns:RuleTable) :
+   ;Compiled Table of Patterns
+   val compiled = HashTable<Symbol,
+      ((List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False)>()
+   ;Back Patches
+   val patches = Vector<[Symbol, ((List, Tuple<(List<KeyValue<Symbol,?>> -> ?)>) -> MResult|False) -> False]>()
+
+   ;Compile all patterns
+   for entry in patterns do :
+      val [n, p] = [key(entry), value(entry)]
+      compiled[n] = compile-pattern(p, compiled, add{patches, [_, _]})
+      
+   ;Run all back patches   
+   for [name, f] in patches do :
+      f(compiled[name])
+
+   ;Return compiled rule table
+   CRuleTable(patterns, compiled)
+
+defn compile-user-pattern (p:Pattern, t:CRuleTable) :
+   check-against(rules(t), p)
+   defn patch (name, f) : fatal("Patching not supported in user pattern.")
+   val cp = compile-pattern(p, compiled(t), patch)
+   fn* (f:List, delays:Tuple<(List<KeyValue<Symbol,?>> -> ?)>) :
+      defn no-match () :
+         throw $ PatternException $
+         "Pattern %~ does not match against %~." % [p, f]         
+      match(cp(f, delays)) :
+         (r:MResult) :
+            if empty?(tail(r)) : head(r)()
+            else : no-match()
+         (r:False) : no-match()
+
+;================== Error Handling ==========================
+defn PatternException (x) :
+   new Exception :
+      defmethod print (o:OutputStream, this) :
+         print(o, x)
+         
+val BAD-NULLABLE-MSG = "Illegal Pattern: In rule for production %~, nullable pattern %~ is not allowed in front of left recursive production %~."
+val BAD-REPEAT-MSG = "Illegal Pattern: In rule for production %~, nullable pattern %~ is not allowed inside a repetition pattern."
+val UNBALANCED-MSG = "Illegal Pattern: Different bindings present in clauses of Choice pattern. Pattern %~ contains bindings %~, but pattern %~ contains bindings %~."
+
