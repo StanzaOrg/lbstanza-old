@@ -1,3 +1,7 @@
+if [ $# -lt 1 ]; then
+    echo "Not enough arguments"
+    exit 2
+fi
 hg archive $1
 mv -f $1/notes $1/scripts $1/tests ~/.Trash/
 mv lstanza $1/lstanza
