@@ -68,7 +68,7 @@
          compiler/lang-renamer.stanza \
          compiler/lang-resolver.stanza \
          compiler/stz-main.stanza \
-      -s bin/$1 \
-      -optimize \
-      -platform linux
+      -o bin/$1 \
+      -optimize
+
 
