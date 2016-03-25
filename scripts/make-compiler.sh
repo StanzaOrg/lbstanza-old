@@ -67,9 +67,7 @@
          compiler/stz-compiler.stanza \
          compiler/stz-arg-parser.stanza \
          compiler/stz-langs.stanza  \
-         compiler/lang-renamer.stanza \         
+         compiler/lang-renamer.stanza \
          compiler/lang-resolver.stanza \
          compiler/stz-main.stanza \
       -o bin/$1
-
-
