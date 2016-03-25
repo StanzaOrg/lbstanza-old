@@ -33,7 +33,7 @@
 #         compiler/stz-main.stanza \
 #      -o bin/$1
 
-./stanza core/reader.stanza \
+../stanzacmp/bin/stanzadev core/reader.stanza \
          core/macro-utils.stanza \
          compiler/stz-algorithms.stanza \
          compiler/stz-padder.stanza \
