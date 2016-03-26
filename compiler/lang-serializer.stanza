@@ -28,6 +28,9 @@ defstruct DefExp <: DefNode :
    reader
    writer
 
+defmethod name (e:DefExp) : fatal("DefNode %_ has no name." % [e])
+defmethod type (e:DefExp) : fatal("DefNode %_ has no type." % [e])
+
 defstruct DefAtom <: DefNode :
    name: Symbol with: (as-method => true)
    arg
@@ -43,7 +46,15 @@ defstruct DefUnion <: DefNode :
 
 defstruct Branch :
    type
-   fields: List<KeyValue<?,Symbol>>
+   fields: List<KeyValue<?,NodeType>>
+
+deftype NodeType 
+defstruct AtomType <: NodeType :
+   name: Symbol
+defstruct CombinatorType <: NodeType :
+   name: Symbol
+   targs: List
+   type: NodeType
 
 ;============================================================
 ;================= Printing =================================
@@ -65,13 +76,20 @@ defprinter (b:Branch) :
    Branch :
       ($branch type fields ...)
 
+defprinter (t:NodeType) :
+   AtomType :
+      custom{name(t)}
+   CombinatorType :
+      ($combinator name (targs ...) type)
+   
+
 ;============================================================
 ;================== Parsing =================================
 ;============================================================
 
 defn expande (e) :
    with-syntax(core) :
-      match-syntax(e) :
+      match-syntax(List(e)) :
          (?e:#exp) :
             e
 
@@ -85,7 +103,8 @@ defsyntax stz/serializer-lang :
          
       prefix-op = (defserializer (?out:#sym : ?out-type:#type, ?in:#sym : ?in-type:#type) :
                       ?nodes:#node ...) :
-         if empty?(nodes) : fatal("Serializer must have at least one node.")             
+         fatal("Serializer must have at least one node.") when empty?(nodes)
+         fatal("First node must be a union or atom") when head(nodes) is-not DefUnion|DefAtom
          val parsed = DefSerializer(out, out-type, in, in-type, nodes)
          expande(compile(parsed))
       prefix-op != (defserializer) :
@@ -95,6 +114,8 @@ defsyntax stz/serializer-lang :
                  writer : ?writer:#exp
                  reader : ?reader:#exp) :
          DefAtom(name, arg, arg-type, writer, reader)
+      node != (defatom) :
+         fatal("Invalid syntax: %_" % [form])
 
       node = (defunion ?name:#uw-sym (?type:#type) :
                  ?branches:#branch ...
@@ -104,13 +125,22 @@ defsyntax stz/serializer-lang :
       node = (defunion ?name:#uw-sym (?type:#type) :
                  ?branches:#branch ...) :
          DefUnion(name, type, branches, List())
+      node != (defunion) :
+         fatal("Invalid syntax: %_" % [form])
          
       node = (reader ?e:#exp) : DefExp(e, List())
       node = (writer ?e:#exp) : DefExp(List(), e)
       node = (?e:#exp) : DefExp(e, e)
          
-      branch = (?type:#type : ((?ks:#sym : ?ts:#uw-sym) @...)) :
-         Branch(type, map(KeyValue, ks, ts))      
+      branch = (?type:#type : ((?ks:#sym : ?nts:#node-type) @...)) :
+         Branch(type, map(KeyValue, ks, nts))
+         
+      node-type = (?name:#uw-sym<?targs:#type ...>(?nt:#node-type)) :
+         CombinatorType(name, targs, nt)
+      node-type = (?name:#uw-sym(?nt:#node-type)) :
+         CombinatorType(name, List(), nt)
+      node-type = (?name:#uw-sym) :
+         AtomType(name)
 
 ;============================================================
 ;================== Compilation =============================
@@ -132,6 +162,21 @@ defn compile-serializer (def:DefSerializer) :
          `Type => type(d)
          `body => writer(d)])
 
+   defn compile-writer (t:NodeType) :
+      match(t) :
+         (t:AtomType) :
+            write-prefix(name(t))
+         (t:CombinatorType) :
+            if empty?(targs(t)) :
+               fill-template(`(write-type{writer, _}), [
+                  `write-type => write-prefix(name(t))
+                  `writer => compile-writer(type(t))])
+            else :
+               fill-template(`(write-type<targs>{writer, _}), [
+                  `write-type => write-prefix(name(t))
+                  `targs => splice(targs(t))
+                  `writer => compile-writer(type(t))])                  
+
    defn compile-branch (b:Branch, branch-tag:Int) :
       val template = `(
          (x:Type) :
@@ -143,7 +188,7 @@ defn compile-serializer (def:DefSerializer) :
          `out => out(def)
          `tag => to-byte(branch-tag)
          `fields => nested $ for f in fields(b) map :
-            [`write-type => write-prefix(value(f))
+            [`write-type => compile-writer(value(f))
              `field => key(f)]])
          
    defn compile-union (d:DefUnion) :
@@ -189,6 +234,21 @@ defn compile-deserializer (def:DefSerializer) :
          `Type => type(d)
          `body => reader(d)])
 
+   defn compile-reader (t:NodeType) :
+      match(t) :
+         (t:AtomType) :
+            read-prefix(name(t))
+         (t:CombinatorType) :
+            if empty?(targs(t)) :
+               fill-template(`(read-type{reader}), [
+                  `read-type => read-prefix(name(t))
+                  `reader => compile-reader(type(t))])
+            else :
+               fill-template(`(read-type<targs>{reader}), [
+                  `read-type => read-prefix(name(t))
+                  `targs => splice(targs(t))
+                  `reader => compile-reader(type(t))])                  
+
    defn compile-branch (b:Branch, branch-tag:Int, args:List) :
       val template = `(
          tag : Type(fields{read-type()}, args))
@@ -197,13 +257,14 @@ defn compile-deserializer (def:DefSerializer) :
          `tag => to-byte(branch-tag)
          `args => splice(args)
          `fields => collect $ [
-            `read-type => map(read-prefix{value(_)}, fields(b))]])
+            `read-type => map(compile-reader{value(_)}, fields(b))]])
 
    defn compile-union (d:DefUnion) :
       val template = `(defn name () -> Type :
                           val tag = read-tag()
                           switch {tag == _} :
-                             branches)
+                             branches
+                             else : core/throw(core/FileReadException()))
       fill-template(template, [
          `name => read-prefix(name(d))
          `Type => type(d)
@@ -241,13 +302,14 @@ defn compile-deserializer (def:DefSerializer) :
 ;============================================================ 
 ;==================== Testing ===============================
 ;============================================================
-;
-;
-;defn main () :
-;   val filename = command-line-arguments()[1]
-;   with-syntax(core, stz/serializer-lang) :
-;      match-syntax(read-file(filename)) :
-;         (?es:#exp ...) :
-;            false
-;
-;main()
+
+#if-defined(TESTING) :
+
+   defn main () :
+      val filename = command-line-arguments()[1]
+      with-syntax(core, stz/serializer-lang) :
+         match-syntax(read-file(filename)) :
+            (?es:#exp ...) :
+               println(es)
+
+   main()

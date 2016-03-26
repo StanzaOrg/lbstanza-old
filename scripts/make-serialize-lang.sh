@@ -5,4 +5,6 @@
          compiler/stz-params.stanza \
          compiler/stz-core-macros.stanza \
          compiler/lang-serializer.stanza \
-      -o serialize-lang
+      -o serialize-lang \
+      -flags TESTING
+
