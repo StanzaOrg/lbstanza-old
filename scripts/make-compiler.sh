@@ -24,7 +24,6 @@
 #         compiler/stz-infer.stanza \
 #         compiler/stz-type-calculus.stanza \
 #         compiler/stz-type.stanza \
-#         compiler/stz-kform.stanza \
 #         compiler/stz-compiler.stanza \
 #         compiler/stz-arg-parser.stanza \
 #         compiler/stz-langs.stanza  \
@@ -47,7 +46,6 @@
          compiler/stz-primitives.stanza \
          compiler/stz-il-ir.stanza \
          compiler/stz-tl-ir.stanza \
-         compiler/stz-pkg-ir.stanza \
          compiler/stz-kl-ir.stanza \
          compiler/stz-tgt-ir.stanza \
          compiler/stz-bb-ir.stanza \
@@ -72,3 +70,8 @@
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
       -o bin/$1
+
+
+
+
+
