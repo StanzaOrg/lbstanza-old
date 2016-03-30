@@ -1,0 +1,315 @@
+defpackage stz/lang-serializer :
+   import core
+   import reader
+   import collections
+   import macro-utils
+   import stz/parser
+   import stz/params
+   import stz/core-macros
+
+#use-overlay(stz/printer-lang)
+
+;============================================================
+;================= Parse Structures =========================
+;============================================================
+
+defstruct DefSerializer :
+   out
+   out-type
+   in
+   in-type
+   nodes: List<DefNode>
+
+deftype DefNode
+defmulti name (n:DefNode) -> Symbol
+defmulti type (n:DefNode) -> ?
+
+defstruct DefExp <: DefNode :
+   reader
+   writer
+
+defmethod name (e:DefExp) : fatal("DefNode %_ has no name." % [e])
+defmethod type (e:DefExp) : fatal("DefNode %_ has no type." % [e])
+
+defstruct DefAtom <: DefNode :
+   name: Symbol with: (as-method => true)
+   arg
+   type with: (as-method => true)
+   writer
+   reader
+
+defstruct DefUnion <: DefNode :
+   name: Symbol with: (as-method => true)
+   type with: (as-method => true)
+   branches: List<Branch>
+   args: List
+
+defstruct Branch :
+   type
+   fields: List<KeyValue<?,NodeType>>
+
+deftype NodeType 
+defstruct AtomType <: NodeType :
+   name: Symbol
+defstruct CombinatorType <: NodeType :
+   name: Symbol
+   targs: List
+   type: NodeType
+
+;============================================================
+;================= Printing =================================
+;============================================================
+
+defprinter (d:DefSerializer) :
+   DefSerializer :
+      ($defserializer out out-type in in-type nodes ...)
+
+defprinter (d:DefNode) :
+   DefAtom :
+      ($defatom name arg type writer reader)
+   DefUnion :
+      ($defunion name args branches ...)
+   DefExp :
+      ($defexp reader writer)
+
+defprinter (b:Branch) :
+   Branch :
+      ($branch type fields ...)
+
+defprinter (t:NodeType) :
+   AtomType :
+      custom{name(t)}
+   CombinatorType :
+      ($combinator name (targs ...) type)
+   
+
+;============================================================
+;================== Parsing =================================
+;============================================================
+
+defn expande (e) :
+   with-syntax(core) :
+      match-syntax(List(e)) :
+         (?e:#exp) :
+            e
+
+defsyntax stz/serializer-lang :
+   defn sym? (x) :
+      unwrap-token(x) is Symbol
+
+   defrule :
+      sym = (?x) when sym?(x) : x
+      uw-sym = (?x) when sym?(x) : unwrap-token(x)
+         
+      prefix-op = (defserializer (?out:#sym : ?out-type:#type, ?in:#sym : ?in-type:#type) :
+                      ?nodes:#node ...) :
+         fatal("Serializer must have at least one node.") when empty?(nodes)
+         fatal("First node must be a union or atom") when head(nodes) is-not DefUnion|DefAtom
+         val parsed = DefSerializer(out, out-type, in, in-type, nodes)
+         expande(compile(parsed))
+      prefix-op != (defserializer) :
+         fatal("Invalid syntax for defserializer.")
+
+      node = (defatom ?name:#uw-sym (?arg:#sym : ?arg-type:#type) :
+                 writer : ?writer:#exp
+                 reader : ?reader:#exp) :
+         DefAtom(name, arg, arg-type, writer, reader)
+      node != (defatom) :
+         fatal("Invalid syntax: %_" % [form])
+
+      node = (defunion ?name:#uw-sym (?type:#type) :
+                 ?branches:#branch ...
+              with :
+                 append-args => (?args:#exps!)) :
+         DefUnion(name, type, branches, args)         
+      node = (defunion ?name:#uw-sym (?type:#type) :
+                 ?branches:#branch ...) :
+         DefUnion(name, type, branches, List())
+      node != (defunion) :
+         fatal("Invalid syntax: %_" % [form])
+         
+      node = (reader ?e:#exp) : DefExp(e, List())
+      node = (writer ?e:#exp) : DefExp(List(), e)
+      node = (?e:#exp) : DefExp(e, e)
+         
+      branch = (?type:#type : ((?ks:#sym : ?nts:#node-type) @...)) :
+         Branch(type, map(KeyValue, ks, nts))
+         
+      node-type = (?name:#uw-sym<?targs:#type ...>(?nt:#node-type)) :
+         CombinatorType(name, targs, nt)
+      node-type = (?name:#uw-sym(?nt:#node-type)) :
+         CombinatorType(name, List(), nt)
+      node-type = (?name:#uw-sym) :
+         AtomType(name)
+
+;============================================================
+;================== Compilation =============================
+;============================================================
+
+defn compile (def:DefSerializer) :
+   List(
+      compile-serializer(def)
+      compile-deserializer(def))
+
+defn compile-serializer (def:DefSerializer) :
+   defn write-prefix (x) :
+      symbol-join(["write-", x])
+   defn compile-atom (d:DefAtom) :
+      val template = `(defn name (x:Type) : body)
+      fill-template(template, [
+         `name => write-prefix(name(d))
+         `x => arg(d)
+         `Type => type(d)
+         `body => writer(d)])
+
+   defn compile-writer (t:NodeType) :
+      match(t) :
+         (t:AtomType) :
+            write-prefix(name(t))
+         (t:CombinatorType) :
+            if empty?(targs(t)) :
+               fill-template(`(write-type{writer, _}), [
+                  `write-type => write-prefix(name(t))
+                  `writer => compile-writer(type(t))])
+            else :
+               fill-template(`(write-type<targs>{writer, _}), [
+                  `write-type => write-prefix(name(t))
+                  `targs => splice(targs(t))
+                  `writer => compile-writer(type(t))])                  
+
+   defn compile-branch (b:Branch, branch-tag:Int) :
+      val template = `(
+         (x:Type) :
+            core/put(out, tag)
+            fields{write-type(field(x))})
+      fill-template(template, [
+         `Type => type(b)
+         `x => gensym("x")
+         `out => out(def)
+         `tag => to-byte(branch-tag)
+         `fields => nested $ for f in fields(b) map :
+            [`write-type => compile-writer(value(f))
+             `field => key(f)]])
+         
+   defn compile-union (d:DefUnion) :
+      val template = `(defn name (x:Type) :
+                          match(x) :
+                             branches)
+      fill-template(template, [
+         `name => write-prefix(name(d))
+         `x => gensym("x")
+         `Type => type(d)
+         `branches => splice $
+            seq-append(compile-branch, branches(d), 0 to false)])
+            
+   defn compile-node (d:DefNode) :
+      match(d) :
+         (d:DefAtom) : compile-atom(d)
+         (d:DefUnion) : compile-union(d)
+         (d:DefExp) : writer(d)
+         
+   val template = `(
+      defn serialize (out:OutType, x:Type) :
+         nodes
+         write-type(x))
+   val n0 = head(nodes(def))      
+   fill-template(template, [
+      `out => out(def)
+      `OutType => out-type(def)
+      `x => gensym("x")
+      `Type => type(n0)
+      `nodes => splice(map(compile-node, nodes(def)))
+      `write-type => write-prefix(name(n0))])        
+
+defn compile-deserializer (def:DefSerializer) :  
+   val #read-tag = gensym("read-tag")
+   
+   defn read-prefix (x) :
+      symbol-join(["read-" x])
+      
+   defn compile-atom (d:DefAtom) :
+      val template = `(defn name () -> Type : body)
+      fill-template(template, [
+         `name => read-prefix(name(d))
+         `Type => type(d)
+         `body => reader(d)])
+
+   defn compile-reader (t:NodeType) :
+      match(t) :
+         (t:AtomType) :
+            read-prefix(name(t))
+         (t:CombinatorType) :
+            if empty?(targs(t)) :
+               fill-template(`(read-type{reader}), [
+                  `read-type => read-prefix(name(t))
+                  `reader => compile-reader(type(t))])
+            else :
+               fill-template(`(read-type<targs>{reader}), [
+                  `read-type => read-prefix(name(t))
+                  `targs => splice(targs(t))
+                  `reader => compile-reader(type(t))])                  
+
+   defn compile-branch (b:Branch, branch-tag:Int, args:List) :
+      val template = `(
+         tag : Type(fields{read-type()}, args))
+      fill-template(template, [
+         `Type => type(b)
+         `tag => to-byte(branch-tag)
+         `args => splice(args)
+         `fields => collect $ [
+            `read-type => map(compile-reader{value(_)}, fields(b))]])
+
+   defn compile-union (d:DefUnion) :
+      val template = `(defn name () -> Type :
+                          val tag = read-tag()
+                          switch {tag == _} :
+                             branches
+                             else : core/throw(core/FileReadException()))
+      fill-template(template, [
+         `name => read-prefix(name(d))
+         `Type => type(d)
+         `tag => gensym("tag")
+         `read-tag => #read-tag
+         `branches => splice $
+            seq-append(compile-branch{_, _, args(d)}, branches(d), 0 to false)])
+
+   defn compile-node (d:DefNode) :
+      match(d) :
+         (d:DefAtom) : compile-atom(d)
+         (d:DefUnion) : compile-union(d)
+         (d:DefExp) : reader(d)
+
+   val template = `(
+      defn deserialize-type (in:InType) -> Type :
+         defn read-tag () :
+            match(core/get-byte(in)) :
+               (b:Byte) : b
+               (b:False) : core/throw(core/FileReadException())
+         nodes
+         read-type())
+   val n0 = head(nodes(def))
+   fill-template(template, [
+      `deserialize-type => symbol-join(["deserialize-" name(n0)])
+      `in => in(def)      
+      `InType => in-type(def)
+      `read-tag => #read-tag
+      `Type => type(n0)
+      `nodes => splice(map(compile-node, nodes(def)))
+      `read-type => read-prefix(name(n0))])
+      
+            
+
+;============================================================ 
+;==================== Testing ===============================
+;============================================================
+
+#if-defined(TESTING) :
+
+   defn main () :
+      val filename = command-line-arguments()[1]
+      with-syntax(core, stz/serializer-lang) :
+         match-syntax(read-file(filename)) :
+            (?es:#exp ...) :
+               println(es)
+
+   main()
