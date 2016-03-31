@@ -2,7 +2,6 @@
 #include<stdio.h>
 #include<sys/time.h>
 #include<errno.h>
-#include<math.h>
 
 //     Stanza Defined Entities
 //     =======================
@@ -31,7 +30,6 @@ FILE* get_stderr () {return stderr;}
 FILE* get_stdin () {return stdin;}
 int get_eof () {return EOF;}
 int get_errno () {return errno;}
-double get_m_pi () {return M_PI;}
 
 //     Time of Day
 //     ===========
