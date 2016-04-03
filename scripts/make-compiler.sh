@@ -46,6 +46,7 @@
          compiler/stz-primitives.stanza \
          compiler/stz-il-ir.stanza \
          compiler/stz-tl-ir.stanza \
+         compiler/stz-pkg-ir.stanza \
          compiler/stz-kl-ir.stanza \
          compiler/stz-tgt-ir.stanza \
          compiler/stz-bb-ir.stanza \
