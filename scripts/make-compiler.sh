@@ -70,8 +70,8 @@
          compiler/lang-resolver.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
-      -o bin/$1 \
-      -optimize
+      -o bin/$1
+
 
 
 
