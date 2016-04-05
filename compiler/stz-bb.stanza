@@ -13,6 +13,7 @@ defpackage stz/bb :
       prefix => asm-
    import stz/padder
    import stz/backend
+   import stz/params
 
 ;============================================================
 ;==================== Main Driver ===========================
@@ -22,15 +23,24 @@ public defn compile (def:tgt-DefFn,
                      backend:Backend,
                      output:Vector<asm-Ins>,
                      infos:Vector<KeyValue<Int,FileInfo>>) -> False :
-   ;headline("Normalize")
+   defn vheadline (name:String) :
+      if flag-defined?(`VERBOSE) :
+         header(name)
+      false
+   defn vprintln (x) :
+      if flag-defined?(`VERBOSE) :
+         println(x)
+      false
+      
+   vheadline("Normalize")
    var d = normalize(def)
    ;println(d)
 
-   ;headline("Spill call arguments")
+   vheadline("Spill call arguments")
    d = spill-call-args(d, backend)
    ;println(d)
 
-   ;headline("Compile to Basic Block IR")
+   vheadline("Compile to Basic Block IR")
    val [tt, bb-ir] = to-bb-ir(d)
    ;println(bb-ir)
 
@@ -39,32 +49,37 @@ public defn compile (def:tgt-DefFn,
 
    u = analyze-liveness(u)
 
-   ;headline("Early Saves")
+   vheadline("Early Saves")
    u = map(emit-early-saves, u)
    ;println(u)
 
-   ;headline("Allocate Classes")
+   vheadline("Allocate Classes")
    u = map(allocate-classes{tt, _, backend}, u)
    ;println(u)
 
-   ;headline("Propagate Assumptions")
+   vheadline("Propagate Assumptions")
    u = map(propagate-assumptions, u)
    ;println(u)
 
-   ;headline("Register Assignment")
+   vheadline("Register Assignment")
    u = register-assignment(tt, backend, u)
    ;println(u)
 
    #if-not-defined(OPTIMIZE) :
-      ;headline("Verify Reigster Assignment")
+      vheadline("Verify Reigster Assignment")
       do(verify-register-assignment{_, backend}, blocks(u) as Vector<WBlock>)
 
-   ;headline("Calculating stack map")
+   vheadline("Calculating stack map")
    val stack-map = calculate-stack-map(tt, u)
 
-   ;headline("Block Collapsing")
+   vheadline("Enforced Clearing")
+   u = enforced-clearing(u, stack-map)
+   vprintln(u)
+
+   vheadline("Block Collapsing")
    val ins = collapse-blocks(u)
-   ;do(println, ins)
+   if flag-defined?(`VERBOSE) :
+      do(println, ins)
 
    compile(tgt-n(d), tt, backend, ins, stack-map, output, infos)
 
@@ -700,6 +715,8 @@ defstruct Save <: Ins&Working :
    x: Var
 defstruct Load <: Ins&Working :
    x: Var
+defstruct Clear <: Ins&Working :
+   x: Var
 defstruct Unload <: Ins&Working :
    x: Var
 defstruct Xchg <: Ins&Working :
@@ -724,6 +741,7 @@ defmethod print (o:OutputStream, i:Ins&Working) :
    print{o, _} $ match(i) :
       (i:Save) : "save %~" % [x(i)]
       (i:Load) : "load %~" % [x(i)]
+      (i:Clear) : "clear %~" % [x(i)]
       (i:Unload) : "unload %~" % [x(i)]
       (i:Xchg) : "xchg %~ %~ through %~" % [x(i), y(i), swap(i)]
       (i:Glue) : "shuffle (%*) = (%*)" % [cms(xs(i)), cms(ys(i))]
@@ -2117,6 +2135,7 @@ defmethod print (o:OutputStream, i:Interval) :
 
 ;     Calculating Stack Intervals
 ;     ---------------------------
+
 defn stack-intervals (p:Unit) :
    ;     Interval State
    ;     --------------
@@ -2208,6 +2227,8 @@ deftype StackMap
 defmulti ref-offsets (s:StackMap) -> Seq<Int>
 defmulti mask (s:StackMap) -> [Int, List<Long>]
 defmulti offset (s:StackMap, x:Stack) -> Int
+defmulti type (s:StackMap, n:Int) -> tgt-TgtType
+defmulti location (s:StackMap, n:Int) -> Int
 defmulti size (s:StackMap) -> Int
 
 ;Location Calculation
@@ -2216,7 +2237,7 @@ defn calculate-stack-map (tt:HashTable<Int,tgt-TgtType>, u:Unit) :
    ;     -------------------------
    val occupied = Vector<False|True>()      ;(occupied[i] = true) => location i is occupied.
    val types = Vector<tgt-TgtType>()        ;type of location i = types[i]
-   val var-locs = HashTable<Int,Int>({_})   ;(var-locs[x] = i) => variable x is at locatii
+   val var-locs = HashTable<Int,Int>({_})   ;(var-locs[x] = i) => variable x is at location i
 
    ;Get the next free location
    defn next-free-loc (t:tgt-TgtType) :
@@ -2291,17 +2312,58 @@ defn calculate-stack-map (tt:HashTable<Int,tgt-TgtType>, u:Unit) :
          val bits = tgt-to-bitmask(refs)
          val n = length(refs)
          [n, bits]
+      defmethod location (this, n:Int) :
+         var-locs[n]
+      defmethod type (this, n:Int) :
+         types[location(this, n)]
       defmethod offset (this, x:Stack) :
-         val i = var-locs[n(x)]
-         offsets[i]
+         offsets[location(this, n(x))]
       defmethod size (this) :
          accum
 
+;============================================================
+;================= Enforce Clearing =========================
+;============================================================
 
+defn enforced-clearing (b:WBlock, smap:StackMap) :   
+   ;Live Stack Locations
+   val loc-live? = HashTable<Int,True|False>(false)
 
+   defn mark-live (n:Int) : loc-live?[location(smap, n)] = true
+   defn mark-dead (n:Int) : loc-live?[location(smap, n)] = false
 
-;                      Block Collapsing
-;                      ================
+   ;Utilities
+   defn ref-var? (x:Var) : type(smap, n(x)) == tgt-REF-TYPE
+   defn var-live? (x:Var) : loc-live?[location(smap, n(x))]
+
+   ;Initialize location liveness according to ports
+   val saved-ports = filter({saved?(_) is True}, out(b))
+   do(mark-live{n(_)}, saved-ports)
+   
+   ;Sweep through instructions in reverse
+   val exps* = Vector<Ins>()
+   for e in in-reverse(ins(b)) do :
+      if e is Load :
+         val e = e as Load
+         if ref-var?(x(e)) and not var-live?(x(e)) :
+            add(exps*, Clear(x(e)))
+      add(exps*, e)
+      match(e) :
+         (e:Load) : mark-live(n(x(e)))
+         (e:Save) : mark-dead(n(x(e)))
+         (e:Set) : mark-dead(n(x(e))) when loc(x(e)) is Stack               
+         (e) : false
+
+   ;Reverse the instructions
+   reverse!(exps*)
+   WBlock(n(b), exps*, next(b), in(b), out(b), dist(b))
+
+defn enforced-clearing (u:Unit, smap:StackMap) :
+   Unit(defs(u), map<WBlock>(enforced-clearing{_ as WBlock, smap}, blocks(u)))      
+
+;============================================================
+;================= Block Collapsing =========================
+;============================================================
 
 defn collapse-blocks (u:Unit) :
    ;     Glue Port Discovery
@@ -2996,6 +3058,9 @@ defn compile (func-id:Int,
             val x* = aval(x(e))
             val sx* = stack-aval(x(e))
             av-mov(sx*, x*)
+         (e:Clear) :
+            val sx* = stack-aval(x(e))
+            av-mov(sx*, av-long(VOID-TAG))
          (e:Load) :
             val x* = aval(x(e))
             val sx* = stack-aval(x(e))
