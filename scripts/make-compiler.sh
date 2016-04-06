@@ -61,6 +61,7 @@
          compiler/stz-type.stanza \
          compiler/stz-kform.stanza \
          compiler/stz-tgt.stanza \
+         compiler/stz-tgt-writer.stanza \
          compiler/stz-bb.stanza \
          compiler/stz-asm-emitter.stanza \
          compiler/stz-compiler.stanza \
