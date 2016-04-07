@@ -33,6 +33,7 @@ val assemble-timer = MillisecondTimer("Assemble")
 
 val index-timer = MillisecondTimer("Index")
 val new-early-saves-timer = MillisecondTimer("New Early Saves")
+val kill-use-timer = MillisecondTimer("Kill Use Timer")
 
 public defn print-timing () :
    val total = time(normalize-timer) + time(spill-timer) + time(to-bb-timer) +
@@ -56,12 +57,19 @@ public defn print-timing () :
    print-percentage(collapse-blocks-timer, total)
    print-percentage(assemble-timer, total)
 
+   println("Class Allocation")
+   print-percentage(spill-calc-timer, time(class-allocation-timer))
+   print-percentage(spill-reg-timer, time(class-allocation-timer))
+   print-percentage(usage-table-timer, time(class-allocation-timer))
+   print-percentage(release-table-timer, time(class-allocation-timer))
+   print-percentage(allocate-sweep-timer, time(class-allocation-timer))
+
+   println("New Pipeline")
    print-percentage(index-timer, total)
    print-percentage(new-early-saves-timer, total)
+   print-percentage(kill-use-timer, total)
 
-   print-percentage(liveness-gather-timer, time(liveness-timer))
-   print-percentage(liveness-propagation-timer, time(liveness-timer))
-   print-percentage(liveness-collect-timer, time(liveness-timer))
+   
 
 public defn compile (def:tgt-DefFn,
                      backend:Backend,
@@ -105,9 +113,14 @@ public defn compile (def:tgt-DefFn,
    stop(index-timer)
    ;print-indexed-prog()
 
-   start(new-early-saves-timer)
-   new-emit-early-saves()
-   stop(new-early-saves-timer)
+   start(kill-use-timer)
+   kill-use-annotations()
+   stop(kill-use-timer)
+   print-indexed-prog()
+
+   ;start(new-early-saves-timer)
+   ;new-emit-early-saves()
+   ;stop(new-early-saves-timer)
    ;print-indexed-prog()
 
    ;Old Pipeline
@@ -1031,6 +1044,94 @@ defn new-emit-early-saves (bi:Int) :
 defn new-emit-early-saves () :
    do(new-emit-early-saves, 0 to length(BLOCKS))
 
+
+;============================================================
+;================ Kill Use Annotations ======================
+;============================================================
+
+var USE-POS-BUFFER = Array<False|Int>(1024, false)
+defn fresh-array<?T> (a:Array<?T>, n:Int, x:T) :
+   if length(a) < n :
+      Array<T>(n, x)
+   else :
+      set-all(a, 0 to n, x)
+      a
+
+defn give-killed (e:Ins, ks:List<Int>) :
+   match(e) :
+      (e:Set) : Set(x(e), y(e), ks)
+      (e:Args) : Args(xs(e), ctxt(e), ks)
+      (e:Return) : Return(xs(e), ctxt(e), ks)
+      (e:Call) : Call(xs(e), f(e), ys(e), type(e), ks)
+      (e:Op) : Op(op(e), xs(e), ys(e), ks)
+      (e:Branch) : Branch(op(e), xs(e), ks)
+
+defn kill-use-annotations (bi:Int) :
+   ;Retrieve block
+   val blk = BLOCKS[bi]
+
+   ;Clear state
+   USE-POS-BUFFER = fresh-array(USE-POS-BUFFER, length(VAR-TYPES), false)
+
+   ;Clear instruction buffer
+   clear(INS-BUFFER)
+   defn emit (e:Ins) : add(INS-BUFFER, e)
+
+   ;Note usages of output ports
+   val num-ins = length(ins(blk))
+   for p in BLOCK-OUTS[bi] do :
+      USE-POS-BUFFER[n(p)] = dist(p) + num-ins
+
+   ;Sweep through instructions backwards
+   for (e in in-reverse(ins(blk)), i in (num-ins - 1) through 0 by -1) do :
+      ;Kill variables that are defined but not used
+      defn kill-unused (x:Var) :
+         val d = USE-POS-BUFFER[n(x)]
+         if d is False :
+            emit(Kill(n(x)))
+      do-defined(kill-unused, e)
+
+      ;Note usages for defined and used variables
+      defn note-usage (x:Imm) :
+         match(x) :
+            (x:Var) :
+               val d = USE-POS-BUFFER[n(x)]
+               if d is Int :
+                  emit(NextUsed(n(x), d as Int))
+            (x) : false
+      do-defined(note-usage, e)
+      do-used(note-usage, e)
+
+      ;Update the position buffer
+      defn mark-pos (x:Imm, d:Int|False) :
+         match(x) :
+            (x:Var) : USE-POS-BUFFER[n(x)] = d
+            (x) : false
+      do-defined(mark-pos, e, false)
+
+      ;Compute killed
+      var killed = List()
+      for x in e do-used :
+         match(x) :
+            (x:Var) :
+               if USE-POS-BUFFER[n(x)] is False :
+                  killed = cons(n(x), killed)
+            (x) : false
+
+      ;Emit the instruction
+      emit(give-killed(e, killed))
+      
+      ;Update the position buffer
+      do-used(mark-pos, e, i)
+      
+   ;Update block instructions
+   clear(ins(blk))
+   add-all(ins(blk), in-reverse(INS-BUFFER))
+
+defn kill-use-annotations () :
+   do(kill-use-annotations, 0 to length(BLOCKS))
+
+
 ;============================================================
 ;====================== Working IR ==========================
 ;============================================================
@@ -1046,6 +1147,11 @@ defstruct Clear <: Ins&Working :
    x: Var
 defstruct Unload <: Ins&Working :
    x: Var
+defstruct NextUsed <: Ins&Working :
+   n: Int
+   pos: Int
+defstruct Kill <: Ins&Working :
+   n: Int
 defstruct Xchg <: Ins&Working :
    x: Var
    y: Var
@@ -1066,6 +1172,8 @@ defstruct Break <: Ins&Working :
 defn cms (xs) : join(xs, ", ")
 defmethod print (o:OutputStream, i:Ins&Working) :
    print{o, _} $ match(i) :
+      (i:NextUsed) : "next used %_ at %_" % [n(i), pos(i)]
+      (i:Kill) : "kill %_" % [n(i)]
       (i:Save) : "save %~" % [x(i)]
       (i:Load) : "load %~" % [x(i)]
       (i:Clear) : "clear %~" % [x(i)]
@@ -1136,6 +1244,13 @@ defmethod print (o:OutputStream, b:WBlock) :
 
 ;     Useful Doers
 ;     ------------
+defn* do-list<?T,?S> (f: (T, S) -> ?, xs:List<?T>, a:?S) -> False :
+   match(xs) :
+      (xs:FullList) :
+         f(head(xs), a)
+         do-list(f, tail(xs), a)
+      (xs:NilList) : false
+      
 defn do-defined (f: Var -> False, e:Ins) :
    match(e) :
       (e:Set) : f(x(e))
@@ -1147,6 +1262,16 @@ defn do-defined (f: Var -> False, e:Ins) :
       (e:Save) : false
       (e:Load) : f(x(e))
 
+defn do-defined<?T> (f: (Var, T) -> False, e:Ins, a:?T) :
+   match(e) :
+      (e:Set) : f(x(e), a)
+      (e:Args) : do-list(f, xs(e), a)
+      (e:Call) : do-list(f, xs(e), a)
+      (e:Return) : false
+      (e:Op) : do-list(f, xs(e), a)
+      (e:Branch) : false
+      (e:Save) : false
+      (e:Load) : f(x(e), a)
 
 defn do-used (g: Imm -> False, e:Ins) :
    match(e) :
@@ -1157,6 +1282,17 @@ defn do-used (g: Imm -> False, e:Ins) :
       (e:Op) : do(g, ys(e))
       (e:Branch) : do(g, xs(e))
       (e:Save) : g(x(e))
+      (e:Load) : false
+
+defn do-used<?T> (g: (Imm, T) -> False, e:Ins, a:?T) :
+   match(e) :
+      (e:Set) : g(y(e), a)
+      (e:Args) : false
+      (e:Call) : (g(f(e), a), do-list(g, ys(e), a))
+      (e:Return) : do-list(g, xs(e), a)
+      (e:Op) : do-list(g, ys(e), a)
+      (e:Branch) : do-list(g, xs(e), a)
+      (e:Save) : g(x(e), a)
       (e:Load) : false
 
 ;============================================================
@@ -1627,7 +1763,7 @@ defn emit-early-saves (b:WBlock) :
       for x in e do-defined :
          if get?(REQUIRES-SAVE, n(x), false) :
             emit(Save(x as Var))
-
+ 
       emit(e)
 
       for x in e do-defined :
@@ -1674,6 +1810,12 @@ defn emit-early-saves (b:WBlock) :
 val SAVED = IntTable<True|False|Any>()
 val LOADED = IntTable<True|False|Any>()
 val PROJ-LOADED = IntTable<True|False>()
+
+val spill-calc-timer = MillisecondTimer("Calc Spill")
+val spill-reg-timer = MillisecondTimer("Spill Registers")
+val usage-table-timer = MillisecondTimer("Usage Table")
+val release-table-timer = MillisecondTimer("Release Table")
+val allocate-sweep-timer = MillisecondTimer("Allocate Sweep")
 
 defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock, backend:Backend) -> WBlock :
    ;     Layer 1
@@ -1777,6 +1919,7 @@ defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock, backend:Backend)
    defn num-spills-required (used:Seqable<Imm>,
                              released:Seqable<Int>,
                              defined:List<Var>) :
+      start(spill-calc-timer)                       
       ;Track whether a variable is projected to be loaded
       clear(PROJ-LOADED)
       defn proj-loaded? (x:Int) :
@@ -1819,10 +1962,15 @@ defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock, backend:Backend)
       ;Return number of spills needed of each type
       val num-spills = max(0, peak-reg-use - num-free-reg)
       val num-fspills = max(0, peak-freg-use - num-free-freg)
+      stop(spill-calc-timer)
       [num-spills, num-fspills]
 
+   start(usage-table-timer)
    val ut = usage-table(b)
+   stop(usage-table-timer)
+   
    defn spill (p:Pos, nr:Int, nf:Int) :
+      start(spill-reg-timer)
       if (nr > 0) or (nf > 0) :
          ;Get the currently loaded variables ordered by
          ;distance to usage (farthest first).
@@ -1846,6 +1994,7 @@ defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock, backend:Backend)
                unload(v)
                num-f = num-f - 1
                total = total - 1
+      stop(spill-reg-timer)         
 
    defn spill-overcommitted (p:Pos) :
       val nr = max(0, (- num-free-reg))
@@ -1859,7 +2008,11 @@ defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock, backend:Backend)
    spill-overcommitted(Pos(0, false))
 
    ;Iterate through block instructions
+   start(release-table-timer)
    val rt = release-table(b)
+   stop(release-table-timer)
+
+   start(allocate-sweep-timer)
    for (e in ins(b), i in 0 to false) do :
       match(e) :
          (e:Set) :
@@ -1909,6 +2062,7 @@ defn allocate-classes (tt:HashTable<Int,tgt-TgtType>, b:WBlock, backend:Backend)
             emit(e)
             define(xs(e))
       kill(rt[Pos(i,true), Pos(i + 1,false)])
+   stop(allocate-sweep-timer)   
 
    ;Read state of outgoing ports
    val out* = for x in out(b) map :
