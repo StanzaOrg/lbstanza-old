@@ -34,7 +34,7 @@ val assemble-timer = MillisecondTimer("Assemble")
 
 public defn print-timing () :
    val total = time(normalize-timer) + time(spill-timer) + time(to-bb-timer) +
-               time(critical-edges-timer) + time(index-timer) + time(liveness-timer) + time(early-saves-timer) +
+               time(critical-edges-timer) + time(liveness-timer) + time(early-saves-timer) +
                time(class-allocation-timer) + time(propagate-assumptions-timer) +
                time(register-assignment-timer) + time(stackmap-timer) + time(enforced-clearing-timer) +
                time(collapse-blocks-timer) + time(assemble-timer)
@@ -44,7 +44,6 @@ public defn print-timing () :
    print-percentage(spill-timer, total)
    print-percentage(to-bb-timer, total)   
    print-percentage(critical-edges-timer, total)
-   print-percentage(index-timer, total)
    print-percentage(liveness-timer, total)
    print-percentage(early-saves-timer, total)
    print-percentage(class-allocation-timer, total)
@@ -55,9 +54,15 @@ public defn print-timing () :
    print-percentage(collapse-blocks-timer, total)
    print-percentage(assemble-timer, total)
 
+   print-percentage(index-timer, total)
+
    print-percentage(liveness-gather-timer, time(liveness-timer))
    print-percentage(liveness-propagation-timer, time(liveness-timer))
    print-percentage(liveness-collect-timer, time(liveness-timer))
+
+   print-percentage(clear-timer, time(index-timer))
+   print-percentage(rename-timer, time(index-timer))
+   print-percentage(propagation-timer, time(index-timer))
 
 public defn compile (def:tgt-DefFn,
                      backend:Backend,
@@ -781,16 +786,40 @@ defn remove-critical-edges (u:Unit) :
 ;==================== Index =================================
 ;============================================================
 
-val VAR-INDICES = HashTable<Int,Int>()
-val BLOCK-INDICES = HashTable<Int,Int>()
+val clear-timer = MillisecondTimer("Clearing")
+val rename-timer = MillisecondTimer("Renaming")
+val propagation-timer = MillisecondTimer("Propagation")
+
+val VAR-INDICES = IntTable<Int>()
+val BLOCK-INDICES = IntTable<Int>()
 val VAR-TYPES = Vector<tgt-TgtType>()
 val BLOCKS = Vector<Block>()
+val PREDECESSORS = Vector<List<Int>>()
+var BLOCK-DEFS = BitArray(1024 * 1024)
+val BLOCK-INS = Vector<List<Port>>()
+val BLOCK-OUTS = Vector<List<Port>>()
+
+val VAR-USES = Vector<List<KeyValue<Int,Int>>>()
+val LIVE-IN-BUFFER = Vector<Int>()
+val LIVE-OUT-BUFFER = Vector<Int>()
+val BLOCK-IN-BUFFER = Vector<Int>()
+val BLOCK-OUT-BUFFER = Vector<Int>()
+
+defn clear-block-defs (n:Int) :
+   if length(BLOCK-DEFS) < n :
+      val n* = max(length(BLOCK-DEFS) * 2, n)
+      BLOCK-DEFS = BitArray(n*)
+   else :
+      clear(BLOCK-DEFS, n)
 
 defn index-prog (u:Unit) :
-   ;Clear
+   ;Clear Vars and Blocks
+   start(clear-timer)
    clear(VAR-INDICES)
    clear(VAR-TYPES)
    clear(BLOCKS)
+   stop(clear-timer)
+   
    ;Populate Variables
    for def in defs(u) do :
       val [n, t] = [tgt-n(def), tgt-type(def)]
@@ -802,22 +831,145 @@ defn index-prog (u:Unit) :
       val n* = length(BLOCKS)
       BLOCK-INDICES[n(blk)] = n*
       add(BLOCKS, blk)
-   ;Rename Instructions
+
+   ;Clear block defs
+   start(clear-timer)
+   val nblocks = length(BLOCKS)
+   val nvars = length(VAR-TYPES)
+   clear-block-defs(nblocks * nvars)
+   ;Clear block uses
+   clear(VAR-USES)
+   set-length(VAR-USES, nvars, List())
+   ;Clear predecessors
+   clear(PREDECESSORS)
+   set-length(PREDECESSORS, nblocks, List())
+   stop(clear-timer)
+   
+   ;Rename Instruction
    defn rename (i:Ins) :
       for imm in i map :
          match(imm) :
             (imm:Var) : Var(VAR-INDICES[n(imm)])
             (imm) : imm
+            
    ;Rename Blocks
    for blk in BLOCKS map! :
-      val n* = BLOCK-INDICES[n(blk)]
-      val ins* = map<Ins>(rename, ins(blk))
+      ;Rename block indices
       val next* = map({BLOCK-INDICES[_]}, next(blk))
-      Block(n*, ins*, next*)
+      val n* = BLOCK-INDICES[n(blk)]
+
+      ;Mark definitions and usages
+      defn mark-defined (v:Var) : BLOCK-DEFS[n* * n(v)] = true
+      defn defined? (v:Var) : BLOCK-DEFS[n* * n(v)]
+      defn mark-used (v:Imm, d:Int) :
+         if v is Var :
+            val v = v as Var
+            if not defined?(v) :
+               VAR-USES[n(v)] = cons(n* => d, VAR-USES[n(v)])
+      
+      val idx-counter = to-seq(0 to false)
+      val ins* = for i in ins(blk) map<Ins> :
+         val idx = next(idx-counter)
+         start(rename-timer)
+         val i* = rename(i)
+         stop(rename-timer)
+         do-used(mark-used{_, idx}, i*)
+         do-defined(mark-defined, i*)
+         i*
+      for n in next* do :
+         PREDECESSORS[n] = cons(n*, PREDECESSORS[n])
+      Block(n(blk), ins*, next*)
+
+   ;Propagate liveness
+   start(clear-timer)
+   clear(BLOCK-INS)
+   clear(BLOCK-OUTS)
+   set-length(BLOCK-INS, nblocks, List())
+   set-length(BLOCK-OUTS, nblocks, List())
+   if length(LIVE-IN-BUFFER) < nblocks :
+      lengthen(LIVE-IN-BUFFER, nblocks, INT-MAX)
+      lengthen(LIVE-OUT-BUFFER, nblocks, INT-MAX)
+   stop(clear-timer)  
+
+   defn save-lives (v:Int) :
+      for b in BLOCK-IN-BUFFER do :
+         BLOCK-INS[b] = cons(DPort(v, Any(), Any(), NoLoc(), LIVE-IN-BUFFER[b]), BLOCK-INS[b])
+         LIVE-IN-BUFFER[b] = INT-MAX
+      start(clear-timer)   
+      clear(BLOCK-IN-BUFFER)
+      stop(clear-timer)
+
+      for b in BLOCK-OUT-BUFFER do :
+         BLOCK-OUTS[b] = cons(DPort(v, Any(), Any(), NoLoc(), LIVE-OUT-BUFFER[b]), BLOCK-OUTS[b])
+         LIVE-OUT-BUFFER[b] = INT-MAX
+      start(clear-timer)   
+      clear(BLOCK-OUT-BUFFER)
+      stop(clear-timer)
+
+   start(propagation-timer)
+   for v in 0 to nvars do :
+      if not empty?(VAR-USES[v]) :
+         for entry in VAR-USES[v] do :
+            val [b, d] = [key(entry), value(entry)]
+            mark-live-in(b, v, d)
+         save-lives(v)     
+   stop(propagation-timer) 
+
+;defn mark-live-out (b:Int, v:Int, d:Int) :
+;   if d < LIVE-OUT-BUFFER[b] :
+;      if LIVE-OUT-BUFFER[b] == INT-MAX :
+;         add(BLOCK-OUT-BUFFER, b)
+;      LIVE-OUT-BUFFER[b] = d
+;      if not BLOCK-DEFS[b * v] :
+;         mark-live-in(b, v, d + length(ins(BLOCKS[b])))
+;
+;defn mark-live-in (b:Int, v:Int, d:Int) :
+;   if LIVE-IN-BUFFER[b] == INT-MAX :
+;      add(BLOCK-IN-BUFFER, b)
+;   LIVE-IN-BUFFER[b] = d
+;   for pred in PREDECESSORS[b] do :
+;      mark-live-out(pred, v, d)
+
+lostanza defn mark-live-out (b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :
+   val old-value = get(LIVE-OUT-BUFFER, b).value
+   if d.value < old-value :
+      if old-value == INT-MAX.value :
+         add(BLOCK-IN-BUFFER, b)
+      set(LIVE-OUT-BUFFER, b, d)
+      if get(BLOCK-DEFS, new Int{b.value * v.value}) == false :
+         val d* = new Int{d.value + length(ins(get(BLOCKS, b))).value}
+         mark-live-in(b, v, d*)
+   return false
+
+lostanza defn mark-live-in (b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :
+   if get(LIVE-IN-BUFFER, b) == INT-MAX :
+      add(BLOCK-IN-BUFFER, b)
+   set(LIVE-IN-BUFFER, b, d)
+   labels :
+      begin :
+         goto loop(get(PREDECESSORS, b))
+      loop (preds:ref<List<Int>>) :
+         match(preds) :
+            (preds:ref<FullList<Int>>) :
+               mark-live-out(head(preds), v, d)
+               goto loop(tail(preds))
+            (preds:ref<NilList>) :
+               return false
+      
+   ;while empty?(preds) == false :
+   ;   mark-live-out(head(preds), v, d)
+   ;   preds = tail(preds)
+   ;return false   
 
 defn print-indexed-prog () :
    println("VARS = %_" % [VAR-TYPES])
-   do(println, BLOCKS)
+   for b in 0 to length(BLOCKS) do :
+      println("Block %_" % [b])
+      println("Predecessors: %_" % [PREDECESSORS[b]])
+      println("Ins: %_" % [BLOCK-INS[b]])
+      println(BLOCKS[b])
+      println("Outs: %_" % [BLOCK-OUTS[b]])
+      println("")
 
 
 ;============================================================
@@ -875,14 +1027,33 @@ defmethod print (o:OutputStream, x:Any) :
 
 ;     Port Definition
 ;     ---------------
-defstruct Port :
-   n: Int
-   saved?: True|False|Any
-   loaded?: True|False|Any
-   loc: Loc
+deftype Port
+defmulti n (p:Port) -> Int
+defmulti saved? (p:Port) -> True|False|Any
+defmulti loaded? (p:Port) -> True|False|Any
+defmulti loc (p:Port) -> Loc
+defmulti dist (p:Port) -> Int
+
+defstruct EPort <: Port :
+   n: Int with: (as-method => true)
+   saved?: True|False|Any with: (as-method => true)
+   loaded?: True|False|Any with: (as-method => true)
+   loc: Loc with: (as-method => true)
+with :
+   constructor => Port
 
 defmethod print (o:OutputStream, p:Port) :
    print(o, "%~ (s:%~, l:%~, at:%~)" % [n(p), saved?(p), loaded?(p), loc(p)])
+
+defn DPort (n:Int, saved?:True|False|Any, loaded?:True|False|Any, loc:Loc, dist:Int) :
+   new Port :
+      defmethod n (this) : n
+      defmethod saved? (this) : saved?
+      defmethod loaded? (this) : loaded?
+      defmethod loc (this) : loc
+      defmethod dist (this) : dist
+      defmethod print (o:OutputStream, this) :
+         print(o, "%~ (s:%~, l:%~, at:%~, dist:%~)" % [n, saved?, loaded?, loc, dist])
 
 ;     Working Block
 ;     -------------
@@ -3243,3 +3414,4 @@ defn compile (func-id:Int,
                      (op) :
                         val [x, y] = [xs(e)[0], xs(e)[1]]
                         av-break(n(e), flip-op?(op), aval(x), aval(y))
+
