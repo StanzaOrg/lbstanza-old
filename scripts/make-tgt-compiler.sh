@@ -13,3 +13,4 @@
      compiler/stz-tgt-compiler.stanza \
   -o tgt-compiler \
   -optimize
+
