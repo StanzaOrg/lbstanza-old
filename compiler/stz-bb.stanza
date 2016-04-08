@@ -35,6 +35,7 @@ val index-timer = MillisecondTimer("Index")
 val new-early-saves-timer = MillisecondTimer("New Early Saves")
 val annotation-timer = MillisecondTimer("Annotation")
 val new-class-allocation-timer = MillisecondTimer("Class Allocation")
+val new-reg-assignment-timer = MillisecondTimer("Register Assignment")
 
 public defn print-timing () :
    val total = time(normalize-timer) + time(spill-timer) + time(to-bb-timer) +
@@ -70,6 +71,7 @@ public defn print-timing () :
    print-percentage(new-early-saves-timer, total)
    print-percentage(annotation-timer, total)
    print-percentage(new-class-allocation-timer, total)
+   print-percentage(new-reg-assignment-timer, total)
 
    
 
@@ -113,17 +115,18 @@ public defn compile (def:tgt-DefFn,
    start(index-timer)
    index-prog(u)
    stop(index-timer)
-   ;print-indexed-prog()
 
    start(annotation-timer)
    add-annotations()
    stop(annotation-timer)
-   ;print-indexed-prog()
 
    start(new-class-allocation-timer)
    new-allocate-classes(backend)
    stop(new-class-allocation-timer)
-   ;print-indexed-prog()
+
+   start(new-reg-assignment-timer)
+   #register-assignment(backend)
+   stop(new-reg-assignment-timer)
 
    ;Old Pipeline
    start(liveness-timer)
@@ -822,19 +825,13 @@ val LIVE-OUT-BUFFER = Vector<Int>()
 val DIRTY-LIVE-INS = Vector<Int>()
 val DIRTY-LIVE-OUTS = Vector<Int>()
 
-defn clear-block-defs (n:Int) :
-   if length(BLOCK-DEFS) < n :
-      val n* = max(length(BLOCK-DEFS) * 2, n)
-      BLOCK-DEFS = BitArray(n*)
-   else :
-      clear(BLOCK-DEFS, n)
-
 defn index-prog (u:Unit) :
    ;Clear Vars and Blocks
    clear(VAR-INDICES)
    clear(BLOCK-INDICES)
    clear(VAR-TYPES)
    clear(BLOCKS)
+   
 
    ;Populate Variables
    for def in defs(u) do :
@@ -851,7 +848,8 @@ defn index-prog (u:Unit) :
    ;Clear block defs
    val nblocks = length(BLOCKS)
    val nvars = length(VAR-TYPES)
-   clear-block-defs(nblocks * nvars)
+   BLOCK-DEFS = fresh-bit-array(BLOCK-DEFS, nblocks * nvars, false)
+
    ;Clear block uses
    clear(VAR-USES)
    set-length(VAR-USES, nvars, List())
@@ -873,8 +871,8 @@ defn index-prog (u:Unit) :
       val n* = BLOCK-INDICES[n(blk)]
 
       ;Mark definitions and usages
-      defn mark-defined (v:Var) : BLOCK-DEFS[n* * n(v)] = true
-      defn defined? (v:Var) : BLOCK-DEFS[n* * n(v)]
+      defn mark-defined (v:Var) : BLOCK-DEFS[n* * nvars + n(v)] = true
+      defn defined? (v:Var) : BLOCK-DEFS[n* * nvars + n(v)]
       defn mark-used (v:Imm, d:Int) :
          if v is Var :
             val v = v as Var
@@ -919,13 +917,15 @@ defn index-prog (u:Unit) :
             mark-live-in(b, v, d)
          save-lives(v)
 
-lostanza defn mark-live-out (b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :
+lostanza defn mark-live-out (b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :   
    val old-value = get(LIVE-OUT-BUFFER, b).value
    if d.value < old-value :
       if old-value == INT-MAX.value :
          add(DIRTY-LIVE-OUTS, b)
       set(LIVE-OUT-BUFFER, b, d)
-      if get(BLOCK-DEFS, new Int{b.value * v.value}) == false :
+
+      val idx = b.value * length(VAR-TYPES).value + v.value
+      if get(BLOCK-DEFS, new Int{idx}) == false :
          val d* = new Int{d.value + length(ins(get(BLOCKS, b))).value}
          mark-live-in(b, v, d*)
    return false
@@ -967,10 +967,17 @@ val INS-BUFFER = Vector<Ins>()
 
 defn fresh-array<?T> (a:Array<?T>, n:Int, x:T) :
    if length(a) < n :
-      Array<T>(n, x)
+      val n* = max(2 * length(a), n)
+      Array<T>(n*, x)
    else :
       set-all(a, 0 to n, x)
       a
+
+defn fresh-array<?T> (a:Array<?T>, n:Int) :
+   if length(a) < n : 
+      val n* = max(2 * length(a), n)
+      Array<T>(n*)
+   else : a   
 
 defn fresh-bit-array (a:BitArray, n:Int, init:True|False) :
    if n < length(a) :
@@ -1136,13 +1143,7 @@ defn new-allocate-classes (bi:Int, backend:Backend) :
    defn define (x:Var) :
       val n = n(x)
       mark-loaded(n)
-      NEW-REQUIRES-SAVE[n] = false
-   defn define (p:Port) :
-      val n = n(p)
-      mark-loaded(n) when loaded?(p) is True|Any         
-      NEW-REQUIRES-SAVE[n] = saved?(p) is True
-      USAGE-BUFFER[n] = dist(p)
-      
+      NEW-REQUIRES-SAVE[n] = false      
    defn save (x:Int, buffer:Vector<Ins>) :
       if NEW-REQUIRES-SAVE[x] is False :
          add(buffer, Save(Var(x)))
@@ -1190,11 +1191,15 @@ defn new-allocate-classes (bi:Int, backend:Backend) :
       spill(nr, nf, buffer)
 
    ;Define Entry Ports
-   do(define, BLOCK-INS[bi])
+   for p in BLOCK-INS[bi] do :
+      val n = n(p)
+      mark-loaded(n) when loaded?(p) is True|Any         
+      NEW-REQUIRES-SAVE[n] = saved?(p) is True
+      USAGE-BUFFER[n] = dist(p)
    spill-overcommitted(DELAY-INS-BUFFER)
    BLOCK-INS[bi] = for p in BLOCK-INS[bi] map :
       val ld = NEW-PREFERS-LOAD[n(p)]
-      DPort(n(p), ld, saved?(p), loc(p), dist(p))
+      DPort(n(p), saved?(p), ld, loc(p), dist(p))
 
    ;Sweep through instructions
    for e in ins(blk) do :
@@ -1232,6 +1237,291 @@ defn new-allocate-classes (bi:Int, backend:Backend) :
 
 defn new-allocate-classes (backend:Backend) :
    do(new-allocate-classes{_, backend}, 0 to length(BLOCKS))
+
+;============================================================
+;=============== Register Assignment ========================
+;============================================================
+
+var #VAR-LOCS = Array<Loc>(1024, NoLoc())
+var #REG-SLOTS = Array<False|Int>(0)
+var #FREG-SLOTS = Array<False|Int>(0)
+var #PORT-TABLE = Array<Port>(1024)
+
+defn PrefReg (xs:List<Imm>) :
+   val regs = for x in xs seq? :
+      match(x) :
+         (x:Var) :
+            match(loc(x)) :
+               (l:Reg|FReg) : One(n(l))
+               (l) : None()
+         (x) : None()
+   FreeReg(to-list(regs))
+
+defn PrefReg (x:Imm) :
+   match(x) :
+      (x:Var) :
+         match(loc(x)) :
+            (l:Reg|FReg) : FreeReg(List(n(l)))
+            (l) : FreeReg()
+      (x) : FreeReg()
+
+defn #register-assignment (bi:Int, ports-in:List<Port>, backend:Backend) :
+   ;Retrieve block
+   val blk = BLOCKS[bi]
+   
+   ;Algorithm state
+   val nvars = length(VAR-TYPES)
+   clear(INS-BUFFER)
+   #VAR-LOCS = fresh-array(#VAR-LOCS, nvars, NoLoc())
+   #REG-SLOTS = fresh-array(#REG-SLOTS, num-regs(backend), false)
+   #FREG-SLOTS = fresh-array(#FREG-SLOTS, num-fregs(backend), false)
+   #PORT-TABLE = fresh-array(#PORT-TABLE, nvars)
+
+   ;Emit to instruction buffer
+   defn emit (e:Ins) :
+      add(INS-BUFFER, e)
+
+   ;Fill an immediate or port with 
+   defn fill (x:Port) :
+      val loc = #VAR-LOCS[n(x)]
+      fatal("Port %_ has not been assigned a location." % [n(x)]) when loc is NoLoc ;DEBUG
+      val sv = (saved?(x) is True) or (loc is Stack)
+      val ld = loc is Reg|FReg
+      DPort(n(x), sv, ld, loc, dist(x))
+   defn fill<?T> (x:?T&Imm) -> T :     
+      {_ as T&Imm} $ match(x) :
+         (x:Var) :
+            fatal("Var %_ has no location." % [n(x)]) when #VAR-LOCS[n(x)] is NoLoc ;DEBUG
+            Var(n(x), #VAR-LOCS[n(x)])
+         (x) : x
+
+   ;Free a register
+   defn free (x:Int) :
+      match(#VAR-LOCS[x]) :
+         (loc:Reg) :
+            #REG-SLOTS[n(loc)] = false
+            #VAR-LOCS[x] = Stack(x)
+         (loc:FReg) :
+            #FREG-SLOTS[n(loc)] = false
+            #VAR-LOCS[x] = Stack(x)
+         (loc) : false
+
+   ;Find the next free register
+   ;TODO: Use a free list
+   defn free-reg (pref:List<Int>) :
+      val reg = for i in pref first :
+         One(Reg(i)) when #REG-SLOTS[i] is False else None()
+      if empty?(reg) : Reg(index-of!(#REG-SLOTS, false))
+      else : value!(reg)
+   defn free-freg (pref:List<Int>) :
+      val reg = for i in pref first :
+         One(FReg(i)) when #FREG-SLOTS[i] is False else None()
+      if empty?(reg) : FReg(index-of!(#FREG-SLOTS, false))
+      else : value!(reg)
+
+   ;Assign a location
+   defn assign (x:Int, l:Loc) :
+      match(l) :
+         (l:FreeReg) :
+            val reg = if tgt-int?(VAR-TYPES[x]) : free-reg(prefer(l))
+                      else : free-freg(prefer(l))
+            assign(x, reg)          
+         (l:Stack) :
+            #VAR-LOCS[x] = l
+         (l:Reg) :
+            #VAR-LOCS[x] = l
+            #REG-SLOTS[n(l)] = x
+         (l:FReg) :
+            #VAR-LOCS[x] = l
+            #FREG-SLOTS[n(l)] = x
+         (l) :
+            fatal("%_ not supported." % [l])
+
+   ;Convenience assigners
+   defn assign (x:Var|Port, l:Loc) :
+      assign(n(x), l)
+   defn assign (xs:List<Var|Port>, l:Loc) :
+      do(assign{_, l}, xs)
+
+   ;Assign several locations   
+   defn assign (xs:List<Var|Port>, ls:List<Loc>) :
+      ;First assign stacks and regs
+      for (x in xs, l in ls) do :
+         assign(n(x), l) when l is-not FreeReg
+      ;Next assign free registers
+      for (x in xs, l in ls) do :
+         assign(n(x), l) when l is FreeReg
+
+   ;Helper: Move whatever was in src to dst
+   defn swap-reg (src:Int, dst:Int) :
+      val x = #REG-SLOTS[src] as Int
+      match(#REG-SLOTS[dst]) :
+         (y:Int) :
+            match(index-of(#REG-SLOTS, false)) :
+               (s:Int) :
+                  emit(Set(Var(y, Reg(dst)), Var(y, Reg(s))))
+                  emit(Set(Var(x, Reg(src)), Var(x, Reg(dst))))
+                  free(x)
+                  free(y)
+                  assign(x, Reg(dst))
+                  assign(y, Reg(s))
+               (s:False) :
+                  emit(Xchg(Var(x, Reg(src)), Var(y, Reg(dst)), false))
+                  free(x)
+                  free(y)
+                  assign(x, Reg(dst))
+                  assign(y, Reg(src))
+         (y:False) :
+            emit(Set(Var(x, Reg(dst)), Var(x, Reg(src))))
+            free(x)
+            assign(x, Reg(dst))
+            
+   defn ensure-free-regs (regs:List<Int>, ks:List<Int>) :
+      ;Will be free after release
+      defn free? (r:Int) :
+         (#REG-SLOTS[r] is False) or
+         contains?(ks, #REG-SLOTS[r])
+      ;Safe position to swap with
+      defn swap? (r:Int) :
+         free?(r) and not contains?(regs, r)
+      val swaps = filter(swap?, 0 to length(#REG-SLOTS))
+      ;Swap out registers to ensure free
+      for r in regs do :
+         swap-reg(r, next(swaps)) when not free?(r)
+
+   ;Ensure that the value x is in register r
+   defn ensure-reg (x:Int, r:Int) :
+      val src = n(#VAR-LOCS[x] as Reg)
+      swap-reg(src, r) when src != r
+
+   ;Assign initial ports
+   for p in ports-in do :
+      #PORT-TABLE[n(p)] = p
+   val locs = for p in BLOCK-INS[bi] map :
+      match(loaded?(p), loc(#PORT-TABLE[n(p)])) :
+         (ld:True, loc:Reg|FReg) : loc
+         (ld:True, loc:Stack) : FreeReg()
+         (ld:False, loc) : Stack(n(p))
+   assign(BLOCK-INS[bi], locs)
+   BLOCK-INS[bi] = map(fill, BLOCK-INS[bi])
+
+   ;Sweep through instructions and assign locations
+   for e in ins(blk) do :
+      match(e) :
+         (e:Set) :
+            val y* = fill(y(e))
+            do(free, killed(e))
+            assign(x(e), PrefReg(y*))
+            emit(Set(fill(x(e)), y*))
+         (e:Op) :
+            defn xs-prefers-arg () :
+               val ys* = map(fill,ys(e))
+               do(free, killed(e))
+               assign(xs(e), PrefReg(ys*))
+               emit(Op(op(e), map(fill,xs(e)), ys*))
+            defn xs-prefers-arg0 () :
+               val ys* = map(fill,ys(e))
+               do(free, killed(e))
+               assign(xs(e), PrefReg(head(ys*)))
+               emit(Op(op(e), map(fill,xs(e)), ys*))
+            defn xs-prefers-none () :
+               val ys* = map(fill,ys(e))
+               do(free, killed(e))
+               assign(xs(e), FreeReg())
+               emit(Op(op(e), map(fill,xs(e)), ys*))
+            defn xs-requires-r0-r3 () :
+               ensure-free-regs(List(0,3), killed(e))
+               val ys* = map(fill,ys(e))
+               do(free, killed(e))
+               assign(xs(e), List(Reg(0), Reg(3)))
+               emit(Op(op(e), map(fill,xs(e)), ys*))
+            defn z-in-r2 () :
+               match(ys(e)[1]) :
+                  (z:Var) : ensure-reg(n(z), 2)
+                  (z) : false
+               xs-prefers-arg0()                  
+            match(op(e)) :
+               (opc:tgt-LoadOp) : xs-prefers-arg()
+               (opc:tgt-StoreOp) : xs-prefers-none()
+               (opc:tgt-AddrOp) : xs-prefers-arg()
+               (opc) :
+                  switch {opc == _} :
+                     tgt-ADD-OP : xs-prefers-arg()
+                     tgt-SUB-OP : xs-prefers-arg0()
+                     tgt-MUL-OP : xs-prefers-arg()
+                     tgt-DIV-OP : xs-prefers-arg0()
+                     tgt-AND-OP : xs-prefers-arg()
+                     tgt-OR-OP : xs-prefers-arg()
+                     tgt-XOR-OP : xs-prefers-arg()
+                     tgt-NOT-OP : xs-prefers-arg()
+                     tgt-NEG-OP : xs-prefers-arg()
+                     tgt-SHL-OP : z-in-r2()
+                     tgt-SHR-OP : z-in-r2()
+                     tgt-ASHR-OP : z-in-r2()
+                     tgt-EQ-OP : xs-prefers-none()
+                     tgt-NE-OP : xs-prefers-none()
+                     tgt-LT-OP : xs-prefers-none()
+                     tgt-GT-OP : xs-prefers-none()
+                     tgt-LE-OP : xs-prefers-none()
+                     tgt-GE-OP : xs-prefers-none()
+                     tgt-ULE-OP : xs-prefers-none()
+                     tgt-ULT-OP : xs-prefers-none()
+                     tgt-UGT-OP : xs-prefers-none()
+                     tgt-UGE-OP : xs-prefers-none()
+                     tgt-DIVMOD-OP : xs-requires-r0-r3()
+                     tgt-CONV-OP : xs-prefers-arg()
+                     tgt-INTERPRET-OP : xs-prefers-arg()
+                     tgt-SWITCH-STACK-OP : xs-prefers-none()
+                     tgt-ENTER-FROM-C : xs-prefers-none()
+                     tgt-NO-OP : false
+         (e:Branch) :
+            emit(Branch(op(e), map(fill, xs(e))))
+            do(free, killed(e))
+         (e:Return) :
+            emit(Return(map(fill,xs(e)), ctxt(e)))
+            do(free, killed(e))
+         (e:Args) :
+            do(free, killed(e))
+            assign(xs(e), FreeReg())
+            emit(Args(map(fill,xs(e)), ctxt(e)))
+         (e:Call) :
+            val f* = fill(f(e))
+            val ys* = map(fill,ys(e))
+            do(free, killed(e))
+            assign(xs(e), FreeReg())
+            emit(Call(map(fill,xs(e)), f*, ys*, type(e)))
+         (e:Save) :
+            emit(Save(fill(x(e))))
+         (e:Load) :
+            assign(x(e), FreeReg())
+            emit(Load(fill(x(e))))
+         (e:Kill) :
+            free(n(e))
+         (e:Unload) :
+            free(n(x(e)))
+         (e) :
+            fatal("%_ not supported." % [e])
+
+   ;Update block instructions
+   clear(ins(blk))
+   add-all(ins(blk), INS-BUFFER)
+
+   ;Fill output ports
+   BLOCK-OUTS[bi] = map(fill, BLOCK-OUTS[bi])
+
+var BLOCK-FLAGS = BitArray(1024)
+defn #register-assignment (backend:Backend) :
+   BLOCK-FLAGS = fresh-bit-array(BLOCK-FLAGS, length(BLOCKS), false)
+   
+   defn assign-regs (bi:Int, ports-in:List<Port>) :
+      if not BLOCK-FLAGS[bi] :         
+         #register-assignment(bi, ports-in, backend)
+         BLOCK-FLAGS[bi] = true
+         for n in next(BLOCKS[bi]) do :
+            assign-regs(n, BLOCK-OUTS[bi])         
+
+   assign-regs(0, List())
+         
 
 ;============================================================
 ;====================== Working IR ==========================
