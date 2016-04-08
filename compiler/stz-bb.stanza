@@ -34,6 +34,7 @@ val assemble-timer = MillisecondTimer("Assemble")
 val index-timer = MillisecondTimer("Index")
 val new-early-saves-timer = MillisecondTimer("New Early Saves")
 val annotation-timer = MillisecondTimer("Annotation")
+val new-class-allocation-timer = MillisecondTimer("Class Allocation")
 
 public defn print-timing () :
    val total = time(normalize-timer) + time(spill-timer) + time(to-bb-timer) +
@@ -68,6 +69,7 @@ public defn print-timing () :
    print-percentage(index-timer, total)
    print-percentage(new-early-saves-timer, total)
    print-percentage(annotation-timer, total)
+   print-percentage(new-class-allocation-timer, total)
 
    
 
@@ -118,9 +120,9 @@ public defn compile (def:tgt-DefFn,
    stop(annotation-timer)
    ;print-indexed-prog()
 
-   ;start(new-early-saves-timer)
-   ;new-emit-early-saves()
-   ;stop(new-early-saves-timer)
+   start(new-class-allocation-timer)
+   new-allocate-classes(backend)
+   stop(new-class-allocation-timer)
    ;print-indexed-prog()
 
    ;Old Pipeline
@@ -1086,6 +1088,152 @@ defn add-annotations () :
 
 
 ;============================================================
+;================== Class Allocation ========================
+;============================================================
+
+val DIRTY-LOADED = Vector<Int>()
+val DELAY-INS-BUFFER = Vector<Ins>()
+
+defn new-allocate-classes (bi:Int, backend:Backend) :
+   ;Retrieve block
+   val blk = BLOCKS[bi]
+
+   ;Algorithm State
+   val nvars = length(VAR-TYPES)
+   clear(INS-BUFFER)
+   clear(DIRTY-LOADED)
+   NEW-PREFERS-LOAD = fresh-array(NEW-PREFERS-LOAD, nvars, false)
+   NEW-REQUIRES-SAVE = fresh-bit-array(NEW-REQUIRES-SAVE, nvars, false)
+   USAGE-BUFFER = fresh-array(USAGE-BUFFER, nvars, false)
+
+   ;Track number of registers used
+   var num-free-reg = num-regs(backend)
+   var num-free-freg = num-fregs(backend)
+   defn inc-reg (n:Int) :
+      if tgt-int?(VAR-TYPES[n]) : num-free-reg = num-free-reg + 1
+      else : num-free-freg = num-free-freg + 1
+   defn dec-reg (n:Int) :
+      if tgt-int?(VAR-TYPES[n]) : num-free-reg = num-free-reg - 1
+      else : num-free-freg = num-free-freg - 1
+
+   ;Track loads
+   defn mark-loaded (n:Int) -> True|False :
+      if NEW-PREFERS-LOAD[n] is False :
+         add(DIRTY-LOADED, n)
+         NEW-PREFERS-LOAD[n] = true
+         dec-reg(n)
+         true
+   defn mark-unloaded (n:Int) -> True|False :
+      if NEW-PREFERS-LOAD[n] is True :
+         NEW-PREFERS-LOAD[n] = false
+         inc-reg(n)
+         true
+   defn do-loaded (f: Int -> ?) :
+      for x in DIRTY-LOADED remove-when :
+         if NEW-PREFERS-LOAD[x] is True : (f(x), false)
+         else : true
+
+   defn define (x:Var) :
+      val n = n(x)
+      mark-loaded(n)
+      NEW-REQUIRES-SAVE[n] = false
+   defn define (p:Port) :
+      val n = n(p)
+      mark-loaded(n) when loaded?(p) is True|Any         
+      NEW-REQUIRES-SAVE[n] = saved?(p) is True
+      USAGE-BUFFER[n] = dist(p)
+      
+   defn save (x:Int, buffer:Vector<Ins>) :
+      if NEW-REQUIRES-SAVE[x] is False :
+         add(buffer, Save(Var(x)))
+      NEW-REQUIRES-SAVE[x] = true   
+   defn load (x:Int, buffer:Vector<Ins>) :
+      if mark-loaded(x) :
+         add(buffer, Load(Var(x)))
+   defn unload (x:Int, buffer:Vector<Ins>) :
+      if mark-unloaded(x) :
+         add(buffer, Unload(Var(x)))
+
+   ;Spill
+   defn next-spill-reg (type?: tgt-TgtType -> True|False) :
+      var reg = false
+      var dist = 0
+      do-loaded $ fn (x) :
+         if type?(VAR-TYPES[x]) :
+            val dist* = USAGE-BUFFER[x] as Int
+            if dist* > dist :
+               reg = x
+               dist = dist*
+      reg as Int
+      
+   defn* spill (nr:Int, nf:Int, buffer:Vector<Ins>) :
+      if nr > 0 :
+         val reg = next-spill-reg(tgt-int?)
+         save(reg, buffer)
+         unload(reg, buffer)
+         spill(nr - 1, nf, buffer)
+      else if nf > 0 :
+         val reg = next-spill-reg(tgt-float?)
+         save(reg, buffer)
+         unload(reg, buffer)
+         spill(nr, nf - 1, buffer)
+
+   defn* reserve (n:Int, buffer:Vector<Ins>) :
+      if tgt-int?(VAR-TYPES[n]) :
+         spill(1, 0, buffer) when num-free-reg < 1
+      else :
+         spill(0, 1, buffer) when num-free-freg < 1
+
+   defn spill-overcommitted (buffer:Vector<Ins>) :
+      val nr = max(0, (- num-free-reg))
+      val nf = max(0, (- num-free-freg))
+      spill(nr, nf, buffer)
+
+   ;Define Entry Ports
+   do(define, BLOCK-INS[bi])
+   spill-overcommitted(DELAY-INS-BUFFER)
+   BLOCK-INS[bi] = for p in BLOCK-INS[bi] map :
+      val ld = NEW-PREFERS-LOAD[n(p)]
+      DPort(n(p), ld, saved?(p), loc(p), dist(p))
+
+   ;Sweep through instructions
+   for e in ins(blk) do :
+      match(e) :
+         (e:NextUsed) :
+            USAGE-BUFFER[n(e)] = pos(e)
+         (e:Unload) :
+            unload(n(x(e)), INS-BUFFER)
+         (e:Save) :
+            save(n(x(e)), INS-BUFFER)
+         (e:Kill) :
+            mark-unloaded(n(e))
+            add(INS-BUFFER,e)
+         (e) :
+            clear(DELAY-INS-BUFFER)
+            ;Load arguments
+            for x in e do-used-var :
+               reserve(n(x), INS-BUFFER)
+               load(n(x), DELAY-INS-BUFFER)
+            ;Emit instruction   
+            add(DELAY-INS-BUFFER, e)
+            ;Release killed
+            for x in killed(e) do :
+               mark-unloaded(x)
+            ;Define new variables
+            for x in e do-defined :
+               reserve(n(x), INS-BUFFER)
+               define(x)
+            ;Add delayed instructions to buffer
+            add-all(INS-BUFFER, DELAY-INS-BUFFER)
+
+   ;Update instructions in block
+   clear(ins(blk))
+   add-all(ins(blk), INS-BUFFER)
+
+defn new-allocate-classes (backend:Backend) :
+   do(new-allocate-classes{_, backend}, 0 to length(BLOCKS))
+
+;============================================================
 ;====================== Working IR ==========================
 ;============================================================
 
@@ -1247,6 +1395,12 @@ defn do-used<?T> (g: (Imm, T) -> False, e:Ins, a:?T) :
       (e:Branch) : do-list(g, xs(e), a)
       (e:Save) : g(x(e), a)
       (e:Load) : false
+
+defn do-used-var (g: Var -> False, e:Ins) :
+   for imm in e do-used :
+      match(imm) :
+         (imm:Var) : g(imm)
+         (imm) : false
 
 defn reverse-sweep (e:Ins, touched: Var -> ?, defined:Var -> ?, emit:Ins -> ?, used:Var -> ?) :
    defn touch-imm (x:Imm) : touched(x as Var) when x is Var
