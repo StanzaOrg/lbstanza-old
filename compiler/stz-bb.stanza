@@ -38,6 +38,7 @@ val new-class-allocation-timer = MillisecondTimer("Class Allocation")
 val new-reg-assignment-timer = MillisecondTimer("Register Assignment")
 val new-stack-map-timer = MillisecondTimer("Stack Map")
 val clearing-timer = MillisecondTimer("Clearing")
+val collapse-timer = MillisecondTimer("Collapse Block")
 
 public defn print-timing () :
    val total = time(normalize-timer) + time(spill-timer) + time(to-bb-timer) +
@@ -76,6 +77,7 @@ public defn print-timing () :
    print-percentage(new-reg-assignment-timer, total)
    print-percentage(new-stack-map-timer, total)
    print-percentage(clearing-timer, total)
+   print-percentage(collapse-timer, total)
 
    
 
@@ -142,6 +144,12 @@ public defn compile (def:tgt-DefFn,
    #enforced-clearing(smap)
    stop(clearing-timer)
    ;print-indexed-prog()
+
+   start(collapse-timer)
+   val #ins = #collapse-blocks(smap)
+   stop(collapse-timer)
+   println("==== Collapsed ====")
+   do(println, #ins)
 
    ;Old Pipeline
    start(liveness-timer)
@@ -1759,6 +1767,142 @@ defn #enforced-clearing (smap:StackMap) :
 
 
 ;============================================================
+;================= Block Collapsing =========================
+;============================================================
+
+val #LOAD-BUFFER = Vector<Ins>()
+val #SAVE-BUFFER = Vector<Ins>()
+val #CLEAR-BUFFER = Vector<Ins>()
+val #BLOCK-IDX-BUFFER = Vector<Int>()
+
+defn ordered-block-indices () :
+   ;Clear block flags
+   BLOCK-FLAGS = fresh-bit-array(BLOCK-FLAGS, length(BLOCKS), false)
+   clear(#BLOCK-IDX-BUFFER)
+   defn order (bi:Int) :
+      if not BLOCK-FLAGS[bi] :
+         BLOCK-FLAGS[bi] = true
+         do(order, next(BLOCKS[bi]))
+         add(#BLOCK-IDX-BUFFER, bi)
+   order(0)
+   reverse!(#BLOCK-IDX-BUFFER)
+   #BLOCK-IDX-BUFFER
+
+defn #collapse-blocks (smap:StackMap) :
+   ;     Manage instruction buffer
+   clear(INS-BUFFER)
+   defn emit (e:Ins) : add(INS-BUFFER, e)
+   defn emit-all (es:Seqable<Ins>) : add-all(INS-BUFFER, es)
+   
+   ;     Parallel Port Glue Engine
+   ;     -------------------------
+   ;Perform xs = ys in parallel, with handling of loads, stores, and clears
+   defn glue-ports (xs:List<Port>, ys:List<Port>) :
+      ;Clear state
+      val nvars = length(VAR-TYPES)
+      #PORT-TABLE = fresh-array(#PORT-TABLE, nvars)
+      clear(#LOAD-BUFFER)
+      clear(#SAVE-BUFFER)
+      clear(#CLEAR-BUFFER)
+      var shuffle-xs = List()
+      var shuffle-ys = List()
+      var fshuffle-xs = List()
+      var fshuffle-ys = List()
+
+      ;Utilities
+      defn ref-var? (n:Int) : VAR-TYPES[n] == tgt-REF-TYPE
+
+      ;Populate port table
+      for y in ys do :
+         #PORT-TABLE[n(y)] = y
+
+      ;Populate instruction buffers
+      for x in xs do :
+         val y = #PORT-TABLE[n(x)]
+         val vx = Var(n(x), loc(x))
+         val vy = Var(n(y), loc(y))         
+         ;1. Emit any saves or clears required
+         match(saved?(x), saved?(y)) :
+            (sx:True, sy:False) : add(#SAVE-BUFFER, Save(vy))
+            (sx:False, sy:True) : add(#CLEAR-BUFFER, Clear(vx)) when ref-var?(n(x))
+            (sx, sy) : false
+         ;2. Emit any loads required
+         match(loaded?(x), loaded?(y)) :
+            (lx:True, ly:False) : add(#LOAD-BUFFER, Load(vx))
+            (lx, ly) : false
+         ;3. Emit any shuffles required
+         match(loc(x), loc(y)) :
+            (lx:Reg, ly:Reg) :
+               shuffle-xs = cons(vx, shuffle-xs)
+               shuffle-ys = cons(vy, shuffle-ys)
+            (lx:FReg, ly:FReg) :
+               fshuffle-xs = cons(vx, fshuffle-xs)
+               fshuffle-ys = cons(vy, fshuffle-ys)
+            (lx, ly) : false
+            
+      ;Output buffers to main instruction buffer
+      emit-all(#SAVE-BUFFER)
+      emit(Glue(shuffle-xs, shuffle-ys)) when not empty?(shuffle-xs)
+      emit(GlueFReg(fshuffle-xs, fshuffle-ys)) when not empty?(fshuffle-xs)
+      emit-all(#LOAD-BUFFER)
+      emit-all(#CLEAR-BUFFER)
+
+   ;     Collapse all Blocks
+   ;     -------------------
+   defn block-lbl (b:Int) : n(BLOCKS[b])
+   
+   val ordered-indices = ordered-block-indices()
+   for (bi in ordered-indices, i in 0 to false) do :
+      ;Retrieve block
+      val blk = BLOCKS[bi]
+      
+      ;Determine whether block bi is coming up next
+      defn upcoming? (bi:Int) :
+         if i < length(ordered-indices) - 1 :
+            bi == ordered-indices[i + 1]
+            
+      ;Emit block label
+      emit(Label(n(blk)))
+      
+      ;Emit entry glue logic
+      if length(PREDECESSORS[bi]) == 1 :
+         val pred = head(PREDECESSORS[bi])
+         if length(next(BLOCKS[pred])) > 1 :
+            glue-ports(BLOCK-INS[bi], BLOCK-OUTS[pred])
+
+      ;Emit instructions
+      for e in ins(blk) do :
+         match(e) :
+            ;Branches need to be laid out
+            (e:Branch) :
+               val conseq = next(blk)[0]
+               val alt = next(blk)[1]
+               match(upcoming?(conseq), upcoming?(alt)) :
+                  (fc:True, fa:False) :
+                     emit(Break(block-lbl(alt), op(e), xs(e), true))
+                  (fc:False, fa:True) :
+                     emit(Break(block-lbl(conseq), op(e), xs(e), false))
+                  (fc:False, fa:False) :
+                     emit(Break(block-lbl(conseq), op(e), xs(e), false))
+                     emit(Goto(block-lbl(alt)))
+            (e) : emit(e)
+
+      ;Emit exit glue logic
+      if length(next(blk)) == 1 :
+         val next = head(next(blk))
+         if length(PREDECESSORS[next]) > 1 :
+            glue-ports(BLOCK-INS[next], BLOCK-OUTS[bi])
+
+      ;Emit goto if necessary
+      if length(next(blk)) == 1 :
+         val n = head(next(blk))
+         emit(Goto(block-lbl(n))) when not upcoming?(n)   
+
+   ;Return instruction buffer
+   INS-BUFFER
+
+
+;============================================================
 ;====================== Working IR ==========================
 ;============================================================
 
@@ -1785,6 +1929,9 @@ defstruct Xchg <: Ins&Working :
 defstruct Glue <: Ins&Working :
    xs: List<Var>
    ys: List<Var>
+defstruct GlueFReg <: Ins&Working :
+   xs: List<Var>
+   ys: List<Var>
 defstruct Label <: Ins&Working :
    n: Int
 defstruct Goto <: Ins&Working :
@@ -1806,6 +1953,7 @@ defmethod print (o:OutputStream, i:Ins&Working) :
       (i:Unload) : "unload %~" % [x(i)]
       (i:Xchg) : "xchg %~ %~ through %~" % [x(i), y(i), swap(i)]
       (i:Glue) : "shuffle (%*) = (%*)" % [cms(xs(i)), cms(ys(i))]
+      (i:GlueFReg) : "shuffle freg (%*) = (%*)" % [cms(xs(i)), cms(ys(i))]
       (i:Label) : "label<%~>" % [n(i)]
       (i:Goto) : "goto label<%~>" % [n(i)]
       (i:Break) : "break label<%~> when %~(%*) (flip:%~)" % [n(i), op(i), cms(xs(i)), flip?(i)]
