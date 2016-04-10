@@ -39,6 +39,7 @@ val new-reg-assignment-timer = MillisecondTimer("Register Assignment")
 val new-stack-map-timer = MillisecondTimer("Stack Map")
 val clearing-timer = MillisecondTimer("Clearing")
 val collapse-timer = MillisecondTimer("Collapse Block")
+val new-assemble-timer = MillisecondTimer("Assemble")
 
 public defn print-timing () :
    val total = time(normalize-timer) + time(spill-timer) + time(to-bb-timer) +
@@ -78,8 +79,10 @@ public defn print-timing () :
    print-percentage(new-stack-map-timer, total)
    print-percentage(clearing-timer, total)
    print-percentage(collapse-timer, total)
+   print-percentage(new-assemble-timer, total)   
 
-   
+val TMP-OUTPUT = Vector<asm-Ins>()
+val TMP-INFOS = Vector<KeyValue<Int,FileInfo>>()
 
 public defn compile (def:tgt-DefFn,
                      backend:Backend,
@@ -129,10 +132,14 @@ public defn compile (def:tgt-DefFn,
    start(new-class-allocation-timer)
    new-allocate-classes(backend)
    stop(new-class-allocation-timer)
+   ;println("==== Class Allocation ===")
+   ;print-indexed-prog()
 
    start(new-reg-assignment-timer)
    #register-assignment(backend)
    stop(new-reg-assignment-timer)
+   ;println("==== Register Assignment ====")
+   ;print-indexed-prog()
 
    #verify-register-assignment(backend)
 
@@ -151,6 +158,13 @@ public defn compile (def:tgt-DefFn,
    stop(collapse-timer)
    ;println("==== Collapsed ====")
    ;do(println, #ins)
+
+   clear(TMP-OUTPUT)
+   start(new-assemble-timer)
+   assemble(tgt-n(d), backend, #ins, smap, TMP-OUTPUT, TMP-INFOS)
+   stop(new-assemble-timer)
+   println("===== Assembled =====")
+   do(println, TMP-OUTPUT)
 
    ;Old Pipeline
    start(liveness-timer)
@@ -1176,6 +1190,8 @@ defn new-allocate-classes (bi:Int, backend:Backend) :
       for x in DIRTY-LOADED remove-when :
          if NEW-PREFERS-LOAD[x] is True : (f(x), false)
          else : true
+   defn mark-all-unloaded () :
+      do-loaded(mark-unloaded)
 
    defn define (x:Var) :
       val n = n(x)
@@ -1261,9 +1277,9 @@ defn new-allocate-classes (bi:Int, backend:Backend) :
                load(n(x), DELAY-INS-BUFFER)
             ;Emit instruction   
             add(DELAY-INS-BUFFER, e)
-            ;Release killed
-            for x in killed(e) do :
-               mark-unloaded(x)
+            ;Unload registers
+            if e is Call : mark-all-unloaded()
+            else : do(mark-unloaded, killed(e))
             ;Define new variables
             for x in e do-defined :
                reserve(n(x), INS-BUFFER)
@@ -2087,6 +2103,596 @@ defn #collapse-blocks (smap:StackMap) :
 
    ;Return instruction buffer
    INS-BUFFER
+
+
+
+;     Compilation
+;     -----------
+defn assemble (func-id:Int,
+               backend:Backend,
+               ins:Vector<Ins>,
+               stackmap:StackMap,
+               output:Vector<asm-Ins>,
+               infos:Vector<KeyValue<Int,FileInfo>>) -> False :
+
+   ;     Output State
+   ;     ------------
+   defn emit (i:asm-Ins) :
+      add(output, i)
+
+   ;     Types Classification
+   ;     --------------------
+   defn int? (t:asm-AsmType) :
+      contains?([asm-BYTE-TYPE, asm-INT-TYPE, asm-LONG-TYPE], t)
+   defn float? (t:asm-AsmType) :
+      contains?([asm-FLOAT-TYPE, asm-DOUBLE-TYPE], t)
+   defn int? (x:AVal) : int?(type(x))
+   defn float? (x:AVal) : float?(type(x))
+
+   ;     Calling Convention
+   ;     ------------------
+   defn call-locations (xs:List<AVal>) :
+      val regs = to-seq(call-regs(backend))
+      val fregs = to-seq(call-fregs(backend))
+      for x in xs map :
+         if int?(x) : RegAV(next(regs), type(x))
+         else : FRegAV(next(fregs), type(x))
+   defn call-locations (f:AVal, xs:List<AVal>) :
+      cons(RegAV(1, asm-LONG-TYPE), call-locations(xs))
+
+   defn callc-locations (xs:List<AVal>) :
+      val regs = to-seq(callc-regs(backend))
+      val fregs = to-seq(callc-fregs(backend))
+      for x in xs map :
+         if int?(x) : RegAV(next(regs), type(x))
+         else : FRegAV(next(fregs), type(x))
+   defn callc-locations (f:AVal, xs:List<AVal>) :
+      cons(RegAV(1, asm-LONG-TYPE), callc-locations(xs))
+   defn callc-ret-locations (xs:List<AVal>) :
+      fatal("Wrong number of returns.") when length(xs) > 1
+      for x in xs map :
+         if int?(x) : RegAV(0, type(x))
+         else : FRegAV(0, type(x))
+
+   defn carg-locations (xs:List<AVal>) :
+      val [sp, args] = [head(xs), tail(xs)]
+      cons(RegAV(6, type(sp))
+           callc-locations(args))
+
+   ;     Value Engine
+   ;     ------------
+   defn aval (x:Imm|Port) :
+      defn asm-type (t:tgt-TgtType) :
+         switch {t == _} :
+            tgt-BYTE-TYPE : asm-BYTE-TYPE
+            tgt-INT-TYPE : asm-INT-TYPE
+            tgt-LONG-TYPE : asm-LONG-TYPE
+            tgt-REF-TYPE : asm-LONG-TYPE
+            tgt-FLOAT-TYPE : asm-FLOAT-TYPE
+            tgt-DOUBLE-TYPE : asm-DOUBLE-TYPE
+
+      match(x) :
+         (x:Var|Port) :
+            val t = asm-type(VAR-TYPES[n(x)])
+            match(loc(x)) :
+               (l:Reg) : RegAV(n(l), t)
+               (l:FReg) : FRegAV(n(l), t)
+               (l:Stack) : StackAV(offset(stackmap, l), t)
+         (x:Val) :
+            match(value(x)) :
+               (x:tgt-ByteImm) : ImmAV(to-int(tgt-value(x)), asm-BYTE-TYPE)
+               (x:tgt-IntImm) : ImmAV(tgt-value(x), asm-INT-TYPE)
+               (x:tgt-LongImm) : ImmAV(tgt-value(x), asm-LONG-TYPE)
+               (x:tgt-Mem) : MemAV(tgt-n(x), tgt-offset(x))
+               (x:tgt-ExMem) : ExMemAV(tgt-name(x), tgt-offset(x))
+               (x:tgt-RSP) : RSPAV()
+
+   defn stack-aval (x:Var) :
+      aval(Var(n(x), Stack(n(x))))
+
+   defn to-asm-op (op:tgt-TgtOp) :
+      switch {op == _} :
+         tgt-ADD-OP : asm-ADD-OP
+         tgt-SUB-OP : asm-SUB-OP
+         tgt-MUL-OP : asm-MUL-OP
+         tgt-DIV-OP : asm-DIV-OP
+         tgt-MOD-OP : asm-MOD-OP
+         tgt-AND-OP : asm-AND-OP
+         tgt-OR-OP : asm-OR-OP
+         tgt-XOR-OP : asm-XOR-OP
+         tgt-SHL-OP : asm-SHL-OP
+         tgt-SHR-OP : asm-SHR-OP
+         tgt-ASHR-OP : asm-ASHR-OP
+         tgt-EQ-OP : asm-EQ-OP
+         tgt-NE-OP : asm-NE-OP
+         tgt-LT-OP : asm-LT-OP
+         tgt-GT-OP : asm-GT-OP
+         tgt-LE-OP : asm-LE-OP
+         tgt-GE-OP : asm-GE-OP
+         tgt-ULE-OP : asm-ULE-OP
+         tgt-ULT-OP : asm-ULT-OP
+         tgt-UGT-OP : asm-UGT-OP
+         tgt-UGE-OP : asm-UGE-OP
+         tgt-NOT-OP : asm-NOT-OP
+         tgt-NEG-OP : asm-NEG-OP
+
+   defn av-mov (x:AVal, y:AVal) :
+      defn mem-base (x:AVal) :
+         match(x) :
+            (x:StackAV) : asm-RegSP()
+            (x:Swap) : asm-Mem(SWAP-LBL, 0)
+      defn mem-offset (x:AVal) :
+         match(x) :
+            (x:StackAV) : offset(x)
+            (x) : 0
+      match(x, y) :
+         (x:RSPAV|RegAV|FRegAV, y:RSPAV|RegAV|FRegAV|ImmAV|MemAV|ExMemAV) :
+            emit(asm-SetIns(type(x), loc!(x), imm!(y)))
+         (x:RSPAV|RegAV|FRegAV, y:StackAV|Swap) :
+            emit(asm-Load(type(x), loc!(x), mem-base(y), mem-offset(y)))
+         (x:StackAV|Swap, y:RSPAV|RegAV|FRegAV|ImmAV) :
+            emit(asm-Store(type(y), mem-base(x), imm!(y), mem-offset(x)))
+         (x, y) :
+            fatal("Illegal mov: %_ = %_" % [x, y])
+
+   defn av-binop (x:AVal, op:tgt-TgtOp, y:AVal, z:AVal) :
+      emit(asm-BinOp(type(y), loc!(x), to-asm-op(op), imm!(y), imm!(z)))
+
+   defn av-unaop (x:AVal, op:tgt-TgtOp, y:AVal) :
+      emit(asm-UnaOp(type(y), loc!(x), to-asm-op(op), imm!(y)))
+
+   defn av-add (x:AVal, y:AVal, z:AVal) :
+      av-binop(x, tgt-ADD-OP, y, z)
+
+   defn av-sub (x:AVal, y:AVal, z:AVal) :
+      av-binop(x, tgt-SUB-OP, y, z)
+
+   defn av-shl (x:AVal, y:AVal, z:AVal) :
+      av-binop(x, tgt-SHL-OP, y, z)
+
+   defn av-divmod (x1:AVal, x2:AVal, y:AVal, z:AVal) :
+      emit(asm-DualOp(type(x1), loc!(x1), loc!(x2), asm-DIVMOD-OP, imm!(y), imm!(z)))
+
+   defn av-load (v:AVal, a:AVal, o:Int) :
+      emit(asm-Load(type(v), loc!(v), imm!(a), o))
+
+   defn av-store (a:AVal, v:AVal, o:Int) :
+      emit(asm-Store(type(v), imm!(a), imm!(v), o))
+
+   defn av-conv (x:AVal, y:AVal) :
+     emit(asm-ConvertIns(type(x), loc!(x), type(y), imm!(y)))
+
+   defn av-interpret (x:AVal, y:AVal) :
+     emit(asm-ReinterpretIns(type(x), loc!(x), type(y), imm!(y)))
+
+   defn av-label (n:Int) :
+     emit(asm-Label(n))
+
+   defn av-goto (v:AVal) :
+      emit(asm-Goto(imm!(v)))
+
+   defn av-break (n:Int, op:tgt-TgtOp, x:AVal, y:AVal) :
+      emit(asm-Branch(type(x), asm-Mem(n,0), to-asm-op(op), imm!(x), imm!(y)))
+
+   defn av-long (v:Int) :
+      ImmAV(v, asm-LONG-TYPE)
+
+   defn av-return () :
+      emit(asm-Return())
+
+   defn av-call (f:AVal) :
+      emit(asm-Call(imm!(f)))
+
+   defn av-xchg (x:AVal, y:AVal) :
+      emit(asm-XchgIns(loc!(x), loc!(y)))
+
+   defn av-data () : emit(asm-DefData())
+   defn av-text () : emit(asm-DefText())
+   defn av-lit-long (i:Long) : emit(asm-DefLong(i))
+
+   ;     Shuffle Engine
+   ;     --------------
+   val rxs = Vector<Int>()
+   val rys = Vector<Int>()
+   val fxs = Vector<Int>()
+   val fys = Vector<Int>()
+   val oxs = Vector<AVal>()
+   val oys = Vector<AVal>()
+
+   defn shuffle (int?:True|False, xs:List<Int>, ys:List<Int>, nreg:Int) :
+      val LT = asm-LONG-TYPE
+      val DT = asm-DOUBLE-TYPE
+      stz/algorithms/shuffle{xs, ys, nreg, _} $ fn (i) :
+         match(i) :
+            (i:ShfMove) :
+               if int? : av-mov(RegAV(dst(i), LT), RegAV(src(i), LT))
+               else : av-mov(FRegAV(dst(i), DT), FRegAV(src(i), DT))
+            (i:ShfSave) :
+               if int? : av-mov(Swap(LT), RegAV(n(i), LT))
+               else : av-mov(Swap(DT), FRegAV(n(i), DT))
+            (i:ShfLoad) :
+               if int? : av-mov(RegAV(n(i), LT), Swap(LT))
+               else : av-mov(FRegAV(n(i), DT), Swap(DT))
+
+   defn shuffle (xs:List<AVal>, ys:List<AVal>) :
+      clear(rxs)
+      clear(rys)
+      clear(fxs)
+      clear(fys)
+      clear(oxs)
+      clear(oys)
+      for (x in xs, y in ys) do :
+         match(x, y) :
+            (x:RegAV, y:RegAV) :
+               add(rxs, n(x))
+               add(rys, n(y))
+            (x:FRegAV, y:FRegAV) :
+               add(fxs, n(x))
+               add(fys, n(y))
+            (x, y) :
+               add(oxs, x)
+               add(oys, y)
+      shuffle(true, to-list(rxs), to-list(rys), num-regs(backend))
+      shuffle(false, to-list(fxs), to-list(fys), num-fregs(backend))
+      do(av-mov, oxs, oys)
+
+   ;     Generate Header
+   ;     ---------------
+   val stack-map-id = fresh-id()
+   let :
+      val [n, bits] = mask(stackmap)
+      av-data()
+      av-label(stack-map-id)
+      av-lit-long(to-long(n))
+      do(av-lit-long, bits)
+      av-text()
+      av-label(func-id)
+
+   ;     Convert Instructions
+   ;     --------------------
+   for e in ins do :
+      match(e) :
+         (e:Set) :
+            av-mov(aval(x(e)), aval(y(e)))
+         (e:Return) :
+            val xs* = map(aval, xs(e))
+            match(ctxt(e)) :
+               (c:StanzaContext) :
+                  val ts* = call-locations(xs*)
+                  shuffle(ts*, xs*)
+                  av-return()
+               (c:CContext) :
+                  ;Convenient registers
+                  val RSP = RSPAV()
+                  val R1 = RegAV(1, asm-LONG-TYPE)
+                  val R6 = RegAV(6, asm-LONG-TYPE)
+                  val R11 = RegAV(11, asm-LONG-TYPE)
+                  val R12 = RegAV(12, asm-LONG-TYPE)
+                  val R13 = RegAV(13, asm-LONG-TYPE)
+                  val R14 = RegAV(14, asm-LONG-TYPE)
+
+                  ;First argument is the stack pointer
+                  val [sp, rets] = [head(xs*), tail(xs*)]
+                  ;Restore c stack pointer
+                  av-mov(RSP, sp)
+                  ;Shuffle return arguments to correct location
+                  shuffle(callc-ret-locations(rets), rets)
+                  ;Restore C context
+                  av-load(R1, RSP, -8)
+                  av-load(R6, RSP, -16)
+                  av-load(R11, RSP, -24)
+                  av-load(R12, RSP, -32)
+                  av-load(R13, RSP, -40)
+                  av-load(R14, RSP, -48)
+                  ;Return to C
+                  av-return()
+         (e:Op) :
+            match(op(e)) :
+               (op:tgt-LoadOp) :
+                  val [x, y, o] = [xs(e)[0], ys(e)[0], tgt-offset(op)]
+                  av-load(aval(x), aval(y), o)
+               (op:tgt-StoreOp) :
+                  val [x, y, o] = [ys(e)[0], ys(e)[1], tgt-offset(op)]
+                  av-store(aval(x), aval(y), o)
+               (op:tgt-AddrOp) :
+                  val x = xs(e)[0]
+                  av-mov(aval(x), MemAV(tgt-n(op), 0))
+               (op) :
+                  if op == tgt-DIVMOD-OP :
+                     val [x1, x2, y, z] = [xs(e)[0], xs(e)[1], ys(e)[0], ys(e)[1]]
+                     av-divmod(aval(x1), aval(x2), aval(y), aval(z))
+
+                  else if op == tgt-CONV-OP :
+                     val [x, y] = [head(xs(e)), head(ys(e))]
+                     av-conv(aval(x), aval(y))
+
+                  else if op == tgt-INTERPRET-OP :
+                     val [x, y] = [head(xs(e)), head(ys(e))]
+                     av-interpret(aval(x), aval(y))
+
+                  else if op == tgt-SWITCH-STACK-OP :
+                     val R0 = RegAV(0, asm-LONG-TYPE)
+                     val R1 = RegAV(1, asm-LONG-TYPE)
+                     val RSP = RSPAV()
+
+                     ;1. Decrement number of free stacks
+                     av-load(R0, MemAV(NUM-FREE-STACKS-LBL,0), 0)
+                     av-sub(R0, R0, av-long(1))
+                     av-store(MemAV(NUM-FREE-STACKS-LBL,0), R0, 0)
+
+                     ;2. Retrieve the next free stack
+                     ;R0 = next free stack
+                     ;temporary R1 = stack pool
+                     av-load(R1, MemAV(FREE-STACKS-LBL,0), 0)
+                     av-load(R0, R1, 0)
+                     av-add(R1, R1, av-long(8))
+                     av-store(MemAV(FREE-STACKS-LBL,0), R1, 0)
+
+                     ;3. Cap the current stack. Set current stack as parent of new stack.
+                     ;R1 = current stack
+                     ;preserve R0 = free stack
+                     av-load(R1, MemAV(STACK-LBL,0), 0)
+                     av-store(R1, RSP, STACK-SP-OFFSET - REF-TAG-BITS)
+                     av-store(R0, R1, STACK-PARENT-OFFSET - REF-TAG-BITS)
+
+                     ;4. update the current stack and limits
+                     ;preserve R0 = free stack
+                     ;temporary R1 = stack limit
+                     ;Update stack register
+                     av-add(RSP, R0, av-long(STACK-ITEMS-OFFSET - REF-TAG-BITS))
+                     ;Update stack limit, and current stack
+                     av-add(R1, R0, av-long(STACK-SIZE - REF-TAG-BITS))
+                     av-store(MemAV(STACK-LIM-LBL,0), R1, 0)
+                     av-store(MemAV(STACK-LBL,0), R0, 0)
+                     ;Intercept return code
+                     av-mov(R1, MemAV(RETRACT-STACK-LBL,0))
+                     av-store(RSP, R1, 0)
+
+                  else if op == tgt-ENTER-FROM-C :
+                     val RSP = RSPAV()
+                     val R1 = RegAV(1, asm-LONG-TYPE)
+                     val R6 = RegAV(6, asm-LONG-TYPE)
+                     val R11 = RegAV(11, asm-LONG-TYPE)
+                     val R12 = RegAV(12, asm-LONG-TYPE)
+                     val R13 = RegAV(13, asm-LONG-TYPE)
+                     val R14 = RegAV(14, asm-LONG-TYPE)
+
+                     ;Store C preserved registers
+                     av-store(RSP, R1, -8)
+                     av-store(RSP, R6, -16)
+                     av-store(RSP, R11, -24)
+                     av-store(RSP, R12, -32)
+                     av-store(RSP, R13, -40)
+                     av-store(RSP, R14, -48)
+
+                     ;Move RSP to R6 for CArgs
+                     av-mov(R6, RSP)
+
+                     ;Restore Stanza context
+                     av-load(RSP, MemAV(STACK-PTR-LBL,0), 0)
+
+                  else if length(ys(e)) == 2 :
+                     val [x, y, z] = [xs(e)[0], ys(e)[0], ys(e)[1]]
+                     av-binop(aval(x), op, aval(y), aval(z))
+
+                  else if length(ys(e)) == 1 :
+                     val [x, y] = [xs(e)[0], ys(e)[0]]
+                     av-unaop(aval(x), op, aval(y))
+
+                  else :
+                     fatal("Unsupported Op: %_" % [e])
+         (e:Args) :
+            ;Write stack map
+            val R0 = RegAV(0, asm-LONG-TYPE)
+            val RSP = RSPAV()
+            av-mov(R0, MemAV(stack-map-id,0))
+            av-store(RSP, R0, 8)
+
+            ;Null out stack
+            for off in ref-offsets(stackmap) do :
+               av-store(RSP, av-long(VOID-TAG), off)
+
+            ;Save argument values
+            val xs* = map(aval, xs(e))
+            val ts* = match(ctxt(e)) :
+               (c:StanzaContext) : call-locations(xs*)
+               (c:CContext) : carg-locations(xs*)
+            shuffle(xs*, ts*)
+         (e:Call) :
+            match(type(e)) :
+               (t:StanzaCall) :
+                  ;Convert to AVals
+                  val ys* = map(aval, ys(e))
+
+                  ;Call in new stack?
+                  if new-stack?(t) :
+                     av-store(MemAV(STACK-LIM-LBL,0), av-long(0), 0)
+
+                  ;Move arguments into position and call
+                  val f* = match(aval(f(e))) :
+                     (f*:MemAV|ExMemAV) :
+                        val ts* = call-locations(ys*)
+                        shuffle(ts*, ys*)
+                        f*
+                     (f*) :
+                        val ts* = call-locations(f*, ys*)
+                        shuffle(ts*, cons(f*,ys*))
+                        head(ts*)
+
+                  ;Arity register
+                  val R0 = RegAV(0, asm-LONG-TYPE)
+                  if tail?(t) :
+                     ;Call
+                     av-mov(R0, av-long(arity(t)))
+                     av-goto(f*)
+                  else :
+                     ;Call
+                     av-mov(R0, av-long(arity(t)))
+                     av-add(RSPAV(), RSPAV(), av-long(size(stackmap) + 8))
+                     av-call(f*)
+                     if info(t) is FileInfo :
+                        val lbl = fresh-id()
+                        add(infos, lbl => info(t) as FileInfo)
+                        av-label(lbl)
+                     av-sub(RSPAV(), RSPAV(), av-long(size(stackmap) + 8))
+
+                     ;Move return values out from Args
+                     val xs* = map(aval, xs(e))
+                     val ts* = call-locations(xs*)
+                     shuffle(xs*, ts*)
+
+               (t:StackCall) :
+                  ;Convert to AVals
+                  val ys* = map(aval, ys(e))
+
+                  ;Move arguments into position
+                  val ts* = call-locations(aval(f(e)), ys*)
+                  shuffle(ts*, cons(aval(f(e)),ys*))
+
+                  val R0 = RegAV(0, asm-LONG-TYPE)
+                  val R1 = RegAV(1, asm-LONG-TYPE)
+                  val RSP = RSPAV()
+
+                  if tail?(t) :
+                     ;Cap the current stack
+                     ;R0 = current stack
+                     av-load(R0, MemAV(STACK-LBL,0), 0)
+                     av-store(R0, RSP, STACK-SP-OFFSET - REF-TAG-BITS)
+
+                     ;Update the current stack and limits
+                     ;R1 = target stack
+                     ;temporary R0 = stack limit
+                     ;Update stack limit, and current stack
+                     av-add(R0, R1, av-long(STACK-SIZE - REF-TAG-BITS))
+                     av-store(MemAV(STACK-LIM-LBL,0), R0, 0)
+                     av-store(MemAV(STACK-LBL,0), R1, 0)
+                     ;Recover stack register
+                     av-load(RSP, R1, STACK-SP-OFFSET - REF-TAG-BITS)
+                     av-return()
+
+                  else :
+                     ;Cap the current stack
+                     ;R0 = current stack
+                     val ret-lbl = fresh-id()
+                     av-add(RSP, RSP, av-long(size(stackmap)))
+                     av-load(R0, MemAV(STACK-LBL,0), 0)
+                     av-store(R0, RSP, STACK-SP-OFFSET - REF-TAG-BITS)
+
+                     ;Write return address
+                     av-mov(R0, MemAV(ret-lbl,0))
+                     av-store(RSP, R0, 0)
+
+                     ;Update the current stack and limits
+                     ;R1 = target stack
+                     ;temporary R0 = stack limit
+                     ;Update stack limit, and current stack
+                     av-add(R0, R1, av-long(STACK-SIZE - REF-TAG-BITS))
+                     av-store(MemAV(STACK-LIM-LBL,0), R0, 0)
+                     av-store(MemAV(STACK-LBL,0), R1, 0)
+                     ;Recover stack register
+                     av-load(RSP, R1, STACK-SP-OFFSET - REF-TAG-BITS)
+                     av-return()
+
+                     ;Move return values out from Args
+                     av-label(ret-lbl)
+                     if info(t) is FileInfo :
+                        add(infos, ret-lbl => info(t) as FileInfo)
+                     av-sub(RSP, RSP, av-long(size(stackmap) + 8))
+                     val xs* = map(aval, xs(e))
+                     val ts* = call-locations(xs*)
+                     shuffle(xs*, ts*)
+
+               (t:CCall) :
+                  ;Convert to AVals
+                  val ys* = map(aval, ys(e))
+
+                  ;Move arguments into position and call
+                  val f* = match(aval(f(e))) :
+                     (f*:MemAV|ExMemAV) :
+                        val ts* = callc-locations(ys*)
+                        shuffle(ts*, ys*)
+                        f*
+                     (f*) :
+                        val ts* = callc-locations(f*, ys*)
+                        shuffle(ts*, cons(f*,ys*))
+                        head(ts*)
+
+                  ;Calculate number of floating point registers
+                  val num-fregs = count({_ is FRegAV}, ys*)
+
+                  ;Call
+                  val R0 = RegAV(0, asm-LONG-TYPE)
+                  val SPL = MemAV(STACK-PTR-LBL,0)
+                  av-mov(R0, av-long(num-fregs))
+                  av-store(SPL, RSPAV(), 0)
+                  av-load(RSPAV(), MemAV(C-RSP-LBL,0), 0)
+                  av-sub(RSPAV(), RSPAV(), av-long(8 * (6 + num-on-stack(t))))
+                  av-call(f*)
+                  av-load(RSPAV(), SPL, 0)
+
+                  ;Move return values out from Args
+                  val xs* = map(aval, xs(e))
+                  val ts* = callc-ret-locations(xs*)
+                  shuffle(xs*, ts*)
+         (e:Save) :
+            val x* = aval(x(e))
+            val sx* = stack-aval(x(e))
+            av-mov(sx*, x*)
+         (e:Clear) :
+            val sx* = stack-aval(x(e))
+            av-mov(sx*, av-long(VOID-TAG))
+         (e:Load) :
+            val x* = aval(x(e))
+            val sx* = stack-aval(x(e))
+            av-mov(x*, sx*)
+         (e:Xchg) :
+            av-xchg(aval(x(e)), aval(y(e)))
+         (e:Glue) :
+            val xs* = map(aval,xs(e))
+            val ys* = map(aval,ys(e))
+            shuffle(xs*, ys*)
+         (e:GlueFReg) :
+            val xs* = map(aval,xs(e))
+            val ys* = map(aval,ys(e))
+            shuffle(xs*, ys*)
+         (e:Label) :
+            av-label(n(e))
+         (e:Goto) :
+            av-goto(MemAV(n(e),0))
+         (e:Break) :
+            defn flip (op:tgt-TgtOp) :
+               switch {op == _} :
+                  tgt-EQ-OP : tgt-NE-OP
+                  tgt-NE-OP : tgt-EQ-OP
+                  tgt-LT-OP : tgt-GE-OP
+                  tgt-GT-OP : tgt-LE-OP
+                  tgt-LE-OP : tgt-GT-OP
+                  tgt-GE-OP : tgt-LT-OP
+                  tgt-ULE-OP : tgt-UGT-OP
+                  tgt-ULT-OP : tgt-UGE-OP
+                  tgt-UGT-OP : tgt-ULE-OP
+                  tgt-UGE-OP : tgt-ULT-OP
+            defn flip-op? (op:tgt-TgtOp) :
+               if flip?(e) : flip(op)
+               else : op
+
+            switch {op(e) == _} :
+               tgt-STACK-HAS-SPACE :
+                  val R0 = RegAV(0, asm-LONG-TYPE)
+                  val R1 = RegAV(1, asm-LONG-TYPE)
+                  val RSP = RSPAV()
+                  av-add(R0, RSP, av-long(size(stackmap) + 8)) ;+8 for extra return address
+                  av-load(R1, MemAV(STACK-LIM-LBL,0), 0)
+                  av-break(n(e), flip-op?(tgt-LE-OP), R0, R1)
+
+               else :
+                  match(op(e)) :
+                     (op:tgt-ArityNEqOp) :
+                        val R0 = RegAV(0, asm-LONG-TYPE)
+                        av-break(n(e), flip-op?(tgt-NE-OP), R0, av-long(tgt-arity(op)))
+                     (op) :
+                        val [x, y] = [xs(e)[0], xs(e)[1]]
+                        av-break(n(e), flip-op?(op), aval(x), aval(y))
 
 
 ;============================================================
@@ -4034,6 +4640,7 @@ defn imm! (v:AVal) :
       (v:ImmAV) : asm-IntImm(value(v))
       (v:MemAV) : asm-Mem(n(v), offset(v))
       (v:ExMemAV) : asm-ExMem(name(v), offset(v))
+      (v) : fatal("Not supported: %_" % [v])
 
 defn loc! (v:AVal) :
    imm!(v) as asm-Loc
