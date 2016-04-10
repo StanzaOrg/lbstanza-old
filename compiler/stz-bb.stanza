@@ -1949,17 +1949,17 @@ defn #collapse-blocks (smap:StackMap) :
          ;3. Emit any shuffles required
          match(loc(x), loc(y)) :
             (lx:Reg, ly:Reg) :
-               shuffle-xs = cons(vx, shuffle-xs)
-               shuffle-ys = cons(vy, shuffle-ys)
+               shuffle-xs = cons(n(lx), shuffle-xs)
+               shuffle-ys = cons(n(ly), shuffle-ys)
             (lx:FReg, ly:FReg) :
-               fshuffle-xs = cons(vx, fshuffle-xs)
-               fshuffle-ys = cons(vy, fshuffle-ys)
+               fshuffle-xs = cons(n(lx), fshuffle-xs)
+               fshuffle-ys = cons(n(ly), fshuffle-ys)
             (lx, ly) : false
             
       ;Output buffers to main instruction buffer
       emit-all(#SAVE-BUFFER)
-      emit(Glue(shuffle-xs, shuffle-ys)) when not empty?(shuffle-xs)
-      emit(GlueFReg(fshuffle-xs, fshuffle-ys)) when not empty?(fshuffle-xs)
+      emit(ShuffleReg(shuffle-xs, shuffle-ys)) when not empty?(shuffle-xs)
+      emit(ShuffleFReg(fshuffle-xs, fshuffle-ys)) when not empty?(fshuffle-xs)
       emit-all(#LOAD-BUFFER)
       emit-all(#CLEAR-BUFFER)
 
@@ -2011,6 +2011,124 @@ defn #collapse-blocks (smap:StackMap) :
 
    ;Return instruction buffer
    INS-BUFFER
+
+;============================================================
+;================= Shuffling Engine =========================
+;============================================================
+
+deftype ShuffleIns
+defstruct ShfMove <: ShuffleIns :
+   dst:Int
+   src:Int
+defstruct ShfSave <: ShuffleIns :
+   n:Int
+defstruct ShfLoad <: ShuffleIns :
+   n:Int
+
+defmethod print (o:OutputStream, i:ShuffleIns) :
+   print{o, _} $ match(i) :
+      (i:ShfMove) : "%~ = %~" % [dst(i), src(i)]
+      (i:ShfSave) : "save %~" % [n(i)]
+      (i:ShfLoad) : "load %~" % [n(i)]
+
+;Buffers
+var PRED = Array<False|Int>(0)
+var DONE = BitArray(64)
+var LOADS = BitArray(64)
+var SUCC? = BitArray(64) ;(Succ?[r] = true) => Register r has a successor
+
+defn shuffle (xs:List<Int>, ys:List<Int>, nreg:Int, f: ShuffleIns -> ?) :
+   ;Predecessor and Successor table
+   PRED = fresh-array(PRED, nreg, false)
+   DONE = fresh-bit-array(DONE, nreg, false)
+   LOADS = fresh-bit-array(LOADS, nreg, false)
+   SUCC? = fresh-bit-array(SUCC?, nreg, false)
+
+   ;Initialize Predecessors
+   for (x in xs, y in ys) do :
+      if x == y : DONE[x] = true
+      else : PRED[x] = y
+
+   ;Find a simple destination.
+   ;A destination that has no successor.
+   defn simple-dst () :
+      ;Determine which registers have successors
+      for i in 0 to nreg do :
+         SUCC?[i] = false
+      for i in 0 to nreg do :
+         match(PRED[i]) :
+            (p:Int) : SUCC?[p] = true
+            (p:False) : false
+      ;Find a register with a predecessor but no successor      
+      for i in 0 to nreg find :
+         PRED[i] is-not False and 
+         (not SUCC?[i])
+
+   ;Find a remaining destination.
+   defn remaining-dst () :
+      for i in 0 to nreg find :
+         PRED[i] is-not False
+         
+   ;Find a swap register
+   ;It cannot be fulfilled as a destination (done)
+   ;and it cannot have a successor.
+   defn swap-reg () :
+      for i in 0 to nreg find :
+         (not SUCC?[i]) and
+         DONE[i] is False
+
+   ;Iterate until predecessors fulfilled.
+   defn* loop () :
+      ;Move src to dst and update pred table
+      defn move (dst:Int, src:Int) :
+         f(ShfMove(dst, src))
+         for i in 0 to nreg do :
+            if PRED[i] == src :
+               PRED[i] = dst
+
+      ;Save register and update pred table
+      defn save (r:Int) :
+         f(ShfSave(r))
+         for i in 0 to nreg do :
+            if PRED[i] == r :
+               PRED[i] = false
+               LOADS[i] = true               
+
+      ;Fills the dst register with its final value
+      defn* fill (r:Int) :
+         match(PRED[r]) :
+            (p:Int) :
+               move(r, p)
+               PRED[r] = false
+               DONE[r] = true
+               fill(p)
+            (p:False) :
+               false
+               
+      match(simple-dst()) :
+         (r:Int) :
+            fill(r)
+            loop()
+         (r:False) :
+            match(remaining-dst(), swap-reg()) :
+               (r:Int, s:Int) :
+                  move(s, r)
+                  loop()
+               (r:Int, s:False) :
+                  save(r)
+                  loop()
+               (r, s) :
+                  false
+   loop()
+
+   ;Load saved registers
+   for i in 0 to nreg do :
+      if LOADS[i] :
+         f(ShfLoad(i))
+
+;============================================================
+;============================================================
+;============================================================
 
 
 
@@ -2200,48 +2318,44 @@ defn assemble (func-id:Int,
 
    ;     Shuffle Engine
    ;     --------------
-   val rxs = Vector<Int>()
-   val rys = Vector<Int>()
-   val fxs = Vector<Int>()
-   val fys = Vector<Int>()
-   val oxs = Vector<AVal>()
-   val oys = Vector<AVal>()
-
-   defn shuffle (int?:True|False, xs:List<Int>, ys:List<Int>, nreg:Int) :
-      val LT = asm-LONG-TYPE
-      val DT = asm-DOUBLE-TYPE
-      stz/algorithms/shuffle{xs, ys, nreg, _} $ fn (i) :
+   defn shuffle-reg (xs:List<Int>, ys:List<Int>) :
+      shuffle{xs, ys, num-regs(backend), _} $ fn (i) :
+         val LT = asm-LONG-TYPE
          match(i) :
-            (i:ShfMove) :
-               if int? : av-mov(RegAV(dst(i), LT), RegAV(src(i), LT))
-               else : av-mov(FRegAV(dst(i), DT), FRegAV(src(i), DT))
-            (i:ShfSave) :
-               if int? : av-mov(Swap(LT), RegAV(n(i), LT))
-               else : av-mov(Swap(DT), FRegAV(n(i), DT))
-            (i:ShfLoad) :
-               if int? : av-mov(RegAV(n(i), LT), Swap(LT))
-               else : av-mov(FRegAV(n(i), DT), Swap(DT))
+            (i:ShfMove) : av-mov(RegAV(dst(i), LT), RegAV(src(i), LT))
+            (i:ShfSave) : av-mov(Swap(LT), RegAV(n(i), LT))
+            (i:ShfLoad) : av-mov(RegAV(n(i), LT), Swap(LT))
+            
+   defn shuffle-freg (xs:List<Int>, ys:List<Int>) :
+      shuffle{xs, ys, num-fregs(backend), _} $ fn (i) :
+         val DT = asm-DOUBLE-TYPE
+         match(i) :
+            (i:ShfMove) : av-mov(FRegAV(dst(i), DT), FRegAV(src(i), DT))
+            (i:ShfSave) : av-mov(Swap(DT), FRegAV(n(i), DT))
+            (i:ShfLoad) : av-mov(FRegAV(n(i), DT), Swap(DT))
 
-   defn shuffle (xs:List<AVal>, ys:List<AVal>) :
-      clear(rxs)
-      clear(rys)
-      clear(fxs)
-      clear(fys)
-      clear(oxs)
-      clear(oys)
+   defn shuffle-vals (xs:List<AVal>, ys:List<AVal>) :
+      var rxs:List<Int> = List()
+      var rys:List<Int> = List()
+      var fxs:List<Int> = List()
+      var fys:List<Int> = List()
+      var oxs:List<AVal> = List()
+      var oys:List<AVal> = List()      
+
       for (x in xs, y in ys) do :
          match(x, y) :
             (x:RegAV, y:RegAV) :
-               add(rxs, n(x))
-               add(rys, n(y))
+               rxs = cons(n(x), rxs)
+               rys = cons(n(y), rys)
             (x:FRegAV, y:FRegAV) :
-               add(fxs, n(x))
-               add(fys, n(y))
+               fxs = cons(n(x), fxs)
+               fys = cons(n(y), fys)
             (x, y) :
-               add(oxs, x)
-               add(oys, y)
-      shuffle(true, to-list(rxs), to-list(rys), num-regs(backend))
-      shuffle(false, to-list(fxs), to-list(fys), num-fregs(backend))
+               oxs = cons(x, oxs)
+               oys = cons(y, oys)
+               
+      shuffle-reg(rxs, rys) when not empty?(rxs)
+      shuffle-freg(fxs, fys) when not empty?(rys)
       do(av-mov, oxs, oys)
 
    ;     Generate Header
@@ -2267,7 +2381,7 @@ defn assemble (func-id:Int,
             match(ctxt(e)) :
                (c:StanzaContext) :
                   val ts* = call-locations(xs*)
-                  shuffle(ts*, xs*)
+                  shuffle-vals(ts*, xs*)
                   av-return()
                (c:CContext) :
                   ;Convenient registers
@@ -2284,7 +2398,7 @@ defn assemble (func-id:Int,
                   ;Restore c stack pointer
                   av-mov(RSP, sp)
                   ;Shuffle return arguments to correct location
-                  shuffle(callc-ret-locations(rets), rets)
+                  shuffle-vals(callc-ret-locations(rets), rets)
                   ;Restore C context
                   av-load(R1, RSP, -8)
                   av-load(R6, RSP, -16)
@@ -2405,7 +2519,7 @@ defn assemble (func-id:Int,
             val ts* = match(ctxt(e)) :
                (c:StanzaContext) : call-locations(xs*)
                (c:CContext) : carg-locations(xs*)
-            shuffle(xs*, ts*)
+            shuffle-vals(xs*, ts*)
          (e:Call) :
             match(type(e)) :
                (t:StanzaCall) :
@@ -2420,11 +2534,11 @@ defn assemble (func-id:Int,
                   val f* = match(aval(f(e))) :
                      (f*:MemAV|ExMemAV) :
                         val ts* = call-locations(ys*)
-                        shuffle(ts*, ys*)
+                        shuffle-vals(ts*, ys*)
                         f*
                      (f*) :
                         val ts* = call-locations(f*, ys*)
-                        shuffle(ts*, cons(f*,ys*))
+                        shuffle-vals(ts*, cons(f*,ys*))
                         head(ts*)
 
                   ;Arity register
@@ -2447,7 +2561,7 @@ defn assemble (func-id:Int,
                      ;Move return values out from Args
                      val xs* = map(aval, xs(e))
                      val ts* = call-locations(xs*)
-                     shuffle(xs*, ts*)
+                     shuffle-vals(xs*, ts*)
 
                (t:StackCall) :
                   ;Convert to AVals
@@ -2455,7 +2569,7 @@ defn assemble (func-id:Int,
 
                   ;Move arguments into position
                   val ts* = call-locations(aval(f(e)), ys*)
-                  shuffle(ts*, cons(aval(f(e)),ys*))
+                  shuffle-vals(ts*, cons(aval(f(e)),ys*))
 
                   val R0 = RegAV(0, asm-LONG-TYPE)
                   val R1 = RegAV(1, asm-LONG-TYPE)
@@ -2508,7 +2622,7 @@ defn assemble (func-id:Int,
                      av-sub(RSP, RSP, av-long(size(stackmap) + 8))
                      val xs* = map(aval, xs(e))
                      val ts* = call-locations(xs*)
-                     shuffle(xs*, ts*)
+                     shuffle-vals(xs*, ts*)
 
                (t:CCall) :
                   ;Convert to AVals
@@ -2518,11 +2632,11 @@ defn assemble (func-id:Int,
                   val f* = match(aval(f(e))) :
                      (f*:MemAV|ExMemAV) :
                         val ts* = callc-locations(ys*)
-                        shuffle(ts*, ys*)
+                        shuffle-vals(ts*, ys*)
                         f*
                      (f*) :
                         val ts* = callc-locations(f*, ys*)
-                        shuffle(ts*, cons(f*,ys*))
+                        shuffle-vals(ts*, cons(f*,ys*))
                         head(ts*)
 
                   ;Calculate number of floating point registers
@@ -2541,7 +2655,7 @@ defn assemble (func-id:Int,
                   ;Move return values out from Args
                   val xs* = map(aval, xs(e))
                   val ts* = callc-ret-locations(xs*)
-                  shuffle(xs*, ts*)
+                  shuffle-vals(xs*, ts*)
          (e:Save) :
             val x* = aval(x(e))
             val sx* = stack-aval(x(e))
@@ -2555,14 +2669,10 @@ defn assemble (func-id:Int,
             av-mov(x*, sx*)
          (e:Xchg) :
             av-xchg(aval(x(e)), aval(y(e)))
-         (e:Glue) :
-            val xs* = map(aval,xs(e))
-            val ys* = map(aval,ys(e))
-            shuffle(xs*, ys*)
-         (e:GlueFReg) :
-            val xs* = map(aval,xs(e))
-            val ys* = map(aval,ys(e))
-            shuffle(xs*, ys*)
+         (e:ShuffleReg) :
+            shuffle-reg(xs(e), ys(e))
+         (e:ShuffleFReg) :
+            shuffle-freg(xs(e), ys(e))
          (e:Label) :
             av-label(n(e))
          (e:Goto) :
@@ -2627,12 +2737,12 @@ defstruct Xchg <: Ins&Working :
    x: Var
    y: Var
    swap: Reg|False
-defstruct Glue <: Ins&Working :
-   xs: List<Var>
-   ys: List<Var>
-defstruct GlueFReg <: Ins&Working :
-   xs: List<Var>
-   ys: List<Var>
+defstruct ShuffleReg <: Ins&Working :
+   xs: List<Int>
+   ys: List<Int>
+defstruct ShuffleFReg <: Ins&Working :
+   xs: List<Int>
+   ys: List<Int>
 defstruct Label <: Ins&Working :
    n: Int
 defstruct Goto <: Ins&Working :
@@ -2653,8 +2763,8 @@ defmethod print (o:OutputStream, i:Ins&Working) :
       (i:Clear) : "clear %~" % [x(i)]
       (i:Unload) : "unload %~" % [x(i)]
       (i:Xchg) : "xchg %~ %~ through %~" % [x(i), y(i), swap(i)]
-      (i:Glue) : "shuffle (%*) = (%*)" % [cms(xs(i)), cms(ys(i))]
-      (i:GlueFReg) : "shuffle freg (%*) = (%*)" % [cms(xs(i)), cms(ys(i))]
+      (i:ShuffleReg) : "shuffle reg (%*) = (%*)" % [cms(xs(i)), cms(ys(i))]
+      (i:ShuffleFReg) : "shuffle freg (%*) = (%*)" % [cms(xs(i)), cms(ys(i))]
       (i:Label) : "label<%~>" % [n(i)]
       (i:Goto) : "goto label<%~>" % [n(i)]
       (i:Break) : "break label<%~> when %~(%*) (flip:%~)" % [n(i), op(i), cms(xs(i)), flip?(i)]
@@ -2675,14 +2785,6 @@ defmulti saved? (p:Port) -> True|False|Any
 defmulti loaded? (p:Port) -> True|False|Any
 defmulti loc (p:Port) -> Loc
 defmulti dist (p:Port) -> Int
-
-defstruct EPort <: Port :
-   n: Int with: (as-method => true)
-   saved?: True|False|Any with: (as-method => true)
-   loaded?: True|False|Any with: (as-method => true)
-   loc: Loc with: (as-method => true)
-with :
-   constructor => Port
 
 defmethod print (o:OutputStream, p:Port) :
    print(o, "%~ (s:%~, l:%~, at:%~)" % [n(p), saved?(p), loaded?(p), loc(p)])
