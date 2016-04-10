@@ -133,7 +133,8 @@ public defn compile (def:tgt-DefFn,
    start(new-reg-assignment-timer)
    #register-assignment(backend)
    stop(new-reg-assignment-timer)
-   ;print-indexed-prog()
+
+   #verify-register-assignment(backend)
 
    start(new-stack-map-timer)
    val smap = #calculate-stack-map()
@@ -148,8 +149,8 @@ public defn compile (def:tgt-DefFn,
    start(collapse-timer)
    val #ins = #collapse-blocks(smap)
    stop(collapse-timer)
-   println("==== Collapsed ====")
-   do(println, #ins)
+   ;println("==== Collapsed ====")
+   ;do(println, #ins)
 
    ;Old Pipeline
    start(liveness-timer)
@@ -835,6 +836,7 @@ defn remove-critical-edges (u:Unit) :
 
 val VAR-INDICES = IntTable<Int>()
 val BLOCK-INDICES = IntTable<Int>()
+val BLOCK-TABLE = IntTable<False|Block>()
 val VAR-TYPES = Vector<tgt-TgtType>()
 val BLOCKS = Vector<Block>()
 val PREDECESSORS = Vector<List<Int>>()
@@ -854,19 +856,31 @@ defn index-prog (u:Unit) :
    clear(BLOCK-INDICES)
    clear(VAR-TYPES)
    clear(BLOCKS)
-   
+   clear(BLOCK-TABLE)
+   BLOCK-FLAGS = fresh-bit-array(BLOCK-FLAGS, length(blocks(u)), false)
 
+   ;Populate Block Table
+   for b in blocks(u) do :
+      BLOCK-TABLE[n(b)] = b
    ;Populate Variables
    for def in defs(u) do :
       val [n, t] = [tgt-n(def), tgt-type(def)]
       val n* = length(VAR-TYPES)
       VAR-INDICES[n] = n*
-      add(VAR-TYPES, t)
-   ;Populate Blocks
-   for blk in blocks(u) do :
-      val n* = length(BLOCKS)
-      BLOCK-INDICES[n(blk)] = n*
-      add(BLOCKS, blk)
+      add(VAR-TYPES, t)      
+   ;Populate Blocks in Reverse Post Order
+   defn order (n:Int) :
+      match(BLOCK-TABLE[n]) :
+         (b:Block) :
+            BLOCK-TABLE[n] = false
+            do(order, next(b))
+            add(BLOCKS, b)
+         (b:False) :
+            false
+   order(n(blocks(u)[0]))         
+   reverse!(BLOCKS)
+   for (b in BLOCKS, i in 0 to false) do :
+      BLOCK-INDICES[n(b)] = i
 
    ;Clear block defs
    val nblocks = length(BLOCKS)
@@ -1214,15 +1228,18 @@ defn new-allocate-classes (bi:Int, backend:Backend) :
       spill(nr, nf, buffer)
 
    ;Define Entry Ports
+   defn fill (p:Port) :
+      val ld = NEW-PREFERS-LOAD[n(p)]
+      val sv = NEW-REQUIRES-SAVE[n(p)]
+      DPort(n(p), sv, ld, loc(p), dist(p))
+      
    for p in BLOCK-INS[bi] do :
       val n = n(p)
       mark-loaded(n) when loaded?(p) is True|Any         
       NEW-REQUIRES-SAVE[n] = saved?(p) is True
       USAGE-BUFFER[n] = dist(p)
    spill-overcommitted(DELAY-INS-BUFFER)
-   BLOCK-INS[bi] = for p in BLOCK-INS[bi] map :
-      val ld = NEW-PREFERS-LOAD[n(p)]
-      DPort(n(p), saved?(p), ld, loc(p), dist(p))
+   BLOCK-INS[bi] = map(fill, BLOCK-INS[bi])
 
    ;Sweep through instructions
    for e in ins(blk) do :
@@ -1257,6 +1274,9 @@ defn new-allocate-classes (bi:Int, backend:Backend) :
    ;Update instructions in block
    clear(ins(blk))
    add-all(ins(blk), INS-BUFFER)
+
+   ;Update output ports
+   BLOCK-OUTS[bi] = map(fill, BLOCK-OUTS[bi])
 
 defn new-allocate-classes (backend:Backend) :
    do(new-allocate-classes{_, backend}, 0 to length(BLOCKS))
@@ -1329,6 +1349,18 @@ defn #register-assignment (bi:Int, ports-in:List<Port>, backend:Backend) :
             #VAR-LOCS[x] = Stack(x)
          (loc) : false
 
+   ;Free all registers
+   defn free-all () :
+      defn free-regs (regs:Array<Int|False>, nregs:Int) :
+         for i in 0 to nregs do :
+            match(regs[i]) :
+               (x:Int) :
+                  regs[i] = false
+                  #VAR-LOCS[x] = Stack(x)
+               (x:False) : false
+      free-regs(#REG-SLOTS, num-regs(backend))
+      free-regs(#FREG-SLOTS, num-fregs(backend))
+
    ;Find the next free register
    ;TODO: Use a free list
    defn free-reg (pref:List<Int>) :
@@ -1382,8 +1414,8 @@ defn #register-assignment (bi:Int, ports-in:List<Port>, backend:Backend) :
          (y:Int) :
             match(index-of(#REG-SLOTS, false)) :
                (s:Int) :
-                  emit(Set(Var(y, Reg(dst)), Var(y, Reg(s))))
-                  emit(Set(Var(x, Reg(src)), Var(x, Reg(dst))))
+                  emit(Set(Var(y, Reg(s)), Var(y, Reg(dst))))
+                  emit(Set(Var(x, Reg(dst)), Var(x, Reg(src))))
                   free(x)
                   free(y)
                   assign(x, Reg(dst))
@@ -1510,7 +1542,7 @@ defn #register-assignment (bi:Int, ports-in:List<Port>, backend:Backend) :
          (e:Call) :
             val f* = fill(f(e))
             val ys* = map(fill,ys(e))
-            do(free, killed(e))
+            free-all()
             assign(xs(e), FreeReg())
             emit(Call(map(fill,xs(e)), f*, ys*, type(e)))
          (e:Save) :
@@ -1545,6 +1577,161 @@ defn #register-assignment (backend:Backend) :
 
    assign-regs(0, List())
 
+;============================================================
+;=========== Register Assignment Verification ===============
+;============================================================
+
+defn #verify-register-assignment (bi:Int, backend:Backend) :   
+   ;Retrieve block
+   val blk = BLOCKS[bi]
+
+   ;Clear state
+   val nvars = length(VAR-TYPES)
+   #REG-SLOTS = fresh-array(#REG-SLOTS, num-regs(backend), false)
+   #FREG-SLOTS = fresh-array(#FREG-SLOTS, num-fregs(backend), false)
+   NEW-REQUIRES-SAVE = fresh-bit-array(NEW-REQUIRES-SAVE, nvars, false)
+   
+   ;Helper: Setting and Retrieving register contents
+   defn get-reg (r:Reg|FReg) :
+      match(r) :
+         (r:Reg) : #REG-SLOTS[n(r)]
+         (r:FReg) : #FREG-SLOTS[n(r)]
+
+   defn set-reg (r:Reg|FReg, v:Int|False) :
+      match(r) :
+         (r:Reg) : #REG-SLOTS[n(r)] = v
+         (r:FReg) : #FREG-SLOTS[n(r)] = v
+
+   ;State updaters
+   defn define (x:Port) :
+      match(saved?(x), loaded?(x), loc(x)) :
+         (sv:True, ld:True, loc:FReg|Reg) :
+            set-reg(loc, n(x))
+            NEW-REQUIRES-SAVE[n(x)] = true
+         (sv:False, ld:True, loc:FReg|Reg) :
+            set-reg(loc, n(x))
+            NEW-REQUIRES-SAVE[n(x)] = false
+         (sv:True, ld:False, loc:Stack) :
+            NEW-REQUIRES-SAVE[n(x)] = true
+         (sv, ld, loc) :
+            fatal("Unreachable combination: (%_, %_, %_)" % [sv, ld, loc])
+
+   defn define (x:Var) :
+      set-reg(reg!(x), n(x))
+      NEW-REQUIRES-SAVE[n(x)] = false
+
+   defn mov (x:Var, y:Imm) :
+      set-reg(reg!(x), n(x))
+      match(y) :
+         (y:Val) :
+            NEW-REQUIRES-SAVE[n(x)] = false
+         (y:Var) :
+            if n(x) != n(y) :
+               NEW-REQUIRES-SAVE[n(x)] = false
+
+   defn load (x:Var) :
+      set-reg(reg!(x), n(x))
+
+   defn save (x:Var) :
+      NEW-REQUIRES-SAVE[n(x)] = true
+
+   defn clear-registers () :
+      for i in 0 to num-regs(backend) do :
+         #REG-SLOTS[i] = false
+      for i in 0 to num-fregs(backend) do :
+         #FREG-SLOTS[i] = false
+
+   defn xchg (x:Var, y:Var) :
+      match(loc(x), loc(y)) :
+         (lx:Reg, ly:Reg) : false
+         (lx:FReg, ly:FReg) : false
+      val lx = reg!(x)
+      val ly = reg!(y)
+      val vx = get-reg(lx)
+      val vy = get-reg(ly)
+      set-reg(lx, vy)
+      set-reg(ly, vx)
+
+   ;Checkers   
+   defn reg! (x:Var) :
+      match(loc(x)) :
+         (l:FReg|Reg) : l
+         (l) : fatal("Block %_: Variable %_ is not in a register." % [n(blk), x])
+         
+   defn saved! (x:Int) :
+      if NEW-REQUIRES-SAVE[x] is-not True :
+         fatal("Block %_: %~ has not been saved." % [n(blk), x])
+   defn saved! (x:Var) : saved!(n(x))
+
+   defn not-saved! (x:Int) :
+      if NEW-REQUIRES-SAVE[x] is-not False :
+         fatal("Block %_: %~ should not be saved." % [n(blk), x])
+
+   defn holds! (r:FReg|Reg, x:Int) :
+      val y = get-reg(r)
+      if y != x :
+         fatal("Block %_: Register %_ should hold %_ but holds %_." % [n(blk), r, x, y])
+
+   defn check! (p:Port) :
+      match(saved?(p), loaded?(p), loc(p)) :
+         (sv:True, ld:True, lc:FReg|Reg) :
+            holds!(lc, n(p))
+            saved!(n(p))
+         (sv:False, ld:True, lc:FReg|Reg) :
+            holds!(lc, n(p))
+            not-saved!(n(p))
+         (sv:True, ld:False, lc:Stack) :
+            saved!(n(p))
+
+   defn check! (x:Imm) :
+      match(x) :
+         (x:Var) :
+            match(loc(x)) :
+               (l:FReg|Reg) : holds!(l, n(x))
+               (l:Stack) : saved!(n(x))
+         (x:Val) : false
+
+   ;     Layer 2
+   ;     -------
+   ;Input ports
+   do(define, BLOCK-INS[bi])
+
+   ;Check each instruction
+   for e in ins(blk) do :
+      match(e) :
+         (e:Set) :
+            check!(y(e))
+            mov(x(e), y(e))
+         (e:Xchg) :
+            check!(x(e))
+            check!(y(e))
+            xchg(x(e), y(e))
+         (e:Op) :
+            do(check!, ys(e))
+            do(define, xs(e))
+         (e:Branch) :
+            do(check!, xs(e))
+         (e:Return) :
+            do(check!, xs(e))
+         (e:Save) :
+            check!(x(e))
+            save(x(e))
+         (e:Load) :
+            saved!(x(e))
+            load(x(e))
+         (e:Args) :
+            do(define, xs(e))
+         (e:Call) :
+            check!(f(e))
+            do(check!, ys(e))
+            clear-registers()
+            do(define, xs(e))
+
+   ;Output ports
+   do(check!, BLOCK-OUTS[bi])
+
+defn #verify-register-assignment (backend:Backend) :
+   do(#verify-register-assignment{_, backend}, 0 to length(BLOCKS))
 
 ;============================================================
 ;============== Stack Interval Calculation ==================
