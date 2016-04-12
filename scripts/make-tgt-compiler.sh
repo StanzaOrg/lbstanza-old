@@ -12,7 +12,7 @@
      compiler/stz-tgt-writer.stanza \
      compiler/stz-bb.stanza \
      compiler/stz-tgt-compiler.stanza \
-  -o tgt-compiler
-
+  -o tgt-compiler \
+  -optimize
 
 
