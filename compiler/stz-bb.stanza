@@ -50,48 +50,48 @@ public defn compile (def:tgt-DefFn,
 ;====================== Utilities ===========================
 ;============================================================
 
-defn make-table<?K,?V,?T> (xs:Seqable<?T>,
-                           k: T -> ?K,
-                           v: T -> ?V,
-                           hash: K -> Int) :
-   val table = HashTable<K,V>(hash)
-   for x in xs do : table[k(x)] = v(x)
-   table
+deftype Cache<T>
+defmulti fresh<?T> (c:Cache<?T>, update: (() -> T) & (T -> T)) -> T
+defn Cache<T> () :
+   var value:T
+   var initialized? = false
+   new Cache<T> :
+      defmethod fresh (this, update:(() -> T) & (T -> T)) :
+         if initialized? : value = update(value)
+         else : value = update()
+         value
 
-defn post-order (bs:Vector<Block>, cull?:True|False) -> Vector<Block> :
-   ;Block Table
-   val block = HashTable<Int,Block>()
-   for b in bs do : block[n(b)] = b
+defn IntTable<T> (c:Cache<IntTable<T>>) :
+   fresh{c, _} $ multifn :
+      () : IntTable<T>()
+      (t) : (clear(t), t)
 
-   ;Mark Table
-   val mark-table = HashTable<Int,True>()
-   defn marked? (b:Block) : key?(mark-table, n(b))
-   defn mark (b:Block) : mark-table[n(b)] = true
+defn Vector<T> (c:Cache<Vector<T>>) :
+   fresh{c, _} $ multifn :
+      () : Vector<T>()
+      (v) : (clear(v), v)
 
-   ;Add blocks to ys
-   val ys = Vector<Block>()
-   defn* loop (b:Block) :
-      if not marked?(b) :
-         mark(b)
-         do(loop{block[_]}, next(b))
-         add(ys, b)
-   loop(bs[0])
+defn Array<T> (c:Cache<Array<T>>, n:Int, x0:T) :
+   fresh{c, _} $ multifn :
+      () :
+         Array<T>(n, x0)
+      (a) :
+         if length(a) < n : (set-all(a, 0 to n, x0), a)
+         else : Array<T>(max(2 * length(a), n), x0)
 
-   ;Add non-reachable blocks
-   if not cull? :
-      for b in bs do :
-         add(ys, b) when not marked?(b)
+defn VarArray<T> (c:Cache<Array<T>>, x0:T) :
+   Array<T>(c, nvars(), x0)
 
-   ;Return
-   ys
+defn BlockArray<T> (c:Cache<Array<T>>, x0:T) :
+   Array<T>(c, nblocks(), x0)
 
-defn post-order (bs:Vector<Block>) -> Vector<Block> :
-   post-order(bs, true)
-
-defn reverse-post-order (bs:Vector<Block>) -> Vector<Block> :
-   val bs* = post-order(bs)
-   reverse!(bs*)
-   bs*
+defn Flags (c:Cache<BitArray>, n:Int, x0:True|False) :
+   fresh{c, _} $ multifn :
+      () :
+         BitArray(n, x0)
+      (a) :
+         if length(a) < n : (clear(a, n, x0), a)
+         else : BitArray(max(2 * length(a), n), x0)
 
 ;============================================================
 ;================= Spill Call Arguments =====================
@@ -673,157 +673,158 @@ defn remove-critical-edges (u:Unit) :
    ;     -------------
    Unit(defs(u), blocks-list)
 
+;============================================================
+;================== Working Set =============================
+;============================================================
+
+val BLOCKS = Vector<Block>()
+val VAR-TYPES = Vector<Type>()
+val BLOCK-INS = Vector<List<Port>>()
+val BLOCK-OUTS = Vector<List<Port>>()
+val PREDECESSORS = Vector<List<Int>>()
+
+defn nblocks () : length(BLOCKS)
+defn nvars () : length(VAR-TYPES)
 
 ;============================================================
 ;==================== Index =================================
 ;============================================================
 
-val VAR-INDICES = IntTable<Int>()
-val BLOCK-INDICES = IntTable<Int>()
-val BLOCK-TABLE = IntTable<False|Block>()
-val VAR-TYPES = Vector<Type>()
-val BLOCKS = Vector<Block>()
-val PREDECESSORS = Vector<List<Int>>()
-var BLOCK-DEFS = BitArray(1024 * 1024)
-val BLOCK-INS = Vector<List<Port>>()
-val BLOCK-OUTS = Vector<List<Port>>()
-
-val VAR-USES = Vector<List<KeyValue<Int,Int>>>()
-val LIVE-IN-BUFFER = Vector<Int>()
-val LIVE-OUT-BUFFER = Vector<Int>()
-val DIRTY-LIVE-INS = Vector<Int>()
-val DIRTY-LIVE-OUTS = Vector<Int>()
+val BLOCK-DEFS-CACHE = Cache<BitArray>()
+val VAR-USES-CACHE = Cache<Array<List<KeyValue<Int,Int>>>>()
+val VAR-INDICES-CACHE = Cache<IntTable<Int>>()
+val BLOCK-INDICES-CACHE = Cache<IntTable<Int>>()
+val BLOCK-TABLE-CACHE = Cache<IntTable<False|Block>>()
+val IN-DISTS-CACHE = Cache<Array<Int>>()
+val OUT-DISTS-CACHE = Cache<Array<Int>>()
+val IN-DIRTY-CACHE = Cache<Vector<Int>>()
+val OUT-DIRTY-CACHE = Cache<Vector<Int>>()
 
 defn index-prog (u:Unit) :
-   ;Clear Vars and Blocks
-   clear(VAR-INDICES)
-   clear(BLOCK-INDICES)
-   clear(VAR-TYPES)
-   clear(BLOCKS)
-   clear(BLOCK-TABLE)
-   BLOCK-FLAGS = fresh-bit-array(BLOCK-FLAGS, length(blocks(u)), false)
-
    ;Populate Block Table
-   for b in blocks(u) do :
-      BLOCK-TABLE[n(b)] = b
+   val block-table = IntTable<False|Block>(BLOCK-TABLE-CACHE)
+   for b in blocks(u) do : block-table[n(b)] = b
    ;Populate Variables
+   clear(VAR-TYPES)
+   val var-indices = IntTable<Int>(VAR-INDICES-CACHE)
    for def in defs(u) do :
       val [n, t] = [tgt-n(def), tgt-type(def)]
-      val n* = length(VAR-TYPES)
-      VAR-INDICES[n] = n*
-      add(VAR-TYPES, t)      
+      add(VAR-TYPES, t)
+      var-indices[n] = length(VAR-TYPES) - 1
    ;Populate Blocks in Reverse Post Order
+   clear(BLOCKS)
    defn order (n:Int) :
-      match(BLOCK-TABLE[n]) :
+      match(block-table[n]) :
          (b:Block) :
-            BLOCK-TABLE[n] = false
+            block-table[n] = false
             do(order, next(b))
             add(BLOCKS, b)
          (b:False) :
             false
    order(n(blocks(u)[0]))         
    reverse!(BLOCKS)
+   ;Assign Block indices
+   val block-indices = IntTable<Int>(BLOCK-INDICES-CACHE)
    for (b in BLOCKS, i in 0 to false) do :
-      BLOCK-INDICES[n(b)] = i
-
-   ;Clear block defs
-   val nblocks = length(BLOCKS)
-   val nvars = length(VAR-TYPES)
-   BLOCK-DEFS = fresh-bit-array(BLOCK-DEFS, nblocks * nvars, false)
-
-   ;Clear block uses
-   clear(VAR-USES)
-   set-length(VAR-USES, nvars, List())
-   ;Clear predecessors
-   clear(PREDECESSORS)
-   set-length(PREDECESSORS, nblocks, List())
+      block-indices[n(b)] = i
 
    ;Rename Instruction
    defn rename (i:Ins) :
       for imm in i map :
          match(imm) :
-            (imm:Var) : Var(VAR-INDICES[n(imm)])
+            (imm:Var) : Var(var-indices[n(imm)])
             (imm) : imm
 
-   ;Rename Blocks
+   ;Compute renamed instruction, predecessors, variable usages, variable definitions
+   ;for each block
+   val var-uses = VarArray<List<KeyValue<Int,Int>>>(VAR-USES-CACHE, List())
+   val block-defs = Flags(BLOCK-DEFS-CACHE, nblocks() * nvars(), false)
+   clear(PREDECESSORS, nblocks(), List())
+   
    for blk in BLOCKS map! :
       ;Rename block indices
-      val next* = map({BLOCK-INDICES[_]}, next(blk))
-      val n* = BLOCK-INDICES[n(blk)]
-
+      val next* = map({block-indices[_]}, next(blk))
+      val n* = block-indices[n(blk)]
       ;Mark definitions and usages
-      defn mark-defined (v:Var) : BLOCK-DEFS[n* * nvars + n(v)] = true
-      defn defined? (v:Var) : BLOCK-DEFS[n* * nvars + n(v)]
+      defn mark-defined (v:Var) :
+         block-defs[n* * nvars() + n(v)] = true
+      defn defined? (v:Var) :
+         block-defs[n* * nvars() + n(v)]
       defn mark-used (v:Imm, d:Int) :
          if v is Var :
             val v = v as Var
             if not defined?(v) :
-               VAR-USES[n(v)] = cons(n* => d, VAR-USES[n(v)])
-
+               var-uses[n(v)] = cons(n* => d, var-uses[n(v)])
+      ;Rename instructions
       val idx-counter = to-seq(0 to false)
-      val ins* = for i in ins(blk) map<Ins> :
+      val ins* = for i in ins(blk) map<Ins> :     ;TODO: Use a vector pool
          val idx = next(idx-counter)
          val i* = rename(i)
          do-used(mark-used{_, idx}, i*)
          do-defined(mark-defined, i*)
          i*
+      ;Record predecessors
       for n in next* do :
          PREDECESSORS[n] = cons(n*, PREDECESSORS[n])
+      ;Return updated block   
       Block(n(blk), ins*, next*)
 
    ;Propagate liveness
-   clear(BLOCK-INS)
-   clear(BLOCK-OUTS)
-   set-length(BLOCK-INS, nblocks, List())
-   set-length(BLOCK-OUTS, nblocks, List())
-   if length(LIVE-IN-BUFFER) < nblocks :
-      lengthen(LIVE-IN-BUFFER, nblocks, INT-MAX)
-      lengthen(LIVE-OUT-BUFFER, nblocks, INT-MAX)
+   clear(BLOCK-INS, nblocks(), List())
+   clear(BLOCK-OUTS, nblocks(), List())
+   val in-dists = BlockArray<Int>(IN-DISTS-CACHE, INT-MAX)
+   val out-dists = BlockArray<Int>(OUT-DISTS-CACHE, INT-MAX)
+   val in-dirty = Vector<Int>(IN-DIRTY-CACHE)
+   val out-dirty = Vector<Int>(OUT-DIRTY-CACHE)
 
-   defn save-lives (v:Int) :
-      for b in DIRTY-LIVE-INS do :
-         BLOCK-INS[b] = cons(Port(v, false, Any(), false, LIVE-IN-BUFFER[b]), BLOCK-INS[b])
-         LIVE-IN-BUFFER[b] = INT-MAX
-      clear(DIRTY-LIVE-INS)
-
-      for b in DIRTY-LIVE-OUTS do :
-         BLOCK-OUTS[b] = cons(Port(v, false, Any(), false, LIVE-OUT-BUFFER[b]), BLOCK-OUTS[b])
-         LIVE-OUT-BUFFER[b] = INT-MAX
-      clear(DIRTY-LIVE-OUTS)
-
-   for v in 0 to nvars do :
-      if not empty?(VAR-USES[v]) :
-         for entry in VAR-USES[v] do :
+   ;For each variable
+   for v in 0 to nvars() do :
+      if not empty?(var-uses[v]) :
+         ;Mark all usages of the variable
+         for entry in var-uses[v] do :
             val [b, d] = [key(entry), value(entry)]
-            mark-live-in(b, v, d)
-         save-lives(v)
+            mark-live-in(block-defs, in-dists, out-dists, in-dirty, out-dirty, b, v, d)
+         ;Record all live in ports
+         for b in in-dirty do :
+            BLOCK-INS[b] = cons(Port(v, false, Any(), false, in-dists[b]), BLOCK-INS[b])
+            in-dists[b] = INT-MAX
+         clear(in-dirty)
+         ;Record all live out ports
+         for b in out-dirty do :
+            BLOCK-OUTS[b] = cons(Port(v, false, Any(), false, out-dists[b]), BLOCK-OUTS[b])
+            out-dists[b] = INT-MAX
+         clear(out-dirty)
 
-lostanza defn mark-live-out (b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :   
-   val old-value = get(LIVE-OUT-BUFFER, b).value
+lostanza defn mark-live-out (defs:ref<BitArray>, in-dists:ref<Array<Int>>, out-dists:ref<Array<Int>>,
+                             in-dirty:ref<Vector<Int>>, out-dirty:ref<Vector<Int>>,
+                             b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :   
+   val old-value = get(out-dists, b).value
    if d.value < old-value :
       if old-value == INT-MAX.value :
-         add(DIRTY-LIVE-OUTS, b)
-      set(LIVE-OUT-BUFFER, b, d)
+         add(out-dirty, b)
+      set(out-dists, b, d)
 
       val idx = b.value * length(VAR-TYPES).value + v.value
-      if get(BLOCK-DEFS, new Int{idx}) == false :
+      if get(defs, new Int{idx}) == false :
          val d* = new Int{d.value + length(ins(get(BLOCKS, b))).value}
-         mark-live-in(b, v, d*)
+         mark-live-in(defs, in-dists, out-dists, in-dirty, out-dirty, b, v, d*)
    return false
 
-lostanza defn mark-live-in (b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :
-   val old-value = get(LIVE-IN-BUFFER, b).value
+lostanza defn mark-live-in (defs:ref<BitArray>, in-dists:ref<Array<Int>>, out-dists:ref<Array<Int>>,
+                            in-dirty:ref<Vector<Int>>, out-dirty:ref<Vector<Int>>,
+                            b:ref<Int>, v:ref<Int>, d:ref<Int>) -> ref<False> :
+   val old-value = get(in-dists, b).value
    if d.value < old-value :
       if old-value == INT-MAX.value :
-         add(DIRTY-LIVE-INS, b)      
-      set(LIVE-IN-BUFFER, b, d)
+         add(in-dirty, b)      
+      set(in-dists, b, d)
       labels :
          begin :
             goto loop(get(PREDECESSORS, b))
          loop (preds:ref<List<Int>>) :
             match(preds) :
                (preds:ref<FullList<Int>>) :
-                  mark-live-out(head(preds), v, d)
+                  mark-live-out(defs, in-dists, out-dists, in-dirty, out-dirty, head(preds), v, d)
                   goto loop(tail(preds))
                (preds:ref<NilList>) : ()
    return false
