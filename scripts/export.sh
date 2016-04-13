@@ -9,4 +9,4 @@ zip -r stanza.zip compiler core docs runtime License.txt stanza
 mv lstanza stanza
 zip -r lstanza.zip compiler core docs runtime License.txt stanza
 mv stanza.zip lstanza.zip ~/Desktop/
-
+rm *
