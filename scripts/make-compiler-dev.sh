@@ -1,4 +1,7 @@
-./bin/stanzadev core/reader.stanza \
+./bin/stanzadev \
+         core/core.stanza \
+         core/collections.stanza \
+         core/reader.stanza \
          core/macro-utils.stanza \
          compiler/stz-algorithms.stanza \
          compiler/stz-padder.stanza \
@@ -38,6 +41,9 @@
          compiler/lang-resolver.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
-      -o bin/$1 \
       -optimize \
+      -pkg fast-pkgs
+      
+#      -o bin/$1 \
+
 
