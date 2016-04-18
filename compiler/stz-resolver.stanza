@@ -9,6 +9,7 @@ defpackage stz/resolver :
    import stz/utils
    import stz/pkg-ir
    import stz/algorithms
+   import stz/pkg
 
 ;============================================================
 ;===================== Defresolver ==========================
@@ -207,8 +208,9 @@ defresolver resolve-exp (e:IExp, eng:Engine) :
 
 
 ;============================================================
-;=================== Implementation =========================
+;============== ScopeBucket Datastructure ===================
 ;============================================================
+;Represents the environment for a single package
 
 deftype Bucket
 defmulti add (b:Bucket, n:Int, x:Symbol, scope:Int) -> False
@@ -229,16 +231,21 @@ defmulti end-scope (s:ScopeBucket) -> False
 defmulti get (s:ScopeBucket, x:Symbol, filter:Int -> True|False) -> List<Int>
 defmulti get-local (s:ScopeBucket, x:Symbol, filter:Int -> True|False) -> List<Int>
 defmulti get-top (s:ScopeBucket, x:Symbol, filter:Int -> True|False) -> List<Int>
+defmulti get-all-top (s:ScopeBucket) -> List<Int>
 
 defn ScopeBucket () :
    val bucket = Bucket()
    val scopes = Vector<Int>()
    val scope-counter = to-seq(1 to false)
+   var top-defs:List<Int> = List()
    add(scopes, next(scope-counter))
 
    new ScopeBucket :
       defmethod add (this, x:Symbol, n:Int) :
-         add(bucket, n, x, peek(scopes))
+         val s = peek(scopes)         
+         add(bucket, n, x, s)
+         if s == scopes[0] :
+            top-defs = cons(n, top-defs)
       defmethod begin-scope (this) :
          add(scopes, next(scope-counter))
       defmethod end-scope (this) :
@@ -254,8 +261,14 @@ defn ScopeBucket () :
          to-list(filter(f, bucket[x, peek(scopes)]))
       defmethod get-top (this, x:Symbol, f:Int -> True|False) :
          to-list(filter(f, bucket[x, scopes[0]]))
+      defmethod get-all-top (this) :
+         top-defs
 
-;======== Prefixer ========
+;============================================================
+;================= Prefixer Datastructure ===================
+;============================================================
+;Creates the prefix environment given a set of Prefix statements
+
 deftype Prefixer
 defmulti set-all-prefix (p:Prefixer, prefix:Symbol) -> False
 defmulti set-prefix (p:Prefixer, xs:List<Symbol>, prefix:Symbol) -> False
@@ -280,13 +293,7 @@ defn Prefixer () :
          else :
             x
 
-;======== Base Environments ========
-defstruct ResolveError <: Exception :
-   msgs: Seqable
-defmethod print (o:OutputStream, e:ResolveError) :
-   print-all(o, join(msgs(e), "\n"))
-
-defn make-prefixer (ps:List<IPrefix>) :
+defn Prefixer (ps:List<IPrefix>) :
    defn prefix! (p:IPrefix) : name(prefix(p) as IVar)
    val prefixer = Prefixer()
    for p in ps do :
@@ -295,251 +302,239 @@ defn make-prefixer (ps:List<IPrefix>) :
          (ns:List<IVar>) : set-prefix(prefixer, map(name, ns), prefix!(p))
    prefixer
 
-defn info-string (i:False|FileInfo) :
-   match(i) :
-      (i:False) : ""
-      (i:FileInfo) : "%_: " % [i]
 
-defn ensure-loaded (nm:NameMap, loaded-pkgs:Vector<Pkg>, pkg-name:Symbol, new-pkgs:List<Symbol>) -> False :
-   ;If not loaded already
-   val p = find({name(_) == pkg-name}, loaded-pkgs)
-   if p is False :
-      ;Load
-      val pkg = load-pkg(pkg-name, new-pkgs)
-      add(loaded-pkgs, pkg)
-      
-      ;Populate namemap
-      for c in comms(pkg) do :
-         match(c) :
-            (c:DefInfo) : register(nm, n(c), package(c), name(c), visibility(c), category(c), info(c))
-            (c) : false
+;============================================================
+;=============== Environment Datastructure ==================
+;============================================================
 
-      ;Ensure imports are loaded
-      for i in imports(pkg) do :
-         ensure-loaded(nm, loaded-pkgs, name(i), new-pkgs)         
+deftype Environment
+defmulti public-scope (e:Environment, name:Symbol) -> ScopeBucket
+defmulti protected-scope (e:Environment, name:Symbol) -> ScopeBucket
+defmulti private-scope (e:Environment, name:Symbol) -> ScopeBucket
 
-defn load-pkg-scope (nm:NameMap, loaded-pkgs:Vector<Pkg>, pkg-name:Symbol, new-pkgs:List<Symbol>) -> [Pkg, Vector<Int>, ScopeBucket] :
-   ensure-loaded(nm, loaded-pkgs, pkg-name, new-pkgs)
-   val pkg = find!({name(_) == pkg-name}, loaded-pkgs)
-   val scope = ScopeBucket()
-   val public-defs = Vector<Int>()
-   
-   ;Populate namemap and scope
-   for c in comms(pkg) do :
-      match(c) :
-         (c:DefInfo) :
-            if visibility(c) is Protected|Public :
-               add(scope, name(c), n(c))
-            if visibility(c) is Public :
-               add(public-defs, n(c))
-         (c) : false
-         
-   ;Return pkg and scope
-   [pkg, public-defs, scope]
-
-defn make-base-scopes (nm:NameMap, loaded-pkgs:Vector<Pkg>, es:List<LetPackage>) ->
-                       [HashTable<Symbol, ScopeBucket>,
-                        HashTable<Symbol, ScopeBucket>] :
-   defn package! (i:IImport) : name(package(i) as IVar)
-
-   ;Errors
-   val errors = Vector<?>()
-   defn no-package (info:False|FileInfo, name:Symbol) :
-      add{errors, _} $
-      "%_Failed to import undefined package %~." % [info-string(info), name]
-
-   ;Classify defined globals
-   val public-defs = HashTable<Symbol, Vector<Int>>()
+defn resolve-with-environment (idmap:IdMap,
+                               nm:NameMap,
+                               exps:List<LoadPackage|LetPackage>,
+                               f:(Environment,LetPackage) -> LetPackage) -> List<LoadPackage|LetPackage> :
+   ;(imported[n] = false) => private scope n has not computed imports yet
+   val imported = HashTable<Symbol,True|False>(false)
+   val pkg-imports = HashTable<Symbol,List<IImport>>()
+   val public-scopes = HashTable<Symbol, ScopeBucket>()
    val protected-scopes = HashTable<Symbol, ScopeBucket>()
    val private-scopes = HashTable<Symbol, ScopeBucket>()
-   for p in es do :
-      val n = name(p)
-      private-scopes[n] = ScopeBucket()
-      protected-scopes[n] = ScopeBucket()
-      public-defs[n] = Vector<Int>()
+   val renamed = HashTable<Symbol, LoadPackage>()
+   val loaded = Vector<Symbol>()
+
+   ;Compute scopes for all immediate packages
+   defn compute-scope (e:LoadPackage) :
+      val pkg* = rename(idmap, pkg(e))
+      renamed[name(e)] = LoadPackage(filename(e), pkg*, info(e))
+      val public-scope = ScopeBucket()
+      val protected-scope = ScopeBucket()
+      public-scopes[name(e)] = public-scope
+      protected-scopes[name(e)] = protected-scope
+      for comm in filter({_ is DefInfo}, comms(pkg*)) do :
+         val c = comm as DefInfo
+         val [n, p, name, vis, cat, info] = [n(c), package(c), name(c), visibility(c), category(c), info(c)]
+         register(nm, n, p, name, vis, cat, info)
+         add(protected-scope, name, n) when vis is Protected|Public
+         add(public-scope, name, n) when vis is Public
+   ;Create empty scopes
+   for e in exps do :
+      match(e) :
+         (e:LoadPackage) :
+            compute-scope(e)
+         (e:LetPackage) :
+            val n = name(e)
+            public-scopes[n] = ScopeBucket()
+            protected-scopes[n] = ScopeBucket()
+            private-scopes[n] = ScopeBucket()
+            pkg-imports[n] = imports(e) as List<IImport>
    for v in globals(nm) do :
       val [n, p, name, vis] = [n(v), package(v), name(v), visibility(v)]
       add(private-scopes[p], name, n) when vis is Private|Protected|Public
       add(protected-scopes[p], name, n) when vis is Protected|Public
-      add(public-defs[p], n) when vis is Public
+      add(public-scopes[p], name, n) when vis is Public
 
-   ;Ensure a package is loaded
-   defn ensure-loaded-package (pkg-name:Symbol) :
-      if not key?(public-defs, pkg-name) :
-         val [pkg, defs, scope] = load-pkg-scope(nm, loaded-pkgs, pkg-name, map(name, es))
-         public-defs[pkg-name] = defs
-         protected-scopes[pkg-name] = scope
+   ;Ensure that a package is loaded and abort if it isn't
+   defn ensure-loaded (pkg-name:Symbol) :
+      if not key?(public-scopes, pkg-name) :
+         val filename = pkg-filename(pkg-name)
+         val pkg = deserialize-pkg(filename)
+         add(loaded, name(pkg))
+         compute-scope(LoadPackage(filename, pkg, false))
+         for i in imports(pkg) do :
+            ensure-loaded(name(i))
 
-   ;Execute imports
-   for e in es do :
-      val [p, imports] = [name(e), imports(e) as List<IImport>]
-      val scope = private-scopes[p]
-      for i in imports do :
-         val prefixer = make-prefixer(prefix(i) as List<IPrefix>)
-         try : ensure-loaded-package(package!(i))
-         catch (e:NoPackageException) : false
-         match(get?(public-defs, package!(i), false)) :
-            (defs:Vector<Int>) :
-               for n in defs do :
-                  val name = prefix(prefixer, name(nm[n]))
-                  add(scope, name, n)
-            (f:False) :
-               no-package(info(i), package!(i))
+   ;Ensure that we evaluated all import statements for the package
+   defn ensure-imported (pkg-name:Symbol) :
+      if not imported[pkg-name] :
+         val scope = private-scopes[pkg-name]
+         for i in pkg-imports[pkg-name] do :
+            val import-name = name!(package(i))
+            ensure-loaded(import-name)
+            val prefixer = Prefixer(prefix(i) as List<IPrefix>)
+            for n in get-all-top(public-scopes[import-name]) do :
+               add(scope, prefix(prefixer, name(nm[n])), n)
+         imported[pkg-name] = true
 
-   ;Resolve errors
-   if not empty?(errors) :
-      throw(ResolveError(errors))
+   ;Create environment
+   val environment = new Environment :
+      defmethod public-scope (this, name:Symbol) :
+         ensure-loaded(name)
+         public-scopes[name]
+      defmethod protected-scope (this, name:Symbol) :
+         ensure-loaded(name)
+         protected-scopes[name]
+      defmethod private-scope (this, name:Symbol) :
+         ensure-imported(name)
+         private-scopes[name]
 
-   ;Return protected and private scopes
-   [protected-scopes, private-scopes]
+   ;Resolve all expressions
+   let :
+      var exps* = for e in exps map :
+         match(e) :
+            (e:LetPackage) : f(environment, e)
+            (e:LoadPackage) : (ensure-loaded(name(e)), name(e))
+      exps* = append(loaded, exps*)
+      for e in exps* map :
+         match(e) :
+            (e:LetPackage) :
+               e
+            (name:Symbol) :
+               val e = renamed[name]
+               val pkg* = resolve(idmap, pkg(e))
+               LoadPackage(filename(e), pkg*, info(e))
 
-;======== Ordering Engine =========
+;============================================================
+;=============== Ordering Engine ============================
+;============================================================
+
 defn order-packages (es:List<LoadPackage|LetPackage>) :
-   defn pkg-name (e:LoadPackage|LetPackage) :
-      match(e) :
-         (e:LoadPackage) : name(pkg(e))
-         (e:LetPackage) : name(e)
+   ;Retrieve imports for a package
    defn pkg-imports (e:LoadPackage|LetPackage) :
       match(e) :
          (e:LoadPackage) : map(name, imports(pkg(e)))
-         (e:LetPackage) : map(name{package(_ as IImport) as IVar}, imports(e))
+         (e:LetPackage) : map(name!{package(_ as IImport)}, imports(e))
 
-   ;Create preference table
-   val prefs = HashTable<Symbol,Int>()
+   ;Create natural ordering table
+   val natural = HashTable<Symbol,Int>()
    for (e in es, i in 0 to false) do :
-      prefs[pkg-name(e)] = i
+      natural[name(e)] = i
 
    ;Create dependencies table
    val dependencies = HashTable<KeyValue<Symbol,Symbol>,True|False>(false)
    val edges = transitive-closure $
       for e in es seq :
-         pkg-name(e) => pkg-imports(e)
+         name(e) => pkg-imports(e)
    for e in edges do :
       for v in value(e) do :         
          dependencies[key(e) => v] = true
 
    ;Before Ordering
    defn before? (a:LoadPackage|LetPackage, b:LoadPackage|LetPackage) :
-      val an = pkg-name(a)
-      val bn = pkg-name(b)
+      val an = name(a)
+      val bn = name(b)
       match(dependencies[an => bn], dependencies[bn => an]) :
          (x:True, y:False) : false
          (x:False, y:True) : true
-         (x, y) : prefs[an] < prefs[bn]
+         (x, y) : natural[an] < natural[bn]
 
    ;Sort
    to-list(lazy-qsort(es, before?))
 
+;============================================================
+;=============== Resolution Engine ==========================
+;============================================================
 
-;======== Resolve Engine ========
 deftype Engine
 defmulti new-definitions (eng:Engine, e:IExp) -> False
 defmulti push-scope (eng:Engine) -> False
 defmulti pop-scope (eng:Engine) -> False
 defmulti resolve (e, eng:Engine, type:Symbol) -> ?
 
-public defn resolve (nm:NameMap, e:IExp) -> IExp :
-   ;======== Error System ========
+;Messages
+val NO-RESOLVE = "%_Could not resolve %_."
+val DEFINED-IN = "\n   %_%_ defined in package %_."
+val AMB-REF = "%_Ambiguous reference to %_. Possibilities include:%*"
+val BAD-SET = "%_Cannot assign to immutable value %_."
+val BAD-CAP = "%_Cannot capture explicit type argument %_."
+val NO-PACKAGE = "%_No package found with name %_."
+val NOT-HS-CLASS = "%_Expected a HiStanza type here but received %_."
+val NOT-LS-CLASS = "%_Expected a LoStanza type here but received %_."
+val NOT-FN = "%_Expected a function here but received %_."
+val NOT-LS-PRIM = "%_%_ is not a recognized LoStanza primitive."
+val NOT-PRIM = "%_%_ is not a recognized Stanza primitive."
+
+defn info-string (i:False|FileInfo) :
+   match(i) :
+      (i:False) : ""
+      (i:FileInfo) : "%_: " % [i]
+
+public defn resolve (nm:NameMap, exps:List<LetPackage|LoadPackage>) -> List<LetPackage|LoadPackage> :
+   ;Error System
    val errors = Vector<?>()
    defn resolve-error (msg) :
       add(errors, msg)
-      throw(ResolveError(errors))
+      throw(new NotResolved)
    defn no-resolve (v:IVar) :
-      resolve-error $
-      "%_Could not resolve %~." % [info-string(info(v)), name(v)]
+      resolve-error(NO-RESOLVE % [info-string(info(v)), name(v)])
    defn amb-resolve (v:IVar, ns:List<Int>) :
       val others = for n in ns seq :
          val e = nm[n]
-         "\n   %_%~ defined in package %~" % [info-string(info(e)), name(e), package(e)]
-      resolve-error $ "%_Ambiguous reference to %~. Possibilities include:%*" %
-         [info-string(info(v)), name(v), others]
+         DEFINED-IN % [info-string(info(e)), name(e), package(e)]
+      resolve-error(AMB-REF % [info-string(info(v)), name(v), others])
    defn not-mutable (v:IVar) :
-      resolve-error $ "%_Cannot assign to immutable value %~." % [info-string(info(v)), name(v)]
+      resolve-error(BAD-SET % [info-string(info(v)), name(v)])
    defn not-cap (v:IVar) :
-      resolve-error $ "%_Cannot capture explicit type argument %~." % [info-string(info(v)), name(v)]
+      resolve-error(BAD-CAP % [info-string(info(v)), name(v)])
    defn no-package (info:False|FileInfo, name:Symbol) :
-      resolve-error $ "%_No package found with name %~." % [info-string(info), name]
+      resolve-error(NO-PACKAGE % [info-string(info), name])
    defn not-hs-class (v:IVar) :
-      resolve-error $ "%_Expected a HiStanza type here but received %~." % [info-string(info(v)), name(v)]
+      resolve-error(NOT-HS-CLASS % [info-string(info(v)), name(v)])
    defn not-ls-class (v:IVar) :
-      resolve-error $ "%_Expected a LoStanza type here but received %~." % [info-string(info(v)), name(v)]
+      resolve-error(NOT-LS-CLASS % [info-string(info(v)), name(v)])
    defn not-fn (v:IVar) :
-      resolve-error $ "%_Expected a function here but received %~." % [info-string(info(v)), name(v)]
+      resolve-error(NOT-FN % [info-string(info(v)), name(v)])
    defn not-ls-prim (v:IVar) :
-      resolve-error $ "%_%~ is not a recognized LoStanza primitive." % [info-string(info(v)), name(v)]
+      resolve-error(NOT-LS-PRIM % [info-string(info(v)), name(v)])
    defn not-prim (v:IVar) :
-      resolve-error $ "%_%~ is not a recognized Stanza primitive." % [info-string(info(v)), name(v)]
-   defn resolve-errors () :
-      if not empty?(errors) :
-         throw(ResolveError(errors))
+      resolve-error(NOT-PRIM % [info-string(info(v)), name(v)])
 
-   ;======== Find packages ========
-   defn find-packages (e:IExp) :
-      val ps = Vector<LetPackage>()
-      defn loop (e:IExp) :
-         match(e) :
-            (e:LetPackage) : add(ps, e)
-            (e) : do(loop, e)
-      loop(e)
-      to-list(ps)
-   val ps = find-packages(e)
-
-   ;======== Find base scopes ========
-   val loaded-pkgs = Vector<Pkg>()
-   val [protected-scopes, private-scopes] = make-base-scopes(nm, loaded-pkgs, ps)
-
-   ;Ensure a package is loaded
-   defn ensure-loaded-package (pkg-name:Symbol) :
-      if not key?(protected-scopes, pkg-name) :
-         attempt:
-            val [pkg, defs, scope] = load-pkg-scope(nm, loaded-pkgs, pkg-name, map(name, ps))
-            protected-scopes[pkg-name] = scope
-
-   ;======== Namespace Utilities ========
+   ;Namespace Utilities
    defn type-pred (f: EType -> True|False) -> Int -> True|False :
       fn (i:Int) :
          f(type(nm[i]))
    defn get-name (e:VarN) :
       name(nm[n(e)])
 
-   ;======== Resolve in a given package ========
-   defn resolve (p:LetPackage) -> LetPackage :
-      ;Track imported packages
-      val imported = HashTable<Symbol,True>()
-      defn all-imported-packages () :
-         ;Include all explicitly imported packages
-         for i in imports(p) do :
-            val name = name(package(i as IImport) as IVar)
-            imported[name] = true
-         ;Don't consider the empty package or current package
-         remove(imported, name(p))
-         remove(imported, `\||)
-         ;Return as list of IImport expressions
-         to-list $ for name in keys(imported) seq :
-            IImport(IVar(name, false), List(), false)
-      
-      val scope = private-scopes[name(p)]
+   ;Resolve a given package
+   defn resolve (environment:Environment, p:LetPackage) -> LetPackage :
+      ;Retrieve package scope
+      val scope = private-scope(environment, name(p))
 
-      defn get-qualified-scope (info:False|FileInfo, str:Symbol) -> ScopeBucket :
-         if str == `\|| :
+      ;Retrieve the scope indicated by the given package name
+      val imported-packages = HashTable<Symbol,True>()
+      defn get-qualified-scope (name:Symbol) -> ScopeBucket :
+         if name == `\|| :
             scope
          else :
-            try : ensure-loaded-package(str)
-            catch (e:Exception) : resolve-error("%_: %_" % [info, e])
-            match(get?(protected-scopes, str, false)) :
-               (s:ScopeBucket) : s
-               (s:False) : no-package(info, str)
+            imported-packages[name] = true
+            protected-scope(environment, name)
 
+      ;Resolve a given identifier
       defn resolve-name (name:Symbol, pass?: Int -> True|False) :
          val [package, local-name] = qualifier(name)
          match(package) :
+            ;Package qualified identifiers access the top level protected scope.
             (package:Symbol) :
-               imported[package] = true
-               val scope = get-qualified-scope(info(e), package)
+               val scope = get-qualified-scope(package)
                get-top(scope, local-name, pass?)
+            ;Otherwise look in current scope
             (package:False) :
                scope[name, pass?]
 
+      ;Resolve an identifier to a single item
       defn resolve-one (e:IVar, pass?: Int -> True|False) :
          val ns = resolve-name(name(e), pass?)
          val l = length(ns)
@@ -547,6 +542,7 @@ public defn resolve (nm:NameMap, e:IExp) -> IExp :
          else if l == 1 : head(ns)
          else : amb-resolve(e, ns)
 
+      ;Resolve an identifier to multiple items
       defn resolve-many (e:IVar, pass?: Int -> True|False) :
          val ns = resolve-name(name(e), pass?)            
          val l = length(ns)
@@ -554,107 +550,124 @@ public defn resolve (nm:NameMap, e:IExp) -> IExp :
          else if l == 1 : head(ns)
          else : ns
 
-      val body* = resolve-exp(body(p), engine) where :
-         val engine = new Engine :
-            defmethod new-definitions (this, e:IExp) :
-               match(e) :
-                  (e:VarN) : add(scope, get-name(e), n(e))
-                  (e) : do(new-definitions{this, _}, e)
+      ;Resolve the body of the package
+      val body* = resolve-exp{body(p), _} $ new Engine :
+         defmethod new-definitions (this, e:IExp) :
+            match(e) :
+               (e:VarN) : add(scope, get-name(e), n(e))
+               (e) : do(new-definitions{this, _}, e)
 
-            defmethod push-scope (this) :
-               begin-scope(scope)
+         defmethod push-scope (this) :
+            begin-scope(scope)
 
-            defmethod pop-scope (this) :
-               end-scope(scope)
+         defmethod pop-scope (this) :
+            end-scope(scope)
 
-            defmethod resolve (e, this, type:Symbol) :
-               val var? = type-pred({_ is LValE|LVarE|LFnE|ValE|VarE|FnE|MultiE})
-               val mvar? = type-pred({_ is LVarE|VarE})
-               val fn? = type-pred({_ is LFnE|FnE|MultiE})
-               val multi? = type-pred({_ is MultiE})
-               val type? = type-pred({_ is TVarE|CapVarE|TypeE|LTypeE})
-               val class? = type-pred({_ is TypeE|LTypeE})
-               val hs-class? = type-pred({_ is TypeE})
-               val ls-class? = type-pred({_ is LTypeE})               
-               val tvar? = type-pred({_ is TVarE|CapVarE})
-               val capvar? = type-pred({_ is CapVarE})
-               val label? = type-pred({_ is LabelE})
+         defmethod resolve (e, this, type:Symbol) :
+            val var? = type-pred({_ is LValE|LVarE|LFnE|ValE|VarE|FnE|MultiE})
+            val mvar? = type-pred({_ is LVarE|VarE})
+            val fn? = type-pred({_ is LFnE|FnE|MultiE})
+            val multi? = type-pred({_ is MultiE})
+            val type? = type-pred({_ is TVarE|CapVarE|TypeE|LTypeE})
+            val class? = type-pred({_ is TypeE|LTypeE})
+            val hs-class? = type-pred({_ is TypeE})
+            val ls-class? = type-pred({_ is LTypeE})               
+            val tvar? = type-pred({_ is TVarE|CapVarE})
+            val capvar? = type-pred({_ is CapVarE})
+            val label? = type-pred({_ is LabelE})
 
-               try :
-                  switch {type == _} :
-                     `var :
-                        match(resolve-many(e, var?)) :
-                           (n:Int) :
-                              VarN(n, info(e))
-                           (ns:List<Int>) :
-                              if all?(fn?, ns) : Mix(map(VarN{_, info(e)}, ns), info(e))
-                              else : amb-resolve(e, ns)
-                     `mutable-var :
-                        val n = resolve-one(e, var?)
-                        not-mutable(e) when not mvar?(n)
-                        VarN(n, info(e))                        
-                     `multi :
-                        match(resolve-many(e, multi?)) :
-                           (n:Int) : VarN(n, info(e))
-                           (ns:List<Int>) : Mix(map(VarN{_, info(e)}, ns), info(e))
-                     `this :
-                        head(scope[`this, var?])
-                     `type :
-                        val n = resolve-one(e, type?)
-                        if class?(n) : Raw(VarN(n, info(e)), info(e))
-                        else : VarN(n, info(e))                        
-                     `capvar :
-                        val ns = get-local(scope, name(e), tvar?)
-                        if empty?(ns) : no-resolve(e)
-                        else if capvar?(head(ns)) : VarN(head(ns), info(e))
-                        else : not-cap(e)
-                     `class :
-                        val n = resolve-one(e, class?)
-                        VarN(n, info(e))
-                     `raw-hs-class :
-                        val n = resolve-one(e, type?)
-                        if hs-class?(n) : Raw(VarN(n, info(e)), info(e))
-                        else : not-hs-class(e)
-                     `hs-class :
-                        val n = resolve-one(e, type?)
-                        if hs-class?(n) : VarN(n, info(e))
-                        else : not-hs-class(e)
-                     `raw-ls-class :
-                        val n = resolve-one(e, type?)
-                        if ls-class?(n) : Raw(VarN(n, info(e)), info(e))
-                        else : not-ls-class(e)
-                     `ls-class :
-                        val n = resolve-one(e, type?)
-                        if ls-class?(n) : VarN(n, info(e))
-                        else : not-ls-class(e)
-                     `label :
-                        val n = resolve-one(e, label?)
-                        VarN(n, info(e))
-                     `function :
-                        match(resolve-many(e, var?)) :
-                           (n:Int) :
-                              if fn?(n) : VarN(n, info(e))
-                              else : not-fn(e)
-                           (ns:List<Int>) :
-                              if all?(fn?, ns) : Mix(map(VarN{_, info(e)}, ns), info(e))
-                              else : amb-resolve(e, ns)
-                     `ls-prim :
-                        if ls-primitive?(name(e)) : e
-                        else : not-ls-prim(e)
-                     `prim :
-                        if primitive?(name(e)) : e
-                        else : not-prim(e)
-                     else :
-                        fatal("Unknown resolver %~" % [type])
-               catch (err:ResolveError) :
-                  e
+            try :
+               switch {type == _} :
+                  `var :
+                     match(resolve-many(e, var?)) :
+                        (n:Int) :
+                           VarN(n, info(e))
+                        (ns:List<Int>) :
+                           if all?(fn?, ns) : Mix(map(VarN{_, info(e)}, ns), info(e))
+                           else : amb-resolve(e, ns)
+                  `mutable-var :
+                     val n = resolve-one(e, var?)
+                     not-mutable(e) when not mvar?(n)
+                     VarN(n, info(e))                        
+                  `multi :
+                     match(resolve-many(e, multi?)) :
+                        (n:Int) : VarN(n, info(e))
+                        (ns:List<Int>) : Mix(map(VarN{_, info(e)}, ns), info(e))
+                  `this :
+                     head(scope[`this, var?])
+                  `type :
+                     val n = resolve-one(e, type?)
+                     if class?(n) : Raw(VarN(n, info(e)), info(e))
+                     else : VarN(n, info(e))                        
+                  `capvar :
+                     val ns = get-local(scope, name(e), tvar?)
+                     if empty?(ns) : no-resolve(e)
+                     else if capvar?(head(ns)) : VarN(head(ns), info(e))
+                     else : not-cap(e)
+                  `class :
+                     val n = resolve-one(e, class?)
+                     VarN(n, info(e))
+                  `raw-hs-class :
+                     val n = resolve-one(e, type?)
+                     if hs-class?(n) : Raw(VarN(n, info(e)), info(e))
+                     else : not-hs-class(e)
+                  `hs-class :
+                     val n = resolve-one(e, type?)
+                     if hs-class?(n) : VarN(n, info(e))
+                     else : not-hs-class(e)
+                  `raw-ls-class :
+                     val n = resolve-one(e, type?)
+                     if ls-class?(n) : Raw(VarN(n, info(e)), info(e))
+                     else : not-ls-class(e)
+                  `ls-class :
+                     val n = resolve-one(e, type?)
+                     if ls-class?(n) : VarN(n, info(e))
+                     else : not-ls-class(e)
+                  `label :
+                     val n = resolve-one(e, label?)
+                     VarN(n, info(e))
+                  `function :
+                     match(resolve-many(e, var?)) :
+                        (n:Int) :
+                           if fn?(n) : VarN(n, info(e))
+                           else : not-fn(e)
+                        (ns:List<Int>) :
+                           if all?(fn?, ns) : Mix(map(VarN{_, info(e)}, ns), info(e))
+                           else : amb-resolve(e, ns)
+                  `ls-prim :
+                     if ls-primitive?(name(e)) : e
+                     else : not-ls-prim(e)
+                  `prim :
+                     if primitive?(name(e)) : e
+                     else : not-prim(e)
+                  else :
+                     fatal("Unknown resolver %~" % [type])
+            catch (err:NotResolved) :
+               e
+               
+      ;Compute all imported packages
+      val imports* = let :
+         for i in imports(p) as List<IImport> do :
+            imported-packages[name!(package(i))] = true
+         to-list $ for p in keys(imported-packages) seq :
+            IImport(IVar(p, false), List(), false)
 
-      LetPackage(name(p), all-imported-packages(), body*, info(p))
+      ;Return new package with resolved body
+      LetPackage(name(p), imports*, body*, info(p))
 
    ;Driver
-   let :
-      val resolved = map(resolve, ps)
-      resolve-errors()
-      val pkgs = seq(LoadPackage{_, false}, loaded-pkgs)
-      val es = order-packages(append(pkgs, resolved))
-      IBegin(es, false)
+   val idmap = IdMap()
+   val resolved = resolve-with-environment(idmap, nm, exps, resolve)
+   throw(ResolveError(errors)) when not empty?(errors)
+   order-packages(resolved)
+
+;============================================================
+;===================== Exceptions ===========================
+;============================================================
+
+deftype NotResolved <: Exception
+
+defstruct ResolveError <: Exception :
+   msgs: Seqable
+defmethod print (o:OutputStream, e:ResolveError) :
+   print-all(o, join(msgs(e), "\n"))
