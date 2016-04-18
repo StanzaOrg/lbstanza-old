@@ -58,6 +58,7 @@ stanza core/reader.stanza \
          compiler/stz-bb-ir.stanza \
          compiler/stz-asm-ir.stanza \
          compiler/stz-backend.stanza \
+         compiler/stz-pkg.stanza \
          compiler/stz-input.stanza \
          compiler/stz-namemap.stanza \
          compiler/stz-renamer.stanza \

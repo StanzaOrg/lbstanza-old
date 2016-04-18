@@ -1,0 +1,902 @@
+;See License.txt for details about licensing
+
+defpackage stz/pkg :
+   import core
+   import collections
+   import stz/namemap
+   import stz/pkg-ir
+   import stz/kl-ir with :
+      prefix(Field, Child) => K
+      prefix(name, comms) => kl-
+   import stz/pkg-node with :
+      prefix(map) => pkg-
+   import stz/tl-ir with :
+      prefix(Field, Child) => T
+   import stz/algorithms
+   import stz/ids
+   import stz/params
+
+;============================================================
+;================== Exceptions ==============================
+;============================================================
+
+;Thrown when an error occurs when attempting to read a package with a given filename.
+public defstruct PackageReadException <: Exception :
+   filename: String
+defmethod print (o:OutputStream, e:PackageReadException) :
+   print(o, "An occurred when reading package from %_." % [filename(e)])
+
+public defstruct NoPackageException <: Exception :
+   name: Symbol
+
+defmethod print (o:OutputStream, e:NoPackageException) :
+   print(o, "Could not locate package %_." % [name(e)])
+
+public defstruct PackageLoadException <: Exception :
+   name: Symbol
+
+defmethod print (o:OutputStream, e:PackageLoadException) :
+   print(o, "An error occurred when loading package %_." % [name(e)])
+
+public defstruct PackageTimestampException <: Exception :
+   name: Symbol
+
+defmethod print (o:OutputStream, e:PackageTimestampException) :
+   print(o, "Loaded package %_ is out of date." % [name(e)])
+
+;============================================================
+;================== Name Mangling ===========================
+;============================================================
+
+val VALID-FILENAME-CHARS = BitArray(256, false)
+set-all(VALID-FILENAME-CHARS, to-int('0') through to-int('9'), true)
+set-all(VALID-FILENAME-CHARS, to-int('a') through to-int('z'), true)
+set-all(VALID-FILENAME-CHARS, to-int('A') through to-int('Z'), true)
+VALID-FILENAME-CHARS[to-int('-')] = true
+VALID-FILENAME-CHARS[to-int('.')] = true
+
+val HEX-CHARS = ['0' '1' '2' '3' '4' '5' '6' '7' '8' '9' 'A' 'B' 'C' 'D' 'E' 'F']
+defn to-hex (c:Char) -> String :
+   val i = to-int(c)
+   val c1 = HEX-CHARS[i & 0xF]
+   val c2 = HEX-CHARS[(i >> 4) & 0xF]
+   String([c2, c1])
+
+defn mangle-pkg-filename (name:Symbol) :
+   val buffer = StringBuffer()
+   for c in to-string(name) do :
+      if VALID-FILENAME-CHARS[to-int(c)] :
+         add(buffer, c)
+      else if c == '/' :
+         add(buffer, '$')
+      else :
+         print(buffer, "_%_" % [to-hex(c)])
+   print(buffer, ".pkg")
+   to-string(buffer)
+
+public defn pkg-filename (name:Symbol) :
+   val mangled = mangle-pkg-filename(name)
+   label<String> return :
+      ;Check functions
+      defn check (filename:String) : return(filename) when file-exists?(filename)
+      defn check-dir (dir:String) : check(to-string("%_/%_" % [dir, mangled]))
+      defn check-dirs (dirs:Seqable<String>) : do(check-dir, dirs)
+      ;Check optimized folders first
+      if flag-defined?(`OPTIMIZE) :
+         check-dirs(STANZA-FAST-PKG-DIRS)
+         check-dir(append(STANZA-INSTALL-DIR "/fast-pkgs"))
+      ;Check normal folders
+      check-dirs(STANZA-PKG-DIRS)
+      check-dir(append(STANZA-INSTALL-DIR "/pkgs"))
+      ;No package found
+      throw(NoPackageException(name))
+
+;============================================================
+;=============== IdMap Datastructure ========================
+;============================================================
+
+public deftype IdMap
+public defmulti rename (m:IdMap, pkg:Pkg) -> Pkg
+public defmulti resolve (m:IdMap, pkg:Pkg) -> Pkg
+
+public defn IdMap () :
+   val id-table = HashTable<Symbol,IntTable<Int>>()
+   
+   new IdMap :
+      defmethod rename (this, pkg:Pkg) :
+         ;Generate ids
+         val global-ids = IntTable<Int>()
+         for id in defined-ids(pkg) do :
+            global-ids[id] = id when stable-id?(id) else fresh-id()
+         ;Remember ids
+         id-table[name(pkg)] = global-ids
+         ;Rename ids
+         mapr-id(
+            fn (id) : global-ids[id]
+            fn (id) : id
+            pkg)
+            
+      defmethod resolve (this, pkg:Pkg) :
+         ;Accumulate imported bindings
+         val pkg-ids = id-table[name(pkg)]
+         for import in imports(pkg) do :
+            val import-ids = id-table[name(import)]
+            for entry in bindings(import) do :
+               pkg-ids[value(entry)] = import-ids[key(entry)]
+         ;Rename ids
+         mapr-id(
+            fn (id) : id
+            fn (id) : pkg-ids[id]
+            pkg)
+
+;============================================================
+;=================== Serialization ==========================
+;============================================================
+
+defn serialize (filename:String, p:Pkg) :
+   val f = FileOutputStream(filename)
+   try : serialize(f, p)
+   finally : close(f)
+
+public defn deserialize-pkg (filename:String) :
+   val f = try : FileInputStream(filename)
+           catch (e:Exception) : throw(PackageReadException(filename))
+   try : deserialize-pkg(f)
+   catch (e:Exception) : throw(PackageReadException(filename))
+   finally : close(f)
+
+#with-syntax(core, stz/serializer-lang) :
+   defserializer (out:FileOutputStream, in:FileInputStream) :
+      defunion pkg (Pkg) :
+         Pkg: (name:symbol, timestamp:long, imports:list(import) comms:list(pkgcomm), kcomms:list(kcomm))
+         
+      defunion import (Import) :
+         Import: (name:symbol, timestamp:long, bindings:list(kv))
+
+      defunion kv (KeyValue) :
+         KeyValue: (key:int, value:int)
+         
+      defunion type (Type) :
+         TMixed: (types:slist(type as TArrow))
+         TPoly: (targs:slist(int), cargs:slist(int), func:type as TArrow)
+         TCap: (n:int)
+         TOf: (n:int, type:type)
+         TTuple: (types:slist(type))
+         TOr: (a:type, b:type)
+         TAnd: (a:type, b:type)
+         TVar: (n:int)
+         TArrow: (a:type, b:type)
+         TGradual: ()
+         TBot: ()
+
+      defunion lstype (LSType) :
+         ByteT: ()
+         IntT: ()
+         LongT: ()
+         FloatT: ()
+         DoubleT: ()
+         UnknownT: ()
+         PolyT: (targs:slist(int), cargs:slist(int), func:lstype as FnT)
+         RestT: (type:lstype)
+         PtrT: (type:lstype)
+         RefT: (type:type)
+         FnT: (a:slist(lstype), r:opt<LSType>(lstype), b:lstype)
+         StructT: (n:int, type:type)
+
+      defunion pkgcomm (PkgComm) :
+         DefInfo : (n:int, name:symbol, package:symbol, visibility:vis, category:category, info:info)
+         DefVal : (n:int, type:opt<Type>(type), ls-type:opt<LSType>(lstype))
+         DefType : (n:int, args:slist(int), parent:opt<Type>(type), children:slist(child))
+         DefLSType : (n:int, args:slist(int), parent:opt<Type>(type), fields:slist(field))
+
+      defunion vis (Vis) :
+         Private: ()
+         Protected: ()
+         Public: ()
+         Local: ()
+
+      defunion category (EType) :
+         ValE: ()
+         VarE: ()
+         TVarE: ()
+         CapVarE: ()
+         TypeE: ()
+         MultiE: ()
+         FnE: ()
+         LValE: ()
+         LVarE: ()
+         LFnE: ()
+         LTypeE: ()
+         FieldE: ()
+         LabelE: ()
+
+      defunion field (Field) :
+         Field: (n:int, name:symbol, type:lstype)
+
+      defunion child (Child) :
+         Child: (n:int, args:slist(int), parent:type)
+
+      defunion info (FileInfo) :
+         FileInfo: (filename:string, line:int, column:int)
+
+      defunion ktype (KType) :
+         KOf: (n:int)
+         KTVar: (n:int)
+         KAnd: (a:ktype, b:ktype)
+         KOr: (a:ktype, b:ktype)
+         KTop: ()
+         KBot: ()
+      
+      defunion klstype (KLSType) :
+         KByteT: ()
+         KIntT: ()
+         KLongT: ()
+         KFloatT: ()
+         KDoubleT: ()
+         KUnknownT: ()
+         KPtrT: (type:klstype)
+         KRefT: (type:ktype)
+         KFnT: (a:slist(klstype), r:opt<KLSType>(klstype), b:klstype)
+         KStructT: (n:int)
+      
+      defunion kloc (KLoc) :
+         Value: (exp:klsexp)
+         Deref: (exp:klsexp, type:klstype)
+         Deptr: (exp:klsexp, type:klstype)
+         Slot: (exp:klsexp, type:klstype, index:klsexp)
+         KField: (base:kloc, n:int)
+
+      defunion kcomm (KComm) :
+         KDef :
+            n: int
+            value: kexp
+         KDefVar :
+            n: int
+            type: ktype
+            value: opt<KExp>(kexp)
+         KDefn :
+            n: int
+            value: kfunc
+         KDefmulti :
+            n: int
+            targs: slist(int)
+            a1: slist(ktype)
+            a2: ktype
+            info: opt<FileInfo>(info)
+         KDefmethod :
+            n: int
+            multi: int
+            targs: slist(ktype)
+            thisn: opt<Int>(int)
+            func: kfunc as KFn
+         KDefType :
+            n: int
+            parent: opt<KType>(ktype)
+            children: slist(kchild)
+         KInit :
+            exp: kexp
+
+         KLSDef :
+            n: int
+            type: klstype
+            value: klsexp
+         KLSDefVar :
+            n: int
+            type: klstype
+            value: opt<KLSExp>(klsexp)
+         KLSDefn :
+            tail?: lit as True|False
+            n: int
+            targs: slist(int)
+            a1: slist(klstype)
+            a2: klstype
+            args: slist(int)
+            body: klscomm
+            info: opt<FileInfo>(info)
+         KLSExternFn :
+            n: int
+            lbl: symbol
+            a1: slist(klstype)
+            a2: klstype
+            args: slist(int)
+            body: klscomm
+            info: opt<FileInfo>(info)
+         KLSDefmethod :
+            tail?: lit as True|False
+            n: int
+            multi: int
+            multi-targs: slist(ktype)
+            targs: slist(int)
+            a1: slist(klstype)
+            a2: klstype
+            args: slist(int)
+            body: klscomm
+            info: opt<FileInfo>(info)
+         KLSDefType :
+            n: int
+            parent: opt<KType>(ktype)
+            fields: slist(kfield)
+            rfield: opt<StructField>(kfield)
+         KExtern :
+            n: int
+            type: klstype
+            lbl: symbol
+         KLSInit :
+            comm: klscomm
+
+      defunion kexp (KExp) :
+         KSet: (n:int, value:kexp)
+         KCast: (exp:kexp, targ:ktype, info:opt<FileInfo>(info))
+         KCheckLength: (exp:kexp, length:int, info:opt<FileInfo>(info))
+         KLet: (def:kcomm as KDef|KDefVar|KDefn, body:kexp)
+         KLetRec: (defs:slist(kcomm as KDefn|KDef), body:kexp, info:opt<FileInfo>(info))
+         KSeq: (a:kexp, b:kexp)
+         KDispatch: (args:slist(kexp), branches:slist(kbranch), info:opt<FileInfo>(info))
+         KMatch: (args:slist(kexp), branches:slist(kbranch), info:opt<FileInfo>(info))
+         KNew: (class:ktype, methods:slist(kcomm as KDefmethod), info:opt<FileInfo>(info))
+         KDo: (func:kexp, args:slist(kexp), a1:slist(ktype), a2:ktype, info:opt<FileInfo>(info))
+         KVar: (n:int, info:opt<FileInfo>(info))
+         KPrim: (op:kop, args:slist(kexp))
+         KLiteral: (value:lit)
+         KTuple: (exps:slist(kexp), info:opt<FileInfo>(info))
+         KTupleGet: (exp:kexp, index:int, info:opt<FileInfo>(info))
+         KMix: (exps:slist(kexp as KCurry), info:opt<FileInfo>(info))
+         KCurry: (n:int, targs:slist(ktype), a1:slist(ktype), a2:ktype, info:opt<FileInfo>(info))
+      with :
+         append-args => (false)
+
+      defunion klsexp (KLSExp) :
+         KLSLet: (comm:klscomm, exp:klsexp)
+         KLSVar: (n:int) 
+         KLSRef: (n:int, args:slist(klsexp), info:opt<FileInfo>(info)) 
+         KLSRefArray: (n:int, args:slist(klsexp), info:opt<FileInfo>(info)) 
+         KLSStruct: (n:int, args:slist(klsexp)) 
+         KLSPtr: (exp:kloc) 
+         KLSRead: (exp:kloc) 
+         KLSPrim: (op:klsop, args:slist(klsexp), type:klstype) 
+         KLSCall: (func:klsexp, args:slist(klsexp), type:klstype, new-stack?:lit as True|False, info:opt<FileInfo>(info)) 
+         KLSSwitchStack: (func:klsexp, arg:klsexp, type:klstype, info:opt<FileInfo>(info)) 
+         KLSCallC: (func:klsexp, args:slist(klsexp), type:klstype, info:opt<FileInfo>(info)) 
+         KLSSizeof: (type:klstype) 
+         KLSTagof: (n:int) 
+         KLSConv: (exp:klsexp, type:klstype, info:opt<FileInfo>(info)) 
+         KLSInterpret: (exp:klsexp, type:klstype) 
+         KLSLitByte: (value:byte) 
+         KLSLitInt: (value:int) 
+         KLSLitLong: (value:long) 
+         KLSLitFloat: (value:float) 
+         KLSLitDouble: (value:double) 
+         KLSLitString: (value:string) 
+         KLSMix: (exps:slist(klsexp as KLSCurry)) 
+         KLSCurry: (n:int, targs:slist(ktype), a1:slist(klstype), a2:klstype) 
+         KLSFn: (ref:kexp) 
+
+      defunion klscomm (KLSComm) :
+         KLSIgnoreComm: (exp:klsexp) 
+         KLSSet: (exp:kloc, value:klsexp) 
+         KLSLabels: (blocks:slist(klscomm as KLSLabeledBlock)) 
+         KLSLabel: (n:int) 
+         KLSLabeledBlock: (n:int, args:slist(int), types:slist(klstype), body:klscomm) 
+         KLSGoto: (n:int, args:slist(klsexp)) 
+         KLSReturn: (exp:klsexp) 
+         KLSDefLocal: (n:int, value:klsexp) 
+         KLSDefLocalVar: (n:int, type:klstype, value:opt<KLSExp>(klsexp)) 
+         KLSSeq: (a:klscomm, b:klscomm) 
+         KLSIf: (pred:klsexp, conseq:klscomm, alt:klscomm) 
+         KLSMatch: (args:slist(klsexp), branches:slist(klsbranch), info:opt<FileInfo>(info)) 
+         KLSDispatch: (args:slist(klsexp), branches:slist(klsbranch), info:opt<FileInfo>(info)) 
+         KLSSkip: ()
+         KLSBranchError: (amb?:lit as True|False, info:opt<FileInfo>(info))
+
+      defatom lit (x:?) :
+         writer :
+            match(x) :
+               (x:Byte) :
+                  write-byte(0Y)
+                  write-byte(x)
+               (x:Char) :
+                  write-byte(1Y)
+                  write-char(x)
+               (x:Int) :
+                  write-byte(2Y)
+                  write-int(x)
+               (x:Long) :
+                  write-byte(3Y)
+                  write-long(x)
+               (x:Float) :
+                  write-byte(4Y)
+                  write-float(x)
+               (x:Double) :
+                  write-byte(5Y)
+                  write-double(x)
+               (x:String) :
+                  write-byte(6Y)
+                  write-string(x)
+               (x:Symbol) :
+                  write-byte(7Y)
+                  write-symbol(x)
+               (x:List) :
+                  write-byte(8Y)
+                  write-list(write-lit, x)
+               (x:True) :
+                  write-byte(9Y)                  
+               (x:False) :
+                  write-byte(10Y)
+         reader :
+            val tag = read-byte()
+            switch {tag == _} :
+               0Y : read-byte()
+               1Y : read-char()
+               2Y : read-int()
+               3Y : read-long()
+               4Y : read-float()
+               5Y : read-double()
+               6Y : read-string()
+               7Y : read-symbol()
+               8Y : read-list(read-lit)
+               9Y : true
+               10Y : false
+               else : throw(FileReadException())
+
+      defatom kop (x:KOp) :
+         writer :
+            write-byte $ switch {x == _} :
+               INT-ADD-OP : 0Y
+               INT-SUB-OP : 1Y
+               INT-MUL-OP : 2Y
+               INT-DIV-OP : 3Y
+               INT-MOD-OP : 4Y
+               INT-AND-OP : 5Y
+               INT-OR-OP : 6Y
+               INT-XOR-OP : 7Y
+               INT-SHL-OP : 8Y
+               INT-SHR-OP : 9Y
+               INT-ASHR-OP : 10Y
+               INT-EQ-OP : 11Y
+               INT-NE-OP : 12Y
+               INT-LE-OP : 13Y
+               INT-LT-OP : 14Y
+               INT-GT-OP : 15Y
+               INT-GE-OP : 16Y
+               INT-NOT-OP : 17Y
+               INT-NEG-OP : 18Y
+               IDENTICAL-OP : 19Y
+               AGET-OP : 20Y
+               ASET-OP : 21Y
+               ALEN-OP : 22Y
+               CHAR-AGET-OP : 23Y
+               CHAR-ASET-OP : 24Y
+               STRING-GET-OP : 25Y
+               STRING-LEN-OP : 26Y
+         reader :
+            val tag = read-byte()
+            switch {tag == _} :
+               0Y : INT-ADD-OP
+               1Y : INT-SUB-OP
+               2Y : INT-MUL-OP
+               3Y : INT-DIV-OP
+               4Y : INT-MOD-OP
+               5Y : INT-AND-OP
+               6Y : INT-OR-OP
+               7Y : INT-XOR-OP
+               8Y : INT-SHL-OP
+               9Y : INT-SHR-OP
+               10Y : INT-ASHR-OP
+               11Y : INT-EQ-OP
+               12Y : INT-NE-OP
+               13Y : INT-LE-OP
+               14Y : INT-LT-OP
+               15Y : INT-GT-OP
+               16Y : INT-GE-OP
+               17Y : INT-NOT-OP
+               18Y : INT-NEG-OP
+               19Y : IDENTICAL-OP
+               20Y : AGET-OP
+               21Y : ASET-OP
+               22Y : ALEN-OP
+               23Y : CHAR-AGET-OP
+               24Y : CHAR-ASET-OP
+               25Y : STRING-GET-OP
+               26Y : STRING-LEN-OP
+               else : throw(FileReadException())
+
+      defatom klsop (x:KLSOp) :
+         writer :
+            match(x) :
+               (x:GetAddrOp) :
+                  write-byte(0Y)
+                  write-symbol(kl-name(x))
+                  write-int(lbl(x))
+               (x:GetterOp) :
+                  write-byte(1Y)
+                  write-symbol(kl-name(x))
+                  write-int(lbl(x))
+               (x:SetterOp) :
+                  write-byte(2Y)
+                  write-symbol(kl-name(x))
+                  write-int(lbl(x))
+               (x) :
+                  write-byte $ switch {x == _} :
+                     ADD-OP : 3Y
+                     SUB-OP : 4Y
+                     MUL-OP : 5Y
+                     DIV-OP : 6Y
+                     MOD-OP : 7Y
+                     AND-OP : 8Y
+                     OR-OP : 9Y
+                     XOR-OP : 10Y
+                     SHL-OP : 11Y
+                     SHR-OP : 12Y
+                     ASHR-OP : 13Y
+                     EQ-OP : 14Y
+                     NE-OP : 15Y
+                     LT-OP : 16Y
+                     GT-OP : 17Y
+                     LE-OP : 18Y
+                     GE-OP : 19Y
+                     ULT-OP : 20Y
+                     UGT-OP : 21Y
+                     ULE-OP : 22Y
+                     UGE-OP : 23Y
+                     NOT-OP : 24Y
+                     NEG-OP : 25Y
+                     SP-OP : 26Y                  
+         reader :
+            val tag = read-byte()
+            switch {tag == _} :
+               0Y : GetAddrOp(read-symbol(), read-int())
+               1Y : GetterOp(read-symbol(), read-int())
+               2Y : SetterOp(read-symbol(), read-int())
+               3Y : ADD-OP
+               4Y : SUB-OP
+               5Y : MUL-OP
+               6Y : DIV-OP
+               7Y : MOD-OP
+               8Y : AND-OP
+               9Y : OR-OP
+               10Y : XOR-OP
+               11Y : SHL-OP
+               12Y : SHR-OP
+               13Y : ASHR-OP
+               14Y : EQ-OP
+               15Y : NE-OP
+               16Y : LT-OP
+               17Y : GT-OP
+               18Y : LE-OP
+               19Y : GE-OP
+               20Y : ULT-OP
+               21Y : UGT-OP
+               22Y : ULE-OP
+               23Y : UGE-OP
+               24Y : NOT-OP
+               25Y : NEG-OP
+               26Y : SP-OP
+               else : throw(FileReadException())            
+
+      defunion klsbranch (KLSBranch) :
+         KLSBranch: (args:slist(int), types:slist(ktype), body:klscomm)
+
+      defunion kbranch (KBranch) :
+         KBranch: (args:slist(int), types:slist(ktype), body:kexp, info:opt<FileInfo>(info))
+
+      defunion kfunc (Func) :
+         KFn: (n:int, tail?:lit as True|False, targs:slist(int), a1:slist(ktype),
+               a2:ktype, closure:opt<Int>(int), args:slist(int), body:kexp, info:opt<FileInfo>(info))
+         KMultifn: (n:int, funcs:slist(kfunc as KFn), info:opt<FileInfo>(info))
+
+      defunion kchild (KChild) :
+         KChild: (n:int, parent:ktype)
+
+      defunion kfield (StructField) :
+         StructField: (n:int, type:klstype)
+
+      reader defn read-slist<?T> (f: () -> ?T) :
+         val n = read-byte()
+         to-list(repeatedly(f, to-int(n)))
+         
+      writer defn write-slist<?T> (f: T -> False, xs:List<?T>) :
+         write-byte(to-byte(length(xs)))
+         do(f, xs)
+
+      reader defn read-list<?T> (f: () -> ?T) :
+         val n = read-int()
+         to-list(repeatedly(f, n))
+         
+      writer defn write-list<?T> (f: T -> False, xs:List<?T>) :
+         write-int(length(xs))
+         do(f, xs)
+
+      reader defn read-opt<T> (f: () -> T) :
+         val n = read-byte()
+         f() when n == 1Y
+
+      writer defn write-opt<T> (f: T -> False, x:T|False) :
+         if x is False :
+            write-byte(0Y)
+         else :
+            write-byte(1Y)
+            f(x as T)
+
+      defatom int (x:Int) :
+         writer :
+            put(out, x)
+         reader :
+            match(get-int(in)) :
+               (x:Int) : x
+               (x:False) : throw(FileReadException())
+
+      defatom long (x:Long) :
+         writer :
+            put(out, x)
+         reader :
+            match(get-long(in)) :
+               (x:Long) : x
+               (x:False) : throw(FileReadException())
+
+      defatom float (x:Float) :
+         writer :
+            put(out, x)
+         reader :
+            match(get-float(in)) :
+               (x:Float) : x
+               (x:False) : throw(FileReadException())
+
+      defatom double (x:Double) :
+         writer :
+            put(out, x)
+         reader :
+            match(get-double(in)) :
+               (x:Double) : x
+               (x:False) : throw(FileReadException())
+
+      defatom byte (x:Byte) :
+         writer :
+            put(out, x)
+         reader :
+            match(get-byte(in)) :
+               (x:Byte) : x
+               (x:False) : throw(FileReadException())
+
+      defatom char (x:Char) :
+         writer :
+            print(out, x)
+         reader :
+            match(get-char(in)) :
+               (x:Char) : x
+               (x:False) : throw(FileReadException())
+
+      defatom string (x:String) :
+         writer :
+            write-int(length(x))
+            print(out, x)
+         reader :
+            val n = read-int()
+            String(repeatedly(read-char, n))
+
+      defatom symbol (x:Symbol) :
+         writer : write-string(to-string(x))
+         reader : to-symbol(read-string())
+
+;============================================================
+;============== Abstract Package Node =======================
+;============================================================
+
+defpackage stz/pkg-node :
+   import core
+   import stz/tl-ir with :
+      prefix(Field, Child) => T
+   import stz/kl-ir with :
+      prefix(Field, Child) => K
+      prefix(name, comms) => kl-
+   import stz/pkg-ir with :
+      prefix(Field, Child) => P
+
+public deftype PkgNode :
+   PkgComm <: PkgNode
+   PChild <: PkgNode
+   PField <: PkgNode
+   Type <: PkgNode
+   LSType <: PkgNode
+   KComm <: PkgNode
+   KType <: PkgNode
+   KLSType <: PkgNode
+   KLoc <: PkgNode
+   KExp <: PkgNode
+   KLSExp <: PkgNode
+   KLSComm <: PkgNode
+   KLSBranch <: PkgNode
+   KBranch <: PkgNode
+   Func <: PkgNode
+   KChild <: PkgNode
+   StructField <: PkgNode
+   
+public defn map (f:PkgNode -> PkgNode, x:PkgNode) -> PkgNode :
+   defn fpc (x:PChild) : f(x) as PChild
+   defn fpf (x:PField) : f(x) as PField
+   defn ft (x:Type) : f(x) as Type
+   defn flt (x:LSType) : f(x) as LSType
+   defn ft? (x:False|Type) : ft(x as Type) when x is Type
+   defn flt? (x:False|LSType) : flt(x as LSType) when x is LSType
+   defn fkc (x:KComm) : f(x) as KComm
+   defn fkt (x:KType) : f(x) as KType
+   defn fkt? (x:False|KType) : fkt(x as KType) when x is KType
+   defn fklt (x:KLSType) : f(x) as KLSType
+   defn fklt? (x:False|KLSType) : fklt(x as KLSType) when x is KLSType
+   defn fkl (x:KLoc) : f(x) as KLoc
+   defn fke (x:KExp) : f(x) as KExp
+   defn fkle (x:KLSExp) : f(x) as KLSExp
+   defn fklc (x:KLSComm) : f(x) as KLSComm
+   defn fklb (x:KLSBranch) : f(x) as KLSBranch
+   defn fkb (x:KBranch) : f(x) as KBranch
+   defn ff (x:Func) : f(x) as Func
+   defn fkc (x:KChild) : f(x) as KChild
+   defn fkf (x:StructField) : f(x) as StructField
+   defn fkf? (x:False|StructField) : fkf(x as StructField) when x is StructField
+   
+   match(x) :
+      ;PkgComm
+      (x:DefInfo) : x
+      (x:DefVal) : DefVal(n(x), ft?(type(x)), flt?(ls-type(x)))
+      (x:DefType) : DefType(n(x), args(x), ft?(parent(x)), map(fpc,children(x)))
+      (x:DefLSType) : DefLSType(n(x), args(x), ft?(parent(x)), map(fpf,fields(x)))
+      (x:PChild) : PChild(n(x), args(x), ft(parent(x)))
+      (x:PField) : PField(n(x), name(x), flt(type(x)))
+      ;Types
+      (x:Type) : map(ft, x)
+      (x:LSType) : map(flt, map(ft, x))
+      ;KComms
+      (x:KDefn) : KDefn(n(x), ff(value(x)))
+      (x:KDefmethod) : KDefmethod(n(x), multi(x), targs(x), thisn(x), ff(func(x)) as KFn)
+      (x:KDefType) : KDefType(n(x), fkt?(parent(x)), map(fkc,children(x)))
+      (x:KLSDefType) : KLSDefType(n(x), fkt?(parent(x)), map(fkf,fields(x)), fkf?(rfield(x)))
+      (x:KComm) : map(fke, map(fklc, map(fkle, map(fkt, map(fklt, x)))))
+      ;KTypes
+      (x:KType) : map(fkt, x)
+      (x:KLSType) : map(fkt, map(fklt, x))
+      ;KLocs
+      (x:KField) : KField(fkl(base(x)), n(x))
+      (x:KLoc) : map(fklt, map(fkle, x))
+      ;KExps
+      (x:KMatch) : KMatch(map(fke,args(x)), map(fkb,branches(x)), info(x), fkt?(type(x)))
+      (x:KDispatch) : KDispatch(map(fke,args(x)), map(fkb,branches(x)), info(x), fkt?(type(x)))
+      (x:KExp) : map(fkc, map(fke, map(fkt, x)))
+      ;KLSExps
+      (x:KLSPtr) : KLSPtr(fkl(exp(x)))
+      (x:KLSRead) : KLSRead(fkl(exp(x)))
+      (x:KLSMatch) : KLSMatch(map(fkle,args(x)), map(fklb,branches(x)), info(x))
+      (x:KLSDispatch) : KLSDispatch(map(fkle,args(x)), map(fklb,branches(x)), info(x))
+      (x:KLSExp) : map(fklc, map(fkle, map(fklt, map(fke, map(fkt, x)))))
+      ;KLSComms
+      (x:KLSSet) : KLSSet(fkl(exp(x)), fkle(value(x)))
+      (x:KLSComm) : map(fklc, map(fkle, map(fklt, x)))
+      ;K Branches
+      (x:KLSBranch) : map(fkt, map(fklc, x))
+      (x:KBranch) : map(fkt, map(fke, x))
+      ;Funcs
+      (x:KMultifn) : KMultifn(n(x), map(ff,funcs(x)) as List<KFn>, info(x))
+      (x:Func) : map(fke, map(fkt, x))
+      (x:KChild) : map(fkt, x)
+      (x:StructField) : map(fklt, x)
+
+public defn do (f: PkgNode -> ?, x:PkgNode) -> False :
+   defn fx (x:PkgNode) : (f(x), x)
+   map(fx, x)
+   false
+
+public defn map-id (defined:Int -> Int, used:Int -> Int, x:PkgNode) -> PkgNode :
+   defn def (x:Int) : defined(x)
+   defn def (x:List<Int>) : map(def, x)
+   defn def (x:False) : x
+   defn use (x:Int) : used(x)
+   defn use (x:List<Int>) : map(use, x)
+   defn use (x:False) : x
+   
+   match(x) : 
+      ;PkgComm
+      (x:DefInfo) : DefInfo(def(n(x)), name(x), package(x), visibility(x), category(x), info(x))
+      (x:DefVal) : DefVal(def(n(x)), type(x), ls-type(x))
+      (x:DefType) : DefType(def(n(x)), def(args(x)), parent(x), children(x))
+      (x:DefLSType) : DefLSType(def(n(x)), def(args(x)), parent(x), fields(x))
+      (x:PChild) : PChild(use(n(x)), def(args(x)), parent(x))
+      (x:PField) : PField(def(n(x)), name(x), type(x))
+      ;Type
+      (x:TPoly) : TPoly(def(targs(x)), def(cargs(x)), func(x))
+      (x:TCap) : TCap(use(n(x)))
+      (x:TOf) : TOf(use(n(x)), type(x))
+      (x:TVar) : TVar(use(n(x)))
+      ;LSType
+      (x:PolyT) : PolyT(def(targs(x)), def(cargs(x)), func(x))
+      (x:StructT) : StructT(use(n(x)), type(x))
+      ;KComm
+      (x:KDef) : KDef(def(n(x)), value(x))
+      (x:KDefVar) : KDefVar(def(n(x)), type(x), value(x))
+      (x:KDefn) : KDefn(def(n(x)), value(x))
+      (x:KDefmulti) : KDefmulti(def(n(x)), def(targs(x)), a1(x), a2(x), info(x))
+      (x:KDefmethod) : KDefmethod(def(n(x)), use(multi(x)), targs(x), def(thisn(x)), func(x))
+      (x:KDefType) : KDefType(def(n(x)), parent(x), children(x))
+      (x:KLSDef) : KLSDef(def(n(x)), type(x), value(x))
+      (x:KLSDefVar) : KLSDefVar(def(n(x)), type(x), value(x))
+      (x:KLSDefn) : KLSDefn(tail?(x), def(n(x)), def(targs(x)), a1(x), a2(x), def(args(x)), body(x), info(x))
+      (x:KLSExternFn) : KLSExternFn(def(n(x)), lbl(x), a1(x), a2(x), def(args(x)), body(x), info(x))
+      (x:KLSDefmethod) : KLSDefmethod(tail?(x), def(n(x)), use(multi(x)), multi-targs(x), def(targs(x)), a1(x), a2(x), def(args(x)), body(x), info(x))
+      (x:KLSDefType) : KLSDefType(def(n(x)), parent(x), fields(x), rfield(x))
+      (x:KExtern) : KExtern(def(n(x)), type(x), lbl(x))
+      ;KExp
+      (x:KSet) : KSet(use(n(x)), value(x), type(x))
+      (x:KVar) : KVar(use(n(x)), info(x), type(x))
+      (x:KCurry) : KCurry(use(n(x)), targs(x), a1(x), a2(x), info(x), type(x))
+      ;Func
+      (x:KFn) : KFn(def(n(x)), tail?(x), def(targs(x)), a1(x), a2(x), def(closure(x)), def(args(x)), body(x), info(x))
+      (x:KMultifn) : KMultifn(def(n(x)), funcs(x), info(x))
+      ;KComm
+      (x:KChild) : KChild(use(n(x)), parent(x))
+      (x:StructField) : StructField(def(n(x)), type(x))
+      ;KBranches
+      (x:KBranch) : KBranch(def(args(x)), types(x), body(x), info(x))
+      (x:KLSBranch) : KLSBranch(def(args(x)), types(x), body(x))
+      ;KLSComm
+      (x:KLSLabel) : KLSLabel(def(n(x)))
+      (x:KLSLabeledBlock) : KLSLabeledBlock(def(n(x)), def(args(x)), types(x), body(x))
+      (x:KLSGoto) : KLSGoto(use(n(x)), args(x))
+      (x:KLSDefLocal) : KLSDefLocal(def(n(x)), value(x))
+      (x:KLSDefLocalVar) : KLSDefLocalVar(def(n(x)), type(x), value(x))
+      ;KLSExp
+      (x:KLSVar) : KLSVar(use(n(x)))
+      (x:KLSRef) : KLSRef(use(n(x)), args(x), info(x))
+      (x:KLSRefArray) : KLSRefArray(use(n(x)), args(x), info(x))
+      (x:KLSStruct) : KLSStruct(use(n(x)), args(x))
+      (x:KLSTagof) : KLSTagof(use(n(x)))
+      (x:KLSCurry) : KLSCurry(use(n(x)), targs(x), a1(x), a2(x))
+      ;KLoc
+      (x:KField) : KField(base(x), use(n(x)))
+      ;KTypes
+      (x:KOf) : KOf(use(n(x)))
+      (x:KTVar) : KTVar(use(n(x)))
+      ;KLSTypes
+      (x:KStructT) : KStructT(use(n(x)))
+      ;Fall through
+      (x) : x
+
+public defn do-id (defined:Int -> ?, used:Int -> ?, x:PkgNode) -> False :
+   defn def (x:Int) : (defined(x), x)
+   defn use (x:Int) : (used(x), x)
+   map-id(def, use, x)
+   false
+
+public defn map-defined (f: Int -> Int, x:PkgNode) :
+   map-id(f, {_}, x)
+public defn map-used (f:Int -> Int, x:PkgNode) :
+   map-id({_}, f, x)
+public defn do-defined (f: Int -> ?, x:PkgNode) :
+   do-id(f, {false}, x)
+public defn do-used (f: Int -> ?, x:PkgNode) :
+   do-id({false}, f, x)
+
+public defn dor-defined (f: Int -> ?, x:PkgNode) -> False :
+   defn fnode (x:PkgNode) : dor-defined(f, x)
+   do-defined(f, x)
+   do(fnode, x)
+
+public defn dor-used (f: Int -> ?, x:PkgNode) -> False :
+   defn fnode (x:PkgNode) : dor-used(f, x)
+   do-used(f, x)
+   do(fnode, x)
+
+public defn mapr-id<?T> (defined: Int -> Int, used: Int -> Int, x:?T&PkgNode) -> T :
+   val x* = map-id(defined, used, x)
+   map(mapr-id{defined, used, _}, x*) as T&PkgNode
+
+public defn mapr-id (defined: Int -> Int, used: Int -> Int, pkg:Pkg) -> Pkg :
+   val comms* = map(mapr-id{defined, used, _}, comms(pkg))
+   val kcomms* = map(mapr-id{defined, used, _}, kcomms(pkg))
+   Pkg(name(pkg), timestamp(pkg), imports(pkg), comms*, kcomms*)
+
+public defn defined-ids (pkg:Pkg) :
+   unique $ generate<Int> :
+      for node in cat(comms(pkg), kcomms(pkg)) do :
+         dor-defined(yield, node)
+
+public defn used-ids (pkg:Pkg) :
+   unique $ generate<Int> :
+      for node in cat(comms(pkg), kcomms(pkg)) do :
+         dor-used(yield, node)
