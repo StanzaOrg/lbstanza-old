@@ -37,12 +37,13 @@
 #      -o bin/$1 \
 
 
-stanza core/reader.stanza \
+./stanza core/reader.stanza \
          core/macro-utils.stanza \
          compiler/stz-algorithms.stanza \
          compiler/stz-padder.stanza \
          compiler/stz-utils.stanza \
          compiler/stz-parser.stanza \
+         compiler/stz-serializer.stanza \
          compiler/stz-params.stanza \
          compiler/stz-core-macros.stanza \
          compiler/stz-ids.stanza \
@@ -79,5 +80,3 @@ stanza core/reader.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
       -o bin/$1 \
-
-
