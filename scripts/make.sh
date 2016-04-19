@@ -56,13 +56,10 @@ rm pkgs/*.pkg
 rm fast-pkgs/*.pkg
 
 #Compile OSX Executable
-$STANZA $FILES -pkg fast-pkgs -optimize -o stanza
+$STANZA $FILES -optimize -pkg fast-pkgs -o stanza
 
 #Compile Linux Executable
 $STANZA $FILES -optimize -s lstanza.s -platform linux
 
 #Compile Pkg Files
 $STANZA $FILES -pkg pkgs
-
-#Compile Fast Pkg Files
-$STANZA $FILES -pkg fast-pkgs -optimize
