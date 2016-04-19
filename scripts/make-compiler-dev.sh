@@ -7,6 +7,7 @@
          compiler/stz-padder.stanza \
          compiler/stz-utils.stanza \
          compiler/stz-parser.stanza \
+         compiler/stz-serializer.stanza \
          compiler/stz-params.stanza \
          compiler/stz-core-macros.stanza \
          compiler/stz-ids.stanza \
@@ -22,6 +23,7 @@
          compiler/stz-bb-ir.stanza \
          compiler/stz-asm-ir.stanza \
          compiler/stz-backend.stanza \
+         compiler/stz-pkg.stanza \
          compiler/stz-input.stanza \
          compiler/stz-namemap.stanza \
          compiler/stz-renamer.stanza \
@@ -41,9 +43,5 @@
          compiler/lang-resolver.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
-      -optimize \
-      -pkg fast-pkgs \
-
-#      -o bin/$1
-
-
+      -o bin/$1 \
+      -optimize
