@@ -42,6 +42,4 @@
          compiler/lang-resolver.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
-      -pkg fast-pkgs \
       -o bin/$1 \
-      -optimize
