@@ -8,28 +8,25 @@ defpackage reader :
 ;================== Public Interface ========================
 ;============================================================
 
-public defn read (eater:StringInputStream) :
-   init-lexer(eater)
-   eat-lexeme()
-   while (peek?(EATER) != false) and not empty?(SCOPES) :
-      eat-lexeme()
-   val form = head(lex-all(group-all()))
-   throw(LexerExceptions(ERRORS)) when not empty?(ERRORS)
-   form
+;public defn read (eater:StringInputStream) :
+;   val info = info(eater)
+;   init-lexer(eater)
+;   eat-lexeme()
+;   while (peek?(EATER) != false) and not empty?(SCOPES) :
+;      eat-lexeme()
+;   val forms = lex-all(group-all())
+;   throw(LexerExceptions(ERRORS)) when not empty?(ERRORS)
+;   throw(NoForm(info)) when empty?(forms)
+;   head(forms)
 
-public defn read-all (eater:StringInputStream) :
-   init-lexer(eater)
-   eat-all()
-   val form = lex-all(group-all())            
-   throw(LexerExceptions(ERRORS)) when not empty?(ERRORS)
-   form
+public defn read-all (s:StringInputStream) :
+   lex-all(group-all(tokenize(s)))
 
 public defn read-all (text:String) -> List :
    read-all(StringInputStream(text))
 
 public defn read-file (filename:String) -> List :
-   val eater = StringInputStream(slurp(filename), filename)
-   read-all(eater)
+   read-all(StringInputStream(slurp(filename), filename))
 
 ;============================================================
 ;================== Token Classes ===========================
@@ -56,27 +53,332 @@ defmethod print (o:OutputStream, t:PuncToken) :
    print-all(o, ["PUNC[" symbol(t) "]"])
 
 ;============================================================
+;================ Generator Refactor ========================
+;============================================================
+
+defn tokenize (s:StringInputStream) :
+   ;TODO: Use get-char! when sure.
+
+   ;Scope stack
+   val scopes = Vector<Symbol>()
+
+   ;Determine if character is operator character
+   defn operator-char? (c) :
+      if c == '>' :
+         empty?(scopes) or (peek(scopes) != `>)
+      else :
+         class?(c, OPERATOR-CHAR)      
+
+   ;Convert escape specifier to character
+   defn escape-char (c:Char) -> Char : ;TODO: Use a map instead
+      switch {c == _} :
+         't' : '\t'
+         'b' : '\b'
+         'r' : '\r'
+         'n' : '\n'
+         '\\' : c
+         '\"' : c
+         '\'' : c
+         '|' : c
+         else : throw(InvalidEscapeChar(info(s), c))
+
+   ;Eat paired characters
+   defn eat-escaped-chars () :
+      val buf = StringBuffer() ;TODO: Pull out stringbuffer
+      val end-char = peek?(s)
+      val end = loop(1) where :
+         defn* loop (i:Int) :  ;TODO: Directly consume characters instead of calculating index
+            val c1 = peek?(s, i)
+            val c2 = peek?(s, i + 1)
+            if c1 == false :
+               false
+            else if c1 == end-char :
+               i + 1
+            else if c1 == '\\' and c2 != false :
+               add(buf, escape-char(c2 as Char))
+               loop(i + 2)
+            else :
+               add(buf, c1 as Char)
+               loop(i + 1)
+      if end != false :
+         get-chars(s, end as Int)
+         to-string(buf)
+
+   ;Eat until end of line
+   defn eat-comment () -> True|False :
+      if peek?(s) == ';' :
+         while (peek?(s) != false and peek?(s) != '\n') :
+            get-char(s)
+         true   
+
+   ;Eat whitespace
+   defn eat-whitespace () :
+      while whitespace?(peek?(s)) :
+         get-char!(s)
+
+   ;Compute the ending index of a symbol
+   ;TODO: alpha? needs a better name
+   defn symbol-end (start:Int) -> False|Int :
+      defn* loop (a?:True|False, i:Int) :
+         if symbol-char?(peek?(s,i)) :
+            loop(a? or alpha?(peek?(s,i)), i + 1)    ;TODO: Simplify this function
+         else if a? :
+            i
+      loop(false, start)
+
+   ;Compute the ending index of a number
+   defn* number-end (i:Int) -> Int : ;TODO: Pull out map
+      val c = peek?(s,i)
+      if c == false or
+         c == '\n' or
+         c == ':' or
+         open-brace?(c) or
+         close-brace?(c) or
+         whitespace?(c) : i
+      else : number-end(i + 1)
+      
+   ;e.g. 'c'
+   defn* eat-char () :
+      val info = info(s)
+      if peek?(s) == '\'' :
+         match(eat-escaped-chars()) :
+            (s:String) : 
+               if length(s) == 1 : Token(s[0], info)
+               else : throw(InvalidCharString(info))
+            (s:False) : throw(UnclosedCharString(info))
+
+   ;e.g. "This is their\'s."
+   defn* eat-string () :
+      val info = info(s)
+      if peek?(s) == '\"' :
+         match(eat-escaped-chars()) :
+            (s:String) : Token(s, info)
+            (s:False) : throw(UnclosedString(info))
+
+   ;e.g. \|My house|
+   defn* eat-escaped-symbol () :
+      val info = info(s)
+      if peek?(s) == '\\' and peek?(s, 1) == '|' :
+         get-char(s)
+         match(eat-escaped-chars()) :
+            (s:String) : Token(to-symbol(s), info)
+            (s:False) : throw(UnclosedSymbol(info))
+
+   ;A symbol is a string of SYMBOL characters that contains at
+   ;least one alpha character. Some special symbols represent values.
+   ;e.g. my/identifier
+   defn* eat-symbol () :
+      match(symbol-end(0)) :
+         (len:Int) :
+            val info = info(s)
+            val str = get-chars(s, len)
+            switch {str == _} :
+               "true" : Token(true, info)
+               "false" : Token(false, info)
+               else : Token(to-symbol(str), info)
+         (len:False) :
+            false
+
+   ;An operator is a reluctant string of OPERATOR characters.
+   ;e.g. <:
+   defn eat-operator () :
+      val len = look-forward(0) where :
+         defn* look-forward (i:Int) :
+            if operator-char?(peek?(s,i)) : look-forward(i + 1)
+            else if alpha?(peek?(s,i)) : look-back(i - 1)
+            else : i
+         defn* look-back (i:Int) :
+            if symbol-char?(peek?(s,i)) : look-back(i - 1)
+            else : i + 1
+      if len > 0 :
+         val info = info(s)
+         Token(to-symbol(get-chars(s, len)), info)
+
+   ;Eat a starting indent (assumes beginning of line)
+   defn* eat-indent () :
+      val info = info(s)
+      val len = find!({peek?(s,_) != ' '}, 0 to false)
+      get-chars(s, len)
+      val indent = Token(Indentation(len), info)
+      if eat-comment() :
+         eat-indent()
+      else if peek?(s) == '\n' :
+         get-char(s)
+         eat-indent()
+      else :
+         indent
+
+   ;Eat a number
+   ;e.g. 103L
+   defn eat-number () :
+      if digit?(peek?(s,0)) or
+         (peek?(s) == '-' and digit?(peek?(s,1))) :      
+         val info = info(s)
+         val str = get-chars(s, number-end(0))            
+         defn number? (x) :
+            match(x) :
+               (x:False) : throw(InvalidNumber(info))
+               (x) : Token(x, info)
+         if contains?(str, '.') :
+            if suffix?(str, "f") or suffix?(str, "F") :
+               number?(to-float(but-last(str)))
+            else : number?(to-double(str))
+         else :
+            if suffix?(str, "y") or suffix?(str, "Y") :
+               number?(to-byte(but-last(str)))      
+            else if suffix?(str, "l") or suffix?(str, "L") :
+               number?(to-long(but-last(str)))
+            else : number?(to-int(str))
+
+   ;Eat a here string
+   ;e.g. \<STR>This is my String<STR>
+   defn eat-here-string () :
+      if peek?(s) == '\\' and peek?(s,1) == '<' :
+         val info = info(s)
+         get-char!(s)
+         val tag-len =
+            match(find({peek?(s,_) == '>'}, 0 to length(s))) :
+               (i:Int) : i + 1
+               (n:False) : throw(InvalidTag(info))
+         defn tag? (i:Int) :                          ;TODO: Use string:index-of instead
+            for j in 0 to tag-len all? :
+               peek?(s, i + j) == peek?(s, j)
+         val str-len =
+            match(find(tag?, tag-len to length(s))) :
+               (i:Int) : i - tag-len
+               (n:False) : throw(NoEndTagFound(info))
+         get-chars(s, tag-len)
+         val str = get-chars(s, str-len)
+         get-chars(s, tag-len)      
+         Token(str, info)
+
+   ;e.g. [
+   defn eat-structural-token () :
+      val info = info(s)
+      if open-brace?(peek?(s)) :
+         Token(OpenToken(to-symbol(get-char!(s))), info)
+      else if close-brace?(peek?(s)) :
+         Token(CloseToken(to-symbol(get-char!(s))), info)
+      else if punc?(peek?(s)) :
+         Token(PuncToken(to-symbol(get-char!(s))), info)
+
+   ;e.g. (
+   defn eat-star-token () :
+      val info = info(s)
+      if open-brace?(peek?(s)) :
+         Token(OpenToken(symbol-join(["*" get-char!(s)])), info)
+
+   ;e.g. ?x
+   defn eat-capture () :   
+      if (peek?(s) == '?') :
+         match(symbol-end(1)) :
+            (end:Int) :
+               val pinfo = info(s)
+               Token(PuncToken(to-symbol(get-char!(s))), pinfo)
+               val info = info(s)
+               Token(to-symbol(get-chars(s, end - 1)), info)
+            (end:False) :
+               false
+
+   ;Update the scope stack
+   defn update-stack (info:FileInfo, c:Symbol) :
+      defn pop-stack () :
+         if empty?(scopes) :
+            throw(ExtraClosingToken(info, c))
+         else if peek(scopes) != c :
+            throw(WrongClosingToken(info, peek(scopes), c))
+         else :
+            pop(scopes)
+
+      switch {c == _} :
+         `\|<| : add(scopes, `\|>|)
+         `\|[| : add(scopes, `\|]|)
+         `\|{| : add(scopes, `\|}|)
+         `\|(| : add(scopes, `\|)|)
+         `\|*<| : add(scopes, `\|>|)
+         `\|*[| : add(scopes, `\|]|)
+         `\|*{| : add(scopes, `\|}|)
+         `\|*(| : add(scopes, `\|)|)
+         `\|>| : pop-stack()
+         `\|]| : pop-stack()
+         `\|}| : pop-stack()
+         `\|)| : pop-stack()
+         else : fatal("Invalid stack symbol: %~" % [c])
+
+   generate<Token> :
+      defn eat? (f: () -> False|Token) :
+         match(f()) :
+            (t:Token) :
+               ;Yield out the token
+               yield(t)
+               ;Update the stack
+               match(item(t)) :
+                  (x:OpenToken) : update-stack(info(t), symbol(x)) ;TODO: Make use of this differentiation
+                  (x:CloseToken) : update-stack(info(t), symbol(x))
+                  (x) : false
+               ;Eat a star token if necessary
+               val star? = match(item(t)) :
+                  (x:CloseToken) : true
+                  (x:Byte|Char|Int|Long|Float|Double|True|False|String) : true
+                  (x:Symbol) : any?(alpha?, to-string(x)) ;TODO: This seems redundant
+                  (x) : false
+               eat?(eat-star-token) when star? ;TODO: A bit messy: Shouldn't be recursing on eat?
+               ;Return true if we successfully ate something
+               true
+            (t:False) :
+               false
+               
+      defn eat-lexeme! () :
+         val eaten =
+            eat?(eat-capture) or
+            eat?(eat-here-string) or
+            eat?(eat-escaped-symbol) or
+            eat?(eat-char) or
+            eat?(eat-string) or
+            eat?(eat-number) or
+            eat?(eat-symbol) or
+            eat?(eat-operator) or
+            eat?(eat-structural-token)
+         throw(InvalidToken(info(s))) when not eaten
+         
+      defn* eat-lexeme () :
+         eat-whitespace()
+         if peek?(s) is-not False :
+            if eat-comment() :
+               eat-lexeme()
+            else if peek?(s) == '\n' :
+               get-char!(s)
+               eat-indent()
+            else :
+               eat-lexeme!()
+
+      while peek?(s) is-not False : ;TODO: Have eat-lexeme return true or false for loop
+         eat-lexeme()
+
+;============================================================
 ;================== Lexer State =============================
 ;============================================================
 
 ;TODO: Use Coroutine to generate LEXEMES?
-var LEXEMES: Vector<Token>
-var SCOPES: Vector<Symbol>
-var ERRORS: Vector<LexerException>
-var EATER: StringInputStream
-var STAR?: True|False
-
-defn init-lexer (eater:StringInputStream) :
-   EATER = eater
-   LEXEMES = Vector<Token>()
-   SCOPES = Vector<Symbol>()
-   ERRORS = Vector<LexerException>()
-   STAR? = false
+;var LEXEMES: Vector<Token>
+;var SCOPES: Vector<Symbol>
+;var ERRORS: Vector<LexerException>
+;var EATER: StringInputStream
+;var STAR?: True|False
+;
+;defn init-lexer (eater:StringInputStream) :
+;   EATER = eater
+;   LEXEMES = Vector<Token>()
+;   SCOPES = Vector<Symbol>()
+;   ERRORS = Vector<LexerException>()
+;   STAR? = false
 
 ;============================================================
 ;================= Character Classes ========================
 ;============================================================
 
+;TODO: Use the existing BitArray to do this.
+;      Or implement a new CharMap
 val CHAR-CLASSES = CharArray(256, to-char(0))
 defn class? (c, bit:Int) -> True|False :
    match(c) :
@@ -153,11 +455,7 @@ defn number-char? (c) :
 defn symbol-char? (c) :
    class?(c, SYMBOL-CHAR)
 
-defn operator-char? (c) :
-   if c == '>' :
-      empty?(SCOPES) or (peek(SCOPES) != `>)
-   else :
-      class?(c, OPERATOR-CHAR)
+
 
 ;============================================================
 ;================== Utilities ===============================
@@ -165,296 +463,22 @@ defn operator-char? (c) :
 
 defn get-char! (s:InputStream) : get-char(s) as Char
 
+defn but-last (str:String) :
+   str[0 to (length(str) - 1)]
+
 ;============================================================
 ;================= Eating Functions =========================
 ;============================================================
 
-;Update the brace scope stack.
-;Throws an error if improperly matched.
-defn update-stack (info:FileInfo, c:Symbol) :
-   defn pop-stack () :
-      if empty?(SCOPES) :
-         throw(ExtraClosingToken(info, c))
-      else if peek(SCOPES) != c :
-         throw(WrongClosingToken(info, peek(SCOPES), c))
-      else :
-         pop(SCOPES)
-
-   switch {c == _} :
-      `\|<| : add(SCOPES, `\|>|)
-      `\|[| : add(SCOPES, `\|]|)
-      `\|{| : add(SCOPES, `\|}|)
-      `\|(| : add(SCOPES, `\|)|)
-      `\|*<| : add(SCOPES, `\|>|)
-      `\|*[| : add(SCOPES, `\|]|)
-      `\|*{| : add(SCOPES, `\|}|)
-      `\|*(| : add(SCOPES, `\|)|)
-      `\|>| : pop-stack()
-      `\|]| : pop-stack()
-      `\|}| : pop-stack()
-      `\|)| : pop-stack()
-      else : fatal("Invalid stack symbol: %~" % [c])
-
-;Update the lexer state with the most recently eaten token
-;Adds it to the lexeme buffer, and updates the scope stack and star? status.
-defn token-eaten (t:Token) :
-   ;Update Lexemes
-   add(LEXEMES, t)
-   
-   ;Update the stack
-   match(item(t)) :
-      (x:OpenToken) : update-stack(info(t), symbol(x))
-      (x:CloseToken) : update-stack(info(t), symbol(x))
-      (x) : false
-
-   ;Update STAR?
-   STAR? = 
-      match(item(t)) :
-         (x:CloseToken) : true
-         (x:Byte|Char|Int|Long|Float|Double|True|False|String) : true
-         (x:Symbol) : any?(alpha?, to-string(x))         
-         (x) : false
-
-   ;Returns true, so that it may be used as return expression
-   ;in predicates.
-   true
-
-;Eat n characters from the input stream
-;Returns the eaten characters
-defn eat (s:StringInputStream, n:Int) :
-   String(repeatedly(get-char!{s}, n))
-
-defn escape-char (c:Char) -> Char :
-   switch {c == _} :
-      't' : '\t'
-      'b' : '\b'
-      'r' : '\r'
-      'n' : '\n'
-      '\\' : c
-      '"' : c
-      '\'' : c
-      '|' : c
-      else : throw(InvalidEscapeChar(info(EATER), c))
-
-defn eat-escaped-chars () :
-   val buf = StringBuffer()
-   val end-char = peek?(EATER)
-   val end = loop(1) where :
-      defn* loop (i:Int) :
-         val c1 = peek?(EATER, i)
-         val c2 = peek?(EATER, i + 1)
-         if c1 == false :
-            false
-         else if c1 == end-char :
-            i + 1
-         else if c1 == '\\' and c2 != false :
-            add(buf, escape-char(c2 as Char))
-            loop(i + 2)
-         else :
-            add(buf, c1 as Char)
-            loop(i + 1)
-   if end != false :
-      eat(EATER, end as Int)
-      to-string(buf)
-
-defn eat-comment () -> True|False :
-   if peek?(EATER) == ';' :
-      while (peek?(EATER) != false and peek?(EATER) != '\n') :
-         get-char(EATER)
-      true   
-
-defn eat-string () :
-   val info = info(EATER)
-   if peek?(EATER) == '"' :
-      match(eat-escaped-chars()) :
-         (s:String) : token-eaten(Token(s, info))
-         (s:False) : throw(UnclosedString(info))
-
-defn eat-char () :
-   val info = info(EATER)
-   if peek?(EATER) == '\'' :
-      match(eat-escaped-chars()) :
-         (s:String) :
-            if length(s) == 1 : token-eaten(Token(s[0], info))
-            else : throw(InvalidCharString(info))
-         (s:False) : throw(UnclosedCharString(info))
-
-defn eat-escaped-symbol () :
-   val info = info(EATER)
-   if peek?(EATER) == '\\' and peek?(EATER, 1) == '|' :
-      get-char(EATER)
-      match(eat-escaped-chars()) :
-         (s:String) : token-eaten(Token(to-symbol(s), info))
-         (s:False) : throw(UnclosedSymbol(info))
-
-;A symbol is a string of SYMBOL characters that contains at
-;least one alpha character.
-defn eat-symbol () :
-   match(symbol-end(0)) :
-      (len:Int) :
-         val info = info(EATER)
-         val str = eat(EATER, len)
-         switch {str == _} :
-            "true" : token-eaten(Token(true, info))
-            "false" : token-eaten(Token(false, info))
-            else : token-eaten(Token(to-symbol(str), info))
-      (len:False) :
-         false
-
-defn symbol-end (start:Int) -> False|Int :
-   defn length (a?:True|False, i:Int) :
-      if symbol-char?(peek?(EATER,i)) :
-         length(a? or alpha?(peek?(EATER,i)), i + 1)
-      else if a? :
-         i
-   length(false, start)      
-
-;An operator is a reluctant string of OPERATOR characters.
-defn eat-operator () :
-   val len = look-forward(0) where :
-      defn* look-forward (i:Int) :
-         if operator-char?(peek?(EATER,i)) : look-forward(i + 1)
-         else if alpha?(peek?(EATER,i)) : look-back(i - 1)
-         else : i
-      defn* look-back (i:Int) :
-         if symbol-char?(peek?(EATER,i)) : look-back(i - 1)
-         else : i + 1
-   if len > 0 :
-      val info = info(EATER)
-      token-eaten(Token(to-symbol(eat(EATER, len)), info))
-
-defn* eat-indent () :
-   val info = info(EATER)
-   val len = find!({peek?(EATER,_) != ' '}, 0 to false)
-   eat(EATER, len)
-   val indent = Token(Indentation(len), info)
-   if eat-comment() :
-      eat-indent()
-   else if peek?(EATER) == '\n' :
-      get-char(EATER)
-      eat-indent()
-   else :
-      token-eaten(indent)
-
-defn* number-end (i:Int) -> Int :
-   val c = peek?(EATER,i)
-   if c == false or
-      c == '\n' or
-      c == ':' or
-      open-brace?(c) or
-      close-brace?(c) or
-      whitespace?(c) : i
-   else : number-end(i + 1)   
-
-defn eat-number () :
-   if digit?(peek?(EATER,0)) or
-      (peek?(EATER) == '-' and digit?(peek?(EATER,1))) :      
-      val info = info(EATER)
-      val str = eat(EATER, number-end(0))
-      parse-number(str, info)
-
-defn parse-number (str:String, info:FileInfo) :
-   defn try-parse (x) :
-      if x == false : throw(InvalidNumber(info))
-      else : token-eaten(Token(x, info))
-   defn but-last (str:String) :
-      str[0 to (length(str) - 1)]
-   if contains?(str, '.') :
-      if suffix?(str, "f") or suffix?(str, "F") :
-         try-parse(to-float(but-last(str)))
-      else : try-parse(to-double(str))
-   else :
-      if suffix?(str, "y") or suffix?(str, "Y") :
-         try-parse(to-byte(but-last(str)))      
-      else if suffix?(str, "l") or suffix?(str, "L") :
-         try-parse(to-long(but-last(str)))
-      else : try-parse(to-int(str))
-
-defn eat-here-string () :
-   if peek?(EATER) == '\\' and peek?(EATER,1) == '<' :
-      val info = info(EATER)      
-      get-char(EATER)
-      val tag-len =
-         match(find({peek?(EATER,_) == '>'}, 0 to length(EATER))) :
-            (i:Int) : i + 1
-            (n:False) : throw(InvalidTag(info))
-      defn tag? (i:Int) :
-         for j in 0 to tag-len all? :
-            peek?(EATER, i + j) == peek?(EATER, j)
-      val str-len =
-         match(find(tag?, tag-len to length(EATER))) :
-            (i:Int) : i - tag-len
-            (n:False) : throw(NoEndTagFound(info))
-      eat(EATER, tag-len)
-      val str = eat(EATER, str-len)
-      eat(EATER, tag-len)      
-      token-eaten(Token(str, info))
-
-defn eat-structural-token () :
-   val info = info(EATER)
-   if open-brace?(peek?(EATER)) :
-      token-eaten(Token(OpenToken(to-symbol(get-char!(EATER))), info))
-   else if close-brace?(peek?(EATER)) :
-      token-eaten(Token(CloseToken(to-symbol(get-char!(EATER))), info))
-   else if punc?(peek?(EATER)) :
-      token-eaten(Token(PuncToken(to-symbol(get-char!(EATER))), info))
-
-defn eat-star-token () :
-   val info = info(EATER)
-   if open-brace?(peek?(EATER)) :
-      token-eaten(Token(OpenToken(symbol-join(["*" get-char!(EATER)])), info))
-
-defn eat-capture () :   
-   if (peek?(EATER) == '?') :
-      match(symbol-end(1)) :
-         (end:Int) :
-            val pinfo = info(EATER)
-            token-eaten(Token(PuncToken(to-symbol(get-char!(EATER))), pinfo))            
-            val info = info(EATER)
-            token-eaten(Token(to-symbol(eat(EATER, end - 1)), info))            
-         (end:False) :
-            false
-
-defn eat-lexeme! () :
-   val ate? =
-      eat-capture() or
-      eat-here-string() or
-      eat-escaped-symbol() or
-      eat-char() or
-      eat-string() or
-      eat-number() or
-      eat-symbol() or
-      eat-operator() or
-      eat-structural-token()
-   if ate? :
-      eat-star-token() when STAR?
-   else : throw(InvalidToken(info(EATER)))
-
-defn eat-whitespace () :
-   if whitespace?(peek?(EATER)) :
-      while whitespace?(peek?(EATER)) :
-         get-char!(EATER)
-      STAR? = false      
+ 
       
-defn eat-lexeme () :
-   eat-whitespace()
-   if peek?(EATER) != false :
-      if eat-comment() :
-         eat-lexeme()
-      else if peek?(EATER) == '\n' :
-         get-char!(EATER)
-         eat-indent()
-      else :
-         eat-lexeme!()
 
-defn eat-all () :
-   while peek?(EATER) != false :
-      eat-lexeme()
       
 ;============================================================
 ;===================== Grouping =============================
 ;============================================================
 
+;TODO: Get rid of the need for these. Change them to characters
 val OPEN-PAREN = `\|(|
 val STAR-PAREN = `\|*(|
 val CLOSE-PAREN = `\|)| 
@@ -480,63 +504,58 @@ defn matching-end (s:Symbol) :
    else if s == STAR-ANGLE : CLOSE-ANGLE
    else : fatal("No matching end")
 
-var START-INFO = false
-var TOKEN-STREAM : Vector<Token>
-defn group-all () -> List<Token> :
-   TOKEN-STREAM = Vector<Token>(length(LEXEMES))
-   while not empty?(LEXEMES) :
-      add(TOKEN-STREAM, pop(LEXEMES))
-   group-rest(false)
-
-defn group-rest (end) -> List<Token> :
-   if empty?(TOKEN-STREAM) :
-      match(end) :
-         (end:Symbol) :
-            throw(NoClosingToken(START-INFO as FileInfo, end))
-         (end) :
-            List()
-   else :
-      val x = peek(TOKEN-STREAM)
-      match(item(x)) :
-         (t:CloseToken) :
-            match(end) :
-               (end:Symbol) :
-                  pop(TOKEN-STREAM)
-                  List()
-               (end:Indentation) :
-                  List()
-         (t:OpenToken) :
-            pop(TOKEN-STREAM)
-            val g = let-var START-INFO = info(x) :
-               group-rest(matching-end(symbol(t)))
-            val h = Token(cons(x, g), info(x))   
-            cons(h, group-rest(end))
-         (t:PuncToken) :
-            pop(TOKEN-STREAM)
-            cons(x, group-rest(end))
-         (s:Symbol) :
-            pop(TOKEN-STREAM)
-            if s == COLON :
-               match(item(peek(TOKEN-STREAM))) :
-                  (i:Indentation) :
-                     val y = pop(TOKEN-STREAM)
-                     val g = group-rest(i)
-                     val h = Token(cons(y, g), info(y))
-                     cons(x, h, group-rest(end))
-                  (t) :
-                     cons(x, group-rest(end))
-            else :
-               cons(x, group-rest(end))
-         (i:Indentation) :
-            if (end is Indentation) and
-               (indent(i) < indent(end as Indentation)) :
+var START-INFO:False|FileInfo = false ;TODO: Move inwards
+defn group-all (s:Seq<Token>) -> List<Token> :
+   defn loop (end) -> List<Token> :
+      if empty?(s) :
+         match(end) :
+            (end:Symbol) :
+               throw(NoClosingToken(START-INFO as FileInfo, end))
+            (end) :
                List()
-            else :
-               pop(TOKEN-STREAM)
-               group-rest(end)
-         (t) :
-            pop(TOKEN-STREAM)
-            cons(x, group-rest(end))
+      else :
+         val x = peek(s)
+         match(item(x)) :
+            (t:CloseToken) :
+               match(end) :
+                  (end:Symbol) :
+                     next(s)
+                     List()
+                  (end:Indentation) :
+                     List()
+            (t:OpenToken) :
+               next(s)
+               val g = let-var START-INFO = info(x) :
+                  loop(matching-end(symbol(t)))
+               val h = Token(cons(x, g), info(x))   
+               cons(h, loop(end))
+            (t:PuncToken) :
+               next(s)
+               cons(x, loop(end))
+            (t:Symbol) :
+               next(s)
+               if t == COLON :
+                  match(item(peek(s))) :
+                     (i:Indentation) :
+                        val y = next(s)
+                        val g = loop(i)
+                        val h = Token(cons(y, g), info(y))
+                        cons(x, h, loop(end))
+                     (t) :
+                        cons(x, loop(end))
+               else :
+                  cons(x, loop(end))
+            (t:Indentation) :
+               if (end is Indentation) and
+                  (indent(t) < indent(end as Indentation)) :
+                  List()
+               else :
+                  next(s)
+                  loop(end)
+            (t) :
+               next(s)
+               cons(x, loop(end))
+   loop(false)
 
 
 ;============================================================
@@ -563,6 +582,7 @@ defn startoken-pending? (xs:List) :
          (x:FullList) : opentoken?(head(x), [STAR-PAREN, STAR-BRACE, STAR-BRACKET, STAR-ANGLE])
          (x) : false
 
+;TODO: Fold this into the grouping algorithm
 defn lex-atom (x) -> ? :
    match(x) :
       (x:Token) :
@@ -657,3 +677,7 @@ defn InvalidTag (info:FileInfo) :
 defn NoEndTagFound (info:FileInfo) :
    LexerException $ string-join $
    [info ": No ending tag found for here string."]
+
+defn NoForm (info:FileInfo) :
+   LexerException $ string-join $
+   [info ": No forms left in stream."]
