@@ -1,5 +1,4 @@
-./bin/stanzadev \
-         core/core.stanza \
+./bin/stanzadev core/core.stanza \
          core/collections.stanza \
          core/reader.stanza \
          core/macro-utils.stanza \
@@ -44,5 +43,3 @@
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
       -o bin/$1 \
-      -optimize \
-      -flags BIG-HEAP
