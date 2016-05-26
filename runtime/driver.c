@@ -1,3 +1,6 @@
+#ifdef PLATFORM_WINDOWS
+  #include<Windows.h>
+#endif
 #include<stdlib.h>
 #include<stdio.h>
 #include<sys/time.h>
@@ -44,3 +47,33 @@ long current_time_ms (void) {
   gettimeofday(&tv, NULL);
   return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
+
+//     Path Resolution
+//     ===============
+#ifdef PLATFORM_WINDOWS
+  int file_exists (char* filename) {
+    int attrib = GetFileAttributes(filename);
+    return attrib != INVALID_FILE_ATTRIBUTES;
+  }
+
+  char* resolve_path (char* filename){
+    if(file_exists(filename)){
+      char* fileext;
+      char* path = (char*)malloc(2048);
+      int ret = GetFullPathName(filename, 2048, path, &fileext);
+      if(ret == 0){
+        free(path);
+        return 0;
+      }else{
+        return path;
+      }             
+    }
+    else{
+      return 0;
+    }
+  }
+#else
+  char* resolve_path (char* filename){
+    return realpath(filename, 0);
+  }
+#endif
