@@ -1,6 +1,7 @@
 #ifdef PLATFORM_WINDOWS
   #include<Windows.h>
 #endif
+#include<stdint.h>
 #include<stdlib.h>
 #include<stdio.h>
 #include<sys/time.h>
@@ -8,12 +9,12 @@
 
 //     Stanza Defined Entities
 //     =======================
-long stanza_entry (char* stack_mem);
-extern long stanza_stack_size;
+int64_t stanza_entry (char* stack_mem);
+extern int64_t stanza_stack_size;
 
 //     Command line arguments
 //     ======================
-long input_argc;
+int64_t input_argc;
 char** input_argv;
 
 //     Main Driver
@@ -36,13 +37,13 @@ int get_errno () {return errno;}
 
 //     Time of Day
 //     ===========
-long current_time_us (void) {
+int64_t current_time_us (void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
   return tv.tv_sec * 1000 * 1000 + tv.tv_usec;
 }
 
-long current_time_ms (void) {
+int64_t current_time_ms (void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
   return tv.tv_sec * 1000 + tv.tv_usec / 1000;
