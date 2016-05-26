@@ -54,15 +54,23 @@ FILES="core/core.stanza \
 #Delete pkg files
 rm pkgs/*.pkg
 rm fast-pkgs/*.pkg
+rm wpkgs/*.pkg
+rm wfast-pkgs/*.pkg
 
 #Compile OSX Executable
-$STANZA $FILES -optimize -o stanza -flags BIG-HEAP
+$STANZA $FILES -optimize -o stanza
 
 #Compile Linux Executable
-$STANZA $FILES -optimize -s lstanza.s -platform linux -flags BIG-HEAP
+$STANZA $FILES -optimize -s lstanza.s -platform linux
 
-#Compile Pkg Files
+#Compile Windows Executable
+$STANZA $FILES -optimize -s wstanza.s -platform windows
+
+#Compile Linux/OS-X Pkg Files
 $STANZA $FILES -pkg pkgs
-
-#Compile Fast Pkg Files
 $STANZA $FILES -optimize -pkg fast-pkgs
+
+Compile Windows Pkg Files
+$STANZA $FILES -pkg wpkgs -platform windows
+$STANZA $FILES -optimize -pkg wfast-pkgs -platform windows
+

@@ -74,6 +74,7 @@ int64_t current_time_ms (void) {
     }
   }
 #else
+  char* realpath(const char *path, char *resolved_path);
   char* resolve_path (char* filename){
     return realpath(filename, 0);
   }
