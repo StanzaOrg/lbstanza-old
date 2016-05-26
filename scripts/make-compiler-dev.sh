@@ -42,4 +42,6 @@
          compiler/lang-resolver.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
-      -o bin/$1 \
+      -s wstanza.s \
+      -platform windows \
+      -optimize \

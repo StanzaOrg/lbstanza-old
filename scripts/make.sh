@@ -70,7 +70,7 @@ $STANZA $FILES -optimize -s wstanza.s -platform windows
 $STANZA $FILES -pkg pkgs
 $STANZA $FILES -optimize -pkg fast-pkgs
 
-Compile Windows Pkg Files
+#Compile Windows Pkg Files
 $STANZA $FILES -pkg wpkgs -platform windows
 $STANZA $FILES -optimize -pkg wfast-pkgs -platform windows
 
