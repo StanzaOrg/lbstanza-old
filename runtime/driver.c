@@ -77,3 +77,22 @@ long current_time_ms (void) {
     return realpath(filename, 0);
   }
 #endif
+
+//     Environment Variable Setting
+//     ============================
+#ifdef PLATFORM_WINDOWS
+  int setenv (char* name, char* value, int overwrite) {
+    //If we don't want to overwrite previous value, then check whether it exists.
+    //If it does, then just return 0.
+    if(!overwrite){
+      if(getenv(name) == 0)
+        return 0;
+    }
+    //(Over)write the environment variable.
+    char* buffer = (char*)malloc(strlen(name) + strlen(value) + 10);
+    sprintf(buffer, "%s=%s", name, value);
+    _putenv(buffer);
+    free(buffer);
+    return 0;
+  }
+#endif
