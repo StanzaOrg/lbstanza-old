@@ -40,13 +40,13 @@ int get_errno () {return errno;}
 int64_t current_time_us (void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  return tv.tv_sec * 1000 * 1000 + tv.tv_usec;
+  return (int64_t)tv.tv_sec * 1000 * 1000 + (int64_t)tv.tv_usec;
 }
 
 int64_t current_time_ms (void) {
   struct timeval tv;
   gettimeofday(&tv, NULL);
-  return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
 }
 
 //     Path Resolution
