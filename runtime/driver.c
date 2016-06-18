@@ -14,7 +14,7 @@ extern int64_t stanza_stack_size;
 
 //     Command line arguments
 //     ======================
-int64_t input_argc;
+int input_argc;
 char** input_argv;
 
 //     Main Driver
