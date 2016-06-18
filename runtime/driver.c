@@ -2,6 +2,7 @@
   #include<Windows.h>
 #endif
 #include<stdint.h>
+#include<unistd.h>
 #include<stdlib.h>
 #include<stdio.h>
 #include<sys/time.h>
@@ -48,6 +49,37 @@ int64_t current_time_ms (void) {
   gettimeofday(&tv, NULL);
   return (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
 }
+
+//     Random Access Files
+//     ===================
+int64_t get_file_size (FILE* f) {
+  int64_t cur_pos = ftell(f);
+  fseek(f, 0, SEEK_END);
+  int64_t size = ftell(f);
+  fseek(f, cur_pos, SEEK_SET);
+  return size;
+}
+
+int file_seek (FILE* f, int64_t pos) {
+  return fseek(f, pos, SEEK_SET);
+}
+
+int file_skip (FILE* f, int64_t num) {
+  return fseek(f, num, SEEK_CUR);
+}
+
+int file_set_length (FILE* f, int64_t size) {
+  return ftruncate(fileno(f), size);
+}
+
+int64_t file_read_block (FILE* f, char* data, int64_t len) {
+  return fread(data, 1, len, f);
+}
+
+int64_t file_write_block (FILE* f, char* data, int64_t len) {
+  return fwrite(data, 1, len, f);
+}
+
 
 //     Path Resolution
 //     ===============

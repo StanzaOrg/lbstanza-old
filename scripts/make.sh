@@ -52,10 +52,14 @@ FILES="core/core.stanza \
        compiler/stz-main.stanza"
 
 #Delete pkg files
-rm pkgs/*.pkg
-rm fast-pkgs/*.pkg
-rm wpkgs/*.pkg
-rm wfast-pkgs/*.pkg
+rm -rf pkgs
+rm -rf fast-pkgs
+rm -rf wpkgs
+rm -rf wfast-pkgs
+mkdir -p pkgs
+mkdir -p fast-pkgs
+mkdir -p wpkgs
+mkdir -p wfast-pkgs
 
 #Compile OSX Executable
 $STANZA $FILES -optimize -o stanza
