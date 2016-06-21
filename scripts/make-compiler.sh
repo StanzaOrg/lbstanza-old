@@ -1,4 +1,19 @@
-./stanza core/core.stanza \
+if [ $# -eq 0 ]
+then
+    STANZA=./stanza
+    OUT=./bin/stanzadev
+elif [ $# -eq 1 ]
+then
+    STANZA=./stanza
+    OUT=$1
+elif [ $# -eq 2 ]
+then
+    STANZA=$1
+    OUT=$2
+fi
+
+mkdir -p bin
+$STANZA  core/core.stanza \
          core/collections.stanza \
          core/reader.stanza \
          core/macro-utils.stanza \
@@ -42,7 +57,4 @@
          compiler/lang-resolver.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
-      -pkg testpkg
-
-
-
+      -o $OUT
