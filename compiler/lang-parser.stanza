@@ -1,0 +1,207 @@
+defpackage parser-lang :
+   import core
+   import reader
+   import collections
+   import stz/core-macros
+   import macro-utils
+   import stz/parser2
+
+defsyntax parser :
+   defrule :
+      sym = (?x) when unwrap-token(x) is Symbol : unwrap-token(x)
+      
+      pat = (rule (?pat ...) : ?body:#exp) : Pattern(`rule, pat, None(), body)
+      pat = (rule (?pat ...) when ?guard:#exp : ?body:#exp) : Pattern(`rule, pat, One(guard), body)
+      pat = (fail-if (?pat ...) : ?body:#exp) : Pattern(`fail-if, pat, None(), body)
+      pat = (fail-if (?pat ...) when ?guard:#exp : ?body:#exp) : Pattern(`fail-if, pat, One(guard), body)
+
+      prod = (defproduction ?name:#sym : (?pats:#pat ... ?rest ...)) :
+         fatal("Expected pattern but got %_." % [rest]) when not empty?(rest)
+         DefProduction(name, pats)
+
+      prefix-op = (defsyntax ?name:#sym : (?prods:#prod ... ?rest ...)) :
+         fatal("Expected production but got %_." % [rest]) when not empty?(rest)
+         expande(compile(DefSyntax(name, prods)))
+
+   defrule :
+      match-prod = ((?pat ...) : ?body:#exp) : MatchPattern(pat, None(), body)
+      match-prod = ((?pat ...) when ?guard:#exp : ?body:#exp) : MatchPattern(pat, One(guard), body)
+      
+      prefix-op = (match-syntax(?arg:#exp) : (?ps:#match-prod ... ?rest ...)) :
+         fatal("Expected match production but got %_." % [rest]) when not empty?(rest)
+         expande(compile(MatchSyntax(ps)))
+
+   defrule :
+      prefix-op = (with-syntax(?names:#sym ...) : ?body:#exp) :
+         expande(compile-with-syntax(names, body))
+      prefix-op = (with-added-syntax(?names:#sym ...) : ?body:#exp) :
+         expande(compile-with-added-syntax(names, body))
+
+;============================================================
+;================ Compilation Utilities =====================
+;============================================================
+
+defn expande (x) :
+   with-syntax(core) :
+      match-syntax(x) :
+         (?x:#exp) : x
+
+defn compile-action (pat:List, body) :
+   val template = `(
+      fn (#bindings) :
+         bindings{
+            val x = lookup(#bindings, `x)()
+         }
+         body)
+   substitute(template, [
+      `#bindings => gensym(`bindings)
+      `bindings => repeated $ [
+         `x => get-bindings(parse-pattern(pat))]
+      `body => body])
+   
+defn compile-guard (pat:List, body) :
+   val template = `(
+      fn (#bindings) :
+         bindings{
+            val x = lookup(#bindings, `x)()
+         }
+         body)
+   substitute(template, [
+      `#bindings => gensym(`bindings)
+      `bindings => repeated $ [
+         `x => get-recomputable-bindings(parse-pattern(pat))]
+      `body => body])
+
+;============================================================
+;================== MatchSyntax Macro =======================
+;============================================================
+
+defstruct MatchSyntax :
+   patterns: List<MatchPattern>
+
+defstruct MatchPattern :
+   pattern: List
+   guard: Maybe
+   body
+
+val MATCH-SYNTAX-COUNTER = to-seq(0 to false)
+
+defn compile (m:MatchSyntax) :
+   ;Compile a matchpattern for executing action idx
+   defn cpl (p:MatchPattern, idx:Int) :
+      var form = substitute(`(parse-pattern(`pat)), [
+         `pat => pattern(p)])
+      if not empty?(guard(p)) :
+         form = substitute(`(Guard(guard, pat)), [
+            `guard => compile-guard(pattern(p), value!(guard(p)))
+            `pat => form])
+      substitute(`(IndexedAction(i, pat)), [
+         `i => idx
+         `pat => form])
+   ;Compile a list of matchpatterns      
+   defn cpl (ps:List<MatchPattern>) :
+      substitute(`(Choice{[pats]}), [
+         `pats => splice(map(cpl, ps, 0 to false))])
+   defn cpl (s:MatchSyntax) :
+      fill-template(`(syntax-match(id, pats, [actions])), [
+         `id => next(MATCH-SYNTAX-COUNTER)
+         `pats => cpl(patterns(s)),
+         `actions => splice $ for p in patterns(s) map :
+            compile-action(pattern(p), body(p))
+         `lookup => deep(`core/lookup)
+         `syntax-match => deep(`stz/parser2/syntax-match)
+         `Choice => deep(`stz/parser2/Choice)
+         `IndexedAction => deep(`stz/parser2/IndexedAction)
+         `Guard => deep(`stz/parser2/Guard)
+         `parse-pattern => deep(`stz/parser2/parse-pattern)])
+   ;Driver         
+   cpl(m)         
+
+;============================================================
+;================= WithSyntax Macro =========================
+;============================================================
+
+defn compile-with-syntax (names:List, body) :
+   fill-template(`(stz/parser2/call-with-syntax(`names, fn () : body)), [
+      `names => names
+      `body => body])
+
+defn compile-with-added-syntax (names:List, body) :
+   fill-template(`(stz/parser2/call-with-added-syntax(`names, fn () : body)), [
+      `names => names
+      `body => body])      
+
+;============================================================
+;================== DefSyntax Macro =========================
+;============================================================
+      
+
+defstruct DefSyntax :
+   name: Symbol
+   prods: List<DefProduction>
+defstruct DefProduction :
+   name: Symbol
+   patterns: List<Pattern>
+defstruct Pattern :
+   type: Symbol
+   pattern: List
+   guard: Maybe
+   body
+
+defn compile (s:DefSyntax) :
+   ;Compile a pattern
+   defn cpl (p:Pattern) :
+      var form = substitute(`(parse-pattern(`pat)), [
+         `pat => pattern(p)])
+      if not empty?(guard(p)) :
+         form = substitute(`(Guard(guard, pat)), [
+            `guard => compile-guard(pattern(p), value!(guard(p)))
+            `pat => form])
+      switch {type(p) == _} :
+         `fail-if :
+            form = substitute(`(FailPat(action, pat)), [
+               `action => compile-action(pattern(p), body(p))
+               `pat => form])
+         `rule :
+            form = substitute(`(Action(action, pat)), [
+               `action => compile-action(pattern(p), body(p))
+               `pat => form])
+      form
+   ;Compile a Production
+   defn cpl (p:DefProduction) :
+      substitute(`(DefProduction(`name, to-list([pats]))), [
+         `name => name(p)
+         `pats => splice(map(cpl, patterns(p)))])
+   ;Compile a Syntax Package
+   defn cpl (p:DefSyntax) :
+      fill-template(`(register-syntax-package(SyntaxPackage(`name, to-list([prods])))), [
+         `name => name(p)
+         `prods => splice(map(cpl, prods(p)))
+         `lookup => deep(`core/lookup)
+         `to-list => deep(`core/to-list)
+         `parse-pattern => deep(`stz/parser2/parse-pattern)
+         `Guard => deep(`stz/parser2/Guard)
+         `FailPat => deep(`stz/parser2/FailPat)
+         `Action => deep(`stz/parser2/Action)
+         `DefProduction => deep(`stz/parser2/DefProduction)
+         `SyntaxPackage => deep(`stz/parser2/SyntaxPackage)
+         `register-syntax-package => deep(`stz/parser2/register-syntax-package)])
+   ;Driver
+   cpl(s)
+
+;============================================================
+;====================== Test ================================
+;============================================================
+
+defn main () :
+   val filename = command-line-arguments()[1]
+   with-syntax(parser, core) :
+      match-syntax(read-file(filename)) :
+         (?es:#exp ...) :
+            for e in es do :
+               println(e)
+               println("\n")
+
+main()
+   
+         
