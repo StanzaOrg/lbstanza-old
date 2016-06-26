@@ -916,8 +916,12 @@ defn prepare-match-pattern (p:Pattern, pkgs:List<SyntaxPackage>) :
 ;====================== RuleSet =============================
 ;============================================================
 
-deftype RuleSet
+deftype RuleSet <: Collection<KeyValue<Symbol,Pattern>>
 defmulti get (r:RuleSet, name:Symbol) -> Pattern
+
+defstruct Suffix :
+   fail?: True|False
+   function: (() -> ?) -> ?
 
 defn RuleSet (pkgs:List<SyntaxPackage>) :
    ;Package qualify all the productions
@@ -1016,7 +1020,7 @@ defn RuleSet (pkgs:List<SyntaxPackage>) :
                   val pat = remove-left-recursive-terminal(pattern(p))
                   val binders = left-recursion-binders(pattern(p))
                   val callback = fn (context:Context) :
-                     fn* (seed) :
+                     Suffix{false, _} $ fn* (seed) :
                         do({context[_] = seed}, binders)
                         val f = action(p) as Context -> ?
                         f(context)
@@ -1027,7 +1031,7 @@ defn RuleSet (pkgs:List<SyntaxPackage>) :
                   val pat = remove-left-recursive-terminal(pattern(p))
                   val binders = left-recursion-binders(pattern(p))
                   val callback = fn (context:Context) :
-                     fn* (seed) :
+                     Suffix{true, _} $ fn* (seed) :
                         do({context[_] = seed}, binders)
                         val f = action(p) as Context -> Void
                         f(context)
@@ -1049,12 +1053,13 @@ defn RuleSet (pkgs:List<SyntaxPackage>) :
          val ys = Binder(gensym(), Repeat(Production(suffix), List(), 0), 1)
          val pat = SeqPat(x, ys)
          val callback = fn (context:Context) :
-            defn* apply-suffix-ops (seed: () -> ?, fs: List<((() -> ?) -> ?)>) :
-               if empty?(fs) :
+            defn* apply-suffix-ops (seed: () -> ?, suffixes: List<Suffix>) :
+               if empty?(suffixes) :
                   seed()
                else :
-                  val [f, fs] = [head(fs), tail(fs)]
-                  apply-suffix-ops(f{seed}, fs)
+                  val [suffix, suffixes] = [head(suffixes), tail(suffixes)]
+                  if fail?(suffix) : function(suffix)(seed)
+                  else : apply-suffix-ops(function(suffix){seed}, suffixes)                  
             apply-suffix-ops(context[0], context[1]())
          Action(callback, pat, 2)
 
@@ -1090,6 +1095,210 @@ defn RuleSet (pkgs:List<SyntaxPackage>) :
    ;Return new rule set
    new RuleSet :
       defmethod get (this, name:Symbol) : patterns[name]
+      defmethod to-seq (this) : to-seq(patterns)
+
+;============================================================
+;=================== Compiled Ruleset =======================
+;============================================================
+
+;type-alias CompiledPattern = (form:List, last-info:False|FileInfo, bind:(Int, () -> ?) -> ?) -> MResult|False
+
+deftype CompiledRuleSet
+defmulti get (rs:CompiledRuleSet, name:Symbol) -> (List, False|FileInfo, (Int, () -> ?) -> ?) -> MResult|False
+defmulti set (rs:CompiledRuleSet, name:Symbol, cr:(List, False|FileInfo, (Int, () -> ?) -> ?) -> MResult|False) -> False
+
+defn compile (ruleset:RuleSet) -> CompiledRuleSet :
+   ;Farthest info
+   defn farthest-info (last-info:False|FileInfo, form) :
+      defn loop (form) -> Maybe<FileInfo> :
+         match(form) :
+            (form:Token) :
+               val inf = loop(item(form))
+               if empty?(inf) : One(info(form))
+               else : inf
+            (form:List) :
+               first(loop, in-reverse(form))
+            (form) :
+               None()
+      match(loop(form)) :
+         (i:One<FileInfo>) : value(i)
+         (i:None) : last-info
+
+   ;No delayed callbacks in a ruleset
+   defn action (p:Action|FailPat) :
+      /action(p) as Context -> ?
+   defn predicate (g:Guard) :
+      /predicate(g) as Context -> True|False
+
+   ;Compiled Ruleset
+   val compiled-patterns = Vector<((List, False|FileInfo, (Int, () -> ?) -> ?) -> MResult|False)>()
+   val production-indices = HashTable<Symbol,Int>()
+   defn unpatched-pattern (form, last-info, bind) : fatal("Unpatched pattern.")
+   val compiled-ruleset = new CompiledRuleSet :
+      defmethod get (this, name:Symbol) -> (List, False|FileInfo, (Int, () -> ?) -> ?) -> MResult|False :
+         match(get?(production-indices, name, false)) :
+            (i:Int) :
+               compiled-patterns[i]
+            (_:False) :
+               val i = length(compiled-patterns)
+               production-indices[name] = i
+               add(compiled-patterns, unpatched-pattern)
+               fn* (form, last-info, bind) :
+                  compiled-patterns[i](form, last-info, bind)            
+      defmethod set (this, name:Symbol, cp:(List, False|FileInfo, (Int, () -> ?) -> ?) -> MResult|False) :
+         match(get?(production-indices, name, false)) :
+            (i:Int) :
+               compiled-patterns[i] = cp
+            (i:False) :
+               production-indices[name] = length(compiled-patterns)
+               add(compiled-patterns, cp)               
+
+   ;Compile a single pattern
+   defn cp (pat:Pattern) -> (List, False|FileInfo, (Int, () -> ?) -> ?) -> MResult|False :
+      match(pat) :
+         (pat:SeqPat) :
+            val ca = cp(a(pat))
+            val cb = cp(b(pat))
+            fn* (form, last-info, bind) :
+               match(ca(form, last-info, bind)) :
+                  (r1:MResult) :
+                     match(cb(tail(r1), info(r1), bind)) :
+                        (r2:MResult) :
+                           val h* = fn* () : append(head(r1)(), head(r2)())
+                           MResult(pat, h*, tail(r2), info(r2))
+                        (r2:False) :
+                           false
+                  (r1:False) :
+                     false
+         (pat:Choice) :
+            val ca = cp(a(pat))
+            val cb = cp(b(pat))
+            fn* (form, last-info, bind) :
+               match(ca(form, last-info, bind)) :
+                  (r1:MResult) : r1
+                  (r1:False) : cb(form, last-info, bind)
+         (pat:Empty) :
+            fn* (form, last-info, bind) :
+               MResult(pat, List, form, last-info)
+         (pat:Terminal) :
+            fn* (form, last-info, bind) :
+               if not empty?(form) :
+                  val h = head(form)
+                  if unwrap-token(h) == value(pat) :
+                     MResult(pat, List{h}, tail(form), farthest-info(last-info, h))               
+         (pat:Action) :
+            val ca = cp(pattern(pat))
+            fn* (form, last-info, bind) :
+               val bindings = BindingArray(num-binders(pat))
+               match(ca(form, last-info, setter(bindings))) :
+                  (r1:MResult) :
+                     defn head* () : List(action(pat)(Context(bindings, form, last-info)))
+                     MResult(pat, head*, tail(r1), info(r1))
+                  (r1:False) :
+                     false
+         (pat:FailPat) :
+            val ca = cp(pattern(pat))
+            fn* (form, last-info, bind) :     
+               val bindings = BindingArray(num-binders(pat))
+               match(ca(form, last-info, setter(bindings))) :
+                  (r1:MResult) : action(pat)(Context(bindings, form, last-info))
+                  (r1:False) : false
+         (pat:NoMatch) :
+            fn* (form, last-info, bind) :
+               false
+         (pat:NotPat) :
+            val ca = cp(pattern(pat))
+            fn* (form, last-info, bind) :       
+               match(ca(form, last-info, bind)) :
+                  (r1:MResult) : false
+                  (r1:False) : MResult(pat, List, form, last-info)
+         (pat:Form) :
+            fn* (form, last-info, bind) :         
+               if not empty?(form) :
+                  val h = head(form)
+                  MResult(pat, List{h}, tail(form), farthest-info(last-info, h))       
+         (pat:Production) :
+            compiled-ruleset[name(pat)]            
+         (pat:Repeat) :
+            val ca = cp(pattern(pat))
+            fn* (form, last-info, bind) :
+               ;Set up new binding list
+               val bindings = BindingArray<List<(() -> ?)>>(num-binders(pat), List())
+               val counts = BindingArray<Int>(num-binders(pat), 0)
+               defn add-bind (i:Int, v:() -> ?) :
+                  counts[i] = counts[i] + 1
+                  bindings[i] = cons(v, bindings[i])
+               defn call-all (fs:List<(() -> ?)>) :
+                  for f in reverse(fs) map :
+                     f()
+               defn bind-all (binders:List<Int>, n:Int) :
+                  for b in binders do :
+                     bind(b, call-all{tailn(bindings[b], counts[b] - n)})
+
+               ;Match as much as we can
+               defn loop (form:List, last-info:False|FileInfo, n:Int) -> MResult :
+                  val r1 = ca(form, last-info, add-bind) when not empty?(form)
+                  match(r1) :
+                     (r1:MResult) :
+                        val r2 = loop(tail(r1), info(r1), n + 1)
+                        defn h* () : append(head(r1)(), head(r2)())
+                        MResult(pat, h*, tail(r2), info(r2))
+                     (r1:False) :
+                        bind-all(binders(pat), n)
+                        MResult(pat, List, form, last-info)
+                        
+               ;Launch
+               loop(form, last-info, 0)
+         (pat:Rest) :
+            fn* (form, last-info, bind) :     
+               MResult(pat, {form}, List(), farthest-info(last-info, form))
+         (pat:ListPat) :      
+            val ca = cp(pattern(pat))
+            fn* (form, last-info, bind) :     
+               if not empty?(form) :
+                  val h = unwrap-token(head(form))
+                  if h is List :
+                     val list-info = match(head(form)) :
+                        (t:Token) : info(t)
+                        (t) : last-info                     
+                     match(ca(h, list-info, bind)) :
+                        (r1:MResult) :
+                           if empty?(tail(r1)) :
+                              MResult(pat, List{head(r1)()}, tail(form), info(r1))
+                        (r1:False) :
+                           false         
+         (pat:Binder) :
+            val ca = cp(pattern(pat))
+            fn* (form, last-info, bind) :
+               match(ca(form, last-info, bind)) :
+                  (r1:MResult) :
+                     val v =
+                        if single?(pattern(r1)) : head{head(r1)()}
+                        else : head(r1)
+                     bind(index(pat), v)
+                     r1
+                  (r1:False) :
+                     false
+         (pat:Guard) :
+            val ca = cp(pattern(pat))
+            fn* (form, last-info, bind) :            
+               ;Set up new binding list
+               val bindings = BindingArray(num-binders(pat))
+               defn bind-all (binders:List<Int>) :
+                  for b in binders do : bind(b, bindings[b])
+
+               match(ca(form, last-info, setter(bindings))) :
+                  (r1:MResult) :
+                     if predicate(pat)(Context(bindings, form, last-info)) :
+                        bind-all(binders(pat))
+                        r1
+                  (r1:False) :
+                     false
+
+   ;Compile all patterns
+   for entry in ruleset do :
+      compiled-ruleset[key(entry)] = cp(value(entry))
+   compiled-ruleset
 
 ;============================================================
 ;====================== Context =============================
