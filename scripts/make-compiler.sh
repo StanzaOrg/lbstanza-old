@@ -27,6 +27,7 @@ $STANZA  core/core.stanza \
          compiler/stz-padder.stanza \
          compiler/stz-utils.stanza \
          compiler/stz-serializer.stanza \
+         compiler/stz-parser.stanza \
          compiler/stz-params.stanza \
          compiler/stz-core-macros.stanza \
          compiler/stz-ids.stanza \
