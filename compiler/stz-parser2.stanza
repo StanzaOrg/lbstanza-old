@@ -2,6 +2,7 @@ defpackage stz/parser2 :
    import core
    import collections
    import macro-utils
+   import stz/algorithms
 
 ;============================================================
 ;==================== Parse Structure =======================
@@ -458,7 +459,7 @@ protected defn syntax-match<?T> (id:Int,
    val pkgs = package-list(cons(base, overlays))
    val base-pkg = SYNTAX-PACKAGES[base] when base != `empty
    val ruleset = RuleSet(pkgs)
-   val pattern = prepare-match-pattern(pat(), base-pkg)
+   val pattern = prepare-match-pattern(pat(), base-pkg, ruleset)
 
    ;If using compiler
    if true :
@@ -494,6 +495,9 @@ defn package-list (names:Collection<Symbol>) -> List<SyntaxPackage> :
          do(import, in-reverse(CURRENT-OVERLAYS))
       else if not included?[name] :
          included?[name] = true
+         if not key?(SYNTAX-PACKAGES, name) :
+            throw $ PatternException $
+            "Could not resolve syntax package %_." % [name]
          val p = SYNTAX-PACKAGES[name]
          val imported = unique(seq(package, imports(p)))
          do(import, imported)
@@ -1058,7 +1062,7 @@ defn prepare (p:Pattern) -> Pattern :
    val indexed = index-binders(p)
    identify-rests(indexed)
 
-defn prepare-match-pattern (p:Pattern, base:False|SyntaxPackage) :
+defn prepare-match-pattern (p:Pattern, base:False|SyntaxPackage, ruleset:RuleSet) :
    match(base) :
       (base:SyntaxPackage) :
          ;Resolve all public productions
@@ -1074,11 +1078,19 @@ defn prepare-match-pattern (p:Pattern, base:False|SyntaxPackage) :
          ;Package qualify the pattern
          defn qualify (p:Pattern) :
             match(p) :
-               (p:Production) : Production(prod-table[name(p)])
+               (p:Production) :
+                  if not key?(prod-table, name(p)) :
+                     throw $ PatternException $
+                     "Could not resolve production %_ in syntax package %_." % [
+                     name(p), name(base)]
+                  Production(prod-table[name(p)])
                (p) : map(qualify, p)
+         ;Ensure proper repetitions
+         ensure-no-nullable-repetitions(ruleset, p)
          ;Prepare and qualify
          qualify(prepare(p))
       (base:False) :
+         ensure-no-nullable-repetitions(ruleset, p)
          prepare(p)
 
 ;============================================================
@@ -1087,12 +1099,32 @@ defn prepare-match-pattern (p:Pattern, base:False|SyntaxPackage) :
 
 deftype RuleSet <: Collection<KeyValue<Symbol,Pattern>>
 defmulti get (r:RuleSet, name:Symbol) -> Pattern
+defmulti ensure-no-nullable-repetitions (r:RuleSet, p:Pattern) -> False
 
 defstruct Suffix :
    fail?: True|False
    function: (() -> ?) -> ?
 
 defn RuleSet (pkgs:List<SyntaxPackage>) :
+   ;Check resolution of imported productions
+   val public-productions = HashTable<[Symbol Symbol],True|False>()
+   for pkg in pkgs do :
+      for prod in productions(pkg) do :
+         val key = [name(pkg), name(prod)]
+         public-productions[key] = public?(prod)
+      for prod in seq-cat(names, imports(pkg)) do :
+         val key = [name(pkg), prod]
+         public-productions[key] = true
+   for pkg in pkgs do :
+      for import in imports(pkg) do :
+         for prod in names(import) do :
+            if not key?(public-productions, [name(pkg), prod]) :
+               throw $ PatternException $
+               "Cannot import production %_ from package %_. No such production." % [prod, name(pkg)]
+            else if not public-productions[[name(pkg), prod]] :
+               throw $ PatternException $
+               "Cannot import production %_ from package %_. Production is not public." % [prod, name(pkg)]
+
    ;Package qualify all the productions
    defn package-qualify (pkg:SyntaxPackage) :
       val qualified = HashTable<Symbol,Symbol>()
@@ -1129,6 +1161,21 @@ defn RuleSet (pkgs:List<SyntaxPackage>) :
             (p) : Choice(p, patterns[name(rule)])
    for entry in patterns do :
       patterns[key(entry)] = prepare(value(entry))
+
+   ;Check for circular inlining
+   defn ensure-no-circular-inlining () :
+      defn inlined (p:Pattern) -> List<Symbol> :
+         match(p) :
+            (p:Inlined) : List(name(p))
+            (p:Choice) : seq-append(inlined, children(p))
+            (p) : List()
+      val groups = strong-components $
+         for entry in patterns seq :
+            key(entry) => inlined(value(entry))
+      for group in groups do :
+         if group is List :
+            throw $ PatternException $
+            "Productions %, circularly inline each other." % [group]
 
    ;Inline productions
    defn inline-productions (table:HashTable<Symbol,Pattern>) :
@@ -1244,26 +1291,108 @@ defn RuleSet (pkgs:List<SyntaxPackage>) :
       for entry in current-entries do :
          val prod = key(entry)
          if left-recursive-production?(prod) :
-            val seed-prod = gensym()
-            val suffix-prod = gensym()
+            val seed-prod = gensym("%_ seed" % [prod])
+            val suffix-prod = gensym("%_ suffix" % [prod])
             table[seed-prod] = seed-subpattern(prod, value(entry))
             table[suffix-prod] = suffix-subpattern(prod, value(entry))
             table[prod] = iteration-pattern(seed-prod, suffix-prod)
+
+   ;Compute nullable productions
+   ;A nullable production is one that can succeed without consuming any input.
+   val nullable-table = HashTable<Symbol,True|False>()
+   defn nullable? (p:Pattern, nullable-production?:Symbol -> True|False) -> True|False :
+      defn loop (p:Pattern) :
+         match(p) :
+            (p:Production) : nullable-production?(name(p))
+            (p:SeqPat) : loop(a(p)) and loop(b(p))
+            (p:Choice) : loop(a(p)) or loop(b(p))
+            (p:Empty) : true
+            (p:Terminal) : false
+            (p:Action) : loop(pattern(p))
+            (p:FailPat) : false
+            (p:NoMatch) : false
+            (p:NotPat) : true
+            (p:Form) : false
+            (p:Repeat) : true
+            (p:Rest) : true
+            (p:ListPat) : false
+            (p:Binder) : loop(pattern(p))
+            (p:Guard) : loop(pattern(p))
+      loop(p)   
+   defn nullable? (p:Pattern) -> True|False :
+      nullable?(p, get?{nullable-table, _, false})
+   defn compute-nullables () :   
+      fixpoint $ fn (progress) :
+         for entry in patterns do :
+            if not key?(nullable-table, key(entry)) :
+               attempt :
+                  nullable-table[key(entry)] = nullable?{value(entry), _} $ fn (name) :
+                     if key?(nullable-table, name) : nullable-table[name]
+                     else : fail()
+                  progress()
+
+   ;Ensure no nullable repetition productions
+   defn ensure-no-nullable-repetitions (p:Pattern) :
+      match(p) :
+         (p:Repeat) :
+            if nullable?(pattern(p)) :
+               throw $ PatternException $
+               "Repetition pattern %_ contains nullable pattern." % [p]
+            else : ensure-no-nullable-repetitions(pattern(p))
+         (p) : do(ensure-no-nullable-repetitions, p)
+   defn ensure-no-nullable-repetitions () :      
+      do(ensure-no-nullable-repetitions, values(patterns))      
+
+   ;Ensure no left recursive productions
+   defn first-productions (p:Pattern) -> List<Symbol> :
+      match(p) :
+         (p:Production) : List(name(p))
+         (p:SeqPat) :
+            val fa = first-productions(a(p))
+            if nullable?(a(p)) : append(fa, first-productions(b(p)))
+            else : fa
+         (p:Choice) : append(first-productions(a(p)), first-productions(b(p)))
+         (p:Empty) : List()
+         (p:Terminal) : List()
+         (p:Action) : first-productions(pattern(p))
+         (p:FailPat) : first-productions(pattern(p))
+         (p:NoMatch) : List()
+         (p:NotPat) : first-productions(pattern(p))
+         (p:Form) : List()
+         (p:Repeat) : first-productions(pattern(p))
+         (p:Rest) : List()
+         (p:ListPat) : List()
+         (p:Binder) : first-productions(pattern(p))
+         (p:Guard) : first-productions(pattern(p))
+   defn ensure-no-left-recursion () :
+      val groups = strong-components $
+         for entry in patterns seq :
+            key(entry) => first-productions(value(entry))
+      for group in groups do :
+         if group is List :
+            throw $ PatternException $
+            "Productions %, are mutually left recursive." % [group]            
 
    ;DEBUG
    println("===== Created Ruleset =====")
    do(println, patterns)
    println("\n===== Inlined Productions =====")
+   ensure-no-circular-inlining()
    inline-productions(patterns)
    do(println, patterns)
    println("\n===== Removing Direct Left Recursion =====")
    remove-direct-left-recursion(patterns)
    do(println, patterns)
-
+   compute-nullables()
+   ensure-no-nullable-repetitions()
+   ensure-no-left-recursion()
+   
    ;Return new rule set
    new RuleSet :
       defmethod get (this, name:Symbol) : patterns[name]
       defmethod to-seq (this) : to-seq(patterns)
+      defmethod ensure-no-nullable-repetitions (this, p:Pattern) :
+         ensure-no-nullable-repetitions(p)
 
 ;============================================================
 ;=================== Compiled Ruleset =======================
