@@ -62,7 +62,6 @@ $STANZA  core/core.stanza \
          compiler/lang-resolver.stanza \
          compiler/lang-serializer.stanza \
          compiler/stz-main.stanza \
-      -optimize \
       -pkg-path no-pkgs \
       -o $OUT
 
