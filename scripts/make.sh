@@ -10,10 +10,10 @@ FILES="core/core.stanza \
        core/collections.stanza \
        core/reader.stanza \
        core/macro-utils.stanza \
+       core/parser.stanza \
        compiler/stz-algorithms.stanza \
        compiler/stz-padder.stanza \
        compiler/stz-utils.stanza \
-       compiler/stz-parser.stanza \
        compiler/stz-serializer.stanza \
        compiler/stz-params.stanza \
        compiler/stz-core-macros.stanza \
