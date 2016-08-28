@@ -4631,6 +4631,16 @@ defmulti subtype? (tt:TypeTable, a:KType, b:KType) -> True|False
 defmulti overlap? (tt:TypeTable, a:KType, b:KType) -> True|False
 defmulti tagged-types (tt:TypeTable) -> Seqable<KLSDefType>
 
+;     Type Statistics
+;     ---------------
+defstruct TypeStats :
+   padded: List<FieldStat>
+   alignment: Int
+   size: Int
+defstruct FieldStat :
+   type: KLSType
+   pad?: True|False
+   offset: Int   
 
 ;     Type Arithmetic
 ;     ---------------
@@ -4728,43 +4738,57 @@ defn TypeTable () :
    val lstypes = HashTable<Int, KLSDefType>()
    val types = HashTable<Int, KDefType>()
 
+   ;     Automatic Recursive Cached Function
+   ;     ===================================
+   defn cache<T,?R> (f: (T, (T -> R)) -> Either<?R,Int>, g: (Int, (T -> R)) -> ?R) :
+     val table = HashTable<Int,R>()
+     defn f* (x:T) :
+       match(f(x, f*)) :
+         (x:Left<R>) :
+           value(x)
+         (x:Right<Int>) :
+           if key?(table, value(x)) :
+             table[value(x)]
+           else :
+             val r = g(value(x), f*)
+             table[value(x)] = r
+             r
+     f*        
+
    ;     Compute Expansions
    ;     ------------------
-   val struct-expansions = HashTable<Int, List<TgtType>>()
-   defn expand (t:KLSType) :
-      defn expand-struct (n:Int) :
-         for f in fields(lstypes[n]) seq-append :
-            expand(type(f))
-      match(t) :
-         (t:KByteT) : List(TgtByteType())
-         (t:KIntT) : List(TgtIntType())
-         (t:KLongT) : List(TgtLongType())
-         (t:KFloatT) : List(TgtFloatType())
-         (t:KDoubleT) : List(TgtDoubleType())
-         (t:KPtrT) : List(TgtLongType())
-         (t:KRefT) : List(TgtRefType())
-         (t:KStructT) :
-            if not key?(struct-expansions, n(t)) :
-               struct-expansions[n(t)] = expand-struct(n(t))
-            struct-expansions[n(t)]
+   val expand = cache<KLSType>(
+     fn (t, expand) :
+       match(t) :
+         (t:KByteT) : Left(List(TgtByteType()))
+         (t:KIntT) : Left(List(TgtIntType()))
+         (t:KLongT) : Left(List(TgtLongType()))
+         (t:KFloatT) : Left(List(TgtFloatType()))
+         (t:KDoubleT) : Left(List(TgtDoubleType()))
+         (t:KPtrT) : Left(List(TgtLongType()))
+         (t:KRefT) : Left(List(TgtRefType()))
+         (t:KStructT) : Right(n(t))
          (t) : fatal("No expansion for %~." % [t])
+     fn (n, expand) :
+       for f in fields(lstypes[n]) seq-append :
+         expand(type(f)))
 
    ;     Compute Field Types and Indices
    ;     -------------------------------
    val field-structs = HashTable<Int,Int>()
-   val field-indices = HashTable<Int,Int>()
    val field-types = HashTable<Int,KLSType>()
+   val field-indices = HashTable<Int,Int>()
    defn compute-field-stats () :
-      for def in values(lstypes) do :
-         for (f in fields(def), i in 0 to false) do :
-            field-structs[n(f)] = n(def)
-            field-indices[n(f)] = i
-            field-types[n(f)] = type(f)
-         if rfield(def) is-not False :
-            val f = rfield(def) as StructField
-            field-structs[n(f)] = n(def)
-            field-indices[n(f)] = length(fields(def))
-            field-types[n(f)] = type(f)
+     for def in values(lstypes) do :
+       val fs = match(rfield(def)) :
+         (rf:StructField) : cat(fields(def), [rf])
+         (rf:False) : fields(def)           
+       var idx:Int = 0
+       for f in fs do :
+         field-structs[n(f)] = n(def)
+         field-types[n(f)] = type(f)
+         field-indices[n(f)] = idx
+         idx = idx + length(expand(type(f)))
 
    ;     Compute Struct Tags
    ;     -------------------
@@ -4773,14 +4797,12 @@ defn TypeTable () :
    defn compute-struct-tags () :
       defn assign-next-tag (n:Int) :
          if not key?(tag-table, n) :
-            if flag-defined?(`VERBOSE) :
-               println("Assigned tag %~ to %~" % [length(tag-types), n])
+            vprintln("Assigned tag %~ to %~" % [length(tag-types), n])
             tag-table[n] = length(tag-types)
             add(tag-types, n)
       assign-next-tag(FALSE-TYPE-ID)
       assign-next-tag(TRUE-TYPE-ID)
-      for def in values(lstypes) do :
-         assign-next-tag(n(def))
+      do(assign-next-tag{n(_)}, values(lstypes))
 
    ;     Compute All Subclasses
    ;     ----------------------
@@ -4820,6 +4842,8 @@ defn TypeTable () :
       for t in keys(types) do : add-child(t, t)
       for t in keys(lstypes) do : add-child(t, t)
 
+   ;    Compute dispatch and cast types
+   ;    -------------------------------
    defn dispatch-type (t:KType) -> KTags|KTop :
       match(t) :
          (t:KOf) : KTags(ls-subclasses(n(t)))
@@ -4891,83 +4915,87 @@ defn TypeTable () :
          ;5. Fall through
          (x, y) : false
 
-   ;     Compute Alignments, Padding, and Size
-   ;     -------------------------------------
-   val pad+expansions = HashTable<Int, List<TgtType>>()
-   val struct-alignments = HashTable<Int, Int>()
-   val type-sizes = HashTable<Int,Int>()
+   ;     Compute Type Statistics
+   ;     -----------------------
+   defn KIntegerType (size:Int) :
+     switch {size == _} :
+       1 : KByteT()
+       4 : KIntT()
+       8 : KLongT()
+      
    val field-offsets = HashTable<Int,Int>()
+   val type-stats = cache<KLSType>(
+     fn (t, type-stats) :
+       defn simple-stat (t:KLSType, sz:Int) :
+         val f = FieldStat(t, false, 0)
+         Left(TypeStats(List(f), sz, sz))
+       match(t) :
+         (t:KStructT) : Right(n(t))
+         (t:KByteT) : simple-stat(t, 1)
+         (t:KIntT) : simple-stat(t, 4)
+         (t:KLongT) : simple-stat(t, 8)
+         (t:KFloatT) : simple-stat(t, 4)
+         (t:KDoubleT) : simple-stat(t, 8)
+         (t:KPtrT) : simple-stat(t, 8)
+         (t:KRefT) : simple-stat(t, 8)
+         (t) : fatal("Unexpected type: %_" % [t])         
+     fn (sn, type-stats) :
+       val def = lstypes[sn]
+       
+       ;Align items
+       val [items, aln] = let :
+         val items = for f in fields(def) seq :
+           Item(alignment(type-stats(type(f))), n(f))
+         match(rfield(def)) :
+           (rf:StructField) : pad(items, alignment(type-stats(type(rf))))
+           (rf:False) : pad(items, 1)
+           
+       ;Compute Type Stats
+       var offset:Int = 0
+       val fs = for x in items map :
+         match(x) :
+           (x:Item) :
+             val f = data(x) as Int
+             val r = FieldStat(field-types[f], false, offset)
+             field-offsets[f] = offset
+             offset = offset + size(type-stats(field-types[f]))
+             r
+           (x:Padding) :
+             val r = FieldStat(KIntegerType(size(x)), true, offset)
+             offset = offset + size(x)
+             r
 
-   defn type-size (t:KLSType) :
-      match(t) :
-         (t:KByteT) : 1
-         (t:KIntT) : 4
-         (t:KLongT) : 8
-         (t:KFloatT) : 4
-         (t:KDoubleT) : 8
-         (t:KPtrT) : 8
-         (t:KRefT) : 8
-         (t:KUnknownT) : fatal("No size.")
-         (t:KFnT) : fatal("No size.")
-         (t:KStructT) :
-            compute-struct(n(t)) when not key?(type-sizes, n(t))
-            type-sizes[n(t)]
+       ;Offset of rest field
+       val rf = rfield(def)
+       match(rf:StructField) :
+         field-offsets[n(rf)] = offset
 
-   defn type-alignment (t:KLSType) :
-      match(t) :
-         (t:KStructT) :
-            compute-struct(n(t)) when not key?(struct-alignments, n(t))
-            struct-alignments[n(t)]
-         (t) : type-size(t)
+       ;Return type statistics
+       TypeStats(fs, aln, offset))
 
-   defn pad+expand (t:KLSType) :
-      match(t) :
-         (t:KStructT) :
-            compute-struct(n(t)) when not key?(pad+expansions, n(t))
-            pad+expansions[n(t)]
-         (t) : expand(t)
-
+   ;Retrieve field offset
    defn field-offset (f:Int) :
-      if not key?(field-offsets, f) :
-         compute-struct(field-structs[f])
-      field-offsets[f]
+     type-stats(KStructT(field-structs[f]))
+     field-offsets[f]
+     
+   ;Retrieve padded expansion
+   val pad+expand = cache<KLSType>(
+     fn (t, pad+expand) :
+       match(t:KStructT) : Right(n(t))
+       else : Left(expand(t))
+     fn (n, pad+expand) :
+         for s in padded(type-stats(KStructT(n))) seq-append :
+           pad+expand(type(s)))
 
-   defn compute-struct (sn:Int) :
-      ;Pad struct fields
-      val def = lstypes[sn]
-
-      ;Accumulated size and expansion
-      var accum = 0
-      val expansion = Vector<TgtType>()
-
-      ;Alignment items
-      val fields = match(rfield(def)) :
-         (rf:False) : fields(def)
-         (rf:StructField) : cat(fields(def), [rf])
-      val items = for f in fields seq :
-         Item(type-alignment(type(f)), n(f))
-      val [items*, aln] = pad(items, 1)
-      label<False> break :
-         for x in items* do :
-            match(x) :
-               (x:Item) :
-                  val f = data(x) as Int
-                  val ft = field-types[f]
-                  field-offsets[f] = accum
-                  if rfield(def) is StructField :
-                     break(false) when f == n(rfield(def) as StructField)
-                  do(add{expansion, _}, pad+expand(ft))
-                  accum = accum + type-size(ft)
-               (x:Padding) :
-                  val sz = size(x)
-                  add(expansion, IntegerType(sz))
-                  accum = accum + size(x)
-
-      ;Record Size, Expansion, and Alignment
-      type-sizes[sn] = accum
-      pad+expansions[sn] = to-list(expansion)
-      struct-alignments[sn] = aln
-
+   ;Retrieve all offsets
+   val offsets = cache<KLSType>(
+     fn (t, offsets) :
+       match(t:KStructT) : Right(n(t))
+       else : Left(List(0))
+     fn (n, offsets) :
+       to-list $ for s in padded(type-stats(KStructT(n))) seq-cat :
+         if pad?(s) : List()
+         else : seq({offset(s) + _}, offsets(type(s))))
 
    ;     Return Table
    ;     ------------
@@ -4987,17 +5015,14 @@ defn TypeTable () :
       defmethod pad+expand (this, t:KLSType) :
          pad+expand(t)
       defmethod offsets (this, t:KLSType) :
-         match(t) :
-            (t:KStructT) :
-               for f in fields(lstypes[n(t)]) map :
-                  field-offset(n(f))
-            (t) : List(0)
+         offsets(t)
       defmethod size (this, t:KLSType) :
-         type-size(t)
+         size(type-stats(t))
       defmethod alignment (this, t:KLSType) :
-         type-alignment(t)
+         alignment(type-stats(t))
       defmethod field-offset (this, f:Int) :
-         field-offset(f)
+         type-stats(KStructT(field-structs[f]))
+         field-offsets[f]
       defmethod field-type (this, f:Int) :
          field-types[f]
       defmethod field-index (this, f:Int) :
