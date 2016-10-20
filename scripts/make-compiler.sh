@@ -38,6 +38,7 @@ $STANZA  core/core.stanza \
          compiler/stz-il-ir.stanza \
          compiler/stz-tl-ir.stanza \
          compiler/stz-kl-ir.stanza \
+         compiler/stz-pl-ir.stanza \
          compiler/stz-input.stanza \
          compiler/stz-namemap.stanza \
          compiler/stz-renamer.stanza \
