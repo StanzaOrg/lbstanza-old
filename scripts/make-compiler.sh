@@ -47,6 +47,7 @@ $STANZA  core/core.stanza \
          compiler/stz-type-calculus.stanza \
          compiler/stz-type.stanza \
          compiler/stz-type-to-kform.stanza \
+         compiler/stz-kform.stanza \
          compiler/stz-compiler.stanza \
          compiler/stz-arg-parser.stanza \
          compiler/stz-langs.stanza  \
