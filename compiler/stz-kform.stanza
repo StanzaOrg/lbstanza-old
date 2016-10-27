@@ -22,6 +22,9 @@ public defn compile (pkgs:List<KPackage>) :
     val pkg2 = create-closures(dec-table, pkg1)
     vheader("Package %_ : After Creating Closures" % [name(pkg)])
     println(pkg2)
+    val pkg3 = guard-boundary(dec-table, pkg2)
+    vheader("Package %_ : After Guarding Boundaries" % [name(pkg)])
+    println(pkg3)
 
 ;============================================================
 ;=================== Method Targ Mapping ====================
@@ -142,9 +145,11 @@ defn map-method-targs (pkg:KPackage) :
 
 deftype DecTable
 defmulti global-function? (t:DecTable, n:Int) -> True|False
+defmulti function? (t:DecTable, n:Int) -> True|False
 defmulti arity (t:DecTable, n:Int) -> Int
-defmulti fn-types (t:DefTable, n:Int, targs:List<KTag>) -> [List<KTag>, KTag]
-defmulti lostanza? (t:DefTable, n:Int) -> True|False
+defmulti fn-types (t:DecTable, n:Int, targs:List<KTag>) -> [List<KTag>, KTag]
+defmulti lostanza? (t:DecTable, n:Int) -> True|False
+defmulti tail? (t:DecTable, n:Int) -> True|False
 
 defn compute-declaration-table (pkgs:List<KPackage>) :
   val globals = HashTable<Int,True>()
@@ -170,13 +175,20 @@ defn compute-declaration-table (pkgs:List<KPackage>) :
   new DecTable :
     defmethod global-function? (this, n:Int) :
       key?(globals,n) and
+      function?(this, n)
+    defmethod function? (this, n:Int) :
       get?(table,n) is KDefn|KDefmulti|KLSDefn
+    defmethod tail? (this, n:Int) :
+      match(table[n]) :
+        (d:KDefn) : tail?(value(d))
+        (d:KLSDefn) : tail?(value(d))
+        (d:KDefmulti) : tail?(d)
     defmethod arity (this, n:Int) :
       match(table[n]) :
         (d:KDefn) : length(a1(value(d)))
         (d:KLSDefn) : length(a1(value(d)))
         (d:KDefmulti) : length(a1(d))
-    defmethod fn-types (this, n:Int, targs:List<KTag>) :
+    defmethod fn-types (this, n:Int, type-args:List<KTag>) :
       val [tvars, a1, a2] = match(table[n]) :
         (d:KDefn) :
           [targs(v), a1(v), a2(v)] where :
@@ -186,9 +198,9 @@ defn compute-declaration-table (pkgs:List<KPackage>) :
         (d:KLSDefn) :
           [targs(v), map(tag!, a1(v)), tag!(a2(v))] where :
             val v = value(d)
-            defn tag! (t:KLSType) : tag(t as RefT)
-      val sub-table = to-hashtable<Int,KTag>(seq(KeyValue,tvars,targs))
-      val a1* = map(replace-tvars, a1, sub-table)
+            defn tag! (t:KLSType) : tag(t as KRefT)
+      val sub-table = to-hashtable<Int,KTag>(seq(KeyValue,tvars,type-args))
+      val a1* = map(replace-tvars{_, sub-table}, a1)
       val a2* = replace-tvars(a2, sub-table)
       [a1*, a2*]
     defmethod lostanza? (this, n:Int) :
@@ -267,13 +279,14 @@ defn create-closures (dec-table: DecTable, pkg:KPackage) -> KPackage :
 ;================= Boundary Guards ==========================
 ;============================================================
 
-defn map-guard (fd:(KDo, True|False) -> KExp,
+defn map-guard (fdef:KDef|KDefVar -> KDef|KDefVar,
+                fdo:(KDo, True|False) -> KExp,
                 fb:KBranch -> KBranch,
                 ff:KFn -> KFn,
                 pkg:KPackage) -> KPackage :
   defn map-tail (f: (KExp, True|False) -> KExp, e:KExp, tailcall?:True|False) :
     defn fb (b:KBranch) :
-      KBranch(args(e), tags(e), f(body(e), tailcall?))
+      KBranch(args(b), tags(b), f(body(b), tailcall?))
     match(e) :
       (e:KLet) : KLet(def(e), f(body(e), tailcall?))
       (e:KLetRec) : KLetRec(defs(e), f(body(e), tailcall?))
@@ -291,7 +304,7 @@ defn map-guard (fd:(KDo, True|False) -> KExp,
         map({ffunc(_) as KFn}, funcs(f))
   defn fexp (e:KExp, t:True|False) :
     match(map(fcomm, map-tail(fexp, e, t))) :
-      (e:KDo) : fd(e, t)
+      (e:KDo) : fdo(e, t)
       (e:KMatch) : KMatch(args(e), map(fb,branches(e)))
       (e:KDispatch) : KDispatch(args(e), map(fb, branches(e)))
       (e) : e
@@ -303,10 +316,16 @@ defn map-guard (fd:(KDo, True|False) -> KExp,
     mapr(flsexp, c)
   defn fcomm (c:KComm) :
     match(c) :
+      (c:KDef) :
+        fdef(KDef(n(c), tag(c), fexp(value(c), false)))
+      (c:KDefVar) :
+        match(value(c)) :
+          (v:KExp) : fdef(KDefVar(n(c), tag(c), fexp(v, false)))
+          (v:False) : c
       (c:KDefn) :
-        KDefn(n(c), ffunc(value(c)))
+        KDefn(n(c), ffunc(value(c)) as KFn)
       (c:KDefmethod) :
-        KDefmethod(multi(c), targs(c), thisn(c), ffunc(value(c)))
+        KDefmethod(multi(c), targs(c), thisn(c), ffunc(value(c)) as KFn)
       (c) :
         map(fexp{_, false},
         map(flsexp,
@@ -338,36 +357,48 @@ defn guard (dec-table:DecTable, e:KDo, tailcall?:True|False) -> KExp :
   ;Guard call to expression
   defn guard (e:KDo) :
     val args* = map(KCast, args(e), a1(e))
-    val func* = KCast(func(e), KTag(FN-TYPE-ID))
+    val func* = KCast(func(e), KOf(FN-TYPE-ID))
     val call = KDo!(func*, List(), args*)
     if tailcall? : call
     else : KCast(call, a2(e))
 
   match(func(e)) :
     (f:KVar) :
-      if function?(n(f)) : guard(n(f), List(), args(e))
+      if function?(dec-table, n(f)) : guard(n(f), List(), args(e))
       else : guard(e)
     (f:KCurry) : guard(n(f), targs(f), args(e))
     (f) : guard(e)
 
 defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
   map-guard(
+    fn (c) :
+      match(c) :
+        (c:KDef) : KDef(n(c), tag(c), KCast(value(c), tag(c)))
+        (c:KDefVar) : KDefVar(n(c), tag(c), KCast(value(c) as KExp, tag(c)))
     fn (e, t) :
       guard(dec-table, e, t)
     fn (b) :
       val guards = seq(KCast{KVar(_), _}, args(b), tags(b))
-      val body = KSeq(cat(guards, [body(b)]))
+      val body = KSeq(guards, body(b))
       KBranch(args(b), tags(b), body)
     fn (f) :
       val guards = seq(KCast{KVar(_), _}, args(f), a1(f))
-      var body:KExp = KSeq(cat(guards, [body(f)]))
+      var body:KExp = KSeq(guards, body(f))
       if not tail?(f) : body = KCast(body, a2(f))
-      KFn(tail?(f), targs(f), a1(f), a2(f), args(f), body))
+      KFn(tail?(f), targs(f), a1(f), a2(f), args(f), body),
+    pkg)
 
 
 ;============================================================
 ;==================== Utilities =============================
 ;============================================================
+
+;==============
+;==== KSeq ====
+;==============
+
+defn KSeq (es:Seqable<KExp>, e:KExp) :
+  reduce-right(KSeq, es, e)
 
 ;================================
 ;==== Trivial Simplification ====
