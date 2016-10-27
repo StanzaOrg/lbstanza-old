@@ -143,11 +143,13 @@ defn map-method-targs (pkg:KPackage) :
 deftype DecTable
 defmulti global-function? (t:DecTable, n:Int) -> True|False
 defmulti arity (t:DecTable, n:Int) -> Int
+defmulti fn-types (t:DefTable, n:Int, targs:List<KTag>) -> [List<KTag>, KTag]
+defmulti lostanza? (t:DefTable, n:Int) -> True|False
 
 defn compute-declaration-table (pkgs:List<KPackage>) :
   val globals = HashTable<Int,True>()
   val table = HashTable<Int,KComm>()
-  
+
   defn declaration? (c:KComm) -> Int|False :
     match(c:KDef|KDefVar|KDefn|KDefmulti|
             KLSDef|KLSDefVar|KLSDefn|KLSExternFn|KLSExtern) :
@@ -163,8 +165,8 @@ defn compute-declaration-table (pkgs:List<KPackage>) :
     scan(comm)
     match(declaration?(comm)) :
       (n:Int) : globals[n] = true
-      (n:False) : false      
-      
+      (n:False) : false
+
   new DecTable :
     defmethod global-function? (this, n:Int) :
       key?(globals,n) and
@@ -174,6 +176,23 @@ defn compute-declaration-table (pkgs:List<KPackage>) :
         (d:KDefn) : length(a1(value(d)))
         (d:KLSDefn) : length(a1(value(d)))
         (d:KDefmulti) : length(a1(d))
+    defmethod fn-types (this, n:Int, targs:List<KTag>) :
+      val [tvars, a1, a2] = match(table[n]) :
+        (d:KDefn) :
+          [targs(v), a1(v), a2(v)] where :
+            val v = value(d)
+        (d:KDefmulti) :
+          [targs(d), a1(d), a2(d)]
+        (d:KLSDefn) :
+          [targs(v), map(tag!, a1(v)), tag!(a2(v))] where :
+            val v = value(d)
+            defn tag! (t:KLSType) : tag(t as RefT)
+      val sub-table = to-hashtable<Int,KTag>(seq(KeyValue,tvars,targs))
+      val a1* = map(replace-tvars, a1, sub-table)
+      val a2* = replace-tvars(a2, sub-table)
+      [a1*, a2*]
+    defmethod lostanza? (this, n:Int) :
+      table[n] is KLSDef|KLSDefVar|KLSDefn
 
 ;============================================================
 ;===================== Closure Creation =====================
@@ -204,7 +223,7 @@ defn map-closures (dec-table: DecTable
         match(func(e)) :
           (f:KLSMix|KLSCurry|KLSVar) : KLSCall(f, map(fle,args(e)), type(e))
           (f) : mapr(fle, e)
-      (e) : mapr(fle, e)    
+      (e) : mapr(fle, e)
   defn fc (c:KComm) :
     mapr(fle, mapr(fe, c))
   KPackage(
@@ -237,20 +256,114 @@ defn create-closures (dec-table: DecTable, pkg:KPackage) -> KPackage :
     match(f) :
       (f:KLSMix) : KMix(map({to-exp(_) as KCurry}, exps(f)))
       (f:KLSCurry) : KCurry(n(f), targs(f))
-      (f:KLSVar) : KVar(n(f))    
+      (f:KLSVar) : KVar(n(f))
   map-closures(
     dec-table,
     fn (e) : KAFn(mix-fn(dec-table, e))
     fn (e) : KLSAFn(mix-fn(dec-table, to-exp(e)))
     pkg)
-        
-;============================================================
-;===================== Tag Analysis =========================
-;============================================================
 
 ;============================================================
-;================= Boundary Guard Insertion =================
+;================= Boundary Guards ==========================
 ;============================================================
+
+defn map-guard (fd:(KDo, True|False) -> KExp,
+                fb:KBranch -> KBranch,
+                ff:KFn -> KFn,
+                pkg:KPackage) -> KPackage :
+  defn map-tail (f: (KExp, True|False) -> KExp, e:KExp, tailcall?:True|False) :
+    defn fb (b:KBranch) :
+      KBranch(args(e), tags(e), f(body(e), tailcall?))
+    match(e) :
+      (e:KLet) : KLet(def(e), f(body(e), tailcall?))
+      (e:KLetRec) : KLetRec(defs(e), f(body(e), tailcall?))
+      (e:KSeq) : KSeq(f(a(e), false), f(b(e), tailcall?))
+      (e:KMatch) : KMatch(map(f{_, false}, args(e)), map(fb, branches(e)))
+      (e:KDispatch) : KDispatch(map(f{_, false}, args(e)), map(fb, branches(e)))
+      (e) : map(f{_, false}, e)
+  defn ffunc (f:KFunc) :
+    match(f) :
+      (f:KFn) :
+        val body* = fexp(body(f), tail?(f))
+        ff(KFn(tail?(f), targs(f), a1(f), a2(f), args(f), body*))
+      (f:KMultifn) :
+        KMultifn $
+        map({ffunc(_) as KFn}, funcs(f))
+  defn fexp (e:KExp, t:True|False) :
+    match(map(fcomm, map-tail(fexp, e, t))) :
+      (e:KDo) : fd(e, t)
+      (e:KMatch) : KMatch(args(e), map(fb,branches(e)))
+      (e:KDispatch) : KDispatch(args(e), map(fb, branches(e)))
+      (e) : e
+  defn flsexp (e:KLSExp) :
+    match(e) :
+      (e:KLSAFn) : KLSAFn(ffunc(value(e)))
+      (e) : mapr(flsexp, e)
+  defn flscomm (c:KLSComm) :
+    mapr(flsexp, c)
+  defn fcomm (c:KComm) :
+    match(c) :
+      (c:KDefn) :
+        KDefn(n(c), ffunc(value(c)))
+      (c:KDefmethod) :
+        KDefmethod(multi(c), targs(c), thisn(c), ffunc(value(c)))
+      (c) :
+        map(fexp{_, false},
+        map(flsexp,
+        map(flscomm,
+        c)))
+  KPackage(
+    name(pkg),
+    ids(pkg),
+    map(fcomm, comms(pkg)))
+
+;Insert guards around the given KDo expression to
+;enforce declared contracts.
+defn guard (dec-table:DecTable, e:KDo, tailcall?:True|False) -> KExp :
+  ;Guard call to known function
+  defn guard (n:Int, targs:List<KTag>, args:List<KExp>) :
+    val [a1, a2] = fn-types(dec-table, n, targs)
+    ;Guard arguments when necessary
+    val args* =
+      if lostanza?(dec-table, n) : map(KCast, args, a1)
+      else : args
+    ;Make call
+    val call = KDo!(KVar(n), targs, args*)
+    ;Guard return when necessary
+    if tailcall? : call
+    else if lostanza?(dec-table, n) : KCast(call, a2)
+    else if tail?(dec-table, n) : KCast(call, a2)
+    else : call
+
+  ;Guard call to expression
+  defn guard (e:KDo) :
+    val args* = map(KCast, args(e), a1(e))
+    val func* = KCast(func(e), KTag(FN-TYPE-ID))
+    val call = KDo!(func*, List(), args*)
+    if tailcall? : call
+    else : KCast(call, a2(e))
+
+  match(func(e)) :
+    (f:KVar) :
+      if function?(n(f)) : guard(n(f), List(), args(e))
+      else : guard(e)
+    (f:KCurry) : guard(n(f), targs(f), args(e))
+    (f) : guard(e)
+
+defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
+  map-guard(
+    fn (e, t) :
+      guard(dec-table, e, t)
+    fn (b) :
+      val guards = seq(KCast{KVar(_), _}, args(b), tags(b))
+      val body = KSeq(cat(guards, [body(b)]))
+      KBranch(args(b), tags(b), body)
+    fn (f) :
+      val guards = seq(KCast{KVar(_), _}, args(f), a1(f))
+      var body:KExp = KSeq(cat(guards, [body(f)]))
+      if not tail?(f) : body = KCast(body, a2(f))
+      KFn(tail?(f), targs(f), a1(f), a2(f), args(f), body))
+
 
 ;============================================================
 ;==================== Utilities =============================
