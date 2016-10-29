@@ -29,8 +29,11 @@ public defn compile (pkgs:List<KPackage>) :
     pkg = guard-boundary(dec-table, pkg)
     vheader("Package %_ : After Guarding Boundaries" % [name(pkg)])
     println(pkg)
-    pkg = reify-types(pkg)
+    pkg = reify-types(dec-table, pkg)
     vheader("Package %_ : After Reifying Types" % [name(pkg)])
+    println(pkg)
+    pkg = compute-freevars(dec-table, pkg)
+    vheader("Package %_ : After Computing Freevars" % [name(pkg)])
     println(pkg)
     
 
@@ -172,6 +175,7 @@ defmulti ls-fn-types (t:DecTable, n:Int, targs:List<KTag>) -> [List<KLSType>, KL
 defmulti lostanza? (t:DecTable, n:Int) -> True|False
 defmulti tail? (t:DecTable, n:Int) -> True|False
 defmulti voidable? (t:DecTable, n:Int) -> True|False
+defmulti register-global (this, c:KComm) -> False
 
 defn compute-declaration-table (pkgs:List<KPackage>) :
   val globals = HashTable<Int,True>()
@@ -196,6 +200,10 @@ defn compute-declaration-table (pkgs:List<KPackage>) :
       (n:False) : false
 
   new DecTable :
+    defmethod register-global (this, c:KComm) :
+      match(c:KDef|KLSDef|KDefConst) :
+        table[n(c)] = c
+        globals[n(c)] = true
     defmethod global-function? (this, n:Int) :
       global?(this, n) and function?(this, n)
     defmethod global? (this, n:Int) :
@@ -612,10 +620,11 @@ defn map-type-args (fdo:KDo! -> KDo!,
     ids(pkg),
     map({fnode(_) as KComm}, comms(pkg)))
 
-defn reify-types (pkg:KPackage) -> KPackage :
+defn reify-types (dec-table:DecTable, pkg:KPackage) -> KPackage :
   ;Define a type object
   val defs = Vector<KComm>()
   defn prepend-defs (pkg:KPackage) :
+    do(register-global{dec-table, _}, filter({_ is KDefConst}, defs))      
     KPackage(name(pkg), ids(pkg), append(defs, comms(pkg)))
 
   ;Table of types
@@ -627,24 +636,26 @@ defn reify-types (pkg:KPackage) -> KPackage :
     defn TypeObject (n:Int, vs:List<Int>) :
       if ls?: KLSTypeObject(n, KLSVars(vs))
       else : KTypeObject(n, KVars(vs))
-    
-    val nt = normalize(t)
-    match(get?(type-table, nt)) :
-      (n:Int) :
-        if empty?(vs) : Var(n)
-        else : TypeObject(n, vs)
-      (_:False) :
-        val type-id = fresh-id()
-        add(defs, KDefTypeObject(type-id, vs*, t*)) where :
-          val [t*, vs*] = alpha-rename(t)
-        if empty?(vs) :
-          val obj-id = fresh-id()
-          add(defs, KDefConst(obj-id, KTypeObject(type-id, List())))
-          type-table[nt] = obj-id
-          Var(obj-id)
-        else :
-          type-table[nt] = type-id
-          TypeObject(type-id, vs)
+    match(t:KTVar) :
+      Var(n(t))
+    else :
+      val nt = normalize(t)
+      match(get?(type-table, nt)) :
+        (n:Int) :
+          if empty?(vs) : Var(n)
+          else : TypeObject(n, vs)
+        (_:False) :
+          val type-id = fresh-id()
+          add(defs, KDefTypeObject(type-id, vs*, t*)) where :
+            val [t*, vs*] = alpha-rename(t)
+          if empty?(vs) :
+            val obj-id = fresh-id()
+            add(defs, KDefConst(obj-id, KTypeObject(type-id, List())))
+            type-table[nt] = obj-id
+            Var(obj-id)
+          else :
+            type-table[nt] = type-id
+            TypeObject(type-id, vs)
 
   ;Creating type objects
   defn type-objects (ts:List<KTag>) :
@@ -683,6 +694,110 @@ defn reify-types (pkg:KPackage) -> KPackage :
       val args* = append(targs(f), args(f))      
       KLSFn!(tail?(f), length(args(f)), a1*, a2*, args*, body(f))
     pkg)
+
+;============================================================
+;=============== Free Variable Computation ==================
+;============================================================
+
+deftype HasFreeVars
+defmulti freevars (x:HasFreeVars) -> List<Int>
+
+defn attach-free (f:KFunc, vs:List<Int>) -> KFunc & HasFreeVars :
+  match(f) :
+    (f:KFn!) :
+      new KFn! & HasFreeVars :
+        defmethod tail? (this) : tail?(f)
+        defmethod arity (this) : arity(f)
+        defmethod a1 (this) : a1(f)
+        defmethod a2 (this) : a2(f)
+        defmethod args (this) : args(f)
+        defmethod body (this) : body(f)
+        defmethod freevars (this) : vs
+        defmethod print (o:OutputStream, this) :
+          val star = "*" when tail?(f) else ""
+          print(o, "($fn%_ (free:%@) %~ (%@) %~ (%@) %~)" % [
+            star, vs, arity(f), a1(f), a2(f), args(f), body(f)])
+    (f:KMultifn) :
+      new KMultifn & HasFreeVars :
+        defmethod funcs (this) : funcs(f)
+        defmethod freevars (this) : vs
+        defmethod print (o:OutputStream, this) :
+          print(o, "($multi (free:%@) %@)" % [
+            vs, funcs(f)])
+
+defn compute-freevars (dec-table:DecTable, pkg:KPackage) :
+  ;Track variable binding
+  var vars = HashTable<Int,True|False>()
+  defn mark-bound (v:Int) : vars[v] = false
+  defn mark-free (v:Int) : vars[v] = true
+  defn all-free () : to-list(seq(key, filter(value, vars)))
+  
+  ;Mapping functions
+  defn markexp (e:KExp) :
+    markn(e) as KExp
+  defn markcomm (x:KComm) :
+    markn(x) as KComm
+  defn markb (b:KBranch) :
+    val body* = markexp(body(b))
+    do(mark-bound, args(b))
+    KBranch(args(b), tags(b), body*)
+  defn markn (x:KNode) :
+    match(x) :
+      ;Branches
+      (x:KMatch) :
+        val args* = map(markexp, args(x))
+        KMatch(args*, map(markb, branches(x)))
+      (x:KDispatch) :  
+        val args* = map(markexp, args(x))
+        KDispatch(args*, map(markb, branches(x)))
+      ;Bound
+      (x:KLet) :
+        val body* = markexp(body(x))
+        mark-bound(n(def(x)))
+        val def* = markn(def(x)) as KDef|KDefVar
+        KLet(def*, body*)
+      (x:KLetRec) :
+        val x* = map-all(markn, x)
+        do(mark-bound{n(_)}, defs(x))
+        x*
+      ;Free
+      (x:KVar) :
+        mark-free(n(x)) when not global?(dec-table, n(x))
+        x
+      (x:KReifiedCast) :
+        for v in freevars(tag(x)) do :
+          mark-free(v) when not global?(dec-table, v)
+        map-all(markn, x)
+      ;Funcs
+      (x:KLSAFn) :
+        KLSAFn(markf(value(x)))
+      (x:KAFn) :
+        KAFn(markf(value(x)))
+      (x:KDefn) :
+        KDefn(n(x), markf(value(x)))
+      (x:KDefmethod) :
+        KDefmethod(multi(x), targs(x), thisn(x), markf(value(x)))
+      ;Recurse  
+      (x) :
+        map-all(markn, x)          
+  defn markfn (f:KFn!) :
+    val body* = markexp(body(f))
+    do(mark-bound, args(f))
+    KFn!(tail?(f), arity(f), a1(f), a2(f), args(f), body*)
+  defn markf (f:KFunc) -> KFunc & HasFreeVars :
+    let-var vars = HashTable<Int,True|False>() :
+      val f* = match(f) :
+        (f:KFn!) : markfn(f)
+        (f:KMultifn) : KMultifn(map(markfn, funcs(f) as List<KFn!>))
+      val vs = all-free()
+      do(mark-free, vs)
+      attach-free(f*, vs)
+    
+  ;Driver
+  KPackage(
+    name(pkg),
+    ids(pkg),
+    map(markcomm, comms(pkg)))
 
 ;============================================================
 ;==================== Utilities =============================
