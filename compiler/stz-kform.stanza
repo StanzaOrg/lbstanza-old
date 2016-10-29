@@ -40,6 +40,12 @@ public defn compile (pkgs:List<KPackage>) :
     println(pkg)
     pkg = lift-objects(pkg)
     vheader("Package %_ : After Lifting Objects" % [name(pkg)])
+    println(pkg)
+    pkg = compute-freevars(dec-table, pkg)
+    vheader("Package %_ : After Computing Freevars Again" % [name(pkg)])
+    println(pkg)    
+    pkg = lift-closures(dec-table, pkg)
+    vheader("Package %_ : After Lifting Closures" % [name(pkg)])
     println(pkg)    
     
 
@@ -562,14 +568,6 @@ defn normalize (t:KTag) :
       (t:KTVar) : KTVar(ids[n(t)])
       (t) : map(loop, t)
 
-defn alpha-rename (t:KTag) -> [KTag, List<Int>] :
-  val ids = IdPool(fresh-id)
-  val t* = let loop (t:KTag = t) :
-    match(t) :
-      (t:KTVar) : KTVar(ids[n(t)])
-      (t) : map(loop, t)
-  [t*, to-list(ids)]
-
 defn freevars (t:KTag) :
   unique $ generate<Int> :
     let loop (t:KTag = t) :
@@ -655,8 +653,7 @@ defn reify-types (dec-table:DecTable, pkg:KPackage) -> KPackage :
           else : TypeObject(n, vs)
         (_:False) :
           val type-id = fresh-id()
-          add(defs, KDefTypeObject(type-id, vs*, t*)) where :
-            val [t*, vs*] = alpha-rename(t)
+          add(defs, KDefTypeObject(type-id, vs, t))
           if empty?(vs) :
             val obj-id = fresh-id()
             add(defs, KDefConst(obj-id, KTypeObject(type-id, List())))
@@ -745,31 +742,12 @@ defn box-mutables (dec-table:DecTable, pkg:KPackage) :
 ;=============== Free Variable Computation ==================
 ;============================================================
 
-deftype HasFreeVars
-defmulti freevars (x:HasFreeVars) -> List<Int>
-
-defn attach-free (f:KFunc, vs:List<Int>) -> KFunc & HasFreeVars :
+defn attach-free (f:KFunc, vs:List<Int>) :
   match(f) :
     (f:KFn!) :
-      new KFn! & HasFreeVars :
-        defmethod tail? (this) : tail?(f)
-        defmethod arity (this) : arity(f)
-        defmethod a1 (this) : a1(f)
-        defmethod a2 (this) : a2(f)
-        defmethod args (this) : args(f)
-        defmethod body (this) : body(f)
-        defmethod freevars (this) : vs
-        defmethod print (o:OutputStream, this) :
-          val star = "*" when tail?(f) else ""
-          print(o, "($fn%_ (free:%@) %~ (%@) %~ (%@) %~)" % [
-            star, vs, arity(f), a1(f), a2(f), args(f), body(f)])
+      KFn!(tail?(f), arity(f), a1(f), a2(f), args(f), body(f), vs)
     (f:KMultifn) :
-      new KMultifn & HasFreeVars :
-        defmethod funcs (this) : funcs(f)
-        defmethod freevars (this) : vs
-        defmethod print (o:OutputStream, this) :
-          print(o, "($multi (free:%@) %@)" % [
-            vs, funcs(f)])
+      KMultifn(funcs(f), vs)
 
 defn compute-freevars (dec-table:DecTable, pkg:KPackage) :
   ;Track variable binding
@@ -826,18 +804,21 @@ defn compute-freevars (dec-table:DecTable, pkg:KPackage) :
       ;Recurse  
       (x) :
         map-all(markn, x)          
-  defn markfn (f:KFn!) :
-    val body* = markexp(body(f))
-    do(mark-bound, args(f))
-    KFn!(tail?(f), arity(f), a1(f), a2(f), args(f), body*)
-  defn markf (f:KFunc) -> KFunc & HasFreeVars :
-    let-var vars = HashTable<Int,True|False>() :
-      val f* = match(f) :
-        (f:KFn!) : markfn(f)
-        (f:KMultifn) : KMultifn(map(markfn, funcs(f) as List<KFn!>))
-      val vs = all-free()
-      do(mark-free, vs)
-      attach-free(f*, vs)
+  defn markf (f:KFunc) :
+    match(f) :
+      (f:KFn!) :
+        let-var vars = HashTable<Int,True|False>() :
+          val body* = markexp(body(f))
+          do(mark-bound, args(f))
+          val f* = KFn!(tail?(f), arity(f), a1(f), a2(f), args(f), body*)
+          val vs = all-free()
+          do(mark-free, vs)
+          attach-free(f*, vs)
+      (f:KMultifn) :
+        val fs* = map(markf, funcs(f))
+        val vs = unique(seq-cat(freevars, fs*))
+        do(mark-free, vs)
+        attach-free(KMultifn(fs*), vs)
     
   ;Driver
   KPackage(
@@ -851,12 +832,12 @@ defn compute-freevars (dec-table:DecTable, pkg:KPackage) :
 
 defn freevars (e:KNew) :
   unique $ for m in methods(e) seq-cat :
-    freevars(value(m) as KFunc&HasFreeVars)
+    freevars(value(m))
 
 defn lift-objects (pkg:KPackage) :
   val defs = Vector<KComm>()
   
-  defn fnew (e:KNew) :
+  defn create-object (e:KNew) :
     val id = fresh-id()
     val obj-vs = freevars(e)
     ;Define Object
@@ -864,11 +845,11 @@ defn lift-objects (pkg:KPackage) :
     ;Pull out Methods
     for m in methods(e) do :
       val obj = thisn(m) as Int
-      val f = value(m) as KFn! & HasFreeVars
+      val f = value(m) as KFn!
       val defs* = for v in freevars(f) seq :
         val i = index-of!(obj-vs, v)
         KDef(v, KTop(), KObjectGet(KVar(obj), i))
-      val body* = KLet(defs*, fnode(body(f)) as KExp)
+      val body* = KLet(defs*, body(f))
       val a1* = for (v in args(f), t in a1(f)) map :
         KOf(id) when v == obj else t
       val f* = KFn!(tail?(f), arity(f), a1*, a2(f), args(f), body*)
@@ -878,8 +859,9 @@ defn lift-objects (pkg:KPackage) :
 
   ;Scanner
   defn fnode (x:KNode) :
-    match(x:KNew) : fnew(x)
-    else : map-all(fnode, x)
+    match(map-all(fnode, x)) :
+      (x:KNew) : create-object(x)
+      (x) : x
       
   ;Driver    
   val comms* = map({fnode(_) as KComm}, comms(pkg))
@@ -887,7 +869,105 @@ defn lift-objects (pkg:KPackage) :
     name(pkg)
     ids(pkg)
     append(defs, comms*))
+
+;============================================================
+;================== Closure Lifting =========================
+;============================================================
+
+defn map-closures (fdef:KDefn -> KDef,
+                   ffn:KAFn -> KClosure,
+                   flsfn:KLSAFn -> KLSClosure,
+                   fdo:KDo! -> KCall|KDo!,
+                   flsdo:KLSDo! -> KLSCall|KLSDo!,
+                   pkg:KPackage) :
+  defn fnode (x:KNode) :
+    match(x) :
+      (x:KLetRec) :
+        val defs* = for d in defs(x) map :
+          fdef(map-all(fnode, d) as KDefn)
+        val body* = fnode(body(x)) as KExp
+        KLetClosures(
+          map(n, defs*),
+          map(value, defs*) as List<KClosure>,
+          body*)          
+      (x) :
+        match(map-all(fnode, x)) :
+          (x:KAFn) : ffn(x)
+          (x:KLSAFn) : flsfn(x)
+          (x:KDo!) : fdo(x)
+          (x:KLSDo!) : flsdo(x)
+          (x) : x
+  KPackage(
+    name(pkg),
+    ids(pkg),
+    map({fnode(_) as KComm}, comms(pkg)))
     
+defn lift-closures (dec-table:DecTable, pkg:KPackage) :
+  ;Code Ids
+  val code-ids = IdPool(fresh-id)
+  defn code-id (n:Int) :
+    fatal("Globals have no code id.") when global?(dec-table, n)
+    code-ids[n]
+
+  ;Create the closure code
+  defn closure-code (func:KFunc) -> KFunc :
+    defn make-code (f:KFn!, var-idx:List<Int>) :
+      val closure = fresh-id()
+      val defs* = for (v in freevars(f), i in var-idx) seq :
+        KDef(v, KTop(), KClosureGet(KVar(closure), i))
+      val body* = KLet(defs*, body(f))
+      val a1* = cons(KOf(FN-TYPE-ID), a1(f))
+      val args* = cons(closure, args(f))
+      KFn!(tail?(f), arity(f), a1*, a2(f), args*, body*)
+    match(func) :
+      (func:KFn!) :
+        val idx = to-list(0 to length(freevars(func)))
+        make-code(func, idx)
+      (func:KMultifn) :
+        val fs* = for f in funcs(func) map :
+          val idx = map(index-of!{freevars(func), _}, freevars(f))
+          make-code(f as KFn!, idx)
+        KMultifn(fs*)        
+
+  ;New Definitions
+  val defs = Vector<KComm>()
+  defn prepend-defs (pkg:KPackage) :
+    KPackage(name(pkg), ids(pkg), append(defs, comms(pkg)))
+
+  prepend-defs $ map-closures(
+    fn (c:KDefn) :
+      val f = value(c)
+      val id = code-id(n(c))
+      add(defs, KDefn(id, closure-code(f)))
+      KDef(n(c), KTop(), KClosure(id, KVars(freevars(f))))
+    fn (e:KAFn) :
+      val f = value(e)
+      val id = fresh-id()
+      add(defs, KDefn(id, closure-code(f)))
+      KClosure(id, KVars(freevars(f)))
+    fn (e:KLSAFn) :
+      val f = value(e)
+      val id = fresh-id()
+      add(defs, KDefn(id, closure-code(f)))
+      KLSClosure(id, KLSVars(freevars(f)))
+    fn (e:KDo!) :
+      match(func(e)) :
+        (f:KVar) :
+          if function?(dec-table, n(f)) :
+            if global?(dec-table, n(f)) : KCall(arity(e), n(f), args(e))
+            else : KCall(arity(e), code-id(n(f)), cons(f, args(e)))
+          else : e
+        (f) : e        
+    fn (e:KLSDo!) :
+      match(func(e)) :
+        (f:KLSVar) :
+          if function?(dec-table, n(f)) :
+            if not global?(dec-table, n(f)) :
+              fatal("Direct call to non-global function.")
+            KLSCall(arity(e), n(f), args(e), type(e))
+          else : e
+        (f) : e
+    pkg)
 
 ;============================================================
 ;==================== Utilities =============================
