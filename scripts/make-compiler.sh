@@ -39,6 +39,7 @@ $STANZA  core/core.stanza \
          compiler/stz-tl-ir.stanza \
          compiler/stz-kl-ir.stanza \
          compiler/stz-pl-ir.stanza \
+         compiler/stz-tgt-ir.stanza \
          compiler/stz-input.stanza \
          compiler/stz-namemap.stanza \
          compiler/stz-renamer.stanza \
@@ -48,6 +49,7 @@ $STANZA  core/core.stanza \
          compiler/stz-type.stanza \
          compiler/stz-type-to-kform.stanza \
          compiler/stz-kform.stanza \
+         compiler/stz-kform-to-tgt.stanza \
          compiler/stz-compiler.stanza \
          compiler/stz-arg-parser.stanza \
          compiler/stz-langs.stanza  \
