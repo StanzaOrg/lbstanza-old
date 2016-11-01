@@ -144,8 +144,9 @@ defn call (f:Int, args:List<TGImm>) :
 defn call (f:Int) :
   call(f, List())
 
-defn allocate-ref (n:Int, obj-size:Int) :
-  val size = TGLong(to-long(obj-size))
+defn allocate-ref (n:Int, size:Int) :
+  allocate-ref(n, TGLong(to-long(obj-size)))
+defn allocate-ref (n:Int, size:TGImm) :
   val ref-tag = TGLong(to-long(REF-TAG-BITS))
   val end-lbl = fresh-id()
   val p = make-var(TGLongT())                                    ;  var p : long
@@ -677,3 +678,348 @@ public defn compile (dec-table:DecTable, f:KFunc) -> Vector<TGIns> :
       (f:KMultifn) : funcs(f) as List<KFn!>
       (f:KFn!) : List(f)
     buffer
+
+
+
+;============================================================
+;============= LSExpression Compilation System ==============
+;============================================================
+
+;Base Compiled Expression
+deftype CLSExp
+defmulti types (c:CLSExp) -> List<TGType>
+defmulti set (ns:Int, c:CLSExp) -> False
+defmulti ignore (c:CLSExp) -> False
+defmulti imms (c:CLSExp) -> List<TGImm>
+defmulti tail (c:CLSExp) -> False
+defmulti return (c:CLSExp) -> False
+
+;Convenience for single immediate
+defn imm (c:CLSExp) :
+  val xs = imms(c)
+  fatal("Not a single immediate.") when length(xs) != 1
+  head(xs)
+
+;Most default things are defined in terms of set
+;Except for ignore
+defmethod imms (c:CLSExp) :
+  val ns = map(fresh-id{}, types(c))
+  do(emit{TGDef(_, _)}, ns, types(c))
+  set(ns, c)
+  map(TGVar, ns)
+defmethod tail (c:CLSExp) : return(c)
+defmethod return (c:CLSExp) : emit(TGReturn(imms(c)))
+
+;;If it is continuable, then define everything in terms of kont
+deftype LSContinuable
+defmulti kont (c:LSContinuable, kont:CLSExp -> False, end?:True|False) -> False
+defmulti kont (c:LSContinuable, kont:CLSExp -> False) -> False
+defmethod kont (c:LSContinuable, k:CLSExp -> False, end?:True|False) : kont(c, k)
+defmethod tail (c:CLSExp & LSContinuable) : kont(c, tail, false)
+defmethod return (c:CLSExp & LSContinuable) : kont(c, return, false)
+defmethod ignore (c:CLSExp & LSContinuable) : kont(c, ignore, false)
+defmethod set (ns:List<Int>, c:CLSExp & LSContinuable) : kont(c, set{ns, _}, false)
+
+;If it is immediate, then set is defined in terms of imm
+defmethod set (ns:List<Int>, c:CLSExp&Immediate) :
+  do(emit{TGSet(TGVar(_), _)}, ns, imms(c))
+
+;;If it is ignorable, then ignore does nothing
+;defmethod ignore (c:CLSExp&Ignorable) : false
+
+;============================================================
+;================ LoStanza Compilation ======================
+;============================================================
+
+public defn compile (dec-table:DecTable, f:KLSFn!) -> Vector<TGIns> :
+  val imm-table = HashTable<Int,List<TGImm>>()
+  val type-table = HashTable<Int,List<TGType>>()
+
+  defn calloc (input-size:Int, offsets:List<Int>, fields:Collection<TGImm|CLSExp>) :
+    new CLSExp :
+      defmethod types (this) :
+        List(KRefT())
+      defmethod set (ns:List<Int>, this) :
+        fatal("Not a single immediate.") when length(ns) != 1
+        val n = head(ns)
+        val fs = for f in fields seq-append :
+          (f:TGImm) : f
+          (f:CLSExp) : imms(f)
+        val size = ceil8(input-size)
+        allocate-ref(n, size)
+        for (f in fs, o in offsets) do :
+          emit(TGStore(TGVar(n), f, o - REF-TAG-BITS))
+
+  defn calloc (fields:Collection<TGImm|CLSExp>) :
+    val n = length(fields)
+    calloc(8 * n, map({8 * _}, 0 to n), fields)
+
+  defn carray (size:Int, rest-size:Int, offsets:List<Int>, fields:Collection<TGImm|CLSExp>) :
+    new CLSExp :
+      defmethod types (this) :
+        List(KRefT())
+      defmethod set (ns:List<Int>, this) :
+        ;Retrieve destination
+        fatal("Not a single immediate.") when length(ns) != 1
+        val n = head(ns)
+        ;Evaluate fields
+        val fs = for f in fields seq-append :
+          (f:TGImm) : f
+          (f:CLSExp) : imms(f)
+        ;Compute length
+        val len = make-var(TGLongT())
+        emit(TGBinOp(len, TGMulOp(), fs[1], TGLong(to-long(rest-size))))
+        emit(TGBinOp(len, TGAddOp(), len, TGLong(to-long(size + 7))))
+        emit(TGBinOp(len, TGAndOp(), len, TGLong(-8L)))
+        ;Allocate array
+        allocate-ref(n, len)
+        ;Store fields
+        for (f in fs, o in offsets) do :
+          emit(TGStore(TGVar(n), f, o - REF-TAG-BITS))        
+  
+  defn cexp (e:KLSExp) -> CLSExp :
+    match(e) :
+      (e:KLSVar) :
+        if global?(dec-table, n(e)) :
+          new CLSExp :
+            defmethod types (this) :
+              global-tgt-types(n(e))
+            defmethod set (xs:Int, this) :
+              for (x in xs, off in global-tgt-offsets(n(e))) do :
+                emit(TGLoad(TGVar(x), TGMem(n(e),0), off))
+        else :
+          new CLSExp & Immediate :
+            defmethod types (this) :
+              type-table[n(e)]
+            defmethod imms (this) :
+              imm-table[n(e)]
+      (e:KLSRef) :
+        val size = 8 + struct-size(dec-table, n(e))
+        val offsets = cons(0, map({8 + _}, struct-offsets(dec-table, n(e))))
+        val fields = cons(TGTag(n(e)), map(cexp, args(e)))
+        calloc(size, offsets, fields)
+      (e:KLSArray) :
+        val size = struct-size(dec-table, n(e))
+        val rest-size = struct-rest-size(dec-table, n(e))
+        val offsets = cons(0, map({8 + _}, struct-offsets(dec-table, n(e))))
+        val fields = cons(TGTag(n(e)), map(cexp, args(e)))
+        carray(size, rest-size, offsets, fields)
+      (e:KLSStruct) :
+        new CLSExp & Immediate :
+          defmethod types (this) :
+            struct-tgt-types(dec-table, n(e))
+          defmethod imms (this) :
+            seq-cat(imms{cexp(_)}, args(e))
+      (e:KLSPtr) :
+        fatal("Not yet supported.")
+      (e:KLSRead) :
+        fatal("Not yet supported.")
+      (e:KLSDoC) :
+        fatal("Not yet supported.")
+      (e:KLSLiteral) :
+        match(value(e)) :
+          (v:Char|Byte|Int|Long|String) :
+            new CLSExp & Immediate :
+              defmethod types (this) :
+                List $ match(v) :
+                  (v:Byte) : TGByteT()
+                  (v:Char) : TGByteT()
+                  (v:Int) : TGIntT()
+                  (v:Long) : TGLongT()
+                  (v:String) : TGLongT()
+              defmethod imms (this) :
+                List $ match(v) :
+                  (v:Char) : TGByte(to-byte(v))
+                  (v:Byte) : TGByte(v)
+                  (v:Int) : TGInt(v)
+                  (v:Long) : TGLong(v)
+                  (v:String) :
+                    val c = fresh-id()
+                    emit(TGDefConst(c, v))
+                    TGMem(c,0)
+          (v:Float|Double) :
+            new CLSExp :
+              defmethod types (this) :
+                List $ match(v) :
+                  (v:Float) : TGFloatT()
+                  (v:Double) : TGDoubleT()
+              defmethod set (ns:List<Int>, this) :
+                match(v) :
+                  (v:Float) :
+                    val n = TGVar(head(ns))
+                    emit(TGInterpret(n, TGInt(bits(v))))
+                  (v:Double) :
+                    val c = fresh-id()
+                    emit(TGDefConst(c, v))
+                    emit(TGLoad(TGVar(head(ns)), TGMem(c,0), 0))
+      (e:KLSCast) :
+        val t = match(type(e)) :
+          (t:KByteT) : TGByteT()
+          (t:KIntT) : TGIntT()
+          (t:KLongT) : TGLongT()
+          (t:KFloatT) : TGFloatT()
+          (t:KDoubleT) : TGDoubleT()
+          (t:KPtrT) : TGLongT()
+          (t:KRefT) : TGRefT()
+        new CLSExp :
+          defmethod types (this) :
+            List(t)
+          defmethod set (ns:List<Int>, this) :
+            val ys = imms(cexp(exp(e)))
+            emit(TGConv(TGVar(head(ns)), head(ys)))
+      (e:KLSAnd) :
+        new CLSExp :
+          defmethod types (this) :
+            List(TGLongT())
+          defmethod set (ns:List<Int>, this) :
+            val done-lbl = fresh-id()
+            set(ns, cexp(a(e)))
+            emit(TGBinCmp(done-lbl, TGEqOp(), TGVar(head(ns)), TGLong(0L)))
+            set(ns, cexp(b(e)))
+            emit(TGLabel(done-lbl))
+      (e:KLSOr) :
+        new CLSExp :
+          defmethod types (this) :
+            List(TGLongT())
+          defmethod set (ns:List<Int>, this) :
+            val done-lbl = fresh-id()
+            set(ns, cexp(a(e)))
+            emit(TGBinCmp(done-lbl, TGNeOp(), TGVar(head(ns)), TGLong(0L)))
+            set(ns, cexp(b(e)))
+            emit(TGLabel(done-lbl))
+      (e:KLSPrim) :
+        fatal("Not yet supported.")
+      (e:KLSSizeof) :
+        new CLSExp & Immediate :
+          defmethod types (this) :
+            List(TGLongT())
+          defmethod imms (this) :            
+            val size = type-size(dec-table, e)
+            List(TGLong(to-long(size)))
+      (e:KLSTagof) :
+        new CLSExp & Immediate :
+          defmethod types (this) : List(TGLongT())
+          defmethod imms (this) : List(TGTag(n(e)))
+      (e:KLSLet) :
+        val b = cexp(body(e))
+        new CLSExp & LSContinuable :
+          defmethod types (this) :
+            types(b)
+          defmethod kont (this, kont:CLSExp -> False) :
+            val ts = tgt-types(dec-table, type(e))
+            val xs = map(make-var, ts)
+            imm-table[n(e)] = xs
+            type-table[n(e)] = ts
+            set(map(n,xs), cexp(value(e)))
+            kont(b)
+      (e:KLSDispatch) :
+        val bs-exps = map(cexp{exp(_)}, branches(e))
+        new CLSExp & LSContinuable :
+          defmethod types (this) :
+            types(head(bs-exps))
+          defmethod kont (this, kont:CLSExp -> False, end?:True|False) :
+            val match-args = seq-append(imms{cexp(_)}, args(e))
+            val bs = map(TGBranch{tags(_), fresh-id()}, branches(e))
+            val done = fresh-id()
+            emit(TGDispatch(match-args, bs))
+            for (b in branches(e), id in seq(n,bs), body in bs-exps) do :
+              emit(TGLabel(id))
+              for (a in args(b), ma in match-args) do :
+                imm-table[a] = List(TGVar(a))
+                type-table[a] = List(TGRefT())
+                emit(TGDef(a, TGRefT()))
+                emit(TGSet(TGVar(a), ma))
+              kont(body)
+              emit(TGGoto(done)) when not end?
+            emit(TGLabel(done)) when not end?
+      (e:KLSTypeObject) :
+        calloc $ append(
+         [TGTag(TYPE-TYPE-ID)
+          TGLong(to-long(length(args(e))))
+          TGMem(n(e),0)]
+          map(cexp, args(e)))
+      (e:KLSClosure) :
+        calloc $ append(
+         [TGTag(FN-TYPE-ID)
+          TGLong(to-long(length(args(e))))
+          TGMem(n(e),0)]
+          map(cexp, args(e)))        
+      (e:KLSDo!) :
+        defn categorize () :
+          val f = func(e) as KLSRead
+          match(loc(f)) :
+            (l:KDeptr) : do-deptr(exp(l))
+            (l:KDeref) : do-deref(exp(l))
+        defn code (f:TGImm) :
+          val x = make-var(TGLongT())
+          emit(TGLoad(x, f, foffset(FN-CODE-FIELD-ID)))
+          x
+        defn do-deptr (f:KLSExp) :
+          make-call(cexp(f), map(cexp, args(e)))
+        defn do-deref (f:KLSExp) :
+          val f* = head(imms(cexp(f)))
+          make-call(code(f*), cons(f*, map(cexp, args(e))))
+        defn imms? (x:TGImm|CLSExp) :
+          match(x) :
+            (x:TGImm) : List(x)
+            (x:CLSExp) : imms(x)
+        defn make-call (f:TGImm|CLSExp, args:List<TGImm|CLSExp>) :
+          new CExp :
+            defmethod types (this) :
+              tgt-types(dec-table, type(e))
+            defmethod set (ns:List<Int>, this) :
+              val xs = map(TGVar, ns)
+              emit(TGCall(arity(e), xs, head(imms?(f)), seq-append(imms?,args)))
+            defmethod tail (this) :
+              emit(TGTCall(arity(e), head(imms?(f)), seq-append(imms?,args)))
+            defmethod ignore (this) :
+              emit(TGCall(arity(e), List(), head(imms?(f)), seq-append(imms?,args)))
+        categorize()
+      (e:KLSCall) :
+        val func = match(extern-label(dec-table, func(e))) :
+          (lbl:Symbol) : TGExMem(lbl,0)
+          (_:False) : TGMem(func(e),0)
+        val args = map(cexp, args(e))
+        new CExp :
+          defmethod types (this) :
+            tgt-types(dec-table, type(e))
+          defmethod set (ns:List<Int>, this) :
+            val xs = map(TGVar, ns)
+            emit(TGCall(arity(e), xs, func, seq-append(imms, args)))
+          defmethod tail (this) :
+            emit(TGTCall(arity(e), func, seq-append(imms, args)))
+          defmethod ignore (this) :
+            emit(TGCall(arity(e), List(), func, seq-append(imms, args)))            
+      (e:KDetagPrim) :
+        fatal("Not yet supported.")
+      (e:KTagPrim) :
+        fatal("Not yet supported.")
+      (e) :
+        fatal("Cannot compile: %_" % [e])
+
+  defn ccomm (c:KLSComm) -> False :
+    match(c) :
+      (c:KLSExec) :
+        fatal("Not yet supported.")
+      (c:KLSSet) :
+        fatal("Not yet supported.")
+      (c:KLSLabels) :
+        fatal("Not yet supported.")
+      (c:KLSGoto) :
+        fatal("Not yet supported.")
+      (c:KLSReturn) :
+        fatal("Not yet supported.")
+      (c:KLSDefLocal) :
+        fatal("Not yet supported.")
+      (c:KLSDefLocalVar) :
+        fatal("Not yet supported.")
+      (c:KLSSeq) :
+        fatal("Not yet supported.")
+      (c:KLSIf) :
+        fatal("Not yet supported.")
+      (c:KLSMatch) :
+        fatal("Not yet supported.")
+      (c:KLSSkip) :
+        fatal("Not yet supported.")
+      (c) :
+        fatal("Cannot compile: %_" % [c])
