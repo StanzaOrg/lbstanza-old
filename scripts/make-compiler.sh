@@ -50,6 +50,7 @@ $STANZA  core/core.stanza \
          compiler/stz-type-to-kform.stanza \
          compiler/stz-kform.stanza \
          compiler/stz-kform-to-tgt.stanza \
+         compiler/stz-reg-alloc.stanza \
          compiler/stz-compiler.stanza \
          compiler/stz-arg-parser.stanza \
          compiler/stz-langs.stanza  \
