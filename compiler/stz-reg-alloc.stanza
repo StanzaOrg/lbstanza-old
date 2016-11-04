@@ -14,6 +14,9 @@ defpackage stz/reg-alloc :
 
 public defn allocate-registers (ins:Collection<TGIns>) :
   load-instructions(ins)
+  remove-critical-edges()
+  compute-predecessors()
+  liveness-analysis()
   print-prog()
   clear-working-set()
 
@@ -80,12 +83,28 @@ public defstruct Branch <: Ins :
   xs: List<Imm>
   killed?: False|List<Int> with: (as-method => true)
 
+public defstruct Save <: Ins :
+   x: Var
+   
+public defstruct Load <: Ins :
+   x: Var
+
 ;==========================
 ;==== Block Definition ====
 ;==========================
 public defstruct Block :
   ins: Vector<Ins>
   next: List<Int>
+
+;========================
+;=== Port Definition ====
+;========================
+defstruct Port :
+   n: Int
+   saved?: True|False
+   loaded?: True|False|Any
+   reg: False|Reg|FReg
+   dist: Int
 
 ;==================================
 ;==== Convenience Constructors ====
@@ -161,6 +180,14 @@ defmethod print (o:OutputStream, op:CastOp) :
   print(o, "cast(%_)" % [tag(op)])
 
 ;============================================================
+;====================== Any =================================
+;============================================================
+
+defstruct Any <: Equalable
+defmethod equal? (a:Any, b:Any) : true
+defmethod print (o:OutputStream, x:Any) : print(o, "any")
+
+;============================================================
 ;====================== Printing ============================
 ;============================================================
 
@@ -169,8 +196,17 @@ defn print-prog () :
     println("val %_ : %_" % [i, VAR-TYPES[i]])
   for i in 0 to nblocks() do :
     println("block %_ :" % [i])
+    if length(IN-PORTS) == nblocks() :
+      println("input ports:")
+      indented $ fn () :
+        do(println, IN-PORTS[i])
+    println("instructions:")
+    if length(OUT-PORTS) == nblocks() :
+      indented $ fn () :
+        println(BLOCKS[i])
+    println("output ports:")
     indented $ fn () :
-      println(BLOCKS[i])
+      do(println, OUT-PORTS[i])
 
 defmethod print (o:OutputStream, v:Imm) :
   print{o, _} $ match(v) :
@@ -215,6 +251,36 @@ defmethod print (o:OutputStream, c:CallType) :
 defmethod print (o:OutputStream, b:Block) :
   do(println{o, _}, ins(b))
   print(o, "next: %," % [next(b)])
+
+defmethod print (o:OutputStream, p:Port) :
+   print(o, "%~ (s:%~, l:%~, at:%~, dist:%~)" % [n(p), saved?(p), loaded?(p), reg(p), dist(p)])
+
+;============================================================
+;=================== Working Functions ======================
+;============================================================
+
+defn do-defined (f: Var -> False, e:Ins) :
+   match(e) :
+      (e:Set) : f(x(e))
+      (e:Args) : do(f, xs(e))
+      (e:Call) : do(f, xs(e))
+      (e:Return) : false
+      (e:Op) : do(f, xs(e))
+      (e:Branch) : false
+      (e:Save) : false
+      (e:Load) : f(x(e))
+
+defn do-used (g: Var -> False, e:Ins) :
+   defn gi (i:Imm) : match(i:Var) : g(i)
+   match(e) :
+      (e:Set) : gi(y(e))
+      (e:Args) : false
+      (e:Call) : (gi(f(e)), do(gi, ys(e)))
+      (e:Return) : do(gi, xs(e))
+      (e:Op) : do(gi, ys(e))
+      (e:Branch) : do(gi, xs(e))
+      (e:Save) : gi(x(e))
+      (e:Load) : false
       
 ;============================================================
 ;===================== Working Set ==========================
@@ -223,8 +289,8 @@ defmethod print (o:OutputStream, b:Block) :
 val CONSTANTS = Vector<TGDefConst>()
 val BLOCKS = Vector<Block>()
 val VAR-TYPES = Vector<TGType>()
-;val IN-PORTS = Vector<List<Port>>()
-;val OUT-PORTS = Vector<List<Port>>()
+val IN-PORTS = Vector<List<Port>>()
+val OUT-PORTS = Vector<List<Port>>()
 val PREDECESSORS = Vector<List<Int>>()
 
 defn nblocks () : length(BLOCKS)
@@ -234,9 +300,6 @@ defn clear-working-set () :
   clear(CONSTANTS)
   clear(BLOCKS)
   clear(VAR-TYPES)
-  ;clear(IN-PORTS)
-  ;clear(OUT-PORTS)
-  clear(PREDECESSORS)
 
 ;============================================================
 ;================= Load into Working Set ====================
@@ -373,3 +436,154 @@ defn load-instructions (instructions:Collection<TGIns>) :
         push(Op(NewStackOp(), List(), List()))
       (e:TGSaveCContext) :
         push(Op(SaveCContextOp(), List(), List()))
+
+;============================================================
+;================= Critical Edge Removal ====================
+;============================================================
+
+defn remove-critical-edges () :
+  ;Count predecessors
+  val num-preds-table = Array<Int>(nblocks(),0)
+  for i in 0 to nblocks() do :
+    val b = BLOCKS[i]
+    for n in next(b) do :
+      num-preds-table[n] = 1 + num-preds-table[n]
+      
+  ;Insert safe blocks
+  defn safe-block (next:Int) :
+    val id = length(BLOCKS)
+    add(BLOCKS, Block(Vector<Ins>(), List(next)))
+    id
+  for i in 0 to nblocks() do :
+    val b = BLOCKS[i]
+    ;If multiple successors
+    if length(next(b)) > 1 :
+      val next* = for n in next(b) map :
+        if num-preds-table[n] > 1 : safe-block(n)
+        else : n
+      BLOCKS[i] = Block(ins(b), next*)
+
+;============================================================
+;================= Compute Predecessors =====================
+;============================================================
+defn compute-predecessors () :
+  clear(PREDECESSORS, nblocks(), List())
+  for (b in BLOCKS, i in 0 to false) do :
+    for n in next(b) do :
+      PREDECESSORS[n] = cons(i, PREDECESSORS[n])
+  
+;============================================================
+;================== Liveness Analysis =======================
+;============================================================
+
+defstruct VarUse :
+  block: Int
+  dist: Int
+
+defn liveness-analysis () :
+  ;Clear state
+  val var-uses = Array<List<VarUse>>(nvars(), List())
+  val block-defs = BitArray(nblocks() * nvars(), false)
+
+  ;Mark uses and defs
+  for (blk in BLOCKS, i in 0 to false) do :
+    ;Marking functions
+    defn mark-defined (v:Var) :
+      block-defs[i * nvars() + n(v)] = true
+    defn defined? (v:Var) :
+      block-defs[i * nvars() + n(v)]
+    defn mark-used (v:Var, d:Int) :
+      if not defined?(v) :
+        val use = VarUse(i,d)
+        var-uses[n(v)] = cons(use, var-uses[n(v)])
+    ;Mark instructions
+    for (e in ins(blk), i in 0 to false) do :
+      do-used(mark-used{_, i}, e)
+      do-defined(mark-defined, e)
+      
+  ;Propagate liveness
+  clear(IN-PORTS, nblocks(), List())
+  clear(OUT-PORTS, nblocks(), List())
+  val in-dists = Array<Int>(nblocks(), INT-MAX)
+  val out-dists = Array<Int>(nblocks(), INT-MAX)
+  val in-dirty = Vector<Int>()
+  val out-dirty = Vector<Int>()
+
+  ;For each variable
+  for (v in 0 to nvars(), uses in var-uses) do :
+    if not empty?(uses) :
+      ;Mark all usages of the variable
+      clear(in-dirty)
+      clear(out-dirty)
+      for use in uses do :
+        mark-live-in(block-defs, in-dists, out-dists, in-dirty, out-dirty,
+                     block(use), v, dist(use))
+      ;Record all live in ports
+      for b in in-dirty do :
+        val p = Port(v, false, Any(), false, in-dists[b])
+        IN-PORTS[b] = cons(p, IN-PORTS[b])
+        in-dists[b] = INT-MAX
+      ;Record all live in ports
+      for b in out-dirty do :
+        val p = Port(v, false, Any(), false, out-dists[b])
+        OUT-PORTS[b] = cons(p, OUT-PORTS[b])        
+        out-dists[b] = INT-MAX      
+
+;Mark that variable v is live-in to block b with distance d
+lostanza defn mark-live-in (defs:ref<BitArray>,
+                            in-dists:ref<Array<Int>>,
+                            out-dists:ref<Array<Int>>,
+                            in-dirty:ref<Vector<Int>>,
+                            out-dirty:ref<Vector<Int>>,
+                            b:ref<Int>,
+                            v:ref<Int>,
+                            d:ref<Int>) -> ref<False> :
+  ;Only mark if distance is smaller
+  val old-value = get(in-dists, b).value
+  if d.value >= old-value : return false
+  set(in-dists, b, d)
+
+  ;Note that block b has been marked
+  if old-value == INT-MAX.value : 
+    add(in-dirty, b)
+    
+  ;Loop through all predecessors of block
+  ;and mark variable v as live-out from them
+  labels :
+    begin :
+      goto loop(get(PREDECESSORS, b))
+    loop (preds:ref<List<Int>>) :
+      if empty?(preds) == false :
+        mark-live-out(defs, in-dists, out-dists, in-dirty, out-dirty, head(preds), v, d)
+        goto loop(tail(preds))
+
+  ;Done
+  return false
+
+
+;Mark that variable v is live-out from block b with distance d
+lostanza defn mark-live-out (defs:ref<BitArray>,
+                             in-dists:ref<Array<Int>>,
+                             out-dists:ref<Array<Int>>,
+                             in-dirty:ref<Vector<Int>>,
+                             out-dirty:ref<Vector<Int>>,
+                             b:ref<Int>,
+                             v:ref<Int>,
+                             d:ref<Int>) -> ref<False> :
+  ;Only mark if distance is smaller
+  val old-value = get(out-dists, b).value
+  if d.value >= old-value : return false
+  set(out-dists, b, d)
+
+  ;Note that block b has been marked
+  if old-value == INT-MAX.value :
+    add(out-dirty, b)
+    
+  ;Mark variable v as live-in to block if not defined in block
+  val idx = b.value * nvars().value + v.value
+  if get(defs, new Int{idx}) == false :
+    val d* = new Int{d.value + length(ins(get(BLOCKS, b))).value}
+    mark-live-in(defs, in-dists, out-dists, in-dirty, out-dirty, b, v, d*)
+      
+  ;Done
+  return false
