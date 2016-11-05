@@ -16,13 +16,17 @@ defpackage stz/reg-alloc :
 public defn allocate-registers (ins:Collection<TGIns>) :
   load-instructions(ins)
   remove-critical-edges()
+  reverse-post-order()
+  println("==== Added Annotations ====")
+  print-prog()
   compute-predecessors()
   liveness-analysis()
   add-annotations()
   println("==== Added Annotations ====")
   print-prog()
   allocate-classes(X86Backend())
-  println("==== Allocated Classes ====")
+  register-assignment(X86Backend())
+  println("==== Assigned Registers ====")
   print-prog()
   clear-working-set()
 
@@ -41,15 +45,30 @@ defstruct Var <: Imm :
 defstruct Val <: Imm :
   value: TGImm
   
-defstruct Reg :
+deftype Loc
+defstruct Reg <: Loc&Equalable :
   n: Int
-defstruct FReg :
+defstruct FReg <: Loc&Equalable :
   n: Int
 
 ;======================
 ;==== Constructors ====
 ;======================
 defn Var (n:Int) : Var(n, false)
+
+defn XReg (t:TGType, n:Int) :
+  match(t:TGIntegerT) : Reg(n)
+  else : FReg(n)
+
+;==================
+;==== Equality ====
+;==================
+
+defmethod equal? (a:Reg, b:Reg) :
+  n(a) == n(b)
+  
+defmethod equal? (a:FReg, b:FReg) :
+  n(a) == n(b)
   
 ;=================================
 ;==== Instruction Definitions ====
@@ -98,13 +117,18 @@ defstruct Load <: Ins :
   x: Var
 
 defstruct Unload <: Ins :
-  x: Var
+  n: Int
 
 defstruct NextUsed <: Ins :
   n: Int
   pos: Int
 
-defmethod killed? (i:Save|Load|Unload|NextUsed) :
+defstruct Xchg <: Ins :
+  x: Var
+  y: Var
+  swap: False|Reg|FReg
+
+defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg) :
   List()
 
 ;==========================
@@ -161,6 +185,14 @@ public defstruct StackSwitch <: CallType
 ;==== Special Ops ====
 ;=====================
 
+public defstruct DivModOp <: TGOp
+defmethod print (o:OutputStream, op:DivModOp) :
+  print(o, "divmod")
+
+public defstruct NoOp <: TGOp
+defmethod print (o:OutputStream, op:NoOp) :
+  print(o, "nop")
+
 public defstruct ConvOp <: TGOp
 defmethod print (o:OutputStream, op:ConvOp) :
   print(o, "conv")
@@ -214,17 +246,18 @@ defn print-prog () :
     println("val %_ : %_" % [i, VAR-TYPES[i]])
   for i in 0 to nblocks() do :
     println("block %_ :" % [i])
-    if length(IN-PORTS) == nblocks() :
-      println("input ports:")
-      indented $ fn () :
-        do(println, IN-PORTS[i])
-    println("instructions:")
-    if length(OUT-PORTS) == nblocks() :
+    indented $ fn () :
+      if length(IN-PORTS) == nblocks() :
+        println("input ports:")
+        indented $ fn () :
+          do(println, IN-PORTS[i])
+      println("instructions:")
       indented $ fn () :
         println(BLOCKS[i])
-    println("output ports:")
-    indented $ fn () :
-      do(println, OUT-PORTS[i])
+      if length(OUT-PORTS) == nblocks() :
+        println("output ports:")
+        indented $ fn () :
+          do(println, OUT-PORTS[i])
 
 defmethod print (o:OutputStream, v:Imm) :
   print{o, _} $ match(v) :
@@ -255,8 +288,9 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:Branch) : "branch when %_(%,)%_" % [op(i), xs(i), ks]
     (i:Save) : "save %_" % [x(i)]
     (i:Load) : "load %_" % [x(i)]    
-    (i:Unload) : "unload %_" % [x(i)]
+    (i:Unload) : "unload V%_" % [n(i)]
     (i:NextUsed) : "next used %_ at %_" % [n(i), pos(i)]
+    (i:Xchg) : "xchg %_ with %_ through %_" % [x(i), y(i), swap(i)]
 
 defmethod print (o:OutputStream, c:FnContext) :
   print{o, _} $ match(c) :
@@ -533,6 +567,34 @@ defn remove-critical-edges () :
       BLOCKS[i] = Block(ins(b), next*)
 
 ;============================================================
+;================== Reverse Post Ordering ===================
+;============================================================
+defn reverse-post-order () :
+  ;Compute ordering
+  val blocks = Vector<Block>()
+  val mapping = HashTable<Int,False|Int>()
+  defn order (n:Int) :
+    if not key?(mapping, n) :
+      mapping[n] = false
+      val blk = BLOCKS[n]
+      do(order, next(blk))
+      mapping[n] = length(blocks)
+      add(blocks, blk)
+  do(order, 0 to nblocks())
+  
+  ;New mapping
+  val num-blocks = length(blocks)
+  defn next* (b:Block) :
+    for n in next(b) map :
+      val n* = mapping[n] as Int
+      num-blocks - 1 - n*
+  
+  ;Update block list
+  clear(BLOCKS)
+  for b in in-reverse(blocks) do :
+    add(BLOCKS, Block(ins(b), next*(b)))
+
+;============================================================
 ;================= Compute Predecessors =====================
 ;============================================================
 defn compute-predecessors () :
@@ -727,10 +789,10 @@ defn add-annotations (blk:Block, b:Int) :
       fn (x:Var):
         ;Unload the variable if it is never used
         if not live?(n(x)) :
-          emit(Unload(x))
-        ;Unload the variable if it doesn't prefer to be loaded.
+          emit(Unload(n(x)))
+        ;Otherwise unload the variable if it doesn't prefer to be loaded.
         else if not prefers-load[n(x)] :
-          emit(Unload(x))          
+          emit(Unload(n(x)))
         ;Save the variable if it needs to be saved
         if requires-save[n(x)] :
           emit(Save(x))
@@ -835,7 +897,7 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
   defn ensure-loaded (n:Int, buffer:False|Vector<Ins>) :
     add?(buffer, Load(Var(n))) when mark-loaded(n)
   defn ensure-unloaded (n:Int, buffer:False|Vector<Ins>) :
-    add?(buffer, Unload(Var(n))) when mark-unloaded(n)
+    add?(buffer, Unload(n)) when mark-unloaded(n)
 
   ;==================
   ;==== Spilling ====
@@ -888,7 +950,7 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
       (e:NextUsed) :
         mark-next-use(n(e), pos(e))
       (e:Unload) :
-        ensure-unloaded(n(x(e)), instructions)
+        ensure-unloaded(n(e), instructions)
       (e:Save) :
         ensure-saved(n(x(e)), instructions)
       (e) :
@@ -912,6 +974,279 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
   ;Update block and output ports
   BLOCKS[b] = Block(instructions, next(blk))
   OUT-PORTS[b] = map(annotate, OUT-PORTS[b])
+
+;============================================================
+;================== Register Assignment =====================
+;============================================================
+
+;=======================
+;==== Free Register ====
+;=======================
+
+defstruct FreeReg <: Loc :
+  prefer: List<Int>
+
+defn FreeReg () :
+  FreeReg(List())
+
+defn PrefReg (xs:List<Imm>) :
+  val ns = seq(n, filter-by<Var>(xs))
+  FreeReg(to-list(ns))
+
+defn PrefReg (x:Imm) :
+  match(x:Var) : FreeReg(List(n(x)))
+  else : FreeReg()
+
+defmethod print (o:OutputStream, r:FreeReg) :
+  print(o, "FreeReg(%,)" % [prefer(r)])
+
+;===================
+;==== Algorithm ====
+;===================
+
+defn register-assignment (backend:Backend) :
+  for (blk in BLOCKS, b in 0 to false) do :
+    register-assignment(blk, b, backend)
+
+defn register-assignment (blk:Block, b:Int, backend:Backend) :
+  ;============================
+  ;==== Instruction Buffer ====
+  ;============================
+  val instructions = Vector<Ins>()
+  defn emit (e:Ins) : add(instructions ,e)
+
+  ;===========================
+  ;==== Register Tracking ====
+  ;===========================
+  val var-locs = Array<False|Reg|FReg>(nvars(), false)
+  val reg-slots = Array<False|Int>(num-regs(backend), false)
+  val freg-slots = Array<False|Int>(num-regs(backend), false)
+    
+  ;Set and retrieve variable occupying a register    
+  defn set-slot (r:Reg|FReg, x:False|Int) :
+    match(r) :
+      (r:Reg) : reg-slots[n(r)] = x
+      (r:FReg) : freg-slots[n(r)] = x
+
+  defn slot (r:Reg|FReg) :
+    match(r) :
+      (r:Reg) : reg-slots[n(r)]
+      (r:FReg) : freg-slots[n(r)]
+
+  ;Retrieve register listing
+  defn all-regs (t:TGType) :
+    match(t:TGIntegerT) : seq(Reg, 0 to length(reg-slots))
+    else : seq(FReg, 0 to length(freg-slots))
+    
+  defn all-regs () :
+    cat(
+      seq(Reg, 0 to length(reg-slots))
+      seq(FReg, 0 to length(freg-slots)))
+
+  ;Free the variable x from its register
+  defn free-var (x:Int) :
+    match(var-locs[x]) :
+      (reg:Reg|FReg) :
+        set-slot(reg, false)
+        var-locs[x] = false
+      (reg:False) :
+        fatal("Var %_ not in register." % [x]) when reg is False
+
+  ;Free all registers
+  defn free-all-regs () :
+    for reg in all-regs() do :
+      val x = slot(reg)
+      match(x:Int) :
+        var-locs[x] = false
+        set-slot(reg, false)
+
+  ;Find an available register (assumes that one is available).  
+  defn available-reg? (t:TGType, pref:List<Int>) :
+    val pref-regs = seq(XReg{t, _}, pref)
+    find({slot(_) is False}, pref-regs) as Reg|FReg or
+    find({slot(_) is False}, all-regs(t))
+  defn available-reg (t:TGType, pref:List<Int>) :
+    available-reg?(t,pref) as Reg|FReg
+    
+  ;Assign a variable to a location
+  defn assign (x:Int, r:Loc) :
+    match(r) :
+      (r:Reg|FReg) :
+        var-locs[x] = r
+        set-slot(r, x)        
+      (r:FreeReg) :
+        assign(x, available-reg(VAR-TYPES[x], prefer(r)))
+
+  ;Convenience
+  defn assign (x:Var|Port, r:Loc) :
+    assign(n(x), r)
+  defn assign (xs:List<Var|Port>, r:Loc) :
+    do(assign{_, r}, xs)
+
+  ;Assign several locations
+  defn assign (xs:List<Var|Port>, rs:List<Loc>) :
+    for (x in xs, r in rs) do :
+      assign(x, r) when r is-not FreeReg
+    for (x in xs, r in rs) do :
+      assign(x, r) when r is FreeReg
+
+  ;==============================
+  ;==== Port/Var Information ====
+  ;==============================
+  defn annotate (p:Port) :
+    var reg = var-locs[n(p)]
+    Port(n(p), saved?(p), reg is Reg|FReg, reg, dist(p))
+  defn annotate<?T> (x:?T&Imm) -> T :
+    match(x:Var) : Var(n(x), var-locs[n(x)]) as T&Imm
+    else : x
+
+  ;===========================
+  ;==== Register Swapping ====
+  ;===========================
+  ;Move contents of src into dst.
+  ;If dst is occupied, then swap the contents of the two registers.
+  defn swap-reg (src:Reg|FReg, dst:Reg|FReg) :
+    val x = slot(src) as Int
+    match(slot(dst)) :
+      ;Dst is unoccupied: Emit move
+      (y:False) :
+        emit(Set(Var(x,dst), Var(x,src)))
+        free-var(x)
+        assign(x,dst)
+      ;Dst is occupied: Emit swap
+      (y:Int) :
+        val regtype = TGIntT() when src is Reg else TGFloatT()
+        val swap = available-reg?(regtype, List())
+        emit(Xchg(Var(x,src), Var(y,dst), swap))
+        free-var(x)
+        free-var(y)
+        assign(x,dst)
+        assign(y,src)        
+
+  ;Ensure that regs will be available once xs are freed
+  defn ensure-available (regs:List<Reg|FReg>, xs:List<Int>) :
+    ;Will be available
+    defn available? (r:Reg|FReg) :
+      match(slot(r)) :
+        (x:Int) : contains?(xs,x)
+        (x:False) : true     
+    ;Swap candidates
+    defn safe-swap? (r:Reg|FReg) :
+      available?(r) and not contains?(regs, r)
+    val swaps = filter(safe-swap?, all-regs(TGIntT()))
+    val fswaps = filter(safe-swap?, all-regs(TGFloatT()))
+    ;Swap out registers
+    for r in regs do :
+      if not available?(r) :
+        swap-reg{r, next(_)} $
+          match(r:Reg) : swaps
+          else : fswaps
+
+  ;Ensure that value x is in register r
+  defn ensure-location (x:Int, reg:Reg|FReg) :
+    val src = var-locs[x] as Reg|FReg
+    swap-reg(src, reg) when src != reg
+
+  ;===================
+  ;==== Algorithm ====
+  ;===================
+  ;Assign input ports
+  val in-ports = IN-PORTS[b]
+  if not empty?(in-ports) :
+    ;Retrieve output ports of predecessor block
+    println("b = %_. Predecessors = %," % [b, PREDECESSORS[b]])
+    val pred = find!({_ < b}, PREDECESSORS[b])
+    val port-table = Array<Port>(nvars())
+    for p in OUT-PORTS[pred] do : port-table[n(p)] = p
+    ;Calculate port locations
+    val port-assigns = to-list $ for p in in-ports seq? :
+      match(loaded?(p), reg(port-table[n(p)])) :
+        (l1:True, r:Reg|FReg) : One(p => r)
+        (l1:True, r:False) : One(p => FreeReg())
+        (l1:False, r) : None()
+    ;Assign ports
+    assign(map(key, port-assigns), map(value, port-assigns))
+    IN-PORTS[b] = map(annotate, in-ports)
+
+  ;Sweep through instructions
+  for e in ins(blk) do :
+    match(e) :
+      (e:Set) :
+        val y* = annotate(y(e))
+        do(free-var, killed(e))
+        assign(x(e), PrefReg(y*))
+        emit(Set(annotate(x(e)), y*))
+      (e:Branch) :
+        emit(Branch(op(e), map(annotate, xs(e))))
+        do(free-var, killed(e))
+      (e:Return) :
+        emit(Return(map(annotate,xs(e)), ctxt(e)))
+        do(free-var, killed(e))
+      (e:Args) :
+        do(free-var, killed(e))
+        assign(xs(e), FreeReg())
+        emit(Args(map(annotate,xs(e)), ctxt(e)))
+      (e:Call) :
+        val f* = annotate(f(e))
+        val ys* = map(annotate,ys(e))
+        free-all-regs()
+        assign(xs(e), FreeReg())
+        emit(Call(map(annotate,xs(e)), f*, ys*, type(e)))
+      (e:Save) :
+        emit(Save(annotate(x(e))))
+      (e:Load) :
+        assign(x(e), FreeReg())
+        emit(Load(annotate(x(e))))
+      (e:Unload) :
+        free-var(n(e))
+      (e:Op) :
+        defn assign-prefs (pref:List<Imm> -> Loc|List<Loc>) :
+          val ys* = map(annotate, ys(e))
+          do(free-var, killed(e))
+          assign(xs(e), pref(ys*))
+          val xs* = map(annotate, xs(e))
+          emit(Op(op(e), xs*, ys*))
+        defn assign-prefs (loc:Loc|List<Loc>) :
+          assign-prefs({loc})
+          
+        match(op(e)) :
+          ;Prefers first argument
+          (op:TGSubOp|TGDivOp|TGModOp) :
+            assign-prefs(PrefReg{head(_)})
+          ;Prefers any argument
+          (op:LoadOp|TGAddOp|TGMulOp|TGAndOp|TGOrOp|TGXorOp|
+              TGNotOp|TGNegOp|ConvOp|InterpretOp) :
+            assign-prefs(PrefReg)
+          ;Second argument in R2, prefer first argument
+          (op:TGShlOp|TGShrOp|TGAshrOp) :
+            val y = ys(e)[1]
+            match(y:Var) : ensure-location(n(y), Reg(2))
+            assign-prefs(PrefReg{head(_)})
+          ;Requires R0,R3
+          (op:DivModOp) :
+            val rs = List(Reg(0), Reg(3))
+            ensure-available(rs, killed(e))
+            assign-prefs(rs)
+          ;Any register will do
+          (op:StoreOp|SaveCContextOp|NewStackOp) :
+            assign-prefs(FreeReg())
+          ;Any register will do
+          (op:TGEqOp|TGNeOp|TGLtOp|TGGtOp|TGLeOp|TGGeOp|
+              TGUleOp|TGUltOp|TGUgtOp|TGUgeOp|
+              TGArityNeOp|TGArityNeOp|TGHasStackSpace) :
+            assign-prefs(FreeReg())
+          ;Nop
+          (op:NoOp) :
+            do(free-var, killed(e))
+          ;Otherwise
+          (op) :
+            fatal("Not supported: %_" % [op])
+      (e) :
+        fatal("%_ not supported." % [e])
+
+  ;Update block/ports
+  BLOCKS[b] = Block(instructions, next(blk))
+  OUT-PORTS[b] = map(annotate, OUT-PORTS[b])  
 
 ;============================================================
 ;====================== Utilities ===========================
