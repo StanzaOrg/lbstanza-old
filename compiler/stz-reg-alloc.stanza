@@ -15,9 +15,13 @@ defpackage stz/reg-alloc :
 
 public defn allocate-registers (ins:Collection<TGIns>) :
   load-instructions(ins)
+  println("==== Load Instructions ====")
+  print-prog()
   remove-critical-edges()
+  println("==== Remove Critical Edges ====")
+  print-prog()
   reverse-post-order()
-  println("==== Added Annotations ====")
+  println("==== Reverse Post Order ====")
   print-prog()
   compute-predecessors()
   liveness-analysis()
@@ -110,6 +114,13 @@ defstruct Branch <: Ins :
   xs: List<Imm>
   killed?: False|List<Int> with: (as-method => true)
 
+defstruct Match <: Ins :
+  dispatch?: True|False
+  tag-lists: List<List<KTag>>
+  xs: List<Imm>
+  scratch?: False|List<Reg>
+  killed?: False|List<Int> with: (as-method => true)
+
 defstruct Save <: Ins :
   x: Var
    
@@ -158,6 +169,8 @@ public defn Return (xs:List<Imm>, ctxt:FnContext) : Return(xs, ctxt, false)
 public defn Call (xs:List<Var>, f:Imm, ys:List<Imm>, type:CallType) : Call(xs, f, ys, type, false)
 public defn Op (op:TGOp, xs:List<Var>, ys:List<Imm>) : Op(op, xs, ys, false)
 public defn Branch (op:TGOp, xs:List<Imm>) : Branch(op, xs, false)
+public defn Match (d?:True|False, ts:List<List<KTag>>, xs:List<Imm>) :
+  Match(d?, ts, xs, false, false)
 
 ;==========================
 ;==== Function Context ====
@@ -217,14 +230,6 @@ public defstruct StoreOp <: TGOp : (offset:Int)
 defmethod print (o:OutputStream, op:StoreOp) :
   print(o, "store/%_" % [offset(op)])
 
-public defstruct MatchOp <: TGOp : (tagss:List<List<KTag>>)
-defmethod print (o:OutputStream, op:MatchOp) :
-  print(o, "match(%,)" % [tagss(op)])
-
-public defstruct DispatchOp <: TGOp : (tagss:List<List<KTag>>)
-defmethod print (o:OutputStream, op:DispatchOp) :
-  print(o, "dispatch(%,)" % [tagss(op)])
-
 public defstruct CastOp <: TGOp : (tag:KTag)
 defmethod print (o:OutputStream, op:CastOp) :
   print(o, "cast(%_)" % [tag(op)])
@@ -246,13 +251,15 @@ defn print-prog () :
     println("val %_ : %_" % [i, VAR-TYPES[i]])
   for i in 0 to nblocks() do :
     println("block %_ :" % [i])
-    indented $ fn () :
+    indented $ fn () :      
       if length(IN-PORTS) == nblocks() :
         println("input ports:")
         indented $ fn () :
           do(println, IN-PORTS[i])
       println("instructions:")
       indented $ fn () :
+        if length(PREDECESSORS) == nblocks() :
+          println("prev: %," % [PREDECESSORS[i]])
         println(BLOCKS[i])
       if length(OUT-PORTS) == nblocks() :
         println("output ports:")
@@ -291,6 +298,12 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:Unload) : "unload V%_" % [n(i)]
     (i:NextUsed) : "next used %_ at %_" % [n(i), pos(i)]
     (i:Xchg) : "xchg %_ with %_ through %_" % [x(i), y(i), swap(i)]
+    (i:Match) :
+      val op = "dispatch" when dispatch?(i) else "match"
+      val sc = match(scratch?(i)) :
+                 (s:False) : ""
+                 (s:List<Reg>) : " (using %,)" % [s]
+      "%_(%,)%_%_" % [op, xs(i), tag-lists(i), ks]
 
 defmethod print (o:OutputStream, c:FnContext) :
   print{o, _} $ match(c) :
@@ -325,6 +338,7 @@ defn do-defined (f: Var -> ?, e:Ins) :
     (e:Branch) : false
     (e:Save) : false
     (e:Load) : f(x(e))
+    (e:Match) : false
   false
 
 defn do-used (gv: Var -> ?, e:Ins) :
@@ -338,6 +352,7 @@ defn do-used (gv: Var -> ?, e:Ins) :
     (e:Branch) : do(g, xs(e))
     (e:Save) : g(x(e))
     (e:Load) : false
+    (e:Match) : do(g, xs(e))
   false
 
 defn used-vars (e:Ins) :
@@ -375,6 +390,9 @@ defn reverse-sweep (e:Ins, define:Var -> ?, emit:Ins -> ?, use-var:Var -> ?) :
     (e:Branch) :
       emit(e)
       do(use, xs(e))
+    (e:Match) :
+      emit(e)
+      do(use, xs(e))
 
 defn update-killed (e:Ins, ks:List<Int>) :
   match(e) :
@@ -384,6 +402,7 @@ defn update-killed (e:Ins, ks:List<Int>) :
     (e:Call) : Call(xs(e), f(e), ys(e), type(e), ks)
     (e:Op) : Op(op(e), xs(e), ys(e), ks)
     (e:Branch) : Branch(op(e), xs(e), ks)
+    (e:Match) : Match(dispatch?(e), tag-lists(e), xs(e), scratch?(e), ks)
       
 ;============================================================
 ;===================== Working Set ==========================
@@ -518,14 +537,10 @@ defn load-instructions (instructions:Collection<TGIns>) :
         val alt = fresh-id()
         close-block(List(n(e), alt))
         open-block(alt)
-      (e:TGMatch) :
-        push(Branch(MatchOp(map(tags, branches(e))), get-imms(xs(e))))
+      (e:TGMatch|TGDispatch) :
+        val ts = map(tags, branches(e))
+        push(Match(e is TGDispatch, ts, get-imms(xs(e))))
         close-block(map(n, branches(e)))
-      (e:TGDispatch) :
-        push(Branch(DispatchOp(map(tags, branches(e))), get-imms(xs(e))))
-        close-block(map(n, branches(e)))
-      (e:TGCast) :
-        push(Op(CastOp(tag(e)), List(), List(get-imm(x(e)))))
       (e:TGCallC) :
         val type = CCall(length(ys(e)), length(vs(e)))
         val args = append(get-imms(ys(e)), get-imms(vs(e)))
@@ -544,28 +559,36 @@ defn load-instructions (instructions:Collection<TGIns>) :
 ;================= Critical Edge Removal ====================
 ;============================================================
 
-defn remove-critical-edges () :
+defn remove-critical-edges () :  
   ;Count predecessors
   val num-preds-table = Array<Int>(nblocks(),0)
-  for i in 0 to nblocks() do :
-    val b = BLOCKS[i]
+  for (b in BLOCKS, i in 0 to false) do :
     for n in next(b) do :
       num-preds-table[n] = 1 + num-preds-table[n]
       
-  ;Insert safe blocks
-  defn safe-block (next:Int) :
-    val id = length(BLOCKS)
-    add(BLOCKS, Block(Vector<Ins>(), List(next)))
-    id
-  for i in 0 to nblocks() do :
-    val b = BLOCKS[i]
-    ;If multiple successors
-    if length(next(b)) > 1 :
-      val next* = for n in next(b) map :
-        if num-preds-table[n] > 1 : safe-block(n)
-        else : n
-      BLOCKS[i] = Block(ins(b), next*)
+  ;Create safe blocks
+  val mapping = HashTable<Int,Int>()
+  defn create-safe-block (n:Int) :
+    if not key?(mapping, n) :
+      val id = length(BLOCKS)
+      add(BLOCKS, Block(Vector<Ins>(), List(n)))
+      mapping[n] = id
 
+  ;Create safe blocks for critical edges
+  val current-nblocks = nblocks()
+  for blk in BLOCKS do :
+    if length(next(blk)) > 1 :
+      for n in next(blk) do :
+        if num-preds-table[n] > 1 :
+          create-safe-block(n)
+
+  ;Update mappings
+  for b in 0 to current-nblocks do :
+    val blk = BLOCKS[b]
+    val next* = for n in next(blk) map :
+      get?(mapping, n, n)
+    BLOCKS[b] = Block(ins(blk), next*)
+    
 ;============================================================
 ;================== Reverse Post Ordering ===================
 ;============================================================
@@ -573,21 +596,20 @@ defn reverse-post-order () :
   ;Compute ordering
   val blocks = Vector<Block>()
   val mapping = HashTable<Int,False|Int>()
-  defn order (n:Int) :
+  let order (n:Int = 0) :
     if not key?(mapping, n) :
       mapping[n] = false
       val blk = BLOCKS[n]
       do(order, next(blk))
       mapping[n] = length(blocks)
       add(blocks, blk)
-  do(order, 0 to nblocks())
   
   ;New mapping
   val num-blocks = length(blocks)
   defn next* (b:Block) :
     for n in next(b) map :
-      val n* = mapping[n] as Int
-      num-blocks - 1 - n*
+      val i = mapping[n] as Int
+      num-blocks - 1 - i
   
   ;Update block list
   clear(BLOCKS)
@@ -953,6 +975,16 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
         ensure-unloaded(n(e), instructions)
       (e:Save) :
         ensure-saved(n(x(e)), instructions)
+      (e:Match) :
+        ;Reserve 2 registers for scratch
+        while num-free-reg < 2 :
+          spill-reg(true, instructions)
+        ;Load as many arguments as possible
+        for x in e do-used :
+          if num-free-reg >= 2 :
+            ensure-loaded(n(x), instructions)
+        ;Emit
+        add(instructions, e)            
       (e) :
         ;Load arguments
         for x in e do-used :
@@ -990,12 +1022,16 @@ defn FreeReg () :
   FreeReg(List())
 
 defn PrefReg (xs:List<Imm>) :
-  val ns = seq(n, filter-by<Var>(xs))
-  FreeReg(to-list(ns))
+  val regs = for x in xs seq? :
+    match(x:Var) :
+      match(reg?(x)) :
+        (r:Reg|FReg) : One(n(r))
+        (r:False) : None()
+    else : None()
+  FreeReg(to-list(regs))
 
 defn PrefReg (x:Imm) :
-  match(x:Var) : FreeReg(List(n(x)))
-  else : FreeReg()
+  PrefReg(List(x))
 
 defmethod print (o:OutputStream, r:FreeReg) :
   print(o, "FreeReg(%,)" % [prefer(r)])
@@ -1067,6 +1103,11 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
     find({slot(_) is False}, all-regs(t))
   defn available-reg (t:TGType, pref:List<Int>) :
     available-reg?(t,pref) as Reg|FReg
+    
+  ;Find n available registers
+  defn available-regs (n:Int, t:TGType) :
+    val rs = filter({slot(_) is False}, all-regs(t))
+    to-list(take-n(n, rs))
     
   ;Assign a variable to a location
   defn assign (x:Int, r:Loc) :
@@ -1153,8 +1194,8 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
   ;Assign input ports
   val in-ports = IN-PORTS[b]
   if not empty?(in-ports) :
+    println("For block %_:" % [b])
     ;Retrieve output ports of predecessor block
-    println("b = %_. Predecessors = %," % [b, PREDECESSORS[b]])
     val pred = find!({_ < b}, PREDECESSORS[b])
     val port-table = Array<Port>(nvars())
     for p in OUT-PORTS[pred] do : port-table[n(p)] = p
@@ -1199,6 +1240,11 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
         emit(Load(annotate(x(e))))
       (e:Unload) :
         free-var(n(e))
+      (e:Match) :
+        val xs* = map(annotate, xs(e))
+        val rs* = available-regs(2, TGIntT()) as List<Reg>
+        do(free-var, killed(e))
+        emit(Match(dispatch?(e), tag-lists(e), xs*, rs*, false))
       (e:Op) :
         defn assign-prefs (pref:List<Imm> -> Loc|List<Loc>) :
           val ys* = map(annotate, ys(e))
