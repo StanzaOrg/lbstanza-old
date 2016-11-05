@@ -7,6 +7,7 @@ defpackage stz/reg-alloc :
   import stz/tgt-ir
   import stz/kl-ir
   import stz/ids
+  import stz/backend
 
 ;============================================================
 ;===================== Driver ===============================
@@ -17,12 +18,13 @@ public defn allocate-registers (ins:Collection<TGIns>) :
   remove-critical-edges()
   compute-predecessors()
   liveness-analysis()
+  add-annotations()
+  println("==== Added Annotations ====")
+  print-prog()
+  allocate-classes(X86Backend())
+  println("==== Allocated Classes ====")
   print-prog()
   clear-working-set()
-
-;============================================================
-;======================= Utilities ==========================
-;============================================================
 
 ;============================================================
 ;========================== IR ==============================
@@ -43,51 +45,67 @@ defstruct Reg :
   n: Int
 defstruct FReg :
   n: Int
+
+;======================
+;==== Constructors ====
+;======================
+defn Var (n:Int) : Var(n, false)
   
 ;=================================
 ;==== Instruction Definitions ====
 ;=================================
-public deftype Ins
-public defmulti killed? (i:Ins) -> False|List<Int>
+deftype Ins
+defmulti killed? (i:Ins) -> False|List<Int>
+defn killed (i:Ins) : killed?(i) as List<Int>
 
-public defstruct Set <: Ins :
+defstruct Set <: Ins :
   x: Var
   y: Imm
   killed?: False|List<Int> with: (as-method => true)
 
-public defstruct Args <: Ins :
+defstruct Args <: Ins :
   xs: List<Var>
   ctxt: FnContext
   killed?: False|List<Int> with: (as-method => true)
 
-public defstruct Return <: Ins :
+defstruct Return <: Ins :
   xs: List<Imm>
   ctxt: FnContext
   killed?: False|List<Int> with: (as-method => true)
    
-public defstruct Call <: Ins :
+defstruct Call <: Ins :
   xs: List<Var>
   f: Imm
   ys: List<Imm>
   type: CallType
   killed?: False|List<Int> with: (as-method => true)
    
-public defstruct Op <: Ins :
+defstruct Op <: Ins :
   op: TGOp
   xs: List<Var>
   ys: List<Imm>   
   killed?: False|List<Int> with: (as-method => true)
 
-public defstruct Branch <: Ins :
+defstruct Branch <: Ins :
   op: TGOp
   xs: List<Imm>
   killed?: False|List<Int> with: (as-method => true)
 
-public defstruct Save <: Ins :
-   x: Var
+defstruct Save <: Ins :
+  x: Var
    
-public defstruct Load <: Ins :
-   x: Var
+defstruct Load <: Ins :
+  x: Var
+
+defstruct Unload <: Ins :
+  x: Var
+
+defstruct NextUsed <: Ins :
+  n: Int
+  pos: Int
+
+defmethod killed? (i:Save|Load|Unload|NextUsed) :
+  List()
 
 ;==========================
 ;==== Block Definition ====
@@ -235,6 +253,10 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:Return) : "return (%,)%_" % [xs(i), ks]
     (i:Op) : "(%,) = %_(%,)%_" % [xs(i), op(i), ys(i), ks]
     (i:Branch) : "branch when %_(%,)%_" % [op(i), xs(i), ks]
+    (i:Save) : "save %_" % [x(i)]
+    (i:Load) : "load %_" % [x(i)]    
+    (i:Unload) : "unload %_" % [x(i)]
+    (i:NextUsed) : "next used %_ at %_" % [n(i), pos(i)]
 
 defmethod print (o:OutputStream, c:FnContext) :
   print{o, _} $ match(c) :
@@ -259,28 +281,75 @@ defmethod print (o:OutputStream, p:Port) :
 ;=================== Working Functions ======================
 ;============================================================
 
-defn do-defined (f: Var -> False, e:Ins) :
-   match(e) :
-      (e:Set) : f(x(e))
-      (e:Args) : do(f, xs(e))
-      (e:Call) : do(f, xs(e))
-      (e:Return) : false
-      (e:Op) : do(f, xs(e))
-      (e:Branch) : false
-      (e:Save) : false
-      (e:Load) : f(x(e))
+defn do-defined (f: Var -> ?, e:Ins) :
+  match(e) :
+    (e:Set) : f(x(e))
+    (e:Args) : do(f, xs(e))
+    (e:Call) : do(f, xs(e))
+    (e:Return) : false
+    (e:Op) : do(f, xs(e))
+    (e:Branch) : false
+    (e:Save) : false
+    (e:Load) : f(x(e))
+  false
 
-defn do-used (g: Var -> False, e:Ins) :
-   defn gi (i:Imm) : match(i:Var) : g(i)
-   match(e) :
-      (e:Set) : gi(y(e))
-      (e:Args) : false
-      (e:Call) : (gi(f(e)), do(gi, ys(e)))
-      (e:Return) : do(gi, xs(e))
-      (e:Op) : do(gi, ys(e))
-      (e:Branch) : do(gi, xs(e))
-      (e:Save) : gi(x(e))
-      (e:Load) : false
+defn do-used (gv: Var -> ?, e:Ins) :
+  defn g (i:Imm) : match(i:Var) : gv(i)
+  match(e) :
+    (e:Set) : g(y(e))
+    (e:Args) : false
+    (e:Call) : (g(f(e)), do(g, ys(e)))
+    (e:Return) : do(g, xs(e))
+    (e:Op) : do(g, ys(e))
+    (e:Branch) : do(g, xs(e))
+    (e:Save) : g(x(e))
+    (e:Load) : false
+  false
+
+defn used-vars (e:Ins) :
+  generate<Int> :
+    do-used(yield{n(_)}, e)
+
+defn do-vars (f: Var -> ?, e:Ins) :
+  do-defined(f, e)
+  do-used(f, e)  
+
+defn reverse-sweep (e:Ins, define:Var -> ?, emit:Ins -> ?, use-var:Var -> ?) :
+  defn use (x:Imm) :
+   match(x:Var) :
+     use-var(x)
+  match(e) :
+    (e:Set) :
+      define(x(e))
+      emit(e)
+      use(y(e))
+    (e:Args) :
+      do(define, xs(e))
+      emit(e)
+    (e:Call) :
+      do(define, xs(e))
+      emit(e)
+      use(f(e))
+      do(use, ys(e))
+    (e:Return) :
+      emit(e)
+      do(use, xs(e))
+    (e:Op) :
+      do(define, xs(e))
+      emit(e)
+      do(use, ys(e))
+    (e:Branch) :
+      emit(e)
+      do(use, xs(e))
+
+defn update-killed (e:Ins, ks:List<Int>) :
+  match(e) :
+    (e:Set) : Set(x(e), y(e), ks)
+    (e:Args) : Args(xs(e), ctxt(e), ks)
+    (e:Return) : Return(xs(e), ctxt(e), ks)
+    (e:Call) : Call(xs(e), f(e), ys(e), type(e), ks)
+    (e:Op) : Op(op(e), xs(e), ys(e), ks)
+    (e:Branch) : Branch(op(e), xs(e), ks)
       
 ;============================================================
 ;===================== Working Set ==========================
@@ -587,3 +656,274 @@ lostanza defn mark-live-out (defs:ref<BitArray>,
       
   ;Done
   return false
+
+;============================================================
+;===================== Add Annotations ======================
+;============================================================
+
+defn add-annotations () :
+  do(add-annotations, BLOCKS, 0 to false)    
+
+defn add-annotations (blk:Block, b:Int) :
+  ;===========================
+  ;==== Liveness Tracking ====
+  ;===========================
+  val usages = Array<False|Int>(nvars(), false)
+  val live-dirty = Vector<Int>()
+
+  defn mark-used (n:Int, dist:Int) :
+    add(live-dirty, n)
+    usages[n] = dist
+
+  defn mark-defined (n:Int) :
+    usages[n] = false
+  
+  defn live? (n:Int) :
+    usages[n] is Int
+
+  defn do-live (f: Int -> ?) :
+    for x in live-dirty remove-when :
+      if live?(x) : (f(x), false)
+      else : true
+
+  ;=============================
+  ;==== Preference Tracking ====
+  ;=============================
+  ;The remaining code prefers the variable to be loaded.
+  val prefers-load = Array<True|False>(nvars(), true)
+  
+  ;The remaining code expects the variable to be saved.
+  val requires-save = Array<True|False>(nvars(), false)
+
+  ;============================
+  ;==== Instruction Buffer ====
+  ;============================
+  val instructions = Vector<Ins>()
+  defn emit (e:Ins) : add(instructions, e)
+
+  ;==========================
+  ;==== Port Information ====
+  ;==========================
+  defn annotate (p:Port) :
+    val v = n(p)
+    Port(v, requires-save[v], prefers-load[v], reg(p), dist(p))
+
+  ;===================
+  ;==== Algorithm ====
+  ;===================  
+  ;Note usages of output ports
+  val num-ins = length(ins(blk))
+  for p in OUT-PORTS[b] do :
+    mark-used(n(p), num-ins + dist(p))
+  
+  for (e in in-reverse(ins(blk)), i in (num-ins - 1) through 0 by -1) do :
+    ;Notate next usages of variables
+    for x in e do-vars :    
+      if live?(n(x)) :
+        emit(NextUsed(n(x), usages[n(x)] as Int))
+      
+    reverse-sweep(e
+      ;Defined
+      fn (x:Var):
+        ;Unload the variable if it is never used
+        if not live?(n(x)) :
+          emit(Unload(x))
+        ;Unload the variable if it doesn't prefer to be loaded.
+        else if not prefers-load[n(x)] :
+          emit(Unload(x))          
+        ;Save the variable if it needs to be saved
+        if requires-save[n(x)] :
+          emit(Save(x))
+        ;Variable is no longer live
+        mark-defined(n(x))
+        requires-save[n(x)] = false
+        prefers-load[n(x)] = false        
+      ;Emit
+      fn (e:Ins) :
+        ;Compute killed variables
+        val killed = to-list(filter({not live?(_)}, used-vars(e)))
+        emit(update-killed(e, to-list(killed)))        
+        ;Cross call boundary
+        match(e:Call) :
+          do-live $ fn (x) :
+            requires-save[x] = true
+            prefers-load[x] = false 
+      ;Used
+      fn (x:Var) :
+        mark-used(n(x), i)
+        prefers-load[n(x)] = true)
+
+  ;Update block/ports
+  reverse!(instructions)
+  BLOCKS[b] = Block(instructions, next(blk))
+  IN-PORTS[b] = map(annotate, IN-PORTS[b])
+
+;============================================================
+;===================== Allocate Classes =====================
+;============================================================
+
+defn allocate-classes (backend:Backend) :
+  for (blk in BLOCKS, b in 0 to false) do :
+    allocate-classes(blk, b, backend)
+
+defn allocate-classes (blk:Block, b:Int, backend:Backend) :
+  ;================================
+  ;==== Free Register Tracking ====
+  ;================================
+  ;Track number of registers used
+  var num-free-reg = num-regs(backend)
+  var num-free-freg = num-fregs(backend)
+  defn inc-reg (n:Int, delta:Int) :
+    match(VAR-TYPES[n]) :
+      (t:TGIntegerT) : num-free-reg = num-free-reg + delta
+      (t:TGRealT) : num-free-freg = num-free-freg + delta
+  defn num-free (integer?:True|False) :
+    if integer? : num-free-reg
+    else : num-free-freg
+  
+  ;============================
+  ;==== Load/Save Tracking ====
+  ;============================
+  ;Track whether a variable has been loaded/saved
+  val loaded = BitArray(nvars())
+  val saved = BitArray(nvars())
+  val dirty-loaded = Vector<Int>()
+  ;Mark variable n as loaded, returns true if the variable wasn't
+  ;already loaded.
+  defn mark-loaded (n:Int) -> True|False :
+    if not loaded[n] :
+      add(dirty-loaded, n)
+      loaded[n] = true
+      inc-reg(n, -1)
+      true
+  defn mark-unloaded (n:Int) -> True|False :
+    if loaded[n] :
+      loaded[n] = false
+      inc-reg(n, 1)
+      true
+  defn mark-saved (n:Int) -> True|False :
+    if not saved[n] :
+      saved[n] = true
+      true
+  defn mark-defined (n:Int) -> False :
+    mark-loaded(n)
+    saved[n] = false
+  ;Return all currently loaded variables
+  defn loaded-vars () -> Seq<Int> :
+    filter({loaded[_]}, dirty-loaded)
+  ;Mark all variables as unloaded
+  defn mark-all-unloaded () :
+    do(mark-unloaded, loaded-vars())
+    clear(dirty-loaded)
+
+  ;========================
+  ;==== Usage Tracking ====
+  ;========================
+  val usages = Array<Int|False>(nvars(), false)
+  defn mark-next-use (n:Int, pos:Int) :
+    usages[n] = pos
+  defn next-use (n:Int) :
+    usages[n]
+
+  ;=================
+  ;==== Actions ====
+  ;=================
+  defn add?<?T> (xs:False|Vector<?T>, x:T) :
+    match(xs:Vector<T>) : add(xs, x)
+  defn ensure-saved (n:Int, buffer:False|Vector<Ins>) :
+    add?(buffer, Save(Var(n))) when mark-saved(n)
+  defn ensure-loaded (n:Int, buffer:False|Vector<Ins>) :
+    add?(buffer, Load(Var(n))) when mark-loaded(n)
+  defn ensure-unloaded (n:Int, buffer:False|Vector<Ins>) :
+    add?(buffer, Unload(Var(n))) when mark-unloaded(n)
+
+  ;==================
+  ;==== Spilling ====
+  ;==================
+  ;Find next variable to spill
+  defn next-spill-var (integer?:True|False) :
+    defn right-type? (n:Int) :
+      if integer? : VAR-TYPES[n] is TGIntegerT
+      else : VAR-TYPES[n] is TGRealT
+    argmax(next-use, filter(right-type?, loaded-vars()))
+  ;Spill one register
+  defn spill-reg (integer?:True|False, buffer:False|Vector<Ins>) :
+    val v = next-spill-var(integer?)
+    ensure-saved(v, buffer)
+    ensure-unloaded(v, buffer)
+  ;Ensure free register for var
+  defn ensure-reg-for-var (n:Int, buffer:False|Vector<Ins>) :
+    if not loaded[n] :
+      val int? = VAR-TYPES[n] is TGIntegerT
+      if num-free(int?) < 1 :
+        spill-reg(int?, buffer)
+
+  ;==========================
+  ;==== Port Information ====
+  ;==========================
+  defn annotate (p:Port) :
+    val v = n(p)
+    Port(v, saved[v], loaded[v], reg(p), dist(p))
+
+  ;===================
+  ;==== Algorithm ====
+  ;===================
+  ;Load as many input ports into registers as possible
+  for p in IN-PORTS[b] do :
+    val v = n(p)
+    mark-loaded(v) when loaded?(p) is True|Any
+    mark-saved(v) when saved?(p)
+    mark-next-use(v, dist(p))
+  ;Spill overcommitted registers
+  while num-free-reg < 0 : spill-reg(true, false)
+  while num-free-freg < 0 : spill-reg(false, false)
+  ;Annotate input ports
+  IN-PORTS[b] = map(annotate, IN-PORTS[b])
+
+  ;Sweep through instructions
+  val instructions = Vector<Ins>()
+  val buffer = Vector<Ins>()
+  for e in ins(blk) do :
+    match(e) :
+      (e:NextUsed) :
+        mark-next-use(n(e), pos(e))
+      (e:Unload) :
+        ensure-unloaded(n(x(e)), instructions)
+      (e:Save) :
+        ensure-saved(n(x(e)), instructions)
+      (e) :
+        ;Load arguments
+        for x in e do-used :
+          ensure-reg-for-var(n(x), buffer)
+          ensure-loaded(n(x), buffer)
+        ;Emit instruction
+        add(buffer, e)
+        ;Unload registers
+        match(e:Call) : mark-all-unloaded()
+        else : do(mark-unloaded, killed(e))
+        ;Define new variables
+        for x in e do-defined :
+          ensure-reg-for-var(n(x), buffer)
+          mark-defined(n(x))
+        ;Flush buffer instructions
+        add-all(instructions, buffer)
+        clear(buffer)
+        
+  ;Update block and output ports
+  BLOCKS[b] = Block(instructions, next(blk))
+  OUT-PORTS[b] = map(annotate, OUT-PORTS[b])
+
+;============================================================
+;====================== Utilities ===========================
+;============================================================
+
+defn argmax<?T> (f:T -> False|Int, xs:Seqable<?T>) -> T :
+  var best-x
+  var best-v = INT-MIN
+  for x in xs do :
+    val v = f(x)
+    match(v:Int) :
+      if v > best-v :
+        best-x = x
+        best-v = v
+  best-x
