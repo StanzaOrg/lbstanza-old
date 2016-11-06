@@ -17,23 +17,33 @@ public defn allocate-registers (ins:Collection<TGIns>) :
   load-instructions(ins)
   println("==== Load Instructions ====")
   print-prog()
+  
   remove-critical-edges()
   println("==== Remove Critical Edges ====")
   print-prog()
+  
   reverse-post-order()
   println("==== Reverse Post Order ====")
   print-prog()
+  
   compute-predecessors()
   liveness-analysis()
   add-annotations()
   println("==== Added Annotations ====")
   print-prog()
-  allocate-classes(X86Backend())
+  
+  allocate-classes(X86Backend())  
   register-assignment(X86Backend())
   println("==== Assigned Registers ====")
   print-prog()
+  
+  val smap = stack-map()
   println("==== Stack Map ====")
-  stack-map()
+  println(smap)
+
+  enforce-clearing(smap)
+  println("==== Enforce Clearing ====")
+  print-prog()
 
   clear-working-set()
 
@@ -121,7 +131,6 @@ defstruct Match <: Ins :
   dispatch?: True|False
   tag-lists: List<List<KTag>>
   xs: List<Imm>
-  scratch?: False|List<Reg>
   killed?: False|List<Int> with: (as-method => true)
 
 defstruct Save <: Ins :
@@ -142,7 +151,10 @@ defstruct Xchg <: Ins :
   y: Var
   swap: False|Reg|FReg
 
-defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg) :
+defstruct Clear <: Ins :
+  n: Int
+
+defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg|Clear) :
   false
 
 ;==========================
@@ -172,8 +184,7 @@ public defn Return (xs:List<Imm>, ctxt:FnContext) : Return(xs, ctxt, false)
 public defn Call (xs:List<Var>, f:Imm, ys:List<Imm>, type:CallType) : Call(xs, f, ys, type, false)
 public defn Op (op:TGOp, xs:List<Var>, ys:List<Imm>) : Op(op, xs, ys, false)
 public defn Branch (op:TGOp, xs:List<Imm>) : Branch(op, xs, false)
-public defn Match (d?:True|False, ts:List<List<KTag>>, xs:List<Imm>) :
-  Match(d?, ts, xs, false, false)
+public defn Match (d?:True|False, ts:List<List<KTag>>, xs:List<Imm>) : Match(d?, ts, xs, false)
 
 ;==========================
 ;==== Function Context ====
@@ -303,10 +314,8 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:Xchg) : "xchg %_ with %_ through %_" % [x(i), y(i), swap(i)]
     (i:Match) :
       val op = "dispatch" when dispatch?(i) else "match"
-      val sc = match(scratch?(i)) :
-                 (s:False) : ""
-                 (s:List<Reg>) : " (using %,)" % [s]
-      "%_(%,)[%,]%_%_" % [op, xs(i), tag-lists(i), sc, ks]
+      "%_(%,)[%,]%_" % [op, xs(i), tag-lists(i), ks]
+    (i:Clear) : "clear %_" % [n(i)]
 
 defmethod print (o:OutputStream, c:FnContext) :
   print{o, _} $ match(c) :
@@ -405,7 +414,7 @@ defn attach-killed (e:Ins, ks:List<Int>) :
     (e:Call) : Call(xs(e), f(e), ys(e), type(e), ks)
     (e:Op) : Op(op(e), xs(e), ys(e), ks)
     (e:Branch) : Branch(op(e), xs(e), ks)
-    (e:Match) : Match(dispatch?(e), tag-lists(e), xs(e), scratch?(e), ks)
+    (e:Match) : Match(dispatch?(e), tag-lists(e), xs(e), ks)
       
 ;============================================================
 ;===================== Working Set ==========================
@@ -979,15 +988,15 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
       (e:Save) :
         ensure-saved(n(x(e)), instructions)
       (e:Match) :
-        ;Reserve 2 registers for scratch
+        ;Load arguments
+        for x in e do-used :
+          ensure-reg-for-var(n(x), instructions)
+          ensure-loaded(n(x), instructions)
+        ;Reserve scratch registers
         while num-free-reg < 2 :
           spill-reg(true, instructions)
-        ;Load as many arguments as possible
-        for x in e do-used :
-          if num-free-reg >= 2 :
-            ensure-loaded(n(x), instructions)
-        ;Emit
-        add(instructions, e)            
+        ;Emit instruction
+        add(instructions, e)
       (e) :
         ;Load arguments
         for x in e do-used :
@@ -1253,10 +1262,10 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
       (e:Unload) :
         free-var(n(e))
       (e:Match) :
+        ensure-available(List(Reg(0), Reg(1)), List())
         val xs* = map(annotate, xs(e))
-        val rs* = available-regs(2, TGIntT()) as List<Reg>
         do(free-var, killed(e))
-        emit(Match(dispatch?(e), tag-lists(e), xs*, rs*, false, killed?(e)))
+        emit(Match(dispatch?(e), tag-lists(e), xs*, killed?(e)))
       (e:Op) :
         defn assign-prefs (pref:List<Imm> -> Loc|List<Loc>) :
           val ys* = map(annotate, ys(e))
@@ -1350,11 +1359,6 @@ defn stack-intervals () -> Seq<Interval> :
     var-start[v] = min(i, var-start[v])
     var-end[v] = max(i, var-end[v])
 
-  defn note-usage (v:Imm, i:Int) :
-    match(v:Var) :
-      match(reg?(v):False) :
-        note-usage(n(v), i)
-
   defn note-in-port-usage (b:Int, v:Int) :
     note-usage(v, in-port-pos[b])
     for b in PREDECESSORS[b] do :
@@ -1393,7 +1397,6 @@ defn stack-intervals () -> Seq<Interval> :
       match(e) :
         (e:Save) : note-usage(n(x(e)), pos)
         (e:Load) : note-usage(n(x(e)), pos)
-        (e:Match) : do(note-usage{_, pos}, xs(e))
         (e) : false
         
     ;Out port usages
@@ -1422,13 +1425,17 @@ defn Counter (init:Int) :
 ;===================== Stack Map ============================
 ;============================================================
 
+deftype StackMap
+defmulti location (m:StackMap, n:Int) -> False|Int
+defmulti locations (m:StackMap) -> Vector<TGType>
+
 defn stack-map () :
   ;===========================
   ;==== Location Tracking ====
   ;===========================
   val occupied-locs = Vector<True|False>()
   val loc-types = Vector<TGType>()
-  val var-locs = Array<Int>(nvars())
+  val var-locs = Array<False|Int>(nvars(), false)
 
   ;Get next available location
   defn available-loc (t:TGType) :
@@ -1452,7 +1459,8 @@ defn stack-map () :
 
   ;Release variable v from its location
   defn release-var (v:Int) :
-    occupied-locs[var-locs[v]] = false
+    val l = var-locs[v] as Int
+    occupied-locs[l] = false
 
   ;===================
   ;==== Algorithm ====
@@ -1465,9 +1473,25 @@ defn stack-map () :
       (int:EndInterval) :
         release-var(n(int))
 
-  ;==== Print out ====
-  for (t in loc-types, i in 0 to false) do :
-    println("Loc %_ : %_" % [i, t])
+  new StackMap :
+    defmethod location (this, n:Int) : var-locs[n]
+    defmethod locations (this) : loc-types
+
+defmethod print (o:OutputStream, s:StackMap) :
+  ;Discover vars per location
+  val vars = Array<List<Int>>(length(locations(s)), List())
+  for v in 0 to nvars() do :
+    val loc = location(s, v)
+    match(loc:Int) :
+      vars[loc] = cons(v, vars[loc])
+  ;Print  
+  print(o, "stackmap:")
+  for (t in locations(s), i in 0 to false) do :
+    defn V# (i:Int) : "V%_" % [i]
+    print(o, "\n  loc %_ : %_ (%,)" % [i, t, seq(V#, vars[i])])
+
+defn num-locations (s:StackMap) :
+  length(locations(s))
   
 ;============================================================
 ;================== Enforced Clearing =======================
@@ -1484,34 +1508,43 @@ defn enforce-clearing (blk:Block, b:Int, smap:StackMap) :
   val instructions = Vector<Ins>()
   defn emit (e:Ins) : add(instructions, e)
 
-  ;===============================
-  ;==== Clearing Instructions ====
-  ;===============================
-  ;Clear if on stack
-  defn clear (n:Int) :
-    if saved?(smap, n) :
-      emit(Clear(n))      
-  defn clear (ns:Seqable<Int>) :
-    do(clear, unique(ns))
+  ;========================
+  ;==== Track Liveness ====
+  ;========================
+  val loc-live = Array<True|False>(num-locations(smap), false)
+  defn loc (n:Int) : location(smap,n) as Int
+  defn mark-live (n:Int) : loc-live[loc(n)] = true
+  defn mark-dead (n:Int) : loc-live[loc(n)] = false  
+  defn live? (v:Var) : loc-live[loc(n(v))]
 
   ;===================
   ;==== Algorithm ====
   ;===================
-  ;Clear predecessor match arguments
-  clear $ for p in PREDECESSORS[b] seq-cat :
-    match(last(ins(BLOCKS[p]))) :
-      (e:Match) : killed(e)
-      (e) : List()
+  ;Is n a reference type
+  defn ref? (v:Var) :
+    VAR-TYPES[n(v)] is TGRefT
 
-  ;Clear instruction kills
-  for e in ins(blk) do :
-    if e is-not Match :
-      val ks = killed?(e)
-      match(ks:List<Int>) : clear(ks)
-    emit(e)
+  ;Initialization liveness
+  for p in OUT-PORTS[b] do :
+    mark-live(n(p)) when saved?(p)
 
-  ;Update block
-  BLOCKS[b] = Block(instructions, next(b))        
+  ;Sweep through instructions in reverse
+  for e in in-reverse(ins(blk)) do :
+    match(e) :
+      (e:Load) :
+        if ref?(x(e)) and not live?(x(e)) :
+          emit(Clear(n(x(e))))
+        emit(e)
+        mark-live(n(x(e)))
+      (e:Save) :
+        emit(e)
+        mark-dead(n(x(e)))
+      (e) :
+        emit(e)
+
+  ;Update block instructions
+  reverse!(instructions)
+  BLOCKS[b] = Block(instructions, next(blk))
 
 ;============================================================
 ;====================== Utilities ===========================
