@@ -45,6 +45,10 @@ public defn allocate-registers (ins:Collection<TGIns>) :
   println("==== Enforce Clearing ====")
   print-prog()
 
+  collapse-blocks()
+  println("==== Collapse Blocks ====")
+  print-prog()
+
   clear-working-set()
 
 ;============================================================
@@ -154,7 +158,24 @@ defstruct Xchg <: Ins :
 defstruct Clear <: Ins :
   n: Int
 
-defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg|Clear) :
+defstruct ShuffleReg <: Ins :
+  xs: List<Int>
+  ys: List<Int>
+
+defstruct ShuffleFReg <: Ins :
+  xs: List<Int>
+  ys: List<Int>
+
+defstruct Goto <: Ins :
+  n: Int
+  
+defstruct Break <: Ins :
+  n: Int
+  op: TGOp
+  xs: List<Imm>
+
+defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg|Clear|
+                     ShuffleReg|ShuffleFReg|Goto|Break) :
   false
 
 ;==========================
@@ -248,6 +269,10 @@ public defstruct CastOp <: TGOp : (tag:KTag)
 defmethod print (o:OutputStream, op:CastOp) :
   print(o, "cast(%_)" % [tag(op)])
 
+public defstruct FlipOp <: TGOp : (op:TGOp)
+defmethod print (o:OutputStream, x:FlipOp) :
+  print(o, "flip(%_)" % [op(x)])
+
 ;============================================================
 ;====================== Any =================================
 ;============================================================
@@ -316,6 +341,10 @@ defmethod print (o:OutputStream, i:Ins) :
       val op = "dispatch" when dispatch?(i) else "match"
       "%_(%,)[%,]%_" % [op, xs(i), tag-lists(i), ks]
     (i:Clear) : "clear %_" % [n(i)]
+    (i:ShuffleReg) : "shuffle (%,) = (%,)" % [xs(i), ys[i]]
+    (i:ShuffleFReg) : "fshuffle (%,) = (%,)" % [xs(i), ys[i]]
+    (i:Goto) : "goto %_" % [n(i)]
+    (i:Break) : "break %_ when %_(%,)" % [n(i), op(i), xs(i)]
 
 defmethod print (o:OutputStream, c:FnContext) :
   print{o, _} $ match(c) :
@@ -1290,7 +1319,7 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
           ;Any register will do
           (op:TGEqOp|TGNeOp|TGLtOp|TGGtOp|TGLeOp|TGGeOp|
               TGUleOp|TGUltOp|TGUgtOp|TGUgeOp|
-              TGArityNeOp|TGArityNeOp|TGHasStackSpace) :
+              TGArityNeOp|TGHasStackSpace) :
             assign-prefs(FreeReg())
           ;Nop
           (op:NoOp) :
@@ -1633,7 +1662,7 @@ defn shuffle (nreg:Int, xs:List<Int>, ys:List<Int>, swap:Int
 
   ;Start from roots
   for y in roots(nreg, xs, ys) do :
-    emit-move(swap, y) when move(y)      
+    emit-move(swap, y) when move(y)     
 
 ;=========================================
 ;==== Shuffling without Swap Register ====
@@ -1653,3 +1682,141 @@ defn shuffle (nreg:Int, xs:List<Int>, ys:List<Int>
           if dst == -1 : emit-save(src)
           else if src == -1 : emit-load(dst)
           else : emit-move(src, dst))
+
+;============================================================
+;=============== Flipped Comparison Operators ===============
+;============================================================
+
+defn flip (op:TGOp) :
+  match(op) :
+    (op:TGEqOp) : TGNeOp()
+    (op:TGNeOp) : TGEqOp()
+    (op:TGLtOp) : TGGeOp()
+    (op:TGGtOp) : TGLeOp()
+    (op:TGLeOp) : TGGtOp()
+    (op:TGGeOp) : TGLtOp()
+    (op:TGUleOp) : TGUgtOp()
+    (op:TGUltOp) : TGUgeOp()
+    (op:TGUgtOp) : TGUleOp()
+    (op:TGUgeOp) : TGUltOp()
+    (op:TGArityNeOp|TGHasStackSpace) : FlipOp(op)
+    (o:FlipOp) : op(o)
+
+;============================================================
+;=================== Block Collapsing =======================
+;============================================================
+
+defn collapse-blocks () :
+  ;============================
+  ;==== Instruction Buffer ====
+  ;============================
+  val instructions = Vector<Ins>()
+  defn emit (e:Ins) : add(instructions, e)
+  defn emit (es:Seqable<Ins>) : add-all(instructions, es)
+
+  ;===================
+  ;==== Port Glue ====
+  ;===================
+  ;Perform xs = ys in parallel
+  defn glue-ports (xs:List<Port>, ys:List<Port>) :
+    ;Instructions buffers
+    val pre = Vector<Ins>()
+    val post = Vector<Ins>()
+    val shuffles = Vector<KeyValue<Int,Int>>()
+    val fshuffles = Vector<KeyValue<Int,Int>>()
+
+    ;Is n a reference variable?
+    defn ref? (n:Int) : VAR-TYPES[n] is TGRefT
+
+    ;Populate port table
+    val port-table = Array<Port>(nvars())
+    for y in ys do : port-table[n(y)] = y
+
+    ;Populate instruction buffers
+    for x in xs do :
+      ;Retrieve corresponding port
+      val y = port-table[n(x)]
+      val vx = Var(n(x), reg?(x))
+      val vy = Var(n(y), reg?(y))
+      ;Saves and Clears
+      match(saved?(x), saved?(y)) :
+        (sx:True, sy:False) : add(pre, Save(sx))
+        (sx:False, sy:True) : add(pre, Clear(n(x))) when ref?(n(x))
+        (sx, sy) : false
+      ;Loads
+      match(loaded?(x), loaded?(y)) :
+        (lx:True, ly:False) : add(post, Load(vx))
+        (lx, ly) : false
+      ;Shuffles
+      match(reg?(x), reg?(y)) :
+        (rx:Reg, ry:Reg) : add(shuffles, n(ry) => n(rx))
+        (rx:FReg, ry:FReg) : add(fshuffles, n(ry) => n(ry))
+        (rx, ry) : false
+        
+    ;Output to main instruction buffer
+    emit(pre)
+    emit(ShuffleReg(map(value,shuffles), map(key,shuffles)))
+    emit(ShuffleFReg(map(value,fshuffles), map(key,fshuffles)))
+    emit(post)
+
+  ;=======================
+  ;==== Glue Location ====
+  ;=======================
+  defn input-glue (b:Int) :
+    if length(PREDECESSORS[b]) == 1 :
+      val p = head(PREDECESSORS[b])
+      val pred = BLOCKS[p]
+      if length(next(pred)) > 1 :
+        OUT-PORTS[p]
+      
+  defn output-glue (blk:Block) :
+    if length(next(blk)) == 1 :
+      val s = head(next(blk))
+      IN-PORTS[s]
+
+  ;======================
+  ;==== Block Labels ====
+  ;======================
+  val lbls = Array<Int>(nblocks())
+  lbls[0 to false] = repeatedly(fresh-id{})
+
+  ;===================
+  ;==== Algorithm ====
+  ;===================  
+  for (blk in BLOCKS, b in 0 to false) do :
+    ;Is block i coming up next?
+    defn upcoming? (i:Int) : i == b + 1
+    
+    ;Emit block label
+    emit(TGLabel(lbls[b]))
+    
+    ;Emit entry glue    
+    match(input-glue(b)) :
+      (ps:List<Port>) : glue-ports(IN-PORTS[b], ps)
+      (ps:False) : false
+
+    ;Emit instructions
+    for e in ins(blk) do :
+      match(e) :
+        (e:Branch) :
+          val conseq = next(blk)[0]
+          val alt = next(blk)[1]
+          match(upcoming?(conseq), upcoming?(alt)) :
+            (a:True, b:False) :
+              emit(Break(lbls[alt], flip(op(e)), xs(e)))
+            (a:False, b:True) :
+              emit(Break(lbls[conseq], op(e), xs(e)))
+            (a:False, b:False) :
+              emit(Break(lbls[conseq], op(e), xs(e)))
+              emit(TGGoto(lbls[alt]))
+        (e) :
+          emit(e)
+
+    ;Emit exit glue
+    match(output-glue(b)) :
+      (ps:List<Port>) : glue-ports(ps, OUT-PORTS[b])
+      (ps:False) : false
+
+  ;Return instruction buffer
+  clear(BLOCKS)
+  add(BLOCKS, Block(instructions, List()))
