@@ -244,24 +244,26 @@ public defstruct StanzaCall <: CallType :
   ret-regs?: False|List<Loc>
 public defstruct StanzaTCall <: CallType :
   arity: Int
-  regs?: False|List<Loc>
+  arg-regs?: False|List<Loc>
   ret-regs?: False|List<Loc>
 public defstruct CCall <: CallType :
   arity: Int
   num-mem-args: Int
   arg-regs?: False|List<Loc>
-public defstruct StackSwitch <: CallType
+  ret-reg?: False|Loc
+public defstruct StackSwitch <: CallType :
   reg?: False|Loc
 
 public defn StanzaCall (arity:Int) : StanzaCall(arity, false, false)
 public defn StanzaTCall (arity:Int) : StanzaTCall(arity, false, false)
-public defn CCall (arity:Int) : CCall(arity, 0, false)
-public defn StackSwitch () : StanzaSwitch(false)
+public defn CCall (arity:Int) : CCall(arity, 0, false, false)
+public defn StackSwitch () : StackSwitch(false)
 public defn arg-regs (t:StanzaCall) : arg-regs?(t) as List<Loc>
 public defn arg-regs (t:StanzaTCall) : arg-regs?(t) as List<Loc>
 public defn ret-regs (t:StanzaCall) : ret-regs?(t) as List<Loc>
 public defn ret-regs (t:StanzaTCall) : ret-regs?(t) as List<Loc>
 public defn arg-regs (t:CCall) : arg-regs?(t) as List<Loc>
+public defn ret-reg (t:CCall) : ret-reg?(t) as Loc
 public defn reg (t:StackSwitch) : reg?(t) as Loc
 
 ;=====================
@@ -616,7 +618,7 @@ defn load-instructions (instructions:Collection<TGIns>) :
         push(Match(e is TGDispatch, ts, get-imms(xs(e))))
         close-block(map(n, branches(e)))
       (e:TGCallC) :
-        val type = CCall(length(ys(e)), length(vs(e)))
+        val type = CCall(length(ys(e)))
         val args = append(get-imms(ys(e)), get-imms(vs(e)))
         push(Call(get-vars(xs(e)), get-imm(f(e)), args, type))
       (e:TGArgsC) :
@@ -639,6 +641,16 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   ;============================
   val instructions = Vector<Ins>()
   defn emit (e:Ins) : add(instructions, e)
+
+  ;======================
+  ;==== Instructions ====
+  ;======================
+  val #argspace = Val(TGMem(ARG-LBL,0))
+  val #c-rsp = Val(TGMem(C-RSP-LBL,0))
+  defn #load (x:Var, y:Imm, offset:Int) :
+    emit(Op(LoadOp(offset), List(x), List(y)))
+  defn #store (x:Imm, y:Imm, offset:Int) :
+    emit(Op(StoreOp(offset), List(), List(x, y)))
 
   ;=============================
   ;==== Variable Operations ====
@@ -668,15 +680,14 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   defn norm-stanza-call (e:Call) :
     val ys* = split-call-locs(ys(e), call-regs(backend), call-fregs(backend))
     val xs* = split-call-locs(xs(e), call-regs(backend), call-fregs(backend))
-    val argspace = TGMem(ARG-SPACE-LBL,0)
     for (y in mems(ys*), o in 0 to false by 8) do :
-      emit(Op(StoreOp(o), argspace, y))
+      #store(#argspace, y, o)
     val type* = match(type(e)) :
       (t:StanzaCall) : StanzaCall(arity(t), locs(ys*), locs(xs*))
       (t:StanzaTCall) : StanzaTCall(arity(t), locs(ys*), locs(xs*))
-    emit(Call(regs(xs*), f(e), regs(ys*), type*))
+    emit(Call(regs(xs*) as List<Var>, f(e), regs(ys*), type*))
     for (x in mems(xs*), o in 0 to false by 8) do :
-      emit(Op(LoadOp(o), x, argspace))
+      #load(x as Var, #argspace, o)
 
   defn norm-c-call (e:Call) :
     val t = type(e) as CCall
@@ -685,23 +696,27 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
       (backend:W64Backend) :
         defn shadow (x:Imm) :
           val x* = make-var(TGIntegerT(type(x)))
-          emit(Op(InterpretOp(), x*, force-var(x)))
+          emit(Op(InterpretOp(), List(x*), List(force-var(x))))
           x*      
         split-call-locs-shadow(ys(e), arity(t), callc-regs(backend),
                                callc-fregs(backend), shadow)
-      (backend:X86Backend) :
+      (backend:Backend) :
         split-call-locs(ys(e), callc-regs(backend), callc-fregs(backend))
     ;Store arguments
     val n = length(mems(ys*))
     if n > 0 :
       val csp = make-var(TGLongT())
-      emit(Op(LoadOp(0), csp, TGMem(C-RSP-LBL,0)))
+      #load(csp, #c-rsp, 0)
       for (y in mems(ys*), i in 0 to false) do :
         val num-ctxt = length(c-preserved-regs(backend))
-        val o = 8 * (i - num-ctxt - n | 1)
-        emit(Op(StoreOp(o), csp, y))
-    ;Emit call    
-    val type* = CCall(arity(t), n, locs(ys*))
+        val o = 8 * (i - (num-ctxt + n) | 1)
+        #store(csp, y, o)
+    ;Emit call
+    val ret-reg =
+      if empty?(xs(e)) : Reg(0)
+      else if type(head(xs(e))) is TGIntegerT : Reg(0)
+      else : FReg(0)
+    val type* = CCall(arity(t), n, locs(ys*), ret-reg)
     emit(Call(xs(e), f(e), regs(ys*), type*))
 
   defn norm-stack-call (e:Call) :
@@ -714,17 +729,17 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   ;==============================
   defn norm-stanza-return (e:Return) :
     val xs* = split-call-locs(xs(e), call-regs(backend), call-fregs(backend))
-    val argspace = TGMem(ARG-SPACE-LBL,0)
+    val argspace = TGMem(ARG-LBL,0)
     for (x in mems(xs*), o in 0 to false by 8) do :
-      emit(Op(StoreOp(o), argspace, x))
+      #store(#argspace, x, o)
     val ctxt* = StanzaContext(locs(xs*))
     emit(Return(regs(xs*), ctxt*))
 
   defn norm-c-return (e:Return) :
     ;Load C pointer, and restore old one
     val c-rsp = make-var(TGLongT())
-    emit(Op(LoadOp(0), c-rsp, TGMem(C-RSP-LBL,0)))
-    emit(Op(StoreOp(0), TGMem(C-RSP-LBL,0), saved-c-rsp()))
+    #load(c-rsp, #c-rsp, 0)
+    #store(#c-rsp, saved-c-rsp(), 0)
     ;Emit instruction
     val xs* = cons(c-rsp, xs(e))
     val ctxt* = CContext(List(Reg(6), Reg(0)))
@@ -735,11 +750,11 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   ;===========================  
   defn norm-stanza-args (e:Args) :
     val xs* = split-call-locs(xs(e), call-regs(backend), call-fregs(backend))
-    val argspace = TGMem(ARG-SPACE-LBL,0)
+    val argspace = TGMem(ARG-LBL,0)
     val ctxt* = StanzaContext(locs(xs*))
-    emit(Args(regs(xs*), ctxt*))
+    emit(Args(regs(xs*) as List<Var>, ctxt*))
     for (x in mems(xs*), o in 0 to false by 8) do :
-      emit(Op(LoadOp(o), x, argspace))
+      #load(x as Var, #argspace, o)
     
   defn norm-c-args (e:Args) :
     ;Split up arguments
@@ -748,18 +763,18 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
       (backend:W64Backend) :
         split-call-locs-shadow(xs(e), arity, callc-regs(backend),
                                callc-fregs(backend), fatal{"No Shadow"})
-      (backend:X86Backend) :
+      (backend:Backend) :
         split-call-locs(xs(e), callc-regs(backend), callc-fregs(backend))
     ;Emit instruction
     val c-rsp = make-var(TGLongT())
     val ctxt* = CContext(cons(Reg(6), locs(xs*)))
-    emit(Args(cons(c-rsp, regs(xs*)), ctxt*))
+    emit(Args(cons(c-rsp, regs(xs*) as List<Var>), ctxt*))
     ;Load arguments
     for (x in mems(xs*), i in 0 to false) do :
-      emit(Op(LoadOp(8 * (i + 1)), x, c-rsp))
+      #load(x as Var, c-rsp, 8 * (i + 1))
     ;Save old C pointer and Set c-rsp as new C pointer
-    emit(Op(LoadOp(0), saved-c-rsp(), TGMem(C-RSP-LBL,0)))
-    emit(Op(StoreOp(0), TGMem(C-RSP-LBL,0), c-rsp))    
+    #load(saved-c-rsp(), #c-rsp, 0)
+    #store(#c-rsp, c-rsp, 0)
 
   ;=============================
   ;==== Match Normalization ====
@@ -767,9 +782,9 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   defn norm-match (e:Match) :
     val [xs, mxs] = split-match-locs(xs(e), num-regs(backend))
     ;Store arguments
-    val argspace = TGMem(ARG-SPACE-LBL,0)
+    val argspace = TGMem(ARG-LBL,0)
     for (x in mxs, o in 0 to false by 8) do :
-      emit(Op(StoreOp(o), argspace, x))
+      #store(#argspace, x, o)
     ;Emit instruction
     emit(Match(dispatch?(e), tag-lists(e), xs))
 
@@ -817,14 +832,14 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
         norm-match(e)
       (e:Op) :
         match(op(e)) :
-          (op:TGDivOp) : norm-div-op(op, xs(e), ys(e))
-          (op:TGModOp) : norm-mod-op(op, xs(e), ys(e))
+          (op:TGDivOp) : norm-div-op(e)
+          (op:TGModOp) : norm-mod-op(e)
           (op) : emit(e)
       (e) :
         emit(e)
 
   ;Replace block
-  BLOCKS[b] = Block(instructions, next(b))
+  BLOCKS[b] = Block(instructions, next(blk))
 
 ;===================================
 ;==== Determining Mem Arguments ====
@@ -854,7 +869,7 @@ defn split-call-locs-shadow (xs:List<Imm>, arity:Int, reg-ns:List<Int>, freg-ns:
                              shadow: Imm -> Var) :
   val regs = seq(Reg, reg-ns)
   val fregs = seq(FReg, freg-ns)
-  val argcount = seq(0 to arity)
+  val argcount = to-seq(0 to arity)
   val reg-xs = Vector<Imm>()
   val mem-xs = Vector<Imm>()
   val xs-locs = Vector<Loc>()
