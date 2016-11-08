@@ -8,8 +8,10 @@ defpackage stz/reg-alloc :
   import stz/kl-ir
   import stz/ids
   import stz/backend
+  import stz/padder
   import stz/asm-ir with :
     prefix => asm-
+
 
 ;============================================================
 ;===================== Driver ===============================
@@ -325,10 +327,6 @@ defmethod print (o:OutputStream, op:LoadOp) :
 public defstruct StoreOp <: TGOp : (offset:Int)
 defmethod print (o:OutputStream, op:StoreOp) :
   print(o, "store/%_" % [offset(op)])
-
-public defstruct CastOp <: TGOp : (tag:KTag)
-defmethod print (o:OutputStream, op:CastOp) :
-  print(o, "cast(%_)" % [tag(op)])
 
 public defstruct FlipOp <: TGOp : (op:TGOp)
 defmethod print (o:OutputStream, x:FlipOp) :
@@ -673,8 +671,8 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   ;======================
   ;==== Instructions ====
   ;======================
-  val #argspace = Val(TGMem(ARG-LBL,0))
-  val #c-rsp = Val(TGMem(C-RSP-LBL,0))
+  val #argspace = Val(TGMem(ARG-LBL))
+  val #c-rsp = Val(TGMem(C-RSP-LBL))
   defn #load (x:Var, y:Imm, offset:Int) :
     emit(Op(LoadOp(offset), List(x), List(y)))
   defn #store (x:Imm, y:Imm, offset:Int) :
@@ -751,14 +749,14 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   defn norm-stack-call (e:Call) :
     val reg = Reg(head(call-regs(backend)))
     val type* = StackSwitch(Reg(1), reg)
-    emit(Call(xs(e), f(e), ys(e), type*))
+    emit(Call(xs(e), force-var(f(e)), ys(e), type*))
 
   ;==============================
   ;==== Return Normalization ====
   ;==============================
   defn norm-stanza-return (e:Return) :
     val xs* = split-call-locs(map(force-new-var,xs(e)), call-regs(backend), call-fregs(backend))
-    val argspace = TGMem(ARG-LBL,0)
+    val argspace = TGMem(ARG-LBL)
     for (x in mems(xs*), o in 0 to false by 8) do :
       #store(#argspace, x, o)
     val ctxt* = StanzaContext(locs(xs*))
@@ -779,7 +777,7 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   ;===========================  
   defn norm-stanza-args (e:Args) :
     val xs* = split-call-locs(xs(e), call-regs(backend), call-fregs(backend))
-    val argspace = TGMem(ARG-LBL,0)
+    val argspace = TGMem(ARG-LBL)
     val ctxt* = StanzaContext(locs(xs*))
     emit(Args(regs(xs*) as List<Var>, ctxt*))
     for (x in mems(xs*), o in 0 to false by 8) do :
@@ -811,7 +809,7 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   defn norm-match (e:Match) :
     val [xs, mxs] = split-match-locs(xs(e), num-regs(backend))
     ;Store arguments
-    val argspace = TGMem(ARG-LBL,0)
+    val argspace = TGMem(ARG-LBL)
     for (x in mxs, o in 0 to false by 8) do :
       #store(#argspace, x, o)
     ;Emit instruction
@@ -1800,28 +1798,16 @@ defn stack-intervals () -> Seq<Interval> :
   ;Return intervals
   sorted-intervals()
 
-;=================
-;==== Counter ====
-;=================
-deftype Counter
-defmulti next (c:Counter, n:Int) -> Int
-defn value (c:Counter) : next(c, 0)
-
-defn Counter (init:Int) :
-  var x = init
-  new Counter :
-    defmethod next (this, n:Int) :
-      val cur-x = x
-      x = x + n
-      cur-x
-
 ;============================================================
 ;===================== Stack Map ============================
 ;============================================================
 
 deftype StackMap
 defmulti location (m:StackMap, n:Int) -> False|Int
+defmulti offset (m:StackMap, n:Int) -> Int
 defmulti locations (m:StackMap) -> Vector<TGType>
+defmulti offsets (m:StackMap) -> Vector<Int>
+defmulti size (m:StackMap) -> Int
 
 defn stack-map () :
   ;===========================
@@ -1867,9 +1853,26 @@ defn stack-map () :
       (int:EndInterval) :
         release-var(n(int))
 
+  ;=====================================
+  ;==== Size and Offset Computation ====
+  ;=====================================
+  val offsets = Vector<Int>()
+  val stack-size = let :
+    val [padded, alignment] = pad(size, size, loc-types, 8)
+    val offset-counter = Counter(16) ;RET + STACK-MAP
+    for x in padded do :
+      match(x) :
+        (x:Padding) : next(offset-counter, size(x))
+        (x:TGType) : add(offsets, next(offset-counter, size(x)))
+    value(offset-counter)
+
+  ;Return Map
   new StackMap :
     defmethod location (this, n:Int) : var-locs[n]
     defmethod locations (this) : loc-types
+    defmethod offsets (this) : offsets
+    defmethod size (this) : stack-size
+    defmethod offset (this, n:Int) : offsets[var-locs[n] as Int]
 
 defmethod print (o:OutputStream, s:StackMap) :
   ;Discover vars per location
@@ -1886,6 +1889,12 @@ defmethod print (o:OutputStream, s:StackMap) :
 
 defn num-locations (s:StackMap) :
   length(locations(s))
+
+defn refmask (s:StackMap) :
+  val mask = Array<True|False>(size(s) / 8, false)
+  for (t in locations(s), offset in offsets(s)) do :
+    match(t:TGRefT) : mask[offset / 8] = true
+  to-bitmask(mask)
 
 ;============================================================
 ;================== Enforced Clearing =======================
@@ -2284,85 +2293,143 @@ defn values<?T> (xs:Vector<KeyValue<?,?T>>) : to-list(seq(value,xs))
 ;          (c:StanzaContext) :
 ;            #ret()
 ;          (c:CContext) :
-;            ;Restore c stack pointer
-;            #mov(#rsp, #r6)
-;            ;Restore C context
-;            #loadl(#r1, #rsp, -8)
-;            #loadl(#r6, #rsp, -16)
-;            #loadl(#r11, #rsp, -24)
-;            #loadl(#r12, #rsp, -32)
-;            #loadl(#r13, #rsp, -40)
-;            #loadl(#r14, #rsp, -48)
-;            ;Return to C
+;            #movl(#rsp, #r6)
+;            for (i in c-preserved-args(backend), o in 8 to false by -8) do :
+;              #loadl(asm-Reg(i), #rsp, o)
 ;            #ret()
 ;      (e:Args) :
 ;        ;Write stack map
-;        #movl(#r0, TGMem(stack-map-lbl,0))
+;        #movl(#r0, asm-Mem(stack-map-lbl))
 ;        #storel(#rsp, #r0, 8)
 ;        ;Null out stack
 ;        for off in ref-offsets(stackmap) do :
-;          #storel(#rsp, asm-LongImm(VOID-TAG), off)
+;          #storel(#rsp, asm-IntImm(VOID-TAG), off)
 ;      (e:Call) :
 ;        match(type(e)) :
 ;          (t:StanzaTCall) :
-;            ;Set arity
 ;            #movl(#r0, asm-IntImm(arity(t)))
-;            ;Jump
 ;            #goto(f(e))
 ;          (t:StanzaCall) :
-;            ;Set arity
 ;            #movl(#r0, asm-IntImm(arity(t)))
-;            ;Call
 ;            #addl(#rsp, #rsp, asm-IntImm(size(stackmap) + 8))
 ;            #call(f(e))
-;            ;Resume
 ;            #subl(#rsp, #rsp, asm-IntImm(size(stackmap) + 8))
 ;          (t:CCall) :
+;            ;Compute frame size
+;            val frame-size = 8 * ((length(c-preserved-args(backend)) + num-mem-args(t)) | 1)
 ;            ;Set number of floating point registers
 ;            val num-fregs = count({asm-type(_) is asm-RealT}, ys(e))
 ;            #movl(#r0, asm-IntImm(num-fregs))
 ;            ;Save stack pointer label
-;            #storel(TGMem(STACK-PTR-LBL), #rsp)
-;            #loadl(#rsp, TGMem(C-RSP-LBL))
-;            #subl(#rsp, #rsp, asm-IntImm(frame-size(t)))
+;            #storel(asm-Mem(STACK-PTR-LBL), #rsp)
+;            #loadl(#rsp, asm-Mem(C-RSP-LBL))
+;            #subl(#rsp, #rsp, asm-IntImm(frame-size))
 ;            #call(f(e))
 ;            ;Restore stack pointer
-;            #loadl(#rsp, TGMem(STACK-PTR-LBL))
+;            #loadl(#rsp, asm-Mem(STACK-PTR-LBL))
 ;          (t:StackSwitch) :
 ;            ;Cap the current stack
 ;            ;#r0 = current stack
 ;            val ret-lbl = fresh-id()
 ;            #addl(#rsp, #rsp, asm-IntImm(size(stackmap)))
-;            #loadl(#r0, Mem(STACK-LBL))
+;            #loadl(#r0, asm-Mem(STACK-LBL))
 ;            #storel(#r0, #rsp, STACK-SP-OFFSET - REF-TAG-BITS)
 ;            ;Write return address
-;            #movl(#r0, Mem(ret-lbl))
+;            #movl(#r0, asm-Mem(ret-lbl))
 ;            #storel(#rsp, #r0)
 ;            ;Update the current stack and limits
 ;            ;#r1 = target stack
 ;            ;temporary #r0 = stack limit
 ;            ;Update stack limit, and current stack
 ;            #addl(#r0, #r1, asm-IntImm(STACK-SIZE - REF-TAG-BITS))
-;            #storel(Mem(STACK-LIM-LBL), #r0)
-;            #storel(Mem(STACK-LBL), #r1)
+;            #storel(asm-Mem(STACK-LIM-LBL), #r0)
+;            #storel(asm-Mem(STACK-LBL), #r1)
 ;            ;Recover stack register
 ;            #loadl(#rsp, #r1, STACK-SP-OFFSET - REF-TAG-BITS)
 ;            #ret()
 ;            ;Return address
 ;            #label(ret-lbl)
 ;            ;Resume
-;            #subl(#rsp, #rsp, IntImm(size(stackmap) + 8))
+;            #subl(#rsp, #rsp, asm-IntImm(size(stackmap) + 8))
 ;      (e:Op) :
 ;        match(op(e)) :
+;          (op:NewStackOp) :
+;            val ret-lbl = fresh-id()
+;            #movl(#r0, asm-Mem(ret-lbl))
+;            #goto(asm-Mem(EXTEND-STACK-LBL))
+;            #label(ret-lbl)
+;            ;;1. Decrement number of free stacks
+;            ;#loadl(#r0, asm-Mem(NUM-FREE-STACKS-LBL))
+;            ;#subl(#r0, #r0, IntImm(1))
+;            ;#storel(asm-Mem(NUM-FREE-STACKS-LBL), #r0)
+;            ;
+;            ;;2. Retrieve the next free stack
+;            ;;R0 = next free stack
+;            ;;temporary R1 = stack pool
+;            ;#loadl(#r1, asm-Mem(FREE-STACKS-LBL))
+;            ;#loadl(#r0, #r1)
+;            ;#addl(#r1, #r1, IntImm(8))
+;            ;#storel(asm-Mem(FREE-STACKS-LBL), #r1)
+;            ;
+;            ;;3. Cap the current stack. Set current stack as parent of new stack.
+;            ;;#r1 = current stack
+;            ;;preserve #r0 = free stack
+;            ;#loadl(#r1, asm-Mem(STACK-LBL))
+;            ;#storel(#r1, #rsp, STACK-SP-OFFSET - REF-TAG-BITS)
+;            ;#storel(#r0, #r1, STACK-PARENT-OFFSET - REF-TAG-BITS)
+;            ;
+;            ;;4. update the current stack and limits
+;            ;;preserve #r0 = free stack
+;            ;;temporary #r1 = stack limit
+;            ;;Update stack register
+;            ;#addl(#rsp, #r0, IntImm(STACK-ITEMS-OFFSET - REF-TAG-BITS))
+;            ;;Update stack limit, and current stack
+;            ;#addl(#r1, #r0, IntImm(STACK-SIZE - REF-TAG-BITS))
+;            ;#storel(asm-Mem(STACK-LIM-LBL), #r1)
+;            ;#storel(asm-Mem(STACK-LBL), #r0)
+;            ;;Intercept return code
+;            ;#movl(#r1, asm-Mem(RETRACT-STACK-LBL))
+;            ;#storel(#rsp, #r1)
+;          (op:SaveCContextOp) :
+;            for (i in c-preserved-args(backend), o in 8 to false by -8) do :
+;              #storel(#rsp, asm-Reg(i), o)
+;            #movl(#r6, #rsp)
+;            #loadl(#rsp, asm-Mem(STACK-PTR-LBL))             
+;          (op:ConvOp) :
+;            val [x, y] = [head(xs(e)), head(ys(e))]
+;            #conv(asm-type(x), x, asm-type(y), y)            
+;          (op:InterpretOp) :
+;            val [x, y] = [head(xs(e)), head(ys(e))]
+;            #interpret(asm-type(x), x, asm-type(y), y)            
+;          (op:LoadOp) :
+;            val [x, y, o] = [xs(e)[0], ys(e)[0], offset(op)]
+;            #load(asm-type(x), x, y, o)
+;          (op:StoreOp) :
+;            val [x, y, o] = [ys(e)[0], ys(e)[1], offset(op)]
+;            #store(asm-type(y), x, y, o)
 ;      (e:Save) :
+;        #store-var(x(e), x(e))
 ;      (e:Load) :
+;        #load-var(x(e))
 ;      (e:Xchg) :
+;        #xchg(???)
 ;      (e:Clear) :
+;        #store-var(x(e), asm-IntImm(VOID-TAG))
 ;      (e:ShuffleReg) :
+;        
 ;      (e:ShuffleFReg) :
 ;      (e:Label) :
+;        #label(n(e))
 ;      (e:Goto) :
+;        #goto(asm-Mem(n(e)))
 ;      (e:Break) :
+;        match(op(e)) :
+;          (op:TGHasStackSpace) :
+;          (op:TGArityNeOp) :
+;          (fop:Flip) :
+;          (op) :
+;            val [x, y] = [xs(e)[0], xs(e)[1]]
+;            #break(asm-type(x), n(e), o, x, y)            
 ;
 ;defn to-asm-type (t:TGType) :
 ;  match(t) :
@@ -2386,3 +2453,36 @@ defn values<?T> (xs:Vector<KeyValue<?,?T>>) : to-list(seq(value,xs))
 ;    (i:TGLongImm) : asm-LongImm(value(i))
 ;    (i:TGMem) : asm-Mem(n(i), offset(i))
 ;    (i:TGExMem) : asm-ExMem(lbl(i), offset(i))
+
+;============================================================
+;======================= Counter ============================
+;============================================================
+deftype Counter
+defmulti next (c:Counter, n:Int) -> Int
+defn value (c:Counter) : next(c, 0)
+
+defn Counter (init:Int) :
+  var x = init
+  new Counter :
+    defmethod next (this, n:Int) :
+      val cur-x = x
+      x = x + n
+      cur-x
+
+;============================================================
+;======================= Bitmasks ===========================
+;============================================================
+
+defn to-bitmask (xs:Seqable<True|False>) -> List<Long> :
+  val sxs = to-seq(xs)
+  defn bit (x:True|False) :
+    1L when x else 0L
+  defn loop (accum:Long, len:Int) :
+    if len == 64 :
+      cons(accum, loop(0L, 0))
+    else if not empty?(sxs) :
+      val mark = bit(next(sxs)) << to-long(len)
+      loop(accum + mark, len + 1)
+    else if len > 0 : List(accum)
+    else : List()
+  loop(0L, 0)  
