@@ -28,7 +28,7 @@ public defn allocate-registers (ins:Collection<TGIns>) :
 
   remove-critical-edges()
   println("==== Remove Critical Edges ====")
-  print-prog()
+  print-prog() 
 
   reverse-post-order()
   println("==== Reverse Post Order ====")
@@ -421,6 +421,32 @@ defmethod print (o:OutputStream, p:Port) :
 ;================== Operator Classification =================
 ;============================================================
 
+deftype Commutative :
+  TGAddOp <: Commutative
+  TGAndOp <: Commutative
+  TGOrOp <: Commutative
+  TGXorOp <: Commutative
+
+deftype NonCommutative :
+  TGSubOp <: NonCommutative
+  TGDivOp <: NonCommutative
+  TGModOp <: NonCommutative
+  TGShlOp <: NonCommutative
+  TGShrOp <: NonCommutative
+  TGAshrOp <: NonCommutative
+
+deftype Comparison :
+  TGEqOp <: Comparison
+  TGNeOp <: Comparison
+  TGLtOp <: Comparison
+  TGGtOp <: Comparison
+  TGLeOp <: Comparison
+  TGGeOp <: Comparison
+  TGUleOp <: Comparison
+  TGUltOp <: Comparison
+  TGUgtOp <: Comparison
+  TGUgeOp <: Comparison
+
 deftype Binary :
    TGAddOp <: Binary
    TGSubOp <: Binary
@@ -708,6 +734,8 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
     emit(Op(LoadOp(offset), List(x), List(y)))
   defn #store (x:Imm, y:Imm, offset:Int) :
     emit(Op(StoreOp(offset), List(), List(x, y)))
+  defn #conv (x:Var, y:Imm) :
+    emit(Op(ConvOp(), List(x), List(y)))
 
   ;=============================
   ;==== Variable Operations ====
@@ -725,6 +753,22 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
   defn force-var (x:Imm) :
     match(x:Var) : x
     else : force-new-var(x)
+
+  defn force-operand (x:Imm) :
+    val max = 1 << 16
+    val min = -1 << 16
+    defn large? (v:Int) : (v < min) or (v > max)
+    defn large? (v:Long) : (v < to-long(min)) or (v > to-long(max))
+    match(x) :
+      (x:Var) :
+        x
+      (x:Val) :
+        match(value(x)) :
+         (v:TGInt|TGLong) :
+           if large?(value(v)) : force-var(x)
+           else : x
+         (v:TGMem|TGExMem) : force-var(x)
+         (v) : x
 
   var c-rsp?: False|Var = false
   defn saved-c-rsp () :
@@ -846,26 +890,125 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
     ;Emit instruction
     emit(Match(dispatch?(e), tag-lists(e), xs))
 
+  ;==============================
+  ;==== Branch Normalization ====
+  ;==============================
+  defn norm-branch (e:Branch) :
+    defn x1 () : force-operand(xs(e)[0])
+    defn x2 () : force-operand(xs(e)[1])
+    match(op(e)) :
+      (op:TGOp&Comparison) :
+        match(x1(), x2()) :
+          (x1:Val, x2:Val) : emit(Branch(op, List(force-var(x1), x2)))
+          (x1, x2) : emit(Branch(op, List(x1, x2)))
+      (op:TGArityNeOp) :
+        emit(Branch(op, List(x1())))
+      (op) : emit(e)
+
   ;===============================
   ;==== Operand Normalization ====
   ;===============================
-  defn norm-div-op (e:Op) :
-    val y1 = ys(e)[0]
-    if type(y1) is TGIntT|TGLongT :
-      val x1 = xs(e)[0]
-      val x2 = make-var(type(y1))
-      emit(Op(DivModOp(), List(x1,x2), ys(e)))
-    else :
-      emit(e)
+  defn cast-to-int (x:Imm) :
+    val ix = make-var(TGIntT())
+    #conv(ix, force-var(x))
+    ix
+      
+  defn cast-to-int (x:Var, y1:Imm, y2:Imm,
+                    f: (TGType, Var, Var, Var) -> False) :
+    val ix = make-var(TGIntT())
+    f(TGIntT(), ix, cast-to-int(y1), cast-to-int(y2))
+    #conv(x, ix)
+    
+  defn cast-to-int (x:Var, y:Imm, 
+                    f: (TGType, Var, Var) -> False) :
+    val ix = make-var(TGIntT())
+    f(TGIntT(), ix, cast-to-int(y))
+    #conv(x, ix)
 
-  defn norm-mod-op (e:Op) :
-    val y1 = ys(e)[0]
-    if type(y1) is TGIntT|TGLongT :
-      val x1 = make-var(type(y1))
-      val x2 = xs(e)[0]
-      emit(Op(DivModOp(), List(x1,x2), ys(e)))
-    else :
-      emit(e)
+  defn norm-div-op (x:Var, y1:Imm, y2:Imm) :
+    match(type(y1)) :    
+      (t:TGIntT|TGLongT) :
+        val x2 = make-var(type(y1))
+        val y1 = force-var(y1)
+        val y2 = force-var(y2)
+        emit(Op(DivModOp(), List(x,x2), List(y1, y2)))
+        emit(Op(NoOp(), List(), List(y2)))
+      (t:TGByteT) :
+        cast-to-int{x, y1, y2, _} $ fn (t, x, y1, y2) :
+          emit(Op(DivModOp(), List(x, make-var(t)), List(y1, y2)))
+          emit(Op(NoOp(), List(), List(y2)))
+      (t:TGRealT) :
+        emit(Op(TGDivOp(), List(x), List(y1, y2)))
+        emit(Op(NoOp(), List(), List(y2)))        
+
+  defn norm-mod-op (x:Var, y1:Imm, y2:Imm) :
+    match(type(y1)) :
+      (t:TGIntT|TGLongT) :
+        val y1 = force-var(y1)
+        val y2 = force-var(y2)
+        emit(Op(DivModOp(), List(make-var(t), x), List(y1, y2)))
+        emit(Op(NoOp(), List(), List(y2)))
+      (t:TGByteT) :
+        cast-to-int{x, y1, y2, _} $ fn (t, x, y1, y2) :
+          emit(Op(DivModOp(), List(make-var(t), x), List(y1, y2)))
+          emit(Op(NoOp(), List(), List(y2)))
+
+  defn norm-mul-op (x:Var, y1:Imm, y2:Imm) :
+    match(type(y1)) :
+      (t:TGByteT) :
+        cast-to-int{x, y1, y2, _} $ fn (t, x, y1, y2) :
+          emit(Op(TGMulOp(), List(x), List(y1, y2)))
+      (t) : emit(Op(TGMulOp(), List(x), List(y1, y2)))
+
+  defn norm-noncomm-op (op:TGOp, x:Var, y1:Imm, y2:Imm) :
+    emit(Op(op, List(x), List(y1, y2)))
+    emit(Op(NoOp(), List(), List(y2)))
+
+  defn norm-cmp-op (op:TGOp, x:Var, y1:Imm, y2:Imm) :
+    match(y1, y2) :
+      (y1:Val, y2:Val) : emit(Op(op, List(x), List(force-var(y1), y2)))
+      (y1, y2) : emit(Op(op, List(x), List(y1, y2)))
+
+  defn norm-neg-op (op:TGOp, x:Var, y:Imm) :
+    match(type(x)) :
+      (t:TGIntegerT) :
+        norm-unary-op(op, x, y)
+      (t:TGRealT) :
+        val zero = make-var(t)
+        #conv(zero, Val(TGInt(0)))
+        emit(Op(TGSubOp(), List(x), List(zero, y)))
+
+  defn norm-unary-op (op:TGOp, x:Var, y:Imm) :
+    match(type(x)) :
+      (t:TGByteT) :
+        cast-to-int{x, y, _} $ fn (t, x, y) :
+          emit(Op(op, List(x), List(y)))
+      (t:TGIntT|TGLongT) :
+        emit(Op(op, List(x), List(y)))
+
+  defn norm-conv-op (x:Var, #y:Imm) :
+    val y = force-var(#y)
+    match(type(x), type(y)) :
+      (xt:TGIntegerT, yt:TGIntegerT) :
+        #conv(x, y)
+      (xt:TGRealT, yt:TGRealT) :
+        #conv(x, y)
+      (xt:TGByteT, yt:TGRealT) :
+        #conv(x, cast-to-int(y))
+      (xt:TGIntegerT, yt:TGRealT) :
+        #conv(x, y)
+      (xt:TGRealT, yt:TGByteT) :        
+        val iy = make-var(TGIntT())
+        #conv(iy, y)
+        #conv(x, iy)
+      (xt:TGRealT, yt:TGIntegerT) :
+        #conv(x, y)
+
+  defn norm-interpret-op (x:Var, y:Imm) :
+    emit(Op(InterpretOp(), List(x), List(force-var(y))))
+
+  defn norm-store-op (op:TGOp, y1:Imm, y2:Imm) :
+    Op(op, List(), List(y1, y2))
 
   ;===================
   ;==== Algorithm ====
@@ -889,10 +1032,25 @@ defn normalize (blk:Block, b:Int, backend:Backend) :
       (e:Match) :
         norm-match(e)
       (e:Op) :
+        defn x () : head(xs(e))
+        defn m1 () : ys(e)[0]
+        defn y1 () : force-operand(ys(e)[0])
+        defn y2 () : force-operand(ys(e)[1])
         match(op(e)) :
-          (op:TGDivOp) : norm-div-op(e)
-          (op:TGModOp) : norm-mod-op(e)
-          (op) : emit(e)
+          (op:TGDivOp) : norm-div-op(x(), y1(), y2())
+          (op:TGModOp) : norm-mod-op(x(), y1(), y2())
+          (op:TGMulOp) : norm-mul-op(x(), y1(), y2())
+          (op:TGOp&Commutative) : emit(e)          
+          (op:TGOp&NonCommutative) : norm-noncomm-op(op, x(), y1(), y2())
+          (op:TGOp&Comparison) : norm-cmp-op(op, x(), y1(), y2())
+          (op:TGNegOp) : norm-neg-op(op, x(), y1())
+          (op:TGNotOp) : norm-unary-op(op, x(), y1())
+          (op:InterpretOp) : norm-interpret-op(x(), y1())
+          (op:ConvOp) : norm-conv-op(x(), y1())
+          (op:StoreOp) : norm-store-op(op, m1(), y2())
+          (op:LoadOp) : emit(e)
+      (e:Branch) :
+        norm-branch(e)
       (e) :
         emit(e)
 
