@@ -12,18 +12,22 @@ defpackage stz/codegen :
   import stz/asm-ir with :
     prefix => asm-
   import stz/ids
+  import stz/backend
+  import stz/padder
 
 ;============================================================
 ;====================== Driver ==============================
 ;============================================================
 
 public defn generate-code (prog:TGProg, backend:Backend) -> Seqable<asm-Ins> :
+  ;Create tag table
+  val tag-table = TagTable(hier(prog))
   ;Create stitcher
-  val s = Stitcher(hier(prog))
+  val s = Stitcher(tag-table, hier(prog))
 
   ;Globals table
   val globals = Vector<TGDefGlobal>()
-  val consts = Vector<TGConst>()
+  val consts = Vector<TGDefConst>()
   val objects = Vector<TGDefObject>()
   
   generate<asm-Ins> :
@@ -48,74 +52,119 @@ public defn generate-code (prog:TGProg, backend:Backend) -> Seqable<asm-Ins> :
           add(globals, decl)
 
     ;=========================
-    ;==== Attach Snippets ====
+    ;==== Runtime Library ====
     ;=========================
+    do(yield, machine-state())
     do(yield, stack-extension())
     do(yield, stack-retraction())
+
+    ;================
+    ;==== Tables ====
+    ;================
+    do(yield, compile-object-table(tag-table, objects))
+    do(yield, compile-constant-table(consts))
+    do(yield, compile-globals(consts, globals))
+
+;============================================================
+;==================== Tag Assignment ========================
+;============================================================
+
+public deftype TagTable
+public defmulti tag (t:TagTable, n:Int) -> Int
+
+public defn TagTable (h:KHierarchy) :
+  val tag-counter = to-seq(0 to false)
+  val table = HashTable<Int,False|Int>()
+  
+  ;Call f on all roots of n
+  defn do-roots (f:Int -> ?, n:Int) :
+    val ps = parents(h, n)
+    if empty?(ps) : f(n)
+    else : do(do-roots{f, _}, ps)
+
+  ;Assign tags to all children
+  defn assign-tags (n:Int) :
+    if not key?(table, n) :
+      table[n] = next(tag-counter) when leaf?(h,n)
+      do(assign-tags, children(h,n))
+      
+  ;Assigns tags
+  assign-tags(FALSE-TYPE-ID)
+  assign-tags(TRUE-TYPE-ID)
+  for n in types(h) do :
+    do-roots(assign-tags, n)
+  val num-tags = next(tag-counter)
+
+  ;Return tag table
+  new TagTable :
+    defmethod tag (this, n:Int) : table[n] as Int
 
 ;============================================================
 ;================== Global Table Compilation ================
 ;============================================================
-defn compile (cs:Vector<TGConst>, gs:Vector<TGDefGlobal>) :
-  ;Track ref-bits
-  val ref-bits = Vector<True|False>()
-  defn mark-bit (i:Int) :
-    if i >= length(ref-bits)
-      lengthen(ref-bits, i + 1, false)
-    ref-bits[i] = true
+defn compile-globals (cs:Vector<TGDefConst>, gs:Vector<TGDefGlobal>) :
+  val buffer = Vector<asm-Ins>()
+  let-var INSTRUCTIONS = buffer :
+    ;Track ref-bits
+    val ref-bits = Vector<True|False>()
+    defn mark-bit (i:Int) :
+      if i >= length(ref-bits) :
+        lengthen(ref-bits, i + 1, false)
+      ref-bits[i] = true
 
-  ;Start of table
-  ;[Consts ... Global Vars ...]
-  #data()
-  #label(GLOBAL-TABLE-LBL)
+    ;Start of table
+    ;[Consts ... Global Vars ...]
+    #data()
+    #label(GLOBAL-TABLE-LBL)
 
-  ;Add constants
-  val size-counter = 0
-  for c in cs do :
-    #label(n(c))
-    #deflong(to-long(VOID-TAG))
-    val offset = next(size-counter, 8)
-    mark-bit(offset / 8)
+    ;Add constants
+    val size-counter = Counter(0)
+    for c in cs do :
+      #label(n(c))
+      #deflong(to-long(VOID-TAG))
+      val offset = next(size-counter, 8)
+      mark-bit(offset / 8)
 
-  ;Add globals (in sorted alignment order)
-  qsort!(alignment, gs)
-  val [padded-gs, gs-aln] = pad(alignment, size, gs, 8)
-  for g in padded-gs do :
-    match(g) :
-      (g:Padding) :
-        #defspace(size(g))
-        next(size-counter, size(g))
-      (g:TGDefGlobal) :
-        #label(n(g))       
-        val start = value(size-counter) ;Starting offset of global
-        for (t in types(g), o in offsets(g)) do :
-          ;Offset of field
-          val offset = start + o
-          ;Difference
-          val diff = offset - value(size-counter)
-          if diff > 0 :
-            #defspace(diff)
-          ;Yield declaration instruction
-          match(t) :
-            (t:TGByteT) : #defbyte(0Y)
-            (t:TGIntT) : #defint(0)
-            (t:TGLongT) : #deflong(0L)
-            (t:TGFloatT) : #deffloat(0.0F)
-            (t:TGDoubleT) : #defdouble(0.0)
-            (t:TGRefT) :
-              #deflong(VOID-TAG)
-              mark-bit(offset / 8)
-          ;Increment counter
-          set-value(size-counter, offset + size(t))
-          
-  ;End of table        
-  #text()
+    ;Add globals (in sorted alignment order)
+    qsort!(alignment, gs)
+    val [padded-gs, gs-aln] = pad(alignment, size, gs, 8)
+    for g in padded-gs do :
+      match(g) :
+        (g:Padding) :
+          #defspace(size(g))
+          next(size-counter, size(g))
+        (g:TGDefGlobal) :
+          #label(n(g))       
+          val start = value(size-counter) ;Starting offset of global
+          for (t in types(g), o in offsets(g)) do :
+            ;Offset of field
+            val offset = start + o
+            ;Difference
+            val diff = offset - value(size-counter)
+            if diff > 0 :
+              #defspace(diff)
+            ;Yield declaration instruction
+            match(t) :
+              (t:TGByteT) : #defbyte(0Y)
+              (t:TGIntT) : #defint(0)
+              (t:TGLongT) : #deflong(0L)
+              (t:TGFloatT) : #deffloat(0.0F)
+              (t:TGDoubleT) : #defdouble(0.0)
+              (t:TGRefT) :
+                #deflong(to-long(VOID-TAG))
+                mark-bit(offset / 8)
+            ;Increment counter
+            set-value(size-counter, offset + size(t))
+            
+    ;End of table        
+    #text()
 
-  ;Emit globals mask table
-  ;[Length, Bits ...]
-  #label(GLOBAL-MAP-LBL)
-  #deflong(to-long(length(ref-bits)))
-  do(#deflong, to-bitmask(ref-bits))
+    ;Emit globals mask table
+    ;[Length, Bits ...]
+    #label(GLOBAL-MAP-LBL)
+    #deflong(to-long(length(ref-bits)))
+    do(#deflong, to-bitmask(ref-bits))
+  buffer
 
 ;============================================================
 ;=============== Constant Table Compilation =================
@@ -123,62 +172,103 @@ defn compile (cs:Vector<TGConst>, gs:Vector<TGDefGlobal>) :
 
 ;     Compiling Constant Table
 ;     ========================
-defn compile-constant-table (cs:Vector<TGConst>) :
-  defn emit-const (v) :
-    match(v) :
-      (v:Byte) :
-        #defint(BYTE-CONST-TAG)
-        #defbyte(v)
-      (v:Char) :
-        #defint(CHAR-CONST-TAG)
-        #defbyte(to-byte(v))
-      (v:Int) :
-        #defint(INT-CONST-TAG)
-        #defint(v)
-      (v:Long) :
-        #defint(LONG-CONST-TAG)
-        #deflong(v)
-      (v:Float) :
-        #defint(FLOAT-CONST-TAG)
-        #deffloat(v)
-      (v:Double) :
-        #defint(DOUBLE-CONST-TAG)
-        #defdouble(v)
-      (v:String) :
-        val n = length(v)
-        #defint(STRING-CONST-TAG)
-        #deflong(to-long(n))
-        #defstring(v)
-      (v:Symbol) :
-        val chars = to-string(v)
-        val n = length(chars)
-        #defint(SYMBOL-CONST-TAG)
-        #deflong(to-long(n))
-        #defstring(chars)
-      (v:List) :
-        #defint(LIST-CONST-TAG)
-        #defint(length(v))
-        do(emit-const, v)
-      (v:True) :
-        #defint(TRUE-CONST-TAG)
-      (v:False) :
-        #defint(FALSE-CONST-TAG)
-      (v:TGTypeObject) :
-        #defint(TYPE-CONST-TAG)
-        #deflabel(n(v))
-      ;Top level closures
-      ;(v:KClosure) :
-      ;  #defint(FN-CONST-TAG)
-      ;  emit(tgt-DefLabel(n(v)))
-      (v) :
-        fatal("Unrecognized constant: %~" % [v])
+defn compile-constant-table (cs:Vector<TGDefConst>) :
+  val buffer = Vector<Ins>()
+  let-var INSTRUCTIONS = buffer :
+    defn emit-const (v:TGConst) :
+      match(v) :
+        (v:Char) :
+          #defint(CHAR-CONST-TAG)
+          #defbyte(to-byte(v))
+        (v:Byte) :
+          #defint(BYTE-CONST-TAG)
+          #defbyte(v)
+        (v:Int) :
+          #defint(INT-CONST-TAG)
+          #defint(v)
+        (v:Long) :
+          #defint(LONG-CONST-TAG)
+          #deflong(v)
+        (v:Float) :
+          #defint(FLOAT-CONST-TAG)
+          #deffloat(v)
+        (v:Double) :
+          #defint(DOUBLE-CONST-TAG)
+          #defdouble(v)
+        (v:String) :
+          val n = length(v)
+          #defint(STRING-CONST-TAG)
+          #deflong(to-long(n))
+          #defstring(v)
+        (v:Symbol) :
+          val chars = to-string(v)
+          val n = length(chars)
+          #defint(SYMBOL-CONST-TAG)
+          #deflong(to-long(n))
+          #defstring(chars)
+        (v:List) :
+          #defint(LIST-CONST-TAG)
+          #defint(length(v))
+          do(emit-const, v)
+        (v:True) :
+          #defint(TRUE-CONST-TAG)
+        (v:False) :
+          #defint(FALSE-CONST-TAG)
+        (v:TGTypeObject) :
+          #defint(TYPE-CONST-TAG)
+          #deflabel(n(v))
+        ;Top level closures
+        ;(v:KClosure) :
+        ;  #defint(FN-CONST-TAG)
+        ;  emit(tgt-DefLabel(n(v)))
+        (v) :
+          fatal("Unrecognized constant: %~" % [v])
 
-  ;Emit constant table
-  #data()
-  #label(CONSTANT-TABLE-LBL)
-  #defint(length(cs))
-  do(emit-const, cs)
-  #text()
+    ;Emit constant table
+    #data()
+    #label(CONSTANT-TABLE-LBL)
+    #defint(length(cs))
+    do(emit-const{value(_)}, cs)
+    #text()
+  buffer
+
+;============================================================
+;=================== Object Table ===========================
+;============================================================
+
+defn compile-object-table (tt:TagTable, objs:Vector<TGDefObject>) :
+  val buffer = Vector<asm-Ins>()
+  let-var INSTRUCTIONS = buffer :
+    ;Sort by tag
+    qsort!(tag{tt, n(_)}, objs)
+
+    ;Sanity check
+    val last-obj = objs[length(objs) - 1]
+    if tag(tt, n(last-obj)) != length(objs) - 1 :
+      fatal("Failed tag assignment.")
+
+    ;Emit table
+    #data()
+    #label(OBJECT-TABLE-LBL)
+    do(#deflabel{n(_)}, objs)
+
+    ;Emit table entries
+    for obj in objs do :
+      defn bitmask (sz:Int, ts:List<TGType>, os:List<Int>) :
+        val bits = Array<True|False>(sz / 8, false)
+        for (t in ts, o in os) do :
+          match(t:TGRefT) :
+            bits[o / 8] = true
+        to-bitmask(bits)
+      
+      #label(n(obj))
+      #defint(size(obj))
+      #defint(rsize(obj))
+      do(#deflong, bitmask(size(obj), types(obj), offsets(obj)))
+      do(#deflong, bitmask(rsize(obj), rtypes(obj), roffsets(obj)))  
+
+    #text()
+  buffer
 
 ;============================================================
 ;=================== Multi Compilation ======================
@@ -196,13 +286,16 @@ defn compile (m:TGDefmulti, backend:Backend) :
       else : yield(Reg(n))
     for i in 0 to false do :
       yield(Mem(ARG-LBL, 8 * i))
-  val args = to-list(take-n(arity(m), all-args))
+  val args = let :
+    do(next{all-args}, 0 to tarity(m))  ;Skip type arguments
+    to-list(take-n(arity(m), all-args)) ;Take arguments
 
   ;Emit code
   val buffer = Vector<asm-Ins>()
   let-var INSTRUCTIONS = buffer :
+    val wrong-arity-lbl = fresh-id()
     #label(n(m))
-    #jneq(wrong-arity-lbl, R0, INT(arity(m)))
+    #jnel(M(wrong-arity-lbl), R0, INT(arity(m)))
     #movl(R1, R2)
     #dispatch(args, bs)
     for (b in bs, m in methods(m)) do :
@@ -213,6 +306,55 @@ defn compile (m:TGDefmulti, backend:Backend) :
     #movl(R0, INT(0))
     #goto(M(ARITY-ERROR-ID))
   buffer
+
+;============================================================
+;===================== Runtime Lib ==========================
+;============================================================
+
+defn machine-state () :
+  val buffer = Vector<asm-Ins>()
+  let-var INSTRUCTIONS = buffer :
+    #data()
+
+    ;Argument space
+    #label(ARG-LBL)
+    #defspace(8 * 256)
+    
+    ;Swapping space
+    #label(SWAP-LBL)
+    #deflong(0L)
+    
+    ;C stack pointer
+    #label(C-RSP-LBL)
+    #deflong(0L)
+    
+    ;Stack size
+    #exlabel(`stanza_stack_size)
+    #deflong(to-long(STACK-SIZE))
+    
+    ;Heap Labels
+    #label(HEAP-PTR-LBL)
+    #deflong(0L)
+    #label(HEAP-LIM-LBL)
+    #deflong(0L)
+    
+    ;Stack Labels
+    #label(STACK-PTR-LBL)
+    #deflong(0L)
+    #label(STACK-LIM-LBL)
+    #deflong(0L)
+    #label(STACK-POOL-LBL)
+    #deflong(0L)
+    #label(NUM-FREE-STACKS-LBL)
+    #deflong(0L)
+    #label(FREE-STACKS-LBL)
+    #deflong(0L)
+    #label(STACK-LBL)
+    #deflong(0L)
+
+    #text()
+  buffer
+
 
 ;============================================================
 ;============== Stack Retraction/Extension ==================
@@ -427,8 +569,17 @@ public val RSP = asm-RegSP()
 
 public defn #data () : E $ asm-DefData()
 public defn #text () : E $ asm-DefText()
+public defn #defbyte (v:Byte) : E $ asm-DefByte(v)
+public defn #defint (v:Int) : E $ asm-DefInt(v)
 public defn #deflong (v:Long) : E $ asm-DefLong(v)
+public defn #deffloat (v:Float) : E $ asm-DefFloat(v)
+public defn #defdouble (v:Double) : E $ asm-DefDouble(v)
+public defn #defstring (v:String) : E $ asm-DefString(v)
+public defn #defspace (size:Int) : E $ asm-DefSpace(size)
+public defn #deflabel (n:Int) : E $ asm-DefLabel(n)
+
 public defn #label (n:Int) : E $ asm-Label(n)
+public defn #exlabel (n:Symbol) : E $ asm-ExLabel(n)
 public defn #goto (x:asm-Imm) : E $ asm-Goto(x)
 public defn #call (x:asm-Imm) : E $ asm-Call(x)
 public defn #return () : E $ asm-Return()
