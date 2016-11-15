@@ -9,6 +9,8 @@ stanza core/core.stanza \
        compiler/stz-pl-ir.stanza \
        compiler/stz-asm-ir.stanza \
        compiler/stz-serializer.stanza \
+       compiler/stz-backend.stanza \
+       compiler/stz-asm-emitter.stanza \
        compiler/stz-pkg.stanza \
        compiler/stz-pkg-reader.stanza \
-    -o reader
+    -o linker
