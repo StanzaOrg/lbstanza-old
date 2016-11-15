@@ -8,6 +8,8 @@ stanza core/core.stanza \
        compiler/stz-kl-ir.stanza \
        compiler/stz-pl-ir.stanza \
        compiler/stz-asm-ir.stanza \
+       compiler/stz-tgt-ir.stanza \
+       compiler/stz-khier.stanza \
        compiler/stz-serializer.stanza \
        compiler/stz-backend.stanza \
        compiler/stz-asm-emitter.stanza \
