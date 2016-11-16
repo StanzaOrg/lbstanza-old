@@ -57,6 +57,7 @@ $STANZA  core/core.stanza \
          compiler/stz-codegen.stanza \
          compiler/stz-stitcher.stanza \
          compiler/stz-asm-emitter.stanza \
+         compiler/stz-fuse.stanza \
          compiler/stz-pkg.stanza \
          compiler/stz-compiler.stanza \
          compiler/stz-arg-parser.stanza \
