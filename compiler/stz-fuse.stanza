@@ -1,0 +1,440 @@
+defpackage stz/fuse :
+  import core
+  import collections
+  import stz/pl-ir
+  import stz/tgt-ir
+  import stz/tl-ir
+  import stz/type-calculus
+  import stz/namemap
+  import stz/asm-ir
+  import stz/kl-ir
+  import stz/ids
+
+;============================================================
+;==================== IdTable ===============================
+;============================================================
+
+;=================
+;==== Id Keys ====
+;=================
+deftype IdKey <: Hashable & Equalable
+defmulti id (k:IdKey) -> Id
+
+defn IdKey (id:Id) :
+  val id* = normalize(id)
+  new IdKey :
+    defmethod id (this) : id*
+  
+defn normalize (id:Id) :
+  defn norm (targs:List<Int>, cargs:List<Int>, a1:List<Type>) ->
+             [List<Int>, List<Int>, List<Type>] :
+    val counter = to-seq(0 to false)
+    val targs* = map(next{counter}, targs)
+    val cargs* = map(next{counter}, cargs)
+    val env = map(KeyValue,
+                  append(targs, cargs),
+                  append(targs*, cargs*))
+    val a1* = map(sub{_, env}, a1)
+    [targs*, cargs*, a1*]
+    
+  defn norm (targs:List<Int>, cargs:List<Int>, a1:List<LSType>) ->
+             [List<Int>, List<Int>, List<LSType>] :
+    val counter = to-seq(0 to false)
+    val targs* = map(next{counter}, targs)
+    val cargs* = map(next{counter}, cargs)
+    val env = map(KeyValue,
+                  append(targs, cargs),
+                  append(targs*, cargs*))
+    val a1* = map(sub{_, env}, a1)
+    [targs*, cargs*, a1*]
+
+  match(id) :
+    (id:FnId) :
+      val [targs*, cargs*, a1*] = norm(targs(id), cargs(id), a1(id))
+      FnId(name(id), tail?(id), targs*, cargs*, a1*, a2(id), visibility(id))      
+    (id:MultiId) :
+      val [targs*, cargs*, a1*] = norm(targs(id), cargs(id), a1(id))
+      MultiId(name(id), tail?(id), targs*, cargs*, a1*, a2(id), visibility(id))
+    (id:LSFnId) :
+      val [targs*, cargs*, a1*] = norm(targs(id), cargs(id), a1(id))
+      LSFnId(name(id), tail?(id), targs*, cargs*, a1*, a2(id), visibility(id))
+    (id) : id
+
+defmethod hash (x:IdKey) :
+  match(id(x)) :
+    (id:ValId) : hash(name(id))
+    (id:VarId) : hash(name(id))
+    (id:TypeId) : hash(name(id))
+    (id:LSValId) : hash(name(id))
+    (id:LSVarId) : hash(name(id))
+    (id:LSTypeId) : hash(name(id))
+    (id:LSExternId) : hash(name(id))
+    (id:FnId) : hash([name(id), targs(id), cargs(id), a1(id)])
+    (id:MultiId) : hash([name(id), targs(id), cargs(id), a1(id)])
+    (id:LSFnId) : hash([name(id), targs(id), cargs(id), a1(id)])
+    (id:LSExternFnId) : hash([name(id), a1(id)])
+  
+defmethod equal? (a:IdKey, b:IdKey) :
+  match(id(a), id(b)) :
+    (a:ValId, b:ValId) : name(a) == name(b)
+    (a:VarId, b:VarId) : name(a) == name(b)
+    (a:TypeId, b:TypeId) : name(a) == name(b)
+    (a:LSValId, b:LSValId) : name(a) == name(b)
+    (a:LSVarId, b:LSVarId) : name(a) == name(b)
+    (a:LSTypeId, b:LSTypeId) : name(a) == name(b)
+    (a:LSExternId, b:LSExternId) : name(a) == name(b)
+    (a:FnId, b:FnId) :
+      name(a) == name(b) and
+      targs(a) == targs(b) and
+      cargs(a) == cargs(b) and
+      a1(a) == a1(b)
+    (a:MultiId, b:MultiId) : 
+      name(a) == name(b) and
+      targs(a) == targs(b) and
+      cargs(a) == cargs(b) and
+      a1(a) == a1(b)
+    (a:LSFnId, b:LSFnId) :
+      name(a) == name(b) and
+      targs(a) == targs(b) and
+      cargs(a) == cargs(b) and
+      a1(a) == a1(b)
+    (a:LSExternFnId, b:LSExternFnId) :
+      name(a) == name(b) and
+      a1(a) == a1(b)
+    (a, b) : false
+
+;==================
+;==== Id Table ====
+;==================
+
+deftype IdTable
+defmulti set (t:IdTable, id:Id, n:Int) -> False
+defmulti get (t:IdTable, id:Id) -> Int
+defmulti key? (t:IdTable, id:Id) -> True|False
+
+defn IdTable () :
+  val table = HashTable<IdKey, Int>()
+  new IdTable :
+    defmethod set (this, id:Id, n:Int) : table[IdKey(id)] = n
+    defmethod get (this, id:Id) : table[IdKey(id)]
+    defmethod key? (this, id:Id) : key?(table, IdKey(id))
+
+;============================================================
+;=================== Fusing Algorithm =======================
+;============================================================
+
+public defn fuse-pkgs (nm:NameMap,
+                       decls:List<KeyValue<Symbol,List<Declare>>>,
+                       pkgs:List<TGPackage>) -> List<TGPackage> :
+  ;DEBUG                       
+  println("Fuse packages")
+  for entry in decls do :
+    println(key(entry))
+    indented $ fn () :
+      do(println, value(entry))
+  for pkg in pkgs do :
+    println(name(pkg))
+    indented $ fn () :
+      println(ids(pkg))  
+  
+  ;========================             
+  ;==== Mapping Tables ====
+  ;========================
+  val rename-tables = HashTable<Symbol,HashTable<Int,Int>>()
+  val id-tables = HashTable<Symbol,IdTable>()
+  val global-ids = HashTable<Int,Id>()
+  
+  ;Initialize tables
+  for pkg in cat(seq(key, decls) seq(name, pkgs)) do :
+    id-tables[pkg] = IdTable()
+  for pkg in seq(name, pkgs) do :
+    rename-tables[pkg] = HashTable<Int,Int>()
+  
+  ;=================
+  ;==== Staging ====
+  ;=================
+  defn stage0? (id:Id) :
+    id is ValId|VarId|TypeId|LSValId|LSVarId|LSTypeId|LSExternId
+  defn stage0? (d:Declare) : stage0?(id(d))
+  defn stage0? (i:Import) : stage0?(id(i))
+    
+  defn stage1? (id:Id) :
+    id is FnId|MultiId|LSFnId|LSExternFnId
+  defn stage1? (d:Declare) : stage1?(id(d))
+  defn stage1? (i:Import) : stage1?(id(i))
+  
+  ;========================================
+  ;==== 1. Compute Declaration Renames ====
+  ;========================================
+  defn old-n (d:Declare) :
+    val e = nm[n(d)] as DeclEntry
+    n(decl(e))
+    
+  for pkg in pkgs do :
+    val table = rename-tables[name(pkg)]
+    for d in declarations(ids(pkg)) do :
+      table[old-n(d)] = n(d)
+  
+  ;===================================
+  ;==== 2. Compute Stage0 Renames ====
+  ;===================================
+  defn record-declarations (stage?:Declare -> True|False,
+                            f: (Symbol, Id) -> Id,
+                            decls:KeyValue<Symbol,List<Declare>>) :
+    val [pkg, ds] = [key(decls), value(decls)]
+    val table = id-tables[pkg]
+    for d in filter(stage?, ds) do :
+      val id* = f(pkg, id(d))
+      table[id*] = n(d)
+      global-ids[n(d)] = id*
+
+  defn all-decls () :
+    val pkg-decls = for pkg in pkgs seq :
+      name(pkg) => declarations(ids(pkg))
+    cat(decls, pkg-decls)
+
+  defn compute-imports (stage?:Import -> True|False,
+                        f: (Symbol, Id) -> Id) :
+    for pkg in pkgs do :
+      val rename-table = rename-tables[name(pkg)]
+      for import-pkg in imports(ids(pkg)) do :
+        ;Retrieve package tables
+        val id-table = id-tables[package(import-pkg)]
+        ;Compute imported renames
+        for import in filter(stage?, imports(import-pkg)) do :
+          val new-n = id-table[f(name(pkg), id(import))]
+          rename-table[n(import)] = new-n                     
+
+  ;Mark all stage0 ids.
+  defn identity (pkg:Symbol, x:Id) : x
+  do(record-declarations{stage0?, identity, _}, all-decls())
+  compute-imports(stage0?, identity)
+  
+  ;===================================
+  ;==== 3. Compute Stage1 Renames ====
+  ;===================================
+  defn rename (pkg:Symbol, id:Id) :
+    defn rename (t:Type) : rename-ids(rename-tables[pkg], t)
+    defn rename (t:LSType) : rename-ids(rename-tables[pkg], t)
+    defn rename (ts:List<Type>) : map(rename, ts)
+    defn rename (ts:List<LSType>) : map(rename, ts)
+    match(id) :
+      (id:FnId) : FnId(name(id), tail?(id), targs(id), cargs(id),
+                    rename(a1(id)), a2(id), visibility(id))
+      (id:MultiId) : MultiId(name(id), tail?(id), targs(id), cargs(id),
+                       rename(a1(id)), a2(id), visibility(id))
+      (id:LSFnId) : LSFnId(name(id), tail?(id), targs(id), cargs(id),
+                      rename(a1(id)), a2(id), visibility(id))
+      (id:LSExternFnId) : LSExternFnId(name(id), lbl(id),
+                            rename(a1(id)), a2(id), visibility(id))
+      (id) : id
+  
+  ;Note stage1 ids
+  do(record-declarations{stage1?, rename, _}, all-decls())
+  compute-imports(stage1?, rename)
+
+  ;===================================
+  ;==== 4. Compute Stage2 Renames ====
+  ;===================================
+  defn map-over (src-pkg:Symbol, src:Int, dst-pkg:Symbol, dst:Int) :
+    val g = rename-tables[src-pkg][src]
+    rename-tables[dst-pkg][dst] = g
+  defn map-over (src-pkg:Symbol, src:List<Int>, dst-pkg:Symbol, dst:List<Int>) :
+    for (s in src, d in dst) do : map-over(src-pkg, s, dst-pkg, d)
+  defn map-over (src-pkg:Symbol, src:Id, dst-pkg:Symbol, dst:Id) :
+    match(src, dst) :
+      (src:FnId, dst:FnId) :
+        map-over(src-pkg, append(targs(src), cargs(src)),
+                 dst-pkg, append(targs(dst), cargs(dst)))        
+      (src:MultiId, dst:MultiId) :
+        map-over(src-pkg, append(targs(src), cargs(src)),
+                 dst-pkg, append(targs(dst), cargs(dst)))        
+      (src:TypeId, dst:TypeId) :
+        map-over(src-pkg, args(src),
+                 dst-pkg, args(dst))                 
+        map-over(src-pkg, seq-append(args, children(src))
+                 dst-pkg, seq-append(args, children(dst)))        
+      (src:LSFnId, dst:LSFnId) :
+        map-over(src-pkg, append(targs(src), cargs(src)),
+                 dst-pkg, append(targs(dst), cargs(dst)))        
+      (src:LSTypeId, dst:LSTypeId) :
+        map-over(src-pkg, args(src),
+                 dst-pkg, args(dst))
+        map-over(src-pkg, map(n, fields(src))
+                 dst-pkg, map(n, fields(dst)))
+  for pkg in pkgs do :
+    val dst-pkg = name(pkg)
+    for import-pkg in imports(ids(pkg)) do :
+      val src-pkg = package(import-pkg)
+      for import in imports(import-pkg) do :
+        match(id(import)) :
+          (id:FnId|MultiId|TypeId|LSFnId|LSTypeId) :
+            val g = rename-tables[dst-pkg][n(import)]
+            map-over(src-pkg, global-ids[g], dst-pkg, id)
+          (id) : false
+
+  ;============================
+  ;==== 5. Rename Packages ====
+  ;============================
+  val pkgs* = for pkg in pkgs map :
+    val table = rename-tables[name(pkg)]
+    rename-ids(table, pkg)
+
+  do(println, pkgs*)
+
+  ;==============================
+  ;==== 6. Check Consistency ====
+  ;==============================
+
+
+  
+  fatal("Stop Here.")
+
+;============================================================
+;==================== Rename Ids ============================
+;============================================================
+
+defn rename-ids (table:HashTable<Int,Int>, t:Type) :
+  let loop (t:Type = t) :
+    match(map(loop, t)) :
+      (t:TOf) : TOf(table[n(t)], type(t))
+      (t) : t
+
+defn rename-ids (table:HashTable<Int,Int>, t:LSType) :
+  let loop (t:LSType = t) :
+    val t* = map(rename-ids{table, _:Type}, map(loop, t))
+    match(t*) :
+      (t:StructT) : StructT(table[n(t)], type(t))
+      (t) : t
+
+defn rename-ids (table:HashTable<Int,Int>, id:Id) :
+  defn rename (c:ChildDec) :
+    ChildDec(rename(n(c)), rename(args(c)), rename(parent(c)))
+  defn rename (f:FieldDec) :
+    FieldDec(rename(n(f)), rename(type(f)))
+  defn rename (i:Int) : table[i]
+  defn rename (x:False) : false
+  defn rename (t:Type) : rename-ids(table, t)
+  defn rename (t:LSType) : rename-ids(table, t)
+  defn rename (ts:List<LSType>) : map(rename, ts)
+  defn rename (ts:List<Type>) : map(rename, ts)
+  defn rename (xs:List<Int>) : map(rename, xs)
+  defn rename (xs:List<ChildDec>) : map(rename, xs)
+  defn rename (xs:List<FieldDec>) : map(rename, xs)
+    
+  match(id) :
+    (id:ValId) :
+      ValId(name(id), rename(type(id)), visibility(id))
+    (id:VarId) :
+      VarId(name(id), rename(type(id)), visibility(id))
+    (id:FnId) :
+      FnId(name(id), tail?(id), rename(targs(id)), rename(cargs(id)),
+        rename(a1(id)), rename(a2(id)), visibility(id))
+    (id:MultiId) :
+      MultiId(name(id), tail?(id), rename(targs(id)), rename(cargs(id)),
+        rename(a1(id)), rename(a2(id)), visibility(id))
+    (id:TypeId) :
+      TypeId(name(id), rename(args(id)), rename(parent(id)),
+        rename(children(id)), visibility(id))
+    (id:TArgId) :
+      id      
+    (id:LSValId) :
+      LSValId(name(id), rename(type(id)), visibility(id))
+    (id:LSVarId) :
+      LSVarId(name(id), rename(type(id)), visibility(id))
+    (id:LSFnId) :
+      LSFnId(name(id), tail?(id), rename(targs(id)), rename(cargs(id)),
+        rename(a1(id)), rename(a2(id)), visibility(id))
+    (id:LSTypeId) :
+      LSTypeId(name(id), rename(args(id)), rename(parent(id)),
+        rename(fields(id)), visibility(id))
+    (id:FieldId) :
+      id
+    (id:LSExternFnId) :
+      LSExternFnId(name(id), lbl(id), rename(a1(id)), rename(a2(id)),
+        visibility(id))
+    (id:LSExternId) :
+      LSExternId(name(id), lbl(id), rename(type(id)), visibility(id))
+
+defn rename-ids (table:HashTable<Int,Int>, ids:PkgIds) :
+  defn rename (d:Declare) :
+    Declare(n(d), rename-ids(table, id(d)), info(d))
+  defn rename (i:Import) :
+    Import(table[n(i)], rename-ids(table, id(i)))
+  defn rename (i:ImportPackage) :
+    ImportPackage(package(i), map(rename, imports(i)))
+  PkgIds(map(rename, declarations(ids)),
+         map(rename, imports(ids)))
+
+;============================================================
+;================= Rename Ids to TGDecl =====================
+;============================================================
+
+defn rename-ids (rename-id:Int -> Int, x:Ins) :
+  defn rename (x:Imm) :
+    match(x) :
+      (x:Mem) : Mem(rename-id(n(x)), offset(x))
+      (x:TagImm) : TagImm(rename-id(n(x)), marker?(x))
+      (x) : x
+  defn rename (t:KTag) :
+    match(t:KOf) : KOf(rename-id(n(t)))
+    else : map(rename, t)
+  defn rename (b:Branch) :
+    Branch(map(rename, tags(b)), rename-id(n(b)))
+  match(map(rename, x)) :
+    (x:Label) : Label(rename-id(n(x)))
+    (x:DefLabel) : DefLabel(rename-id(n(x)))
+    (x:Match) : Match(xs(x), map(rename, branches(x)))
+    (x:Dispatch) : Dispatch(xs(x), map(rename, branches(x)))
+    (x) : x
+
+defn rename-ids (rename-id:Int -> Int, e:TGDecl) :
+  defn rename (n:Int) : rename-id(n)
+  defn rename (n:Symbol) : n
+  defn rename (x:False) : x
+  defn rename (t:KTag) :
+    match(t:KOf) : KOf(rename-id(n(t)))
+    else : map(rename, t)
+  defn rename (xs:Vector<Ins>) :
+    map<Ins>(rename-ids{rename-id, _}, xs)
+  defn rename (xs:List<KTag>) :
+    map(rename, xs)
+  defn rename-const (c:TGConst) :
+    match(c:TGTypeObject) : TGTypeObject(rename(n(c)))
+    else : c
+    
+  match(e) :
+    (e:TGDefASM) :
+      TGDefASM(rename(n(e)), rename(ins(e)))
+    (e:TGDefmulti) :
+      TGDefmulti(rename(n(e)), tarity(e), arity(e))
+    (e:TGDefmethod) :
+      TGDefmethod(rename(multi(e)), rename(tags(e)), rename(code(e)))
+    (e:TGDefConst) :
+      TGDefConst(rename(n(e)), rename-const(value(e)))
+    (e:TGDefObject) :
+      TGDefObject(rename(n(e)), rename(parent(e)), size(e),
+        types(e), offsets(e), rsize(e), rtypes(e), roffsets(e))
+    (e:TGDefGlobal) :
+      TGDefGlobal(rename(n(e)), size(e), alignment(e),
+        types(e), offsets(e))
+
+defn rename-ids (table:HashTable<Int,Int>, pkg:TGPackage) :
+  val local-ids = HashTable<Int,Int>()
+  defn rename? (x:Int) :
+    match(get?(table, x)) :
+      (y:Int) : y
+      (_:False) :
+        match(get?(local-ids, x)) :
+          (y:Int) : y
+          (_:False) :
+            val y = fresh-id()
+            table[x] = y
+            y
+  defn rename (x:TGDecl) :
+    rename-ids(rename?, x)
+    
+  TGPackage(name(pkg),
+            rename-ids(table, ids(pkg)),
+            rename?(entry(pkg)),
+            map<TGDecl>(rename, decls(pkg)))
