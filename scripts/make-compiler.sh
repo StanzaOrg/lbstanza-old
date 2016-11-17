@@ -50,6 +50,7 @@ $STANZA  core/core.stanza \
          compiler/stz-type.stanza \
          compiler/stz-type-to-kform.stanza \
          compiler/stz-kform.stanza \
+         compiler/stz-dec-table.stanza \
          compiler/stz-kform-to-tgt.stanza \
          compiler/stz-khier.stanza \
          compiler/stz-backend.stanza \
