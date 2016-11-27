@@ -40,6 +40,7 @@ $STANZA  core/core.stanza \
          compiler/stz-kl-ir.stanza \
          compiler/stz-pl-ir.stanza \
          compiler/stz-tgt-ir.stanza \
+         compiler/stz-tgt-utils.stanza \
          compiler/stz-asm-ir.stanza \
          compiler/stz-input.stanza \
          compiler/stz-namemap.stanza \
