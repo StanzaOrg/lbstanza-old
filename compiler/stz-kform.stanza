@@ -43,6 +43,9 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         pkg = infer-types(dec-table, hier, pkg)
         vheader("Package %_ : After Inferring Types" % [name(pkg)])
         println(pkg)
+        pkg = elide-checks(hier, pkg)
+        vheader("Package %_ : After Eliding Checks" % [name(pkg)])
+        println(pkg)
 
         if false :
           pkg = lift-constants(dec-table, pkg)
@@ -393,6 +396,7 @@ defn map-guards (fv: KVar -> KExp,
       (e:KDo) : fdo(e, t)
       (e:KMatch) : KMatch(args(e), map(fb,branches(e)), info(e))
       (e:KDispatch) : KDispatch(args(e), map(fb, branches(e)), info(e))
+      (e:KAFn) : KAFn(ffunc(value(e)))
       (e) : e
   defn ffunc<?T> (f:?T&KFunc) -> T :
     {_ as T&KFunc} $ match(f) :
@@ -462,7 +466,7 @@ defn guard (dec-table:DecTable, e:KDo, tailcall?:True|False) -> KExp :
 
   ;Guard call to expression
   defn guard (e:KDo) :
-    val args* = map(KCast{_, _, info(e)}, args(e), a1(e))
+    val args* = map(KCast{_, _, info(e), true}, args(e), a1(e))
     val func* = KCast(func(e), KOf(FN-TYPE-ID), info(e))
     val call = KDo!(length(args*), func*, args*, info(e))
     if tailcall? : call
@@ -474,6 +478,14 @@ defn guard (dec-table:DecTable, e:KDo, tailcall?:True|False) -> KExp :
       else : guard(e)
     (f:KCurry) : guard(n(f), targs(f), args(e))
     (f) : guard(e)
+
+defn KCastTVar (e:KExp, t:KTag, i:False|FileInfo) :
+  defn strip (t:KTag) :
+    if has-var?(t) : map(strip, t)
+    else : KTop()
+  match(trivial-simplify(strip(t))) :
+    (t:KTop) : e
+    (t) : KCast(e, t, i, false)  
 
 defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
   map-guards(
@@ -495,7 +507,7 @@ defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
       guard(dec-table, e, t)
     ;Branches check their arguments (in case of unmatched parameters)
     fn (b) :
-      val guards = seq(KCast{KVar(_), _, info(b)}, args(b), tags(b))
+      val guards = seq(KCastTVar{KVar(_), _, info(b)}, args(b), tags(b))
       val body = KSeq(guards, body(b))
       KBranch(args(b), map(remove-tvars,tags(b)), body, info(b))
     ;LoStanza branches erase their type variables
@@ -505,7 +517,7 @@ defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
       KLSBranchExp(args(b), map(remove-tvars,tags(b)), exp(b))
     ;Functions check arguments and return
     fn (f) :
-      val guards = seq(KCast{KVar(_), _, info(f)}, args(f), a1(f))
+      val guards = seq(KCast{KVar(_), _, info(f), false}, args(f), a1(f))
       var body:KExp = KSeq(guards, body(f))
       if not tail?(f) : body = KCast(body, a2(f), info(f))
       KFn(tail?(f), targs(f), a1(f), a2(f), args(f), body, info(f)),
@@ -523,6 +535,7 @@ defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
 defn map-types (dec-table:DecTable, pkg:KPackage,
                 fdef:(Int, KTag) -> False,
                 f:KExp -> KTag) :
+  defn tag! (e:KExp) : tag(e as KTypedExp)
   defn fnode (e:KNode) -> KNode :
     ;Definitions
     match(e) :
@@ -532,14 +545,20 @@ defn map-types (dec-table:DecTable, pkg:KPackage,
       (e:KDefmethod) : ffunc(value(e))
       (e:KAFn) : ffunc(value(e))
       (e:KLSAFn) : ffunc(value(e))
-      (e:KMatch) : do(fbranch, branches(e))
-      (e:KDispatch) : do(fbranch, branches(e))
       (e) : false
     ;Recursing
     val e* = match(e) :
       (e:KDo!) : KDo!(arity(e), f*, args*, info(e)) where :
                    val f* = fexp?(func(e))
                    val args* = map(fexp, args(e))
+      (e:KMatch) : KMatch(args*, branches*, info(e)) where :
+                     val args* = map(fexp, args(e))
+                     val arg-tags = map(tag!, args*)
+                     val branches* = map(fbranch{_, arg-tags}, branches(e))
+      (e:KDispatch) : KDispatch(args*, branches*, info(e)) where :
+                        val args* = map(fexp, args(e))
+                        val arg-tags = map(tag!, args*)
+                        val branches* = map(fbranch{_, arg-tags}, branches(e))
       (e) : map-all(fnode, e)
     ;Wrapping
     match(e*) :
@@ -554,12 +573,14 @@ defn map-types (dec-table:DecTable, pkg:KPackage,
         else : fexp(e)
       (e:KCurry) : e
       (e) : fexp(e)
+  defn fbranch (b:KBranch, arg-tags:List<KTag>) :
+    do(fdef{_, KAnd(_, _)}, args(b), tags(b), arg-tags)
+    val body* = fexp(body(b))
+    KBranch(args(b), tags(b), body*, info(b))
   defn ffunc (v:KFunc) :
     match(v) :
       (v:KFn) : do(fdef, args(v), a1(v))
       (v:KMultifn) : do(ffunc, funcs(v))
-  defn fbranch (b:KBranch) :
-    do(fdef, args(b), tags(b))
   map({fnode(_) as KComm}, pkg)
   
 defn infer-types (dec-table:DecTable, hier:KHierarchy, pkg:KPackage) -> KPackage :
@@ -671,6 +692,25 @@ defn infer-types (dec-table:DecTable, hier:KHierarchy, pkg:KPackage) -> KPackage
         (e:KDispatch) : KOr(map(tag!{body(_)}, branches(e)))
         (e:KEnsureSet) : tag!(exp(e))
         (e) : fatal("Not yet supported: %_" % [e]))
+
+;============================================================
+;==================== Check Elision =========================
+;============================================================
+
+defn elide-checks (hier:KHierarchy, pkg:KPackage) :
+  defn tag! (e:KExp) :
+    tag(e as KTypedExp)
+  defn fnode (e:KNode) :
+    match(e) :
+      (e:KCast) :
+        if elidable?(e) and
+           subtype?(hier, tag!(exp(e)), tag(e)) :
+          fnode(exp(e))
+        else :
+          map-all(fnode, e)
+      (e:KTypedExp) : fnode(exp(e))
+      (e) : map-all(fnode, e)
+  map({fnode(_) as KComm}, pkg)
 
 ;============================================================
 ;=================== Constant Lifting =======================
