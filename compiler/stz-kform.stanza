@@ -50,7 +50,7 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         ;println(pkg)
         pkg = simple-inlining(pkg)
         ;vheader("Package %_ : After Simple Inlining" % [name(pkg)])
-        ;println(pkg)        
+        ;println(pkg)
         pkg = infer-types(dec-table, hier, pkg)
         ;vheader("Package %_ : After Inferring Types" % [name(pkg)])
         ;println(pkg)
@@ -85,6 +85,79 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         ;vheader("Package %_ : After Analyzing New Stack" % [name(pkg)])
         ;println(pkg)
         to-tgpackage(dec-table, pkg)
+
+;============================================================
+;=================== Optimized Mode =========================
+;============================================================
+
+public defn compile-optimized (#pkg:KPackage) :
+  var pkg:KPackage = #pkg
+  val dec-table = compute-declaration-table(List(pkg))
+  val hier = compute-hierarchy(List(pkg))
+  pkg = map-method-targs(dec-table, pkg)
+  ;vheader("Package %_ : After Mapping Method Targs" % [name(pkg)])
+  ;println(pkg)
+  pkg = create-closures(dec-table, pkg)
+  ;vheader("Package %_ : After Creating Closures" % [name(pkg)])
+  ;println(pkg)
+  pkg = convert-mixes(dec-table, pkg)
+  ;vheader("Package %_ : After Converting Mixes" % [name(pkg)])
+  ;println(pkg)
+  pkg = guard-boundary(dec-table, pkg)
+  ;vheader("Package %_ : After Guarding Boundaries" % [name(pkg)])
+  ;println(pkg)
+  pkg = lift-constants(dec-table, pkg)
+  ;vheader("Package %_ : After Lifting Constants" % [name(pkg)])
+  ;println(pkg)
+  pkg = detect-loops(pkg)        
+  ;vheader("Package %_ : After Detecting Loops" % [name(pkg)])
+  ;println(pkg)
+  pkg = simple-inlining(pkg)
+  ;vheader("Package %_ : After Simple Inlining" % [name(pkg)])
+  ;println(pkg)
+  pkg = inlining(pkg)
+  ;vheader("Package %_ : After Full Inlining" % [name(pkg)])
+  ;println(pkg)  
+  pkg = type-erasure(pkg)
+  ;vheader("Package %_ : After Reifying Types" % [name(pkg)])
+  ;println(pkg)
+  pkg = box-mutables(pkg)
+  ;vheader("Package %_ : After Boxing Mutables" % [name(pkg)])
+  ;println(pkg)
+  pkg = lambda-lift(dec-table, pkg)
+  ;vheader("Package %_ : After Lambda Lifting" % [name(pkg)])
+  ;println(pkg)
+  pkg = compute-freevars(dec-table, pkg)
+  ;vheader("Package %_ : After Computing Freevars" % [name(pkg)])
+  ;println(pkg)
+  pkg = lift-objects(dec-table, pkg)
+  ;vheader("Package %_ : After Lifting Objects" % [name(pkg)])
+  ;println(pkg)
+  pkg = compute-freevars(dec-table, pkg)
+  ;vheader("Package %_ : After Computing Freevars Again" % [name(pkg)])
+  ;println(pkg)
+  pkg = lift-closures(dec-table, pkg)
+  ;vheader("Package %_ : After Lifting Closures" % [name(pkg)])
+  ;println(pkg)
+  pkg = primitive-tagging(pkg)
+  ;vheader("Package %_ : After Tagging Primitives" % [name(pkg)])
+  ;println(pkg)
+  pkg = analyze-new-stack(pkg)
+  ;vheader("Package %_ : After Analyzing New Stack" % [name(pkg)])
+  ;println(pkg)
+  to-tgpackage(dec-table, pkg)
+
+
+;============================================================
+;==================== Flatten ===============================
+;============================================================
+
+public defn flatten (pkgs:List<KPackage>) -> KPackage :  
+  val ids* = PkgIds(decls*, List()) where :
+    val decls* = for pkg in pkgs seq-append :
+      declarations(ids(pkg))
+  val comms* = seq-append(comms, pkgs)
+  KPackage(`program, ids*, comms*, false)
 
 ;============================================================
 ;============== Compute Declaration Table ===================
@@ -963,12 +1036,12 @@ defn pred-graph (graph:HashTable<KeyValue<Int,Int>,Int>) :
   preds
 
 ;Inline
-defn simple-inline (func:KFunc, call-targs:List<KTag>, call-args:List<KExp>) :
+defn inline (func:KFunc, call-targs:List<KTag>, call-args:List<KExp>) :
   defn same-length? (xs:List, ys:List) : length(xs) == length(ys)
   ;Retrieve appropriate function or fail    
   val f = match(func) :
     (f:KFn) :
-      fatal("Not Inlinable") when not
+      fail() when not
         same-length?(targs(f), call-targs) and
         same-length?(args(f), call-args)
       f
@@ -977,7 +1050,7 @@ defn simple-inline (func:KFunc, call-targs:List<KTag>, call-args:List<KExp>) :
         val f = f0 as KFn
         same-length?(targs(f), call-targs) and
         same-length?(args(f), call-args)
-      fatal("Not Inlinable") when f* is False
+      fail() when f* is False
       f* as KFn
       
   ;Rename the body
@@ -1063,7 +1136,8 @@ defn simple-inline (function:KFunc) -> KFunc :
         attempt :
           val f = inline-func(func(e))
           val args* = map(inline-exp, args(e))
-          simple-inline(f, targs!(func(e)), args*)
+          attempt : inline(f, targs!(func(e)), args*)
+          else : fatal("Not inlinable")
         else :
           map(inline-exp, e)
       (e) :
@@ -1087,6 +1161,217 @@ defn simple-inlining (pkg:KPackage) :
       (e) :
         map-all(fnode, e)
   for c:KComm in pkg map :
+    fnode(c) as KComm
+
+;============================================================
+;=================== Full Inlining ==========================
+;============================================================
+;Inline all functions whose size is below this threshold
+val INLINE-THRESHOLD = 5
+
+deftype InlineEntry
+defmulti size (n:InlineEntry) -> Int
+defmulti func (n:InlineEntry) -> KFunc
+
+defn InlineEntry (f:KFunc) :
+  defn size (e:KNode) :
+    ;Count number of subnodes
+    var counter:Int = 0
+    for e:KNode in e do-all :
+      counter = counter + size(e)
+    ;Add cost of node
+    counter + match(e) :
+      (e:KVar|KCast|KLet|KLetRec|KSeq|KLiteral|KCurry|KLetLoop|KGoto) : 0
+      (e:KDo!) : 2
+      (e) : 1
+  defn size (f:KFunc) :
+    match(f) :
+      (f:KFn) : size(body(f))
+      (f:KMultifn) : sum(seq(size, funcs(f)))
+      
+  val entry-size = size(f)
+  new InlineEntry :
+    defmethod size (this) : entry-size
+    defmethod func (this) : f
+    defmethod print (o:OutputStream, this) :
+      if entry-size <= INLINE-THRESHOLD :
+        print(o, "Function of size %_ = %_" % [entry-size, f])
+      else :
+        print(o, "Function of size %_" % [entry-size])
+
+defn scan-functions (pkg:KPackage) :
+  val table = HashTable<Int,InlineEntry>()
+  defn scan (e:KNode) :
+    do-all(scan, e)
+    match(e:KDefn) :
+      table[n(e)] = InlineEntry(value(e))
+  do(scan, pkg)
+  table
+
+defn inlining (e:KNode, ctxt:List<Int>, table:HashTable<Int,InlineEntry>, progress:() -> ?) :
+  ;Recursion
+  defn inline-exp (e:KExp) : inlining(e, ctxt, table, progress) as KExp
+  defn inline-node (e:KNode) : inlining(e, ctxt, table, progress)
+  defn inline-in-ctxt (c:Int, e:KNode) : inlining(e, cons(c, ctxt), table, progress)  
+
+  ;Retrieve the func to inline given its id or fail otherwise
+  defn inline-func (n:Int) :
+    fail() when contains?(ctxt, n)
+    fail() when not key?(table, n)
+    val e = table[n]
+    fail() when size(e) > INLINE-THRESHOLD
+    func(e)
+
+  ;Retrieve the func to inline or fail otherwise
+  defn inline-func (e:KExp) :
+    match(e) :
+      (e:KVar) : inline-func(n(e))
+      (e:KCurry) : inline-func(n(e))
+      (e:KAFn) : value(e)
+      (e) : fail()
+      
+  ;Retrieve the type arguments in the given function expression
+  defn targs! (e:KExp) :
+    match(e) :
+      (e:KCurry) : targs(e)
+      (e:KVar) : List()
+      
+  match(e) :
+    (e:KDefn) :
+      map-all(inline-in-ctxt{n(e), _}, e)
+    (e:KVar) :
+      attempt : KAFn(inline-func(e))
+      else : e
+    (e:KDo!) :
+      val args* = map(inline-exp, args(e))
+      attempt :
+        val inlined = inline(inline-func(func(e)), targs!(func(e)), args*)
+        println("inlined %_ = %_" % [e, inlined])
+        progress()
+        rename-binders(inlined)
+      else :
+        val func* = inline-exp(func(e))
+        KDo!(arity(e), func*, args*, info(e))        
+    (e) :
+      map-all(inline-node, e)
+
+defn inlining (#pkg:KPackage) :
+  var pkg:KPackage = #pkg
+  fixpoint{5, _} $ fn (progress) :    
+    val table = scan-functions(pkg)
+    pkg = for comm in pkg map :
+      inlining(comm, List(), table, progress) as KComm
+    pkg
+
+;deftype CallNode
+;defmulti weight (n:CallNode) -> Int
+;defmulti func (n:CallNode) -> KFunc
+;
+;;Construct a CallNode
+;defn CallNode (f:KFunc) :
+;  new CallNode :
+;    defmethod weight (this) : 0
+;    defmethod func (this) : f
+;
+;deftype WeightedCallGraph
+;defmulti set (cg:WeightedCallGraph, id:Int, n:CallNode) -> False
+;defmulti node (cg:WeightedCallGraph, id:Int) -> CallNode
+;defmulti set (cg:WeightedCallGraph, src:Int, dst:Int, weight:Int) -> False
+;defmulti edge (cg:WeightedCallGraph, src:Int, dst:Int) -> Int|False
+;
+;;Construct a weighted call graph
+;defn WeightedCallGraph () :
+;  val nodes = HashTable<Int,CallNode>()
+;  val edges = HashTable<KeyValue<Int,Int>, Int>()
+;  new WeightedCallGraph :
+;    defmethod set (this, id:Int, n:CallNode) : nodes[id] = n
+;    defmethod node (this, id:Int) : nodes[id]
+;    defmethod set (this, src:Int, dst:Int, weight:Int) : edges[src => dst] = weight
+;    defmethod edge (this, src:Int, dst:Int) : get?(edges, src => dst)
+;    defmethod print (o:OutputStream, this) :
+;      print(o, "WeightedCallGraph:")
+;      print(o, "\n  Nodes: %," % [keys(nodes)])
+;      print(o, "\n  Edges: %," % [edges])
+;
+;defn add-edge (cg:WeightedCallGraph, src:Int, dst:Int) :
+;  match(edge(cg, src, dst)) :
+;    (i:Int) : cg[src,dst] = i + 1
+;    (i:False) : cg[src,dst] = 1
+;
+;;Scan for entries in given function
+;defn scan-entries (cg:WeightedCallGraph, ctxt:Int, f:KFunc) :
+;  defn scan-node (ctxt:Int, e:KNode) -> False :
+;    match(e) :
+;      (e:KVar|KCurry) : add-edge(cg, ctxt, n(e))
+;      (e:KDefn) : scan-entries(cg, n(e), value(e))
+;      (e) : do-all(scan-node{ctxt, _}, e)
+;  cg[ctxt] = CallNode(f)  
+;  do(scan-node{ctxt, _}, f)
+;
+;;Scan for entries in package
+;defn weighted-call-graph (pkg:KPackage) :
+;  val cg = WeightedCallGraph()
+;  defn scan-node (e:KNode) :
+;    match(e) :
+;      (e:KDefn) : scan-entries(cg, n(e), value(e))      
+;      (e:KLSComm|KLSExp) : e
+;      (e) : do-all(scan-node, e)
+;  do(scan-node, pkg)
+;  cg
+;
+;defn inlining (cg:WeightedCallGraph, f:KFunc, to-inline:List<Int>) :
+;  defn fnode (e:KNode) :
+;    match(e) :
+;      (e:KVar) :
+;      (e:KDo!) :
+;      (e) : map-all(fnode, e)
+;
+
+;============================================================
+;=================== Type Erasure ===========================
+;============================================================
+defn type-erasure (pkg:KPackage) :
+  defn erase (t:KLSType) :
+    match(t:KRefT) : KRefT(KTop())
+    else : map(erase, t)
+  defn erase (ts:List<KLSType>) :
+    map(erase, ts)
+  defn ffn (x:KFn) :
+    KFn(tail?(x), List(), KTops(args(x)), KTop(), args(x), body(x), info(x))
+  defn flfunc (#x:KLSFunc) :
+    val x = #x as KLSFn
+    KLSFn(tail?(x), List(), erase(a1(x)), erase(a2(x)), args(x), body(x), info(x))
+  defn ffunc (f:KFunc) :
+    match(f) :
+      (f:KFn) : ffn(f)
+      (f:KMultifn) : KMultifn(map(ffunc, funcs(f)))
+  defn fnode (x:KNode) :
+    match(map-all(fnode, x)) :
+      (x:KCurry) :
+        KVar(n(x))
+      (x:KCast) :
+        exp(x)      
+      (x:KLetLoop) :
+        KLetLoop(n(x), List(), args(x), KTops(args(x)), List(), init-args(x), body(x))
+      (x:KGoto) :
+        KGoto(loop(x), List(), args(x))
+      (x:KAFn) :
+        KAFn(ffunc(value(x)))
+      (x:KLSAFn) :
+        KLSAFn(ffunc(value(x)))
+      (x:KDefn) :
+        KDefn(n(x), ffunc(value(x)))
+      (x:KDefmethod) :
+        KDefmethod(multi(x), targs(x), thisn(x), ffunc(value(x)))
+      (x:KLSDefn) :
+        KLSDefn(n(x), flfunc(value(x)))
+      (x:KLSDefmethod) :
+        KLSDefmethod(multi(x), List(), flfunc(value(x)))
+      (x:KLSExternFn) :
+        KLSExternFn(n(x), lbl(x), flfunc(value(x)))
+      (x) :
+        x
+  for c in pkg map :
     fnode(c) as KComm
 
 ;============================================================
