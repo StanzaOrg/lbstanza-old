@@ -10,8 +10,10 @@
 
 //     Stanza Defined Entities
 //     =======================
-int64_t stanza_entry (char* stack_mem);
+int64_t stanza_entry (void);
 extern int64_t stanza_stack_size;
+extern int64_t stanza_stack_items_offset;
+extern char* stanza_stack_pointer;
 
 //     Command line arguments
 //     ======================
@@ -24,7 +26,8 @@ int main (int argc, char* argv[]) {
   input_argc = argc;
   input_argv = argv;
   char* stack_mem = (char*)malloc(stanza_stack_size);
-  stanza_entry(stack_mem);
+  stanza_stack_pointer = stack_mem + stanza_stack_items_offset;
+  stanza_entry();
   return 0;
 }
 
