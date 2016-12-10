@@ -1,3 +1,6 @@
+# USAGES:
+# ./scripts/make.sh ./stanza
+
 if [ $# -lt 1 ]; then
     echo "Not enough arguments"
     exit 2
@@ -9,8 +12,8 @@ STANZA=$1
 FILES="core/core.stanza \
        core/collections.stanza \
        core/reader.stanza \
-       core/macro-utils.stanza \
        core/parser.stanza \
+       core/macro-utils.stanza \
        compiler/stz-algorithms.stanza \
        compiler/stz-padder.stanza \
        compiler/stz-utils.stanza \
@@ -24,13 +27,11 @@ FILES="core/core.stanza \
        compiler/stz-imms.stanza \
        compiler/stz-il-ir.stanza \
        compiler/stz-tl-ir.stanza \
-       compiler/stz-pkg-ir.stanza \
        compiler/stz-kl-ir.stanza \
+       compiler/stz-pl-ir.stanza \
        compiler/stz-tgt-ir.stanza \
-       compiler/stz-bb-ir.stanza \
+       compiler/stz-tgt-utils.stanza \
        compiler/stz-asm-ir.stanza \
-       compiler/stz-backend.stanza \
-       compiler/stz-pkg.stanza \
        compiler/stz-input.stanza \
        compiler/stz-namemap.stanza \
        compiler/stz-renamer.stanza \
@@ -38,11 +39,18 @@ FILES="core/core.stanza \
        compiler/stz-infer.stanza \
        compiler/stz-type-calculus.stanza \
        compiler/stz-type.stanza \
+       compiler/stz-type-to-kform.stanza \
        compiler/stz-kform.stanza \
-       compiler/stz-tgt.stanza \
-       compiler/stz-tgt-writer.stanza \
-       compiler/stz-bb.stanza \
+       compiler/stz-dec-table.stanza \
+       compiler/stz-kform-to-tgt.stanza \
+       compiler/stz-khier.stanza \
+       compiler/stz-backend.stanza \
+       compiler/stz-reg-alloc.stanza \
+       compiler/stz-codegen.stanza \
+       compiler/stz-stitcher.stanza \
        compiler/stz-asm-emitter.stanza \
+       compiler/stz-fuse.stanza \
+       compiler/stz-pkg.stanza \
        compiler/stz-compiler.stanza \
        compiler/stz-arg-parser.stanza \
        compiler/stz-langs.stanza  \
@@ -52,29 +60,37 @@ FILES="core/core.stanza \
        compiler/stz-main.stanza"
 
 #Delete pkg files
+rm -rf bin
 rm -rf pkgs
 rm -rf fast-pkgs
+rm -rf lpkgs
+rm -rf lfast-pkgs
 rm -rf wpkgs
 rm -rf wfast-pkgs
+
+#Create folders
+mkdir -p bin
 mkdir -p pkgs
 mkdir -p fast-pkgs
+mkdir -p lpkgs
+mkdir -p lfast-pkgs
 mkdir -p wpkgs
 mkdir -p wfast-pkgs
 
-#Compile OSX Executable
-$STANZA $FILES -optimize -o stanza
-
-#Compile Linux Executable
-$STANZA $FILES -optimize -s lstanza.s -platform linux
-
-#Compile Windows Executable
-$STANZA $FILES -optimize -s wstanza.s -platform windows
-
-#Compile Linux/OS-X Pkg Files
+#Compile OSX Pkgs and Executable
+echo "Compiling OSX Pkgs"
 $STANZA $FILES -pkg pkgs
-$STANZA $FILES -optimize -pkg fast-pkgs
+echo "Compiling OSX Executable"
+$STANZA $FILES -pkg fast-pkgs -optimize -o bin/stanza
 
-#Compile Windows Pkg Files
+#Compile Linux Pkgs and Executable
+echo "Compiling Linux Pkgs"
+$STANZA $FILES -pkg lpkgs -platform linux
+echo "Compiling Linux Executable"
+$STANZA $FILES -pkg lfast-pkgs -optimize -s bin/lstanza.s -platform linux
+
+#Compile Windows Pkgs and Executable
+echo "Compiling Windows Pkgs"
 $STANZA $FILES -pkg wpkgs -platform windows
-$STANZA $FILES -optimize -pkg wfast-pkgs -platform windows
-
+echo "Compiling Windows Executable"
+$STANZA $FILES -pkg wfast-pkgs -optimize -s bin/wstanza.s -platform windows
