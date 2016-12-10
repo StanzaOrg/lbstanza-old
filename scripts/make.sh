@@ -60,7 +60,6 @@ FILES="core/core.stanza \
        compiler/stz-main.stanza"
 
 #Delete pkg files
-rm -rf bin
 rm -rf pkgs
 rm -rf fast-pkgs
 rm -rf lpkgs
@@ -69,7 +68,6 @@ rm -rf wpkgs
 rm -rf wfast-pkgs
 
 #Create folders
-mkdir -p bin
 mkdir -p pkgs
 mkdir -p fast-pkgs
 mkdir -p lpkgs
@@ -81,16 +79,16 @@ mkdir -p wfast-pkgs
 echo "Compiling OSX Pkgs"
 $STANZA $FILES -pkg pkgs
 echo "Compiling OSX Executable"
-$STANZA $FILES -pkg fast-pkgs -optimize -o bin/stanza
+$STANZA $FILES -pkg fast-pkgs -optimize -o stanza
 
 #Compile Linux Pkgs and Executable
 echo "Compiling Linux Pkgs"
 $STANZA $FILES -pkg lpkgs -platform linux
 echo "Compiling Linux Executable"
-$STANZA $FILES -pkg lfast-pkgs -optimize -s bin/lstanza.s -platform linux
+$STANZA $FILES -pkg lfast-pkgs -optimize -s lstanza.s -platform linux
 
 #Compile Windows Pkgs and Executable
 echo "Compiling Windows Pkgs"
 $STANZA $FILES -pkg wpkgs -platform windows
 echo "Compiling Windows Executable"
-$STANZA $FILES -pkg wfast-pkgs -optimize -s bin/wstanza.s -platform windows
+$STANZA $FILES -pkg wfast-pkgs -optimize -s wstanza.s -platform windows
