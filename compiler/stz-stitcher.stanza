@@ -1,0 +1,329 @@
+;See License.txt for details about licensing.
+
+defpackage stz/stitcher :
+  import core
+  import collections
+  import stz/asm-ir
+  import stz/kl-ir
+  import stz/khier
+  import stz/algorithms
+  import stz/codegen
+  import stz/ids
+  
+;============================================================
+;===================== Stitcher =============================
+;============================================================
+
+public deftype Stitcher
+public defmulti stitch (s:Stitcher, e:Ins) -> False
+
+public defn Stitcher (tag-table:TagTable, h:KHierarchy) :
+  ;Instruction mapper
+  defn replace-tags (e:Ins) :
+    for x in e map :
+      match(x) :
+        (x:TagImm) :
+          val tag = tag(tag-table,n(x))
+          if marker?(x) : IntImm(tag << 3 + MARKER-TAG-BITS)
+          else : IntImm(tag)
+        (x) : x
+  
+  new Stitcher :
+    defmethod stitch (this, e:Ins) :
+      match(replace-tags(e)) :
+        (e:Match) : compile(tag-table, h, e)
+        (e:Dispatch) :  compile(tag-table, h, e)
+        (e:Label) :
+          val info = info(e)
+          match(info:FileInfo) : FILE-TABLE(n(e), info)
+          E(e)
+        (e) : E(e)
+
+;============================================================
+;===================== Match Tries ==========================
+;============================================================
+
+deftype MTrie
+defstruct IfTrie <: MTrie :
+  branches: List<KeyValue<KBits, MTrie>>
+defstruct EndTrie <: MTrie :
+  lbl: Int
+
+defmethod print (o:OutputStream, t:MTrie) :
+  print{o, _} $ match(t) :
+    (t:IfTrie) : "(%*)" % [join(branches(t), " or ")]
+    (t:EndTrie) : lbl(t)
+
+;============================================================
+;===================== Trie Conversion ======================
+;============================================================
+
+defn to-trie (bs:List<KeyValue<List<KBits>, Int>>) -> MTrie :
+  ;Utilities
+  defn less? (a:KBits, b:KBits) : subset?(a, b)
+  defn minus (a:KBits, b:KBits) : subtract(a, b)
+  defn bit-and (a:KBits, b:KBits) : intersect(a, b)
+
+  ;Initial starting place
+  defn init (ts:List<KBits>, lbl:Int) -> MTrie :
+    if empty?(ts) :
+      EndTrie(lbl)
+    else : 
+      val [X, YZ] = [head(ts), tail(ts)]
+      IfTrie(List(X => init(YZ, lbl)))
+    
+  ;Add a branch to a trie
+  defn add (t:MTrie, ts:List<KBits>, lbl:Int) -> MTrie :
+    match(t) :
+      (t:IfTrie) : IfTrie(add(branches(t), ts, lbl))
+      (t:EndTrie) : t
+
+  ;Add X => Y => Z ... to (A => B => C, rest ...)
+  defn add (brs:List<KeyValue<KBits, MTrie>>,
+            ts:List<KBits>,
+            lbl:Int) ->
+            List<KeyValue<KBits, MTrie>> :
+    val [X, YZ] = [head(ts), tail(ts)]
+    if bottom?(X) :
+      brs    
+    else if empty?(brs) :
+      List(X => init(YZ, lbl))
+    else :
+      val [A, BC] = [key(head(brs)), value(head(brs))]
+      val rest = tail(brs)
+      if A < X :
+        val b1 = A => add(BC, YZ, lbl)
+        val b2 = add(rest, cons(X - A, YZ), lbl)
+        cons(b1, b2)     
+      else if X < A :
+        val b1 = X => add(BC, YZ, lbl)
+        val b2 = (A - X) => BC
+        cons(b1, b2, rest)
+      else if disjoint?(A, X) :
+        cons(
+          head(brs)
+          add(rest, ts, lbl))      
+      else :
+        val W = A & X
+        val ts1 = cons(W, tail(ts))
+        val ts2 = cons(X - W, tail(ts))
+        add(add(brs, ts1, lbl), ts2, lbl)
+
+  ;Driver
+  val b0 = head(bs)
+  reduce{_, init(key(b0), value(b0)), tail(bs)} $
+    fn (trie:MTrie, branch:KeyValue<List<KBits>,Int>) :
+      add(trie, key(branch), value(branch))
+
+;============================================================
+;================== Dispatch Conversion =====================
+;============================================================
+
+defn union-taglists (hier:KHierarchy, tag-lists:List<List<KBits>>) -> List<List<KBits>> :
+  defn compatible? (xs:List<KBits>, ys:List<KBits>) :
+    val n = for [x, y] in zip(xs, ys) count : x != y
+    n <= 1
+  val lists = Vector<List<KBits>>()
+  defn add-list (ts:List<KBits>) :
+    match(index-when(compatible?{ts, _}, lists)) :
+      (i:Int) : lists[i] = map(union, ts, lists[i])
+      (i:False) : add(lists, ts)
+  for [xs, ys] in all-pairs(tag-lists) do :
+    val ts = map(intersect, xs, ys)
+    add-list(ts) when none?(bottom?, ts)
+  to-list(lists)
+
+defn dispatch-branches (hier:KHierarchy,
+                        branches:List<KeyValue<List<KTag>, Int>>,
+                        amb-lbl:Int) ->
+                        List<KeyValue<List<KBits>, Int>> :
+  val lists = to-vector<List<KTag>>(seq(key,branches))
+  val lbls = to-vector<Int>(seq(value,branches))
+  defn more-applicable? (a:Int, b:Int) :
+    all?(subtype?{hier, _, _}, lists[a], lists[b])
+    
+  defn kbits (xs:List<KTag>) : map(/kbits{hier,_}, xs)    
+  val ordering = ambiguity-ordering(length(lists), more-applicable?)
+  to-list $ for entry in ordering seq-cat :
+    match(entry) :
+      (i:Int) :
+        List(kbits(lists[i]) => lbls[i])
+      (idx:List<Int>) :
+        val lists = union-taglists(hier, map(kbits{lists[_]}, idx))
+        seq({_ => amb-lbl}, lists)
+
+;============================================================
+;================= Dispatch Compilation =====================
+;============================================================
+
+defn compile-match (tt:TagTable,
+                    hier:KHierarchy,
+                    xs:List<Imm>,
+                    brs:List<KeyValue<List<KBits>, Int>>,
+                    no-branch:Int) :
+  if empty?(brs) :
+    #goto(M(no-branch))
+  else :
+    ;Compute locations of immediates  
+    defn arg (i:Int) :
+      if i < length(xs) :
+        xs[i]
+      else :
+        val offset = 8 * (i - length(xs))
+        Mem(ARG-LBL, offset)
+        
+    ;Convert to trie
+    val trie = to-trie(brs)
+    
+    ;Compile trie
+    let loop (i:Int = 0, trie:MTrie = trie) :
+      match(trie) :
+        (trie:IfTrie) :
+          val ns = map(fresh-id{}, branches(trie))
+          compile-dispatch(tt, hier, arg(i), map(key,branches(trie)), ns, no-branch)
+          for (b in branches(trie), n in ns) do :
+            #label(n)
+            loop(i + 1, value(b))
+        (trie:EndTrie) :
+          #goto(M(lbl(trie)))
+
+defn compile (tt:TagTable, hier:KHierarchy, e:Match) :
+  val bs = for b in branches(e) map :
+    map(kbits{hier, _}, tags(b)) => n(b)
+  compile-match(tt, hier, xs(e) as List<Reg>, bs, no-branch(e))                
+  
+defn compile (tt:TagTable, hier:KHierarchy, e:Dispatch) :
+  val bs = for b in branches(e) map :
+    tags(b) => n(b)
+  val xs = xs(e) as List<Reg>
+  val dbs = dispatch-branches(hier, bs, amb-branch(e))
+  compile-match(tt, hier, xs, dbs, no-branch(e))
+        
+;============================================================
+;================== Dispatch Code Gen =======================
+;============================================================
+
+;Requires R0 and R1
+defn compile-dispatch (tt:TagTable,
+                       hier:KHierarchy,
+                       x:Imm,
+                       types:List<KBits>,
+                       lbls:List<Int>,
+                       no-branch:Int) :
+  ;Compilation tables
+  val prim-lbls = HashTable<Int,Int>()
+  val mark-lbls = HashTable<Int,Int>()
+  val ref-lbls = HashTable<Int,Int>()
+  var default-lbl = no-branch
+
+  ;Update table
+  defn update (table:HashTable<Int,Int>, k:Int, v:Int) :
+    if not key?(table, k) :
+      table[k] = v
+
+  ;Is type a primitive type
+  defn primitive? (n:Int) :
+    contains?([BYTE-TYPE-ID, CHAR-TYPE-ID,
+               INT-TYPE-ID, FLOAT-TYPE-ID],
+              n)
+
+  ;Classify types
+  label break :
+    for (t in types, l in lbls) do :
+      match(t) :
+        (t:KSomeBits) :
+          for n in ns(t) do :
+            update{_, n, l} $
+              if primitive?(n) : prim-lbls
+              else if marker?(hier,n) : mark-lbls
+              else : ref-lbls
+        (t:KAllBits) :
+          default-lbl = l
+          break()
+
+  ;Convert type to bit tag
+  defn prim-bit-tag (n:Int) :
+    switch {n == _} :
+      BYTE-TYPE-ID : INT(BYTE-TAG-BITS)
+      CHAR-TYPE-ID : INT(CHAR-TAG-BITS)
+      INT-TYPE-ID : INT(0)
+      FLOAT-TYPE-ID : INT(FLOAT-TAG-BITS)
+      else : fatal("Not a primitive: %~" % [n])
+
+  ;Put value into R1
+  match(x) :
+    (x:Mem) : #loadl(R1, x)
+    (x:Imm) : #movl(R1, x)
+
+  ;Primitive Dispatch
+  ;R0 = primitive tag
+  #andl(R0, R1, INT(7))
+  for entry in prim-lbls do :
+    #jeql(M(value(entry)), R0, prim-bit-tag(key(entry)))
+
+  ;Marker Dispatch
+  val not-markerL = fresh-id()
+  #jnel(M(not-markerL), R0, INT(MARKER-TAG-BITS))
+  val grouped-marks = group-keys(mark-lbls)
+  #shrl(R1, R1, INT(3))
+  for entry in grouped-marks do :
+    val tags = map(tag{tt, _}, value(entry))
+    jump-member(key(entry), tags)
+  #goto(M(default-lbl))
+  #label(not-markerL)
+
+  ;Reference Dispatch
+  val not-refL = fresh-id()
+  #jnel(M(not-refL), R0, INT(REF-TAG-BITS))
+  #loadl(R1, R1, (- REF-TAG-BITS))
+  val grouped-refs = group-keys(ref-lbls)
+  for entry in grouped-refs do :
+    val tags = map(tag{tt, _}, value(entry))
+    jump-member(key(entry), tags)
+  #label(not-refL)
+
+  ;Emit Default Branch if there is one
+  #goto(M(default-lbl))
+
+;Group all keys with the same value in hashtable
+defn group-keys (t:HashTable<Int,Int>) :
+  val ret = HashTable<Int,List<Int>>()
+  for entry in t do :
+    val [k,v] = [key(entry), value(entry)]
+    ret[v] = cons(k, get?(ret, v, List()))
+  ret
+
+;Jump to lbl if R1 is one of ns
+;Destroys R0
+;Destroys R1 if successful
+defn jump-member (lbl:Int, ns:List<Int>) :
+  val num = length(ns)
+  if num <= 3 :
+    for n in ns do :
+      #jeql(M(lbl), R1, INT(n))
+  else :
+    defn jump-bit-set (low:Int, word:Long) :
+      ;Range check
+      val fail-lbl = fresh-id()
+      #subl(R1, R1, INT(low))           ;  R1 = R1 - low      
+      #jugel(M(fail-lbl), R1, INT(64))  ;  goto fail if R1 >= 64
+      #movl(R0, INT(word))              ;  goto lbl if word[R1] is set
+      #jbsl(M(lbl), R0, R1)           
+      #label(fail-lbl)                  ;fail:
+      #addl(R1, R1, INT(low))           ;  R1 = R1 + low
+    
+    defn to-bits (xs:Seqable<Int>) :
+      val xs-seq = to-seq(xs)
+      let loop (accum:Long = 0L) :
+        if empty?(xs-seq) : accum
+        else : loop(accum | (1L << to-long(next(xs-seq))))
+
+    val low = minimum(ns)
+    val hi = maximum(ns)
+    if hi - low < 64 :
+      val word = to-bits(seq({_ - low}, ns))
+      jump-bit-set(low, word)
+    else :
+      val [ns1, ns2] = split({_ < low + 64}, ns)
+      jump-member(lbl, to-list(ns1))
+      jump-member(lbl, to-list(ns2))

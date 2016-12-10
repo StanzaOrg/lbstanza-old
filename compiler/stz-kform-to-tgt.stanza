@@ -1,0 +1,1808 @@
+defpackage stz/kform-to-tgt :
+  import core
+  import collections
+  import stz/kl-ir
+  import stz/pl-ir
+  import stz/tgt-ir
+  import stz/tgt-utils
+  import stz/tl-ir with :
+    prefix(CExp, CLSExp) => TL
+  import stz/ids
+  import stz/kform
+  import stz/khier
+  import stz/primitives
+  import stz/utils
+  import stz/dec-table
+
+;============================================================
+;====================== Driver ==============================
+;============================================================
+
+public defn to-tgpackage (dt:DecTable, pkg:KPackage) -> TGPackage :
+  ;======================
+  ;==== Declarations ====
+  ;======================
+  val decls = Vector<TGDecl>()
+
+  ;===============================
+  ;==== Scan through Packages ====
+  ;===============================
+  val hsc = HSCompiler(dt)
+  val lsc = LSCompiler(dt)
+  for c in comms(pkg) do :
+    match(c) :
+      (c:KDef) :
+        add(decls, compile-global(dt,c))
+      (c:KDefVar) :
+        add(decls, compile-global(dt,c))
+      (c:KDefn) :
+        add(decls, compile(hsc, n(c), value(c), true))
+      (c:KDefmulti) :
+        val tarity = length(targs(c))
+        val arity = length(a1(c))
+        add(decls, TGDefmulti(n(c), tarity, arity, info(c)))
+      (c:KDefmethod) :
+        ;Code
+        val n = fresh-id()
+        val v = value(c) as KFn!
+        add(decls, compile(hsc, n, v, false))
+        ;Method
+        val a1* = lastn(a1(v), arity(v))
+        add(decls, TGDefmethod(multi(c), a1*, n))
+      (c:KLSDef) :
+        add(decls, compile-global(dt,c))
+      (c:KLSDefVar) :
+        add(decls, compile-global(dt,c))
+      (c:KLSDefn) :
+        val f = value(c) as KLSFn!
+        add(decls, compile(lsc, n(c), f, false, true))
+      (c:KLSDefmethod) :
+        ;Code
+        val n = fresh-id()
+        val f = value(c) as KLSFn!
+        add(decls, compile(lsc, n, f, false, false))
+        ;Method
+        val a1-tags = map(tag{_ as KRefT}, lastn(a1(f),arity(f)))
+        add(decls, TGDefmethod(multi(c), a1-tags, n))
+      (c:KLSExternFn) :
+        val f = value(c) as KLSFn!
+        add(decls, compile(lsc, lbl(c), f, true, false))
+      (c:KDefConst) :
+        add(decls, TGDefConst(n(c), tgt-const(value(c))))
+      (c:KDefTypeObject) :
+        add(decls, compile(c))
+      (c:KDefObject) :
+        add(decls, compile(c))
+      (c:KLSDefStruct) :
+        add(decls, compile(dt, c))
+      (c) :
+        false
+
+  ;=====================
+  ;==== Entry Point ====
+  ;=====================
+  val entry = compile-main-function(dt, comms(pkg))
+  add(decls, entry)
+
+  ;=======================
+  ;==== Return TGProg ====
+  ;=======================
+  val entry-lbl = n(entry) as Int
+  TGPackage(name(pkg), ids(pkg), entry-lbl, decls, false)
+
+;============================================================
+;================= Package Combination ======================
+;============================================================
+
+public defn combine (pkgs:List<TGPackage>) -> TGProg :
+  val hier = KHierarchy(seq-cat(hier-entries, pkgs))
+  val decls = to-vector<TGDecl>(seq-cat(decls, pkgs))
+  add(decls, compile-entry-function(map(entry, pkgs)))
+  TGProg(hier, decls)
+
+;============================================================
+;==================== Compiling Objects =====================
+;============================================================
+
+defn compile (dt:DecTable, c:KLSDefStruct) :
+  match(rfield(c)) :
+    (rf:False) :
+      TGDefObject(
+        n(c),
+        parent(c),
+        size(dt, n(c)),
+        tgt-types(dt, n(c)),
+        field-offsets(dt, n(c)),
+        0,
+        List(),
+        List())
+    (rf:KStructField) :
+      val rt = type(rf)
+      TGDefObject(
+        n(c),
+        parent(c),
+        size(dt, n(c)),
+        tgt-types(dt, n(c)),
+        field-offsets(dt, n(c)),
+        size(dt, rt)
+        tgt-types(dt, rt)
+        field-offsets(dt, rt))
+
+defn compile (c:KDefObject) :
+  TGDefObject(
+    n(c),
+    parent(c),
+    8 * arity(c),
+    map(TGRefT{}, 0 to arity(c)),
+    map({_ * 8}, 0 to arity(c)),
+    0,
+    List(),
+    List())
+
+;============================================================
+;==================== Compiling Constants ===================
+;============================================================
+
+defn tgt-const (v) -> TGConst :
+  match(v) :
+    (v:KTypeObject) :
+      fatal("Non-empty type object.") when not empty?(args(v))
+      TGTypeObject(n(v))
+    (v:KClosure) :
+      fatal("Non-empty closure.") when not empty?(args(v))
+      TGClosure(n(v))
+    (v) : v
+
+;============================================================
+;=================== DecTable Queries =======================
+;============================================================
+
+defn global-mem (dt:DecTable, n:Int) :
+  match(extern-label(dt, n)) :
+    (lbl:Symbol) : TGExMem(lbl,0)
+    (lbl:False) : TGMem(n,0)
+
+;============================================================
+;================= Compiling Type Objects ===================
+;============================================================
+
+defn compile (c:KDefTypeObject) :
+  val body = emit-to-buffer $ fn () :
+    ;Compile entry
+    val tobj = make-var(TGRefT())
+    val arg = make-var(TGRefT())
+    
+    val default-lbl = fresh-id()
+    val body-lbl = fresh-id()
+    val num-free = make-var(TGLongT())
+    emit(TGNullCmp(default-lbl, TGHasStackSpace()))
+    emit(TGNewStack())
+    emit(TGArgs(List(tobj, arg)))
+    emit(TGLoad(num-free, TGMem(NUM-FREE-STACKS-LBL,0), 0))
+    emit(TGBinCmp(body-lbl, TGGeOp(), num-free, TGLong(3L)))
+    call(EXTEND-STACK-ID, false)
+    emit(TGGoto(body-lbl))
+    emit(TGLabel(default-lbl))
+    emit(TGArgs(List(tobj, arg)))
+    emit(TGLabel(body-lbl))
+
+    ;Retrieve freevars
+    for (n in args(c), i in 0 to false) do :
+      emit(TGDef(n, TGRefT()))
+      emit(TGLoad(TGVar(n), tobj, 8 * i + TYPE-FREE-OFFSET - REF-TAG-BITS))
+
+    ;Compile predicate
+    val true-lbl = fresh-id()
+    val false-lbl = fresh-id()
+    compile-typeof(arg, tag(c), true-lbl, false-lbl, TGVar)
+    emit(TGLabel(false-lbl))
+    emit(TGReturn(List(TGInt(0))))
+    emit(TGLabel(true-lbl))
+    emit(TGReturn(List(TGInt(1))))
+
+  TGDefCode(n(c), body)
+
+;============================================================
+;============= Expression Compilation System ================
+;============================================================
+
+;Base Compiled Expression
+deftype CExp
+defmulti set (n:Int, c:CExp) -> False
+defmulti ignore (c:CExp) -> False
+defmulti imm (c:CExp) -> TGImm
+defmulti tail (c:CExp) -> False
+defmulti return (c:CExp) -> False
+
+;Most default things are defined in terms of set
+;Except for ignore
+defmethod imm (c:CExp) :
+  val n = fresh-id()
+  emit(TGDef(n, TGRefT()))
+  set(n, c)
+  TGVar(n)
+defmethod tail (c:CExp) : return(c)
+defmethod return (c:CExp) : emit(TGReturn(List(imm(c))))
+
+;If it is continuable, then define everything in terms of kont
+deftype Continuable
+defmulti kont (c:Continuable, kont:CExp -> False, end?:True|False) -> False
+defmulti kont (c:Continuable, kont:CExp -> False) -> False
+defmethod kont (c:Continuable, k:CExp -> False, end?:True|False) : kont(c, k)
+defmethod tail (c:CExp&Continuable) : kont(c, tail, true)
+defmethod return (c:CExp&Continuable) : kont(c, return, true)
+defmethod ignore (c:CExp&Continuable) : kont(c, ignore, false)
+defmethod set (n:Int, c:CExp&Continuable) : kont(c, set{n, _}, false)
+
+;If it is immediate, then set is defined in terms of imm
+deftype Immediate
+defmethod set (n:Int, c:CExp&Immediate) : emit(TGSet(TGVar(n), imm(c)))
+
+;If it is ignorable, then ignore does nothing
+deftype Ignorable
+defmethod ignore (c:CExp&Ignorable) : false
+
+;============================================================
+;================ Compilation Utilities =====================
+;============================================================
+
+defn tcall (f:Int, args:List<TGImm>, i:False|FileInfo) :
+  emit(TGCall(length(args), List(), TGMem(f,0), args, i, true))
+defn tcall (f:Int, i:False|FileInfo) :
+  tcall(f, List(), i)
+defn call (f:Int, args:List<TGImm>, i:False|FileInfo) :
+  emit(TGCall(length(args), List(), TGMem(f,0), args, i, false))
+defn call (f:Int, i:False|FileInfo) :
+  call(f, List(), i)
+
+defn allocate-ref (n:Int, size:Int, info:False|FileInfo) :
+  allocate-ref(n, TGLong(to-long(size)), info)
+defn allocate-ref (n:Int, size:TGImm, info:False|FileInfo) :
+  val ref-tag = TGLong(to-long(REF-TAG-BITS))
+  val end-lbl = fresh-id()
+  val p = make-var(TGLongT())                                    ;  var p : long
+  val new-p = make-var(TGLongT())                                ;  var new-p : long
+  val limit = make-var(TGLongT())                                ;  var limit : long
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                      ;  p = [heap-ptr]
+  emit(TGLoad(limit, TGMem(HEAP-LIM-LBL,0), 0))                  ;  limit = [heap-lim]
+  emit(TGBinOp(new-p, TGAddOp(), p, size))                       ;  new-p = p + size
+  emit(TGBinCmp(end-lbl, TGUleOp(), new-p, limit))               ;  goto end-lbl if new-p <= limit
+  call(EXTEND-HEAP-ID, List(size), info)                         ;  extend-heap(size)
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                      ;  p = [heap-ptr]
+  emit(TGBinOp(new-p, TGAddOp(), p, size))                       ;  new-p = p + size
+  emit(TGLabel(end-lbl))                                         ;end-lbl:
+  emit(TGStore(TGMem(HEAP-PTR-LBL,0), new-p, 0))                 ;  [heap-ptr] = new-p
+  emit(TGBinOp(TGVar(n), TGAddOp(), p, ref-tag))                 ;  n = p + REF-TAG-BITS
+
+defn allocate-refs (ns:List<Int>, sizes:List<Int>, info:False|FileInfo) :
+  val total = TGLong(to-long(sum(sizes)))
+  val end-lbl = fresh-id()
+  val p = make-var(TGLongT())                                     ;  var p : long
+  val new-p = make-var(TGLongT())                                 ;  var new-p : long
+  val limit = make-var(TGLongT())                                 ;  var limit : long
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                       ;  p = [heap-ptr]
+  emit(TGLoad(limit, TGMem(HEAP-LIM-LBL,0), 0))                   ;  limit = [heap-lim]
+  emit(TGBinOp(new-p, TGAddOp(), p, total))                       ;  new-p = p + total
+  emit(TGBinCmp(end-lbl, TGUleOp(), new-p, limit))                ;  goto end-lbl if new-p <= limit
+  call(EXTEND-HEAP-ID, List(total), info)                         ;  extend-heap(total)
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                       ;  p = [heap-ptr]
+  emit(TGBinOp(new-p, TGAddOp(), p, total))                       ;  new-p = p + total
+  emit(TGLabel(end-lbl))                                          ;end-lbl:
+  emit(TGStore(TGMem(HEAP-PTR-LBL,0), new-p, 0))                  ;  [heap-ptr] = new-p
+  val offset-counter = Counter(REF-TAG-BITS)                      ;
+  for (n in ns, size in sizes) do :                               ;  (ns ...) = p + (sizes ...) + REF-TAG-BITS
+    val offset = next(offset-counter, size)
+    emit(TGBinOp(TGVar(n), TGAddOp(), p, TGLong(to-long(offset))))
+
+defn bit-representation (value) :
+  match(value) :
+    (value:Byte) : to-long(value) << 3L + to-long(BYTE-TAG-BITS)
+    (value:Char) : to-long(to-int(value) << 3 + CHAR-TAG-BITS)
+    (value:Int) : to-long(value) << 32L
+    (value:Float) : to-long(value) << 3L + to-long(FLOAT-TAG-BITS)
+    (value:True) : 1L << 3L + to-long(MARKER-TAG-BITS)
+    (value:False) : to-long(MARKER-TAG-BITS)
+
+val BINARY-OPS = [ADD-OP, SUB-OP, MUL-OP, DIV-OP, MOD-OP, AND-OP,
+                  OR-OP, XOR-OP, SHL-OP, SHR-OP, ASHR-OP, EQ-OP, NE-OP,
+                  LT-OP, GT-OP, LE-OP, GE-OP, IDENTICAL-OP, AGET-OP,
+                  CHAR-AGET-OP, STRING-GET-OP]
+val UNARY-OPS = [NOT-OP, NEG-OP, ALEN-OP, STRING-LEN-OP]
+val EFFECTFUL-TERNARY-OPS = [ASET-OP, CHAR-ASET-OP]
+
+val LS-BINARY-OPS = [LS-ADD-OP, LS-SUB-OP, LS-MUL-OP, LS-DIV-OP, LS-MOD-OP,
+                     LS-AND-OP, LS-OR-OP, LS-XOR-OP, LS-SHL-OP, LS-SHR-OP,
+                     LS-ASHR-OP, LS-EQ-OP, LS-NE-OP, LS-LT-OP, LS-GT-OP,
+                     LS-LE-OP, LS-GE-OP, LS-ULT-OP, LS-UGT-OP, LS-ULE-OP, LS-UGE-OP]
+val LS-UNARY-OPS = [LS-NOT-OP, LS-NEG-OP, LS-BITS-OP, LS-FNUM-OP]
+
+;============================================================
+;================ HiStanza Compilation ======================
+;============================================================
+;TODO: Don't check (nor set) arity when guaranteed.
+
+deftype HSCompiler
+defmulti compile (s:HSCompiler, e:KExp) -> False
+defmulti compile (s:HSCompiler, n:Int, f:KFunc, check-arity?:True|False) -> TGDefCode
+
+defn HSCompiler (dec-table:DecTable) :
+  ;===================
+  ;==== Utilities ====
+  ;===================
+  defn foffset (n:Int) :
+    field-offset(dec-table, n) + 8 - REF-TAG-BITS
+  val length-offset = 8 - REF-TAG-BITS
+
+  defn calloc (fields:List<TGImm|CExp>, info:False|FileInfo) :
+    new CExp :
+      defmethod set (n:Int, this) :
+        val fs = for f in fields map :
+          match(f) :
+            (f:TGImm) : f
+            (f:CExp) : imm(f)
+        val size = 8 * length(fs)
+        allocate-ref(n, size, info)
+        for (f in fs, i in 0 to false) do :
+          emit(TGStore(TGVar(n), f, 8 * i - REF-TAG-BITS))
+      defmethod ignore (this) :
+        do(ignore, filter-by<CExp>(fields))
+
+  ;============================
+  ;==== Compilation Tables ====
+  ;============================
+  var loop-arg-table:HashTable<Int,List<Int>>
+  defn init-compilation-tables () :
+    loop-arg-table = HashTable<Int,List<Int>>()
+  init-compilation-tables()
+
+  ;=================================
+  ;==== Compiling an Expression ====
+  ;=================================
+  defn cexp (e:KExp) -> CExp :
+    match(e) :
+      (e:KSeq) :
+        new CExp & Continuable :
+          defmethod kont (this, kont:CExp -> False) :
+            ignore(cexp(a(e)))
+            kont(cexp(b(e)))
+      (e:KVar) :
+        if global?(dec-table, n(e)) :
+          new CExp & Ignorable :
+            defmethod set (v:Int, this) :
+              emit(TGLoad(TGVar(v), TGMem(n(e),0), 0))
+        else :
+          new CExp & Ignorable & Immediate :
+            defmethod imm (this) :
+              TGVar(n(e))
+      (e:KLiteral) :
+        new CExp & Ignorable & Immediate :
+          defmethod imm (this) :
+            TGLong(bit-representation(value(e)))
+      (e:KSet) :
+        new CExp & Immediate :
+          defmethod imm (this) :
+            ignore(this)
+            TGLong(bit-representation(false))
+          defmethod ignore (this) :
+            emit(TGStore(TGMem(n(e),0), imm(cexp(value(e))), 0))
+      (e:KLet) :
+        val def = def(e) as KDef
+        new CExp & Continuable :
+          defmethod kont (this, kont:CExp -> False) :
+            emit(TGDef(n(def), TGRefT()))
+            set(n(def), cexp(value(def)))
+            kont(cexp(body(e)))
+      (e:KLetLoop) :
+        loop-arg-table[n(e)] = args(e)
+        new CExp & Continuable :
+          defmethod kont (this, kont:CExp -> False) :
+            do(emit{TGDef(_, TGRefT())}, args(e))            
+            do(set{_, cexp(_)}, args(e), init-args(e))
+            emit(TGLabel(n(e)))
+            kont(cexp(body(e)))
+      (e:KGoto) :
+        new CExp :
+          defmethod set (n:Int, this) :
+            ignore(this)
+          defmethod ignore (this) :
+            val args* = map(make-var{TGRefT()}, args(e))
+            do(set{n(_), cexp(_)}, args*, args(e))
+            do(emit{TGSet(TGVar(_), _)}, loop-arg-table[loop(e)], args*)
+            emit(TGGoto(loop(e)))
+      (e:KBoxGet) :
+        val box = cexp(exp(e))
+        new CExp :
+          defmethod set (n:Int, this) :
+            emit(TGLoad(TGVar(n), imm(box), foffset(BOX-ITEM-FIELD-ID)))
+          defmethod ignore (this) :
+            ignore(box)
+      (e:KBoxSet) :
+        val box = cexp(exp(e))
+        val value = cexp(value(e))
+        new CExp & Immediate :
+          defmethod imm (this) :
+            ignore(this)
+            TGLong(bit-representation(false))
+          defmethod ignore (this) :
+            emit(TGStore(imm(box), imm(value), foffset(BOX-ITEM-FIELD-ID)))
+      (e:KBox) :
+        val v = match(value(e)) :
+          (v:KExp) : cexp(v)
+          (v:False) : TGLong(to-long(VOID-TAG))
+        calloc(List(TGTag(BOX-TYPE-ID), v), false)
+      (e:KReifiedCast) :
+        new CExp & Immediate :
+          defmethod imm (this) :
+            val pass-lbl = fresh-id()
+            val fail-lbl = fresh-id()
+            val obj = imm(cexp(exp(e)))
+            compile-typeof(obj, tag(e), pass-lbl, fail-lbl, TGVar)
+            ;Emit fail code
+            emit(TGLabel(fail-lbl))
+            tcall(CAST-ERROR-ID, info(e))
+            ;Emit pass code
+            emit(TGLabel(pass-lbl))
+            obj
+          defmethod ignore (this) :
+            imm(this)
+            false
+      (e:KTypeObject) :
+        calloc{_, false} $ append(
+         [TGTag(TYPE-TYPE-ID)
+          TGLong(to-long(length(args(e))))
+          TGMem(n(e),0)]
+          map(cexp, args(e)))
+      (e:KClosureGet) :
+        val c = cexp(exp(e))
+        new CExp :
+          defmethod set (n:Int, this) :
+            val offset = 8 * index(e) + foffset(FN-FREE-FIELD-ID)
+            emit(TGLoad(TGVar(n), imm(c), offset))
+          defmethod ignore (this) :
+            ignore(c)
+      (e:KClosure) :
+        calloc{_, info(e)} $ append(
+         [TGTag(FN-TYPE-ID)
+          TGLong(to-long(length(args(e))))
+          TGMem(n(e),0)]
+          map(cexp, args(e)))
+      (e:KLetClosures) :
+        new CExp & Continuable :
+          defmethod kont (this, kont:CExp -> False) :
+            ;Compile all arguments to closures
+            val argss = for c in closures(e) map :
+              append(
+               [TGTag(FN-TYPE-ID)
+                TGLong(to-long(length(args(c))))
+                TGMem(n(c), 0)]
+                map(imm{cexp(_)}, args(c)))
+            ;Allocate closures
+            do(emit{TGDef(_, TGRefT())}, ns(e))
+            val sizes = map({8 * length(_)}, argss)
+            allocate-refs(ns(e), sizes, info(c0)) where :
+              val c0 = head(closures(e))
+            ;Store arguments
+            for (n in ns(e), args in argss) do :
+              for (arg in args, i in 0 to false) do :
+                emit(TGStore(TGVar(n), arg, 8 * i - REF-TAG-BITS))
+            ;Continue with body
+            kont(cexp(body(e)))
+      (e:KObject) :
+        if empty?(args(e)) :
+          new CExp & Immediate & Ignorable :
+            defmethod imm (this) :
+              TGTag(n(e), true)
+        else :
+          calloc{_, info(e)} $ cons(
+            TGTag(n(e)),
+            map(cexp, args(e)))
+      (e:KObjectGet) :
+        val o = cexp(exp(e))
+        new CExp :
+          defmethod set (n:Int, this) :
+            val offset = 8 * index(e) + 8 - REF-TAG-BITS
+            emit(TGLoad(TGVar(n), imm(o), offset))
+          defmethod ignore (this) :
+            ignore(o)
+      (e:KTuple) :
+        ;Big Tuples
+        val len = length(exps(e))
+        if len > 32 :
+          new CExp :
+            defmethod set (n:Int, this) :              
+              emit(TGCall(1, ret, f, len, info(e), false)) where :
+                val ret = List(TGVar(n))
+                val f = TGMem(VOID-TUPLE-ID)
+                val len = List(TGLong(to-long(len)))
+              for (e in exps(e), i in 0 to false) do :
+                val offset = 8 * i + foffset(TUPLE-ITEMS-FIELD-ID)
+                emit(TGStore(TGVar(n), imm(cexp(e)), offset))
+            defmethod ignore (this) :
+              do(ignore{cexp(_)}, exps(e))
+        ;Small Tuples
+        else :
+          calloc{_, info(e)} $ append(
+           [TGTag(TUPLE-TYPE-ID)
+            TGLong(to-long(len))]
+            map(cexp, exps(e)))
+      (e:KTupleGet) :
+        val o = cexp(exp(e))
+        new CExp :
+          defmethod set (n:Int, this) :
+            val offset = 8 * index(e) + foffset(TUPLE-ITEMS-FIELD-ID)
+            emit(TGLoad(TGVar(n), imm(o), offset))
+          defmethod ignore (this) :
+            ignore(o)
+      (e:KCall) :
+        val func = global-mem(dec-table, func(e))
+        val args = map(cexp, args(e))
+        new CExp :
+          defmethod set (n:Int, this) :
+            emit(TGCall(arity(e), List(TGVar(n)), func, map(imm, args), info(e), false))
+          defmethod tail (this) :
+            emit(TGTCall(arity(e), func, map(imm, args)))
+          defmethod ignore (this) :
+            emit(TGCall(arity(e), List(), func, map(imm, args), info(e), false))
+      (e:KDo!) :
+        val func = cexp(func(e))
+        val args = map(cexp, args(e))
+        defn code (f:TGImm) :
+          val x = make-var(TGLongT())
+          emit(TGLoad(x, f, foffset(FN-CODE-FIELD-ID)))
+          x
+        new CExp :
+          defmethod set (n:Int, this) :
+            val f = imm(func)
+            val code = code(f)
+            emit(TGCall(arity(e), List(TGVar(n)), code, cons(f, map(imm, args)), info(e), false))
+          defmethod tail (this) :
+            val f = imm(func)
+            val code = code(f)
+            emit(TGTCall(arity(e), code, cons(f, map(imm, args))))
+          defmethod ignore (this) :
+            val f = imm(func)
+            val code = code(f)
+            emit(TGCall(arity(e), List(), code, cons(f, map(imm, args)), info(e), false))
+      (e:KEnsureSet) :
+        new CExp & Immediate :
+          defmethod imm (this) :
+            val lbl = fresh-id()
+            val o = imm(cexp(exp(e)))
+            emit(TGBinCmp(lbl, TGNeOp(), o, TGLong(to-long(VOID-TAG))))
+            tcall(VARIABLE-UNINITIALIZED-ERROR-ID, info(e))
+            emit(TGLabel(lbl))
+            o
+          defmethod ignore (this) :
+            imm(this)
+            false
+      (e:KEnsureLength) :
+        new CExp & Immediate :
+          defmethod imm (this) :
+            val lbl = fresh-id()
+            val o = imm(cexp(exp(e)))
+            val len = make-var(TGLongT())
+            emit(TGLoad(len, o, 8 - REF-TAG-BITS))
+            emit(TGBinCmp(lbl, TGEqOp(), len, TGLong(to-long(length(e)))))
+            tcall(TUPLE-LENGTH-ERROR-ID, info(e))
+            emit(TGLabel(lbl))
+            o
+          defmethod ignore (this) :
+            imm(this)
+            false
+      (e:KMatch|KDispatch) :
+        new CExp & Continuable :
+          defmethod kont (this, kont:CExp -> False, end?:True|False) :
+            val match-args = map(imm{cexp(_)}, args(e))
+            val bs = map(TGBranch{tags(_), fresh-id()}, branches(e))
+            val done = fresh-id()
+            match(e) :
+              (e:KMatch) :
+                val no-branch = fresh-id()
+                emit(TGMatch(match-args, bs, no-branch))
+                emit(TGLabel(no-branch))
+                tcall(NO-BRANCH-ERROR-ID, info(e))
+              (e:KDispatch) :
+                val no-branch = fresh-id()
+                val amb-branch = fresh-id()
+                emit(TGDispatch(match-args, bs, no-branch, amb-branch))
+                emit(TGLabel(no-branch))
+                tcall(NO-BRANCH-ERROR-ID, info(e))
+                emit(TGLabel(amb-branch))
+                tcall(AMB-BRANCH-ERROR-ID, info(e))                
+            for (b in branches(e), id in seq(n,bs)) do :
+              emit(TGLabel(id))
+              for (a in args(b), ma in match-args) do :
+                emit(TGDef(a, TGRefT()))
+                emit(TGSet(TGVar(a), ma))
+              kont(cexp(body(b)))
+              emit(TGGoto(done)) when not end?
+            emit(TGLabel(done)) when not end?
+      (e:KPrim) :
+        ;Utilities
+        defn binop (x:TGVar, op:TGOp, a:TGImm, b:TGImm) :
+          emit(TGBinOp(x, op, a, b))
+        defn binop (n:Int, op:TGOp, a:TGImm, b:TGImm) :
+          binop(TGVar(n), op, a, b)
+        defn unaop (x:TGVar, op:TGOp, a:TGImm) :
+          emit(TGUnaOp(x, op, a))
+        defn unaop (n:Int, op:TGOp, a:TGImm) :
+          unaop(TGVar(n), op, a)
+        defn detag-int (y:TGImm) :
+          val x = make-var(TGLongT())
+          binop(x, TGAshrOp(), y, TGLong(32L))
+          x
+        defn detag-char (y:TGImm) :
+          val x = make-var(TGLongT())
+          val b = make-var(TGByteT())
+          binop(x, TGShrOp(), y, TGLong(3L))
+          emit(TGConv(b,x))
+          b
+        defn tag-as-bool (x:TGVar, y:TGImm) :
+          binop(x, TGShlOp(), y, TGLong(3L))
+          binop(x, TGAddOp(), x, TGLong(to-long(MARKER-TAG-BITS)))
+        defn tag-as-char (x:TGVar, y:TGImm) :
+          emit(TGConv(x,y))
+          binop(x, TGShlOp(), x, TGLong(3L))
+          binop(x, TGAddOp(), x, TGLong(to-long(CHAR-TAG-BITS)))
+
+        ;Dispatch
+        switch contains?{_, op(e)} :
+          BINARY-OPS :
+            val a = cexp(args(e)[0])
+            val b = cexp(args(e)[1])
+            new CExp :
+              defmethod set (n:Int, this) :
+                val a = imm(a)
+                val b = imm(b)
+                switch(op(e)) :
+                  ADD-OP :
+                    binop(n, TGAddOp(), a, b)
+                  SUB-OP :
+                    binop(n, TGSubOp(), a, b)
+                  MUL-OP :
+                    binop(n, TGMulOp(), detag-int(a), b)
+                  DIV-OP :
+                    val x = make-var(TGLongT())
+                    binop(x, TGDivOp(), a, b)
+                    binop(n, TGShlOp(), x, TGLong(32L))
+                  MOD-OP :
+                    binop(n, TGModOp(), a, b)
+                  AND-OP :
+                    binop(n, TGAndOp(), a, b)
+                  OR-OP :
+                    binop(n, TGOrOp(), a, b)
+                  XOR-OP :
+                    binop(n, TGXorOp(), a, b)
+                  SHL-OP :
+                    binop(n, TGShlOp(), a, detag-int(b))
+                  SHR-OP :
+                    val x = make-var(TGLongT())
+                    binop(x, TGShrOp(), a, detag-int(b))
+                    binop(x, TGShrOp(), x, TGLong(32L))
+                    binop(n, TGShlOp(), x, TGLong(32L))
+                  ASHR-OP :
+                    val x = make-var(TGLongT())
+                    binop(x, TGAshrOp(), a, detag-int(b))
+                    binop(x, TGShrOp(), x, TGLong(32L))
+                    binop(n, TGShlOp(), x, TGLong(32L))
+                  EQ-OP :
+                    binop(n, TGEqOp(), a, b)
+                    tag-as-bool(TGVar(n), TGVar(n))
+                  NE-OP :
+                    binop(n, TGNeOp(), a, b)
+                    tag-as-bool(TGVar(n), TGVar(n))
+                  LT-OP :
+                    binop(n, TGLtOp(), a, b)
+                    tag-as-bool(TGVar(n), TGVar(n))
+                  GT-OP :
+                    binop(n, TGGtOp(), a, b)
+                    tag-as-bool(TGVar(n), TGVar(n))
+                  LE-OP :
+                    binop(n, TGLeOp(), a, b)
+                    tag-as-bool(TGVar(n), TGVar(n))
+                  GE-OP :
+                    binop(n, TGGeOp(), a, b)
+                    tag-as-bool(TGVar(n), TGVar(n))
+                  IDENTICAL-OP :
+                    binop(n, TGEqOp(), a, b)
+                    tag-as-bool(TGVar(n), TGVar(n))
+                  AGET-OP :
+                    val o = make-var(TGLongT())
+                    binop(o, TGAshrOp(), b, TGLong(32L - 3L))
+                    binop(o, TGAddOp(), o, a)
+                    emit(TGLoad(TGVar(n), o, foffset(RAWARRAY-ITEMS-FIELD-ID)))
+                  CHAR-AGET-OP :
+                    val o = make-var(TGLongT())
+                    val c = make-var(TGByteT())
+                    binop(o, TGAshrOp(), b, TGLong(32L))
+                    binop(o, TGAddOp(), o, a)
+                    emit(TGLoad(c, o, foffset(CHARARRAY-CHARS-FIELD-ID)))
+                    tag-as-char(TGVar(n), c)
+                  STRING-GET-OP :
+                    val o = make-var(TGLongT())
+                    val c = make-var(TGByteT())
+                    binop(o, TGAshrOp(), b, TGLong(32L))
+                    binop(o, TGAddOp(), o, a)
+                    emit(TGLoad(c, o, foffset(STRING-CHARS-FIELD-ID)))
+                    tag-as-char(TGVar(n), c)
+              defmethod ignore (this) :
+                ignore(a)
+                ignore(b)
+          UNARY-OPS :
+            val a = cexp(head(args(e)))
+            new CExp :
+              defmethod set (n:Int, this) :
+                val a = imm(a)
+                switch(op(e)) :
+                  NOT-OP :
+                    val x = make-var(TGLongT())
+                    unaop(x, TGNotOp(), a)
+                    binop(x, TGShrOp(), x, TGLong(32L))
+                    binop(n, TGShlOp(), x, TGLong(32L))
+                  NEG-OP :
+                    unaop(n, TGNegOp(), a)
+                  ALEN-OP :
+                    emit(TGLoad(TGVar(n), a, 8 - REF-TAG-BITS))
+                    binop(n, TGShlOp(), TGVar(n), TGLong(32L))
+                  STRING-LEN-OP :
+                    emit(TGLoad(TGVar(n), a, 8 - REF-TAG-BITS))
+                    binop(n, TGShlOp(), TGVar(n), TGLong(32L))
+              defmethod ignore (this) :
+                ignore(a)
+          EFFECTFUL-TERNARY-OPS :
+            val a = cexp(args(e)[0])
+            val b = cexp(args(e)[1])
+            val c = cexp(args(e)[2])
+            new CExp & Immediate :
+              defmethod imm (this) :
+                ignore(this)
+                TGLong(bit-representation(false))
+              defmethod ignore (this) :
+                val a = imm(a)
+                val b = imm(b)
+                val c = imm(c)
+                switch(op(e)) :
+                  ASET-OP :
+                    val o = make-var(TGLongT())
+                    binop(o, TGAshrOp(), b, TGLong(32L - 3L))
+                    binop(o, TGAddOp(), o, a)
+                    emit(TGStore(o, c, foffset(RAWARRAY-ITEMS-FIELD-ID)))
+                  CHAR-ASET-OP :
+                    val o = make-var(TGLongT())
+                    binop(o, TGAshrOp(), b, TGLong(32L))
+                    binop(o, TGAddOp(), o, a)
+                    emit(TGStore(o, detag-char(c), foffset(CHARARRAY-CHARS-FIELD-ID)))
+          else :
+            fatal("Cannot compile primitive: %_" % [op(e)])
+
+  ;=====================================
+  ;==== Compiling a Single Function ====
+  ;=====================================
+  ;[3 Reserve stacks]
+  ;  - For handling stack overflow
+  ;  - For running the GC
+  ;  - For handling overflow during GC
+  defn cfn (f:KFn!) :
+    ;Extend stack if necessary
+    defn stack-extension-prelude () :
+      ;  goto default if has-space
+      ;  new-stack
+      ;  vs = args
+      ;  goto body if num-free-stacks >= 3 ;See [3 Reserve Stacks]
+      ;  extend-stack()
+      ;  goto body
+      ;default:
+      ;  vs = args
+      ;body:
+      val default-lbl = fresh-id()
+      val body-lbl = fresh-id()
+      val num-free = make-var(TGLongT())
+      emit(TGNullCmp(default-lbl, TGHasStackSpace()))
+      emit(TGNewStack())
+      emit(TGArgs(map(TGVar, args(f))))
+      emit(TGLoad(num-free, TGMem(NUM-FREE-STACKS-LBL,0), 0))
+      emit(TGBinCmp(body-lbl, TGGeOp(), num-free, TGLong(3L)))
+      call(EXTEND-STACK-ID, info(f))
+      emit(TGGoto(body-lbl))
+      emit(TGLabel(default-lbl))
+      emit(TGArgs(map(TGVar, args(f))))
+      emit(TGLabel(body-lbl))
+
+    ;Define args
+    do(emit{TGDef(_, TGRefT())}, args(f))
+    ;Driver
+    stack-extension-prelude()
+    if tail?(f) : tail(cexp(body(f)))
+    else : return(cexp(body(f)))
+
+  ;======================================
+  ;==== Compiling Multiple Functions ====
+  ;======================================
+  defn cfns (fs:List<KFn!>) :
+    for f in fs do :
+      val fail-lbl = fresh-id()
+      emit(TGUnaCmp(fail-lbl, TGArityNeOp(), TGInt(arity(f))))
+      cfn(f)
+      emit(TGLabel(fail-lbl))
+    emit(TGArgs(List()))
+    tcall(ARITY-ERROR-ID, info(head(fs)))
+
+  ;================
+  ;==== Driver ====
+  ;================
+  new HSCompiler :
+    defmethod compile (this, e:KExp) :
+      ignore(cexp(e))
+    defmethod compile (this, n:Int, f:KFunc, check-arity?:True|False) :
+      init-compilation-tables()
+      val body = emit-to-buffer $ fn () :
+        match(f) :
+          (f:KMultifn) :
+            cfns(funcs(f) as List<KFn!>)
+          (f:KFn!) :
+            if check-arity? : cfns(List(f))
+            else : cfn(f)
+      TGDefCode(n, body)
+
+;============================================================
+;============= LSExpression Compilation System ==============
+;============================================================
+
+;Base Compiled Expression
+deftype CLSExp
+defmulti types (c:CLSExp) -> List<TGType>
+defmulti set (ns:List<Int>, c:CLSExp) -> False
+defmulti ignore (c:CLSExp) -> False
+defmulti imms (c:CLSExp) -> List<TGImm>
+defmulti tail (c:CLSExp) -> False
+defmulti return (c:CLSExp) -> False
+defmulti return-c (c:CLSExp) -> False
+
+;Convenience for single immediate
+defn imm (c:CLSExp) :
+  val xs = imms(c)
+  fatal("Not a single immediate.") when length(xs) != 1
+  head(xs)
+
+defn set (n:Int, c:CLSExp) :
+  set(List(n), c)
+
+;Most default things are defined in terms of set
+;Except for ignore
+defmethod imms (c:CLSExp) :
+  val ns = map(fresh-id{}, types(c))
+  do(emit{TGDef(_, _)}, ns, types(c))
+  set(ns, c)
+  map(TGVar, ns)
+defmethod tail (c:CLSExp) : return(c)
+defmethod return (c:CLSExp) : emit(TGReturn(imms(c)))
+defmethod return-c (c:CLSExp) : emit(TGReturnC(imms(c)))
+
+;;If it is continuable, then define everything in terms of kont
+deftype LSContinuable
+defmulti kont (c:LSContinuable, kont:CLSExp -> False, end?:True|False) -> False
+defmulti kont (c:LSContinuable, kont:CLSExp -> False) -> False
+defmethod kont (c:LSContinuable, k:CLSExp -> False, end?:True|False) : kont(c, k)
+defmethod tail (c:CLSExp & LSContinuable) : kont(c, tail, false)
+defmethod return (c:CLSExp & LSContinuable) : kont(c, return, false)
+defmethod return-c (c:CLSExp & LSContinuable) : kont(c, return-c, false)
+defmethod ignore (c:CLSExp & LSContinuable) : kont(c, ignore, false)
+defmethod set (ns:List<Int>, c:CLSExp & LSContinuable) : kont(c, set{ns, _}, false)
+
+;If it is immediate, then set is defined in terms of imm
+defmethod set (ns:List<Int>, c:CLSExp&Immediate) :
+  do(emit{TGSet(TGVar(_), _)}, ns, imms(c))
+
+;============================================================
+;================= Pointer Compilation ======================
+;============================================================
+
+deftype CLoc
+defstruct PtrLoc <: CLoc :
+  base: CLSExp
+  offset: Int
+defstruct VarLoc <: CLoc :
+  n: Int
+  index: Int
+defstruct ExpLoc <: CLoc :
+  base: CLSExp
+  index: Int
+
+;============================================================
+;================ LoStanza Compilation ======================
+;============================================================
+
+deftype LSCompiler
+defmulti compile (s:LSCompiler, c:KLSComm) -> False
+defmulti compile (s:LSCompiler, n:Int|Symbol, f:KLSFn!,
+                  externfn?:True|False, check-arity?:True|False) -> TGDefCode
+
+defn LSCompiler (dec-table:DecTable) :
+  ;===================================
+  ;==== External Function Setting ====
+  ;===================================
+  var externfn?:True|False = false
+  var use-tail-calls?:True|False = false
+
+  ;===================
+  ;==== Utilities ====
+  ;===================
+  defn foffset (n:Int) :
+    field-offset(dec-table, n) + 8 - REF-TAG-BITS
+
+  defn ktype (op:GetterPrimitive) :
+    to-ktype(type(op))
+
+  defn calloc (input-size:Int, offsets:List<Int>, fields:List<TGImm|CLSExp>, info:False|FileInfo) :
+    new CLSExp :
+      defmethod types (this) :
+        List(TGRefT())
+      defmethod set (ns:List<Int>, this) :
+        fatal("Not a single immediate.") when length(ns) != 1
+        val n = head(ns)
+        val fs = for f in fields seq-append :
+          match(f) :
+            (f:TGImm) : List(f)
+            (f:CLSExp) : imms(f)
+        val size = ceil8(input-size)
+        allocate-ref(n, size, info)
+        for (f in fs, o in offsets) do :
+          emit(TGStore(TGVar(n), f, o - REF-TAG-BITS))
+
+  defn calloc (fields:List<TGImm|CLSExp>, info:False|FileInfo) :
+    val n = length(fields)
+    calloc(8 * n, map({8 * _}, 0 to n), fields, info)
+
+  defn carray (size:Int, rest-size:Int, offsets:List<Int>, fields:List<TGImm|CLSExp>, info:False|FileInfo) :
+    new CLSExp :
+      defmethod types (this) :
+        List(TGRefT())
+      defmethod set (ns:List<Int>, this) :
+        ;Retrieve destination
+        fatal("Not a single immediate.") when length(ns) != 1
+        val n = head(ns)
+        ;Evaluate fields
+        val fs = for f in fields seq-append :
+          match(f) :
+            (f:TGImm) : List(f)
+            (f:CLSExp) : imms(f)
+        ;Compute length
+        val len = make-var(TGLongT())
+        emit(TGBinOp(len, TGMulOp(), fs[1], TGLong(to-long(rest-size))))
+        emit(TGBinOp(len, TGAddOp(), len, TGLong(to-long(size + 7))))
+        emit(TGBinOp(len, TGAndOp(), len, TGLong(-8L)))
+        ;Allocate array
+        allocate-ref(n, len, info)
+        ;Store fields
+        for (f in fs, o in offsets) do :
+          emit(TGStore(TGVar(n), f, o - REF-TAG-BITS))
+
+  defn cargs (xs:List<TGVar>) :
+    if externfn? : emit(TGArgsC(xs))
+    else : emit(TGArgs(xs))
+
+  ;============================
+  ;==== Compilation Tables ====
+  ;============================
+  var imm-table:HashTable<Int,List<TGImm>>
+  var type-table:HashTable<Int,List<TGType>>
+  var block-arg-table:HashTable<Int,List<List<Int>>>
+
+  defn init-compilation-tables () :
+    imm-table = HashTable<Int,List<TGImm>>()
+    type-table = HashTable<Int,List<TGType>>()
+    block-arg-table = HashTable<Int,List<List<Int>>>()
+  init-compilation-tables()
+
+  ;===============================
+  ;==== Compilation Functions ====
+  ;===============================
+  defn cloc (e:KLoc) -> CLoc :
+    match(e) :
+      (e:KValue) :
+        ExpLoc(cexp(exp(e)), 0)
+      (e:KVarLoc) :
+        if global?(dec-table, n(e)) :
+          val base = new CLSExp & Immediate :
+            defmethod types (this) : List(TGLongT())
+            defmethod imms (this) : List(global-mem(dec-table, n(e)))
+          PtrLoc(base, 0)
+        else :
+          VarLoc(n(e), 0)
+      (e:KDeref) :
+        PtrLoc(cexp(exp(e)), 8 - REF-TAG-BITS)
+      (e:KDeptr) :
+        PtrLoc(cexp(exp(e)), 0)
+      (e:KSlot) :
+        ;Compute ptr and offset
+        val [ptr, ptr-offset] = match(cloc(exp(e))) :
+          (l:PtrLoc) : [base(l), offset(l)]
+          (l:ExpLoc) : [base(l), 0]
+        ;Compute base cexp
+        val base = new CLSExp :
+          defmethod types (this) :
+            List(TGLongT())
+          defmethod set (ns:List<Int>, this) :
+            ;ns = base
+            ;offset = index
+            ;offset = offset * size
+            ;n = n + offset
+            set(ns, ptr)
+            val offset = make-var(TGLongT())
+            set(n(offset), cexp(index(e)))
+            val size = size(dec-table, type(e))
+            emit(TGBinOp(offset, TGMulOp(), offset, TGLong(to-long(size)))) when size != 1
+            val x = TGVar(head(ns))
+            emit(TGBinOp(x, TGAddOp(), x, offset))
+        ;Return location
+        PtrLoc(base, ptr-offset)
+      (e:KField) :
+        match(cloc(exp(e))) :
+          (l:PtrLoc) :
+            PtrLoc(
+              base(l),
+              offset(l) + field-offset(dec-table, n(e)))
+          (l:ExpLoc) :
+            ExpLoc(
+              base(l),
+              index(l) + field-index(dec-table, n(e)))
+          (l:VarLoc) :
+            VarLoc(
+              n(l),
+              index(l) + field-index(dec-table, n(e)))
+
+  defn cexp (e:KLSExp) -> CLSExp :
+    match(e) :
+      (e:KLSVar) :
+        if global?(dec-table, n(e)) :
+          val t = ls-var-type(dec-table, n(e))
+          new CLSExp :
+            defmethod types (this) :
+              tgt-types(dec-table, t)
+            defmethod set (xs:List<Int>, this) :
+              for (x in xs, off in field-offsets(dec-table,t)) do :
+                val m = global-mem(dec-table, n(e))
+                emit(TGLoad(TGVar(x), m, off))
+            defmethod ignore (this) :
+              false
+        else :
+          new CLSExp & Immediate :
+            defmethod types (this) :
+              type-table[n(e)]
+            defmethod imms (this) :
+              imm-table[n(e)]
+            defmethod ignore (this) :
+              false
+      (e:KLSRef) :
+        if empty?(args(e)) :
+          new CLSExp & Immediate :
+            defmethod types (this) :
+              List(TGRefT())
+            defmethod imms (this) :
+              List(TGTag(n(e), true))
+        else :
+          val size = 8 + size(dec-table, n(e))
+          val offsets = cons(0, map({8 + _}, field-offsets(dec-table, n(e))))
+          val fields = cons(TGTag(n(e)), map(cexp, args(e)))
+          calloc(size, offsets, fields, info(e))
+      (e:KLSArray) :
+        val size = 8 + size(dec-table, n(e))
+        val rest-size = rest-size(dec-table, n(e))
+        val offsets = cons(0, map({8 + _}, field-offsets(dec-table, n(e))))
+        val fields = cons(TGTag(n(e)), map(cexp, args(e)))
+        carray(size, rest-size, offsets, fields, info(e))
+      (e:KLSStruct) :
+        new CLSExp & Immediate :
+          defmethod types (this) :
+            tgt-types(dec-table, KStructT(n(e)))
+          defmethod imms (this) :
+            seq-append(imms{cexp(_)}, args(e))
+      (e:KLSPtr) :
+        val l = cloc(loc(e)) as PtrLoc
+        if offset(l) == 0 :
+          base(l)
+        else :
+          new CLSExp :
+            defmethod types (this) :
+              List(TGLongT())
+            defmethod set (ns:List<Int>, this) :
+              set(ns, base(l))
+              val x = TGVar(head(ns))
+              val off = TGLong(to-long(offset(l)))
+              emit(TGBinOp(x, TGAddOp(), x, off))
+      (e:KLSRead) :
+        match(cloc(loc(e))) :
+          (l:PtrLoc) :
+            new CLSExp :
+              defmethod types (this) :
+                tgt-types(dec-table, type(e))
+              defmethod set (ns:List<Int>, this) :
+                val p = imm(base(l))
+                for (n in ns, o in field-offsets(dec-table, type(e))) do :
+                  emit(TGLoad(TGVar(n), p, offset(l) + o))
+          (l:ExpLoc) :
+            new CLSExp & Immediate :
+              defmethod types (this) :
+                tgt-types(dec-table, type(e))
+              defmethod imms (this) :
+                val xs = imms(base(l))
+                val len = length(dec-table, type(e))
+                headn(tailn(xs, index(l)), len)
+          (l:VarLoc) :
+            new CLSExp & Immediate :
+              defmethod types (this) :
+                tgt-types(dec-table, type(e))
+              defmethod imms (this) :
+                val xs = imm-table[n(l)]
+                val len = length(dec-table, type(e))
+                headn(tailn(xs, index(l)), len)
+      (e:KLSLiteral) :
+        match(value(e)) :
+          (v:Char|Byte|Int|Long|String) :
+            new CLSExp & Immediate :
+              defmethod types (this) :
+                List $ match(v) :
+                  (v:Byte) : TGByteT()
+                  (v:Char) : TGByteT()
+                  (v:Int) : TGIntT()
+                  (v:Long) : TGLongT()
+                  (v:String) : TGLongT()
+              defmethod imms (this) :
+                List $ match(v) :
+                  (v:Char) : TGByte(to-byte(v))
+                  (v:Byte) : TGByte(v)
+                  (v:Int) : TGInt(v)
+                  (v:Long) : TGLong(v)
+                  (v:String) :
+                    val c = fresh-id()
+                    emit(TGDefData(c, v))
+                    TGMem(c,0)
+          (v:Float|Double) :
+            new CLSExp :
+              defmethod types (this) :
+                List $ match(v) :
+                  (v:Float) : TGFloatT()
+                  (v:Double) : TGDoubleT()
+              defmethod set (ns:List<Int>, this) :
+                match(v) :
+                  (v:Float) :
+                    val n = TGVar(head(ns))
+                    emit(TGInterpret(n, TGInt(bits(v))))
+                  (v:Double) :
+                    val c = fresh-id()
+                    emit(TGDefData(c, v))
+                    emit(TGLoad(TGVar(head(ns)), TGMem(c,0), 0))
+          (v:True|False) :
+            new CLSExp & Immediate :
+              defmethod types (this) :
+                List(TGRefT())
+              defmethod imms (this) :
+                List(TGLong(bit-representation(v)))
+      (e:KLSCast) :
+        val t = match(type(e)) :
+          (t:KByteT) : TGByteT()
+          (t:KIntT) : TGIntT()
+          (t:KLongT) : TGLongT()
+          (t:KFloatT) : TGFloatT()
+          (t:KDoubleT) : TGDoubleT()
+          (t:KPtrT) : TGLongT()
+          (t:KRefT) : TGRefT()
+        new CLSExp :
+          defmethod types (this) :
+            List(t)
+          defmethod set (ns:List<Int>, this) :
+            val ys = imms(cexp(exp(e)))
+            emit(TGConv(TGVar(head(ns)), head(ys)))
+      (e:KLSGuard) :
+        new CLSExp & Immediate :
+          defmethod types (this) :
+            List(TGRefT())
+          defmethod imms (this) :
+            val pass-lbl = fresh-id()
+            val fail-lbl = fresh-id()
+            val obj = imm(cexp(exp(e)))
+            compile-typeof(obj, tag(e), pass-lbl, fail-lbl, head{imm-table[_]})
+            ;Emit fail code
+            emit(TGLabel(fail-lbl))
+            tcall(CAST-ERROR-ID, info(e))
+            ;Emit pass code
+            emit(TGLabel(pass-lbl))
+            List(obj)
+          defmethod ignore (this) :
+            imms(this)
+            false
+      (e:KLSAnd) :
+        new CLSExp :
+          defmethod types (this) :
+            List(TGLongT())
+          defmethod set (ns:List<Int>, this) :
+            val done-lbl = fresh-id()
+            set(ns, cexp(a(e)))
+            emit(TGBinCmp(done-lbl, TGEqOp(), TGVar(head(ns)), TGLong(0L)))
+            set(ns, cexp(b(e)))
+            emit(TGLabel(done-lbl))
+      (e:KLSOr) :
+        new CLSExp :
+          defmethod types (this) :
+            List(TGLongT())
+          defmethod set (ns:List<Int>, this) :
+            val done-lbl = fresh-id()
+            set(ns, cexp(a(e)))
+            emit(TGBinCmp(done-lbl, TGNeOp(), TGVar(head(ns)), TGLong(0L)))
+            set(ns, cexp(b(e)))
+            emit(TGLabel(done-lbl))
+      (e:KLSSizeof) :
+        new CLSExp & Immediate :
+          defmethod types (this) :
+            List(TGLongT())
+          defmethod imms (this) :
+            val size = size(dec-table, type(e))
+            List(TGLong(to-long(size)))
+      (e:KLSTagof) :
+        new CLSExp & Immediate :
+          defmethod types (this) : List(TGLongT())
+          defmethod imms (this) : List(TGTag(n(e)))
+      (e:KLSLet) :
+        val b = cexp(body(e))
+        new CLSExp & LSContinuable :
+          defmethod types (this) :
+            types(b)
+          defmethod kont (this, kont:CLSExp -> False) :
+            val ts = tgt-types(dec-table, type(e))
+            val xs = map(make-var, ts)
+            imm-table[n(e)] = xs
+            type-table[n(e)] = ts
+            set(map(n,xs), cexp(value(e)))
+            kont(b)
+      (e:KLSDispatch) :
+        val bs-exps = map(cexp{exp(_)}, branches(e))
+        new CLSExp & LSContinuable :
+          defmethod types (this) :
+            types(head(bs-exps))
+          defmethod kont (this, kont:CLSExp -> False, end?:True|False) :
+            val match-args = seq-append(imms{cexp(_)}, args(e))
+            val bs = map(TGBranch{tags(_), fresh-id()}, branches(e))
+            val done = fresh-id()
+            val no-branch = fresh-id()
+            val amb-branch = fresh-id()
+            emit(TGDispatch(match-args, bs, no-branch, amb-branch))
+            emit(TGLabel(no-branch))
+            tcall(NO-BRANCH-ERROR-ID, info(e))
+            emit(TGLabel(amb-branch))
+            tcall(AMB-BRANCH-ERROR-ID, info(e))
+            for (b in branches(e), id in seq(n,bs), body in bs-exps) do :
+              emit(TGLabel(id))
+              for (a in args(b), ma in match-args) do :
+                imm-table[a] = List(TGVar(a))
+                type-table[a] = List(TGRefT())
+                emit(TGDef(a, TGRefT()))
+                emit(TGSet(TGVar(a), ma))
+              kont(body)
+              emit(TGGoto(done)) when not end?
+            emit(TGLabel(done)) when not end?
+      (e:KLSTypeObject) :
+        calloc{_, false} $ append(
+         [TGTag(TYPE-TYPE-ID)
+          TGLong(to-long(length(args(e))))
+          TGMem(n(e),0)]
+          map(cexp, args(e)))
+      (e:KLSClosure) :
+        calloc{_, info(e)} $ append(
+         [TGTag(FN-TYPE-ID)
+          TGLong(to-long(length(args(e))))
+          TGMem(n(e),0)]
+          map(cexp, args(e)))
+      (e:KLSDo!) :
+        defn categorize () :
+          match(func(e)) :
+            (f:KLSRead) :
+              match(loc(f)) :
+                (l:KDeptr) : do-deptr(exp(l))
+                (l:KDeref) : do-deref(exp(l))
+            (f:KLSVar) :
+              do-direct(f)
+        defn code (f:TGImm) :
+          val x = make-var(TGLongT())
+          emit(TGLoad(x, f, foffset(FN-CODE-FIELD-ID)))
+          x
+        defn do-direct (f:KLSVar) :
+          val m = global-mem(dec-table, n(f))
+          make-call(m, map(cexp, args(e)))
+        defn do-deptr (f:KLSExp) :
+          make-call(cexp(f), map(cexp, args(e)))
+        defn do-deref (f:KLSExp) :
+          val f* = head(imms(cexp(f)))
+          make-call(code(f*), cons(f*, map(cexp, args(e))))
+        defn imms? (x:TGImm|CLSExp) :
+          match(x) :
+            (x:TGImm) : List(x)
+            (x:CLSExp) : imms(x)
+        defn make-call (f:TGImm|CLSExp, args:List<TGImm|CLSExp>) :
+          new CLSExp :
+            defmethod types (this) :
+              tgt-types(dec-table, type(e))
+            defmethod set (ns:List<Int>, this) :
+              val xs = map(TGVar, ns)
+              val args* = seq-append(imms?,args)
+              emit(TGCall(arity(e), xs, head(imms?(f)), args*, info(e), false))
+            defmethod tail (this) :
+              val args* = seq-append(imms?,args)
+              emit(TGTCall(arity(e), head(imms?(f)), args*))
+            defmethod ignore (this) :
+              set(List(), this)
+        categorize()
+      (e:KLSDoC) :
+        val f* = match(func(e)) :
+          (f:KLSRead) :
+            val l = loc(f) as KDeptr
+            cexp(exp(l))
+          (f:KLSVar) :
+            global-mem(dec-table, n(f))
+        val args = map(cexp, args(e))
+        val varargs = map(cexp, varargs(e))
+        defn imm? (x:TGImm|CLSExp) :
+          match(x) :
+            (x:TGImm) : x
+            (x:CLSExp) : imm(x)
+        new CLSExp :
+          defmethod types (this) :
+            tgt-types(dec-table, type(e))
+          defmethod set (ns:List<Int>, this) :
+            val xs = map(TGVar, ns)
+            val args* = seq-append(imms, args)
+            val varargs* = seq-append(imms, varargs)
+            emit(TGCallC(xs, imm?(f*), args*, varargs*))
+          defmethod ignore (this) :
+            set(List(), this)
+      (e:KDetagPrim) :
+        new CLSExp :
+          defmethod types (this) :
+            List $ switch(n(e)) :
+              BYTE-TYPE-ID : TGByteT()
+              CHAR-TYPE-ID : TGByteT()
+              INT-TYPE-ID : TGIntT()
+              FLOAT-TYPE-ID : TGFloatT()
+          defmethod set (ns:List<Int>, this) :
+            val x = TGVar(head(ns))
+            val y = make-var(TGLongT())
+            set(List(n(y)), cexp(exp(e)))
+            switch(n(e)) :
+              BYTE-TYPE-ID :
+                emit(TGBinOp(y, TGAshrOp(), y, TGLong(3L)))
+                emit(TGConv(x, y))
+              CHAR-TYPE-ID :
+                emit(TGBinOp(y, TGAshrOp(), y, TGLong(3L)))
+                emit(TGConv(x, y))
+              INT-TYPE-ID :
+                emit(TGBinOp(y, TGAshrOp(), y, TGLong(32L)))
+                emit(TGConv(x, y))
+              FLOAT-TYPE-ID :
+                emit(TGBinOp(y, TGAshrOp(), y, TGLong(3L)))
+                val y2 = make-var(TGIntT())
+                emit(TGConv(y2, y))
+                emit(TGInterpret(x, y2))
+      (e:KTagPrim) :
+        new CLSExp :
+          defmethod types (this) :
+            List(TGRefT())
+          defmethod set (ns:List<Int>, this) :
+            val x = TGVar(head(ns))
+            switch(n(e)) :
+              BYTE-TYPE-ID :
+                val y = make-var(TGLongT())
+                emit(TGConv(y, head(imms(cexp(exp(e))))))
+                emit(TGBinOp(y, TGShlOp(), y, TGLong(3L)))
+                emit(TGBinOp(x, TGAddOp(), y, TGLong(to-long(BYTE-TAG-BITS))))
+              CHAR-TYPE-ID :
+                val y = make-var(TGLongT())
+                emit(TGConv(y, head(imms(cexp(exp(e))))))
+                emit(TGBinOp(y, TGShlOp(), y, TGLong(3L)))
+                emit(TGBinOp(x, TGAddOp(), y, TGLong(to-long(CHAR-TAG-BITS))))
+              INT-TYPE-ID :
+                val y = make-var(TGLongT())
+                emit(TGConv(y, head(imms(cexp(exp(e))))))
+                emit(TGBinOp(x, TGShlOp(), y, TGLong(32L)))
+              FLOAT-TYPE-ID :
+                val y1 = make-var(TGIntT())
+                emit(TGInterpret(y1, head(imms(cexp(exp(e))))))
+                val y2 = make-var(TGLongT())
+                emit(TGConv(y2, y1))
+                emit(TGBinOp(y2, TGShlOp(), y2, TGLong(3L)))
+                emit(TGBinOp(x, TGAddOp(), y2, TGLong(to-long(FLOAT-TAG-BITS))))
+      (e:KLSPrim) :
+        match(op(e)) :
+          (op:GetterPrimitive) :
+            if op == GET-SP-OP :
+              new CLSExp & Immediate :
+                defmethod types (this) : List(TGLongT())
+                defmethod imms (this) : List(TGRegSP())
+            else :
+              new CLSExp :
+                defmethod types (this) :
+                  tgt-types(dec-table, ktype(op))
+                defmethod set (ns:List<Int>, this) :
+                  val x = TGVar(head(ns))
+                  val p = TGMem(lbl(op),0)
+                  emit(TGLoad(x, p, 0))
+          (op:AddrPrimitive) :
+            new CLSExp & Immediate :
+              defmethod types (this) : List(TGLongT())
+              defmethod imms (this) : List(TGMem(lbl(op),0))
+          (op:SetterPrimitive) :
+            val a = cexp(head(args(e)))
+            new CLSExp & Immediate :
+              defmethod types (this) :
+                List(TGLongT())
+              defmethod imms (this) :
+                val p = TGMem(lbl(op),0)
+                emit(TGStore(p, imm(a), 0))
+                List(TGLong(0L))
+              defmethod ignore (this) :
+                imms(this)
+                false
+          (op) :
+            if op == LS-YIELD-OP :
+              val s = cexp(args(e)[0])
+              val y = cexp(args(e)[1])
+              new CLSExp :
+                defmethod types (this) :
+                  List(TGRefT())
+                defmethod ignore (this) :
+                  val x = make-var(TGRefT())
+                  set(n(x), this)
+                defmethod set (ns:List<Int>, this) :
+                  val x = TGVar(head(ns))
+                  emit(TGSwitchStack(x, imm(s), imm(y)))
+            else :
+              switch contains?{_, op} :
+                LS-BINARY-OPS :
+                  val a = cexp(args(e)[0])
+                  val b = cexp(args(e)[1])
+                  new CLSExp :
+                    defmethod types (this) :
+                      switch(op) :
+                        LS-ADD-OP : types(a)
+                        LS-SUB-OP : types(a)
+                        LS-MUL-OP : types(a)
+                        LS-DIV-OP : types(a)
+                        LS-MOD-OP : types(a)
+                        LS-AND-OP : types(a)
+                        LS-OR-OP : types(a)
+                        LS-XOR-OP : types(a)
+                        LS-SHL-OP : types(a)
+                        LS-SHR-OP : types(a)
+                        LS-ASHR-OP : types(a)
+                        LS-EQ-OP : List(TGLongT())
+                        LS-NE-OP : List(TGLongT())
+                        LS-LT-OP : List(TGLongT())
+                        LS-GT-OP : List(TGLongT())
+                        LS-LE-OP : List(TGLongT())
+                        LS-GE-OP : List(TGLongT())
+                        LS-ULT-OP : List(TGLongT())
+                        LS-UGT-OP : List(TGLongT())
+                        LS-ULE-OP : List(TGLongT())
+                        LS-UGE-OP : List(TGLongT())
+                    defmethod set (ns:List<Int>, this) :
+                      val op* = switch(op) :
+                        LS-ADD-OP : TGAddOp()
+                        LS-SUB-OP : TGSubOp()
+                        LS-MUL-OP : TGMulOp()
+                        LS-DIV-OP : TGDivOp()
+                        LS-MOD-OP : TGModOp()
+                        LS-AND-OP : TGAndOp()
+                        LS-OR-OP : TGOrOp()
+                        LS-XOR-OP : TGXorOp()
+                        LS-SHL-OP : TGShlOp()
+                        LS-SHR-OP : TGShrOp()
+                        LS-ASHR-OP : TGAshrOp()
+                        LS-EQ-OP : TGEqOp()
+                        LS-NE-OP : TGNeOp()
+                        LS-LT-OP : TGLtOp()
+                        LS-GT-OP : TGGtOp()
+                        LS-LE-OP : TGLeOp()
+                        LS-GE-OP : TGGeOp()
+                        LS-ULT-OP : TGUltOp()
+                        LS-UGT-OP : TGUgtOp()
+                        LS-ULE-OP : TGUleOp()
+                        LS-UGE-OP : TGUgeOp()
+                      val x = TGVar(head(ns))
+                      emit(TGBinOp(x, op*, imm(a), imm(b)))
+                LS-UNARY-OPS :
+                  val a = cexp(head(args(e)))
+                  new CLSExp :
+                    defmethod types (this) :
+                      switch(op) :
+                        LS-NOT-OP : types(a)
+                        LS-NEG-OP : types(a)
+                        LS-BITS-OP : List(TGIntegerT(head(types(a)) as TGRealT))
+                        LS-FNUM-OP : List(TGRealT(head(types(a)) as TGIntegerT))
+                    defmethod set (ns:List<Int>, this) :
+                      val t = head(types(this))
+                      val x = TGVar(head(ns))
+                      switch(op) :
+                        LS-NOT-OP :
+                          emit(TGUnaOp(x, TGNotOp(), imm(a)))
+                        LS-NEG-OP :
+                          emit(TGUnaOp(x, TGNegOp(), imm(a)))
+                        LS-BITS-OP :
+                          emit(TGInterpret(x, imm(a)))
+                        LS-FNUM-OP :
+                          emit(TGInterpret(x, imm(a)))
+      (e) :
+        fatal("Cannot compile: %_" % [e])
+
+  defn ccomm (c:KLSComm) -> False :
+    match(c) :
+      (c:KLSExec) :
+        ignore(cexp(exp(c)))
+      (c:KLSSet) :
+        match(cloc(loc(c))) :
+          (l:PtrLoc) :
+            val p = imm(base(l))
+            val ys = imms(cexp(value(c)))
+            val offsets = field-offsets(dec-table, type(c))
+            for (y in ys, o in offsets) do :
+              emit(TGStore(p, y, o + offset(l)))
+          (l:VarLoc) :
+            val base = imm-table[n(l)] as List<TGVar>
+            val len = length(dec-table, type(c))
+            val xs = headn(tailn(base, index(l)), len)
+            set(map(n,xs), cexp(value(c)))
+      (c:KLSLabels) :
+        ;Create block args
+        for b in blocks(c) do :
+          val tss = map(tgt-types{dec-table, _}, types(b))
+          val xss = map(map{make-var, _}, tss)
+          for (a in args(b), xs in xss, ts in tss) do :
+            imm-table[a] = xs
+            type-table[a] = ts
+          block-arg-table[n(b)] = map(map{n, _}, xss)
+        ;Compile blocks
+        val end-lbl = fresh-id()
+        for b in blocks(c) do :
+          emit(TGLabel(n(b)))
+          ccomm(body(b))
+          emit(TGGoto(end-lbl))
+        emit(TGLabel(end-lbl))
+      (c:KLSGoto) :
+        val nss = block-arg-table[n(c)]
+        val vs = seq(cexp, args(c))
+        do(set, nss, vs)
+        emit(TGGoto(n(c)))
+      (c:KLSReturn) :
+        if use-tail-calls? : tail(cexp(exp(c)))
+        else if externfn? : return-c(cexp(exp(c)))
+        else : return(cexp(exp(c)))
+      (c:KLSDefLocal) :
+        val ts = tgt-types(dec-table, type(c))
+        val v = cexp(value(c))
+        imm-table[n(c)] = imms(v)
+        type-table[n(c)] = ts
+      (c:KLSDefLocalVar) :
+        val ts = tgt-types(dec-table, type(c))
+        val vs = map(make-var, ts)
+        val exp = value(c)
+        match(exp:KLSExp) :
+          set(map(n,vs), cexp(exp))
+        else :
+          for (v in vs, t in ts) do :
+            emit $ match(t) :
+              (t:TGByteT) : TGSet(v, TGByte(0Y))
+              (t:TGIntT) : TGSet(v, TGInt(0))
+              (t:TGLongT) : TGSet(v, TGLong(0L))
+              (t:TGFloatT) : TGConv(v, TGInt(0))
+              (t:TGDoubleT) : TGConv(v, TGInt(0))
+              (t:TGRefT) : TGSet(v, TGLong(to-long(VOID-TAG)))
+        imm-table[n(c)] = vs
+        type-table[n(c)] = ts
+      (c:KLSSeq) :
+        ccomm(a(c))
+        ccomm(b(c))
+      (c:KLSIf) :
+        val false-lbl = fresh-id()
+        val done-lbl = fresh-id()
+        val p = imm(cexp(pred(c)))
+        emit(TGBinCmp(false-lbl, TGEqOp(), p, TGLong(0L)))
+        ccomm(conseq(c))
+        emit(TGGoto(done-lbl))
+        emit(TGLabel(false-lbl))
+        ccomm(alt(c))
+        emit(TGLabel(done-lbl))
+      (c:KLSMatch) :
+        val match-args = seq-append(imms{cexp(_)}, args(c))
+        val bs = map(TGBranch{tags(_), fresh-id()}, branches(c))
+        val done = fresh-id()
+        val no-branch = fresh-id()
+        emit(TGMatch(match-args, bs, no-branch))
+        emit(TGLabel(no-branch))
+        tcall(NO-BRANCH-ERROR-ID, info(c))
+        for (b in branches(c), id in seq(n,bs)) do :
+          emit(TGLabel(id))
+          for (a in args(b), ma in match-args) do :
+            imm-table[a] = List(TGVar(a))
+            type-table[a] = List(TGRefT())
+            emit(TGDef(a, TGRefT()))
+            emit(TGSet(TGVar(a), ma))
+          ccomm(body(b))
+          emit(TGGoto(done))
+        emit(TGLabel(done))
+      (c:KLSSkip) :
+        false
+      (c) :
+        fatal("Cannot compile: %_" % [c])
+
+  defn cfn (f:KLSFn!, check-arity?:True|False) :
+    ;Extend stack if necessary
+    defn stack-extension-prelude (args:List<TGVar>) :
+      ;  goto default if has-space
+      ;  new-stack
+      ;  vs = args
+      ;  goto body if num-free-stacks >= 3 ;See [3 Reserve Stacks]
+      ;  extend-stack()
+      ;  goto body
+      ;default:
+      ;  vs = args
+      ;body:
+      val default-lbl = fresh-id()
+      val body-lbl = fresh-id()
+      val num-free = make-var(TGLongT())
+      emit(TGSaveCContext()) when externfn?
+      emit(TGNullCmp(default-lbl, TGHasStackSpace()))
+      emit(TGNewStack())
+      cargs(args)
+      emit(TGLoad(num-free, TGMem(NUM-FREE-STACKS-LBL,0), 0))
+      emit(TGBinCmp(body-lbl, TGGeOp(), num-free, TGLong(3L)))
+      call(EXTEND-STACK-ID, info(f))
+      emit(TGGoto(body-lbl))
+      emit(TGLabel(default-lbl))
+      cargs(args)
+      emit(TGLabel(body-lbl))
+
+    ;Always run function in new stack
+    defn new-stack-prelude (args:List<TGVar>) :
+      ;  new-stack
+      ;  vs = args
+      ;  goto body if num-free-stacks >= 3 ;See [3 Reserve Stacks]
+      ;  extend-stack()
+      ;body:
+      val body-lbl = fresh-id()
+      val num-free = make-var(TGLongT())
+      emit(TGSaveCContext()) when externfn?
+      emit(TGNewStack())
+      cargs(args)
+      emit(TGLoad(num-free, TGMem(NUM-FREE-STACKS-LBL,0), 0))
+      emit(TGBinCmp(body-lbl, TGGeOp(), num-free, TGLong(3L)))
+      call(EXTEND-STACK-ID, info(f))
+      emit(TGLabel(body-lbl))
+
+    ;Run function in last stack (without checking stack exhaustion)
+    defn last-stack-prelude (args:List<TGVar>) :
+      ;  new-stack
+      ;  vs = args
+      emit(TGSaveCContext()) when externfn?
+      emit(TGNewStack())
+      cargs(args)
+
+    ;Register arguments
+    for (a in args(f), t in a1(f)) do :
+      val ts = tgt-types(dec-table, t)
+      imm-table[a] = map(make-var, ts)
+      type-table[a] = ts
+
+    ;Verify arity
+    val wrong-arity-lbl = fresh-id()
+    val chk-arity? = check-arity? and (not externfn?)
+    if chk-arity? :
+      emit(TGUnaCmp(wrong-arity-lbl, TGArityNeOp(), TGInt(arity(f))))
+
+    ;Prelude
+    val arg-vars = seq-append({imm-table[_] as List<TGVar>}, args(f))
+    match(stack-properties(f)) :
+      (sp:NewStack) : new-stack-prelude(arg-vars)
+      (sp:LastStack) : last-stack-prelude(arg-vars)
+      (sp:CheckStack) : stack-extension-prelude(arg-vars)
+
+    ;Body
+    ccomm(body(f))
+
+    ;Arity failure
+    if chk-arity? :
+      emit(TGLabel(wrong-arity-lbl))
+      emit(TGArgs(List()))
+      tcall(ARITY-ERROR-ID, info(f))
+
+  ;================
+  ;==== Driver ====
+  ;================
+  new LSCompiler :
+    defmethod compile (this, c:KLSComm) :
+      ccomm(c)
+    defmethod compile (this, n:Int|Symbol, f:KLSFn!, exfn?:True|False, chk?:True|False) :
+      init-compilation-tables()
+      let-var externfn? = exfn? :
+        let-var use-tail-calls? = tail?(f) :
+          val body = emit-to-buffer $ fn () :
+            cfn(f, chk?)
+          TGDefCode(n,body)
+
+;============================================================
+;================ Entry Function Compilation ================
+;============================================================
+
+defn compile-entry-function (ns:List<Int>) -> TGDefCode :
+  ;Compile body
+  val body = emit-to-buffer $ fn () :
+    ;Enter from C
+    emit $ TGSaveCContext()
+    emit $ TGArgsC(List())
+
+    ;stk = rsp + REF-TAG - STACK-ITEMS-OFFSET
+    ;[stack] = stk
+    val stk = make-var(TGRefT())
+    emit $ TGBinOp(stk, TGAddOp(), TGRegSP(), TGLong(to-long(REF-TAG-BITS - STACK-ITEMS-OFFSET)))
+    emit $ TGStore(TGMem(STACK-LBL), stk, 0)
+
+    ;limit = stk + STACK-SIZE - REF-TAG
+    ;[stack-limit] = limit
+    val limit = make-var(TGLongT())
+    emit $ TGBinOp(limit, TGAddOp(), stk, TGLong(to-long(STACK-SIZE - REF-TAG-BITS)))
+    emit $ TGStore(TGMem(STACK-LIM-LBL), limit, 0)
+
+    ;Top Level Body
+    do(call{_, false}, ns)
+
+    ;Return to C
+    emit $ TGReturnC(List(TGLong(0L)))
+
+  ;Return function
+  TGDefCode(`stanza_entry, body)
+
+;============================================================
+;================ Main Function Compilation =================
+;============================================================
+
+defn compile-main-function (dt:DecTable, comms:Seqable<KComm>) -> TGDefCode :
+  ;Compile body
+  val body = emit-to-buffer $ fn () :
+    val hsc = HSCompiler(dt)
+    val lsc = LSCompiler(dt)
+    emit(TGArgs(List()))
+    for c in comms do :
+      match(c) :
+        (c:KDef) :
+          compile(hsc, KSet(n(c), tag(c), value(c)))
+        (c:KDefVar) :
+          match(value(c)) :
+            (v:KExp) : compile(hsc, KSet(n(c), tag(c), v))
+            (v) : false
+        (c:KInit) :
+          compile(hsc, exp(c))
+        (c:KLSDef) :
+          compile(lsc, KLSSet(KVarLoc(n(c)), type(c), value(c)))
+        (c:KLSDefVar) :
+          match(value(c)) :
+            (v:KLSExp) : compile(lsc, KLSSet(KVarLoc(n(c)), type(c), v))
+            (v:False) : false
+        (c:KLSInit) :
+          compile(lsc, comm(c))
+        (c) :
+          false
+    emit(TGReturn(List(TGLong(0L))))
+
+  ;Return function
+  TGDefCode(fresh-id(), body)
+
+;============================================================
+;================== Global Compilation ======================
+;============================================================
+
+defn compile-global (dt:DecTable, def:KDef|KDefVar|KLSDef|KLSDefVar) :
+  match(def) :
+    (def:KDef|KDefVar) :
+      TGDefGlobal(n(def), 8, 8, List(TGRefT()), List(0))
+    (def:KLSDef|KLSDefVar) :
+      TGDefGlobal(n(def),
+                  size(dt, type(def)),
+                  alignment(dt, type(def)),
+                  tgt-types(dt, type(def)),
+                  field-offsets(dt, type(def)))
