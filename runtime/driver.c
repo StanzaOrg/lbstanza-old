@@ -7,6 +7,8 @@
 #include<stdio.h>
 #include<sys/time.h>
 #include<errno.h>
+#include<sys/stat.h>
+#include<sys/types.h>
 
 //     Stanza Defined Entities
 //     =======================
@@ -133,3 +135,13 @@ int64_t file_write_block (FILE* f, char* data, int64_t len) {
     return 0;
   }
 #endif
+
+//             Time Modified
+//             =============
+
+int64_t file_time_modified (char* filename){
+  struct stat attrib;
+  if(stat(filename, &attrib) == 0)
+    return (int64_t)attrib.st_mtime;
+  return 0;
+}
