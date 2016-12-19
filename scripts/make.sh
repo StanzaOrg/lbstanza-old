@@ -57,6 +57,7 @@ FILES="core/core.stanza \
        compiler/lang-renamer.stanza \
        compiler/lang-resolver.stanza \
        compiler/lang-serializer.stanza \
+       compiler/stz-build.stanza \
        compiler/stz-main.stanza"
 
 #Delete pkg files
@@ -79,7 +80,7 @@ mkdir -p wfast-pkgs
 echo "Compiling OSX Pkgs"
 $STANZA $FILES -pkg pkgs
 echo "Compiling OSX Executable"
-$STANZA $FILES -pkg fast-pkgs -optimize -o stanza
+$STANZA $FILES -pkg fast-pkgs -optimize -s stanza.s
 
 #Compile Linux Pkgs and Executable
 echo "Compiling Linux Pkgs"
