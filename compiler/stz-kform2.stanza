@@ -29,6 +29,9 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         pkg = create-closures(dec-table, pkg)
         vheader("Package %_ : After Creating Closures" % [name(pkg)])
         vprintln(pkg)
+        pkg = convert-mixes(dec-table, pkg)
+        vheader("Package %_ : After Converting Mixes" % [name(pkg)])
+        vprintln(pkg)
   exit(0)
 
 ;============================================================
@@ -36,10 +39,16 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
 ;============================================================
 
 defn compute-declaration-table (pkgs:List<KPkgComm>) :
-  val table = DecTable()      
+  val table = DecTable()
+  defn scan (e:KTExp) :
+    defn scan-e (e:KExp) :
+      do(scan-e, e)
+      register(table, e)
+    register(table, e)
+    do(scan-e, e)
   for pkg in pkgs do :
     match(pkg) :
-      (pkg:KPackage) : do(register{table, _}, exps(pkg))
+      (pkg:KPackage) : do(scan, exps(pkg))
       (pkg:TGPackage) : false ;do(register{table, _}, declarations(ids(pkg)))
   table
 
@@ -117,29 +126,23 @@ defn map-method-targs (dec-table:DecTable, pkg:KPackage) :
 ;============================================================
 
 defn map-closures (pkg: KPackage, dec-table: DecTable
-                   register-local: (Int, Int, False|FileInfo) -> False
-                   f: KMix|KCurry|KVar -> KFn|KMultifn) -> KPackage :                   
+                   f: KMix|KCurry|KVar -> KFn|KMultifn) -> KPackage :
   ;Track newly introduced global functions
   val global-functions = HashTable-init<Int,KDefConst> $
     KDefConst{fresh-id(), f(KVar(_))}
   defn lift-function (func:Int) :
-    n(global-functions[func])    
+    n(global-functions[func])
   defn prepend-defs (pkg:KPackage) :
     do(register{dec-table, _}, values(global-functions))
     attach-exps(pkg, append(values(global-functions), exps(pkg)))
 
   ;Map over expressions
   defn fe (e:KExp) :
-    ;Register local functions
-    match(e:KLetRec) :
-      for (n in ns(e), e in values(e) as List<KFn|KFn*>) do :
-        register-local(n, length(a1(e)), info(e))
-    ;Map
     match(map-without-functions(fe, e)) :
       (e:KMix|KCurry) :
         f(e)
       (e:KVar|KVar*) :
-        if function?(dec-table, n(e)) :
+        if global?(dec-table,n(e)) and function?(dec-table, n(e)) :
           KVar(lift-function(n(e)))
         else : e
       (e) :
@@ -147,42 +150,109 @@ defn map-closures (pkg: KPackage, dec-table: DecTable
   defn fte (e:KTExp) : map(fe, e)
   prepend-defs(map(fte,pkg))
 
-defn create-closures (dec-table: DecTable, pkg:KPackage) -> KPackage :
-  ;Store information for local functions
-  val local-table = IntTable<[Int,False|FileInfo]>()
-  defn arity (n:Int) :
-    if key?(local-table,n) : fst(local-table[n])
-    else : /arity(dec-table, n)
-  defn info (n:Int) :
-    if key?(local-table,n) : snd(local-table[n])
-    else : /info(dec-table, n)
-  
+defn create-closures (dec-table:DecTable, pkg:KPackage) -> KPackage :
   defn mix-fn (dec-table:DecTable, f:KMix|KCurry|KVar) :
     defn make-fn (f:KExp, arity:Int) :
       val args* = map(fresh-id{}, 0 to arity)
       val body = KDo(f, KVars(args*), KTop(), false)
       val info = let loop (f:KExp = f) :
         match(f) :
-          (f:KVar|KCurry) : info(n(f))
+          (f:KVar|KCurry) : info(dec-table, n(f))
           (f:KMix) : loop(head(exps(f)))
       KFn(true, List(), KTops(args*), KTop(), args*, body, info)
 
     match(f) :
       (f:KCurry|KVar) :
-        make-fn(f, arity(n(f)))
+        make-fn(f, arity(dec-table, n(f)))
       (f:KMix) :
         val groups = IntTable<List<KCurry|KVar|KVar*>>(List())
         for exp in exps(f) as List<KCurry|KVar|KVar*> do :
-          val n = arity(n(exp))
+          val n = arity(dec-table, n(exp))
           update(groups, cons{exp, _}, n)
         KMultifn{to-list(_)} $ for entry in groups seq :
           val [n, fs] = [key(entry), value(entry)]
           if length(fs) == 1 : make-fn(head(fs), n)
           else : make-fn(KMix(fs), n)
-        
-  map-closures(pkg, dec-table,
-    {local-table[_] = [_, _]}
-    mix-fn{dec-table, _})
+
+  map-closures(pkg, dec-table, mix-fn{dec-table, _})
+
+;============================================================
+;===================== Mix Conversion =======================
+;============================================================
+
+defn map-mixes (pkg:KPackage, f: KDo|KDo* -> KExp) :
+  defn fe (e:KExp) :
+    match(map(fe,e)) :
+      (e:KDo|KDo*) :
+        match(func(e):KMix) : f(e)
+        else : e
+      (e) : e
+  defn fte (e:KTExp) :
+    map(fe, e)
+  map(fte, pkg)
+
+defn convert (dec-table:DecTable, e:KDo|KDo*) :
+  ;===== Utilities =====
+  ;Construct a call to f with given arguments and return type
+  defn Do (f:KExp, args:List<KExp>, a2:KType) :
+    match(e) :
+      (e:KDo) : KDo(f, args, a2, info(e))
+      (e:KDo*) : KDo*(f, args, a1(e), a2, info(e))
+
+  ;Retrieve argument types for function
+  defn arg-types (e:KExp) :
+    val n = n(e as KVar|KVar*|KCurry)
+    fst(/fn-types(dec-table, n))
+
+  ;Retrieve argument types for given function
+  defn fn-types (f:KCurry|KVar|KVar*) :
+    match(f) :
+      (f:KVar|KVar*) : /fn-types(dec-table, n(f), List())
+      (f:KCurry) : /fn-types(dec-table, n(f), targs(f))
+
+  ;===== Stages =====
+  ;Pull out definitions to before call
+  defn pull-out-defs (e:KDo|KDo*) :
+    val defs = Vector<KeyValue<Int,KExp>>()
+    val args* = Vector<KVar>()
+    for x in args(e) do :
+      match(x) :
+        (x:KVar) :
+          add(args*, x)
+        (x) :
+          val id = fresh-id()
+          add(defs, id => x)
+          add(args*, KVar(id))
+    val body = make-dispatch(func(e) as KMix, to-list(args*))
+    reduce-right{_, defs, body} $ fn (def, body) :
+      KLet(key(def), value(def), body)
+
+  ;Make a call to func with given args
+  defn make-dispatch (func:KMix, args:List<KExp>) :
+    if all?(histanza?, arg-types(head(exps(func)))) :
+      val bs = for f in exps(func) as List<KCurry|KVar|KVar*> map :
+        val args* = map(fresh-id{}, args)
+        val [a1, a2] = fn-types(f)
+        KBranch(args*, a1, Do(f, KVars(args*), a2))
+      KDispatch(args, bs, info(e))
+    else :
+      ;Compute mask
+      val refmask = map(histanza?, arg-types(head(exps(func))))
+      val refargs = select(args, refmask)
+      ;Create branches
+      val bs = for f in exps(func) as List<KCurry|KVar|KVar*> map :
+        val refargs* = map(fresh-id{}, refargs)
+        val args* = replace(args, refmask, KVars(refargs*))
+        val [a1, a2] = fn-types(f)
+        KBranch(refargs*, select(a1,refmask), Do(f,args*,a2))
+      ;Create dispatch
+      KDispatch(refargs, bs, info(e))
+
+  ;Driver
+  pull-out-defs(e)
+
+defn convert-mixes (dec-table:DecTable, pkg:KPackage) -> KPackage :
+  map-mixes(pkg, convert{dec-table, _})
 
 ;============================================================
 ;===================== Fancy Mappers ========================
