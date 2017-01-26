@@ -1,0 +1,201 @@
+defpackage stz/kform2 :
+  import core
+  import collections
+  import stz/pl-ir
+  import stz/kl2-ir
+  import stz/ids
+  import stz/dec-table2
+  import stz/tgt-ir
+  import stz/utils
+
+;============================================================
+;======================= Driver =============================
+;============================================================
+
+public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
+  val dec-table = compute-declaration-table(pkgs)
+  println(dec-table)
+  for pkg in pkgs map :
+    match(pkg) :
+      (pkg:TGPackage) :
+        pkg
+      (#pkg:KPackage) :
+        var pkg:KPackage = #pkg
+        vheader("Package %_" % [name(pkg)])
+        vprintln(pkg)
+        pkg = map-method-targs(dec-table, pkg)
+        vheader("Package %_ : After Mapping Method Targs" % [name(pkg)])
+        vprintln(pkg)
+        pkg = create-closures(dec-table, pkg)
+        vheader("Package %_ : After Creating Closures" % [name(pkg)])
+        vprintln(pkg)
+  exit(0)
+
+;============================================================
+;============== Compute Declaration Table ===================
+;============================================================
+
+defn compute-declaration-table (pkgs:List<KPkgComm>) :
+  val table = DecTable()      
+  for pkg in pkgs do :
+    match(pkg) :
+      (pkg:KPackage) : do(register{table, _}, exps(pkg))
+      (pkg:TGPackage) : false ;do(register{table, _}, declarations(ids(pkg)))
+  table
+
+;============================================================
+;================== Method TArg Mapping =====================
+;============================================================
+
+defn inverse-solve (input-xs:List<Int>, input-targs:List<KType>) -> [List<Int>, List<KType>] :
+  ;Created targs
+  val ys = map(fresh-id{}, input-targs)
+  ;Simplify
+  val targs = map(trivial-simplify, input-targs)
+  ;Initialize solved table
+  val solved = IntTable<Int>()
+  defn update (x:Int, y:Int) :
+    set?(solved, x, {y})
+  ;Precise Solutions
+  for (t in targs, y in ys) do :
+    match(t:KTVar) : update(n(t), y)
+  ;Approximate Solutions
+  for (t in targs, y in ys) do :
+    let loop (t:KType = t) :
+      match(t) :
+        (t:KTVar) : update(n(t), y)
+        (t:KOr) : do(loop, t)
+        (t) : false
+  ;Invert solutions
+  val solns = for x in input-xs map :
+    match(get?(solved,x)) :
+      (y:Int) : KTVar(y)
+      (y:False) : KTop()
+  ;Return solutions
+  [ys, solns]
+
+defn map-methods (pkg:KPackage, dec-table:DecTable, f:(KFn|KFn*, Int, List<KType>) -> KFn|KFn*) :
+  defn registered (e:KTExp) : (register(dec-table,e), e)
+  defn fe (e:KExp) :
+    match(map(fe,e)) :
+      (e:KMethod*) :
+        val value* = f(value(e) as KFn|KFn*, multi(e), targs(e))
+        KMethod(multi(e), thisn(e), value*)
+      (e) : e
+  defn fte (e:KTExp) :
+    match(map(fe,e)) :
+      (e:KDefmethod*) :
+        val value* = f(value(e) as KFn|KFn*, multi(e), targs(e))
+        registered(KDefmethod(fresh-id(), multi(e), value*))
+      (e) : e
+  map(fte, pkg)
+
+defn replace-tvars (e:KExp, xs:List<Int>, ts:List<KType>) :
+  val table = to-hashtable<Int,KType>(xs,ts)
+  defn fe (e:KExp) :
+    val e* = map(fe, e)
+    map(replace-tvars{_:KType, table}, e*)
+  fe(e)
+
+defn attach (f:KFn|KFn*, targs:List<Int>, a1:List<KType>, a2:KType) :
+  match(f) :
+    (f:KFn) : KFn(tail?(f), targs, a1, a2, args(f), body(f), info(f))
+    (f:KFn*) : KFn*(tail?(f), targs, a1, a2, args(f), body(f), info(f))
+
+defn map-method-targs (dec-table:DecTable, pkg:KPackage) :
+  map-methods(pkg, dec-table
+    fn (f:KFn|KFn*, m:Int, targ-types:List<KType>) :
+      val [targs*, targ-types*] = inverse-solve(targs(f), targ-types)
+      val [multi-a1, multi-a2] = fn-types(dec-table, m, map(KTVar,targs*))
+      val f* = replace-tvars(f, targs(f), targ-types*) as KFn|KFn*
+      val a1* = map(KAnd, multi-a1, a1(f*))
+      val a2* = KAnd(multi-a2, a2(f*))
+      attach(f*, targs*, a1*, a2*))
+
+;============================================================
+;===================== Closure Creation =====================
+;============================================================
+
+defn map-closures (pkg: KPackage, dec-table: DecTable
+                   register-local: (Int, Int, False|FileInfo) -> False
+                   f: KMix|KCurry|KVar -> KFn|KMultifn) -> KPackage :                   
+  ;Track newly introduced global functions
+  val global-functions = HashTable-init<Int,KDefConst> $
+    KDefConst{fresh-id(), f(KVar(_))}
+  defn lift-function (func:Int) :
+    n(global-functions[func])    
+  defn prepend-defs (pkg:KPackage) :
+    do(register{dec-table, _}, values(global-functions))
+    attach-exps(pkg, append(values(global-functions), exps(pkg)))
+
+  ;Map over expressions
+  defn fe (e:KExp) :
+    ;Register local functions
+    match(e:KLetRec) :
+      for (n in ns(e), e in values(e) as List<KFn|KFn*>) do :
+        register-local(n, length(a1(e)), info(e))
+    ;Map
+    match(map-without-functions(fe, e)) :
+      (e:KMix|KCurry) :
+        f(e)
+      (e:KVar|KVar*) :
+        if function?(dec-table, n(e)) :
+          KVar(lift-function(n(e)))
+        else : e
+      (e) :
+        e
+  defn fte (e:KTExp) : map(fe, e)
+  prepend-defs(map(fte,pkg))
+
+defn create-closures (dec-table: DecTable, pkg:KPackage) -> KPackage :
+  ;Store information for local functions
+  val local-table = IntTable<[Int,False|FileInfo]>()
+  defn arity (n:Int) :
+    if key?(local-table,n) : fst(local-table[n])
+    else : /arity(dec-table, n)
+  defn info (n:Int) :
+    if key?(local-table,n) : snd(local-table[n])
+    else : /info(dec-table, n)
+  
+  defn mix-fn (dec-table:DecTable, f:KMix|KCurry|KVar) :
+    defn make-fn (f:KExp, arity:Int) :
+      val args* = map(fresh-id{}, 0 to arity)
+      val body = KDo(f, KVars(args*), KTop(), false)
+      val info = let loop (f:KExp = f) :
+        match(f) :
+          (f:KVar|KCurry) : info(n(f))
+          (f:KMix) : loop(head(exps(f)))
+      KFn(true, List(), KTops(args*), KTop(), args*, body, info)
+
+    match(f) :
+      (f:KCurry|KVar) :
+        make-fn(f, arity(n(f)))
+      (f:KMix) :
+        val groups = IntTable<List<KCurry|KVar|KVar*>>(List())
+        for exp in exps(f) as List<KCurry|KVar|KVar*> do :
+          val n = arity(n(exp))
+          update(groups, cons{exp, _}, n)
+        KMultifn{to-list(_)} $ for entry in groups seq :
+          val [n, fs] = [key(entry), value(entry)]
+          if length(fs) == 1 : make-fn(head(fs), n)
+          else : make-fn(KMix(fs), n)
+        
+  map-closures(pkg, dec-table,
+    {local-table[_] = [_, _]}
+    mix-fn{dec-table, _})
+
+;============================================================
+;===================== Fancy Mappers ========================
+;============================================================
+
+defn map-without-functions (f:KExp -> KExp, e:KExp) :
+  defn ff (e:KExp) :
+    match(e:KVar|KCurry|KMix|KVar*) : e
+    else : f(e)
+  defn fs (es:List<KExp>) :
+    map(f, es)
+  match(e) :
+    (e:KDo*) : KDo*(ff(func(e)), fs(args(e)), a1(e), a2(e), info(e))
+    (e:KDo) : KDo(ff(func(e)), fs(args(e)), type(e), info(e))
+    (e:KDoC) : KDoC(ff(func(e)), fs(args(e)), fs(varargs(e)), type(e))
+    (e) : map(f,e)
