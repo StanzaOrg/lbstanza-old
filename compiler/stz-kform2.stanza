@@ -32,6 +32,9 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         pkg = convert-mixes(dec-table, pkg)
         vheader("Package %_ : After Converting Mixes" % [name(pkg)])
         vprintln(pkg)
+        pkg = guard-boundary(dec-table, pkg)
+        vheader("Package %_ : After Guarding Boundary" % [name(pkg)])
+        vprintln(pkg)
   exit(0)
 
 ;============================================================
@@ -223,9 +226,7 @@ defn convert (dec-table:DecTable, e:KDo|KDo*) :
           val id = fresh-id()
           add(defs, id => x)
           add(args*, KVar(id))
-    val body = make-dispatch(func(e) as KMix, to-list(args*))
-    reduce-right{_, defs, body} $ fn (def, body) :
-      KLet(key(def), value(def), body)
+    KLet(defs, make-dispatch(func(e) as KMix, to-list(args*)))
 
   ;Make a call to func with given args
   defn make-dispatch (func:KMix, args:List<KExp>) :
@@ -255,6 +256,125 @@ defn convert-mixes (dec-table:DecTable, pkg:KPackage) -> KPackage :
   map-mixes(pkg, convert{dec-table, _})
 
 ;============================================================
+;=================== Boundary Guards ========================
+;============================================================
+
+defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
+  ;Guard a call to a known function
+  defn guard-call-to-known (e:KDo*, tail-pos?:True|False) :
+    val [n, targs] = n+targs(func(e))
+    val [a1, a2] = fn-types(dec-table, n, targs)
+    ;Guard arguments when necessary
+    val args* =
+      if guarded?(dec-table, n) :
+        args(e)
+      else :
+        map(KCheck{_, _, ARG-ERROR-TYPE, info(e)}, args(e), a1)
+    ;Make call
+    val call = KDo(func(e), args*, a2, info(e))
+    ;Determine whether return should be guarded
+    val guard-return? =
+      if tail-pos? : false
+      else if not guarded?(dec-table, n) : true
+      else if tail?(dec-table, n) : true
+      else : false
+    ;Guard return when necessary
+    if guard-return? : KCheck(call, a2, RETURN-ERROR-TYPE, info(e))
+    else : call
+
+  ;Guard a call to an unknown function
+  defn guard-call-to-unknown (e:KDo*, tail-pos?:True|False) :
+    val args* = map(KCheck{_, _, ARG-ERROR-TYPE, info(e)}, args(e), a1(e))
+    val func* = KCheck(func(e), KOf(FN-TYPE-ID), CALL-ERROR-TYPE, info(e))
+    val call = KDo(func*, args*, a2(e), info(e))
+    if tail-pos? : call
+    else : KCheck(call, a2(e), RETURN-ERROR-TYPE, info(e))
+
+  ;Cast expression to just the variables tvars in the type
+  defn KCheckTVar (e:KExp, t:KType, i:False|FileInfo) :
+    defn strip (t:KType) :
+      if has-var?(t) :
+        match(t:KOr) : t
+        else : map(strip, t)
+      else : KTop()
+    KCheck(e, trivial-simplify(strip(t)), ARG-ERROR-TYPE, i)
+
+  ;Add boundary guards
+  defn guard (e:KExp, tail-pos?:True|False, method-pos?:True|False, loc-pos?:True|False) :
+    defn recur (e:KExp) :
+      map-tail(guard{_, _, e is KMethod*|KMethod, false}, e, tail-pos?)
+    match(e) :
+      (e0:KFn*) :
+        val e = recur(e0) as KFn*
+        ;Check arguments
+        val args* = map(fresh-id{}, args(e))
+        val defs = for (a in args(e), a* in args*, t in a1(e)) map :
+          if method-pos? : a => KCheckTVar(KVar(a*), t, info(e))
+          else : a => KCheck(KVar(a*), t, ARG-ERROR-TYPE, info(e))
+        ;Check return
+        val body* =
+          if tail?(e) : body(e)
+          else : map-return(KCheck{_, a2(e), RETURN-ERROR-TYPE, info(e)}, body(e))
+        ;Create function
+        KFn(tail?(e), targs(e), a1(e), a2(e),
+            args*, KLet(defs, body*), info(e))
+      (e:KDo*) :
+        recur $ match(func(e)) :
+          (f:KVar|KVar*) :
+            if function?(dec-table, n(f)) : guard-call-to-known(e, tail-pos?)
+            else : guard-call-to-unknown(e, tail-pos?)
+          (f:KCurry) : guard-call-to-known(e, tail-pos?)
+          (f) : guard-call-to-unknown(e, tail-pos?)
+      (e:KVar*) :
+        val check? =
+          if guarded?(dec-table, n(e)) :
+            if global?(dec-table, n(e)) :
+              true
+            else if mutable?(dec-table, n(e)) :
+              not initialized?(dec-table, n(e))
+        if check? : KEnsureSet(KVar(n(e)), info(e))
+        else : KVar(n(e))
+      (e:KLet*) :
+        val v* = KCheck(value(e), type(e), DEF-ERROR-TYPE, info(e))
+        recur(KLet(n(e), v*, body(e)))
+      (e:KLetVar*) :
+        val v* = attempt: KCheck(value(e) as? KExp, type(e), DEF-ERROR-TYPE, info(e))
+        recur(KLetVar(n(e), type(e), v*, body(e)))
+      (e:KSet*) :
+        val loc = guard(exp(e), false, false, true)
+        val v = guard(value(e), false, false, false)
+        val v* = match(loc) :
+          (loc:KVar) :
+            if guarded?(dec-table, n(loc)) :
+              KCheck(v, type(e), SET-ERROR-TYPE, info(e))
+            else : v
+          (loc) : v
+        KSet(loc, type(e), v*)
+      (e0:KBranch*) :
+        val e = recur(e0) as KBranch*
+        val guards = for (a in args(e), t in types(e)) map :
+          KCheckTVar(KVar(a), t, info(e))
+        val body* = KSeq(guards, body(e))
+        KBranch(args(e), types(e), body*)
+      (e0:KEnsureLength) :
+        val e = recur(e0) as KEnsureLength
+        val v = KCheck(exp(e), KOf(TUPLE-TYPE-ID), TUPLE-ERROR-TYPE, info(e))
+        KEnsureLength(v, length(e), info(e))
+      (e:KField) :
+        KField(guard(exp(e), false, false, loc-pos?), n(e))
+      (e:KPtr) :
+        KPtr(guard(loc(e), false, false, true))
+      (e) :
+        recur(e)
+
+  ;Add guards
+  defn guard (e:KTExp) :
+    val method? = e is KDefmethod
+    map(guard{_, false, method?, false}, e)
+
+  map(guard, pkg)
+
+;============================================================
 ;===================== Fancy Mappers ========================
 ;============================================================
 
@@ -269,3 +389,84 @@ defn map-without-functions (f:KExp -> KExp, e:KExp) :
     (e:KDo) : KDo(ff(func(e)), fs(args(e)), type(e), info(e))
     (e:KDoC) : KDoC(ff(func(e)), fs(args(e)), fs(varargs(e)), type(e))
     (e) : map(f,e)
+
+defn map-tail (f:(KExp, True|False) -> KExp, e:KExp, tail-pos?:True|False) :
+  defn ftail (e:KExp) : f(e, true)
+  defn farg (e:KExp) : f(e, false)
+  defn fcont (e:KExp) : f(e, tail-pos?)
+  defn fargs (e:List<KExp>) : map(farg, e)
+  defn fconts (e:List<KExp>) : map(fcont, e)
+  defn farg? (e:KExp|False) : match(e:KExp) : farg(e)
+
+  match(e) :
+    ;Input Expressions
+    (e:KFn*) :
+      val body* = f(body(e), tail?(e))
+      KFn*(tail?(e), targs(e), a1(e), a2(e), args(e), body*, info(e))
+    (e:KLet*) :
+      val value* = farg(value(e))
+      val body* = fcont(body(e))
+      KLet*(n(e), type(e), value*, body*, info(e))
+    (e:KLetVar*) :
+      val value* = farg?(value(e))
+      val body* = fcont(body(e))
+      KLetVar*(n(e), type(e), value*, body*, info(e))
+    (e:KBranch*) :
+      val body* = fcont(body(e))
+      KBranch*(args(e), types(e), body*, info(e))
+    ;Standard Expressions
+    (e:KLet) :
+      val value* = farg(value(e))
+      val body* = fcont(body(e))
+      KLet(n(e), value*, body*)
+    (e:KLetVar) :
+      val value* = farg?(value(e))
+      val body* = fcont(body(e))
+      KLetVar(n(e), type(e), value*, body*)
+    (e:KLetRec) :
+      val values* = fargs(values(e))
+      val body* = fcont(body(e))
+      KLetRec(ns(e), values*, body*)
+    (e:KMatch) :
+      val args* = fargs(args(e))
+      val branches* = fconts(branches(e))
+      KMatch(args*, branches*, info(e))
+    (e:KBranch) :
+      val body* = fcont(body(e))
+      KBranch(args(e), types(e), body*)
+    (e:KLabels) :
+      KLabels(fconts(blocks(e)))
+    (e:KBlock) :
+      KBlock(n(e), args(e), types(e), fcont(body(e)))
+    (e:KIf) :
+      KIf(farg(pred(e)), fcont(conseq(e)), fcont(alt(e)))
+    (e:KSeq) :
+      KSeq(farg(a(e)), fcont(b(e)))
+    (e:KReturn) :
+      KReturn(ftail(exp(e)))
+    (e:KFn) :
+      val body* = f(body(e), tail?(e))
+      KFn(tail?(e), targs(e), a1(e), a2(e), args(e), body*, info(e))
+    ;Working Expressions
+    (e:KLetType) :
+      val body* = fcont(body(e))
+      KLetType(n(e), type(e), body*)
+    (e:KDispatch) :
+      val args* = fargs(args(e))
+      val branches* = fconts(branches(e))
+      KDispatch(args*, branches*, info(e))
+    ;Otherwise
+    (e) :
+      map(farg, e)
+
+defn map-return (f:KExp -> KExp, e:KExp) :
+  defn scan (e:KExp, ret-pos?:True|False) :
+    match(e:KReturn) :
+      map(scan{_, true}, e)
+    else: if has-body?(e) :
+      map-tail(scan, e, ret-pos?)
+    else if ret-pos? :
+      f(map(scan{_, false}, e))
+    else :
+      map(scan{_, false}, e)
+  scan(e, true)
