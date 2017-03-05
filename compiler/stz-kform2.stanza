@@ -48,6 +48,9 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         pkg = box-mutables(dec-table, pkg)
         vheader("Package %_ : After Boxing Mutables" % [name(pkg)])
         vprintln(pkg)
+        pkg = simple-inline(pkg)
+        vheader("Package %_ : After Simple Inlining" % [name(pkg)])
+        vprintln(pkg)
         pkg = lift-objects(dec-table, pkg)
         vheader("Package %_ : After Lifting Objects" % [name(pkg)])
         vprintln(pkg)
@@ -575,7 +578,243 @@ defn rename (e:KExp, vs:Seqable<KeyValue<Int,Int>>) :
   defn fe (e:KExp) :
     map-ids(fi,map(fe,map(ft,e)))
   fe(e)  
-    
+
+;============================================================
+;================== Simple Inlining =========================
+;============================================================
+
+deftype CallGraph
+defmulti num-references (g:CallGraph, n:Int) -> Int
+defmulti reachable? (g:CallGraph, src:Int, dst:Int) -> True|False
+defmulti successors (g:CallGraph, n:Int) -> List<Int>
+
+;Construct call graph
+defn call-graph (pkg:KPackage) :
+  ;Discover edges
+  val graph = HashTable<KeyValue<Int,Int>,Int>(0)
+  defn add-edge (src:Int, dst:Int) :
+    update(graph, {_ + 1}, src => dst)
+    false
+  defn scan (ctxt:Int, e:KExp) :
+    match(e) :
+      (e:KVar|KCurry) : add-edge(ctxt, n(e))
+      (e:KLetRec) :
+        do(scan, ns(e), values(e) as List<KFn|KMultifn>)
+        scan(ctxt, body(e))
+      (e) : do(scan{ctxt, _}, e)
+  for e in exps(pkg) do :
+    match(e) :
+      (e:KDefn) :
+        scan(n(e), value(e))
+        add-edge(0, n(e)) when not private?(e)
+      (e:KDefmethod) :
+        scan(n(e), value(e))
+        add-edge(0, n(e))
+      (e:KExternFn) :
+        scan(n(e), value(e))
+        add-edge(0, n(e))
+      (e) :
+        do(scan{0, _}, e)
+
+  ;Compute successor graph
+  val succ-graph = IntTable<List<Int>>(List())
+  defn add-succ (n:Int, succ:Int) :
+    update(succ-graph, cons{succ, _}, n)
+  for entry in graph do :
+    val [k, n] = [key(entry), value(entry)]
+    val [src, dst] = [key(k), value(k)]
+    add-succ(src, dst)
+
+  ;Compute predecessor graph
+  val pred-graph = IntTable<List<KeyValue<Int,Int>>>(List())
+  defn add-pred (n:Int, pred:Int, weight:Int) :
+    update(pred-graph, cons{pred => weight, _}, n)
+  for entry in graph do :
+    val [k, n] = [key(entry), value(entry)]
+    val [src, dst] = [key(k), value(k)]
+    add-pred(dst, src, n)
+
+  ;Compute reachability
+  val VISITED = IntSet()
+  defn reachable? (src:Int, dst:Int) :
+    val result = let dst? (n:Int = src) :
+      if not VISITED[n] :
+        if n == dst :
+          true
+        else :
+          add(VISITED,n)
+          any?(dst?, succ-graph[n])
+    clear(VISITED)      
+    result
+
+  new CallGraph :
+    defmethod num-references (this, n:Int) -> Int :      
+      sum $ seq(value, pred-graph[n])
+    defmethod reachable? (this, src:Int, dst:Int) -> True|False :
+      reachable?(src, dst)
+    defmethod successors (this, n:Int) -> List<Int> :
+      succ-graph[n]
+
+;Inline
+defn inline (f:KFn, call-targs:List<KType>, call-args:List<KExp>) :
+  ;Verify input arity, fail otherwise
+  defn same-length? (xs:List, ys:List) : length(xs) == length(ys)
+  if not (same-length?(targs(f), call-targs) and
+          same-length?(args(f), call-args)) :
+    fail()
+  ;Substitute type variables
+  var body* = replace-tvars(body(f), targs(f), call-targs)
+  ;Create identifier for ending block
+  var end-block = false
+  defn end-label () :
+    match(end-block) :
+      (id:Int) :
+        id
+      (id:False) :
+        end-block = fresh-id()
+        end-block as Int
+  ;Remove return expressions
+  defn remove-returns (body:KExp) :
+    ;Return the expression e
+    defn return (e:KExp) :
+      match(e) :
+        (e:KReturn) :
+          jump(exp(e))
+        (e) :
+          map-tail{_, e, true} $ fn (e, ret?) :
+            if ret? : return(e)
+            else : jump(e)
+    ;Jump to ending block for any return expression
+    defn jump (e:KExp) :
+      match(map(jump, e)) :
+        (e:KReturn) :
+          KGoto(end-label(), List(exp(e)))
+        (e) : e
+    ;Body is initially in return position
+    return(body)    
+  ;Bind arguments
+  body* =
+    KLet(map(KeyValue, args(f), call-args),
+         remove-returns(body*))
+  ;Create labeled blocks if necessary
+  match(end-block) :
+    (end-block-id:False) :
+      body*
+    (end-block-id:Int) :
+      ;Body block
+      val body-block = KBlock(fresh-id(), List(), List(), body*)
+      ;End block
+      val ret-arg = fresh-id()
+      val end-block = KBlock(end-block-id, List(ret-arg), List(a2(f)), KVar(ret-arg))
+      ;Label construct
+      KLabels(List(body-block, end-block))
+
+defn inline (f:KMultifn, call-targs:List<KType>, call-args:List<KExp>) :
+  defn same-length? (xs:List, ys:List) : length(xs) == length(ys)
+  val f* = for f in funcs(f) as List<KFn> find :
+    same-length?(targs(f), call-targs) and
+    same-length?(args(f), call-args)
+  match(f*) :
+    (f*:KFn) : inline(f*, call-targs, call-args)
+    (f*:False) : fail()
+
+defn simple-inline (pkg:KPackage) :
+  ;Compute call graph
+  val graph = call-graph(pkg)
+
+  ;A function is inlined if it is only referenced once
+  defn inlined? (n:Int) :
+    num-references(graph, n) == 1
+
+  ;Inline table
+  val inline-table = IntTable<KFn|KMultifn>()
+  defn add-inline-entries (es:Collection<KeyValue<Int,KFn|KMultifn>>) :
+    val table = to-hashtable<Int,KFn|KMultifn>(es)
+    defn loop (n:Int) :
+      match(get?(table,n)) :
+        (f:KFn|KMultifn) :
+          remove(table,n)
+          do(loop, successors(graph,n))
+          inline-table[n] = inline-calls(n,f) as KFn|KMultifn
+        (f:False) :
+          false
+    do(loop{key(_)}, es)
+
+  ;Perform all simple inlining
+  defn inline-calls (ctxt:Int, e:KExp) -> KExp :
+    ;Is function n reachable from current context
+    defn referenced? (n:Int) : reachable?(graph, ctxt, n)
+    ;Recursively inline sub expression in current context
+    defn recur (e:KExp) : inline-calls(ctxt, e)
+    ;Retrieve function to inline or fail
+    defn inline-func (e:KExp) :
+      match(e) :
+        (e:KVar|KCurry) :
+          match(get?(inline-table,n(e))) :
+            (f:KFn|KMultifn) : f
+            (f:False) : fail()
+        (e:KFn|KMultifn) : e
+        (e) : fail()
+    ;Retrieve the type arguments given the function expression
+    defn targs! (e:KExp) :
+      match(e:KCurry) : targs(e)
+      else : List()
+    ;Dispatch based on type of expression
+    match(e) :
+      (e:KLetRec) :
+        ;Track which entries to inline/not inline
+        val inline = Vector<KeyValue<Int,KFn|KMultifn>>()
+        val dont-inline = Vector<KeyValue<Int,KFn|KMultifn>>()
+        for (n in ns(e), v in values(e)) do :
+          val f = v as KFn|KMultifn
+          if referenced?(n) :
+            if inlined?(n) : add(inline, n => f)
+            else : add(dont-inline, n => f)
+        ;Add inline entries
+        add-inline-entries(inline)
+        ;Recurse upon non-inline entries
+        if empty?(dont-inline) :
+          recur(body(e))
+        else :
+          val ns = to-list(seq(key,dont-inline))
+          val vs = to-list(seq(recur{value(_)},dont-inline))
+          KLetRec(ns, vs, recur(body(e)))
+      (e:KVar) :
+        match(get?(inline-table, n(e))) :
+          (f:KFn|KMultifn) : f
+          (f:False) : e
+      (e:KDo) :
+        attempt :
+          val f = inline-func(func(e))
+          val args* = map(recur, args(e))
+          attempt : inline(f, targs!(func(e)), args*)
+          else : fatal("Not inlinable")
+        else :
+          map(recur, e)
+      (e) :
+        map(recur, e)
+
+  ;Divide top-level expressions into inlinable entries (inline)
+  ;and non-inlinable entries (accum).
+  val inline-exps = Vector<KeyValue<Int,KFn|KMultifn>>()
+  val accum-exps = Vector<KTExp>()  
+  for e in exps(pkg) do :
+    match(e) :
+      (e:KDefn) :
+        defn check-stack? (f:KExp) :
+          match(f) :
+            (f:KFn) : stack-properties(f) is CheckStack
+            (f:KMultifn) : all?(check-stack?, funcs(f))
+        if private?(e) and check-stack?(value(e)) and inlined?(n(e)) :
+          add(inline-exps, n(e) => value(e) as KFn|KMultifn)
+        else : add(accum-exps, e)
+      (e) : add(accum-exps, e)
+      
+  add-inline-entries(inline-exps)
+  for e in accum-exps map! :
+    print-if-annotated $ map(inline-calls{0, _}, e)
+  attach-exps(pkg, to-list(accum-exps))
+  
 ;============================================================
 ;=================== Object Lifting =========================
 ;============================================================
