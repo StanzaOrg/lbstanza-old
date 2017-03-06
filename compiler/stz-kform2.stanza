@@ -3,12 +3,14 @@ defpackage stz/kform :
   import collections
   import stz/pl-ir
   import stz/kl-ir
+  import stz/khier
   import stz/ids
   import stz/dec-table
   import stz/tgt-ir
   import stz/utils
   import stz/primitives
   import stz/kform-to-tgt
+  import stz/algorithms
 
 ;============================================================
 ;======================= Driver =============================
@@ -16,7 +18,8 @@ defpackage stz/kform :
 
 public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
   var dec-table = compute-declaration-table(pkgs)
-  println(dec-table)
+  val hier = KHierarchy(seq-cat(hier-entries, pkgs))
+
   var pkgs* = for pkg in pkgs map :
     match(pkg) :
       (pkg:TGPackage) :
@@ -51,10 +54,11 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         pkg = simple-inline(pkg)
         vheader("Package %_ : After Simple Inlining" % [name(pkg)])
         vprintln(pkg)
+        pkg = elide-checks(dec-table, hier, pkg)
+        vheader("Package %_ : After Eliding Checks" % [name(pkg)])
+        vprintln(pkg)
 
-        val pkg2 = infer-types(dec-table, pkg)
-        vheader("Package %_ : After Inferring Types" % [name(pkg2)])
-        vprintln(pkg2)        
+        lambda-lift(dec-table, pkg)
 
         pkg = lift-objects(dec-table, pkg)
         vheader("Package %_ : After Lifting Objects" % [name(pkg)])
@@ -967,6 +971,120 @@ defn infer-types (dec-table:DecTable, pkg:KPackage) :
         (e:KClosure) : KOf(FN-TYPE-ID)
         (e:KTagPrim) : KOf(n(e))
         (e:KDetagPrim) : ls-detag-type(n(e)))
+
+;============================================================
+;================== Elide Checks ============================
+;============================================================
+
+defn elide-checks (dec-table:DecTable, hier:KHierarchy, pkg:KPackage) :
+  defn type! (e:KExp) : type(e as KTypedExp)
+  defn elide (e:KExp) :
+    match(e) :
+      (e:KCheck) :
+        if subtype?(hier, type!(exp(e)), type(e)) : elide(exp(e))
+        else : map(elide, e)
+      (e:KTypedExp) : elide(exp(e))
+      (e) : map(elide, e)
+  val pkg* = infer-types(dec-table, pkg)    
+  for e in pkg* map : map(elide,e)
+
+;============================================================
+;=================== Lambda Lifting =========================
+;============================================================
+
+;Compute usage table
+defn usage-table (pkg:KPackage) :
+  val used = IntSet()
+  for e in pkg do :
+    defn scan (e:KExp, call-pos?:True|False) :
+      match(e) :
+        (e:KVar) :
+          add(used, n(e)) when not call-pos?
+        (e:KDo) :
+          scan(func(e), true)
+          do(scan-false, args(e))
+        (e) :
+          do(scan-false, e)
+    defn scan-false (e:KExp) : scan(e, false)
+    do(scan-false, e)
+  used
+
+;Returns a hashtable that maps n => [vs ..., ts ...].
+;  Where vs,ts is the list of all freevars,freetypes that need to be
+;  passed in to n for lifting.
+defn lift-table (used:IntSet, pkg:KPackage) :
+  ;Utilities
+  defn freevars (f:KFn|KMultifn) :
+    match(f) :
+      (f:KFn) : /freevars(f)
+      (f:KMultifn) : unique(seq-cat(/freevars, funcs(f) as List<KFn>))
+  defn freevars+freetypes (f:KFn|KMultifn) :
+    match(f) :
+      (f:KFn) : append(/freevars(f), freetypes(f))
+      (f:KMultifn) : unique(seq-cat(freevars+freetypes, funcs(f) as List<KFn>))
+
+  ;Gather all functions
+  val functions = Vector<KeyValue<Int,KFn|KMultifn>>()
+  val var-table = IntSet()
+  for e in pkg do :
+    defn scan (e:KExp) :
+      do(scan,e)
+      match(e:KLetRec) :
+        val vs = values(e) as List<KFn|KMultifn>
+        add-all(var-table, seq-cat(freevars,vs))
+        add-all(functions, map(KeyValue,ns(e),vs))
+    do(scan, e)
+
+  ;Anchors are functions that have been determined to not be lifted
+  val anchors = IntSet()
+
+  ;Populate lift table with all functions that can be lifted
+  ;in the given function group
+  val argss = fixpoint $
+    fn (assumptions-changed) :
+      ;Maximum lift
+      val max-args = 6
+      ;Compute lifting args
+      val argss = bipartite-closure $
+        for entry in functions seq? :
+          val [n, f] = [key(entry), value(entry)]
+          ;Lift if not anchor, and if less freevars than max-args
+          if anchors[n] :
+            None()
+          else :
+            val vs = freevars+freetypes(f)
+            if length(vs) > max-args : None()
+            else : One(n => vs)
+      ;Verify assumptions
+      for entry in argss do :
+        val [f, args] = [key(entry), value(entry)]
+        ;It's an anchor if:
+        ;  1. It has freevars and it's used as first-class value, or
+        ;  2. The number of freevars exceeds max-args
+        if (used[f] and not empty?(args)) or
+           (length(args) > max-args) :
+          add(anchors, f)
+          assumptions-changed()        
+      ;Return lifting arguments
+      argss
+
+  ;Return as table
+  to-hashtable<Int,[List<Int>,List<Int>]> $
+    for entry in argss seq :
+      defn var? (n:Int) : var-table[n]
+      val [vars,types] = split!(var?, value(entry))
+      key(entry) => [to-list(vars), to-list(types)]
+
+defn lambda-lift (dt:DecTable, pkg0:KPackage) :
+  ;Compute free variables
+  val pkg = compute-freevars(dt, pkg0)
+
+  ;Compute lift tables
+  val used = usage-table(pkg)
+  val lift-table = lift-table(used, pkg)
+
+  println("Lift Table:")
+  do(println, lift-table)
   
 ;============================================================
 ;=================== Object Lifting =========================
