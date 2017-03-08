@@ -57,9 +57,9 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
         pkg = elide-checks(dec-table, hier, pkg)
         vheader("Package %_ : After Eliding Checks" % [name(pkg)])
         vprintln(pkg)
-
-        lambda-lift(dec-table, pkg)
-
+        pkg = lambda-lift(dec-table, pkg)
+        vheader("Package %_ : After Lambda Lifting" % [name(pkg)])
+        vprintln(pkg)
         pkg = lift-objects(dec-table, pkg)
         vheader("Package %_ : After Lifting Objects" % [name(pkg)])
         vprintln(pkg)
@@ -581,9 +581,12 @@ defn rename (e:KExp, vs:Seqable<KeyValue<Int,Int>>) :
   defn fi (i:Int) :
     get?(table, i, i)
   defn ft (t:KType) :
-    match(t) :
+    match(map(ft,t)) :
       (t:KTVar) : KTVar(fi(n(t)))
-      (t) : map(ft, t)
+      (t:KStructT) : KStructT(fi(n(t)))
+      (t:KOf) : KOf(fi(n(t)))
+      (t:KTypeObject) : KTypeObject(fi(n(t)), targs(t))
+      (t) : t
   defn fe (e:KExp) :
     map-ids(fi,map(fe,map(ft,e)))
   fe(e)  
@@ -829,10 +832,13 @@ defn simple-inline (pkg:KPackage) :
 ;============================================================
 
 ;Wrap up every expression in a KTypedExp (preserving implicit structure).
-defn map-types (dec-table:DecTable, pkg:KPackage, bindvar: (Int, KType) -> ?, infer:KExp -> KType) :
-  ;Call type-exp on all children of e
-  defn recur-exp (e:KExp) -> KExp :
-    match(e) :
+defn map-types (dec-table:DecTable,
+                pkg:KPackage,
+                bindvar: (Int, KType) -> ?,
+                infer:KExp -> KType) :
+  defn type-exp (#e:KExp) :
+    val [e, structured?] = get-annotation<True|False>(#e, false)
+    val e* = match(e) :
       (e:KLet) :
         val v* = type-exp(value(e)) as KTypedExp
         bindvar(n(e), type(v*))
@@ -843,12 +849,10 @@ defn map-types (dec-table:DecTable, pkg:KPackage, bindvar: (Int, KType) -> ?, in
         KLetVar(n(e), type(e), v*, type-exp(body(e)))
       (e:KLetRec) :
         do(bindvar{_, KOf(FN-TYPE-ID)}, ns(e))
-        val values* = map(recur-exp, values(e))
-        val body* = type-exp(body(e))
-        KLetRec(ns(e), values*, body*)
+        map(type-exp, e)
       (e:KBranch) :
         do(bindvar, args(e), types(e))
-        map(type-exp, e)
+        map(type-exp, e)        
       (e:KBlock) :
         do(bindvar, args(e), types(e))
         map(type-exp, e)
@@ -856,19 +860,12 @@ defn map-types (dec-table:DecTable, pkg:KPackage, bindvar: (Int, KType) -> ?, in
         do(bindvar{_, KTop()}, args(e)) ;Do not assume inputs are valid
         map(type-exp, e)
       (e) :
-        map-implicit-structure{dec-table, _, e} $ fn (e, structured?) :
-          if structured? : recur-exp(e)
-          else : type-exp(e)
-  ;Wrap up in a KTypedExp when appropriate
-  defn type-exp (e:KExp) -> KExp :
-    val e* = recur-exp(e)
-    KTypedExp(e*, infer(e*))      
-  ;Driver
-  for e in pkg map :
-    map-implicit-structure{_, e} $ fn (e, structured?) :
-      if structured? : recur-exp(e)
-      else : type-exp(e)
-
+        map(type-exp, e)
+    if structured? : e*
+    else : KTypedExp(e*, infer(e*))
+  for te in pkg map :
+    map(type-exp, annotate-structure(dec-table, te))
+    
 defn infer-types (dec-table:DecTable, pkg:KPackage) :
   ;Utilities
   defn type! (e:KExp) : type(e as KTypedExp)
@@ -1082,9 +1079,112 @@ defn lambda-lift (dt:DecTable, pkg0:KPackage) :
   ;Compute lift tables
   val used = usage-table(pkg)
   val lift-table = lift-table(used, pkg)
+  defn lift? (n:Int) : key?(lift-table, n)
 
   println("Lift Table:")
   do(println, lift-table)
+
+  ;Top level lifted definitions
+  val lift-defs = Vector<KTExp>()
+  defn prepend-defs (pkg:KPackage) :
+    do(register{dt, _}, lift-defs)
+    attach-exps(pkg, append(lift-defs, exps(pkg)))
+
+  ;===== Helpers =====
+  ;Lift an anonymous function with no freevars to the top level
+  defn lift-afn (e:KFn|KMultifn) :
+    val n* = fresh-id()
+    add(lift-defs, KDefConst(n*, e))
+    n*
+
+  ;Lift a function to the top level
+  defn lift-fn (n:Int, e:KFn|KMultifn) :
+    defn lifted (e:KFn|KMultifn) :
+      match(e) :
+        (e:KFn) :
+          val [freevars, freetypes] = lift-table[n]
+          val args* = append(freevars, args(e))
+          val targs* = append(freetypes, targs(e))
+          val a1* = append(KTops(freevars), a1(e))
+          val e* = KFn(tail?(e), stack-properties(e), targs*, a1*, a2(e), args*, body(e), info(e))
+          rename(e*, cat(freevars, freetypes))
+        (e:KMultifn) :
+          map(lifted{_ as KFn}, e)
+    val e* = lifted(e)
+    add(lift-defs, KDefn(KFnProperties(false), true, n, lifted(e)))
+
+  ;Create a forwarding closure at the top level
+  val closure-ids = HashTable-init<Int,Int>(fresh-id{})
+  defn lift-closure (n:Int, e:KFn|KMultifn) :
+    defn forward (e:KFn|KMultifn) :
+      match(e) :
+        (e:KFn) :
+          val args = map(fresh-id{}, args(e))
+          val body = KDo(KVar(n), KVars(args), a2(e), info(e))
+          KFn(true, CheckStack(), List(), KTops(args), KTop(), args, body, info(e))
+        (e:KMultifn) :
+          map(forward{_ as KFn}, e) as KMultifn
+    add(lift-defs, KDefConst(closure-ids[n], forward(e)))
+
+  ;Recursively Perform all required lifting in the expression
+  ;Helpers: lift-afn
+  defn lift-exp (#e:KExp) :
+    val [e, structured?] = get-annotation<True|False>(#e, false)
+    if structured? :
+      map(lift-exp, e)
+    else :
+      match(e) :
+        ;Lift anonymous functions with no free variables
+        (#e:KFn|KMultifn) :
+          val e = map(lift-exp, #e) as KFn|KMultifn
+          val no-freevars? = match(e) :
+            (e:KFn) : empty?(freevars(e))
+            (e:KMultifn) : all?(empty?{freevars(_ as KFn)}, funcs(e))
+          if no-freevars? : KVar(lift-afn(e))
+          else : e        
+        ;Move lifted functions to top-level
+        (e:KLetRec) :
+          val [ns*, vs*] = [Vector<Int>(), Vector<KFn|KMultifn>()]
+          for (n in ns(e), v in values(e)) do :
+            val v* = lift-exp(v) as KFn|KMultifn
+            if lift?(n) :
+              lift-fn(n, v*)
+              lift-closure(n, v*) when used[n]
+            else :
+              add(ns*, n)
+              add(vs*, v*)
+          val body* = lift-exp(body(e))
+          if empty?(ns*) : body*
+          else : KLetRec(to-list(ns*), to-list(vs*), body*)
+        ;Add extra arguments to calls
+        (e:KDo) :
+          attempt :
+            ;Helper: Make a KVar/KCurry
+            defn make-func (n:Int, targs:List<KType>) :
+              if empty?(targs) : KVar(n)
+              else : KCurry(n, targs)
+            ;Retrieve lifting id and type args
+            val [n, targs] = match(strip-annotation(func(e))) :
+              (f:KVar) : [n(f), List()]
+              (f:KCurry) : [n(f), targs(f)]
+              (f) : fail()
+            fail() when not lift?(n)
+            ;Lift call
+            val [freevars, freetypes] = lift-table[n]
+            val args* = append(KVars(freevars), map(lift-exp,args(e)))
+            val targs* = append(KTVars(freetypes), targs)
+            KDo(make-func(n,targs*), args*, type(e), info(e))
+          else :
+            map(lift-exp, e)
+        (e:KVar) :
+          if lift?(n(e)) and used[n(e)] : KVar(closure-ids[n(e)])
+          else : e
+        (e) :
+          map(lift-exp, e)
+
+  prepend-defs $
+    for e in pkg map :
+      map(lift-exp, annotate-structure(dt, e))
   
 ;============================================================
 ;=================== Object Lifting =========================
@@ -1403,36 +1503,55 @@ defn map-ids (f:Int -> Int, e:KExp) :
                   fs(args(e)), body(e), info(e), stats(e))
     (e:KMethod) : KMethod(props(e), f(multi(e)), f(thisn(e)), value(e))
     (e:KNewObject) : KNewObject(f(n(e)), targs(e), args(e), info(e))
+    (e:KObjectGet) : KObjectGet(object(e), f(n(e)), index(e))
+    (e:KObjectTGet) : KObjectTGet(object(e), f(n(e)), index(e))
     (e:KLetType) : KLetType(f(n(e)), value(e), body(e))
     (e:KClosure) : KClosure(f(n(e)), targs(e), args(e), info(e))
+    (e:KTagPrim) : KTagPrim(f(n(e)), exp(e))
+    (e:KDetagPrim) : KDetagPrim(f(n(e)), exp(e))
     (e) : e
 
-defn map-implicit-structure (dec-table:DecTable, f: (KExp, True|False) -> KExp, e:KExp) -> KExp :
-  defn ftrue (e:KExp) : f(e, true)
-  defn ffalse (e:KExp) : f(e, false)
-  defn ffunc (e:KExp) :
-    match(e) :
-      (e:KVar) : f(e, function?(dec-table,n(e)))
-      (e:KCurry) : ftrue(e)
-      (e) : ffalse(e)
+defn get-annotation<T> (e:KExp, default:T) :
   match(e) :
-    (e:KLetRec) : KLetRec(ns(e), map(ftrue,values(e)), ffalse(body(e)))
-    (e:KMatch) : KMatch(map(ffalse,args(e)), map(ftrue,branches(e)), info(e))
-    (e:KDispatch) : KDispatch(map(ffalse,args(e)), map(ftrue,branches(e)), info(e))
-    (e:KLabels) : map(ftrue, e)
-    (e:KDo) : KDo(ffunc(func(e)), map(ffalse,args(e)), type(e), info(e))
-    (e:KDoC) : KDoC(ffunc(func(e)), map(ffalse,args(e)), map(ffalse,varargs(e)), type(e))
-    (e:KMethod) : map(ftrue, e)
-    (e:KMultifn) : map(ftrue, e)
-    (e:KNew) : map(ftrue, e)
-    (e) : map(ffalse, e)
+    (e:KAnnotated) : [exp(e), annotation(e) as T]
+    (e) : [e, default]
 
-defn map-implicit-structure (f: (KExp, True|False) -> KExp, e:KTExp) :
-  defn ftrue (e:KExp) : f(e, true)
-  defn ffalse (e:KExp) : f(e, false)
+defn strip-annotation (e:KExp) :
   match(e) :
-    (e:KDefn|KDefmethod|KExternFn|KDefClosure) : map(ftrue, e)
-    (e) : map(ffalse, e)
+    (e:KAnnotated) : exp(e)
+    (e) : e
+
+defn annotate-structure (dec-table:DecTable, e:KExp) :
+  ;Recursively annotate all sub-expressions
+  defn recur (e:KExp) :
+    defn annotate (e:KExp) :
+      KAnnotated(recur(e), true)
+    defn annotate-func (e:KExp) :
+      match(e) :
+        (e:KVar) : KAnnotated(e, true) when function?(dec-table, n(e)) else e
+        (e:KCurry) : KAnnotated(e, true)
+        (e) : recur(e)
+    match(e) :
+      (e:KLetRec) : KLetRec(ns(e), map(annotate, values(e)), recur(body(e)))
+      (e:KMatch) : KMatch(map(recur,args(e)), map(annotate, branches(e)), info(e))
+      (e:KDispatch) : KDispatch(map(recur,args(e)), map(annotate, branches(e)), info(e))
+      (e:KLabels) : KLabels(map(annotate, blocks(e)))
+      (e:KDo) : KDo(annotate-func(func(e)), map(recur,args(e)), type(e), info(e))
+      (e:KDoC) : KDoC(annotate-func(func(e)), map(recur,args(e)), map(recur,varargs(e)), type(e))
+      (e:KMultifn) : KMultifn(map(annotate,funcs(e)))
+      (e:KNew) :
+        val methods* = for m in methods(e) as List<KMethod> map :
+          KAnnotated(map(annotate, m), true)
+        KNew(type(e), name(e), methods*, info(e))
+      (e) : map(recur,e)
+  recur(e)
+
+defn annotate-structure (dec-table:DecTable, e:KTExp) -> KTExp :      
+  match(e) :
+    (te:KDefn|KDefmethod|KExternFn|KDefClosure|KDefConst) :
+      for e in te map :
+        KAnnotated(annotate-structure(dec-table, e), true)
+    (e) : map(annotate-structure{dec-table, _:KExp}, e)
 
 defn map-bound (before:KExp -> KExp, bindvar:Int -> ?, bindtvar:Int -> ?, after:KExp -> KExp, e:KExp) :
   match(e) :
