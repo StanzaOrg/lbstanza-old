@@ -125,9 +125,9 @@ public defn compile-optimized (#pkg:KPackage) :
   pkg = simple-inline(pkg)
   vheader("Package %_ : After Simple Inlining" % [name(pkg)])
   vprintln(pkg)
-  ;pkg = full-inline(pkg)
-  ;vheader("Package %_ : After Full Inlining" % [name(pkg)])
-  ;vprintln(pkg)
+  pkg = full-inline(pkg)
+  vheader("Package %_ : After Full Inlining" % [name(pkg)])
+  vprintln(pkg)
   dec-table = compute-declaration-table(List(pkg))
   pkg = elide-checks(dec-table, hier, pkg)
   vheader("Package %_ : After Eliding Checks" % [name(pkg)])
@@ -848,6 +848,9 @@ defn inline (f:KMultifn, call-targs:List<KType>, call-args:List<KExp>) :
 defn simple-inline (pkg:KPackage) :
   ;Compute call graph
   val graph = call-graph(pkg)
+  
+  ;Preserve inline table
+  val inline-table = IntTable<KFn|KMultifn>()
 
   ;Erase the body of a function
   defn erase-body (e:KFn|KMultifn) -> KFn|KMultifn :
@@ -874,8 +877,7 @@ defn simple-inline (pkg:KPackage) :
     match(e:KDefn) :
       private?(e) and check-stack?(value(e)) and inlined?(n(e))
 
-  ;Inline table
-  val inline-table = IntTable<KFn|KMultifn>()
+  ;Inline recursively a group of functions
   defn inline-group (ns:List<Int>, vs:List<KFn|KMultifn>) ->
                      [List<Int>, List<KFn|KMultifn>] :
     val table = to-hashtable<Int,KFn|KMultifn>(ns,vs)
@@ -951,8 +953,11 @@ defn simple-inline (pkg:KPackage) :
     defn inline-texp (e:KTExp) : inline-texp(0, e)
     do-successors{_, to-list(keys(table)), graph} $ fn (n) :
       val e* = inline-texp(n, table[n])
-      table[n] = erase-body(e*)
-      inline-table[n] = func(e*)
+      if inlined?(e*) :
+        table[n] = erase-body(e*)
+        inline-table[n] = func(e*)
+      else :
+        table[n] = e*
     to-list $ cat(
       values(table)
       seq(inline-texp, accum))
@@ -1122,28 +1127,25 @@ defn elide-checks (dec-table:DecTable, hier:KHierarchy, pkg:KPackage) :
 ;============================================================
 val INLINE-THRESHOLD = 5
 
-defn size (e:KExp) :
-  ;Add cost of subnodes
-  var counter:Int = 0
-  for se:KExp in e do :
-    counter = counter + size(se)
-  ;Add cost of node
-  if e is KSet|KNew|KTuple|KTupleGet|KObject|KArray|KDo|
+defn size+used? (ctxt:Int, e:KExp) -> [Int, True|False] :
+  val counter = to-seq(0 to false)
+  var used?:True|False = false
+  defn loop (e:KExp) :
+    do(loop, e)
+    match(e) :
+      (e:KSet|KNew|KTuple|KTupleGet|KObject|KArray|KDo|
           KDoC|KInterpret|KConv|KAndExp|KOrExp|KPrim|KMatch|
           KIf|KDeref|KDeptr|KField|KSlot|KDispatch|KNewObject|
           KObjectGet|KObjectTGet|KBox|KBoxGet|KBoxSet|
-          KClosure|KTagPrim|KDetagPrim :
-    counter = counter + 1
-  ;Return counter
-  counter
-
-defn size (e:KTExp) :
-  ;Add cost of subnodes
-  var counter:Int = 0
-  for se:KExp in e do :
-    counter = counter + size(se)
-  ;Return counter
-  counter
+          KClosure|KTagPrim|KDetagPrim) :
+        next(counter)
+      (e:KVar|KCurry) :
+        if n(e) == ctxt :
+          used? = true
+      (e) :
+        false
+  loop(e)
+  [next(counter), used?]
 
 defn full-inline (pkg:KPackage) :
   ;Compute call graph
@@ -1152,40 +1154,42 @@ defn full-inline (pkg:KPackage) :
   ;Inline table
   val inline-table = HashTable<Int,KFn|KMultifn>()
 
+  ;Determine whether to inline
+  defn inline? (n:Int, e:KFn|KMultifn) :
+    val [s, recursive?] = size+used?(n, e)
+    (not recursive?) and s < INLINE-THRESHOLD
+  defn inline? (e:KTExp) :
+    defn check-stack? (f:KExp) :
+      match(f) :
+        (f:KFn) : stack-properties(f) is CheckStack
+        (f:KMultifn) : all?(check-stack?, funcs(f))
+    match(e:KDefn|KDefmethod) :
+      val v = value(e) as KFn|KMultifn
+      check-stack?(v) and inline?(n(e), v)
+
   ;Add entries to inline table
   ;Returns all entries not added
   defn add-inline-entries (ns:List<Int>, values:List<KFn|KMultifn>) ->
                            [List<Int>, List<KFn|KMultifn>] :
     val table = to-hashtable<Int,KFn|KMultifn>(ns, values)
-    val marked = IntSet()
-    val ns* = Vector<Int>()
-    val vs* = Vector<KFn|KMultifn>()
-    defn inline? (n:Int) :
-      if key?(table,n) and not marked[n] :
-        add(marked, n)
-        do(inline?, successors(call-graph, n))
-        val f* = inline-calls(table[n]) as KFn|KMultifn
-        table[n] = f*
-        val s = size(f*)
-        if s < INLINE-THRESHOLD :
-          inline-table[n] = f*
-        else :
-          add(ns*, n)
-          add(vs*, f*)
-    [to-list(ns*), to-list(vs*)]
-
-  ;Retrieve function to inline and targs
-  defn fn-targs (e:KExp) :
-    val [n, targs] = match(e) :
-      (e:KVar) : [n(e), List()]
-      (e:KCurry) : [n(e), targs(e)]
-      (e) : fail()
-    match(get?(inline-table, n)) :
-      (f:KFn|KMultifn) : [f, targs]
-      (f:False) : fail()
+    do-successors{_, ns, call-graph} $ fn (n) :
+      val f* = inline-calls(table[n]) as KFn|KMultifn
+      if inline?(n, f*) : inline-table[n] = f*
+      table[n] = f*
+    [ns, map({table[_]}, ns)]
 
   ;Inline all calls in expression
   defn inline-calls (e:KExp) -> KExp :
+    ;Retrieve function to inline and targs
+    defn fn-targs (e:KExp) :
+      val [n, targs] = match(e) :
+        (e:KVar) : [n(e), List()]
+        (e:KCurry) : [n(e), targs(e)]
+        (e) : fail()
+      match(get?(inline-table, n)) :
+        (f:KFn|KMultifn) : [f, targs]
+        (f:False) : fail()
+      
     match(e) :
       (e:KLetRec) :
         val [ns*, values*] = add-inline-entries(ns(e), values(e) as List<KFn|KMultifn>)
@@ -1194,7 +1198,7 @@ defn full-inline (pkg:KPackage) :
         else : KLetRec(ns*, values*, body*)
       (e:KVar) :
         match(get?(inline-table, n(e))) :
-          (f:KFn|KMultifn) : f
+          (f:KFn|KMultifn) : rename-binders(f)
           (f:False) : e
       (e:KDo) :
         attempt :
@@ -1207,32 +1211,31 @@ defn full-inline (pkg:KPackage) :
         map(inline-calls, e)
         
   ;Inline top-level expressions
-  defn add-inline-entries (tes:Seqable<KTExp>) :
-    defn id (e:KTExp) : n(e as KDefn|KDefmethod)
+  defn inline-exps (tes:Seqable<KTExp>) :
+    ;Retrieve id and function from expression
     defn func (e:KTExp) : value(e as KDefn|KDefmethod) as KFn|KMultifn
-    val table = to-hashtable<Int,KTExp> $ for e in tes seq : id(e) => e
-    val marked = IntSet()
-    val accum = Vector<KTExp>()
-    defn inline? (n:Int) :
-      if key?(table,n) and not marked[n] :
-        add(marked, n)
-        do(inline?, successors(call-graph, n))
-        val te* = map(inline-calls, table[n])
-        val s = size(te*)
-        if s < INLINE-THRESHOLD :
-          inline-table[n] = func(te*)
-        else :
-          add(accum, te*)
-    do(inline?, to-list(keys(table)))
-    accum
 
-  ;Inline top-level expressions
-  val exps* = let :
-    val [inlinable, not-inlinable] = split({_ is KDefn|KDefmethod}, exps(pkg))
-    val not-inlined = add-inline-entries(inlinable)
-    val not-inlinable* = seq(map{inline-calls, _}, not-inlinable)
-    to-list(cat(not-inlined, not-inlinable*))
-  attach-exps(pkg, exps*)
+    ;Find entries to inline
+    val table = HashTable<Int,KTExp>()
+    val accum = Vector<KTExp>()
+    for e in tes do :
+      match(e:KDefn|KDefmethod) : table[n(e)] = e
+      else : add(accum, e)
+
+    ;Inline inlinable entries
+    defn inline-texp (e:KTExp) : map(inline-calls, e)
+    do-successors{_, to-list(keys(table)), call-graph} $ fn (n) :
+      val e* = inline-texp(table[n])
+      if inline?(e*) : inline-table[n] = func(e*)
+      table[n] = e*
+        
+    ;Return all exps
+    to-list $ cat(
+      values(table)
+      seq(inline-texp, accum))
+
+  ;Attach expressions to package
+  attach-exps(pkg, inline-exps(exps(pkg)))
 
 ;============================================================
 ;=================== Lambda Lifting =========================
