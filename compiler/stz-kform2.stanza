@@ -97,7 +97,6 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
 public defn compile-optimized (#pkg:KPackage) :
   var pkg:KPackage = #pkg
   var dec-table = compute-declaration-table(List(pkg))
-  val hier = KHierarchy(seq-cat(hier-entries, List(pkg)))
   
   pkg = analyze-stack-properties(pkg)
   vheader("Package %_ : After Analyzing Stack Properties" % [name(pkg)])
@@ -123,12 +122,18 @@ public defn compile-optimized (#pkg:KPackage) :
   vheader("Package %_ : After Boxing Mutables" % [name(pkg)])
   vprintln(pkg)
   pkg = simple-inline(pkg)
+  dec-table = compute-declaration-table(List(pkg))
+  var hier = KHierarchy(seq-cat(hier-entries, List(pkg)))
   vheader("Package %_ : After Simple Inlining" % [name(pkg)])
+  vprintln(pkg)  
+  pkg = resolve-methods(dec-table, hier, pkg)
+  vheader("Package %_ : After Resolving Methods" % [name(pkg)])
   vprintln(pkg)
   pkg = full-inline(pkg)
+  dec-table = compute-declaration-table(List(pkg))
+  hier = KHierarchy(seq-cat(hier-entries, List(pkg)))
   vheader("Package %_ : After Full Inlining" % [name(pkg)])
   vprintln(pkg)
-  dec-table = compute-declaration-table(List(pkg))
   pkg = elide-checks(dec-table, hier, pkg)
   vheader("Package %_ : After Eliding Checks" % [name(pkg)])
   vprintln(pkg)
@@ -1135,6 +1140,115 @@ defn elide-checks (dec-table:DecTable, hier:KHierarchy, pkg:KPackage) :
   for e in pkg* map : map(elide,e)
 
 ;============================================================
+;================== Method Resolution =======================
+;============================================================
+
+;=====================
+;==== MethodEntry ====
+;=====================
+defstruct MethodEntry :
+  n: Int|False
+  types: List<KType>
+
+defn applicable? (khier:KHierarchy, e:MethodEntry, ts:List<KType>) -> True|False :
+  all?(overlap?{khier, _, _}, types(e), ts)
+
+defn covers? (khier:KHierarchy, e:MethodEntry, ts:List<KType>) -> True|False :
+  all?(covered?{khier, _, _}, ts, types(e))
+
+defn unique-minimum! (khier:KHierarchy, es:Vector<MethodEntry>) -> MethodEntry :
+  defn less? (a:MethodEntry, b:MethodEntry) :
+    all?(subtype?{khier, _, _}, types(a), types(b))
+  unique-minimum!(less?, es)
+
+;===================
+;==== Utilities ====
+;===================
+;Return the minimum entry in es according to less?.
+;Fails if there is no unique minimum.
+defn unique-minimum!<?T> (less?: (T,T) -> True|False, es:Vector<?T>) -> T :
+  val n = length(es)
+  val mark = FreeList(n,true)
+  for i in 0 to n do :
+    for j in 0 to n do :
+      if i != j and es[i] < es[j] :
+        remove(mark,j)
+  fail() when length(mark) != 1
+  es[next(to-seq(mark))]
+
+;=====================
+;==== MethodTable ====
+;=====================
+deftype MethodTable
+defmulti get (t:MethodTable, n:Int, ts:List<KType>) -> Int
+
+defn method-table (khier:KHierarchy, pkg:KPackage) :
+  val table = IntTable<List<MethodEntry>>(List())
+  defn add-entry (n:Int, e:MethodEntry) : update(table, cons{e,_}, n)
+
+  ;Scan for internal methods
+  defn scan (e:KExp) :
+    do(scan,e)
+    match(e:KMethod) :
+      val v = value(e) as KFn
+      add-entry(multi(e), MethodEntry(false, a1(v)))
+      
+  ;Scan top level expressions
+  for e in exps(pkg) do :
+    do(scan, e)
+    match(e:KDefmethod) :
+      val v = value(e) as KFn
+      add-entry(multi(e), MethodEntry(n(e), a1(v)))
+
+  ;Return table
+  new MethodTable :
+    defmethod get (this, func:Int, ts:List<KType>) -> Int :
+      fail() when not key?(table,func)
+      val es = to-vector<MethodEntry>(filter(applicable?{khier, _, ts}, table[func]))
+      val e = 
+        if length(es) == 1 :
+          es[0]
+        else :
+          val e = unique-minimum!(khier, es)
+          fail() when not covers?(khier, e, ts)
+          e
+      n(e) as? Int
+
+;===================
+;==== Algorithm ====
+;===================
+defn resolve-methods (dt:DecTable, khier:KHierarchy, pkg:KPackage) :
+  ;Build method table
+  val mtable = method-table(khier, pkg)
+  ;Utilities
+  defn type! (e:KExp) : type(e as KTypedExp)
+  defn n! (e:KExp) : n((e as? KVar|KCurry) as KVar|KCurry)
+  defn attach-n (e:KExp, n:Int) :
+    match(e) :
+      (e:KVar) : KVar(n)
+      (e:KCurry) : KCurry(n, targs(e))
+  ;Resolve methods in expression
+  defn resolve (e:KExp) :
+    match(e) :
+      (e:KDo) :
+        attempt :
+          val f = n!(func(e))
+          val ts = map(type!, args(e))
+          val f* = mtable[f,ts]
+          val args* = map(resolve, args(e))
+          KDo(attach-n(func(e), f*), args*, type(e), info(e))
+        else :
+          map(resolve, e)
+      (e:KTypedExp) : resolve(exp(e))
+      (e) : map(resolve, e)
+  defn resolve (e:KTExp) :
+    map(resolve, e)
+  ;Driver
+  val pkg* = infer-types(dt, pkg)
+  map(resolve, pkg*)
+  
+      
+;============================================================
 ;================== Full Inlining ===========================
 ;============================================================
 val INLINE-THRESHOLD = 5
@@ -1468,7 +1582,7 @@ defn lift-objects (dec-table:DecTable, pkg:KPackage) :
     [unique(vs), unique(ts)]
   
   defn create-object (e:KNew) :
-    val id = fresh-id()    
+    val id = fresh-id()
     val [vs,ts] = free(e)
     ;Define object
     add(defs, KDefObject(id, name(e), type(e), length(ts), length(vs)))
