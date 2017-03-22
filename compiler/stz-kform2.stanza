@@ -55,6 +55,9 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
     pkg = box-mutables(dec-table, pkg)
     vheader("Package %_ : After Boxing Mutables" % [name(pkg)])
     vprintln(pkg)
+    pkg = detect-loops(pkg)
+    vheader("Package %_ : After Detecting Loops" % [name(pkg)])
+    vprintln(pkg)
     pkg = simple-inline(pkg)
     vheader("Package %_ : After Simple Inlining" % [name(pkg)])
     vprintln(pkg)
@@ -126,8 +129,9 @@ public defn compile-optimized (#pkg:KPackage) :
   ;Transformation Pipeline
   update-pkg("Lift Constants", lift-constants)
   update-pkg("Box Mutables", box-mutables)
+  update-pkg("Detect Loops", detect-loops)
   update-pkg("Simple Inline", simple-inline)
-  update-dec-table()  
+  update-dec-table()
   update-hier()
   update-pkg("Resolve Methods", resolve-methods)
   update-pkg("Full Inline", full-inline)
@@ -146,7 +150,7 @@ public defn compile-optimized (#pkg:KPackage) :
   update-hier()
   update-pkg("Erase Types", erase-types)
 
-  ;Return 
+  ;Return
   update-dec-table()
   to-tgpackage(dec-table, pkg)
 
@@ -304,7 +308,7 @@ defn map-closures (pkg: KPackage, dec-table: DecTable
   ;Map over expressions
   defn fe (e:KExp) :
     match(e) :
-      (e:KMix|KCurry) :      
+      (e:KMix|KCurry) :
         defn remove-var* (e:KExp) :
           match(e:KVar*) : KVar(n(e))
           else : map(remove-var*,e)
@@ -700,6 +704,89 @@ defn rename-binders (e:KExp) :
     map(ft,
     map-bound(fe, make-var, make-var, fe, e)))
   fe(e)
+
+;============================================================
+;==================== Detect Loops ==========================
+;============================================================
+defn detect-loops (pkg:KPackage) :
+  ;Function for retrieving the id of the current loop
+  var loop-id! : () -> Int = fatal{"Uninitialized."}
+
+  ;Transform function
+  defn transform-fn (ctxt:False|Int, e:KFn|KMultifn) -> KFn|KMultifn :
+    match(e) :
+      (e:KFn) :
+        ;New loop id for this function
+        ;Function for creating loop id
+        val loop-id = fresh-id()
+        var has-loop? = false
+        defn make-loop-id () :
+          has-loop? = true
+          loop-id
+        ;Create new loop
+        let-var loop-id! = make-loop-id :
+          val body* = transform-exp(ctxt, body(e), tail?(e))
+          if has-loop? :
+            val targs* = map(fresh-id{}, targs(e))
+            val tenv = to-hashtable<Int,KTVar>(targs(e), KTVars(targs*))
+            val a1* = map(replace-tvars{_, tenv}, a1(e))
+            val a2* = replace-tvars(a2(e), tenv)
+            val args* = map(fresh-id{}, args(e))
+            val body* = KLabels(List(start-block, loop-block)) where :
+              val loop-block = KBlock(loop-id, targs(e), args(e), a1(e), body*)
+              val start-block = KBlock(fresh-id(), List(), List(), List(),
+                KGoto(loop-id, KTVars(targs*), KVars(args*)))
+            KFn(tail?(e), stack-properties(e), targs*, a1*, a2*, args*, body*, info(e))
+          else :
+            map({body*}, e)
+      (e:KMultifn) :
+        map(transform-fn{false, _ as KFn}, e) as KMultifn
+
+  ;Transform tail calls to loops
+  defn transform-exp (ctxt:False|Int, e:KExp, tail-pos?:True|False) -> KExp :
+    match(e) :
+      (e:KFn|KMultifn) :
+        transform-fn(false, e)
+      (e:KLetRec) :
+        val values* = for (n in ns(e), v in values(e)) map :          
+          transform-fn(n, v as KFn|KMultifn)
+        val body* = transform-exp(ctxt, body(e), tail-pos?)
+        KLetRec(ns(e), values*, body*)
+      (e) :
+        match(map-tail(transform-exp{ctxt, _, _}, e, tail-pos?)) :
+          (e:KDo) :
+            ;Retrieve id given function reference (if appropriate)
+            defn get-loop-id! (f:KExp) :
+              fail() when not tail-pos?
+              val n = n(f as? KVar|KCurry)
+              fail() when n != ctxt
+              loop-id!()
+            ;Retrieve type arguments
+            defn targs! (f:KExp) :
+              match(f) :
+                (f:KCurry) : targs(f)
+                (f:KVar) : List()
+            ;Attempt transformation
+            attempt :
+              val l = get-loop-id!(func(e))
+              KGoto(l, targs!(func(e)), args(e))
+            else : e
+          (e) :
+            e
+
+  ;Transform top level expression
+  defn transform-texp (e:KTExp) :
+    match(e) :
+      (e:KDefn) :
+        val value* = transform-fn(n(e), value(e) as KFn|KMultifn)
+        KDefn(props(e), private?(e), n(e), value*)
+      (e:KDefmethod) : 
+        val value* = transform-fn(n(e), value(e) as KFn|KMultifn)
+        KDefmethod(props(e), n(e), multi(e), value*)
+      (e) : map(transform-exp{false, _, false}, e)
+
+  ;Driver
+  map(transform-texp, pkg)
 
 ;============================================================
 ;=================== Call Graph =============================
@@ -1489,7 +1576,7 @@ defn lambda-lift (dt:DecTable, pkg0:KPackage) :
     match(e) :
       (e:KFn) : empty?(freevars(e)) and empty?(freetypes(e))
       (e:KMultifn) : all?(no-freevars?, funcs(e) as List<KFn>)
-  
+
   ;Lift an anonymous function with no freevars to the top level
   defn lift-afn (e:KFn|KMultifn) :
     val n* = fresh-id()
