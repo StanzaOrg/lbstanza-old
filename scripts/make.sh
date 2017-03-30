@@ -53,7 +53,7 @@ FILES="core/core.stanza \
        compiler/stz-pkg.stanza \
        compiler/stz-compiler.stanza \
        compiler/stz-arg-parser.stanza \
-       compiler/stz-langs.stanza  \
+       compiler/stz-langs.stanza \
        compiler/lang-renamer.stanza \
        compiler/lang-resolver.stanza \
        compiler/lang-serializer.stanza \
