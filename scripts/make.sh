@@ -24,7 +24,6 @@ FILES="core/core.stanza \
        compiler/lang-read.stanza \
        compiler/lang-check.stanza \
        compiler/stz-primitives.stanza \
-       compiler/stz-imms.stanza \
        compiler/stz-il-ir.stanza \
        compiler/stz-tl-ir.stanza \
        compiler/stz-kl-ir.stanza \
