@@ -49,6 +49,9 @@ public defn compile (pkgs:List<KPkgComm>) -> List<TGPackage> :
     vprintln(pkg)
 
     ;Package is done here.
+    pkg = normalize-kform(pkg)
+    vheader("Package %_ : After Normalizing KForm" % [name(pkg)])
+    vprintln(pkg)    
     pkg = lift-constants(dec-table, pkg)
     vheader("Package %_ : After Lifting Constants" % [name(pkg)])
     vprintln(pkg)
@@ -129,6 +132,7 @@ public defn compile-optimized (#pkg:KPackage) :
   update-pkg("Guard Boundary", guard-boundary)
 
   ;Transformation Pipeline
+  update-pkg("Normalize KForm", normalize-kform)
   update-pkg("Lift Constants", lift-constants)
   update-pkg("Box Mutables", box-mutables)
   update-pkg("Detect Loops", detect-loops)
@@ -449,10 +453,20 @@ defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
   ;Guard a call to an unknown function
   defn guard-call-to-unknown (e:KDo*, tail-pos?:True|False) :
     val args* = map(KCheck{_, _, ARG-ERROR-TYPE, info(e)}, args(e), a1(e))
-    val func* = KCheck(func(e), KOf(FN-TYPE-ID), CALL-ERROR-TYPE, info(e))
+    val func* = guard-func(func(e), info(e))
     val call = KDo(func*, args*, a2(e), info(e))
     if tail-pos? : call
     else : KCheck(call, a2(e), RETURN-ERROR-TYPE, info(e))
+
+  ;Guard a function
+  defn guard-func (e:KExp, info:FileInfo|False) :
+    for f in e map-inwards :
+      match(f) :
+        (f:KVar|KVar*) :
+          if function?(dec-table, n(f)) : f
+          else : KCheck(f, KOf(FN-TYPE-ID), CALL-ERROR-TYPE, info)
+        (f:KCurry) : f
+        (f) : KCheck(f, KOf(FN-TYPE-ID), CALL-ERROR-TYPE, info)
 
   ;Cast expression to just the variables tvars in the type
   defn KCheckTVar (e:KExp, t:KType, i:False|FileInfo) :
@@ -547,6 +561,118 @@ defn guard-boundary (dec-table:DecTable, pkg:KPackage) :
       (e) : e
 
   map(guard, pkg)
+
+;============================================================
+;=================== KForm Normalization ====================
+;============================================================
+defn mutable-globals (pkg:KPackage) -> IntSet :
+  val mutables = IntSet()
+  for import in seq-cat(imports, imports(ids(pkg))) do :
+    match(id(import):VarId|LSVarId) :
+      add(mutables, n(import))
+  for te in pkg do :
+    match(te:KDefVar) :
+      add(mutables, n(te))
+  mutables
+
+defn normalize-kform (pkg:KPackage) :
+  ;Mutable Table
+  val mutables = mutable-globals(pkg)
+
+  ;Convert all expressions to KForm
+  defn to-kform (e:KExp) :
+    ;Holds the wrapper
+    var wrapper: KExp -> KExp = {_}
+    defn add-wrapper (f:KExp -> KExp) :
+      val current-wrapper = wrapper
+      wrapper = current-wrapper{f(_)}
+
+    ;Returns an atom for representing the result of e
+    defn atomize (e:KExp) -> KExp :
+      val atomic? = match(e) :
+        (e:KLiteral|KLSLiteral) : true
+        (e:KVar) : not mutables[n(e)]
+        (e) : false
+      if atomic? :
+        e
+      else :
+        val n = fresh-id()
+        remove-compound-exps(KLet(n, e, KVar(n)))
+
+    ;Returns an atom for representing e (assuming e is in function position)
+    defn atomize-func (e:KExp) :
+      match(e) :
+        (e:KCurry) : e
+        (e:KRead) : map(atomize, e)
+        (e) : atomize(e)
+
+    ;Returns an expression without nested expressions
+    defn remove-compound-exps (e:KExp) -> KExp :
+      match(e) :
+        ;These expressions introduce wrappers
+        (e:KLet) :
+          val value* = remove-compound-exps(value(e))
+          add-wrapper(KLet{n(e), value*, _})
+          remove-compound-exps(body(e))
+        (e:KLetVar) :          
+          val value* = attempt: atomize(value(e) as? KExp)
+          add(mutables, n(e))
+          add-wrapper(KLetVar{n(e), type(e), value*, _})
+          remove-compound-exps(body(e))
+        (e:KLetRec) :
+          val values* = map(to-kform, values(e))
+          add-wrapper(KLetRec{ns(e), values*, _})
+          remove-compound-exps(body(e))
+        (e:KLetType) :
+          val value* = atomize(value(e))
+          add-wrapper(KLetType{n(e), value*, _})
+          remove-compound-exps(body(e))
+        (e:KSeq) :
+          val a* = remove-compound-exps(a(e))
+          add-wrapper(KSeq{a*, _})
+          remove-compound-exps(b(e))
+
+        ;These expressions have special invariants
+        (e:KReturn) :
+          match(exp(e)) :
+            (f:KDo) : map(remove-compound-exps, e)
+            (f) : map(atomize, e)
+        (e:KDo) :          
+          val args* = map(atomize, args(e))
+          match(push-call-inwards(func(e), KDo{_, args*, type(e), info(e)})) :
+            (e:KDo) : KDo(atomize-func(func(e)), args(e), type(e), info(e))
+            (e) : remove-compound-exps(e)
+        (e:KDoC) :
+          val args* = map(atomize, args(e))
+          val varargs* = map(atomize, varargs(e))
+          match(push-call-inwards(func(e), KDoC{_, args*, varargs*, type(e)})) :
+            (e:KDoC) : KDoC(atomize-func(func(e)), args(e), varargs(e), type(e))
+            (e) : remove-compound-exps(e)
+          
+        ;These expressions contain a mix of atomizable and structured sub-exps
+        (e:KMatch) : KMatch(map(atomize,args(e)), map(to-kform,branches(e)), info(e))
+        (e:KDispatch) : KDispatch(map(atomize,args(e)), map(to-kform,branches(e)), info(e))
+        (e:KIf) : KIf(atomize(pred(e)), to-kform(conseq(e)), to-kform(alt(e)))
+
+        ;These expressions are structured
+        (e:KBranch|KLabels|KBlock|KFn|KMultifn|KNew|KMethod|KAndExp|KOrExp) : map(to-kform, e)
+        
+        ;All other expressions are unrestricted
+        (e) : map(atomize, e)
+
+    ;Push call into structured func
+    defn push-call-inwards (e:KExp, call:KExp -> KExp) -> KExp :
+      for f in e map-inwards :
+        match(f) :
+          (f:KReturn|KGoto) : f   ;Ignore call
+          (f) : call(f)           ;Make call
+
+    ;Launcher
+    wrapper(remove-compound-exps(e))
+
+  ;Convert all expressions in pkg
+  for te in pkg map :
+    map(to-kform, te)
 
 ;============================================================
 ;================== Free Variable Analysis ==================
@@ -1032,7 +1158,7 @@ defn simple-inline (pkg:KPackage) :
           (f:False) : e
       (e:KDo) :
         attempt :
-          val f = inline-func(func(e))
+          val f = inline-func(recur(func(e)))
           val args* = map(recur, args(e))
           rename-binders(inline(f, targs!(func(e)), args*))
         else :
@@ -1895,6 +2021,26 @@ defn print-if-annotated (e:KTExp) -> KTExp :
       show-optimization?(props(e))
   println(e) when annotated?(e)
   e
+
+defn map-inwards (f:KExp -> KExp, e:KExp) :
+  defn recur (e:KExp) : map-inwards(f, e)
+  match(e) :
+    ;Input nodes
+    (e:KLet*) : KLet*(n(e), type(e), value(e), recur(body(e)), info(e))
+    (e:KLetVar*) : KLetVar*(n(e), type(e), value(e), recur(body(e)), info(e))
+    (e:KBranch*) : KBranch*(args(e), types(e), recur(body(e)), info(e))
+    ;Regular nodes
+    (e:KLet) : KLet(n(e), value(e), recur(body(e)))
+    (e:KLetVar) : KLetVar(n(e), type(e), value(e), recur(body(e)))
+    (e:KLetRec) : KLetRec(ns(e), values(e), recur(body(e)))
+    (e:KLetType) : KLetType(n(e), value(e), recur(body(e)))
+    (e:KSeq) : KSeq(a(e), recur(b(e)))    
+    (e:KMatch) : KMatch(args(e), map(recur,branches(e)), info(e))
+    (e:KDispatch) : KDispatch(args(e), map(recur,branches(e)), info(e))
+    (e:KIf) : KIf(pred(e), recur(conseq(e)), recur(alt(e)))
+    (e:KBranch|KLabels|KBlock|KAndExp|KOrExp) : map(recur, e)
+    ;Simple call
+    (e) : f(e)  
 
 defn map-without-functions (f:KExp -> KExp, e:KExp) :
   defn ff (e:KExp) :
