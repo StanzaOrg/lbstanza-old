@@ -69,9 +69,8 @@ $STANZA \
     compiler/lang-serializer.stanza \
     compiler/stz-build.stanza \
     compiler/stz-main.stanza \
+    compiler/stz-driver.stanza \
   -s $OUT.s \
   -o $OUT \
-  -optimize
-
-
+  -optimize \
 
