@@ -57,7 +57,9 @@ FILES="core/core.stanza \
        compiler/lang-resolver.stanza \
        compiler/lang-serializer.stanza \
        compiler/stz-build.stanza \
-       compiler/stz-main.stanza"
+       compiler/stz-config.stanza \
+       compiler/stz-main.stanza \
+       compiler/stz-driver.stanza"
 
 #Delete pkg files
 rm -rf pkgs

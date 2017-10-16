@@ -68,6 +68,7 @@ $STANZA \
     compiler/lang-resolver.stanza \
     compiler/lang-serializer.stanza \
     compiler/stz-build.stanza \
+    compiler/stz-config.stanza \
     compiler/stz-main.stanza \
     compiler/stz-driver.stanza \
   -s $OUT.s \
