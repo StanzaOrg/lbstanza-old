@@ -521,11 +521,13 @@ void initialize_launcher_process (){
     close(lin[READ]);
     close(lout[WRITE]);
 
-    //Write int
-    printf("write int\n");
-    write_int(lin[WRITE], 42);
-    int y = read_int(lout[READ]);
-    printf("y = %d\n", y);
+    int y = 0;
+    for(int i=0; i<10; i++){
+      printf("write y = %d\n", y);
+      write_int(lin[WRITE], y);
+      y = read_int(lout[READ]);
+      printf("received y = %d\n", y);
+    }
   }
   else{
     //Child
@@ -533,9 +535,11 @@ void initialize_launcher_process (){
     close(lout[READ]);
 
     //Read int
-    int x = read_int(lin[READ]);
-    printf("x = %d\n", x);
-    write_int(lout[WRITE], x + 1);
+    for(int i=0; i<10; i++){
+      int x = read_int(lin[READ]);
+      printf("x%d = %d\n", i, x);
+      write_int(lout[WRITE], x + 1);
+    }
   }
 }
 
