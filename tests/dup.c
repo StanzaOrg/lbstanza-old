@@ -163,12 +163,12 @@ Process make_process (long pid, char* pipe){
 //============================================================
 
 // ===== Serialization =====
-//void write_int (FILE* f, int x){
-//  fwrite(&x, sizeof(int), 1, f);
-//}
-//void write_long (FILE* f, long x){
-//  fwrite(&x, sizeof(long), 1, f);
-//}
+void write_int (FILE* f, int x){
+  fwrite(&x, sizeof(int), 1, f);
+}
+void write_long (FILE* f, long x){
+  fwrite(&x, sizeof(long), 1, f);
+}
 //void write_string (FILE* f, char* s){
 //  int n = strlen(s);
 //  write_int(f, n);
@@ -193,27 +193,21 @@ Process make_process (long pid, char* pipe){
 //}
 
 // ===== Deserialization =====
-//void bread (void* xs0, int size, int n0, FILE* f){
-//  char* xs = xs0;
-//  int n = n0;
-//  while(n > 0){
-//    printf("bread n = %d\n", n);
-//    int c = fread(xs, size, n, f);
-//    printf("c = %d\n", c);
-//    if(c < n && feof(f))
-//      fprintf(stderr, "EOF\n");
-//    if(c < n && ferror(f)) exit_with_error();
-//    n = n - c;
-//    xs = xs + size*c;
-//  }
-//}
-//int read_int (FILE* f){
-//  printf("Read int\n");
-//  int n;
-//  bread(&n, sizeof(int), 1, f);
-//  printf("Int = %d\n", n);
-//  return n;
-//}
+void bread (void* xs0, int size, int n0, FILE* f){
+  char* xs = xs0;
+  int n = n0;
+  while(n > 0){
+    int c = fread(xs, size, n, f);
+    if(c < n && ferror(f)) exit_with_error();
+    n = n - c;
+    xs = xs + size*c;
+  }
+}
+int read_int (FILE* f){
+  int n;
+  bread(&n, sizeof(int), 1, f);
+  return n;
+}
 //long read_long (FILE* f){
 //  long n;
 //  bread(&n, sizeof(long), 1, f);
@@ -500,21 +494,21 @@ ProcessState process_state (Process p){
 //  write(fd, &x, sizeof(int));
 //}
 
-int read_int (FILE* fd){
-  while(1){
-    int x;
-    int c = fread(&x, sizeof(int), 1, fd);
-    if(c < 0) exit_with_error();
-    if(c == 1)
-      return x;
-    else
-      printf("c = %d\n", c);
-  }
-}
-
-void write_int (FILE* fd, int x){
-  fwrite(&x, sizeof(int), 1, fd);
-}
+//int read_int (FILE* fd){
+//  while(1){
+//    int x;
+//    int c = fread(&x, sizeof(int), 1, fd);
+//    if(c < 0) exit_with_error();
+//    if(c == 1)
+//      return x;
+//    else
+//      printf("c = %d\n", c);
+//  }
+//}
+//
+//void write_int (FILE* fd, int x){
+//  fwrite(&x, sizeof(int), 1, fd);
+//}
 
 void initialize_launcher_process (){
   //Create pipes
