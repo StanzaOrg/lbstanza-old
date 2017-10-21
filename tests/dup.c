@@ -543,6 +543,44 @@ void initialize_launcher_process (){
   }
 }
 
+void initialize_named_launcher_process (){
+  //Create pipes
+  mkfifo("lin", S_IRUSR|S_IWUSR);
+  mkfifo("lout", S_IRUSR|S_IWUSR);
+
+  //Fork
+  long pid = (long)fork();
+  if(pid < 0) exit_with_error();
+
+  if(pid > 0){
+    int lin = open("lin", O_WRONLY);
+    int lout = open("lout", O_RDONLY);
+    if(lin < 0) exit_with_error();
+    if(lout < 0) exit_with_error();
+
+    int y = 0;
+    for(int i=0; i<10; i++){
+      printf("write y = %d\n", y);
+      write_int(lin, y);
+      y = read_int(lout);
+      printf("received y = %d\n", y);
+    }
+  }
+  else{
+    int lin = open("lin", O_RDONLY);
+    int lout = open("lout", O_WRONLY);
+    if(lin < 0) exit_with_error();
+    if(lout < 0) exit_with_error();   
+
+    //Read int
+    for(int i=0; i<10; i++){
+      int x = read_int(lin);
+      printf("x%d = %d\n", i, x);
+      write_int(lout, x + 1);
+    }
+  }
+}
+
 int main (void){
-  initialize_launcher_process();
+  initialize_named_launcher_process();
 }
