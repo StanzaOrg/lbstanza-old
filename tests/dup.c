@@ -166,104 +166,106 @@ Process make_process (long pid, char* pipe){
 //size_t fread ( void * ptr, size_t size, size_t count, FILE * stream );
 
 // ===== Serialization =====
-void write_int (FILE* f, int x){
-  fwrite(&x, sizeof(int), 1, f);
-}
-void write_long (FILE* f, long x){
-  fwrite(&x, sizeof(long), 1, f);
-}
-void write_string (FILE* f, char* s){
-  int n = strlen(s);
-  write_int(f, n);
-  fwrite(s, 1, n, f);
-}
-int count_non_null (void** xs){
-  int n=0;
-  while(xs[n] != NULL)
-    n++;
-  return n;
-}
-void write_strings (FILE* f, char** s){
-  int n = count_non_null((void**)s);
-  write_int(f, n);
-  for(int i=0; i<n; i++)
-    write_string(f, s[i]);
-}
-void write_earg (FILE* f, EvalArg* earg){
-  write_string(f, earg->pipe);
-  write_string(f, earg->file);
-  write_strings(f, earg->argvs);
-}
+//void write_int (FILE* f, int x){
+//  fwrite(&x, sizeof(int), 1, f);
+//}
+//void write_long (FILE* f, long x){
+//  fwrite(&x, sizeof(long), 1, f);
+//}
+//void write_string (FILE* f, char* s){
+//  int n = strlen(s);
+//  write_int(f, n);
+//  fwrite(s, 1, n, f);
+//}
+//int count_non_null (void** xs){
+//  int n=0;
+//  while(xs[n] != NULL)
+//    n++;
+//  return n;
+//}
+//void write_strings (FILE* f, char** s){
+//  int n = count_non_null((void**)s);
+//  write_int(f, n);
+//  for(int i=0; i<n; i++)
+//    write_string(f, s[i]);
+//}
+//void write_earg (FILE* f, EvalArg* earg){
+//  write_string(f, earg->pipe);
+//  write_string(f, earg->file);
+//  write_strings(f, earg->argvs);
+//}
 
 // ===== Deserialization =====
-void bread (void* xs0, int size, int n0, FILE* f){
-  char* xs = xs0;
-  int n = n0;
-  while(n > 0){
-    printf("bread n = %d\n", n);
-    int c = fread(xs, size, n, f);
-    printf("c = %d\n", c);
-    if(c < n && ferror(f)) exit_with_error();
-    n = n - c;
-    xs = xs + size*c;
-  }
-}
-int read_int (FILE* f){
-  printf("Read int\n");
-  int n;
-  bread(&n, sizeof(int), 1, f);
-  printf("Int = %d\n", n);
-  return n;
-}
-long read_long (FILE* f){
-  long n;
-  bread(&n, sizeof(long), 1, f);
-  return n;
-}
-char* read_string (FILE* f){
-  int n = read_int(f);
-  char* s = (char*)malloc(n + 1);
-  bread(s, 1, n, f);
-  s[n] = '\0';
-  return s;
-}
-char** read_strings (FILE* f){
-  int n = read_int(f);
-  char** xs = (char**)malloc(sizeof(char*)*(n + 1));
-  for(int i=0; i<n; i++)
-    xs[i] = read_string(f);
-  xs[n] = NULL;
-  return xs;
-}
-EvalArg* read_earg (FILE* f){
-  EvalArg* earg = (EvalArg*)malloc(sizeof(EvalArg));
-  printf("Read pipe\n");
-  earg->pipe = read_string(f);
-  printf("Read file\n");
-  earg->file = read_string(f);
-  printf("Read argvs\n");
-  earg->argvs = read_strings(f);
-  return earg;
-}
-
-//===== Process Daemon =====
-int eval_process (void* arg0){
-  EvalArg* arg = arg0;
-  return execvp(arg->file, arg->argvs);
-}
-
-int process_daemon (void* dummy) {
-  while(1){
-    EvalArg* earg = read_earg(0);
-    printf("read arg = %s\n", earg->file); fflush(stdout);
-    //long pid = fork_child(earg->pipe, &eval_process, earg);
-    //write(1, &pid, sizeof(long));
-    //Process p = {42L, 42, 42, 42};
-    // Process p = make_process(&eval_process, earg);
-    // write_process(1, &p);
-  }
-}
-
+//void bread (void* xs0, int size, int n0, FILE* f){
+//  char* xs = xs0;
+//  int n = n0;
+//  while(n > 0){
+//    printf("bread n = %d\n", n);
+//    int c = fread(xs, size, n, f);
+//    printf("c = %d\n", c);
+//    if(c < n && feof(f))
+//      fprintf(stderr, "EOF\n");
+//    if(c < n && ferror(f)) exit_with_error();
+//    n = n - c;
+//    xs = xs + size*c;
+//  }
+//}
+//int read_int (FILE* f){
+//  printf("Read int\n");
+//  int n;
+//  bread(&n, sizeof(int), 1, f);
+//  printf("Int = %d\n", n);
+//  return n;
+//}
+//long read_long (FILE* f){
+//  long n;
+//  bread(&n, sizeof(long), 1, f);
+//  return n;
+//}
+//char* read_string (FILE* f){
+//  int n = read_int(f);
+//  char* s = (char*)malloc(n + 1);
+//  bread(s, 1, n, f);
+//  s[n] = '\0';
+//  return s;
+//}
+//char** read_strings (FILE* f){
+//  int n = read_int(f);
+//  char** xs = (char**)malloc(sizeof(char*)*(n + 1));
+//  for(int i=0; i<n; i++)
+//    xs[i] = read_string(f);
+//  xs[n] = NULL;
+//  return xs;
+//}
+//EvalArg* read_earg (FILE* f){
+//  EvalArg* earg = (EvalArg*)malloc(sizeof(EvalArg));
+//  printf("Read pipe\n");
+//  earg->pipe = read_string(f);
+//  printf("Read file\n");
+//  earg->file = read_string(f);
+//  printf("Read argvs\n");
+//  earg->argvs = read_strings(f);
+//  return earg;
+//}
+//
+////===== Process Daemon =====
+//int eval_process (void* arg0){
+//  EvalArg* arg = arg0;
+//  return execvp(arg->file, arg->argvs);
+//}
+//
+//int process_daemon (void* dummy) {
+//  while(1){
+//    EvalArg* earg = read_earg(0);
+//    printf("read arg = %s\n", earg->file); fflush(stdout);
+//    //long pid = fork_child(earg->pipe, &eval_process, earg);
+//    //write(1, &pid, sizeof(long));
+//    //Process p = {42L, 42, 42, 42};
+//    // Process p = make_process(&eval_process, earg);
+//    // write_process(1, &p);
+//  }
+//}
+//
 //Process launcher_process;
 //void initialize_launcher_process (){
 //  make_pipes("pipe0");
@@ -406,33 +408,101 @@ ProcessState process_state (Process p){
 //============================================================
 //============================================================
 //============================================================
+//
+//int launcher_main (int lin_fd, int lout_fd){
+//  //Open streams
+//  FILE* lin = fdopen(lin_fd, "r");
+//  if(lin == NULL) exit_with_error();
+//  FILE* lout = fdopen(lout_fd, "w");
+//  if(lout == NULL) exit_with_error();
+//  
+//  while(1){    
+//    printf("Read earg\n");
+//    EvalArg* earg = read_earg(lin);    
+//    printf("file = %s\n", earg->file);
+//    write_long(lout, 42L); fflush(lout);
+//  }
+//}
+//
+//FILE* launcher_in;
+//FILE* launcher_out;
+//void initialize_launcher_process (){
+//  //Create pipes
+//  int READ = 0;
+//  int WRITE = 1;
+//  int lin[2];
+//  int lout[2];
+//  if(pipe(lin) < 0) exit_with_error();
+//  if(pipe(lout) < 0) exit_with_error();
+//
+//  //Fork
+//  long pid = (long)fork();
+//  if(pid < 0) exit_with_error();
+//
+//  if(pid > 0){
+//    //parent
+//    close(lin[READ]);
+//    close(lout[WRITE]);
+//    launcher_in = fdopen(lin[WRITE], "w");
+//    if(launcher_in == NULL) exit_with_error();
+//    launcher_out = fdopen(lout[READ], "r");
+//    if(launcher_out == NULL) exit_with_error();
+//  }else{
+//    //child
+//    close(lin[WRITE]);
+//    close(lout[READ]);
+//    exit(launcher_main(lin[READ], lout[WRITE]));
+//  }
+//}
+//
+//void launch_eval (char* file, char** argvs){
+//  //Create eval argument
+//  EvalArg arg;
+//  arg.pipe = "pipe";
+//  arg.file = file;
+//  arg.argvs = argvs;
+//  //Write to daemon process
+//  printf("Write earg\n");
+//  write_earg(launcher_in, &arg);
+//  fflush(launcher_in);
+//  //Read back process id
+//  printf("Read back process\n");
+//  long pid = read_long(launcher_out);
+//  //Print out process id
+//  printf("Launched eval process %ld\n", pid);
+//
+//  printf("Finish Writing\n");
+//  write_earg(launcher_in, &arg);
+//  fflush(launcher_in);
+//}
+//
+//int main (void){
+//  initialize_launcher_process();
+//  
+//  char* argvs[] = {"./child", NULL};
+//  launch_eval("./child", argvs);
+//}
 
-int launcher_main (int lin_fd, int lout_fd){
-  //Open streams
-  FILE* lin = fdopen(lin_fd, "r");
-  if(lin == NULL) exit_with_error();
-  FILE* lout = fdopen(lout_fd, "w");
-  if(lout == NULL) exit_with_error();
-  
+//============================================================
+//============================================================
+//============================================================
+
+int read_int (int fd){
   while(1){
-    int c = fgetc(lin);
-    printf("c = %d\n", c);
-
-    
-    //printf("Read earg\n");
-    //EvalArg* earg = read_earg(lin);    
-    //printf("file = %s\n", earg->file); fflush(stdout);
-    //write_long(lout, 42L); fflush(lout);
-   
-    //int x;
-    //int n = fscanf(lin, "%d", &x);
-    //if(n == 1)
-    //  printf("Received %d\n", x);
+    int x;
+    int c = read(fd, &x, sizeof(int));
+    if(c < 0) exit_with_error();
+    if(c == sizeof(int))
+      return x;
+    else
+      printf("c = %d\n", c);
   }
 }
 
-FILE* launcher_in;
-FILE* launcher_out;
+void write_int (int fd, int x){
+  write(fd, &x, sizeof(int));
+}
+
 void initialize_launcher_process (){
   //Create pipes
   int READ = 0;
@@ -447,41 +517,28 @@ void initialize_launcher_process (){
   if(pid < 0) exit_with_error();
 
   if(pid > 0){
-    //parent
+    //Parent
     close(lin[READ]);
     close(lout[WRITE]);
-    launcher_in = fdopen(lin[WRITE], "w");
-    if(launcher_in == NULL) exit_with_error();
-    launcher_out = fdopen(lout[READ], "r");
-    if(launcher_out == NULL) exit_with_error();
 
-  }else{
-    //child
+    //Write int
+    printf("write int\n");
+    write_int(lin[WRITE], 42);
+    int y = read_int(lout[READ]);
+    printf("y = %d\n", y);
+  }
+  else{
+    //Child
     close(lin[WRITE]);
     close(lout[READ]);
-    exit(launcher_main(lin[READ], lout[WRITE]));
-  }
-}
 
-void launch_eval (char* file, char** argvs){
-  //Create eval argument
-  EvalArg arg;
-  arg.pipe = "pipe";
-  arg.file = file;
-  arg.argvs = argvs;
-  //Write to daemon process
-  printf("Write earg\n");
-  write_earg(launcher_in, &arg);
-  //Read back process id
-  printf("Read back process\n");
-  long pid = read_long(launcher_out);
-  //Print out process id
-  printf("Launched eval process %ld\n", pid);
+    //Read int
+    int x = read_int(lin[READ]);
+    printf("x = %d\n", x);
+    write_int(lout[WRITE], x + 1);
+  }
 }
 
 int main (void){
   initialize_launcher_process();
-  
-  //char* argvs[] = {"./child", NULL};
-  //launch_eval("./child", argvs);
 }
