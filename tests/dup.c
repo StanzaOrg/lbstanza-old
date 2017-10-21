@@ -162,9 +162,6 @@ Process make_process (long pid, char* pipe){
 //======================= Process Daemon =====================
 //============================================================
 
-//size_t fwrite ( const void * ptr, size_t size, size_t count, FILE * stream );
-//size_t fread ( void * ptr, size_t size, size_t count, FILE * stream );
-
 // ===== Serialization =====
 //void write_int (FILE* f, int x){
 //  fwrite(&x, sizeof(int), 1, f);
@@ -487,20 +484,36 @@ ProcessState process_state (Process p){
 //============================================================
 //============================================================
 
-int read_int (int fd){
+//int read_int (int fd){
+//  while(1){
+//    int x;
+//    int c = read(fd, &x, sizeof(int));
+//    if(c < 0) exit_with_error();
+//    if(c == sizeof(int))
+//      return x;
+//    else
+//      printf("c = %d\n", c);
+//  }
+//}
+//
+//void write_int (int fd, int x){
+//  write(fd, &x, sizeof(int));
+//}
+
+int read_int (FILE* fd){
   while(1){
     int x;
-    int c = read(fd, &x, sizeof(int));
+    int c = fread(&x, sizeof(int), 1, fd);
     if(c < 0) exit_with_error();
-    if(c == sizeof(int))
+    if(c == 1)
       return x;
     else
       printf("c = %d\n", c);
   }
 }
 
-void write_int (int fd, int x){
-  write(fd, &x, sizeof(int));
+void write_int (FILE* fd, int x){
+  fwrite(&x, sizeof(int), 1, fd);
 }
 
 void initialize_launcher_process (){
@@ -521,11 +534,15 @@ void initialize_launcher_process (){
     close(lin[READ]);
     close(lout[WRITE]);
 
+    FILE* fin = fdopen(lin[WRITE], "w");
+    FILE* fout = fdopen(lout[READ], "r");
+
     int y = 0;
     for(int i=0; i<10; i++){
       printf("write y = %d\n", y);
-      write_int(lin[WRITE], y);
-      y = read_int(lout[READ]);
+      write_int(fin, y);
+      fflush(fin);
+      y = read_int(fout);
       printf("received y = %d\n", y);
     }
   }
@@ -534,53 +551,60 @@ void initialize_launcher_process (){
     close(lin[WRITE]);
     close(lout[READ]);
 
+    FILE* fin = fdopen(lin[READ], "r");
+    FILE* fout = fdopen(lout[WRITE], "w");
+
     //Read int
     for(int i=0; i<10; i++){
-      int x = read_int(lin[READ]);
+      int x = read_int(fin);
       printf("x%d = %d\n", i, x);
-      write_int(lout[WRITE], x + 1);
+      write_int(fout, x + 1);
+      fflush(fout);
     }
   }
 }
 
-void initialize_named_launcher_process (){
-  //Create pipes
-  mkfifo("lin", S_IRUSR|S_IWUSR);
-  mkfifo("lout", S_IRUSR|S_IWUSR);
-
-  //Fork
-  long pid = (long)fork();
-  if(pid < 0) exit_with_error();
-
-  if(pid > 0){
-    int lin = open("lin", O_WRONLY);
-    int lout = open("lout", O_RDONLY);
-    if(lin < 0) exit_with_error();
-    if(lout < 0) exit_with_error();
-
-    int y = 0;
-    for(int i=0; i<10; i++){
-      printf("write y = %d\n", y);
-      write_int(lin, y);
-      y = read_int(lout);
-      printf("received y = %d\n", y);
-    }
-  }
-  else{
-    int lin = open("lin", O_RDONLY);
-    int lout = open("lout", O_WRONLY);
-    if(lin < 0) exit_with_error();
-    if(lout < 0) exit_with_error();   
-
-    //Read int
-    for(int i=0; i<10; i++){
-      int x = read_int(lin);
-      printf("x%d = %d\n", i, x);
-      write_int(lout, x + 1);
-    }
-  }
-}
+//void initialize_named_launcher_process (){
+//  //Create pipes
+//  mkfifo("lin", S_IRUSR|S_IWUSR);
+//  mkfifo("lout", S_IRUSR|S_IWUSR);
+//
+//  //Fork
+//  long pid = (long)fork();
+//  if(pid < 0) exit_with_error();
+//
+//  if(pid > 0){
+//    printf("creating lin\n");
+//    int lin = open("lin", O_WRONLY);
+//    printf("created lin\n");
+//    int lout = open("lout", O_RDONLY);
+//    printf("created lout\n");
+//    if(lin < 0) exit_with_error();
+//    if(lout < 0) exit_with_error();
+//
+//    int y = 0;
+//    for(int i=0; i<10; i++){
+//      printf("write y = %d\n", y);
+//      write_int(lin, y);
+//      y = read_int(lout);
+//      printf("received y = %d\n", y);
+//    }
+//  }
+//  else{
+//    int lin = open("lin", O_RDONLY);
+//    int lout = open("lout", O_WRONLY);
+//    if(lin < 0) exit_with_error();
+//    if(lout < 0) exit_with_error();   
+//    
+//    //Read int
+//    for(int i=0; i<10; i++){
+//      int x = read_int(lin);
+//      printf("x%d = %d\n", i, x);
+//      write_int(lout, x + 1);
+//    }
+//  }
+//}
 
 int main (void){
-  initialize_named_launcher_process();
+  initialize_launcher_process();
 }
