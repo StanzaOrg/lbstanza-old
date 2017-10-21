@@ -169,11 +169,11 @@ void write_int (FILE* f, int x){
 void write_long (FILE* f, long x){
   fwrite(&x, sizeof(long), 1, f);
 }
-//void write_string (FILE* f, char* s){
-//  int n = strlen(s);
-//  write_int(f, n);
-//  fwrite(s, 1, n, f);
-//}
+void write_string (FILE* f, char* s){
+  int n = strlen(s);
+  write_int(f, n);
+  fwrite(s, 1, n, f);
+}
 //int count_non_null (void** xs){
 //  int n=0;
 //  while(xs[n] != NULL)
@@ -213,13 +213,13 @@ int read_int (FILE* f){
 //  bread(&n, sizeof(long), 1, f);
 //  return n;
 //}
-//char* read_string (FILE* f){
-//  int n = read_int(f);
-//  char* s = (char*)malloc(n + 1);
-//  bread(s, 1, n, f);
-//  s[n] = '\0';
-//  return s;
-//}
+char* read_string (FILE* f){
+  int n = read_int(f);
+  char* s = (char*)malloc(n + 1);
+  bread(s, 1, n, f);
+  s[n] = '\0';
+  return s;
+}
 //char** read_strings (FILE* f){
 //  int n = read_int(f);
 //  char** xs = (char**)malloc(sizeof(char*)*(n + 1));
@@ -534,10 +534,10 @@ void initialize_launcher_process (){
     int y = 0;
     for(int i=0; i<10; i++){
       printf("write y = %d\n", y);
-      write_int(fin, y);
+      write_string(fin, "One");
       fflush(fin);
-      y = read_int(fout);
-      printf("received y = %d\n", y);
+      char* r = read_string(fout);
+      printf("received r = %s\n", r);
     }
   }
   else{
@@ -550,9 +550,9 @@ void initialize_launcher_process (){
 
     //Read int
     for(int i=0; i<10; i++){
-      int x = read_int(fin);
-      printf("x%d = %d\n", i, x);
-      write_int(fout, x + 1);
+      char* s = read_string(fin);
+      printf("read r = %s\n", s);
+      write_string(fout, s);
       fflush(fout);
     }
   }
