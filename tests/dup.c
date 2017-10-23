@@ -174,23 +174,23 @@ void write_string (FILE* f, char* s){
   write_int(f, n);
   fwrite(s, 1, n, f);
 }
-//int count_non_null (void** xs){
-//  int n=0;
-//  while(xs[n] != NULL)
-//    n++;
-//  return n;
-//}
-//void write_strings (FILE* f, char** s){
-//  int n = count_non_null((void**)s);
-//  write_int(f, n);
-//  for(int i=0; i<n; i++)
-//    write_string(f, s[i]);
-//}
-//void write_earg (FILE* f, EvalArg* earg){
-//  write_string(f, earg->pipe);
-//  write_string(f, earg->file);
-//  write_strings(f, earg->argvs);
-//}
+int count_non_null (void** xs){
+  int n=0;
+  while(xs[n] != NULL)
+    n++;
+  return n;
+}
+void write_strings (FILE* f, char** s){
+  int n = count_non_null((void**)s);
+  write_int(f, n);
+  for(int i=0; i<n; i++)
+    write_string(f, s[i]);
+}
+void write_earg (FILE* f, EvalArg* earg){
+  write_string(f, earg->pipe);
+  write_string(f, earg->file);
+  write_strings(f, earg->argvs);
+}
 
 // ===== Deserialization =====
 void bread (void* xs0, int size, int n0, FILE* f){
@@ -208,11 +208,11 @@ int read_int (FILE* f){
   bread(&n, sizeof(int), 1, f);
   return n;
 }
-//long read_long (FILE* f){
-//  long n;
-//  bread(&n, sizeof(long), 1, f);
-//  return n;
-//}
+long read_long (FILE* f){
+  long n;
+  bread(&n, sizeof(long), 1, f);
+  return n;
+}
 char* read_string (FILE* f){
   int n = read_int(f);
   char* s = (char*)malloc(n + 1);
@@ -220,25 +220,22 @@ char* read_string (FILE* f){
   s[n] = '\0';
   return s;
 }
-//char** read_strings (FILE* f){
-//  int n = read_int(f);
-//  char** xs = (char**)malloc(sizeof(char*)*(n + 1));
-//  for(int i=0; i<n; i++)
-//    xs[i] = read_string(f);
-//  xs[n] = NULL;
-//  return xs;
-//}
-//EvalArg* read_earg (FILE* f){
-//  EvalArg* earg = (EvalArg*)malloc(sizeof(EvalArg));
-//  printf("Read pipe\n");
-//  earg->pipe = read_string(f);
-//  printf("Read file\n");
-//  earg->file = read_string(f);
-//  printf("Read argvs\n");
-//  earg->argvs = read_strings(f);
-//  return earg;
-//}
-//
+char** read_strings (FILE* f){
+  int n = read_int(f);
+  char** xs = (char**)malloc(sizeof(char*)*(n + 1));
+  for(int i=0; i<n; i++)
+    xs[i] = read_string(f);
+  xs[n] = NULL;
+  return xs;
+}
+EvalArg* read_earg (FILE* f){
+  EvalArg* earg = (EvalArg*)malloc(sizeof(EvalArg));
+  earg->pipe = read_string(f);
+  earg->file = read_string(f);
+  earg->argvs = read_strings(f);
+  return earg;
+}
+
 ////===== Process Daemon =====
 //int eval_process (void* arg0){
 //  EvalArg* arg = arg0;
@@ -533,11 +530,16 @@ void initialize_launcher_process (){
 
     int y = 0;
     for(int i=0; i<10; i++){
-      printf("write y = %d\n", y);
-      write_string(fin, "One");
+      //Write in
+      char* eargvs[] = {"a", "b", "c", NULL};
+      EvalArg e = {"pipe", "file", eargvs};
+      write_earg(fin, &e);
       fflush(fin);
-      char* r = read_string(fout);
-      printf("received r = %s\n", r);
+
+      //Read out
+      EvalArg* r = read_earg(fout);
+      printf("Parent received r.file = %s\n", r->file);
+      free(r);
     }
   }
   else{
@@ -550,9 +552,14 @@ void initialize_launcher_process (){
 
     //Read int
     for(int i=0; i<10; i++){
-      char* s = read_string(fin);
-      printf("read r = %s\n", s);
-      write_string(fout, s);
+      //Read in
+      EvalArg* r = read_earg(fin);
+      printf("Child received r.file = %s, arg[0] = %s\n", r->file, r->argvs[0]);
+
+
+      //Write out
+      r->file = "outfile";
+      write_earg(fout, r);
       fflush(fout);
     }
   }
