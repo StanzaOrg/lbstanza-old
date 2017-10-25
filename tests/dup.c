@@ -50,22 +50,32 @@ void exit_with_error (){
   exit(-1);
 }
 
+char* string_join (char* a, char* b){
+  int len = strlen(a) + strlen(b);
+  char* buffer = (char*)malloc(len + 1);
+  sprintf(buffer, "%s%s", a, b);
+  return buffer;
+}
+
+//Opening a named pipe
+int open_pipe (char* prefix, char* suffix, int options){
+  char* name = string_join(prefix, suffix);
+  int fd = open(name, options);
+  if(fd < 0) exit_with_error();
+  free(name);
+  return fd;
+}
+
+//Creating a named pipe
+void make_pipe (char* prefix, char* suffix){
+  char* name = string_join(prefix, suffix);
+  int r = mkfifo(name, S_IRUSR|S_IWUSR);
+  if(r < 0) exit_with_error();
+}
+
 //============================================================
 //==================== Process Creation ======================
 //============================================================
-
-int open_pipe (char* prefix, char* suffix, int options){
-  int len = strlen(prefix) + strlen(suffix);
-  char* buffer = (char*)malloc(len + 1);
-  sprintf(buffer, "%s%s", prefix, suffix);
-  int fd = open(buffer, options);
-  if(fd < 0){
-    fprintf(stderr, "%s\n", strerror(errno));
-    exit(-1);
-  }
-  free(buffer);
-  return fd;
-}
 
 void make_pipes (char* name){
   int len = strlen(name);
@@ -198,7 +208,10 @@ void bread (void* xs0, int size, int n0, FILE* f){
   int n = n0;
   while(n > 0){
     int c = fread(xs, size, n, f);
-    if(c < n && ferror(f)) exit_with_error();
+    if(c < n){
+      if(ferror(f)) exit_with_error();
+      if(feof(f)) return;
+    }
     n = n - c;
     xs = xs + size*c;
   }
@@ -475,38 +488,37 @@ ProcessState process_state (Process p){
 //============================================================
 //============================================================
 
-//int read_int (int fd){
-//  while(1){
-//    int x;
-//    int c = read(fd, &x, sizeof(int));
-//    if(c < 0) exit_with_error();
-//    if(c == sizeof(int))
-//      return x;
-//    else
-//      printf("c = %d\n", c);
-//  }
-//}
-//
-//void write_int (int fd, int x){
-//  write(fd, &x, sizeof(int));
-//}
+//Daemon process for launching child processes
+void launcher_main (FILE* lin, FILE* lout){
+  while(1){
+    //Read in evaluation arguments
+    EvalArg* earg = read_earg(lin);
+    if(feof(lin)) exit(0);
 
-//int read_int (FILE* fd){
-//  while(1){
-//    int x;
-//    int c = fread(&x, sizeof(int), 1, fd);
-//    if(c < 0) exit_with_error();
-//    if(c == 1)
-//      return x;
-//    else
-//      printf("c = %d\n", c);
-//  }
-//}
-//
-//void write_int (FILE* fd, int x){
-//  fwrite(&x, sizeof(int), 1, fd);
-//}
+    //Fork a new child
+    long pid = (long)fork();
+    if(pid < 0) exit_with_error();
 
+    if(pid > 0){
+      //Return new process id
+      write_long(lout, pid);
+      fflush(lout);
+    }
+    else{
+      //Open named pipes
+      dup2(open_pipe(earg->pipe, "_in", O_RDONLY), 0);
+      dup2(open_pipe(earg->pipe, "_out", O_WRONLY), 1);
+      dup2(open_pipe(earg->pipe, "_err", O_WRONLY), 2);
+      //Launch child process      
+      execvp(earg->file, earg->argvs);
+      exit_with_error();
+    }
+  }
+}
+
+long launcher_pid = -1;
+FILE* launcher_in = NULL;
+FILE* launcher_out = NULL;
 void initialize_launcher_process (){
   //Create pipes
   int READ = 0;
@@ -522,90 +534,76 @@ void initialize_launcher_process (){
 
   if(pid > 0){
     //Parent
+    launcher_pid = pid;
     close(lin[READ]);
     close(lout[WRITE]);
-
-    FILE* fin = fdopen(lin[WRITE], "w");
-    FILE* fout = fdopen(lout[READ], "r");
-
-    int y = 0;
-    for(int i=0; i<10; i++){
-      //Write in
-      char* eargvs[] = {"a", "b", "c", NULL};
-      EvalArg e = {"pipe", "file", eargvs};
-      write_earg(fin, &e);
-      fflush(fin);
-
-      //Read out
-      EvalArg* r = read_earg(fout);
-      printf("Parent received r.file = %s\n", r->file);
-      free(r);
-    }
+    launcher_in = fdopen(lin[WRITE], "w");
+    if(launcher_in == NULL) exit_with_error();
+    launcher_out = fdopen(lout[READ], "r");
+    if(launcher_out == NULL) exit_with_error();
   }
   else{
     //Child
     close(lin[WRITE]);
     close(lout[READ]);
-
     FILE* fin = fdopen(lin[READ], "r");
+    if(fin == NULL) exit_with_error();
     FILE* fout = fdopen(lout[WRITE], "w");
-
-    //Read int
-    for(int i=0; i<10; i++){
-      //Read in
-      EvalArg* r = read_earg(fin);
-      printf("Child received r.file = %s, arg[0] = %s\n", r->file, r->argvs[0]);
-
-
-      //Write out
-      r->file = "outfile";
-      write_earg(fout, r);
-      fflush(fout);
-    }
+    if(fout == NULL) exit_with_error();
+    launcher_main(fin, fout);
   }
 }
 
-//void initialize_named_launcher_process (){
-//  //Create pipes
-//  mkfifo("lin", S_IRUSR|S_IWUSR);
-//  mkfifo("lout", S_IRUSR|S_IWUSR);
-//
-//  //Fork
-//  long pid = (long)fork();
-//  if(pid < 0) exit_with_error();
-//
-//  if(pid > 0){
-//    printf("creating lin\n");
-//    int lin = open("lin", O_WRONLY);
-//    printf("created lin\n");
-//    int lout = open("lout", O_RDONLY);
-//    printf("created lout\n");
-//    if(lin < 0) exit_with_error();
-//    if(lout < 0) exit_with_error();
-//
-//    int y = 0;
-//    for(int i=0; i<10; i++){
-//      printf("write y = %d\n", y);
-//      write_int(lin, y);
-//      y = read_int(lout);
-//      printf("received y = %d\n", y);
-//    }
-//  }
-//  else{
-//    int lin = open("lin", O_RDONLY);
-//    int lout = open("lout", O_WRONLY);
-//    if(lin < 0) exit_with_error();
-//    if(lout < 0) exit_with_error();   
-//    
-//    //Read int
-//    for(int i=0; i<10; i++){
-//      int x = read_int(lin);
-//      printf("x%d = %d\n", i, x);
-//      write_int(lout, x + 1);
-//    }
-//  }
-//}
+void print_all (FILE* f){
+  char buffer[1000];
+  while(1){
+    char* r = fgets(buffer, 1000, f);
+    if(ferror(f)) exit_with_error();
+    if(r == NULL) break;
+    printf("%s", r);
+    if(feof(f)) break;
+  }
+}
+
+Process* launch_process (char* file, char** argvs){
+  //Initialize launcher if necessary
+  if(launcher_pid < 0)
+    initialize_launcher_process();
+  //Figure out unique pipe name
+  char pipe_name[80];
+  sprintf(pipe_name, "execpipe%ld", (long)getpid());
+  //Create pipes to child
+  make_pipe(pipe_name, "_in");
+  make_pipe(pipe_name, "_out");
+  make_pipe(pipe_name, "_err");
+  //Write in evaluation arguments
+  EvalArg earg = {pipe_name, file, argvs};
+  write_earg(launcher_in, &earg);
+  fflush(launcher_in);
+  //Read back process id
+  long pid = read_long(launcher_out);
+  //Open pipes to child
+  int in = open_pipe(pipe_name, "_in", O_WRONLY);
+  int out = open_pipe(pipe_name, "_out", O_RDONLY);
+  int err = open_pipe(pipe_name, "_err", O_RDONLY);
+  FILE* fin = fdopen(in, "w");
+  if(fin == NULL) exit_with_error();
+  FILE* fout = fdopen(out, "r");
+  if(fout == NULL) exit_with_error();
+  FILE* ferr = fdopen(err, "r");
+  if(ferr == NULL) exit_with_error();
+  //Now what?
+  Process* p = (Process*)malloc(sizeof(Process));
+  p->pid = pid;
+  p->in = fin;
+  p->out = fout;
+  p->err = ferr;
+  return p;
+}
 
 int main (void){
   initialize_launcher_process();
+  char* argvs[] = {"ls", NULL};
+  Process* p = launch_process("ls", argvs);
+  print_all(p->out);
 }
