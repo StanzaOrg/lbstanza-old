@@ -574,19 +574,24 @@ Process* launch_process (char* file, char** argvs){
   //Initialize launcher if necessary
   if(launcher_pid < 0)
     initialize_launcher_process();
+  
   //Figure out unique pipe name
   char pipe_name[80];
-  sprintf(pipe_name, "execpipe%ld", (long)getpid());
+  sprintf(pipe_name, "/tmp/stanza_exec_pipe%ld", (long)getpid());
+  
   //Create pipes to child
   make_pipe(pipe_name, "_in");
   make_pipe(pipe_name, "_out");
   make_pipe(pipe_name, "_err");
+  
   //Write in evaluation arguments
   EvalArg earg = {pipe_name, file, argvs};
   write_earg(launcher_in, &earg);
   fflush(launcher_in);
+  
   //Read back process id
   long pid = read_long(launcher_out);
+  
   //Open pipes to child
   int in = open_pipe(pipe_name, "_in", O_WRONLY);
   int out = open_pipe(pipe_name, "_out", O_RDONLY);
@@ -597,7 +602,8 @@ Process* launch_process (char* file, char** argvs){
   if(fout == NULL) exit_with_error();
   FILE* ferr = fdopen(err, "r");
   if(ferr == NULL) exit_with_error();
-  //Now what?
+  
+  //Return process structure
   Process* p = (Process*)malloc(sizeof(Process));
   p->pid = pid;
   p->in = fin;
