@@ -137,6 +137,10 @@ void write_earg (FILE* f, EvalArg* earg){
   write_string(f, earg->file);
   write_strings(f, earg->argvs);
 }
+void write_process_state (FILE* f, ProcessState* s){
+  write_int(f, s->state);
+  write_int(f, s->code);
+}
 
 // ===== Deserialization =====
 void bread (void* xs0, int size, int n0, FILE* f){
@@ -191,6 +195,10 @@ EvalArg* read_earg (FILE* f){
   earg->argvs = read_strings(f);
   return earg;
 }
+void read_process_state (FILE* f, ProcessState* s){  
+  s->state = read_int(f);
+  s->code = read_int(f);
+}
 
 //===== Free =====
 void free_earg (EvalArg* arg){
@@ -208,67 +216,112 @@ void free_earg (EvalArg* arg){
 //==================== Process Queries =======================
 //============================================================
 
-ProcessState process_state (Process p){
+void get_process_state (long pid, ProcessState* s){
   int status;
-  int ret = waitpid((pid_t)p.pid, &status, WNOHANG);
-  if(ret == 0){
-    ProcessState s = {PROCESS_RUNNING, 0};
-    return s;
-  }
-  else if(WIFEXITED(status)){
-    ProcessState s = {PROCESS_DONE, WEXITSTATUS(status)};
-    return s;
-  }
-  else if(WIFSIGNALED(status)){
-    ProcessState s = {PROCESS_TERMINATED, WTERMSIG(status)};
-    return s;
-  }
-  else if(WIFSTOPPED(status)){
-    ProcessState s = {PROCESS_STOPPED, WSTOPSIG(status)};
-    return s;
-  }
-  else{
-    ProcessState s = {PROCESS_RUNNING, 0};
-    return s;
-  }
+  int ret = waitpid(pid, &status, WNOHANG);  
+  
+  if(ret == 0)
+    *s = (ProcessState){PROCESS_RUNNING, 0};
+  else if(WIFEXITED(status))
+    *s = (ProcessState){PROCESS_DONE, WEXITSTATUS(status)};
+  else if(WIFSIGNALED(status))
+    *s = (ProcessState){PROCESS_TERMINATED, WTERMSIG(status)};
+  else if(WIFSTOPPED(status))
+    *s = (ProcessState){PROCESS_STOPPED, WSTOPSIG(status)};
+  else
+    *s = (ProcessState){PROCESS_RUNNING, 0};
 }
 
 //============================================================
 //====================== Launcher Main =======================
 //============================================================
 
-//Daemon process for launching child processes
+#define LAUNCH_COMMAND 0
+#define STATE_COMMAND 1
+
 void launcher_main (FILE* lin, FILE* lout){
   while(1){
-    //Read in evaluation arguments
-    EvalArg* earg = read_earg(lin);
+    //Read in command
+    int comm = fgetc(lin);
     if(feof(lin)) exit(0);
 
-    //Fork a new child
-    long pid = (long)fork();
-    if(pid < 0) exit_with_error();
+    //Interpret launch process command
+    if(comm == LAUNCH_COMMAND){
+      //Read in evaluation arguments
+      EvalArg* earg = read_earg(lin);
+      if(feof(lin)) exit(0);
 
-    if(pid > 0){
-      //Free the evaluation arg
-      free_earg(earg);
-      //Return new process id
-      write_long(lout, pid);
+      //Fork a new child
+      long pid = (long)fork();
+      if(pid < 0) exit_with_error();
+
+      if(pid > 0){
+        //Return new process id
+        write_long(lout, pid);
+        fflush(lout);
+      }else{
+        //Open named pipes
+        if(earg->in_pipe != NULL)
+          dup2(open_pipe(earg->pipe, earg->in_pipe, O_RDONLY), 0);
+        if(earg->out_pipe != NULL)
+          dup2(open_pipe(earg->pipe, earg->out_pipe, O_WRONLY), 1);
+        if(earg->err_pipe != NULL)
+          dup2(open_pipe(earg->pipe, earg->err_pipe, O_WRONLY), 2);
+        //Launch child process      
+        execvp(earg->file, earg->argvs);
+        exit_with_error();
+      }      
+    }
+    //Interpret state retrieval command
+    else if(comm == STATE_COMMAND){
+      //Read in process id
+      long pid = read_long(lin);
+
+      //Retrieve state
+      ProcessState s; get_process_state(pid, &s);
+      write_process_state(lout, &s);
       fflush(lout);
     }
+    //Unrecognized command
     else{
-      //Open named pipes
-      if(earg->in_pipe != NULL)
-        dup2(open_pipe(earg->pipe, earg->in_pipe, O_RDONLY), 0);
-      if(earg->out_pipe != NULL)
-        dup2(open_pipe(earg->pipe, earg->out_pipe, O_WRONLY), 1);
-      if(earg->err_pipe != NULL)
-        dup2(open_pipe(earg->pipe, earg->err_pipe, O_WRONLY), 2);
-      //Launch child process      
-      execvp(earg->file, earg->argvs);
-      exit_with_error();
+      fprintf(stderr, "Illegal command: %d\n", comm);
+      exit(-1);
     }
   }
 }
+
+//Daemon process for launching child processes
+//void launcher_main (FILE* lin, FILE* lout){
+//  while(1){
+//    //Read in evaluation arguments
+//    EvalArg* earg = read_earg(lin);
+//    if(feof(lin)) exit(0);
+//
+//    //Fork a new child
+//    long pid = (long)fork();
+//    if(pid < 0) exit_with_error();
+//
+//    if(pid > 0){
+//      //Free the evaluation arg
+//      free_earg(earg);
+//      //Return new process id
+//      write_long(lout, pid);
+//      fflush(lout);
+//    }
+//    else{
+//      //Open named pipes
+//      if(earg->in_pipe != NULL)
+//        dup2(open_pipe(earg->pipe, earg->in_pipe, O_RDONLY), 0);
+//      if(earg->out_pipe != NULL)
+//        dup2(open_pipe(earg->pipe, earg->out_pipe, O_WRONLY), 1);
+//      if(earg->err_pipe != NULL)
+//        dup2(open_pipe(earg->pipe, earg->err_pipe, O_WRONLY), 2);
+//      //Launch child process      
+//      execvp(earg->file, earg->argvs);
+//      exit_with_error();
+//    }
+//  }
+//}
 
 long launcher_pid = -1;
 FILE* launcher_in = NULL;
@@ -335,13 +388,15 @@ void launch_process (char* file, char** argvs,
   if(pipe_sources[PROCESS_ERR] >= 0)
     make_pipe(pipe_name, "_err");
   
-  //Write in evaluation arguments
+  //Write in command and evaluation arguments
   EvalArg earg = {pipe_name, NULL, NULL, NULL, file, argvs};
   if(input == PROCESS_IN) earg.in_pipe = "_in";
   if(output == PROCESS_OUT) earg.out_pipe = "_out";
   if(output == PROCESS_ERR) earg.out_pipe = "_err";
   if(error == PROCESS_OUT) earg.err_pipe = "_out";
-  if(error == PROCESS_ERR) earg.err_pipe = "_err";   
+  if(error == PROCESS_ERR) earg.err_pipe = "_err";
+  int r = fputc(LAUNCH_COMMAND, launcher_in);
+  if(r == EOF) exit_with_error();
   write_earg(launcher_in, &earg);
   fflush(launcher_in);
   
@@ -366,12 +421,34 @@ void launch_process (char* file, char** argvs,
   process->err = ferr;
 }
 
+void retrieve_process_state (long pid, ProcessState* s){
+  //Check whether launcher has been initialized
+  if(launcher_pid < 0){
+    fprintf(stderr, "Launcher not initialized.\n");
+    exit(-1);
+  }
+    
+  //Send command
+  int r = fputc(STATE_COMMAND, launcher_in);
+  if(r == EOF) exit_with_error();
+  write_long(launcher_in, pid);
+  fflush(launcher_in);
+
+  //Read back process state
+  read_process_state(launcher_out, s);
+}
+
 //============================================================
 //========================= Scratch ==========================
 //============================================================
 
-///int main (void){
-///  char* argvs[] = {"ls", NULL};
-///  Process* p = launch_process("ls", argvs);
-///  print_all(p->out);
-///}
+int main (void){
+  char* argvs[] = {"./child", NULL};
+  Process p;
+  launch_process("./child", argvs, STANDARD_IN, STANDARD_OUT, STANDARD_ERR, &p);
+  printf("pid = %ld\n", p.pid);
+  
+  sleep(1);
+  ProcessState s; retrieve_process_state(p.pid, &s);
+  printf("State = %d, Code = %d\n", s.state, s.code);
+}
