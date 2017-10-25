@@ -39,12 +39,6 @@ typedef struct {
 //==================== Utilities =============================
 //============================================================
 
-//int child_process (void* arg) {
-//  for (int i=0; i<100; i++)
-//    printf("Number(%d)\n", i);
-//  return 42;
-//}
-
 void exit_with_error (){
   fprintf(stderr, "%s\n", strerror(errno));
   exit(-1);
@@ -247,6 +241,15 @@ EvalArg* read_earg (FILE* f){
   earg->file = read_string(f);
   earg->argvs = read_strings(f);
   return earg;
+}
+
+//===== Free =====
+void free_earg (EvalArg* arg){
+  free(arg->pipe);
+  free(arg->file);
+  for(int i=0; arg->argvs[i] != NULL; i++)
+    free(arg->argvs[i]);
+  free(arg->argvs);
 }
 
 ////===== Process Daemon =====
@@ -500,6 +503,8 @@ void launcher_main (FILE* lin, FILE* lout){
     if(pid < 0) exit_with_error();
 
     if(pid > 0){
+      //Free the evaluation arg
+      free_earg(earg);
       //Return new process id
       write_long(lout, pid);
       fflush(lout);
@@ -602,7 +607,6 @@ Process* launch_process (char* file, char** argvs){
 }
 
 int main (void){
-  initialize_launcher_process();
   char* argvs[] = {"ls", NULL};
   Process* p = launch_process("ls", argvs);
   print_all(p->out);
