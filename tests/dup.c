@@ -26,6 +26,9 @@ typedef struct {
 
 typedef struct {
   char* pipe;
+  char* in_pipe;
+  char* out_pipe;
+  char* err_pipe;
   char* file;
   char** argvs;
 } EvalArg;
@@ -34,6 +37,14 @@ typedef struct {
 #define PROCESS_DONE 1
 #define PROCESS_TERMINATED 2
 #define PROCESS_STOPPED 3
+
+#define STANDARD_IN 0
+#define STANDARD_OUT 1
+#define PROCESS_IN 2
+#define PROCESS_OUT 3
+#define STANDARD_ERR 4
+#define PROCESS_ERR 5
+#define NUM_STREAM_SPECS 6
 
 //============================================================
 //==================== Utilities =============================
@@ -49,6 +60,17 @@ int count_non_null (void** xs){
   while(xs[n] != NULL)
     n++;
   return n;
+}
+
+void print_all (FILE* f){
+  char buffer[1000];
+  while(1){
+    char* r = fgets(buffer, 1000, f);
+    if(ferror(f)) exit_with_error();
+    if(r == NULL) break;
+    printf("%s", r);
+    if(feof(f)) break;
+  }
 }
 
 char* string_join (char* a, char* b){
@@ -74,6 +96,13 @@ void make_pipe (char* prefix, char* suffix){
   if(r < 0) exit_with_error();
 }
 
+//Opening a file stream to a pipe
+FILE* open_file (int fd, char* mode) {
+  FILE* f = fdopen(fd, mode);
+  if(f == NULL) exit_with_error();
+  return f;
+}
+
 //============================================================
 //======================= Serialization ======================
 //============================================================
@@ -86,9 +115,13 @@ void write_long (FILE* f, long x){
   fwrite(&x, sizeof(long), 1, f);
 }
 void write_string (FILE* f, char* s){
-  int n = strlen(s);
-  write_int(f, n);
-  fwrite(s, 1, n, f);
+  if(s == NULL)
+    write_int(f, -1);
+  else{
+    int n = strlen(s);
+    write_int(f, n);
+    fwrite(s, 1, n, f);
+  }
 }
 void write_strings (FILE* f, char** s){
   int n = count_non_null((void**)s);
@@ -98,6 +131,9 @@ void write_strings (FILE* f, char** s){
 }
 void write_earg (FILE* f, EvalArg* earg){
   write_string(f, earg->pipe);
+  write_string(f, earg->in_pipe);
+  write_string(f, earg->out_pipe);
+  write_string(f, earg->err_pipe);
   write_string(f, earg->file);
   write_strings(f, earg->argvs);
 }
@@ -128,10 +164,14 @@ long read_long (FILE* f){
 }
 char* read_string (FILE* f){
   int n = read_int(f);
-  char* s = (char*)malloc(n + 1);
-  bread(s, 1, n, f);
-  s[n] = '\0';
-  return s;
+  if(n < 0)
+    return NULL;
+  else{    
+    char* s = (char*)malloc(n + 1);
+    bread(s, 1, n, f);
+    s[n] = '\0';
+    return s;
+  }
 }
 char** read_strings (FILE* f){
   int n = read_int(f);
@@ -144,6 +184,9 @@ char** read_strings (FILE* f){
 EvalArg* read_earg (FILE* f){
   EvalArg* earg = (EvalArg*)malloc(sizeof(EvalArg));
   earg->pipe = read_string(f);
+  earg->in_pipe = read_string(f);
+  earg->out_pipe = read_string(f);
+  earg->err_pipe = read_string(f);
   earg->file = read_string(f);
   earg->argvs = read_strings(f);
   return earg;
@@ -152,6 +195,9 @@ EvalArg* read_earg (FILE* f){
 //===== Free =====
 void free_earg (EvalArg* arg){
   free(arg->pipe);
+  if(arg->in_pipe != NULL) free(arg->in_pipe);
+  if(arg->out_pipe != NULL) free(arg->out_pipe);
+  if(arg->err_pipe != NULL) free(arg->err_pipe);
   free(arg->file);
   for(int i=0; arg->argvs[i] != NULL; i++)
     free(arg->argvs[i]);
@@ -211,9 +257,12 @@ void launcher_main (FILE* lin, FILE* lout){
     }
     else{
       //Open named pipes
-      dup2(open_pipe(earg->pipe, "_in", O_RDONLY), 0);
-      dup2(open_pipe(earg->pipe, "_out", O_WRONLY), 1);
-      dup2(open_pipe(earg->pipe, "_err", O_WRONLY), 2);
+      if(earg->in_pipe != NULL)
+        dup2(open_pipe(earg->pipe, earg->in_pipe, O_RDONLY), 0);
+      if(earg->out_pipe != NULL)
+        dup2(open_pipe(earg->pipe, earg->out_pipe, O_WRONLY), 1);
+      if(earg->err_pipe != NULL)
+        dup2(open_pipe(earg->pipe, earg->err_pipe, O_WRONLY), 2);
       //Launch child process      
       execvp(earg->file, earg->argvs);
       exit_with_error();
@@ -259,18 +308,9 @@ void initialize_launcher_process (){
   }
 }
 
-void print_all (FILE* f){
-  char buffer[1000];
-  while(1){
-    char* r = fgets(buffer, 1000, f);
-    if(ferror(f)) exit_with_error();
-    if(r == NULL) break;
-    printf("%s", r);
-    if(feof(f)) break;
-  }
-}
-
-Process* launch_process (char* file, char** argvs){
+void launch_process (char* file, char** argvs,
+                     int input, int output, int error,
+                     Process* process){
   //Initialize launcher if necessary
   if(launcher_pid < 0)
     initialize_launcher_process();
@@ -278,14 +318,30 @@ Process* launch_process (char* file, char** argvs){
   //Figure out unique pipe name
   char pipe_name[80];
   sprintf(pipe_name, "/tmp/stanza_exec_pipe%ld", (long)getpid());
+
+  //Compute pipe sources
+  int pipe_sources[NUM_STREAM_SPECS];
+  for(int i=0; i<NUM_STREAM_SPECS; i++)
+    pipe_sources[i] = -1;
+  pipe_sources[input] = 0;
+  pipe_sources[output] = 1;
+  pipe_sources[error] = 2;
   
   //Create pipes to child
-  make_pipe(pipe_name, "_in");
-  make_pipe(pipe_name, "_out");
-  make_pipe(pipe_name, "_err");
+  if(pipe_sources[PROCESS_IN] >= 0)
+    make_pipe(pipe_name, "_in");
+  if(pipe_sources[PROCESS_OUT] >= 0)
+    make_pipe(pipe_name, "_out");
+  if(pipe_sources[PROCESS_ERR] >= 0)
+    make_pipe(pipe_name, "_err");
   
   //Write in evaluation arguments
-  EvalArg earg = {pipe_name, file, argvs};
+  EvalArg earg = {pipe_name, NULL, NULL, NULL, file, argvs};
+  if(input == PROCESS_IN) earg.in_pipe = "_in";
+  if(output == PROCESS_OUT) earg.out_pipe = "_out";
+  if(output == PROCESS_ERR) earg.out_pipe = "_err";
+  if(error == PROCESS_OUT) earg.err_pipe = "_out";
+  if(error == PROCESS_ERR) earg.err_pipe = "_err";   
   write_earg(launcher_in, &earg);
   fflush(launcher_in);
   
@@ -293,31 +349,29 @@ Process* launch_process (char* file, char** argvs){
   long pid = read_long(launcher_out);
   
   //Open pipes to child
-  int in = open_pipe(pipe_name, "_in", O_WRONLY);
-  int out = open_pipe(pipe_name, "_out", O_RDONLY);
-  int err = open_pipe(pipe_name, "_err", O_RDONLY);
-  FILE* fin = fdopen(in, "w");
-  if(fin == NULL) exit_with_error();
-  FILE* fout = fdopen(out, "r");
-  if(fout == NULL) exit_with_error();
-  FILE* ferr = fdopen(err, "r");
-  if(ferr == NULL) exit_with_error();
+  FILE* fin = NULL;
+  if(pipe_sources[PROCESS_IN] >= 0)
+    fin = open_file(open_pipe(pipe_name, "_in", O_WRONLY), "w");
+  FILE* fout = NULL;
+  if(pipe_sources[PROCESS_OUT] >= 0)
+    fout = open_file(open_pipe(pipe_name, "_out", O_RDONLY), "r");
+  FILE* ferr = NULL;
+  if(pipe_sources[PROCESS_ERR] >= 0)
+    ferr = open_file(open_pipe(pipe_name, "_err", O_RDONLY), "r");
   
   //Return process structure
-  Process* p = (Process*)malloc(sizeof(Process));
-  p->pid = pid;
-  p->in = fin;
-  p->out = fout;
-  p->err = ferr;
-  return p;
+  process->pid = pid;
+  process->in = fin;
+  process->out = fout;
+  process->err = ferr;
 }
 
 //============================================================
 //========================= Scratch ==========================
 //============================================================
 
-int main (void){
-  char* argvs[] = {"ls", NULL};
-  Process* p = launch_process("ls", argvs);
-  print_all(p->out);
-}
+///int main (void){
+///  char* argvs[] = {"ls", NULL};
+///  Process* p = launch_process("ls", argvs);
+///  print_all(p->out);
+///}
