@@ -44,6 +44,13 @@ void exit_with_error (){
   exit(-1);
 }
 
+int count_non_null (void** xs){
+  int n=0;
+  while(xs[n] != NULL)
+    n++;
+  return n;
+}
+
 char* string_join (char* a, char* b){
   int len = strlen(a) + strlen(b);
   char* buffer = (char*)malloc(len + 1);
@@ -68,102 +75,7 @@ void make_pipe (char* prefix, char* suffix){
 }
 
 //============================================================
-//==================== Process Creation ======================
-//============================================================
-
-void make_pipes (char* name){
-  int len = strlen(name);
-  char* buffer = (char*)malloc(len + 10);
-  sprintf(buffer, "%s_in", name);
-  mkfifo(buffer, S_IRUSR|S_IWUSR);
-  sprintf(buffer, "%s_out", name);
-  mkfifo(buffer, S_IRUSR|S_IWUSR);
-  sprintf(buffer, "%s_err", name);
-  mkfifo(buffer, S_IRUSR|S_IWUSR);
-}
-
-long fork_child (char* pipe, int (*f)(void*), void* arg){
-  //Fork
-  long pid = (long)fork();
-  if(pid < 0){
-    fprintf(stderr, "Could not fork.\n");
-    fprintf(stderr, "%s\n", strerror(errno));
-    exit(-1);
-  }
-
-  //If parent
-  if(pid > 0){
-    return pid;
-  }else{
-    dup2(open_pipe(pipe, "_in", O_RDONLY), 0);
-    dup2(open_pipe(pipe, "_out", O_WRONLY), 1);
-    dup2(open_pipe(pipe, "_err", O_WRONLY), 2);
-    exit(f(arg));
-  }
-}
-
-FILE* try_fdopen (int fd, char* mode){
-  FILE* ret = fdopen(fd, mode);
-  if(ret == NULL){
-    fprintf(stderr, "%s\n", strerror(errno));
-    exit(-1);
-  }
-  return ret;
-}
-
-Process make_process (long pid, char* pipe){
-  Process p = {
-    pid,
-    try_fdopen(open_pipe(pipe, "_in", O_WRONLY), "w"),
-    try_fdopen(open_pipe(pipe, "_out", O_RDONLY), "r"),
-    try_fdopen(open_pipe(pipe, "_err", O_RDONLY), "r")};
-  return p;
-}
-
-//Process make_process (char* in, char* out, char* err, int (*f)(void*), void* arg) {
-//  //File descriptors
-//  int READ = 0;
-//  int WRITE = 1;
-//  int ERR = 2;
-//  int afd[2];
-//  int bfd[2];
-//  int efd[2];
-//  //Parent writes to A, reads from B
-//  //Child reads from A, writes to B
-//
-//  //Make file descriptors
-//  if(pipe(afd) < 0 || pipe(bfd) < 0 || pipe(efd) < 0){
-//    fprintf(stderr, "Could not create pipes.\n");
-//    exit(-1);
-//  }
-//
-//  //Fork
-//  long pid = (long)fork();
-//  if(pid < 0){
-//    fprintf(stderr, "Could not fork.\n");
-//    exit(-1);
-//  }
-//
-//  //If parent
-//  if(pid > 0){
-//    close(afd[READ]);
-//    close(bfd[WRITE]);
-//    close(efd[WRITE]);
-//    Process p = {pid, afd[WRITE], bfd[READ], efd[READ]};
-//    return p;
-//  }else{
-//    close(afd[WRITE]);
-//    close(bfd[READ]);
-//    close(efd[READ]);
-//    dup2(afd[READ], 0);
-//    dup2(bfd[WRITE], 1);
-//    dup2(efd[WRITE], 2);
-//    exit(f(arg));
-//  }
-//}
-
-//============================================================
-//======================= Process Daemon =====================
+//======================= Serialization ======================
 //============================================================
 
 // ===== Serialization =====
@@ -177,12 +89,6 @@ void write_string (FILE* f, char* s){
   int n = strlen(s);
   write_int(f, n);
   fwrite(s, 1, n, f);
-}
-int count_non_null (void** xs){
-  int n=0;
-  while(xs[n] != NULL)
-    n++;
-  return n;
 }
 void write_strings (FILE* f, char** s){
   int n = count_non_null((void**)s);
@@ -252,42 +158,6 @@ void free_earg (EvalArg* arg){
   free(arg->argvs);
 }
 
-////===== Process Daemon =====
-//int eval_process (void* arg0){
-//  EvalArg* arg = arg0;
-//  return execvp(arg->file, arg->argvs);
-//}
-//
-//int process_daemon (void* dummy) {
-//  while(1){
-//    EvalArg* earg = read_earg(0);
-//    printf("read arg = %s\n", earg->file); fflush(stdout);
-//    //long pid = fork_child(earg->pipe, &eval_process, earg);
-//    //write(1, &pid, sizeof(long));
-//    //Process p = {42L, 42, 42, 42};
-//    // Process p = make_process(&eval_process, earg);
-//    // write_process(1, &p);
-//  }
-//}
-//
-//Process launcher_process;
-//void initialize_launcher_process (){
-//  make_pipes("pipe0");
-//  long pid = fork_child("pipe0", &process_daemon, NULL);
-//  printf("Id of launcher process = %ld\n", pid);
-//  launcher_process = make_process(pid, "pipe0");
-//}
-//
-//Process launch_process (EvalArg* arg){
-//  char* pipe = "pipe1";
-//  arg->pipe = pipe;
-//  make_pipes(pipe);
-//  write_earg(launcher_process.in, arg);
-//  fflush(launcher_process.in);
-//  long pid = read_long(launcher_process.out);
-//  return make_process(pid, pipe);
-//}
-
 //============================================================
 //==================== Process Queries =======================
 //============================================================
@@ -318,177 +188,7 @@ ProcessState process_state (Process p){
 }
 
 //============================================================
-//==================== Scratch ===============================
-//============================================================
-
-//int read_all (Process p){
-//  while(1){
-//    printf("Attempt a read\n");
-//    char buffer[100];
-//    char* ret = fgets(buffer, 100, p.out);
-//    if(ret == NULL){
-//      ProcessState s = process_state(p);
-//      if(s.state != PROCESS_RUNNING){
-//        printf("Process is done with exit code %d.\n", s.code);
-//        return 0;
-//      }
-//    }else{
-//      ret[strlen(ret) - 1] = '\0';
-//      printf("Read line: '%s'\n", buffer);
-//    }
-//  }
-//}
-
-//int main3 (void){
-//  Process p = make_process(&child_process, NULL);
-//  return read_all(p);
-//}
-//
-//int main2 (void){
-//  char* argvs[5];
-//  argvs[0] = "ls";
-//  argvs[1] = NULL;
-//  EvalArg eval_arg = {argvs[0], argvs};
-//  Process p = make_process(&eval_process, &eval_arg);
-//
-//  return read_all(p);
-//}
-
-//int main (void){  
-//  char* argvs[5];
-//  argvs[0] = "./child";
-//  argvs[1] = NULL;
-//  EvalArg eval_arg = {argvs[0], argvs};
-//  Process p = make_process(&eval_process, &eval_arg);
-//  while(1){
-//    //Ask number
-//    int i = rand() % 7;
-//    printf("Asking %d\n", i);
-//    fprintf(p.in, "%d\n\n", i);
-//    fflush(p.in);
-//
-//    //Get response
-//    char buffer[100];
-//    char* ret = fgets(buffer, 100, p.out);
-//    if(ret == NULL){
-//      printf("No response\n");
-//      ProcessState s = process_state(p);
-//      if(s.state != PROCESS_RUNNING){
-//        printf("Process is done with exit code %d.\n", s.code);
-//        return 0;
-//      }
-//    }else{
-//      ret[strlen(ret) - 1] = '\0';
-//      printf("Response: '%s'\n", ret);
-//    }
-//  }
-//}
-//
-//int main (void){
-//  //Step one
-//  initialize_launcher_process();
-//
-//  //Create eval argument
-//  char* argvs[5];
-//  argvs[0] = "./child";
-//  argvs[1] = NULL;
-//  EvalArg eval_arg = {"pipe", argvs[0], argvs};
-//  
-//  //Write the eval argument
-//  write_earg(launcher_process.in, &eval_arg);
-//  fflush(launcher_process.in);
-//
-//  char buffer[100];
-//  fgets(buffer, 100, launcher_process.out);
-//  printf("received %s\n", buffer);
-//  
-//  //Process p = launch_process(&eval_arg);
-//  //printf("p.id = %ld\n", p.pid);
-//  //printf("p.in = %d\n", p.in);
-//  return 0;
-//}
-
-
-//============================================================
-//============================================================
-//============================================================
-//
-//int launcher_main (int lin_fd, int lout_fd){
-//  //Open streams
-//  FILE* lin = fdopen(lin_fd, "r");
-//  if(lin == NULL) exit_with_error();
-//  FILE* lout = fdopen(lout_fd, "w");
-//  if(lout == NULL) exit_with_error();
-//  
-//  while(1){    
-//    printf("Read earg\n");
-//    EvalArg* earg = read_earg(lin);    
-//    printf("file = %s\n", earg->file);
-//    write_long(lout, 42L); fflush(lout);
-//  }
-//}
-//
-//FILE* launcher_in;
-//FILE* launcher_out;
-//void initialize_launcher_process (){
-//  //Create pipes
-//  int READ = 0;
-//  int WRITE = 1;
-//  int lin[2];
-//  int lout[2];
-//  if(pipe(lin) < 0) exit_with_error();
-//  if(pipe(lout) < 0) exit_with_error();
-//
-//  //Fork
-//  long pid = (long)fork();
-//  if(pid < 0) exit_with_error();
-//
-//  if(pid > 0){
-//    //parent
-//    close(lin[READ]);
-//    close(lout[WRITE]);
-//    launcher_in = fdopen(lin[WRITE], "w");
-//    if(launcher_in == NULL) exit_with_error();
-//    launcher_out = fdopen(lout[READ], "r");
-//    if(launcher_out == NULL) exit_with_error();
-//  }else{
-//    //child
-//    close(lin[WRITE]);
-//    close(lout[READ]);
-//    exit(launcher_main(lin[READ], lout[WRITE]));
-//  }
-//}
-//
-//void launch_eval (char* file, char** argvs){
-//  //Create eval argument
-//  EvalArg arg;
-//  arg.pipe = "pipe";
-//  arg.file = file;
-//  arg.argvs = argvs;
-//  //Write to daemon process
-//  printf("Write earg\n");
-//  write_earg(launcher_in, &arg);
-//  fflush(launcher_in);
-//  //Read back process id
-//  printf("Read back process\n");
-//  long pid = read_long(launcher_out);
-//  //Print out process id
-//  printf("Launched eval process %ld\n", pid);
-//
-//  printf("Finish Writing\n");
-//  write_earg(launcher_in, &arg);
-//  fflush(launcher_in);
-//}
-//
-//int main (void){
-//  initialize_launcher_process();
-//  
-//  char* argvs[] = {"./child", NULL};
-//  launch_eval("./child", argvs);
-//}
-
-//============================================================
-//============================================================
+//====================== Launcher Main =======================
 //============================================================
 
 //Daemon process for launching child processes
@@ -611,6 +311,10 @@ Process* launch_process (char* file, char** argvs){
   p->err = ferr;
   return p;
 }
+
+//============================================================
+//========================= Scratch ==========================
+//============================================================
 
 int main (void){
   char* argvs[] = {"ls", NULL};
