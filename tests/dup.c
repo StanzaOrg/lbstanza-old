@@ -4,9 +4,10 @@
 #include<string.h>
 #include<signal.h>
 #include<errno.h>
-#include <fcntl.h>
+#include<fcntl.h>
 #include<sys/types.h>
 #include<sys/stat.h>
+#include<sys/wait.h>
 
 //============================================================
 //=================== Structures =============================
@@ -441,14 +442,14 @@ void retrieve_process_state (long pid, ProcessState* s){
 //============================================================
 //========================= Scratch ==========================
 //============================================================
-
-int main (void){
-  char* argvs[] = {"./child", NULL};
-  Process p;
-  launch_process("./child", argvs, STANDARD_IN, STANDARD_OUT, STANDARD_ERR, &p);
-  printf("pid = %ld\n", p.pid);
-  
-  sleep(1);
-  ProcessState s; retrieve_process_state(p.pid, &s);
-  printf("State = %d, Code = %d\n", s.state, s.code);
-}
+//
+//int main (void){
+//  char* argvs[] = {"./child", NULL};
+//  Process p;
+//  launch_process("./child", argvs, STANDARD_IN, STANDARD_OUT, STANDARD_ERR, &p);
+//  printf("pid = %ld\n", p.pid);
+//  
+//  sleep(1);
+//  ProcessState s; retrieve_process_state(p.pid, &s);
+//  printf("State = %d, Code = %d\n", s.state, s.code);
+//}
