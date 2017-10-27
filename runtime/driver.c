@@ -432,37 +432,39 @@ long launcher_pid = -1;
 FILE* launcher_in = NULL;
 FILE* launcher_out = NULL;
 void initialize_launcher_process (){
-  //Create pipes
-  int READ = 0;
-  int WRITE = 1;
-  int lin[2];
-  int lout[2];
-  if(pipe(lin) < 0) exit_with_error();
-  if(pipe(lout) < 0) exit_with_error();
+  if(launcher_pid < 0){    
+    //Create pipes
+    int READ = 0;
+    int WRITE = 1;
+    int lin[2];
+    int lout[2];
+    if(pipe(lin) < 0) exit_with_error();
+    if(pipe(lout) < 0) exit_with_error();
 
-  //Fork
-  long pid = (long)fork();
-  if(pid < 0) exit_with_error();
+    //Fork
+    long pid = (long)fork();
+    if(pid < 0) exit_with_error();
 
-  if(pid > 0){
-    //Parent
-    launcher_pid = pid;
-    close(lin[READ]);
-    close(lout[WRITE]);
-    launcher_in = fdopen(lin[WRITE], "w");
-    if(launcher_in == NULL) exit_with_error();
-    launcher_out = fdopen(lout[READ], "r");
-    if(launcher_out == NULL) exit_with_error();
-  }
-  else{
-    //Child
-    close(lin[WRITE]);
-    close(lout[READ]);
-    FILE* fin = fdopen(lin[READ], "r");
-    if(fin == NULL) exit_with_error();
-    FILE* fout = fdopen(lout[WRITE], "w");
-    if(fout == NULL) exit_with_error();
-    launcher_main(fin, fout);
+    if(pid > 0){
+      //Parent
+      launcher_pid = pid;
+      close(lin[READ]);
+      close(lout[WRITE]);
+      launcher_in = fdopen(lin[WRITE], "w");
+      if(launcher_in == NULL) exit_with_error();
+      launcher_out = fdopen(lout[READ], "r");
+      if(launcher_out == NULL) exit_with_error();
+    }
+    else{
+      //Child
+      close(lin[WRITE]);
+      close(lout[READ]);
+      FILE* fin = fdopen(lin[READ], "r");
+      if(fin == NULL) exit_with_error();
+      FILE* fout = fdopen(lout[WRITE], "w");
+      if(fout == NULL) exit_with_error();
+      launcher_main(fin, fout);
+    }
   }
 }
 
@@ -470,8 +472,7 @@ void launch_process (char* file, char** argvs,
                      int input, int output, int error,
                      Process* process){
   //Initialize launcher if necessary
-  if(launcher_pid < 0)
-    initialize_launcher_process();
+  initialize_launcher_process();
   
   //Figure out unique pipe name
   char pipe_name[80];
