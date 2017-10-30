@@ -389,15 +389,44 @@ void launcher_main (FILE* lin, FILE* lout){
       EvalArg* earg = read_earg(lin);
       if(feof(lin)) exit(0);
 
+      //Create error-code pipe
+      int READ = 0;
+      int WRITE = 1;
+      int exec_error[2];
+      if(pipe(exec_error) < 0) exit_with_error();
+
       //Fork a new child
       long pid = (long)fork();
       if(pid < 0) exit_with_error();
 
       if(pid > 0){
-        //Return new process id
-        write_long(lout, pid);
-        fflush(lout);
+        //Read from error-code pipe
+        int exec_code;
+        close(exec_error[WRITE]);
+        int exec_r = read(exec_error[READ], &exec_code, sizeof(int));
+        close(exec_error[READ]);
+        
+        if(exec_r == 0){
+          //Exec evaluated successfully
+          //Return new process id
+          write_long(lout, pid);
+          fflush(lout);          
+        }
+        else if(exec_r == sizeof(int)){
+          //Exec evaluated unsuccessfully
+          //Return error code as negative long
+          write_long(lout, -exec_code);
+          fflush(lout);
+        }
+        else{
+          fprintf(stderr, "Unreachable code.");
+          exit(-1);
+        }
       }else{
+        //Close exec pipe read, and close write end on successful exec
+        close(exec_error[READ]);
+        fcntl(exec_error[WRITE], F_SETFD, FD_CLOEXEC);
+        
         //Open named pipes
         if(earg->in_pipe != NULL)
           dup2(open_pipe(earg->pipe, earg->in_pipe, O_RDONLY), 0);
@@ -405,10 +434,15 @@ void launcher_main (FILE* lin, FILE* lout){
           dup2(open_pipe(earg->pipe, earg->out_pipe, O_WRONLY), 1);
         if(earg->err_pipe != NULL)
           dup2(open_pipe(earg->pipe, earg->err_pipe, O_WRONLY), 2);
+        
         //Launch child process      
         execvp(earg->file, earg->argvs);
-        exit_with_error();
-      }      
+
+        //Unsuccessful exec, write error number
+        int error_code = errno;
+        write(exec_error[WRITE], &error_code, sizeof(int));
+        close(exec_error[WRITE]);
+      }
     }
     //Interpret state retrieval command
     else if(comm == STATE_COMMAND){
@@ -468,9 +502,9 @@ void initialize_launcher_process (){
   }
 }
 
-void launch_process (char* file, char** argvs,
-                     int input, int output, int error,
-                     Process* process){
+int launch_process (char* file, char** argvs,
+                    int input, int output, int error,
+                    Process* process){
   //Initialize launcher if necessary
   initialize_launcher_process();
   
@@ -506,8 +540,12 @@ void launch_process (char* file, char** argvs,
   write_earg(launcher_in, &earg);
   fflush(launcher_in);
   
-  //Read back process id
+  //Read back process id, and set errno if failed
   long pid = read_long(launcher_out);
+  if(pid < 0){
+    errno = (int)(- pid);
+    return -1;
+  }
   
   //Open pipes to child
   FILE* fin = NULL;
@@ -525,6 +563,7 @@ void launch_process (char* file, char** argvs,
   process->in = fin;
   process->out = fout;
   process->err = ferr;
+  return 0;
 }
 
 void retrieve_process_state (long pid, ProcessState* s){
