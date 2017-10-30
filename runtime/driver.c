@@ -195,6 +195,8 @@ typedef struct {
 #define PROCESS_ERR 5
 #define NUM_STREAM_SPECS 6
 
+#define RETURN_NEG(x) {int r=(x); if(r < 0) return -1;}
+
 //------------------------------------------------------------
 //-------------------- Utilities -----------------------------
 //------------------------------------------------------------
@@ -222,23 +224,14 @@ char* string_join (char* a, char* b){
 int open_pipe (char* prefix, char* suffix, int options){
   char* name = string_join(prefix, suffix);
   int fd = open(name, options);
-  if(fd < 0) exit_with_error();
   free(name);
   return fd;
 }
 
 //Creating a named pipe
-void make_pipe (char* prefix, char* suffix){
+int make_pipe (char* prefix, char* suffix){
   char* name = string_join(prefix, suffix);
-  int r = mkfifo(name, S_IRUSR|S_IWUSR);
-  if(r < 0) exit_with_error();
-}
-
-//Opening a file stream to a pipe
-FILE* open_file (int fd, char* mode) {
-  FILE* f = fdopen(fd, mode);
-  if(f == NULL) exit_with_error();
-  return f;
+  return mkfifo(name, S_IRUSR|S_IWUSR);
 }
 
 //------------------------------------------------------------
@@ -377,6 +370,13 @@ void get_process_state (long pid, ProcessState* s){
 #define LAUNCH_COMMAND 0
 #define STATE_COMMAND 1
 
+void write_error_and_exit (int fd){
+  int code = errno;
+  write(fd, &code, sizeof(int));
+  close(fd);
+  exit(-1);
+}
+
 void launcher_main (FILE* lin, FILE* lout){
   while(1){
     //Read in command
@@ -428,20 +428,27 @@ void launcher_main (FILE* lin, FILE* lout){
         fcntl(exec_error[WRITE], F_SETFD, FD_CLOEXEC);
         
         //Open named pipes
-        if(earg->in_pipe != NULL)
-          dup2(open_pipe(earg->pipe, earg->in_pipe, O_RDONLY), 0);
-        if(earg->out_pipe != NULL)
-          dup2(open_pipe(earg->pipe, earg->out_pipe, O_WRONLY), 1);
-        if(earg->err_pipe != NULL)
-          dup2(open_pipe(earg->pipe, earg->err_pipe, O_WRONLY), 2);
+        if(earg->in_pipe != NULL){
+          int fd = open_pipe(earg->pipe, earg->in_pipe, O_RDONLY);
+          if(fd < 0) write_error_and_exit(exec_error[WRITE]);
+          dup2(fd, 0);
+        }
+        if(earg->out_pipe != NULL){
+          int fd = open_pipe(earg->pipe, earg->out_pipe, O_WRONLY);
+          if(fd < 0) write_error_and_exit(exec_error[WRITE]);
+          dup2(fd, 1);
+        }
+        if(earg->err_pipe != NULL){
+          int fd = open_pipe(earg->pipe, earg->err_pipe, O_WRONLY);
+          if(fd < 0) write_error_and_exit(exec_error[WRITE]);
+          dup2(fd, 2);
+        }
         
         //Launch child process      
         execvp(earg->file, earg->argvs);
 
         //Unsuccessful exec, write error number
-        int error_code = errno;
-        write(exec_error[WRITE], &error_code, sizeof(int));
-        close(exec_error[WRITE]);
+        write_error_and_exit(exec_error[WRITE]);
       }
     }
     //Interpret state retrieval command
@@ -522,11 +529,11 @@ int launch_process (char* file, char** argvs,
   
   //Create pipes to child
   if(pipe_sources[PROCESS_IN] >= 0)
-    make_pipe(pipe_name, "_in");
+    RETURN_NEG(make_pipe(pipe_name, "_in"))
   if(pipe_sources[PROCESS_OUT] >= 0)
-    make_pipe(pipe_name, "_out");
+    RETURN_NEG(make_pipe(pipe_name, "_out"))
   if(pipe_sources[PROCESS_ERR] >= 0)
-    make_pipe(pipe_name, "_err");
+    RETURN_NEG(make_pipe(pipe_name, "_err"))
   
   //Write in command and evaluation arguments
   EvalArg earg = {pipe_name, NULL, NULL, NULL, file, argvs};
@@ -536,7 +543,7 @@ int launch_process (char* file, char** argvs,
   if(error == PROCESS_OUT) earg.err_pipe = "_out";
   if(error == PROCESS_ERR) earg.err_pipe = "_err";
   int r = fputc(LAUNCH_COMMAND, launcher_in);
-  if(r == EOF) exit_with_error();
+  if(r == EOF) return -1;
   write_earg(launcher_in, &earg);
   fflush(launcher_in);
   
@@ -549,14 +556,26 @@ int launch_process (char* file, char** argvs,
   
   //Open pipes to child
   FILE* fin = NULL;
-  if(pipe_sources[PROCESS_IN] >= 0)
-    fin = open_file(open_pipe(pipe_name, "_in", O_WRONLY), "w");
+  if(pipe_sources[PROCESS_IN] >= 0){
+    int fd = open_pipe(pipe_name, "_in", O_WRONLY);
+    RETURN_NEG(fd)
+    fin = fdopen(fd, "w");
+    if(fin == NULL) return -1;
+  }
   FILE* fout = NULL;
-  if(pipe_sources[PROCESS_OUT] >= 0)
-    fout = open_file(open_pipe(pipe_name, "_out", O_RDONLY), "r");
+  if(pipe_sources[PROCESS_OUT] >= 0){
+    int fd = open_pipe(pipe_name, "_out", O_RDONLY);
+    RETURN_NEG(fd)
+    fout = fdopen(fd, "r");
+    if(fout == NULL) return -1;
+  }
   FILE* ferr = NULL;
-  if(pipe_sources[PROCESS_ERR] >= 0)
-    ferr = open_file(open_pipe(pipe_name, "_err", O_RDONLY), "r");
+  if(pipe_sources[PROCESS_ERR] >= 0){
+    int fd = open_pipe(pipe_name, "_err", O_RDONLY);
+    RETURN_NEG(fd)
+    ferr = fdopen(fd, "r");
+    if(ferr == NULL) return -1;
+  }
   
   //Return process structure
   process->pid = pid;
