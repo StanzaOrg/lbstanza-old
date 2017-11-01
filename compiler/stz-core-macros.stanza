@@ -20,13 +20,6 @@ defn CSE (info:False|FileInfo, msg) :
 ;==================== Utilities =============================
 ;============================================================
 
-defstruct StructField :
-   name
-   type
-   as-method?: True|False
-   setter
-   box
-
 defstruct ForBinding :
   name:Symbol
   values:List
@@ -35,6 +28,161 @@ defn wrap-info (info:False|FileInfo, x) :
    match(info) :
       (info:FileInfo) : Token(x, info)
       (info:False) : x
+
+;============================================================
+;====================== Compilation =========================
+;============================================================
+
+deftype StructField
+defmulti bindings (s:StructField, sname:Token|Symbol) -> Tuple
+defmulti argument? (s:StructField) -> True|False|Symbol
+
+defn StructField (name:Token|Symbol,         ;Name of field
+                  type,                      ;Type of field
+                  as-method?:True|False,     ;Define as method?
+                  setter:Maybe,              ;Setter for field
+                  updater:Maybe,             ;Updater for field
+                  ensure:Maybe,              ;Precondition for field
+                  init:Maybe,                ;Initial value for field
+                  default:Maybe) :           ;Default value for field
+  val box = gensym(`box)                
+  new StructField :
+    defmethod argument? (this) :
+      match(init, default) :
+        (i:One, d) : false
+        (i, d:One) : `optional
+        (i, d) : true
+    defmethod bindings (this, sname:Token|Symbol) :
+     [`name => name
+      `type => type
+      `description => to-string("field %_/%_" % [sname, name])
+      `method? => choice(as-method?)
+      `box => gensym(name)
+      `setter? => choice(setter is One)
+      `setter => value?(setter)
+      `updater? => choice(updater is One)
+      `updater => value?(updater)
+      `ensure? => choice(ensure is One)
+      `ensure => value?(ensure)
+      `init-value => value?(init, value?(default))]
+
+defn gen-defstruct (sname:Token|Symbol,
+                    targs:List
+                    parent:Maybe
+                    fields:List<StructField>,
+                    constructor:Maybe) :
+  ;===== Bindings =====
+  val cargs = map(List{`@cap, _}, targs)
+  val field-bindings = map(bindings{_, sname}, fields)
+
+  ;===== Sub constructors =====
+  defn split-optional (bindings:List, num:Int) -> [Collection, Collection] :
+    val counter = to-seq(0 to false)
+    for (b in field-bindings, f in fields) split! :
+      val arg? = argument?(f)      
+      if arg? == `optional : next(counter) < num
+      else : arg? as True|False
+      
+  val num-optional = count({argument?(_) == `optional}, fields)
+  val sub-constructors = nested $
+    for n in 0 through num-optional map :
+      val [args, inits] = split-optional(field-bindings, n)
+      [`args => nested(args)
+       `inits => nested(inits)]
+       
+  val [main-args, main-inits] = split-optional(field-bindings, 0)
+
+  ;===== Fill Template =====
+  val template = `((
+    ;Class Definition
+    deftype Struct<TArgs> parent?{<: Parent}{}
+    
+    ;Multis
+    fields{method?{}{
+      defmulti name<CArgs> (x:Struct<CArgs>) -> type
+      setter?{defmulti setter<CArgs> (x:Struct<CArgs>, name:type) -> core/False}{}
+      updater?{defmulti updater<CArgs> (x:Struct<CArgs>, name:type) -> Struct<TArgs>}{}
+    }}
+
+    ;Determine whether we require sub-constructors
+    sub-constructors?{
+      ;Main Constructor
+      defn #Constructor<TArgs> (fields{name:type}) :
+        ;Ensure that fields satisfy preconditions
+        fields{ensure?{
+          #if-not-defined(OPTIMIZE) :
+            ensure(description, name)
+        }{}}
+        
+        ;Box all mutable fields
+        fields{setter?{var box:type = name}{}}
+        
+        ;Create object
+        new Struct<TArgs> :
+          fields{
+            setter?{
+              defmethod name (this) : box
+              defmethod setter (this, x:type) : box = x
+            }{
+              defmethod name (this) : name
+            }
+            updater?{
+              defmethod updater (this, name:type) :
+                #Constructor<TArgs>(fields{name})
+            }{}
+          }
+
+      ;Sub Constructors
+      sub-constructors{
+        defn Constructor<TArgs> (args{name:type}) :
+          inits{val name:type = init-value}
+          #Constructor<TArgs>(fields{name})
+      }
+    }{
+      ;Single Constructor
+      defn Constructor<TArgs> (args{name:type}) :
+        ;Initialize 
+        inits{val name:type = init-value}
+        
+        ;Ensure that fields satisfy preconditions
+        fields{ensure?{
+          #if-not-defined(OPTIMIZE) :
+            ensure(description, name)
+        }{}}
+        
+        ;Box all mutable fields
+        fields{setter?{var box:type = name}{}}
+        
+        ;Create object
+        new Struct<TArgs> :
+          fields{
+            setter?{
+              defmethod name (this) : box
+              defmethod setter (this, x:type) : box = x
+            }{
+              defmethod name (this) : name
+            }
+            updater?{
+              defmethod updater (this, name:type) :
+                Constructor<TArgs>(fields{name})
+            }{}
+          }
+    }))
+  fill-template(template, [
+    `Struct => sname
+    `parent? => choice(parent is One)
+    `Parent => value?(parent)
+    `#Constructor => gensym(sname)
+    `Constructor => value?(constructor, sname)
+    `TArgs => splice(targs)
+    `CArgs => splice(cargs)
+    `fields => nested(field-bindings)
+    `x => gensym(`x)
+    `sub-constructors? => choice(num-optional > 0)
+    `sub-constructors => sub-constructors
+    `args => nested(main-args)
+    `inits => nested(main-inits)
+    ])
 
 ;============================================================
 ;================= Core Syntax Package ======================
@@ -77,8 +225,18 @@ defsyntax core :
    public defproduction lexer-tag: Symbol|Token      
    defrule lexer-tag = (?x) when lexer-tag?(x) : x
 
+   ;                   Primitives
+   ;                   ==========
+   defproduction bool : Token|True|False
+   defrule bool = (?v:true) : v
+   defrule bool = (?v:false) : v
+
    ;                Error Handling
    ;                ==============
+
+   defproduction bool! : Token|True|False
+   defrule bool! = (?v:#bool) : v
+   fail-if bool! = () : CSE(closest-info(), "Expected a true/false value here.")
 
    public defproduction type!
    public defproduction type$
@@ -1078,141 +1236,62 @@ defsyntax core :
 
    ;                      DefStruct
    ;                      =========
-   defn parse-struct-field (info:False|FileInfo, name, type, ops, vs) :
-      val options = map(KeyValue, ops, vs)
-      val setter = unwrap-token(lookup?(options, `setter))
-      if setter is-not Symbol|False :
-         throw(CSE(info, "Setter name is expected to be either false or a symbol."))
-      val as-method? = unwrap-token(lookup?(options, `as-method))
-      if as-method? is-not True|False :
-         throw(CSE(info, "As-method option is expected to be either true or false."))
-      StructField(name, type, as-method?, setter, gensym(name))
+   defrule exp4 = (defstruct ?name:#id! ?targs:#struct-targs ?parent:#struct-parent
+                   ?fields:#struct-fields ?options:#struct-options) :
+     val constructor = lookup?(options, `constructor, None())
+     parse-syntax[core / #exp](
+       gen-defstruct(name, targs, parent, fields, constructor))
 
-   defn gen-struct-exp (sname, targs, parent,
-                        fields:List<StructField>,
-                        options:List<KeyValue<Symbol, ?>>) :
-      val template = `((
-         class-def{
-            deftype Name<Targs>
-         }{
-            deftype Name<Targs> <: Parent
-         }
-         getter-multis{
-            defmulti field<Cargs> (x: Name<Cargs>) -> type
-         }
-         setter-multis{
-            defmulti set-field<Cargs> (x: Name<Cargs>, field:type) -> core/False
-         }
-         defn Constructor<Targs> (args{field : type}) :
-            boxes{
-               var @field : type = field
-            }
-            new Name<Targs> :
-               getters{
-                  defmethod field (this) : value
-               }
-               setters{
-                  defmethod set-field (this, field:type) :
-                     @field = field
-               }))
-               
-      parse-syntax[core / #exp](         
-         fill-template(template, [
-            `class-def => choice(unwrap-token(parent) is False)
-            `Name => sname
-            `Constructor => lookup?(options, `constructor, sname)
-            `Targs => splice(targs)
-            `Cargs => splice $ for v in targs map :
-                         List(`@cap, v)
-            `Parent => parent
-            `getter-multis => nested $ to-list $ generate :
-               for f in fields do :
-                  if not as-method?(f) :
-                     yield $ [`field => name(f)
-                              `type => type(f)]
-            `setter-multis => nested $ to-list $ generate :
-               for f in fields do :
-                  if (not as-method?(f)) and setter(f) != false :
-                     yield $ [`set-field => setter(f)
-                              `field => name(f)
-                              `type => type(f)]
-            `args => nested $
-               for f in fields map :
-                  [`field => name(f)
-                   `type => type(f)]
-            `boxes => nested $ to-list $ generate :
-               for f in fields do :
-                  if setter(f) != false :
-                     yield $ [`@field => box(f)
-                              `type => type(f)
-                              `field => name(f)]
-            `getters => nested $
-               for f in fields map :
-                  [`field => name(f)
-                   `value => if setter(f) is False : name(f)
-                             else : box(f)]
-            `setters => nested $ to-list $ generate :
-               for f in fields do :
-                  if setter(f) != false :
-                     yield $ [`set-field => setter(f)
-                              `@field => box(f)
-                              `field => name(f)
-                              `type => type(f)]]))
+   defproduction struct-targs:List
+   defrule struct-targs = ((@of ?xs:#id! ...)) : xs
+   defrule struct-targs = () : List()
 
-   defproduction struct-name! : [Symbol|Token, List<Symbol|Token>]  
-   defrule struct-name! = (?name:#id!<?targs:#id! ...>) :
-      [name, targs]
-   defrule struct-name! = (?name:#id!) :
-      [name, List()]
-   fail-if struct-name! = () :
-      CSE(closest-info(), "Expected name for struct here.")
+   defproduction struct-fields:List<StructField>
+   defrule struct-fields = (: (?fs:#struct-field! ...)) : fs
+   defrule struct-fields = () : List()
 
-   defproduction struct-parent
-   defrule struct-parent = (<: ?parent:#type!) : parent
-   defrule struct-parent = () : false
+   defproduction struct-parent:Maybe
+   defrule struct-parent = (<: ?p:#type!) : One(p)
+   defrule struct-parent = () : None()
 
-   defproduction struct-field! : StructField
-   defproduction field-option: Symbol
-   defrule field-option = (?x: (as-method | setter)) : unwrap-token(x)
-   
-   defrule struct-field! = (?name:#id! : ?type:#type! with #:! (
-                              (?ops:#field-option => ?vs) @...
-                              ?rest ...)) :
-      if not empty?(rest) :
-         throw(CSE(closest-info(rest), "Invalid struct field option."))
-      parse-struct-field(closest-info(), name, type, ops, vs)
-
-   defrule struct-field! = (?name:#id! with #:! (
-                              (?ops:#field-option => ?vs) @...
-                              ?rest ...)) :
-      if not empty?(rest) :
-         throw(CSE(closest-info(rest), "Invalid struct field option."))
-      parse-struct-field(closest-info(), name, `?, ops, vs)
-   defrule struct-field! = (?name:#id! : ?type:#type!) :
-      parse-struct-field(closest-info(), name, type, List(), List())
-   defrule struct-field! = (?name:#id!) :
-      parse-struct-field(closest-info(), name, `?, List(), List())
-   fail-if struct-field! = () :
-      CSE(closest-info(), "Expected struct field declaration here.")
-
-   defproduction struct-option! : KeyValue<Symbol,?>
-   defrule struct-option! = (constructor => ?name:#id!) :
-      `constructor => name
-   fail-if struct-option! = () :
-      CSE(closest-info(), "Expected struct option declaration here.")
-
-   defproduction struct-options: List<KeyValue<Symbol,?>>
-   defrule struct-options = (with #:! (?ops:#struct-option! ...)) : ops
+   defproduction struct-options:List<KeyValue<Symbol,?>>
+   defrule struct-options = (with: (?options:#struct-option! ...)) : options
    defrule struct-options = () : List()
 
-   defrule exp4 = (defstruct ?struct-name:#struct-name! ?parent:#struct-parent :
-                      ?fields:#struct-field! ...
-                   ?ops:#struct-options) :
-      val [name, targs] = struct-name
-      gen-struct-exp(name, targs, parent, fields, ops)
-   defrule exp4 = (defstruct ?struct-name:#struct-name! ?parent:#struct-parent ?ops:#struct-options) :
-      val [name, targs] = struct-name
-      gen-struct-exp(name, targs, parent, List(), ops)
+   defproduction struct-option!:KeyValue<Symbol,?>
+   defrule struct-option! = (constructor => ?name:#id!) : `constructor => One(name)
+   fail-if struct-option! = () : CSE(closest-info(), "Expected struct option declaration here.")
+
+   defproduction struct-field!:StructField
+   defrule struct-field! = (?name:#id! ?t:#field-type ?ops:#field-options) :
+     val init = lookup?(ops, `init, None())
+     val default = lookup?(ops, `default, None())
+     match(init:One, default:One) :
+       throw(CSE(closest-info(), "A field cannot have both an initialization and a default value."))
+     StructField(name, t,
+       lookup?(ops, `as-method),
+       lookup?(ops, `setter, None()),
+       lookup?(ops, `updater, None()),
+       lookup?(ops, `ensure, None()),
+       init, default)
+   fail-if struct-field! = () : CSE(closest-info(), "Expected a field declaration here.")
+
+   defproduction field-type
+   defrule field-type = (: ?t:#type!) : t
+   defrule field-type = () : `?
+
+   defproduction field-options:List<KeyValue<Symbol,?>>
+   defrule field-options = (with: (?options:#field-option! ...)) : options
+   defrule field-options = () : List()
+
+   defproduction field-option!:KeyValue<Symbol,?>
+   defrule field-option! = (as-method => ?v:#bool!) : `as-method => unwrap-token(v)
+   defrule field-option! = (setter => ?v:#id!) : `setter => One(v)
+   defrule field-option! = (updater => ?v:#id!) : `updater => One(v)
+   defrule field-option! = (init => ?v:#exp!) : `init => One(v)
+   defrule field-option! = (default => ?v:#exp!) : `default => One(v)
+   defrule field-option! = (ensure => ?v:#exp!) : `ensure => One(v)
+   fail-if field-option! = () : CSE(closest-info(), "Expected a field option declaration here.")
 
    defrule id != (defstruct)
 
