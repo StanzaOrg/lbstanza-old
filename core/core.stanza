@@ -449,77 +449,173 @@ lostanza defn info-entry (p:ptr<?>) -> ptr<FileInfoEntry> :
   return null
 
 ;============================================================
+;=================== Smoothing Array ========================
+;============================================================
+
+lostanza deftype SmoothingArray :
+  length: long
+  index: long
+  total: long
+  data: long ...
+  
+lostanza defn SmoothingArray (n:ref<Int>) -> ref<SmoothingArray> :
+  val len = n.value as long
+  val a = new SmoothingArray{len, 0, 0}
+  for (var i:long = 0, i < len, i = i + 1) :
+    a.data[i] = 0
+  return a
+
+lostanza defn add (a:ref<SmoothingArray>, v:long) -> long :
+  val old = a.data[a.index]
+  a.data[a.index] = v
+  a.total = a.total - old + v
+  a.index = a.index - 1
+  if a.index < 0 : a.index = a.length - 1
+  return a.total
+
+;============================================================
 ;=============== Garbage Collector ==========================
 ;============================================================
 
 ;              Generated Entry Points
 ;              ======================
 
+;Time counters
+val gc-times = SmoothingArray(4)
+val compute-times = SmoothingArray(4)
+val extend-stack-counts = SmoothingArray(4)
+lostanza var last-gc-time:long = call-c clib/current_time_ms()
+
 ;Called when attempting to allocate beyond the heap limit.
 lostanza defn extend-heap (sz:long) -> int :
-   if gc-running :
-      fatal!("Heap access within garbage collector")
-   else :
-      run-garbage-collector()
-      val new-size = enlarged-size(sz)
-      if new-size < 0 :
-         val sp = current-stack-pos(call-prim stack(), call-prim sp())
-         fatal!("Out of Memory", sp)
-      else if new-size != mem-size : enlarge-heap(new-size)
+  ;Precondition
+  if gc-running :
+    fatal!("Heap access within garbage collector")
+    
+  ;Count as heap extension
+  val num-stack-counts = add(extend-stack-counts, 0)
+
+  labels :
+    loop :
+      ;Measure time since last gc
+      val time-now = call-c clib/current_time_ms()
+      val time-since = time-now - last-gc-time
+      val time-gc = run-garbage-collector()
+
+      ;Retrieve smoothed times
+      val smoothed-time-gc = add(gc-times, time-gc)
+      val smoothed-time-since = add(compute-times, time-since)
+
+      ;Measure minimum heap size
+      val min-mem-size = call-prim heap() - heap-mem + sz 
+
+      ;DEBUG
+      ;call-c clib/printf("Extend heap(%ld)\n", sz)
+      ;call-c clib/printf("Smoothed time since = %ldms\n", smoothed-time-since)
+      ;call-c clib/printf("Smoothed time GC = %ldms\n", smoothed-time-gc)
+      ;call-c clib/printf("min-mem-size = %ld\n", min-mem-size)
+      ;call-c clib/printf("mem-size = %ld\n", mem-size)
+      ;call-c clib/printf("num-stack-counts = %ld\n", num-stack-counts)
+
+      ;Enlarge the heap if
+      ;  1. spending more time in gc than computing, or
+      ;  2. we've requested more space than we have
+      if (smoothed-time-gc > smoothed-time-since and num-stack-counts < 3) or min-mem-size > mem-size :
+        val success = enlarge-heap(min-mem-size)
+        ;If not successful and it was necessary, then out of memory.
+        if success == 0 and min-mem-size > mem-size :
+          val sp = current-stack-pos(call-prim stack(), call-prim sp())
+          fatal!("Out of Memory", sp)
+        
+      ;Start measuring again
+      last-gc-time = call-c clib/current_time_ms()
+
+      ;Run notifiers
       run-gc-notifiers()
-   return 0
 
-lostanza defn enlarged-size (sz:long) -> long :
-   ;Case 1: Out of memory
-   val min-mem-size = call-prim heap() + sz - heap-mem
-   if min-mem-size > max-mem-size :
-      return -1
+      ;Check whether notifiers broke invariant
+      if call-prim heap() + sz > call-prim heap-limit() :
+        goto loop      
 
-   ;Case 2: Safe mem size
-   val safe-mem-size = mem-size >>> 1
-   if min-mem-size <= safe-mem-size :
-      return mem-size
-
-   ;Case 3: Enlarged size
-   var new-size:long = mem-size * 2
-   while new-size < min-mem-size :
-      new-size = new-size * 2
-   return min(new-size, max-mem-size)
+  ;Done
+  return 0
 
 lostanza defn min (a:long, b:long) -> long :
    if a < b : return a
    else : return b
 
-lostanza defn enlarge-heap (size:long) -> int :
-   ;Set new size
-   mem-size = size
+lostanza defn enlarge-heap (min-mem-size:long) -> int :
+  ;Compute desired size
+  var desired-size:long = mem-size * 2
+  while desired-size < min-mem-size :
+    desired-size = desired-size * 2
+  if desired-size > max-mem-size :
+    return 0
 
-   ;Enlarge freespace
-   call-c clib/free(free-mem)
-   free-mem = call-c clib/malloc(mem-size)
+  ;Set new size
+  mem-size = desired-size
 
-   ;Copy to enlarged freespace
-   run-garbage-collector()
+  ;Enlarge freespace
+  call-c clib/free(free-mem)
+  free-mem = call-c clib/malloc(mem-size)
 
-   ;Enlarge the new freespace to match the new heapspace
-   call-c clib/free(free-mem)
-   free-mem = call-c clib/malloc(mem-size)
-   return 0
+  ;Copy to enlarged freespace
+  run-garbage-collector()
+
+  ;Enlarge the new freespace to match the new heapspace
+  call-c clib/free(free-mem)
+  free-mem = call-c clib/malloc(mem-size)
+
+  ;Successfully enlarged
+  return 1
 
 ;Called when the number of free stacks is 2 or less.
 ;Running extend-stack uses two stacks (1 for GC, 1 for handling extend-stack during GC).
 lostanza defn extend-stack () -> int :
+  ;Precondition
   if gc-running :
     fatal!("Stack overflow in garbage collector")
-  else :
-    run-garbage-collector()
-    if call-prim num-free-stacks() <= 2 :
-      if enlarge-stack-pool() == 0 :
-        val sp = current-stack-pos(call-prim stack(), call-prim sp())
-        fatal!("Stack overflow", sp)
-    run-gc-notifiers()
 
-  ;Return
+  ;Count as stack extension
+  val num-stack-counts = add(extend-stack-counts, 1)
+
+  ;Measure time since last gc
+  val time-now = call-c clib/current_time_ms()
+  val time-since = time-now - last-gc-time
+  val time-gc = run-garbage-collector()
+
+  ;Retrieve smoothed times
+  val smoothed-time-gc = add(gc-times, time-gc)
+  val smoothed-time-since = add(compute-times, time-since)
+
+  ;Enlarge stack pool
+  val num-free-stacks = call-prim num-free-stacks()
+
+  ;DEBUG
+  ;call-c clib/printf("Extend stack\n")
+  ;call-c clib/printf("Smoothed time since = %ldms\n", smoothed-time-since)
+  ;call-c clib/printf("Smoothed time GC = %ldms\n", smoothed-time-gc)
+  ;call-c clib/printf("num-stacks = %d\n", num-stacks)
+  ;call-c clib/printf("num-free-stacks = %d\n", num-free-stacks)
+  ;call-c clib/printf("num-stack-counts = %ld\n", num-stack-counts)
+
+  ;Enlarge the stack if
+  ;  1. spending more time in gc than computing, or
+  ;  2. we've requested more stack than we have
+  if (smoothed-time-gc > smoothed-time-since and num-stack-counts >= 3) or num-free-stacks <= 2 :
+    val success = enlarge-stack-pool()
+    ;If not successful and it was necessary, then stack overflow.
+    if success == 0 and num-free-stacks <= 2 :
+      val sp = current-stack-pos(call-prim stack(), call-prim sp())
+      fatal!("Stack overflow", sp)
+
+  ;Start measuring again
+  last-gc-time = call-c clib/current_time_ms()
+
+  ;Run notifiers
+  run-gc-notifiers()
+
+  ;Done
   return 0
 
 ;                   Main Function
@@ -528,9 +624,12 @@ lostanza defn extend-stack () -> int :
 ;Main function for garbage collector
 lostanza var gc-running:long = 0
 lostanza var tracker-chain:ref<False|LivenessTracker>
-lostanza defn run-garbage-collector () -> int :   
+lostanza defn run-garbage-collector () -> long :   
    ;Run in new stack
    ($ls-prim last-stack)
+
+   ;Get starting time   
+   val time-start = call-c clib/current_time_ms()
 
    ;Mark GC as running to detect stack extension within GC
    gc-running = 1
@@ -566,9 +665,13 @@ lostanza defn run-garbage-collector () -> int :
    ;All active stacks have their mark bits set.
    free-unmarked-stacks()
 
+   ;Get ending time
+   val time-end = call-c clib/current_time_ms()
+   val time-elapsed = time-end - time-start
+
    ;Finish
    gc-running = 0
-   return 0
+   return time-elapsed
 
 
 ;                    Notifiers
