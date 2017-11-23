@@ -73,4 +73,4 @@ $STANZA \
     compiler/stz-driver.stanza \
   -s $OUT.s \
   -o $OUT \
-  -optimize
+  -optimize \
