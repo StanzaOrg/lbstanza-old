@@ -546,14 +546,7 @@ int launch_process (char* file, char** argvs,
   if(r == EOF) return -1;
   write_earg(launcher_in, &earg);
   fflush(launcher_in);
-  
-  //Read back process id, and set errno if failed
-  long pid = read_long(launcher_out);
-  if(pid < 0){
-    errno = (int)(- pid);
-    return -1;
-  }
-  
+
   //Open pipes to child
   FILE* fin = NULL;
   if(pipe_sources[PROCESS_IN] >= 0){
@@ -576,6 +569,13 @@ int launch_process (char* file, char** argvs,
     ferr = fdopen(fd, "r");
     if(ferr == NULL) return -1;
   }
+  
+  //Read back process id, and set errno if failed
+  long pid = read_long(launcher_out);
+  if(pid < 0){
+    errno = (int)(- pid);
+    return -1;
+  } 
   
   //Return process structure
   process->pid = pid;
