@@ -135,9 +135,17 @@ int64_t file_write_block (FILE* f, char* data, int64_t len) {
     //(Over)write the environment variable.
     char* buffer = (char*)malloc(strlen(name) + strlen(value) + 10);
     sprintf(buffer, "%s=%s", name, value);
-    _putenv(buffer);
+    int r = _putenv(buffer);
     free(buffer);
-    return 0;
+    return r;
+  }
+
+  int unsetenv (char* name){
+    char* buffer = (char*)malloc(strlen(name) + 10);
+    sprintf(buffer, "%s=", name);
+    int r = _putenv(buffer);
+    free(buffer);
+    return r;
   }
 #endif
 
