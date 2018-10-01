@@ -8,7 +8,7 @@ defpackage stz/vm :
 ;============================================================
 
 public defstruct VMProg :
-  ins: Tuple<VMIns>
+  funcs: Tuple<VMFunc>
 
 public deftype VMImm
 public defstruct Reg <: VMImm :
@@ -23,6 +23,12 @@ public defstruct VMInt <: VMType
 public defstruct VMDouble <: VMType
 public defstruct VMRef <: VMType
 public defstruct VMPointer <: VMType
+
+public defstruct VMFunc :
+  id: Int
+  args: Tuple<VMType>
+  num-reg: Int
+  ins: Tuple<VMIns>
 
 public deftype VMIns
 public defstruct SetIns <: VMIns :
@@ -47,6 +53,7 @@ public defstruct Branch2Ins <: VMIns :
   x: VMImm
   y: VMImm
 public defstruct ReturnIns <: VMIns 
+public defstruct NoOpIns <: VMIns
 
 public deftype VMOp
 public defstruct AddOp <: VMOp : (type:VMType)
@@ -78,9 +85,15 @@ public defstruct NegOp <: VMOp : (type:VMType)
 ;============================================================
 
 defmethod print (o:OutputStream, p:VMProg) :
-  for (ins in ins(p), i in 0 to false) do :
-    print(o, '\n') when i > 0
-    print(o, ins)
+  for (f in funcs(p), i in 0 to false) do :
+    if i == 0 : print(o, f)
+    else : lnprint(o, f)
+
+defmethod print (o:OutputStream, f:VMFunc) :
+  print(o, "func %_ (%,) :" % [id(f), args(f)])
+  val o2 = IndentedStream(o)
+  lnprint(o2, "num-reg = %_" % [num-reg(f)])
+  do(lnprint{o2, _}, ins(f))
 
 defmethod print (o:OutputStream, x:VMImm) :
   print{o, _} $ match(x) :
@@ -97,6 +110,7 @@ defmethod print (o:OutputStream, i:VMIns) :
     (i:GotoIns) : "goto %_" % [n(i)]
     (i:Branch2Ins) : "goto %_ when %_ %_ %_" % [n(i), op(i), x(i), y(i)]
     (i:ReturnIns) : "return"
+    (i:NoOpIns) : "noop"
 
 defmethod print (o:OutputStream, op:VMOp) :
   print(o, "%_ " % [type(op as ?)])
@@ -132,6 +146,10 @@ defmethod print (o:OutputStream, t:VMType) :
     (t:VMRef) : "ref"
     (t:VMPointer) : "ptr"
 
+defn lnprint (o:OutputStream, x) :
+  print(o, '\n')
+  print(o, x)
+
 ;============================================================
 ;======================= Reader =============================
 ;============================================================
@@ -164,7 +182,6 @@ defsyntax vmcode :
   defrule op2 = (?t:#type ugt) : UgtOp(t)
   defrule op2 = (?t:#type uge) : UgeOp(t)
 
-
   defproduction type : VMType
   defrule type = (int) : VMInt()
   defrule type = (double) : VMDouble()
@@ -194,8 +211,14 @@ defsyntax vmcode :
   defrule ins = (goto ?n:#int!) : GotoIns(n)
   defrule ins = (return) : ReturnIns()
 
+  defproduction func : VMFunc
+  defrule func = (func ?id:#int! (?args:#type! ...) :
+                    num-regs = ?nreg:#int!
+                    ?ins:#ins! ...) :
+    VMFunc(id, to-tuple(args), nreg, to-tuple(ins))
+
   public defproduction prog : VMProg
-  defrule prog = (?ins:#ins! ...) : VMProg(to-tuple(ins))
+  defrule prog = (?funcs:#func! ...) : VMProg(to-tuple(funcs))
 
   ;===== Primitives =====
   defproduction int : Int
@@ -214,6 +237,14 @@ defsyntax vmcode :
   defrule ins! = (?x:#ins) : x
   fail-if ins! = () : VME(closest-info(), "Expected an instruction here.")
 
+  defproduction func! : VMFunc
+  defrule func! = (?x:#func) : x
+  fail-if func! = () : VME(closest-info(), "Expected a function here.")
+
+  defproduction type! : VMType
+  defrule type! = (?x:#type) : x
+  fail-if type! = () : VME(closest-info(), "Expected a type here.")
+
 ;============================================================
 ;====================== Errors ==============================
 ;============================================================
@@ -230,19 +261,75 @@ defmethod print (o:OutputStream, e:VMError) :
   print-all(o, [info-str, msg(e)])
 
 ;============================================================
+;================ Overall Instruction Buffer ================
+;============================================================
+deftype InsBuffer
+defmulti get (b:InsBuffer, i:Int) -> VMIns
+defmulti set (b:InsBuffer, i:Int, ins:VMIns) -> False
+defmulti alloc (b:InsBuffer, size:Int) -> Int
+defmulti free (b:InsBuffer, n:Int) -> False
+
+defn InsBuffer () :
+  val v = Vector<VMIns>()
+  val segments = IntTable<InsSegment>()
+  new InsBuffer :
+    defmethod get (this, i:Int) :
+      v[i]
+    defmethod set (this, i:Int, ins:VMIns) :
+      v[i] = ins
+    defmethod alloc (this, size:Int) -> Int :
+      val pos = length(v)
+      lengthen(v, length(v) + size, NoOpIns())
+      segments[pos] = InsSegment(size)
+      pos
+    defmethod free (this, n:Int) -> False :
+      fatal("Not yet implemented")
+
+defstruct InsSegment :
+  size: Int      
+
+;============================================================
 ;==================== Interpretation ========================
 ;============================================================
 
 defn ensure-length<?T> (v:Vector<?T>, len:Int, x:T) :
   lengthen(v, len, x) when length(v) < len
 
+defstruct FuncRecord :
+  id: Int
+  args: Tuple<VMType>
+  num-reg: Int
+  pos: Int
+
 public defn interpret (prog:VMProg) :
-  ;Load jump table
-  val jump-table = Vector<Int>()
-  for (ins in ins(prog), i in 0 to false) do :
-    match(ins:LabelIns) :
-      ensure-length(jump-table, n(ins), -1)
-      jump-table[n(ins)] = i
+  ;Instruction buffer
+  val buffer = InsBuffer()
+  val func-records = IntTable<FuncRecord>()
+
+  ;Load a function into the VM
+  defn load-function (f:VMFunc) :
+    val pos = alloc(buffer, length(ins(f)))
+    val labels = IntTable<Int>()
+    within (delay) = with-delay() :
+      let loop (src:Int = 0, dst:Int = pos) :
+        if src < length(ins(f)) :
+          match(ins(f)[src]) :
+            (ins:LabelIns) :
+              labels[n(ins)] = dst
+              loop(src + 1, dst)
+            (ins:GotoIns) :
+              delay $ fn () :
+                buffer[dst] = GotoIns(labels[n(ins)])
+              loop(src + 1, dst + 1)
+            (ins:Branch2Ins) :
+              delay $ fn () :
+                buffer[dst] = Branch2Ins(labels[n(ins)], op(ins), x(ins), y(ins))
+              loop(src + 1, dst + 1)
+            (ins) :
+              buffer[dst] = ins
+              loop(src + 1, dst + 1)
+    func-records[id(f)] = FuncRecord(id(f), args(f), num-reg(f), pos)
+  do(load-function, funcs(prog))
 
   ;Define registers
   val registers = Vector<?>()
@@ -286,41 +373,54 @@ public defn interpret (prog:VMProg) :
       (op:UgtOp) : fatal("Not yet supported")
       (op:UgeOp) : fatal("Not yet supported")
 
-  defn assign (r:Reg, v) :
-    ensure-length(registers, index(r), false)
-    registers[index(r)] = v
-
   ;Interpretation loop
-  let loop (i:Int = 0) :
-    val ins = ins(prog)[i]
+  defn* run (i:Int) :
+    ;Assign a value to a register
+    defn* assign (r:Reg, v) :
+      registers[index(r)] = v
+
+    val ins = buffer[i]
     println("Trace: %_" % [ins])
     match(ins) :
       (ins:SetIns) :
         assign(x(ins), eval(y(ins)))
-        loop(i + 1)
+        run(i + 1)
       (ins:Op1Ins) :
         assign(x(ins), eval(op(ins), eval(y(ins))))
-        loop(i + 1)
+        run(i + 1)
       (ins:Op2Ins) :
         assign(x(ins), eval(op(ins), eval(y(ins)), eval(z(ins))))
-        loop(i + 1)
+        run(i + 1)
       (ins:LabelIns) :
-        loop(i + 1)
+        run(i + 1)
       (ins:GotoIns) :
-        loop(jump-table[n(ins)])
+        run(n(ins))
       (ins:Branch2Ins) :
-        if eval-pred(op(ins), eval(x(ins)), eval(y(ins))) : loop(jump-table[n(ins)])
-        else : loop(i + 1)
+        val pred = eval-pred(op(ins), eval(x(ins)), eval(y(ins)))
+        if pred : run(n(ins))
+        else : run(i + 1)
       (ins:ReturnIns) :
         false
+  defn* run-func (f:Int) :
+    val rec = func-records[f]
+    lengthen(registers, num-reg(rec), false)
+    run(pos(rec))
 
   ;Print result of registers
+  run-func(0)
   for (v in registers, i in 0 to false) do :
     println("R%_ = %_" % [i, v])
   
-  
+;============================================================
+;==================== Utilities =============================
+;============================================================
 
-  
+defn with-delay<?T> (f:((() -> ?) -> False) -> ?T) :
+  val delays = Vector<(() -> ?)>()
+  defn* delay (x:() -> ?) : add(delays, x)
+  val result = f(delay)
+  for d in delays do : d()
+  result
 
 ;============================================================
 ;=================== Scratch Pad ============================
