@@ -30,7 +30,7 @@ public defstruct VMPointer <: VMType
 public defstruct VMFunc :
   id: Int
   args: Tuple<VMType>
-  num-reg: Int
+  local-size: Int
   ins: Tuple<VMIns>
 
 public deftype VMClass
@@ -53,9 +53,8 @@ public defstruct VMAbstractClass <: VMClass :
 public deftype VMIns
 public defstruct CallIns <: VMIns :
   fid: Int
-  x: Reg
 public defstruct CallClosureIns <: VMIns :
-  x: Reg
+  x: VMImm
 public defstruct SetIns <: VMIns :
   x: Reg
   y: VMImm
@@ -98,6 +97,14 @@ public defstruct RefGetIns <: VMIns :
   x: Reg
   y: VMImm
   z: VMImm
+public defstruct GetLocalIns <: VMIns :
+  x: Reg
+  type: VMType
+  offset: Int
+public defstruct SetLocalIns <: VMIns :
+  type: VMType
+  offset: Int
+  x: VMImm
 public defstruct ReturnIns <: VMIns 
 public defstruct NoOpIns <: VMIns
 
@@ -139,7 +146,7 @@ defmethod print (o:OutputStream, p:VMProg) :
 defmethod print (o:OutputStream, f:VMFunc) :
   print(o, "func %_ (%,) :" % [id(f), args(f)])
   val o2 = IndentedStream(o)
-  lnprint(o2, "num-reg = %_" % [num-reg(f)])
+  lnprint(o2, "local-size = %_" % [local-size(f)])
   do(lnprint{o2, _}, ins(f))
   
 defmethod print (o:OutputStream, c:VMAbstractClass) :
@@ -160,7 +167,7 @@ defmethod print (o:OutputStream, x:VMImm) :
   
 defmethod print (o:OutputStream, i:VMIns) :
   print{o, _} $ match(i) :
-    (i:CallIns) : "%_ = call %_" % [x(i), fid(i)]
+    (i:CallIns) : "call %_" % [fid(i)]
     (i:CallClosureIns): "call-closure %_" % [x(i)]
     (i:ReserveIns) : "reserve %_ %_" % [num-objects(i), size(i)]
     (i:AllocIns) : "%_ = alloc<%_> %_" % [x(i), type(i), size(i)]
@@ -175,6 +182,8 @@ defmethod print (o:OutputStream, i:VMIns) :
     (i:Branch2Ins) : "goto %_ when %_ %_ %_" % [n(i), op(i), x(i), y(i)]
     (i:ReturnIns) : "return"
     (i:NoOpIns) : "noop"
+    (i:GetLocalIns) : "%_ = %_ local[%_]" % [x(i), type(i), offset(i)]
+    (i:SetLocalIns) : "local[%_] = %_ %_" % [offset(i), type(i), x(i)]
 
 public defstruct InstanceofIns <: VMIns :
   x: Reg
@@ -276,8 +285,10 @@ defsyntax vmcode :
   defrule imm = (?r:#reg) : r
 
   defproduction ins : VMIns
-  defrule ins = (call-closure ?x:#reg) : CallClosureIns(x)
-  defrule ins = (?x:#reg = call ?fid:#int!) : CallIns(fid, x)
+  defrule ins = (call-closure ?x:#imm!) : CallClosureIns(x)
+  defrule ins = (call ?fid:#int!) : CallIns(fid)
+  defrule ins = (?x:#reg = ?t:#type local[?offset:#int!]) : GetLocalIns(x, t, offset)
+  defrule ins = (local[?offset:#int!] = ?t:#type ?x:#imm!) : SetLocalIns(t, offset, x)
   defrule ins = (?x:#reg = alloc<?t:#int!> ?size:#imm!) : AllocIns(x, t, size)
   defrule ins = (?x:#reg = ?t:#type ?y:#imm[?z:#imm!]) : RefGetIns(t, x, y, z)
   defrule ins = (?x:#imm[?y:#imm] = ?t:#type ?z:#imm!) : RefSetIns(t, x, y, z)
@@ -293,9 +304,9 @@ defsyntax vmcode :
 
   defproduction func : VMFunc
   defrule func = (func ?id:#int! (?args:#type! ...) :
-                    num-regs = ?nreg:#int!
+                    local-size = ?size:#int!
                     ?ins:#ins! ...) :
-    VMFunc(id, to-tuple(args), nreg, to-tuple(ins))
+    VMFunc(id, to-tuple(args), size, to-tuple(ins))
 
   defproduction class : VMClass
   defrule class = (class ?id:#int! (?parents:#int! ...) (base-size = ?base:#int!, item-size = ?item:#int!)) :
@@ -422,16 +433,13 @@ defn map-labels (f:Int -> Int, ins:HasTargetLabel) -> VMIns&HasTargetLabel :
 defstruct FuncRecord :
   id: Int
   args: Tuple<VMType>
-  num-reg: Int
+  local-size: Int
   pos: Int
-
-defstruct StackRecord :
-  return: Int
-  frame-pointer: Int
 
 deftype HeapValue :
   Int <: HeapValue
   Double <: HeapValue
+  False <: HeapValue
 defstruct TypeTag <: HeapValue :
   type: Int
 with: (printer => true)
@@ -465,15 +473,17 @@ public defn interpret (prog:VMProg) :
               match(ins:AllocIns) :
                 fatal("Invalid type %_" % [type(ins)]) when not class?(class-table, type(ins))
               loop(src + 1, dst + 1)
-    func-records[id(f)] = FuncRecord(id(f), args(f), num-reg(f), pos)
+    func-records[id(f)] = FuncRecord(id(f), args(f), local-size(f), pos)
   do(load-function, funcs(prog))
 
   ;Define machine quantities
-  val registers = Vector<?>()
-  val callstack = Vector<StackRecord>()
-  val heap = IntTable<?>()
+  val registers = Array<HeapValue>(256, false)
+  val heap = IntTable<HeapValue>()
   var heap-top:Int = 0
   var heap-size:Int = 0
+  val stack = IntTable<HeapValue>()
+  var stack-pointer:Int = 0
+  var stack-size:Int = 0
 
   ;Evaluation
   defn eval (op:VMOp, y) :
@@ -526,18 +536,18 @@ public defn interpret (prog:VMProg) :
       (op:UgeOp) : fatal("Not yet supported")
 
   ;Interpretation loop
-  defn* run (i:Int, fp:Int) :
+  defn* run (i:Int) :
     ;Assign a value to a register
-    defn* assign (r:Reg, v) :
-      registers[fp + index(r)] = v
+    defn* assign (r:Reg, v:HeapValue) :
+      registers[index(r)] = v
     defn eval-imm (imm:VMImm) :
       match(imm) :
-        (r:Reg) : registers[fp + index(r)]
+        (r:Reg) : registers[index(r)]
         (x:IntConst) : value(x)
         (x:DoubleConst) : value(x)
         (x:CodeId) : fid(x)
-    defn* step () : run(i + 1, fp)
-    defn* jump (n:Int) : run(n, fp)
+    defn* step () : run(i + 1)
+    defn* jump (n:Int) : run(n)
 
     val ins = buffer[i]
     println("Trace: %_" % [ins])
@@ -562,17 +572,18 @@ public defn interpret (prog:VMProg) :
         val pred = eval-pred(op(ins), eval-imm(x(ins)), eval-imm(y(ins)))
         jump(n(ins)) when pred else step()
       (ins:CallIns) :
-        val fp* = fp + index(x(ins))
-        call-func(fid(ins), fp*, StackRecord(i + 1, fp))
+        call-func(fid(ins), i + 1)
       (ins:CallClosureIns) :
         val ref = eval-imm(x(ins)) as Reference
-        val fp* = fp + index(x(ins))
         val fid = heap[address(ref) + 8 + 8] as Int
-        call-func(fid, fp*, StackRecord(i + 1, fp))
+        call-func(fid, i + 1)
       (ins:ReturnIns) :
-        if not empty?(callstack) :
-          val rec = pop(callstack)
-          run(return(rec), frame-pointer(rec))
+        val return = stack[stack-pointer]
+        val old-sp = stack[stack-pointer + 8]
+        match(return:Int) :
+          stack-size = stack-pointer
+          stack-pointer = old-sp as Int
+          run(return)
       (ins:ReserveIns) :
         val sz = eval-imm(size(ins)) as Int
         fatal("Size is not a multiple of 8.") when not multiple8?(sz)
@@ -602,18 +613,30 @@ public defn interpret (prog:VMProg) :
         fatal("Out of heap bounds.") when (addr + size(type(ins))) > heap-size
         assign(x(ins), heap[addr])
         step()
+      (ins:GetLocalIns) :
+        val pos = stack-pointer + 16 + offset(ins)
+        fatal("Out of stack bounds.") when pos >= stack-size
+        assign(x(ins), stack[pos])
+        step()
+      (ins:SetLocalIns) :
+        val pos = stack-pointer + 16 + offset(ins)
+        fatal("Out of stack bounds.") when pos >= stack-size
+        stack[pos] = eval-imm(x(ins))
+        step()
 
-  defn* call-func (f:Int, fp:Int, st:StackRecord|False) :
-    match(st:StackRecord) :
-      add(callstack, st)
-    val rec = func-records[f]
-    ensure-length(registers, fp + num-reg(rec), false)
-    run(pos(rec), fp)
+  defn* call-func (fid:Int, return:Int|False) :
+    stack[stack-size] = return
+    stack[stack-size + 8] = stack-pointer
+    stack-pointer = stack-size
+    val rec = func-records[fid]
+    stack-size = stack-pointer + 16 + local-size(rec)
+    run(pos(rec))
 
   ;Print result of registers
-  call-func(0, 0, false)
+  call-func(0, false)
   for (v in registers, i in 0 to false) do :
-    println("R%_ = %_" % [i, v])
+    if v is-not False :
+      println("R%_ = %_" % [i, v])
 
 defn size (t:VMType) :
   match(t) :
