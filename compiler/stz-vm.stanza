@@ -11,8 +11,6 @@ public deftype LinkedIns :
   NewStackIns <: LinkedIns
   SetIns <: LinkedIns
   Op0Ins <: LinkedIns
-  ReserveIns <: LinkedIns
-  AllocIns <: LinkedIns
   JumpIns <: LinkedIns
 
 public deftype JumpIns :
@@ -88,10 +86,23 @@ public defstruct LinkedBranchRegIns <: LinkedIns :
   value: Int  
 public defstruct LinkedErrorIns <: LinkedIns :
   msg: String
+public defstruct LinkedReserveIns <: LinkedIns :
+  space: VMImm
+  num-obj: Int
+public defstruct LinkedAllocIns <: LinkedIns :
+  x: Local
+  type: Int
+  size: VMImm
 
 ;============================================================
 ;======================= Printer ============================
 ;============================================================
+defmethod print (o:OutputStream, i:LinkedReserveIns) :
+  print(o, "reserve %_, %_" % [space(i), num-obj(i)])
+
+defmethod print (o:OutputStream, i:LinkedAllocIns) :
+  print(o, "%_ = alloc<%_> %_" % [x(i), type(i), size(i)])
+  
 defmethod print (o:OutputStream, i:LinkedErrorIns) :
   print(o, "error %~" % [msg(i)])
   
@@ -162,6 +173,7 @@ defmethod print (o:OutputStream, ins:LinkedBranchRegIns) :
 deftype Linker
 defmulti instructions (l:Linker) -> Tuple<LinkedIns>
 defmulti link (l:Linker, f:VMFunction) -> Int
+defmulti live-map-table (l:Linker) -> LiveMapTable
 
 defn Linker () :
   ;===== Overall Buffer =====
@@ -333,25 +345,42 @@ defn Linker () :
             val t = simple-type(imm-type(y(ins)))
             add(buffer, LinkedOp2Ins(t, x(ins*), op(ins*), y(ins*), z(ins*)))
           (ins:Branch2Ins) :
-            add(buffer, false)
             within pos = delayed-ins() :
               val ins* = link-ins(ins, pos)
               val t = simple-type(imm-type(y(ins)))
               LinkedBranch2Ins(t, n(ins*), op(ins*), x(ins*), y(ins*))
           (ins:JumpIns&VMIns) :
-            add(buffer, false)
             within pos = delayed-ins() :
               link-ins(ins, pos)
+          (ins:NewStackIns) :
+            val ins* = link-ins(ins, pos)
+            add(buffer, LinkedReserveIns(NumConst(SIZEOF-STACK), 1))
+            add(buffer, ins*)
+          (ins:AllocIns) :
+            val ins* = link-ins(ins, pos)
+            if length(sizes(ins*)) == 1 :
+              val x = xs(ins*)[0]
+              val type = types(ins*)[0]
+              val size = sizes(ins*)[0]
+              add(buffer, LinkedReserveIns(size, 1))
+              add(buffer, LinkedAllocIns(x, type, size))
+            else :
+              val num-obj = length(sizes(ins*))
+              val size = sum $
+                for s in sizes(ins*) seq :
+                  value(s as NumConst) as Int
+              add(buffer, LinkedReserveIns(NumConst(size), num-obj))
+              for (x in xs(ins*), t in types(ins*), s in sizes(ins*)) do :
+                add(buffer, LinkedAllocIns(x, t, s))
           (ins:LinkedIns&VMIns) :
             add(buffer, link-ins(ins, pos))
     ;Dump to instruction buffer
     function-pos
 
   new Linker :
-    defmethod instructions (this) :
-      to-tuple(ins-buffer)
-    defmethod link (this, f:VMFunction) :
-      link(f)
+    defmethod instructions (this) : to-tuple(ins-buffer)
+    defmethod link (this, f:VMFunction) : link(f)
+    defmethod live-map-table (this) : live-map-table
 
 ;============================================================
 ;================= Live Map Analysis ========================
@@ -492,6 +521,7 @@ public defn coalesce (f:CallFormat) :
 deftype GlobalTable
 defmulti space (t:GlobalTable) -> Int
 defmulti position (t:GlobalTable, gid:Int) -> Int
+defmulti roots (t:GlobalTable) -> Seqable<Int>
 
 defn GlobalTable (prog:VMProg) :
   val global-space = maximum{0, _} $ 
@@ -505,6 +535,11 @@ defn GlobalTable (prog:VMProg) :
       global-space
     defmethod position (this, gid:Int) :
       position(table[gid] as VMGlobal)
+    defmethod roots (this) :
+      for g in filter-by<VMGlobal>(table) seq-cat :
+        val root-base = position(g) / 8
+        for r in roots(g) seq :
+          root-base + r
 
 ;============================================================
 ;==================== VM Constants ==========================
@@ -550,6 +585,7 @@ lostanza deftype Function :
   slots: long ...
 
 lostanza val SIZEOF-FRAME:ref<Int> = new Int{sizeof(Frame) as int}
+lostanza val SIZEOF-STACK:ref<Int> = new Int{sizeof(Stack) as int}
 
 ;============================================================
 ;==================== VM Implementation =====================
@@ -558,8 +594,9 @@ lostanza val SIZEOF-FRAME:ref<Int> = new Int{sizeof(Frame) as int}
 lostanza defn VirtualMachine (gt:ref<GlobalTable>) -> ref<VirtualMachine> :
   val registers = call-c clib/malloc(sizeof(ptr<?>) * 256)
   val globals = call-c clib/malloc(space(gt).value)
-  val heap = call-c clib/malloc(512 * 1024 * 1024)
-  val heap-limit = heap + 512 * 1024 * 1024
+  val heap-size = 512 * 1024
+  val heap = call-c clib/malloc(heap-size)
+  val heap-limit = heap + heap-size
   val null = 0L as ptr<?>
   return new VirtualMachine{registers, globals, heap, heap, heap, heap-limit,
                             0L, null, 0}
@@ -570,7 +607,6 @@ lostanza defn alloc-stack (vm:ref<VirtualMachine>, pc:int) -> long :
   val s = tag(vm.heap-top)
   val null = 0L as ptr<?>
   vm.heap-top = vm.heap-top + 8 + sizeof(Stack)
-  vm.heap-end = vm.heap-end + 8 + sizeof(Stack)
   val sptr:ptr<Stack> = untag(s)
   sptr.size = stack-size
   sptr.frames = frames
@@ -769,6 +805,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
                    functions:ref<Tuple<Int>>,
                    class-table:ref<ClassTable>,
                    global-table:ref<GlobalTable>,
+                   live-map-table:ref<LiveMapTable>,
                    trace?:ref<True|False>) -> ref<False> :
   ;Define machine quantities                 
   val regs = vm.registers
@@ -783,6 +820,8 @@ lostanza defn run (vm:ref<VirtualMachine>,
   labels :
     begin :
       val mainpc = get(functions, new Int{0}).value
+      ;Reserve and allocate initial stack
+      vm.heap-end = vm.heap-end + 8 + sizeof(Stack)
       val main-stack = alloc-stack(vm, mainpc)
       heap-end = vm.heap-end
       heap-top = vm.heap-top
@@ -827,16 +866,22 @@ lostanza defn run (vm:ref<VirtualMachine>,
           val z = eval-imm(stack-pointer, global-table, globals, z(ins))
           assign(stack-pointer, x(ins), eval-op(type(ins), op(ins), y, z))
           goto step(pc + 1)
-        (ins:ref<ReserveIns>) :
-          val size = eval-imm(stack-pointer, global-table, globals, size(ins))
+        (ins:ref<LinkedReserveIns>) :
+          val size = eval-imm(stack-pointer, global-table, globals, space(ins))
           if size & 0x7L : fatal("Size is not a multiple of 8.")
-          val total-size = size + 8 * num-objects(ins).value
+          val total-size = size + 8 * num-obj(ins).value
           heap-end = heap-end + total-size
-          if heap-end > heap-limit : fatal("Out of heap memory.")
+          if heap-end > heap-limit :
+            vm.heap-top = heap-top
+            vm.heap-end = heap-end
+            vm.current-stack = current-stack
+            vm.stack-pointer = stack-pointer
+            vm.pc = pc
+            scan-roots(vm, global-table, live-map-table)            
+            fatal("Out of heap memory.")
           goto step(pc + 1)
-        (ins:ref<AllocIns>) :
+        (ins:ref<LinkedAllocIns>) :
           val size = eval-imm(stack-pointer, global-table, globals, size(ins))
-          if size & 0x7L : fatal("Size is not a multiple of 8.")
           val total-size = size + 8
           [heap-top] = type(ins).value
           assign(stack-pointer, x(ins), tag(heap-top))
@@ -962,6 +1007,25 @@ lostanza defn run (vm:ref<VirtualMachine>,
   return false
 
 ;============================================================
+;==================== Garbage Collector =====================
+;============================================================
+
+lostanza defn scan-roots (vm:ref<VirtualMachine>,
+                          global-table:ref<GlobalTable>
+                          live-map-table:ref<LiveMapTable>) -> long :
+  call-c clib/printf("=== Scanning globals ===\n")
+  val globals = vm.globals
+  val roots = to-seq(roots(global-table))
+  while empty?(roots) == false :
+    val i = next(roots).value
+    scan-root(globals[i])
+  return 0
+
+lostanza defn scan-root (r:long) -> long :
+  call-c clib/printf(" root = %ld\n", r)
+  return 0
+
+;============================================================
 ;==================== Utilities =============================
 ;============================================================
 defn ensure-length<?T> (v:Vector<?T>, len:Int, x:T) :
@@ -1004,4 +1068,5 @@ public defn interpret (prog:VMProg, trace?:True|False) :
       func-table,
       class-table,
       gt,
+      live-map-table(linker),
       trace?)
