@@ -581,6 +581,7 @@ lostanza deftype VirtualMachine :
   class-table: ref<ClassTable>
   registers: ptr<long>
   globals: ptr<long>
+  gcmarker: long
   heap: ptr<long>           ;[semi-variable]
   heap-top: ptr<long>       ;[variable]
   heap-end: ptr<long>       ;[variable]
@@ -598,6 +599,7 @@ lostanza deftype Frame :
 
 lostanza deftype Stack :
   size: long
+  gcmarker: long
   frames: ptr<Frame>
   stack-pointer: ptr<Frame>
   pc: int
@@ -624,6 +626,10 @@ lostanza val SIZEOF-FRAME:ref<Int> = new Int{sizeof(Frame) as int}
 lostanza val SIZEOF-STACK:ref<Int> = new Int{sizeof(Stack) as int}
 lostanza val STACK-TAG:long = 1L
 
+lostanza defn stack-end (stackref:long) -> ptr<Frame> :
+  val s:ptr<Stack> = untag(stackref)
+  return s.frames + s.size
+
 ;============================================================
 ;==================== VM Implementation =====================
 ;============================================================
@@ -641,7 +647,7 @@ lostanza defn VirtualMachine (global-table:ref<GlobalTable>,
   val free-limit = free + heap-size
   val null = 0L as ptr<?>
   return new VirtualMachine{global-table, func-table, live-map-table, class-table,
-                            registers, globals, heap, heap, heap, heap-limit,
+                            registers, globals, 0L, heap, heap, heap, heap-limit,
                             free, free-limit, 0L, null, 0}
 
 lostanza defn alloc-stack (vm:ref<VirtualMachine>, pc:int) -> long :
@@ -657,6 +663,7 @@ lostanza defn alloc-stack (vm:ref<VirtualMachine>, pc:int) -> long :
   ;Fill in stack fields
   val sptr:ptr<Stack> = untag(s)
   sptr.size = stack-size
+  sptr.gcmarker = 0L
   sptr.frames = frames
   sptr.stack-pointer = frames
   sptr.pc = pc
@@ -851,7 +858,7 @@ lostanza defn assign (frame:ptr<Frame>, l:ref<Local>, value:long) -> long :
   return 0
 
 lostanza defn run (vm:ref<VirtualMachine>,
-                   instructions:Tuple<LinkedIns>,
+                   instructions:ref<Tuple<LinkedIns>>,
                    trace?:ref<True|False>) -> ref<False> :
   ;Define machine quantities      
   val global-table = vm.global-table
@@ -860,19 +867,18 @@ lostanza defn run (vm:ref<VirtualMachine>,
   val class-table = vm.class-table
   val regs = vm.registers
   val globals = vm.globals
-  val instructions = instructions(func-table)
-  var heap-limit:ptr<long> = vm.heap-limit
-  var heap-end:ptr<long>
-  var heap-top:ptr<long>
-  var stack-pointer:ptr<Frame>
-  var stack-end:ptr<Frame>
-  var current-stack:long
+  var heap-limit:ptr<long> = vm.heap-limit          ;[LOAD]
+  var heap-end:ptr<long>                            ;[STORE/LOAD]
+  var heap-top:ptr<long>                            ;[STORE/LOAD]
+  var stack-pointer:ptr<Frame>                      ;[STORE/LOAD]
+  var stack-end:ptr<Frame>                          ;[LOAD]
+  var current-stack:long                            ;[STORE/LOAD]
   
   labels :
     begin :
-      val mainpc = get(functions, new Int{0}).value
       ;Reserve and allocate initial stack
       vm.heap-end = vm.heap-end + 8 + sizeof(Stack)
+      val mainpc = address(func-table, new Int{0}).value
       val main-stack = alloc-stack(vm, mainpc)
       heap-end = vm.heap-end
       heap-top = vm.heap-top
@@ -881,12 +887,12 @@ lostanza defn run (vm:ref<VirtualMachine>,
       current-stack = stack
       val sptr:ptr<Stack> = untag(current-stack)
       stack-pointer = sptr.stack-pointer
-      stack-end = sptr.frames + sptr.size
+      stack-end = /stack-end(current-stack)
       goto step(sptr.pc)      
     call-function (fid:int, return:int) :
       val old-sp = stack-pointer
       stack-pointer.return = return
-      val pos = get(functions, new Int{fid}).value
+      val pos = address(func-table, new Int{fid}).value
       goto step(pos)
     step (pc:int) :
       val ins = get(instructions, new Int{pc})
@@ -894,7 +900,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
       match(ins) :
         (ins:ref<NewStackIns>) :
           val fid = eval-imm(stack-pointer, global-table, globals, fid(ins)) as int
-          val fpc = get(functions, new Int{fid}).value
+          val fpc = address(func-table, new Int{fid}).value
           vm.heap-top = heap-top
           vm.heap-end = heap-end          
           val stk = alloc-stack(vm, fpc)
@@ -923,13 +929,20 @@ lostanza defn run (vm:ref<VirtualMachine>,
           val total-size = size + 8 * num-obj(ins).value
           heap-end = heap-end + total-size
           if heap-end > heap-limit :
-            vm.heap-top = heap-top
+            ;Store required values
             vm.heap-end = heap-end
-            vm.current-stack = current-stack
+            vm.heap-top = heap-top
             vm.stack-pointer = stack-pointer
-            vm.pc = pc
-            scan-roots(vm, global-table, live-map-table)            
-            fatal("Out of heap memory.")
+            vm.current-stack = current-stack
+            ;Run garbage collector
+            collect-garbage(vm)
+            ;Load required values
+            heap-limit = vm.heap-limit
+            heap-end = vm.heap-end + total-size
+            heap-top = vm.heap-top
+            stack-pointer = vm.stack-pointer
+            current-stack = vm.current-stack
+            stack-end = /stack-end(current-stack)
           goto step(pc + 1)
         (ins:ref<LinkedAllocIns>) :
           val size = eval-imm(stack-pointer, global-table, globals, size(ins))
@@ -1061,81 +1074,104 @@ lostanza defn run (vm:ref<VirtualMachine>,
 ;==================== Garbage Collector =====================
 ;============================================================
 
-lostanza defn collect-garbage (vm:ref<VirtualMachine>,
-                               global-table:ref<GlobalTable>
-                               live-map-table:ref<LiveMapTable>) -> long :
+lostanza defn collect-garbage (vm:ref<VirtualMachine>) -> long :
+  ;Construct marker
+  vm.gcmarker = vm.gcmarker + 1
+  
+  ;Swap free with heap
+  val heap = vm.heap
+  val heap-limit = vm.heap-limit
+  val free = vm.free
+  val free-limit = vm.free-limit
+  vm.heap = free
+  vm.heap-top = free
+  vm.heap-limit = free-limit
+  vm.free = heap
+  vm.free-limit = heap-limit
+
   ;Cap the current stack (The stack pointer currently points to the current frame)
   val sp = vm.stack-pointer
-  val num-current-slots = num-slots(sp, live-map-table)
+  val num-current-slots = num-slots(sp, vm)
   val s:ptr<Stack> = untag(vm.current-stack)
   s.stack-pointer = addr(sp.slots[num-current-slots]) as ptr<Frame>  
 
   ;Scan global roots
   call-c clib/printf("=== Scanning globals ===\n")
   val globals = vm.globals
-  val roots = to-seq(roots(global-table))
+  val roots = to-seq(roots(vm.global-table))
   while empty?(roots) == false :
     val i = next(roots).value
-    scan-root(globals[i])
+    globals[i] = post-gc-object(globals[i], vm)
 
   ;Scan stack roots
   call-c clib/printf("=== Scanning stack ===\n")
-  scan-stack(vm.current-stack, live-map-table)
+  scan-stack(vm.current-stack, vm)
 
+  ;Scan heap
+  scan-heap(vm)
+
+  ;Cap off heap
+  vm.heap-end = vm.heap-top
+
+  ;Return
   return 0
 
-lostanza defn num-slots (f:ptr<Frame>, live-map-table:ref<LiveMapTable>) -> int :
-  val map = get(live-map-table, new Int{f.liveness-map as int})
+lostanza defn num-slots (f:ptr<Frame>, vm:ref<VirtualMachine>) -> int :
+  val map = get(vm.live-map-table, new Int{f.liveness-map as int})
   return num-slots(map).value
 
-lostanza defn scan-stack (stackref:long,
-                          live-map-table:ref<LiveMapTable>) -> long :
+lostanza defn scan-stack (stackref:long, vm:ref<VirtualMachine>) -> long :
   val stk:ptr<Stack> = untag(stackref)
-  var f:ptr<Frame> = stk.frames
-  val f-end = stk.stack-pointer
-  while f < f-end :
-    val map = get(live-map-table, new Int{f.liveness-map as int})
-    val live-slots = live-slots(map)
-    val num-live = length(live-slots).value
-    for (var i:int = 0, i < num-live, i = i + 1) :
-      val s = get(live-slots, new Int{i}).value
-      scan-root(f.slots[s])
-    f = addr(f.slots[num-slots(map).value]) as ptr<Frame>
+  if stk.gcmarker != vm.gcmarker :
+    stk.gcmarker = vm.gcmarker
+    var f:ptr<Frame> = stk.frames
+    val f-end = stk.stack-pointer
+    while f < f-end :
+      val map = get(vm.live-map-table, new Int{f.liveness-map as int})
+      val live-slots = live-slots(map)
+      val num-live = length(live-slots).value
+      for (var i:int = 0, i < num-live, i = i + 1) :
+        val s = get(live-slots, new Int{i}).value
+        f.slots[s] = post-gc-object(f.slots[s], vm)
+      f = addr(f.slots[num-slots(map).value]) as ptr<Frame>    
   return 0
 
-lostanza defn scan-heap (vm:ref<VirtualMachine>,
-                         class-table:ref<ClassTable>,
-                         live-map-table:ref<LiveMapTable>) -> int :
+lostanza defn scan-heap (vm:ref<VirtualMachine>) -> int :
   var p:ptr<long> = vm.heap
   while p < vm.heap-top :
-    p = scan-object(p)
+    p = scan-object(p, vm)
   return 0
 
-lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>, class-table:ref<ClassTable>) -> ptr<long> :
+lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>) -> ptr<long> :
   ;p is [tag, cells ...]
-  val class = get(class-table, new Int{[p] as int})
+  val tag = [p] as int
+  val class = get(vm.class-table, new Int{tag})
   match(class) :
     (class:ref<VMLeafClass>) :
-      val obj = p as ptr<ObjectLayout>
+      ;Get properties
+      val size = size(class).value
       val roots = roots(class)
       val num-roots = length(roots).value
+      ;Scan slots
+      val obj = p as ptr<ObjectLayout>      
       for (var i:int = 0, i < num-roots, i = i + 1) :
         val r = get(roots, new Int{i}).value
-        obj.slots[r] = post-gc-object(obj.slots[r])
-      return addr(obj.slots[num-roots])
+        obj.slots[r] = post-gc-object(obj.slots[r], vm)
+      ;Return end of object
+      return p + 8 + size
     (class:ref<VMArrayClass>) :
-      val array = p as ptr<ArrayLayout>
       ;Get properties
-      val base-roots = base-roots(class).value
-      val item-roots = item-roots(class).value
+      val base-roots = base-roots(class)
+      val item-roots = item-roots(class)
       val base-size = base-size(class).value
       val item-size = item-size(class).value
       val num-base-roots = length(base-roots).value
       val num-item-roots = length(item-roots).value
       ;Scan base roots
+      val array = p as ptr<ArrayLayout>
       for (var i:int = 0, i < num-base-roots, i = i + 1) :
         val r = get(base-roots, new Int{i}).value
-        array.slots[r] = post-gc-object(obj.slots[r])
+        array.slots[r] = post-gc-object(array.slots[r], vm)
       ;Scan item roots
       var items:ptr<long> = addr(array.slots) + base-size
       val len = array.length
@@ -1143,36 +1179,32 @@ lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>, class-table:ref<
         for (var n:long = 0, n < len, n = n + 1) :
           for (var i:int = 0, i < num-item-roots, i = i + 1) :
             val r = get(item-roots, new Int{i}).value
-            items[r] = post-gc-object(items[r])
+            items[r] = post-gc-object(items[r], vm)
           items = items + item-size
       ;Return end of array
-      return (addr(obj.slots) + base-size + item-size * len + 7L) & -8L      
+      val size = (8 + base-size + item-size * len + 7L) & -8L
+      return p + size
 
-lostanza defn post-gc-object (vm:ref<VirtualMachine>, class-table:ref<ClassTable>, ref:long) -> long :
+lostanza defn post-gc-object (ref:long, vm:ref<VirtualMachine>) -> long :
   val tagbits = ref & 7L
   if tagbits == REF-TAG :
     val obj = (ref - REF-TAG) as ptr<long>
-    val tag = [obj]
+    val obj-tag = [obj]
     ;Case: Broken Heart
-    if tag == -1 :
+    if obj-tag == -1 :
       val heart = obj as ptr<BrokenHeartLayout>
       return heart.forward
     ;Case: Stack
-    else if tag == STACK-TAG :
-      scan-stack(ref, live-map-table)
+    else if obj-tag == STACK-TAG :
+      scan-stack(ref, vm)
       return ref
     ;Case: Uncopied object
     else :
-      val class = get(class-table, new Int{tag as int})
-      match(class) :
-        (class:ref<VMLeafClass>) :
-          val obj* = copy-obj-to-heap(obj, size(class).value)
-          set-broken-heart(obj, obj*)
-          return obj*
-        (class:ref<VMArrayClass>) :
-          val obj* = copy-array-to-heap(obj, base-size(class).value, item-size(class).value)
-          set-broken-heart(obj, obj*)
-          return obj*    
+      val obj* = tag(vm.heap-top)
+      val class = get(vm.class-table, new Int{obj-tag as int})
+      copy-bytes-to-heap(obj, num-bytes(obj, class, vm), vm)
+      set-broken-heart(obj, obj*)
+      return obj*
   else :
     fatal("Tagged primitives not yet supported")
     return 0
@@ -1183,18 +1215,17 @@ lostanza defn set-broken-heart (obj:ptr<long>, obj*:long) -> int :
   heart.forward = obj*
   return 0
 
-lostanza defn copy-obj-to-heap (vm:ref<VirtualMachine>, obj:ptr<ObjectLayout>, size:long) -> long :
-  val obj* = vm.heap-top
-  copy-bytes-to-free(vm, obj, 8 + size)
-  return tag(obj*)
-
-lostanza defn copy-array-to-heap (vm:ref<VirtualMachine>, obj:ptr<ArrayLayout>, base-size:long, item-size:long) -> long :  
-  val obj* = vm.heap-top
-  val size = (8 + base-size + obj.length * item-size + 7L) & -8L
-  copy-bytes-to-free(vm, obj, size)
-  return tag(obj*)  
+lostanza defn num-bytes (obj:ptr<?>, class:ref<VMClass>, vm:ref<VirtualMachine>) -> long :
+  match(class) :
+    (class:ref<VMLeafClass>) :
+      return 8 + size(class).value
+    (class:ref<VMArrayClass>) :
+      val array = obj as ptr<ArrayLayout>
+      val base-size = base-size(class).value
+      val item-size = item-size(class).value
+      return (8 + base-size + array.length * item-size + 7) & -8L
   
-lostanza defn copy-bytes-to-free (vm:ref<VirtualMachine>, p:ptr<?>, n:long) -> int :
+lostanza defn copy-bytes-to-heap (p:ptr<?>, n:long, vm:ref<VirtualMachine>) -> int :
   val heap = vm.heap-top
   val nwords = n >>> 3
   val src = p as ptr<long>
