@@ -59,6 +59,7 @@ public defstruct LinkedYield <: LinkedIns :
 public defstruct LinkedReturn <: LinkedIns
 public defstruct FunctionEntry <: LinkedIns :
   num-locals:Int
+  map:Int
 public defstruct LinkedDump <: LinkedIns :
   x: Local
 public defstruct LinkedOp1Ins <: LinkedIns :
@@ -155,7 +156,7 @@ defmethod print (o:OutputStream, x:LinkedReturn) :
   print(o, "return")
 
 defmethod print (o:OutputStream, x:FunctionEntry) :
-  print(o, "enter (num-locals = %_)" % [num-locals(x)])
+  print(o, "enter (num-locals = %_, map = %_)" % [num-locals(x), map(x)])
 
 defmethod print (o:OutputStream, ins:LinkedDump) :
   print(o, "dump %_" % [x(ins)])
@@ -273,7 +274,8 @@ defn Linker () :
       ;Create entry instructions
       val num-locals = maximum(-1, seq(local, defs(func))) + 1
       val frame-size = SIZEOF-FRAME + num-locals * 8
-      add(buffer, FunctionEntry(num-locals))
+      val empty-map = LivenessMap([], num-locals)
+      add(buffer, FunctionEntry(num-locals, map-index(live-map-table, empty-map)))
       get-regs(args(func))
       ;Link and add to buffer
       for ins in ins(func) do :
@@ -419,11 +421,13 @@ defmethod equal? (a:LivenessMap, b:LivenessMap) :
 public defn LiveMapTable () :
   val maps = Vector<LivenessMap>()
   val table = HashTable<LivenessMap,Int>()
+  defn add-map (m:LivenessMap) :
+    table[m] = length(maps)
+    add(maps, m)
+  add-map(LivenessMap([], 0))
   new LiveMapTable :
     defmethod map-index (this, map:LivenessMap) :
-      if not key?(table, map) :
-        table[map] = length(maps)
-        add(maps, map)
+      add-map(map) when not key?(table, map)
       table[map]
     defmethod get (this, i:Int) :
       maps[i]
@@ -665,6 +669,7 @@ lostanza defn alloc-stack (vm:ref<VirtualMachine>, pc:int) -> long :
   sptr.stack-pointer = frames
   sptr.pc = pc
   sptr.frames.return = -1L
+  sptr.frames.liveness-map = 0L
 
   ;Return stack
   return s
@@ -933,6 +938,8 @@ lostanza defn run (vm:ref<VirtualMachine>,
             vm.current-stack = current-stack
             ;Run garbage collector
             collect-garbage(vm)
+            if vm.heap-end + total-size > vm.heap-limit :
+              fatal("Out of heap")
             ;Load required values
             heap-limit = vm.heap-limit
             heap-end = vm.heap-end + total-size
@@ -965,6 +972,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
           val z = eval-imm(stack-pointer, global-table, globals, z(ins))
           val yptr:ptr<long> = untag(y)
           val sz = size(ins).value
+          call-c clib/printf("L%d = ref %p[%ld] (%d bytes)\n", index(x(ins)).value, y, z, sz)
           var value:long
           if sz == 1 : value = [yptr as ptr<byte> + z]
           else if sz == 4 : value = [yptr as ptr<int> + z]
@@ -986,6 +994,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
           val y = eval-imm(stack-pointer, global-table, globals, y(ins))
           val z = eval-imm(stack-pointer, global-table, globals, z(ins))
           val sz = size(ins).value
+          call-c clib/printf("L%d = %p[%ld] (%d bytes)\n", index(x(ins)).value, y, z, sz)
           var value:long
           if sz == 1 : value = [y as ptr<byte> + z]
           else if sz == 4 : value = [y as ptr<int> + z]
@@ -1013,10 +1022,14 @@ lostanza defn run (vm:ref<VirtualMachine>,
           assign(stack-pointer, x(ins), regs[reg(ins).value])
           goto step(pc + 1)
         (ins:ref<PushFrameIns>) :
+          val old-sp = stack-pointer
           stack-pointer = stack-pointer + frame-size(ins).value
+          call-c clib/printf("push stack from %p to %p\n", old-sp, stack-pointer)
           goto step(pc + 1)
         (ins:ref<PopFrameIns>) :
+          val old-sp = stack-pointer
           stack-pointer = stack-pointer - frame-size(ins).value
+          call-c clib/printf("pop stack from %p to %p\n", old-sp, stack-pointer)
           goto step(pc + 1)
         (ins:ref<LinkedCall>) :          
           val fid = eval-imm(stack-pointer, global-table, globals, f(ins)) as int
@@ -1046,6 +1059,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
           val frame-size = (num-locals(ins).value * 8 + sizeof(Frame)) as int
           val size-required = frame-size + sizeof(Frame)
           if stack-pointer + size-required > stack-end : fatal("Stack overflow.")
+          stack-pointer.liveness-map = map(ins).value
           goto step(pc + 1)
         (ins:ref<LinkedDump>) :
           val xvalue = eval-imm(stack-pointer, global-table, globals, x(ins))
@@ -1072,6 +1086,10 @@ lostanza defn run (vm:ref<VirtualMachine>,
 ;============================================================
 
 lostanza defn collect-garbage (vm:ref<VirtualMachine>) -> long :  
+  ;Print results
+  call-c clib/printf("Before Garbage Collection\n")
+  dump-heap(vm.heap, vm.heap-top, vm)
+
   ;Swap free with heap
   val heap = vm.heap
   val heap-limit = vm.heap-limit
@@ -1083,13 +1101,12 @@ lostanza defn collect-garbage (vm:ref<VirtualMachine>) -> long :
   vm.free = heap
   vm.free-limit = heap-limit
 
-  ;Cap the current stack (The stack pointer currently points to the current frame)
-  val sp = vm.stack-pointer
-  val num-current-slots = num-slots(sp, vm)
+  ;Cap the current stack
   val s:ptr<Stack> = untag(vm.current-stack)
-  s.stack-pointer = addr(sp.slots[num-current-slots]) as ptr<Frame>  
+  s.stack-pointer = vm.stack-pointer
 
   ;Scan global roots
+  call-c clib/printf("Scan globals\n")
   val globals = vm.globals
   val roots = to-seq(roots(vm.global-table))
   while empty?(roots) == false :
@@ -1097,17 +1114,19 @@ lostanza defn collect-garbage (vm:ref<VirtualMachine>) -> long :
     globals[i] = post-gc-object(globals[i], vm)
 
   ;Scan stack roots
+  call-c clib/printf("Scan stack\n")
   vm.current-stack = post-gc-object(vm.current-stack, vm)
 
   ;Scan heap
+  call-c clib/printf("Scan heap\n")
   scan-heap(vm)
 
   ;Cap off heap
   vm.heap-end = vm.heap-top
 
   ;Print results
+  call-c clib/printf("After Garbage Collection\n")
   dump-heap(vm.heap, vm.heap-top, vm)
-  dump-stack(vm.current-stack, vm)
 
   ;Return
   return 0
@@ -1117,15 +1136,21 @@ lostanza defn num-slots (f:ptr<Frame>, vm:ref<VirtualMachine>) -> int :
   return num-slots(map).value
 
 lostanza defn scan-frames (frames:ptr<Frame>, f-end:ptr<Frame>, vm:ref<VirtualMachine>) -> int :
+  call-c clib/printf("scan-frames %p to %p\n", frames, f-end)
   var f:ptr<Frame> = frames
-  while f < f-end :
+  while f <= f-end :
+    call-c clib/printf("scan frame %p\n", f)
     val map = get(vm.live-map-table, new Int{f.liveness-map as int})
+    call-c clib/printf("num-slots = %d\n", num-slots(map).value)
     val live-slots = live-slots(map)
     val num-live = length(live-slots).value
     for (var i:int = 0, i < num-live, i = i + 1) :
       val s = get(live-slots, new Int{i}).value
       f.slots[s] = post-gc-object(f.slots[s], vm)
+    call-c clib/printf("num-slots = %d\n", num-slots(map).value)
+    call-c clib/printf("old f = %p\n", f)
     f = addr(f.slots[num-slots(map).value]) as ptr<Frame>
+    call-c clib/printf("new f = %p\n", f)
   return 0
 
 lostanza defn scan-heap (vm:ref<VirtualMachine>) -> int :
@@ -1137,6 +1162,7 @@ lostanza defn scan-heap (vm:ref<VirtualMachine>) -> int :
 lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>) -> ptr<long> :
   ;p is [tag, cells ...]
   val tag = [p] as int
+  call-c clib/printf("scan-object %p with tag %d\n", p, tag)
   ;Special class Stack
   if tag == STACK-TAG :
     val s = (p + 8) as ptr<Stack>
@@ -1183,13 +1209,14 @@ lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>) -> ptr<long> :
         val size = (8 + base-size + item-size * len + 7L) & -8L
         return p + size
 
-lostanza defn post-gc-object (ref:long, vm:ref<VirtualMachine>) -> long :
+lostanza defn post-gc-object (ref:long, vm:ref<VirtualMachine>) -> long :  
   val tagbits = ref & 7L
   if tagbits == REF-TAG :
     val obj = (ref - REF-TAG) as ptr<long>
     val obj-tag = [obj]
+    call-c clib/printf("post-gc-object(%p) (tag = %ld)\n", ref, obj-tag)
     ;Case: Broken Heart
-    if obj-tag == -1 :
+    if obj-tag == -1L :
       val heart = obj as ptr<BrokenHeartLayout>
       return heart.forward
     ;Case: Uncopied object
@@ -1205,7 +1232,7 @@ lostanza defn post-gc-object (ref:long, vm:ref<VirtualMachine>) -> long :
 
 lostanza defn set-broken-heart (obj:ptr<long>, obj*:long) -> int :
   val heart = obj as ptr<BrokenHeartLayout>
-  heart.tag == -1L
+  heart.tag = -1L
   heart.forward = obj*
   return 0
 
@@ -1233,10 +1260,13 @@ lostanza defn copy-bytes-to-heap (p:ptr<?>, n:long, vm:ref<VirtualMachine>) -> i
 ;============================================================
 
 lostanza defn dump-heap (pstart:ptr<long>, pend:ptr<long>, vm:ref<VirtualMachine>) -> int :
+  val stackrefs = Vector<Long>()
   call-c clib/printf("Heap:\n")
   var p:ptr<long> = pstart
   while p < pend :
     val tag = [p] as int
+    if tag == STACK-TAG :
+      add(stackrefs, new Long{/tag(p)})      
     val class = get(vm.class-table, new Int{tag})
     match(class) :
       (class:ref<VMLeafClass>) :
@@ -1260,6 +1290,10 @@ lostanza defn dump-heap (pstart:ptr<long>, pend:ptr<long>, vm:ref<VirtualMachine
         call-c clib/printf("\n")
         ;Advance to next object
         p = p + (8 + size + 7) & -8L  
+  ;Dump stacks
+  for (var i:int = 0, i < length(stackrefs).value, i = i + 1) :
+    val s = get(stackrefs, new Int{i})
+    dump-stack(s.value, vm)
   return 0
 
 lostanza defn dump-stack (stackref:long, vm:ref<VirtualMachine>) -> int :
@@ -1267,14 +1301,14 @@ lostanza defn dump-stack (stackref:long, vm:ref<VirtualMachine>) -> int :
   var f:ptr<Frame> = stk.frames
   val f-end = stk.stack-pointer
   call-c clib/printf("Stack %p:\n", stackref)
-  while f < f-end :
+  while f <= f-end :
     ;Get frame properties
     val map = get(vm.live-map-table, new Int{f.liveness-map as int})
     val live-slots = live-slots(map)
     val num-live = length(live-slots).value
     val num-slots = num-slots(map).value
     ;Print properties
-    call-c clib/printf("  [Frame %ld, num-slots = %d]", f.liveness-map, num-slots)
+    call-c clib/printf("  %p: [Frame %ld, num-slots = %d]", f, f.liveness-map, num-slots)
     for (var i:int = 0, i < num-slots, i = i + 1) :
       call-c clib/printf("  %lx", f.slots[i])
     call-c clib/printf("\n")
