@@ -41,7 +41,6 @@ $STANZA \
     compiler/stz-pl-ir.stanza \
     compiler/stz-tgt-ir.stanza \
     compiler/stz-tgt-utils.stanza \
-    compiler/stz-asm-ir.stanza \
     compiler/stz-input.stanza \
     compiler/stz-namemap.stanza \
     compiler/stz-renamer.stanza \
@@ -54,11 +53,6 @@ $STANZA \
     compiler/stz-dec-table.stanza \
     compiler/stz-kform-to-tgt.stanza \
     compiler/stz-khier.stanza \
-    compiler/stz-backend.stanza \
-    compiler/stz-reg-alloc.stanza \
-    compiler/stz-codegen.stanza \
-    compiler/stz-stitcher.stanza \
-    compiler/stz-asm-emitter.stanza \
     compiler/stz-fuse.stanza \
     compiler/stz-pkg.stanza \
     compiler/stz-compiler.stanza \
