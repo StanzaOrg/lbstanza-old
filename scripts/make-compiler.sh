@@ -51,7 +51,8 @@ $STANZA \
     compiler/stz-type-to-kform.stanza \
     compiler/stz-kform.stanza \
     compiler/stz-dec-table.stanza \
-    compiler/stz-kform-to-tgt.stanza \
+    compiler/stz-kform-to-vm.stanza \
+    compiler/stz-vm-ir.stanza \
     compiler/stz-khier.stanza \
     compiler/stz-fuse.stanza \
     compiler/stz-pkg.stanza \
@@ -67,4 +68,4 @@ $STANZA \
     compiler/stz-driver.stanza \
   -s $OUT.s \
   -o $OUT \
-  -optimize
+  -pkg build
