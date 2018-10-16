@@ -597,16 +597,51 @@ defn GlobalTable (prog:VMProg) :
           root-base + r
 
 ;============================================================
+;==================== Data Table ============================
+;============================================================
+
+deftype DataTable
+defmulti space (t:DataTable) -> Int
+defmulti offset (t:DataTable, id:Int) -> Long
+defmulti data (t:DataTable, id:Int) -> ByteArray
+defmulti ids (t:DataTable) -> Seq<Int>
+
+defn DataTable (prog:VMProg) :
+  val table = to-inttable<VMData> $
+    for d in datas(prog) seq : id(d) => d
+  val offset-table = IntTable<Long>()
+  var offset:Long = 0L
+  val space = sum $
+    for d in datas(prog) seq :
+      offset-table[id(d)] = offset
+      val size = (length(data(d)) + 7) & -8
+      offset = offset + to-long(size)
+      size
+  new DataTable :
+    defmethod space (this) : space
+    defmethod offset (this, id:Int) : offset-table[id]
+    defmethod data (this, id:Int) : data(table[id])
+    defmethod ids (this) : keys(table)
+
+;============================================================
+;==================== Tag Bits ==============================
+;============================================================
+
+lostanza val REF-TAG-BITS:long = 1L
+lostanza val MARKER-TAG-BITS:long = 2L
+lostanza val BYTE-TAG-BITS:long = 3L
+lostanza val CHAR-TAG-BITS:long = 4L
+lostanza val FLOAT-TAG-BITS:long = 5L
+
+;============================================================
 ;==================== VM Constants ==========================
 ;============================================================
 
-lostanza val REF-TAG:long = 1L
-
 lostanza defn untag (x:long) -> ptr<?> :
-  return (x - REF-TAG + 8) as ptr<?>
+  return (x - REF-TAG-BITS + 8) as ptr<?>
 
 lostanza defn tag (x:ptr<?>) -> long :
-  return (x + REF-TAG) as long
+  return (x + REF-TAG-BITS) as long
 
 ;============================================================
 ;=================== VM Structures ==========================
@@ -617,8 +652,10 @@ lostanza deftype VirtualMachine :
   func-table: ref<FuncTable>
   live-map-table: ref<LiveMapTable>
   class-table: ref<ClassTable>
+  data-table: ref<DataTable>
   registers: ptr<long>
   globals: ptr<long>
+  data: ptr<long>
   heap: ptr<long>           ;[semi-variable]
   heap-top: ptr<long>       ;[variable]
   heap-limit: ptr<long>     ;[semi-variable]
@@ -671,23 +708,25 @@ lostanza defn stack-end (stackref:long) -> ptr<Frame> :
 lostanza defn VirtualMachine (global-table:ref<GlobalTable>,
                               func-table: ref<FuncTable>,
                               live-map-table: ref<LiveMapTable>,
+                              data-table: ref<DataTable>,
                               class-table: ref<ClassTable>) -> ref<VirtualMachine> :
   val registers = call-c clib/malloc(sizeof(ptr<?>) * 256)
   val globals = call-c clib/malloc(space(global-table).value)
-  val heap-size = 3 * 1024
+  val data = call-c clib/malloc(space(data-table).value)
+  val heap-size = 3 * 1024  
   val heap = call-c clib/malloc(heap-size)
   val heap-limit = heap + heap-size
   val free = call-c clib/malloc(heap-size)
   val free-limit = free + heap-size
   val null = 0L as ptr<?>
-  return new VirtualMachine{global-table, func-table, live-map-table, class-table,
-                            registers, globals, heap, heap, heap-limit,
+  return new VirtualMachine{global-table, func-table, live-map-table, class-table, data-table,
+                            registers, globals, data, heap, heap, heap-limit,
                             free, free-limit, 0L, null, 0}
 
 lostanza defn alloc-stack (vm:ref<VirtualMachine>, pc:int) -> long :
   ;Allocate stack on heap
   val s = tag(vm.heap-top)
-  [vm.heap-top] = STACK-TAG.value
+  [vm.heap-top] = STACK-TYPE-ID.value
   vm.heap-top = vm.heap-top + 8 + sizeof(Stack)
 
   ;Allocate stack frames
@@ -716,7 +755,9 @@ lostanza defn call-c-function (function:long, registers:ptr<long>, format:int) -
     fatal("Unknown format.")
     return 0
 
-lostanza defn eval-imm (frame:ptr<Frame>, gt:ref<GlobalTable>, globals:ptr<long>, x:ref<VMImm>) -> long :
+lostanza defn eval-imm (frame:ptr<Frame>,
+                        gt:ref<GlobalTable>, globals:ptr<long>,
+                        dt:ref<DataTable>, data:ptr<long>, x:ref<VMImm>) -> long :
   match(x) :
     (x:ref<Local>) :
       return frame.slots[index(x).value]
@@ -734,6 +775,11 @@ lostanza defn eval-imm (frame:ptr<Frame>, gt:ref<GlobalTable>, globals:ptr<long>
     (x:ref<GlobalId>) :
       val offset = position(gt, gid(x)).value
       return (globals + offset) as long
+    (x:ref<DataId>) :
+      val offset = offset(dt, did(x)).value
+      return (data + offset) as long
+    (x:Marker) :
+      return (type(x).value << 3L) + MARKER-TAG-BITS
 
 lostanza defn eval-op (current-stack:long, op:ref<VMOp>) -> long :
   match(op) :
@@ -758,8 +804,21 @@ lostanza defn eval-op (class-table:ref<ClassTable>, type:ref<VMType>, op:ref<VMO
         (op:ref<NotOp>) : return (~ y)
         (op:ref<NegOp>) : return (- y)
         (op:ref<InstanceofOp>) : 
-          val tag = new Int{[(y - REF-TAG) as ptr<long>] as int}
+          val tag = new Int{[(y - REF-TAG-BITS) as ptr<long>] as int}
           return instanceof?(class-table, tag, /type(op)) == true
+        (op:ref<TagOp>) :
+          val t = type(op).value
+          if t == BYTE-TYPE-ID :
+            return y << 32L + BYTE-TAG-BITS
+          else if t == CHAR-TYPE-ID :
+            return y << 32L + CHAR-TAG-BITS
+          else if t == INT-TYPE-ID :
+            return y << 32L
+          else if t == FLOAT-TYPE-ID :
+            return y << 32L + FLOAT-TAG-BITS
+          else :
+            fatal("Illegal op.")
+            return 0
         (op) : (fatal("Illegal op."), return 0)
     (type:ref<VMFloat>) :
       val yint = y as int
@@ -917,22 +976,36 @@ lostanza defn assign (frame:ptr<Frame>, l:ref<Local>, value:long) -> long :
   frame.slots[index(l).value] = value
   return 0
 
+lostanza defn init-data (vm:ref<VirtualMachine>) -> int :
+  val ids = ids(vm.data-table)
+  while not empty?(ids) :
+    val id = next(ids)
+    val o = offset(vm.data-table, id).value
+    val bytes = data(vm.data-table, id)
+    call-c memcpy(vm.data + o, bytes.data, length(bytes).value)
+  return 0
+
 lostanza defn run (vm:ref<VirtualMachine>,
                    instructions:ref<Tuple<LinkedIns>>,
                    trace?:ref<True|False>) -> ref<False> :
   ;Define machine quantities      
   val global-table = vm.global-table
+  val data-table = vm.data-table
   val func-table = vm.func-table
   val live-map-table = vm.live-map-table
   val class-table = vm.class-table
   val regs = vm.registers
   val globals = vm.globals
+  val data = vm.data
   var heap-limit:ptr<long> = vm.heap-limit          ;[LOAD]
   var heap-top:ptr<long>                            ;[STORE/LOAD]
   var stack-pointer:ptr<Frame>                      ;[STORE/LOAD]
   var stack-end:ptr<Frame>                          ;[LOAD]
   var current-stack:long                            ;[STORE/LOAD]
-  
+
+  ;Initialize data segment
+  init-data(vm)
+
   labels :
     begin :
       ;Reserve and allocate initial stack
@@ -958,7 +1031,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
       if trace? == true : print-ins(ins)
       match(ins) :
         (ins:ref<NewStackIns>) :
-          val fid = eval-imm(stack-pointer, global-table, globals, fid(ins)) as int
+          val fid = eval-imm(stack-pointer, global-table, globals, data-table, data, fid(ins)) as int
           val fpc = address(func-table, new Int{fid}).value
           vm.heap-top = heap-top
           val stk = alloc-stack(vm, fpc)
@@ -966,26 +1039,26 @@ lostanza defn run (vm:ref<VirtualMachine>,
           assign(stack-pointer, x(ins), stk)
           goto step(pc + 1)
         (ins:ref<SetIns>) :
-          assign(stack-pointer, x(ins), eval-imm(stack-pointer, global-table, globals, y(ins)))
+          assign(stack-pointer, x(ins), eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins)))
           goto step(pc + 1)
         (ins:ref<Op0Ins>) :
           assign(stack-pointer, x(ins), eval-op(current-stack, op(ins)))
           goto step(pc + 1)        
         (ins:ref<LinkedOp1Ins>) :
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
           assign(stack-pointer, x(ins), eval-op(class-table, type(ins), op(ins), y))
           goto step(pc + 1)        
         (ins:ref<LinkedOp2Ins>) :
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
-          val z = eval-imm(stack-pointer, global-table, globals, z(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
+          val z = eval-imm(stack-pointer, global-table, globals, data-table, data, z(ins))
           assign(stack-pointer, x(ins), eval-op(type(ins), op(ins), y, z))
           goto step(pc + 1)
         (ins:ref<LinkedConvIns>) :
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
           assign(stack-pointer, x(ins), eval-conv(op(ins), xtype(ins), ytype(ins), y))
           goto step(pc + 1)
         (ins:ref<LinkedReserveIns>) :
-          val size = eval-imm(stack-pointer, global-table, globals, space(ins))
+          val size = eval-imm(stack-pointer, global-table, globals, data-table, data, space(ins))
           if size & 0x7L : fatal("Size is not a multiple of 8.")
           val total-size = size + 8 * num-obj(ins).value          
           if heap-top + total-size > heap-limit :
@@ -1003,7 +1076,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
             stack-end = /stack-end(current-stack)
           goto step(pc + 1)
         (ins:ref<LinkedAllocIns>) :
-          val size = eval-imm(stack-pointer, global-table, globals, size(ins))
+          val size = eval-imm(stack-pointer, global-table, globals, data-table, data, size(ins))
           val total-size = size + 8
           [heap-top] = type(ins).value
           assign(stack-pointer, x(ins), tag(heap-top))
@@ -1011,9 +1084,9 @@ lostanza defn run (vm:ref<VirtualMachine>,
           if heap-top > heap-limit : fatal("Beyond heap limits.")
           goto step(pc + 1)
         (ins:ref<LinkedRefStoreIns>) :
-          val x = eval-imm(stack-pointer, global-table, globals, x(ins))
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
-          val z = eval-imm(stack-pointer, global-table, globals, z(ins))
+          val x = eval-imm(stack-pointer, global-table, globals, data-table, data, x(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
+          val z = eval-imm(stack-pointer, global-table, globals, data-table, data, z(ins))
           val xptr = untag(x)
           val sz = size(ins).value
           if sz == 1 : [xptr as ptr<byte> + y] = z as byte
@@ -1022,8 +1095,8 @@ lostanza defn run (vm:ref<VirtualMachine>,
           else : fatal("Invalid size.")
           goto step(pc + 1)
         (ins:ref<LinkedRefLoadIns>) :
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
-          val z = eval-imm(stack-pointer, global-table, globals, z(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
+          val z = eval-imm(stack-pointer, global-table, globals, data-table, data, z(ins))
           val yptr:ptr<long> = untag(y)
           val sz = size(ins).value
           var value:long
@@ -1034,9 +1107,9 @@ lostanza defn run (vm:ref<VirtualMachine>,
           assign(stack-pointer, x(ins), value)
           goto step(pc + 1)
         (ins:ref<LinkedStoreIns>) :
-          val x = eval-imm(stack-pointer, global-table, globals, x(ins))
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
-          val z = eval-imm(stack-pointer, global-table, globals, z(ins))
+          val x = eval-imm(stack-pointer, global-table, globals, data-table, data, x(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
+          val z = eval-imm(stack-pointer, global-table, globals, data-table, data, z(ins))
           val sz = size(ins).value
           if sz == 1 : [x as ptr<byte> + y] = z as byte
           else if sz == 4 : [x as ptr<int> + y] = z as int
@@ -1044,8 +1117,8 @@ lostanza defn run (vm:ref<VirtualMachine>,
           else : fatal("Invalid size.")
           goto step(pc + 1)
         (ins:ref<LinkedLoadIns>) :
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
-          val z = eval-imm(stack-pointer, global-table, globals, z(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
+          val z = eval-imm(stack-pointer, global-table, globals, data-table, data, z(ins))
           val sz = size(ins).value
           var value:long
           if sz == 1 : value = [y as ptr<byte> + z]
@@ -1057,18 +1130,18 @@ lostanza defn run (vm:ref<VirtualMachine>,
         (ins:ref<GotoIns>) :
           goto step(pc + n(ins).value)
         (ins:ref<Branch1Ins>) :
-          val x = eval-imm(stack-pointer, global-table, globals, x(ins))
+          val x = eval-imm(stack-pointer, global-table, globals, data-table, data, x(ins))
           val r = eval-op(class-table, VMLong(), op(ins), x)
           if r : goto step(pc + n(ins).value)
           else : goto step(pc + 1)
         (ins:ref<LinkedBranch2Ins>) :
-          val x = eval-imm(stack-pointer, global-table, globals, x(ins))
-          val y = eval-imm(stack-pointer, global-table, globals, y(ins))
+          val x = eval-imm(stack-pointer, global-table, globals, data-table, data, x(ins))
+          val y = eval-imm(stack-pointer, global-table, globals, data-table, data, y(ins))
           val r = eval-op(type(ins), op(ins), x, y)
           if r : goto step(pc + n(ins).value)
           else : goto step(pc + 1)
         (ins:ref<SetReg>) :
-          regs[reg(ins).value] = eval-imm(stack-pointer, global-table, globals, x(ins))
+          regs[reg(ins).value] = eval-imm(stack-pointer, global-table, globals, data-table, data, x(ins))
           goto step(pc + 1)
         (ins:ref<GetReg>) :
           assign(stack-pointer, x(ins), regs[reg(ins).value])
@@ -1080,23 +1153,23 @@ lostanza defn run (vm:ref<VirtualMachine>,
           stack-pointer = stack-pointer - frame-size(ins).value
           goto step(pc + 1)        
         (ins:ref<LinkedCall>) :          
-          val fid = eval-imm(stack-pointer, global-table, globals, f(ins)) as int
+          val fid = eval-imm(stack-pointer, global-table, globals, data-table, data, f(ins)) as int
           goto call-function(fid, pc + 1)
         (ins:ref<LinkedCallClosure>) :
-          val fref = eval-imm(stack-pointer, global-table, globals, f(ins))
+          val fref = eval-imm(stack-pointer, global-table, globals, data-table, data, f(ins))
           val fptr = untag(fref) as ptr<Function>
           val fid = fptr.code as int
           goto call-function(fid, pc + 1)
         (ins:ref<LinkedTCall>) :          
-          val fid = eval-imm(stack-pointer, global-table, globals, f(ins)) as int
+          val fid = eval-imm(stack-pointer, global-table, globals, data-table, data, f(ins)) as int
           goto tcall-function(fid, pc + 1)
         (ins:ref<LinkedTCallClosure>) :
-          val fref = eval-imm(stack-pointer, global-table, globals, f(ins))
+          val fref = eval-imm(stack-pointer, global-table, globals, data-table, data, f(ins))
           val fptr = untag(fref) as ptr<Function>
           val fid = fptr.code as int
           goto tcall-function(fid, pc + 1)
         (ins:ref<LinkedCallC>) :
-          val faddr = eval-imm(stack-pointer, global-table, globals, f(ins))
+          val faddr = eval-imm(stack-pointer, global-table, globals, data-table, data, f(ins))
           val launcher = launcher(ins).value as ptr<((long, ptr<long>) -> long)>
           [launcher](faddr, regs)
           goto step(pc + 1)
@@ -1106,7 +1179,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
           s.stack-pointer = stack-pointer
           s.pc = pc + 1
           ;Load next next
-          val sref = eval-imm(stack-pointer, global-table, globals, f(ins))          
+          val sref = eval-imm(stack-pointer, global-table, globals, data-table, data, f(ins))          
           goto load-stack(sref)
         (ins:ref<LinkedReturn>) :
           val ret = stack-pointer.return as int
@@ -1129,7 +1202,7 @@ lostanza defn run (vm:ref<VirtualMachine>,
             stack-end = /stack-end(current-stack)
           goto step(pc + 1)
         (ins:ref<LinkedDump>) :
-          val xvalue = eval-imm(stack-pointer, global-table, globals, x(ins))
+          val xvalue = eval-imm(stack-pointer, global-table, globals, data-table, data, x(ins))
           val xint = xvalue as int
           val xvaluef = ($ls-prim fnum xint)
           val xvalued = ($ls-prim fnum xvalue)
@@ -1274,7 +1347,7 @@ lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>) -> ptr<long> :
   match(class) :
     (class:ref<VMLeafClass>) :
       ;Scan the frames of a stack
-      if tag == STACK-TAG.value :
+      if tag == STACK-TYPE-ID.value :
         val s = (p + 8) as ptr<Stack>
         scan-frames(s.frames, s.stack-pointer, vm)
       ;Get properties
@@ -1316,8 +1389,8 @@ lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>) -> ptr<long> :
 
 lostanza defn post-gc-object (ref:long, vm:ref<VirtualMachine>) -> long :  
   val tagbits = ref & 7L
-  if tagbits == REF-TAG :
-    val obj = (ref - REF-TAG) as ptr<long>
+  if tagbits == REF-TAG-BITS :
+    val obj = (ref - REF-TAG-BITS) as ptr<long>
     val obj-tag = [obj]
     ;Case: Broken Heart
     if obj-tag == -1L :
@@ -1369,7 +1442,7 @@ lostanza defn dump-heap (pstart:ptr<long>, pend:ptr<long>, vm:ref<VirtualMachine
   var p:ptr<long> = pstart
   while p < pend :
     val tag = [p] as int
-    if tag == STACK-TAG.value :
+    if tag == STACK-TYPE-ID.value :
       add(stackrefs, new Long{/tag(p)})      
     val class = get(vm.class-table, new Int{tag})
     match(class) :
