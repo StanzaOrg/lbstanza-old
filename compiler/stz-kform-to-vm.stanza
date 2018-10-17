@@ -42,7 +42,7 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
         val func = match(value(te)) :
           (value:KMultifn) : fatal("Not yet implemented")
           (value:KFn) : value
-        within c = compile-function(n(te), func, dec-table, literal-defs) :
+        val vmfunc = within c = compile-function(n(te), func, dec-table, literal-defs) :
           val targ-locals = for a in targs(func) map :
             val x = make-def(c, VMRef())
             set-imms-types(c, a, [x], [VMRef()])
@@ -54,6 +54,7 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
               set-imms-types(c, a, xs, ts)
               xs            
           to-tuple(qquote(false, false, ~@ targ-locals, ~@ arg-locals))
+        add(funcs, vmfunc)
       (te:KDefmulti) : fatal("Not yet implemented")
       (te:KDefmethod) : fatal("Not yet implemented")
       (te:KDefType) :
@@ -83,10 +84,12 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
         add(externs, VMExtern(n(te), lbl(te)))          
       (te:KInit) :
         add(initializers, exp(te))
-      (te:KDefConst) : fatal("Not yet implemented")
+      (te:KDefConst) :
+        println("DefConst compilation skipped")
       (te:KDefObject) : fatal("Not yet implemented")
       (te:KDefClosure) : fatal("Not yet implemented")
-      (te:KDefTypeObject) : fatal("Not yet implemented")
+      (te:KDefTypeObject) :
+        add(funcs, compile-type-object(n(te), args(te), type(te), dec-table, literal-defs))
 
   println("===== Input =====")
   within indented() :
@@ -145,11 +148,36 @@ defn compile-function (gen-args:Compiler -> Tuple<Local|False>, id:Int, f:KFn,
                        dec-table:DecTable,
                        literal-defs:LiteralDefs) :
   val compiler = Compiler()
+  val exp-compiler = ExpCompiler(compiler, dec-table, literal-defs)
   val args = gen-args(compiler)
   val return-ctxt = TailContext() when tail?(f)
                else ReturnContext()
-  compile-exp(compiler, return-ctxt, body(f), dec-table, literal-defs)
+  compile-exp(exp-compiler, return-ctxt, body(f))
   VMFunc(id, args, defs(compiler), instructions(compiler))
+
+;============================================================
+;================= Type Object Compilation ==================
+;============================================================
+defn compile-type-object (n:Int, args:List<Int>, t:KType, dec-table:DecTable, literal-defs:LiteralDefs) :
+  val compiler = Compiler()
+  val exp-compiler = ExpCompiler(compiler, dec-table, literal-defs)
+  ;Arguments
+  val tobj = make-def(compiler, VMRef())
+  val obj = make-def(compiler, VMRef())
+  ;Freevars
+  for (a in args, i in 0 to false) do :
+    val local = make-def(compiler, VMRef())
+    val offset = 8 * i + field-offset(dec-table, TYPE-FREE-FIELD-ID)
+    emit(compiler, LoadIns(local, tobj, NumConst(offset)))
+    set-imms-types(compiler, a, [local], [VMRef()])
+  val pass-lbl = make-label(compiler)
+  val fail-lbl = make-label(compiler)
+  compile-typeof(exp-compiler, obj, t, pass-lbl, fail-lbl)
+  emit(compiler, LabelIns(pass-lbl))
+  emit(compiler, ReturnIns([NumConst(1L)]))
+  emit(compiler, LabelIns(fail-lbl))
+  emit(compiler, ReturnIns([NumConst(0L)]))
+  VMFunc(n, [tobj, false, obj], defs(compiler), instructions(compiler))
 
 ;============================================================
 ;=============== Initializer Compilation ====================
@@ -172,22 +200,37 @@ defn Initializers () :
 
 defn compile-init (i:Initializers, dec-table:DecTable, literal-defs:LiteralDefs) :
   val compiler = Compiler()
-  compile-exp(compiler, TargetContext([]), inits(i), dec-table, literal-defs)
+  val exp-compiler = ExpCompiler(compiler, dec-table, literal-defs)
+  compile-exp(exp-compiler, TargetContext([]), inits(i))
   emit(compiler, ReturnIns([]))
   VMFunc(0, [], defs(compiler), instructions(compiler))
 
 ;============================================================
 ;================ Expression Compilation ====================
 ;============================================================
-defn compile-exp (compiler:Compiler, return-ctxt:Context, e:KExp, dec-table:DecTable, literal-defs:LiteralDefs) :
-  ;Function address
+deftype ExpCompiler
+defmulti compile-typeof (e:ExpCompiler, obj:VMImm, t:KType, pass:Int, fail:Int) -> False
+defmulti compile-exp (e:ExpCompiler, ctxt:Context, e:KExp) -> False
+
+defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDefs) :
+  ;Utilities
   defn function-address (n:Int) :
     val lbl = extern-label(dec-table, n)
     match(lbl:Symbol) : ExternId(n)
     else : CodeId(n)
+  defn tcall (n:Int, args:Tuple<VMImm>) :
+    val false-marker = Marker(VM-FALSE-TYPE-ID)
+    val arity = length(args)
+    val ys = to-tuple $ cat-all $ [
+      [false-marker, NumConst(arity)]
+      args]
+    TCallIns(CodeId(n), ys)
 
   ;Track mutables
   val mutables = IntSet()
+
+  ;Return context
+  var return-ctxt:Context = ReturnContext()
 
   ;Compiling a location
   defn compile (e:KLoc) -> CLoc :
@@ -251,6 +294,65 @@ defn compile-exp (compiler:Compiler, return-ctxt:Context, e:KExp, dec-table:DecT
       ;  ExpLoc(cexp(exp(e)), 0)    
       (e) :
         fatal("Not yet implemented")
+
+  ;Compiling a type object
+  defn compile (t:KType) -> CResult :
+    match(t) :
+      (t:KTVar) :
+        if global?(dec-table, n(t)) :
+          fatal("Not yet implemented")
+        else :
+          new CImms :
+            defmethod types (c, this) : [VMRef()]
+            defmethod imms (c, this) : imms(c, n(t))
+      (t:KTypeObject) :
+        new CStore :
+          defmethod types (c, this) : [VMRef()]
+          defmethod store (c, this, xs:Tuple<Local>) :
+            val ntargs = length(targs(t))
+            val size = 8          ;length
+                     + 8          ;code
+                     + 8 * ntargs ;free
+            ;Freevars
+            val targs* = to-list(seq(imm{c, compile(_)}, targs(t)))
+            ;Allocate object
+            val x = xs[0]
+            emit(c, AllocIns(xs, [VM-TYPE-TYPE-ID], [NumConst(size)]))
+            ;Store fields
+            val ys = cat-all $ [[NumConst(to-long(ntargs)), CodeId(n(t))], targs*]
+            for (y in ys, o in 0 to false by 8) do :
+              emit(c, StoreIns(x, NumConst(o), y))
+
+  ;Compiling a typeof expression
+  defn compile-typeof (c:Compiler, obj:VMImm, t:KType, pass:Int, fail:Int) :
+    defn branch-when-instanceof (t:KOf, true-lbl:Int, false-lbl:Int) :
+      val typeid = to-vm-id(n(t))
+      emit(c, Branch1Ins(true-lbl, InstanceofOp(typeid), obj))
+      emit(c, GotoIns(false-lbl))
+    let loop (t:KType = t, true-lbl:Int = pass, false-lbl:Int = fail) :
+      match(t) :
+        (t:KTVar) :
+          val pred = make-def(c, VMLong())
+          val timm = imms(c, n(t))[0]
+          emit(c, CallClosureIns([pred], timm, [timm, NumConst(1), obj]))
+        (t:KOf) :
+          val typeid = to-vm-id(n(t))
+          emit(c, Branch1Ins(true-lbl, InstanceofOp(typeid), obj))
+          emit(c, GotoIns(false-lbl))
+        (t:KAnd) :
+          val next-lbl = make-label(c)
+          loop(a(t), next-lbl, false-lbl)
+          emit(c, LabelIns(next-lbl))
+          loop(b(t), true-lbl, false-lbl)
+        (t:KOr) :
+          val next-lbl = make-label(c)
+          loop(a(t), true-lbl, next-lbl)
+          emit(c, LabelIns(next-lbl))
+          loop(b(t), true-lbl, false-lbl)
+        (t:KTop) :
+          emit(c, GotoIns(true-lbl))
+        (t:KBot) :
+          emit(c, GotoIns(false-lbl))
 
   ;Compiling an expression
   defn compile (e:KExp) -> CResult :
@@ -461,11 +563,37 @@ defn compile-exp (compiler:Compiler, return-ctxt:Context, e:KExp, dec-table:DecT
             val y = compile(exp(e))
             val x = xs[0]
             emit(c, Op1Ins(x, ConvOp(), imm(c,y)))
+      (e:KCheck) :
+        match(type(e)) :
+          (t:KBot) :
+            new CResult :
+              defmethod types (c, this) : []
+              defmethod gen-ins (c, ctxt, this) :
+                val obj = imm(c, compile(exp(e)))
+                val targ* = imm(c, compile(tobj!(e)))
+                emit(c, tcall(VM-CAST-ERROR-FN-ID, [NumConst(option(e)), obj, targ*]))
+          (t) :
+            new CStore :
+              defmethod types (c, this) : [VMRef()]
+              defmethod store (c, this, xs:Tuple<Local>) :
+                val x = xs[0]
+                val pass-lbl = make-label(c)
+                val fail-lbl = make-label(c)
+                val obj = imm(c, compile(exp(e)))
+                compile-typeof(c, obj, type(e), pass-lbl, fail-lbl)
+                emit(c, LabelIns(fail-lbl))
+                val targ* = imm(c, compile(tobj!(e)))
+                emit(c, tcall(VM-CAST-ERROR-FN-ID, [NumConst(option(e)), obj, targ*]))
       (e) :
         fatal("Not yet implemented")
 
-  ;Driver
-  gen-ins(compiler, return-ctxt, compile(e))
+  ;Return compiler
+  new ExpCompiler :
+    defmethod compile-exp (this, ctxt:Context, e:KExp) :
+      let-var return-ctxt = ctxt :
+        gen-ins(compiler, ctxt, compile(e))
+    defmethod compile-typeof (this, obj:VMImm, t:KType, pass:Int, fail:Int) :
+      compile-typeof(compiler, obj, t, pass, fail)
 
 ;============================================================
 ;====================== Types ===============================
@@ -504,8 +632,10 @@ defmulti imms (c:Compiler, n:Int) -> Tuple<VMImm>
 defmulti set-types (c:Compiler, n:Int, ts:Tuple<VMType>) -> False
 defmulti set-imms (c:Compiler, n:Int, imms:Tuple<VMImm>) -> False
 defmulti make-def (c:Compiler, t:VMType) -> Local
+defmulti make-label (c:Compiler) -> Int
 defmulti defs (c:Compiler) -> Tuple<VMDef>
 defmulti instructions (c:Compiler) -> Tuple<VMIns>
+
 
 defn set-imms-types (c:Compiler, n:Int, imms:Tuple<VMImm>, ts:Tuple<VMType>) :
   set-imms(c, n, imms)
@@ -519,6 +649,7 @@ defn Compiler () :
   val immtable = IntTable<Tuple<VMImm>>()
   val typetable = IntTable<Tuple<VMType>>()
   val ins = Vector<VMIns>()
+  val labelcounter = to-seq(0 to false)
   new Compiler :
     defmethod emit (this, i:VMIns) : add(ins, i)
     defmethod types (this, n:Int) : typetable[n]
@@ -531,6 +662,7 @@ defn Compiler () :
       Local(i)
     defmethod defs (this) : to-tuple(defs)
     defmethod instructions (this) : to-tuple(ins)
+    defmethod make-label (this) : next(labelcounter)
 
 ;Representation of a compiled result
 deftype CResult
