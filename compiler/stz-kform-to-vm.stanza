@@ -31,10 +31,13 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
         (te:KDef) : fatal("Not yet implemented")
         (te:KDefVar) : fatal("Not yet implemented")
         (te:KDefn) :
-          val func = match(value) :
+          val func = match(value(te)) :
             (value:KMultifn) : fatal("Not yet implemented")
             (value:KFn) : value
-          compile-function(n(te), func)
+          within c = compile-function(dec-table, n(te), func) :
+            val targ-locals = map(make-def{c, VMRef()}, targs(func))
+            val arg-locals = map(make-def{c, to-vm-type(_)}, a1(func))
+            to-tuple(qquote(false, false, ~@ targ-locals, ~@ arg-locals))
         (te:KDefmulti) : fatal("Not yet implemented")
         (te:KDefmethod) : fatal("Not yet implemented")
         (te:KDefType) :
@@ -67,16 +70,6 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
         (te:KDefClosure) : fatal("Not yet implemented")
         (te:KDefTypeObject) : fatal("Not yet implemented")
 
-  ;defn compile-fn (te:KDefn) :
-  ;  val e = value(te) as KFn
-  ;  false
-  ;  ;Given:
-  ;  ;  tail?(e) : Whether the function is tail recursive
-  ;  ;  a1(e) : The types of the arguments
-  ;  ;  a2(e) : The return type
-  ;  ;  args(e) : The identifiers of the arguments
-  ;  ;  body(e) : The body expression
-
   println("===== Input =====")
   within indented() :
     println(kpkg)
@@ -91,13 +84,141 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
 ;============================================================
 ;================= Function Compilation =====================
 ;============================================================
-defn compile-function (id:Int, f:KFn) :
+defn compile-function (gen-args:Compiler -> Tuple<Local|False>, dec-table:DecTable, id:Int, f:KFn) :
+  ;Return context
+  defn FnReturnContext () :
+    if tail?(f) : TailContext()
+    else : ReturnContext()
+
+  ;Function address
+  defn function-address (n:Int) :
+    val lbl = extern-label(dec-table, n)
+    match(lbl:Symbol) : ExternId(n)
+    else : CodeId(n)
+          
+  ;Track mutables
+  val mutables = IntSet()
   defn compile (e:KExp) -> CResult :
     println("Compiling expression %_" % [e])
     match(e) :
-      (e) : fatal("Not yet implemented")
-  
-  compile(body(f))
+      (e:KLet) :
+        val v = compile(value(e))
+        val body = compile(body(e))
+        new CResult :
+          defmethod types (c, this) : types(c,body)
+          defmethod gen-ins (c, ctxt, this) :
+            set-imms-types(c, n(e), imms(c,v), types(c,v))
+            gen-ins(c, ctxt, body)
+      (e:KInterpret) :
+        new CStore :
+          defmethod types (c, this) : [to-vm-type(type(e))]
+          defmethod store (c, this, xs:Tuple<Local>) :
+            val y = compile(exp(e))
+            emit(c, Op1Ins(xs[0], InterpretOp(), imm(c,y)))
+      (e:KVar) :
+        if global?(dec-table, n(e)) :
+          val t = var-type(dec-table, n(e))
+          new CStore :
+            defmethod types (c, this) : to-tuple(vm-types(dec-table, t))
+            defmethod store (c, this, xs:Tuple<Local>) :
+              for (x in xs, o in field-offsets(dec-table, t)) do :
+                emit(c, LoadIns(x, GlobalId(n(e)), NumConst(o)))
+        else if mutables[n(e)] :
+          ;TODO: Not necessary if we pull out
+          ;mutated variables from expressions first.
+          new CImms :
+            defmethod types (c, this) : types(c, n(e))
+            defmethod imms (c, this) :
+              val ts = types(c, n(e))
+              val xs = make-defs(c, ts)
+              set-imms-types(c, n(e), xs, ts)
+              for (x in xs, y in imms(c, n(e))) do :
+                emit(c, SetIns(x, y))
+              xs
+        else :
+          new CImms :
+            defmethod types (c, this) : types(c, n(e))
+            defmethod imms (c, this) : imms(c, n(e))
+      (e:KDo) :
+        ;Result representing a call to known code
+        defn ccall-result (get-args: Compiler -> [Int, Tuple<VMImm>, VMImm], closure?:True|False) :
+          new CCall :
+            defmethod types (c, this) :
+              to-tuple(vm-types(dec-table, type(e)))
+            defmethod closure? (this) :
+              closure?
+            defmethod call-args (c, this) :
+              val [arity, args, f] = get-args(c)
+              val closure = if closure? : f
+                            else : Marker(VM-FALSE-TYPE-ID)              
+              val arity-imm = NumConst(to-long(arity))
+              val arg-imms = to-tuple $ qquote(~ closure, ~ arity-imm, ~@ args)
+              [arg-imms, f]
+        ;Cases
+        defn call-pointer (p:KExp, args:List<KExp>) :
+          within c = ccall-result(false) :
+            val args* = to-tuple(seq-cat(imms{c, compile(_)}, args))
+            val func = imm(c, compile(p))
+            [length(args), args*, func]
+        defn call-closure (clo:KExp, targs:List<KType>, args:List<KExp>) :
+          within c = ccall-result(true) :
+            fatal("Not yet implemented") when not empty?(targs)
+            val args* = to-tuple $ seq-cat(imms{c, compile(_)}, args)
+            ;val args* = to-tuple $ cat(
+            ;  seq-cat(imms{c, compile(_)}, targs)
+            ;  seq-cat(imms{c, compile(_)}, args))
+            val closure* = imm(c, compile(clo))
+            [length(args), args*, closure*]
+        defn call-code (n:Int, targs:List<KType>, args:List<KExp>) :
+          within c = ccall-result(false) :
+            fatal("Not yet implemented") when not empty?(targs)
+            val args* = to-tuple $ seq-cat(imms{c, compile(_)}, args)
+            ;val args* = to-tuple $ cat(
+            ;  seq-cat(imms{c, compile(_)}, targs)
+            ;  seq-cat(imms{c, compile(_)}, args))
+            [length(args), args*, function-address(n)]
+        ;Categorize
+        match(func(e)) :
+          (f:KVar|KCurry) :
+            val [f*, targs] = match(f) :
+              (f:KVar) : [f, List()]
+              (f:KCurry) : [KVar(n(f)), targs(f)]
+            if function?(dec-table, n(f)) : call-code(n(f), targs, args(e))
+            else : call-closure(f*, targs, args(e))
+          (f:KRead) :
+            match(loc(f)) :
+              (l:KDeptr) : call-pointer(exp(l), args(e))
+              (l:KDeref) : call-closure(exp(l), List(), args(e))
+          (f:KExp) :
+            call-closure(f, List(), args(e))
+      (e:KReturn) :
+        val v = compile(exp(e))
+        new CResult :
+          defmethod types (c, this) : []
+          defmethod gen-ins (c, ctxt, this) :
+            gen-ins(c, FnReturnContext(), v)
+      (e) :
+        fatal("Not yet implemented")
+
+  ;Compile the function
+  val compiler = Compiler()
+  val args = gen-args(compiler)
+  gen-ins(compiler, FnReturnContext(), compile(body(f)))
+  VMFunc(id, args, defs(compiler), instructions(compiler))
+
+;============================================================
+;====================== Types ===============================
+;============================================================
+
+defn to-vm-type (t:KType) :
+  match(t) :
+    (t:KByteT) : VMByte()
+    (t:KIntT) : VMInt()
+    (t:KLongT) : VMLong()
+    (t:KFloatT) : VMFloat()
+    (t:KDoubleT) : VMDouble()
+    (t:KPtrT) : VMPointer()
+    (t) : VMRef()
 
 ;============================================================
 ;=================== Compiler Tools =========================
@@ -111,6 +232,15 @@ defmulti imms (c:Compiler, n:Int) -> Tuple<VMImm>
 defmulti set-types (c:Compiler, n:Int, ts:Tuple<VMType>) -> False
 defmulti set-imms (c:Compiler, n:Int, imms:Tuple<VMImm>) -> False
 defmulti make-def (c:Compiler, t:VMType) -> Local
+defmulti defs (c:Compiler) -> Tuple<VMDef>
+defmulti instructions (c:Compiler) -> Tuple<VMIns>
+
+defn set-imms-types (c:Compiler, n:Int, imms:Tuple<VMImm>, ts:Tuple<VMType>) :
+  set-imms(c, n, imms)
+  set-types(c, n, ts)
+
+defn make-defs (c:Compiler, ts:Tuple<VMType>) :
+  map(make-def{c, _}, ts)
 
 defn Compiler () :
   val defs = Vector<VMDef>()
@@ -123,63 +253,85 @@ defn Compiler () :
     defmethod imms (this, n:Int) : immtable[n]
     defmethod set-types (this, n:Int, ts:Tuple<VMType>) : typetable[n] = ts
     defmethod set-imms (this, n:Int, xs:Tuple<VMImm>) : immtable[n] = xs
-    defmethod make-def (this, t:VMType) : ???
+    defmethod make-def (this, t:VMType) :
+      val i = length(defs)
+      add(defs, VMDef(i, t, 0))
+      Local(i)
+    defmethod defs (this) : to-tuple(defs)
+    defmethod instructions (this) : to-tuple(ins)
 
 ;Representation of a compiled result
 deftype CResult
 deftype Context
-defmulti types (r:CResult) -> Tuple<VMType>
+defmulti types (compiler:Compiler, r:CResult) -> Tuple<VMType>
 defmulti gen-ins (compiler:Compiler, ctxt:Context, r:CResult) -> False
 
 ;============================================================
 ;============== Specialized Results/Contexts ================
 ;============================================================
 defstruct TargetContext <: Context :
-  locals: Tuple<VMLocal>
+  locals: Tuple<Local>
 
 deftype AcceptContext <: Context
 defmulti accept (compiler:Compiler, c:AcceptContext, imms:Tuple<VMImm>) -> False
 
-deftype TailContext <: Context
+defstruct TailContext <: Context
 
-deftype CImms <: CResult
-defmulti imms (compiler:Compiler, c:CImms) -> Tuple<VMImm>
+;Represents a non-forwarded compiled result. 
+deftype CValue <: CResult
 
-deftype CStore <: CResult
+deftype CImms <: CValue
+
+deftype CStore <: CValue
 defmulti store (compiler:Compiler, c:CStore, xs:Tuple<Local>) -> False
 
-deftype CCall <: CResult
-defmulti imms (compiler:Compiler, c:CCall) -> [Tuple<VMImm>, VMImm]
+deftype CCall <: CValue
+defmulti call-args (compiler:Compiler, c:CCall) -> [Tuple<VMImm>, VMImm]
 defmulti closure? (c:CCall) -> True|False
+
+defmulti imms (compiler:Compiler, r:CResult) -> Tuple<VMImm>
+defmethod imms (compiler:Compiler, r:CResult) :
+  val xs = map(make-def{compiler, _}, types(compiler,r))
+  gen-ins(compiler, TargetContext(xs), r)
+  xs
+
+defn imm (compiler:Compiler, r:CResult) :
+  val xs = imms(compiler, r)
+  fatal("Result does not have a single immediate.") when length(xs) != 1
+  xs[0]
 
 defmethod gen-ins (compiler:Compiler, ctxt:AcceptContext, c:CImms) :
   accept(compiler, ctxt, imms(compiler, c))
 
-defmethod gen-ins (compiler:Compiler, ctxt:AcceptContext, r:CResult) :
-  val xs = map(make-def{compiler, _}, types(r))
-  gen-ins(compiler, TargetContext(xs), r)
-  accept(compiler, ctxt, xs)
+defmethod gen-ins (compiler:Compiler, ctxt:AcceptContext, r:CValue) :
+  accept(compiler, ctxt, imms(compiler,r))
 
 defmethod gen-ins (compiler:Compiler, ctxt:TargetContext, c:CStore) :
   store(compiler, c, locals(ctxt))
 
 defmethod gen-ins (compiler:Compiler, ctxt:TargetContext, c:CImms) :
-  for (x in locals(ctxt), y in imms(compiler, c)) :
-    emit(SetIns(x, y))
+  for (x in locals(ctxt), y in imms(compiler, c)) do :
+    emit(compiler, SetIns(x, y))
 
 defmethod gen-ins (compiler:Compiler, ctxt:TargetContext, c:CCall) :
-  val [args, func] = imms(compiler, c)
+  val [args, func] = call-args(compiler, c)
   emit(compiler, CallIns(locals(ctxt), func, args))
 
 defmethod gen-ins (compiler:Compiler, ctxt:TailContext, c:CCall) :
-  val [args, func] = imms(compiler, c)
+  val [args, func] = call-args(compiler, c)
   if closure?(c) : emit(compiler, TCallClosureIns(func, args))
   else : emit(compiler, TCallIns(func, args))
 
-defmethod gen-ins (compiler:Compiler, ctxt:TailContext, r:CResult) :
-  val xs = map(make-def{compiler, _}, types(r))
-  gen-ins(compiler, TargetContext(xs), r)
-  emit(compiler, ReturnIns(xs))
+defmethod gen-ins (compiler:Compiler, ctxt:TailContext, r:CValue) :
+  emit(compiler, ReturnIns(imms(compiler,r)))
+
+;============================================================
+;================ Convenience Contexts ======================
+;============================================================
+
+defstruct ReturnContext <: AcceptContext
+defmethod accept (compiler:Compiler, ctxt:ReturnContext, imms:Tuple<VMImm>) :
+  emit(compiler, ReturnIns(imms))
 
 ;============================================================
 ;======================= Roots ==============================
