@@ -64,6 +64,8 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
           ;Return args
           to-tuple(qquote(false, false, ~@ targ-locals, ~@ arg-locals))
         add(funcs, vmfunc)
+      (te:KDefClosure) :
+        compile-closure(te, dec-table, literal-defs)
       (te:KDefmulti) : fatal("Not yet implemented")
       (te:KDefmethod) : fatal("Not yet implemented")
       (te:KDefType) :
@@ -96,7 +98,6 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
       (te:KDefConst) :
         println("DefConst compilation skipped")
       (te:KDefObject) : fatal("Not yet implemented")
-      (te:KDefClosure) : fatal("Not yet implemented")
       (te:KDefTypeObject) :
         add(funcs, compile-type-object(n(te), args(te), type(te), dec-table, literal-defs))
 
@@ -163,6 +164,59 @@ defn compile-function (gen-args:Compiler -> Tuple<Local|False>, id:Int, f:KFn,
                else ReturnContext()
   compile-exp(exp-compiler, return-ctxt, body(f))
   VMFunc(id, args, defs(compiler), instructions(compiler))
+
+;============================================================
+;=================== Closure Compilation ====================
+;============================================================
+defn compile-closure (e:KDefClosure, dec-table:DecTable, literal-defs:LiteralDefs) :
+  ;Create compiler
+  val c = Compiler()
+  val exp-compiler = ExpCompiler(c, dec-table, literal-defs)
+  comment(c, "Code for closure %_" % [n(e)])
+
+  ;Retrieve function
+  val func = match(func(e)) :
+    (f:KMultifn) : fatal("Not yet implemented.")
+    (f:KFn) : f
+
+  ;Compute arg types
+  set-types(c, closure(e), [VMRef()])
+  for a in targs(func) do :
+    set-types(c, a, [VMRef()])
+  for (a in args(func), t in a1(func)) do :
+    set-types(c, a, to-tuple(vm-types(dec-table,t)))
+    
+  ;Compute arg locals
+  val clo = make-def(c, VMRef())
+  set-imms(c, closure(e), [clo])
+  val targ-locals = for a in targs(func) map :
+    val x = make-def(c, VMRef())
+    comment(c, "%_ is type argument %_" % [x, a])
+    set-imms(c, a, [x])
+    x
+  val arg-locals = to-list $
+    for a in args(func) seq-cat :
+      val xs = make-defs(c, types(c,a))
+      comment(c, "%_ is argument %_" % [xs, a])
+      set-imms(c, a, xs)
+      xs
+
+  ;Load free
+  for (a in cat(freetypes(func), freevars(func)), i in 0 to false) do :
+    val x = make-def(c, VMRef())
+    comment(c, "%_ is freevar %_" % [x, a])
+    set-imms(c, a, [x])
+    set-types(c, a, [VMRef()])
+    val offset = 8 * i + field-offset(dec-table, TYPE-FREE-FIELD-ID)
+    emit(c, LoadIns(x, clo, NumConst(offset)))
+
+  ;Compile body
+  val return-ctxt = TailContext() when tail?(func)
+               else ReturnContext()
+  compile-exp(exp-compiler, return-ctxt, body(func))
+  val args = to-tuple $ cat-all $ [[clo, false], targ-locals, arg-locals]
+  VMFunc(n(e), args, defs(c), instructions(c))
+    
 
 ;============================================================
 ;================= Type Object Compilation ==================
@@ -392,18 +446,53 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
         val v = match(value(e)) :
           (v:KExp) : compile(v)
           (v:False) : v
-        set-types(compiler, n(e), to-tuple(vm-types(dec-table, type(e))))
+        val ts = to-tuple(vm-types(dec-table, type(e)))
+        set-types(compiler, n(e), ts)
         add(mutables, n(e))
         val body = compile(body(e))
         new CResult :
           defmethod types (this) : types(body)
           defmethod gen-ins (c, ctxt, this) :
-            val xs = make-defs(c, types(c, n(e)))
+            val xs = make-defs(c, ts)
             set-imms(c, n(e), xs)
             comment(c, "var %_ = %_" % [n(e), xs])
             match(v:CResult) :
               gen-ins(c, TargetContext(xs), v)
             gen-ins(c, ctxt, body)
+      (e:KLetRec) :
+        ;Set types
+        for n in ns(e) do :
+          set-types(compiler, n, [VMRef()])
+        val body = compile(body(e))
+        val closures = values(e) as List<KClosure>
+        new CResult :
+          defmethod types (this) : types(body)
+          defmethod gen-ins (c, ctxt, this) :
+            ;Make locals and allocate closures
+            val xs = to-tuple $ for n in ns(e) seq :
+              val local = make-def(c, VMRef())
+              set-imms(c, n, [local])
+              local
+            ;Compute sizes
+            val sizes = to-tuple $ for c in closures seq :
+              val nslots = length(targs(c)) + length(args(c))
+              NumConst(8,          ;length
+                     + 8,          ;code
+                     + 8 * nslots) ;slots
+            ;Allocate closures
+            val types = to-tuple(repeat(FN-TYPE-ID, length(ns(e))))
+            emit(c, AllocIns(xs, types, sizes))
+            ;Compile closures
+            for (x in xs, k in closures) do :
+              val nslots = length(targs(k)) + length(args(k))
+              val targs* = seq(imm{c, compile(_)}, targs(k))
+              val args* = seq(imm{c, compile(_)}, args(k))
+              val ys = cat-all $ [[NumConst(to-long(nslots)), CodeId(n(k))], targs*, args*]
+              val os = cat([0 8], 16 to false by 8)
+              for (o in os, y in ys) do :
+                emit(c, StoreIns(x, NumConst(o), y))
+            ;Compile body
+            gen-ins(c, ctxt, body)              
       (e:KInterpret) :
         new CStore :
           defmethod types (this) : [to-vm-type(type(e))]
@@ -992,8 +1081,7 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
               ;If fail
               emit(c, LabelIns(fail-lbl))
             ;Ending label
-            emit(c, LabelIns(end-lbl))
-                
+            emit(c, LabelIns(end-lbl))                
       (e) :
         fatal("Not yet implemented")
 
