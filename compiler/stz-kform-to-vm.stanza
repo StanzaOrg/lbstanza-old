@@ -294,6 +294,10 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
     val lbl = extern-label(dec-table, n)
     match(lbl:Symbol) : ExternId(n)
     else : CodeId(n)
+  defn global-address (n:Int) :
+    val lbl = extern-label(dec-table, n)
+    match(lbl:Symbol) : ExternId(n)
+    else : GlobalId(n)
   defn tcall (n:Int, args:Tuple<VMImm>) :
     val false-marker = Marker(VM-FALSE-TYPE-ID)
     val arity = length(args)
@@ -505,7 +509,7 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
             defmethod types (this) : to-tuple(vm-types(dec-table, t))
             defmethod store (c, this, xs:Tuple<Local>) :
               for (x in xs, o in field-offsets(dec-table, t)) do :
-                emit(c, LoadIns(x, GlobalId(n(e)), NumConst(o)))
+                emit(c, LoadIns(x, global-address(n(e)), NumConst(o)))
         else if mutables[n(e)] :
           ;TODO: Not necessary if we pull out
           ;mutated variables from expressions first.
@@ -672,6 +676,23 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
             ;Store fields
             for (a in args*, o in offsets) do :
               emit(c, StoreIns(x, NumConst(o), a))
+      (e:KStruct) :
+        new CImms :
+          defmethod types (this) : to-tuple(vm-types(dec-table, n(e)))
+          defmethod imms (c, this) :
+            to-tuple(seq-cat(imms{c, compile(_)}, args(e)))
+      (e:KPtr) :
+        val l = compile(loc(e)) as PtrLoc
+        if offset(l) == 0 :
+          base(l)
+        else :
+          new CStore :
+            defmethod types (this) : [VMLong()]
+            defmethod store (c, this, xs:Tuple<Local>) :
+              gen-ins(c, TargetContext(xs), base(l))
+              emit(c, Op2Ins(x, AddOp(), x, offset)) where :
+                val x = xs[0]
+                val offset = NumConst(to-long(offset(l)))
       (e:KSeq) :
         val a* = compile(a(e))
         val b* = compile(b(e))
@@ -1120,6 +1141,15 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
             emit(c, AllocIns(xs, [VM-TUPLE-TYPE-ID], [size]))
             for (a in exps*, o in 8 to false by 8) do :
               emit(c, StoreIns(xs[0], NumConst(o), a))
+      (e:KVoidTuple) :
+        new CStore :
+          defmethod types (this) : [VMRef()]
+          defmethod store (c, this, xs:Tuple<Local>) :
+            emit(c, CallIns(xs, void-fn, [mfalse, one, len])) where :
+              val void-fn = CodeId(VM-VOID-TUPLE-FN-ID)
+              val mfalse = Marker(VM-FALSE-TYPE-ID)
+              val one = NumConst(1L)
+              val len = NumConst(to-long(length(e)))
       (e:KTupleGet) :
         new CStore :
           defmethod types (this) : [VMRef()]
@@ -1147,6 +1177,102 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
             emit(c, Branch2Ins(pass-lbl, EqOp(), len, expected-len))
             tcall(VM-LENGTH-ERROR-FN-ID, [len, expected-len])
             emit(c, LabelIns(pass-lbl))
+      (e:KIf) :
+        new CResult :
+          defmethod types (this) : []
+          defmethod gen-ins (c:Compiler, ctxt:Context, this) :
+            ;Compile predicate
+            defn compile-pred (pred:KExp, true-lbl:Int, false-lbl:Int) :
+              match(pred) :
+                (pred:KAndExp) :
+                  val kont-lbl = make-label(c)
+                  compile-pred(a(pred), kont-lbl, false-lbl)
+                  emit(c, LabelIns(kont-lbl))
+                  compile-pred(b(pred), true-lbl, false-lbl)
+                (pred:KOrExp) :
+                  val kont-lbl = make-label(c)
+                  compile-pred(a(pred), true-lbl, kont-lbl)
+                  emit(c, LabelIns(kont-lbl))
+                  compile-pred(b(pred), true-lbl, false-lbl)
+                (pred:KExp) :
+                  val p = imm(c, compile(pred))
+                  emit(c, Branch1Ins(true-lbl, false, p))
+                  emit(c, GotoIns(false-lbl))
+
+            ;Body
+            val true-lbl = make-label(c)
+            val false-lbl = make-label(c)
+            val end-lbl = make-label(c)
+            compile-pred(pred(e), true-lbl, false-lbl)
+            emit(c, LabelIns(true-lbl))
+            gen-ins(c, ctxt, compile(conseq(e)))
+            emit(c, GotoIns(end-lbl))
+            emit(c, LabelIns(false-lbl))
+            gen-ins(c, ctxt, compile(alt(e)))
+            emit(c, GotoIns(end-lbl))
+            emit(c, LabelIns(end-lbl))
+      (e:KSizeof) :
+        new CImms :
+          defmethod types (this) : [VMLong()]
+          defmethod imms (c, this) :
+            val size = size(dec-table, type(e))
+            [NumConst(to-long(size))]
+      (e:KRead) :
+        match(compile(loc(e))) :
+          (l:PtrLoc) :
+            new CStore :
+              defmethod types (this) :
+                to-tuple(vm-types(dec-table, type(e)))
+              defmethod store (c, this, xs:Tuple<Local>) :
+                val b = imm(c, base(l))
+                for (x in xs, o in field-offsets(dec-table, type(e))) do :
+                  emit(c, LoadIns(x, b, NumConst(to-long(offset(l) + o))))
+          (l:ExpLoc) :
+            new CImms :
+              defmethod types (this) :
+                to-tuple(vm-types(dec-table, type(e)))
+              defmethod imms (c, this) :
+                val xs = imms(c, base(l))
+                val len = length(dec-table, type(e))
+                xs[index(l) to index(l) + len]
+          (l:VarLoc) :
+            defn slice<?T> (xs:Tuple<?T>) :
+              val len = length(dec-table, type(e))
+              xs[index(l) to index(l) + len]
+              
+            if mutables[n(l)] :
+              ;Not necessary if mutables pulled out
+              new CImms :
+                defmethod types (this) :
+                  to-tuple(vm-types(dec-table, type(e)))
+                defmethod imms (c, this) :
+                  val ts = slice(types(c,n(l)))
+                  val xs = make-defs(c, ts)
+                  val ys = slice(imms(c,n(l)))
+                  for (x in xs, y in ys) do :
+                    emit(c, SetIns(x,y))
+                  xs
+            else :
+              new CImms :
+                defmethod types (this) :
+                  to-tuple(vm-types(dec-table, type(e)))
+                defmethod imms (c, this) :
+                  slice(imms(c,n(l)))                  
+      (e:KObjectGet) : 
+        new CStore :
+          defmethod types (this) : [VMRef()]
+          defmethod store (c, this, xs:Tuple<Local>) :
+            val obj = imm(c, compile(object(e)))
+            val num-targs = object-tarity(dec-table, n(e))
+            val offset = 8 * (num-targs + index(e))
+            emit(c, LoadIns(xs[0], obj, NumConst(offset)))
+      (e:KObjectTGet) : 
+        new CStore :
+          defmethod types (this) : [VMRef()]
+          defmethod store (c, this, xs:Tuple<Local>) :
+            val obj = imm(c, compile(object(e)))
+            val offset = 8 * index(e)
+            emit(c, LoadIns(xs[0], obj, NumConst(offset)))
       (e) :
         fatal("Not yet implemented")
 
