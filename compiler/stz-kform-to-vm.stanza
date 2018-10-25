@@ -17,8 +17,6 @@ defpackage stz/kform-to-vm :
 
 public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
   ;Define accumulators
-  val globals = Vector<VMGlobal>()
-  val consts = Vector<VMConst>()
   val classes = Vector<VMClass>()
   val funcs = Vector<VMFunction>()
   val externs = Vector<VMExtern>()
@@ -34,16 +32,14 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
     println("Compiling top level expression: %_" % [te])
     match(te) :
       (te:KDef) :
-        add(globals, VMGlobal(n(te), size, position, roots)) where :
+        add(global-defs, VMGlobal(n(te), size, roots)) where :
           val size = size(dec-table, type(te))
           val roots = roots(vm-types(dec-table, type(te)), field-offsets(dec-table, type(te)))
-          val position = current-offset(global-defs, size)
         init-global(initializers, n(te), type(te), value(te))
       (te:KDefVar) : 
-        add(globals, VMGlobal(n(te), size, position, roots)) where :
+        add(global-defs, VMGlobal(n(te), size, roots)) where :
           val size = size(dec-table, type(te))
           val roots = roots(vm-types(dec-table, type(te)), field-offsets(dec-table, type(te)))
-          val position = current-offset(global-defs, size)
         match(value(te)) :
           (v:KExp) : init-global(initializers, n(te), type(te), v)
           (v:False) : false        
@@ -106,7 +102,15 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
       (te:KInit) :
         add(initializers, exp(te))
       (te:KDefConst) :
-        println("DefConst compilation skipped")
+        val v = match(value(te)) :
+          (v:KTypeObject) :
+            fatal("Non-empty type object.") when not empty?(targs(v))
+            VMTypeObject(CodeId(n(v)))
+          (v:KClosure) :
+            fatal("Non-empty closure.") when not empty?(args(v))
+            VMClosure(CodeId(n(v)))
+          (v:VMValue) : v
+        add(global-defs, VMConst(n(te), v))
       (te:KDefObject) : fatal("Not yet implemented")
       (te:KDefTypeObject) :
         add(funcs, compile-type-object(n(te), args(te), type(te), dec-table, literal-defs))
@@ -121,7 +125,7 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
     do(compile{_, dec-table, literal-defs}, method-table)
     add(funcs, compile-init(initializers, dec-table, literal-defs))
 
-  VMProg(to-tuple(globals), defs(literal-defs), to-tuple(consts),
+  VMProg(globals(global-defs), defs(literal-defs), consts(global-defs),
          to-tuple(classes), to-tuple(funcs), to-tuple(externs))
 
 ;============================================================
@@ -129,19 +133,30 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
 ;============================================================
 
 deftype GlobalDefs
-defmulti current-offset (g:GlobalDefs) -> Int
-defmulti increment-offset (g:GlobalDefs, size:Int) -> False
-
-defn current-offset (g:GlobalDefs, size:Int) :
-  val p = current-offset(g)
-  increment-offset(g, size)
-  p
+defmulti add (g:GlobalDefs, def:VMGlobal) -> False
+defmulti add (g:GlobalDefs, def:VMConst) -> False
+defmulti globals (g:GlobalDefs) -> Tuple<VMGlobal>
+defmulti consts (g:GlobalDefs) -> Tuple<VMConst>
 
 defn GlobalDefs () :
-  var offset:Int = 0
+  val global-defs = Vector<VMGlobal>()
+  val const-defs = Vector<VMConst>()
+
   new GlobalDefs :
-    defmethod current-offset (this) : offset
-    defmethod increment-offset (this, size:Int) : offset = (offset + size + 7) & -8
+    defmethod add (this, g:VMGlobal) :
+      add(global-defs, g)
+    defmethod add (this, c:VMConst) :
+      add(const-defs, c)
+    defmethod globals (this) :
+      var offset:Int = 0
+      val defs = Vector<VMGlobal>()
+      defn push (g:VMGlobal) :
+        add(defs, sub-position(g, offset))
+        offset = offset + size(g)
+      do(push, global-defs)
+      to-tuple(defs)
+    defmethod consts (this) :
+      to-tuple(const-defs)
 
 ;============================================================
 ;=================== Literals Compilation ===================
@@ -336,7 +351,9 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
   defn global-address (n:Int) :
     val lbl = extern-label(dec-table, n)
     match(lbl:Symbol) : ExternId(n)
-    else : GlobalId(n)
+    else :
+      if const?(dec-table, n) : ConstId(n)
+      else : GlobalId(n)
   defn tcall (n:Int, args:Tuple<VMImm>) :
     val false-marker = Marker(VM-FALSE-TYPE-ID)
     val arity = length(args)
@@ -898,6 +915,30 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
                 ;        binop(o, TGAddOp(), o, a)
                 ;        emit(TGStore(o, detag-char(c), foffset(CHARARRAY-CHARS-FIELD-ID)))
                 ;    List(false-marker)
+          (op:GetterPrimitive) :
+            defn get-op (t:VMType, op:VMOp) : 
+              new CStore :
+                defmethod types (this) : [t]
+                defmethod store (c:Compiler, this, xs:Tuple<Local>) :
+                  emit(c, Op0Ins(xs[0], op))                                  
+            switch(op) :
+              GET-GLOBAL-TABLE-OP : get-op(VMLong(), GlobalsOp())
+              GET-CONSTS-OP : get-op(VMLong(), ConstsOp())
+              GET-CONSTS-DATA-OP : get-op(VMLong(), ConstsDataOp())
+              else :
+                fatal("Not yet implemented")
+            ;if op == GET-SP-OP :
+            ;  new CImm & Ignorable :
+            ;    defmethod types (this) : List(TGLongT())
+            ;    defmethod imms (this) : List(TGRegSP())
+            ;else :
+            ;  new CExp & Ignorable :
+            ;    defmethod types (this) :
+            ;      tgt-types(dec-table, type(e))
+            ;    defmethod set (ns:List<Int>, this) :
+            ;      val x = TGVar(head(ns))
+            ;      val p = TGMem(lbl(op),0)
+            ;      emit(TGLoad(x, p, 0))
           (op:LSPrimitive) :
             if op == LS-YIELD-OP :
               fatal("Not yet implemented.")
@@ -989,20 +1030,6 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
                           emit(c, Op1Ins(xs[0], InterpretOp(), imm(c,a)))
                         LS-FNUM-OP :
                           emit(c, Op1Ins(xs[0], InterpretOp(), imm(c,a)))
-          (op:GetterPrimitive) :
-            fatal("Not yet implemented")
-            ;if op == GET-SP-OP :
-            ;  new CImm & Ignorable :
-            ;    defmethod types (this) : List(TGLongT())
-            ;    defmethod imms (this) : List(TGRegSP())
-            ;else :
-            ;  new CExp & Ignorable :
-            ;    defmethod types (this) :
-            ;      tgt-types(dec-table, type(e))
-            ;    defmethod set (ns:List<Int>, this) :
-            ;      val x = TGVar(head(ns))
-            ;      val p = TGMem(lbl(op),0)
-            ;      emit(TGLoad(x, p, 0))
           (op:AddrPrimitive) :
             fatal("Not yet implemented")
             ;new CImm & Ignorable :
