@@ -27,6 +27,9 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
   val initializers = Initializers()
   val method-table = MethodTable()
 
+  ;Create KHierarchy
+  val khier = KHierarchy(hier-entries(kpkg))
+
   ;Compiling a top-level expression
   defn compile-te (te:KTExp) :
     println("Compiling top level expression: %_" % [te])
@@ -47,7 +50,7 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
         val func = match(value(te)) :
           (value:KMultifn) : fatal("Not yet implemented")
           (value:KFn) : value
-        val vmfunc = within c = compile-function(n(te), func, dec-table, literal-defs) :
+        val vmfunc = within c = compile-function(n(te), func, khier, dec-table, literal-defs) :
           ;Compute types
           for a in targs(func) do :
             set-types(c, a, [VMRef()])
@@ -69,7 +72,7 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
           to-tuple(qquote(false, false, ~@ targ-locals, ~@ arg-locals))
         add(funcs, vmfunc)
       (te:KDefClosure) :
-        add(funcs, compile-closure(te, dec-table, literal-defs))
+        add(funcs, compile-closure(te, khier, dec-table, literal-defs))
       (te:KDefmulti) :
         add(method-table, te)
       (te:KDefmethod) :
@@ -113,7 +116,7 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
         add(global-defs, VMConst(n(te), v))
       (te:KDefObject) : fatal("Not yet implemented")
       (te:KDefTypeObject) :
-        add(funcs, compile-type-object(n(te), args(te), type(te), dec-table, literal-defs))
+        add(funcs, compile-type-object(n(te), args(te), type(te), khier, dec-table, literal-defs))
 
   println("===== Input =====")
   within indented() :
@@ -122,8 +125,9 @@ public defn to-vmprog (dec-table:DecTable, kpkg:KPackage) -> VMProg :
   println("===== Compiling =====")
   within indented() :
     do(compile-te, exps(kpkg))
-    do(compile{_, dec-table, literal-defs}, method-table)
-    add(funcs, compile-init(initializers, dec-table, literal-defs))
+    for e in method-table do :
+      add(funcs, compile(khier, e, dec-table, literal-defs))
+    add(funcs, compile-init(initializers, khier, dec-table, literal-defs))
 
   VMProg(globals(global-defs), defs(literal-defs), consts(global-defs),
          to-tuple(classes), to-tuple(funcs), to-tuple(externs))
@@ -199,20 +203,61 @@ defn MethodTable () :
     defmethod to-seq (this) :
       to-seq(values(multis))
 
-defn compile (e:MultiEntry, dec-table:DecTable, literal-defs:LiteralDefs) :
-  println("Compiling multi: %_" % [multi(e)])
-  within indented() :
-    for m in methods(e) do :
-      println("Method: %_" % [m])
+defn compile (khier:KHierarchy, e:MultiEntry, dec-table:DecTable, literal-defs:LiteralDefs) :
+  val compiler = Compiler()
+  val exp-compiler = ExpCompiler(khier, compiler, dec-table, literal-defs)
+
+  ;Compute the immediates for representing the arguments
+  val targ-imms = for a in targs(multi(e)) map :
+    make-def(compiler, VMRef())
+  val arg-imms = for a in a1(multi(e)) map :
+    make-def(compiler, VMRef())
+
+  ;Compute the dispatch branch ordering
+  defn branch-types (m:KDefmethod) : map(erase-tvars, a1(value(m) as KFn))
+  val dispatch-branches = map(value, dispatch-ordering(khier, seq(branch-types, methods(e))))
+
+  println("Compiling multi:")
+  println(multi(e))
+  println(methods(e))
+  println("dispatch branches = %_" % [dispatch-branches])
+
+  ;Compile each method
+  for dispatch in dispatch-branches do :
+    match(dispatch) :
+      (dispatch:List<Int>) :
+        println("Ambiguity branch %_." % [dispatch])
+      (dispatch:Int) :
+        val types = branch-types(methods(e)[dispatch])        
+        val end-body = make-label(compiler)
+        val f = value(methods(e)[dispatch]) as KFn
+        for (x in cat(targ-imms, arg-imms), a in cat(targs(f), args(f))) do :
+          set-types(compiler, a, [VMRef()])
+          set-imms(compiler, a, [x])
+        for (x in arg-imms, t in types) do :
+          val pass-lbl = make-label(compiler)
+          compile-typeof(exp-compiler, x, t, pass-lbl, end-body)
+          emit(compiler, LabelIns(pass-lbl))
+        val return-ctxt = TailContext() when tail?(multi(e))
+                     else ReturnContext()
+        compile-exp(exp-compiler, return-ctxt, body(f))
+        emit(compiler, LabelIns(end-body))
+
+  ;Create VMFunc 
+  val all-args = to-tuple $ cat-all $ [
+    [false, false],
+    cat(targ-imms, arg-imms)]
+  VMFunc(n(multi(e)), all-args, defs(compiler), instructions(compiler))
 
 ;============================================================
 ;================= Function Compilation =====================
 ;============================================================
 defn compile-function (gen-args:Compiler -> Tuple<Local|False>, id:Int, f:KFn,
+                       khier:KHierarchy,
                        dec-table:DecTable,
                        literal-defs:LiteralDefs) :
   val compiler = Compiler()
-  val exp-compiler = ExpCompiler(compiler, dec-table, literal-defs)
+  val exp-compiler = ExpCompiler(khier, compiler, dec-table, literal-defs)
   val args = gen-args(compiler)
   val return-ctxt = TailContext() when tail?(f)
                else ReturnContext()
@@ -222,10 +267,10 @@ defn compile-function (gen-args:Compiler -> Tuple<Local|False>, id:Int, f:KFn,
 ;============================================================
 ;=================== Closure Compilation ====================
 ;============================================================
-defn compile-closure (e:KDefClosure, dec-table:DecTable, literal-defs:LiteralDefs) :
+defn compile-closure (e:KDefClosure, khier:KHierarchy, dec-table:DecTable, literal-defs:LiteralDefs) :
   ;Create compiler
   val c = Compiler()
-  val exp-compiler = ExpCompiler(c, dec-table, literal-defs)
+  val exp-compiler = ExpCompiler(khier, c, dec-table, literal-defs)
   comment(c, "Code for closure %_" % [n(e)])
 
   ;Retrieve function
@@ -275,9 +320,9 @@ defn compile-closure (e:KDefClosure, dec-table:DecTable, literal-defs:LiteralDef
 ;============================================================
 ;================= Type Object Compilation ==================
 ;============================================================
-defn compile-type-object (n:Int, args:List<Int>, t:KType, dec-table:DecTable, literal-defs:LiteralDefs) :
+defn compile-type-object (n:Int, args:List<Int>, t:KType, khier:KHierarchy, dec-table:DecTable, literal-defs:LiteralDefs) :
   val compiler = Compiler()
-  val exp-compiler = ExpCompiler(compiler, dec-table, literal-defs)
+  val exp-compiler = ExpCompiler(khier, compiler, dec-table, literal-defs)
   comment(compiler, "Check typeof %_" % [t])
   ;Arguments
   val tobj = make-def(compiler, VMRef())
@@ -322,9 +367,9 @@ defn Initializers () :
       if empty?(inits) : KLSLiteral(false)
       else : KSeq(inits)
 
-defn compile-init (i:Initializers, dec-table:DecTable, literal-defs:LiteralDefs) :
+defn compile-init (i:Initializers, khier:KHierarchy, dec-table:DecTable, literal-defs:LiteralDefs) :
   val compiler = Compiler()
-  val exp-compiler = ExpCompiler(compiler, dec-table, literal-defs)
+  val exp-compiler = ExpCompiler(khier, compiler, dec-table, literal-defs)
   compile-exp(exp-compiler, TargetContext([]), inits(i))
   emit(compiler, ReturnIns([]))
   VMFunc(0, [], defs(compiler), instructions(compiler))
@@ -336,7 +381,7 @@ deftype ExpCompiler
 defmulti compile-typeof (e:ExpCompiler, obj:VMImm, t:KType, pass:Int, fail:Int) -> False
 defmulti compile-exp (e:ExpCompiler, ctxt:Context, e:KExp) -> False
 
-defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDefs) :
+defn ExpCompiler (khier:KHierarchy, compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDefs) :
   ;Track mutables
   val mutables = IntSet()
 
@@ -1152,6 +1197,37 @@ defn ExpCompiler (compiler:Compiler, dec-table:DecTable, literal-defs:LiteralDef
               ;If fail
               emit(c, LabelIns(fail-lbl))
             ;Ending label
+            emit(c, LabelIns(end-lbl))
+      (e:KDispatch) :
+        new CResult :
+          defmethod types (this) : []
+          defmethod gen-ins (c:Compiler, ctxt:Context, this) :            
+            ;Compute dispatch ordering
+            val branches = to-tuple(branches(e) as List<KBranch>)
+            defn branch-types (e:KBranch) : map(erase-tvars, types(e))
+            val dispatches = map(value, dispatch-ordering(khier, seq(branch-types, branches)))
+            ;Compile arguments
+            val args* = map(imm{c, compile(_)}, args(e))
+            ;Compile branches
+            val end-lbl = make-label(c)
+            for dispatch in dispatches do :
+              match(dispatch) :
+                (dispatch:List<Int>) :
+                  println("Ambiguity branch %_." % [dispatch])
+                (dispatch:Int) :
+                  val b = branches[dispatch]
+                  val types = branch-types(b)
+                  val end-body = make-label(c)
+                  for (a in args(b), x in args*) do :
+                    set-types(c, a, [VMRef()])
+                    set-imms(c, a, [x])
+                  for (x in args*, t in types) do :
+                    val pass-lbl = make-label(c)
+                    compile-typeof(c, x, t, pass-lbl, end-body)
+                    emit(c, LabelIns(pass-lbl))
+                  gen-ins(c, ctxt, compile(body(b)))
+                  emit(c, GotoIns(end-lbl))
+                  emit(c, LabelIns(end-body))
             emit(c, LabelIns(end-lbl))
       (e:KBox) :
         new CStore :
