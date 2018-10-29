@@ -1,6 +1,6 @@
 if [ $1 == "vm" ]
 then    
-  stanza compiler/stz-vm-ir.stanza compiler/stz-vm.stanza compiler/stz-built-ins.stanza tests/bindings.stanza compiler/stz-vm-driver.stanza -o vm -ccfiles tests/mycfunctions.c
+  stanza compiler/stz-vm-ir.stanza compiler/stz-vm-analyze.stanza compiler/stz-vm.stanza compiler/stz-built-ins.stanza tests/bindings.stanza compiler/stz-vm-driver.stanza -o vm -ccfiles tests/mycfunctions.c
 elif [ $1 == "gen-bindings" ]
 then
   stanza compiler/stz-vm-ir.stanza compiler/stz-vm.stanza compiler/stz-built-ins.stanza compiler/stz-vm-bindings.stanza -o vm-bindings
