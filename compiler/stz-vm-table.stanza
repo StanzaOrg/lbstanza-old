@@ -4,36 +4,67 @@ defpackage stz/vm-table :
   import stz/vm-ir
 
 ;============================================================
+;=============== Low-Level Expanding Buffer =================
+;============================================================
+
+lostanza deftype Buffer :
+  size:long
+  capacity:long
+  mem:ptr<?>
+
+lostanza defn Buffer () -> ref<Buffer> :
+  val cap = 1024L
+  val mem = call-c clib/malloc(cap)
+  return new Buffer{0L, cap, mem}
+
+lostanza defn ensure-capacity (b:ref<Buffer>, capacity:long) -> int :
+  if b.capacity >= capacity : return 0
+  var c:long = b.capacity * 2L
+  while c < capacity : c = c * 2L
+  val mem2 = call-c clib/malloc(c)
+  call-c memcpy(mem2, b.mem, b.size)
+  call-c clib/free(b.mem)
+  b.capacity = c
+  b.mem = mem2
+  return 0
+
+lostanza defn alloc (b:ref<Buffer>, size:long) -> long :
+  val size2 = b.size + size
+  ensure-capacity(b, size2)
+  val offset = b.size
+  b.size = size2
+  return offset
+
+lostanza defn alloc (b:ref<Buffer>, size:ref<Int>) -> ref<Int> :
+  return new Int{alloc(b, size.value) as int}
+
+;============================================================
 ;================ Definition of all Tables ==================
 ;============================================================
 
-lostanza deftype VMTable :
+public lostanza deftype VMTable :
   ;Globals
-  global-table:ref<IntTable<Int>>    ;Will not be needed after indices are dense
-  num-globals:int
-  globals:ptr<long>
+  global-table:ref<IntTable<VMGlobal>>
+  global-offsets:ref<IntTable<Int>>      ;Will not be needed after indices are dense
+  globals:ref<Buffer>
   global-roots:ref<Vector<Int>>
 
   ;Constants
-  const-table:ref<IntTable<Int>>     ;Will not be needed after indices are dense
-  num-consts:int
-  consts:ptr<long>
+  const-positions:ref<IntTable<Int>>     ;Will not be needed after indices are dense
+  consts:ref<Buffer>
   new-consts:ptr<long>
   consts-data:ptr<byte>
 
   ;Data
-  data-table:ref<IntTable<Int>>      ;Will not be needed after indices are dense
-  num-data:int
-  data:ptr<long>
-  
+  data-positions:ref<IntTable<Int>>      ;Will not be needed after indices are dense
+  data:ref<Buffer>
+
   ;Functions
-  function-table:ref<IntTable<Int>>  ;Will not be needed after indices are dense
+  function-addresses:ref<IntTable<Int>>  ;Will not be needed after indices are dense
   instructions:ref<Vector<LinkedIns>>
 
   ;Externs
-  extern-table:ref<IntTable<Int>>    ;Will not be needed after indices are dense
-  num-externs:int
-  externs:ptr<long>
+  extern-addresses:ref<IntTable<Long>>    ;Will not be needed after indices are dense
 
 ;============================================================
 ;======================= Initialization =====================
@@ -46,35 +77,207 @@ lostanza defn void-mem (n:int) -> ptr<long> :
     mem[i] = VOID-MARKER
   return mem
 
-lostanza defn VMTable () -> ref<VMTable> :
+public lostanza defn VMTable () -> ref<VMTable> :
   return new VMTable{
     ;Globals
+    IntTable<VMGlobal>(),
     IntTable<Int>(),
-    0,
-    0L as ptr<long>,
+    Buffer(),
     Vector<Int>(),
 
     ;Constants
     IntTable<Int>(),
-    0,
-    0L as ptr<long>,
+    Buffer(),
     0L as ptr<long>,
     0L as ptr<byte>,
 
     ;Data
     IntTable<Int>(),
-    0,
-    0L as ptr<long>,
+    Buffer(),
 
     ;Functions
     IntTable<Int>(),
     Vector<LinkedIns>(),
 
     ;Externs
-    IntTable<Int>()
-    0,
-    0L as ptr<long>}
+    IntTable<Long>()}
 
 ;============================================================
+;=================== Global Loading =========================
 ;============================================================
+
+public lostanza defn load-globals (vmt:ref<VMTable>, globals:ref<Seqable<VMGlobal>>) -> ref<False> :
+  load-globals(globals, vmt.global-table, vmt.global-offsets, vmt.globals, vmt.global-roots)
+  return false
+
+defn load-globals (globals:Seqable<VMGlobal>,
+                   global-table:IntTable<VMGlobal>,
+                   offsets:IntTable<Int>,
+                   buffer:Buffer,
+                   roots:Vector<Int>) :
+  ;Accumulate roots to add and remove
+  val rm-roots = Vector<Int>()
+  val add-roots = Vector<Int>()
+  for g in globals do :
+    ;Remove old roots
+    if key?(global-table, id(g)) :
+      val g0 = global-table[id(g)]
+      val offset = offsets[id(g)]
+      for r in roots(g0) do :
+        add(rm-roots, offset / 8 + r)
+    ;Add new roots      
+    val size* = (size(g) + 7) & -8
+    val offset = alloc(buffer, size*)
+    for r in roots(g) do :
+      add(add-roots, offset / 8 + r)
+    ;Add to tables
+    global-table[id(g)] = g
+    offsets[id(g)] = offset
+
+  ;Clear the new roots
+  for r in add-roots do :
+    make-void(buffer, r)
+
+  ;Add/Remove the new roots to the root vector
+  add-remove(roots, add-roots, rm-roots)
+
+lostanza make-void (buffer:ref<Buffer>, i:ref<Int>) -> ref<False> :
+  buffer.mem[i.value] = VOID-MARKER
+  return false
+
+defn add-remove (xs:Vector<Int>, addxs:Vector<Int>, rmxs:Vector<Int>) :
+  val tmp = IntSet()
+  add-all(tmp, xs)
+  for x in rmxs do :
+    if not remove(tmp, x) :
+      fatal("Root %_ does not exist." % [x])
+  for x in addxs do :
+    if not add(tmp, x) :
+      fatal("Root %_ already exists." % [x])
+  clear(xs)
+  add-all(xs, tmp)
+  qsort!(xs)
+
 ;============================================================
+;===================== Const Loading ========================
+;============================================================
+
+public lostanza defn load-consts (vmt:ref<VMTable>, consts:ref<Tuple<VMConst>>) -> ref<False> :
+  ;Put into const-positions table
+  val nconsts = length(consts)
+  val const-space = nconsts.value * 8L
+  val pos = alloc(vmt.consts, const-space) / 8
+  for (var i:int = 0, i < nconsts, i = i + 1) :
+    val id = id(consts.items[i])
+    if key?(const-positions, id) : fatal("Const already defined.")
+    set(const-positions, id, new Int{pos + i})
+
+  ;Compile data
+  vmt.consts-data = compile-const-data(consts)
+
+  ;Point to new constants
+  vmt.new-consts = addr!(vmt.consts.mem[pos])
+
+  return false
+
+;============================================================
+;=================== Const Compilation ======================
+;============================================================
+
+lostanza defn compile-const-data (consts:ref<Tuple<VMConst>>) -> ptr<byte> :
+  return to-byte-ptr(to-byte-buffer(consts))
+
+defn to-byte-buffer (consts:Tuple<VMConst>) :
+  val buffer = ByteBuffer()
+  put(buffer, length(consts))
+  defn emit (v:VMValue) :
+    match(v) :
+      (v:Char) :
+        put(buffer, CHAR-CONST-TAG)
+        put(buffer, v)
+      (v:Byte) :
+        put(buffer, BYTE-CONST-TAG)
+        put(buffer, v)
+      (v:Int) :
+        put(buffer, INT-CONST-TAG)
+        put(buffer, v)
+      (v:Long) :
+        put(buffer, LONG-CONST-TAG)
+        put(buffer, v)
+      (v:Float) :
+        put(buffer, FLOAT-CONST-TAG)
+        put(buffer, v)
+      (v:Double) :
+        put(buffer, DOUBLE-CONST-TAG)
+        put(buffer, v)
+      (v:String) :
+        put(buffer, STRING-CONST-TAG)
+        emit-chars(v)
+      (v:Symbol) :
+        put(buffer, SYMBOL-CONST-TAG)
+        emit-chars(to-string(v))
+      (v:List) :
+        put(buffer, LIST-CONST-TAG)
+        put(buffer, length(v))
+        do(emit, v)
+      (v:True) :
+        put(buffer, TRUE-CONST-TAG)
+      (v:False) :
+        put(buffer, FALSE-CONST-TAG)
+      (v:VMTypeObject) :
+        put(buffer, TYPE-CONST-TAG)
+        put(buffer, to-long(fid(id(v))))
+      (v:VMClosure) :
+        put(buffer, FN-CONST-TAG)
+        put(buffer, to-long(fid(id(v))))
+      (v) :
+        fatal("Unrecognized constant: %~" % [v])
+  defn emit-chars (s:String) :
+    val n = length(s)
+    put(buffer, n)
+    for c in s do :
+      put(buffer, c)
+    val endn = (n + 3) & -4
+    for i in n to endn do :
+      put(buffer, 0Y)
+  do(emit{value(_)}, consts)
+  buffer
+  
+lostanza defn to-byte-ptr (b:ref<ByteBuffer>) -> ptr<byte> :
+  val n = length(b).value
+  val x = call-c clib/malloc(n)
+  call-c memcpy(x, data(b), n)
+  return x
+
+;============================================================
+;====================== Data Loading ========================
+;============================================================
+
+public lostanza defn load-data (vmt:ref<VMTable>, d:ref<VMData>) -> ref<False> :
+  ;Put into data buffer
+  val size = length(data(d)).value
+  val size* = (size + 7L) & -8L
+  val pos = alloc(vmt.data, size*) / 8
+  call-c clib/memcpy(addr!(vmt.data.mem[pos]), array(data(d)), size)
+  if key?(vmt.data-positions, id(d)) : fatal("Data already defined.")
+  set(vmt.data-positions, id(d), new Int{pos})
+  return false
+
+;============================================================
+;====================== Extern Loading ======================
+;============================================================
+
+public lostanza defn load-extern (vmt:ref<VMTable>, e:ref<VMExtern>) -> ref<False> :
+  val address = get(EXTERN-TABLE, id(e))
+  set(vmt.extern-addresses, id(e), address)
+  return false
+
+;============================================================
+;===================== Function Loading =====================
+;============================================================
+
+public lostanza defn load-function (vmt:ref<VMTable>, id:ref<Int>, ins:ref<Seqable<LinkedIns>>) -> ref<False> :
+  val address = length(vmt.instructions)
+  add-all(vmt.instructions, ins)
+  set(vmt.function-addresses, id, address)
+  return false
