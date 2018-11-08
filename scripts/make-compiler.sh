@@ -54,6 +54,7 @@ $STANZA \
     compiler/stz-kform-to-vm.stanza \
     compiler/stz-built-ins.stanza \
     compiler/stz-vm-ir.stanza \
+    compiler/stz-vm-analyze.stanza \
     compiler/stz-khier.stanza \
     compiler/stz-fuse.stanza \
     compiler/stz-pkg.stanza \
