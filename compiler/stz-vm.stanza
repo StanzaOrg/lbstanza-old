@@ -1168,7 +1168,7 @@ public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:re
   return false
 
 ;============================================================
-;==================== Garbage Collector =====================
+;==================== Heap/Stack Extension ==================
 ;============================================================
 
 extern memcpy : (ptr<?>, ptr<?>, long) -> int
@@ -1192,6 +1192,9 @@ lostanza defn extend-stack (vm:ref<VirtualMachine>, size:long) -> long :
   return 0
 
 lostanza defn extend-heap (vm:ref<VirtualMachine>, size:long) -> long :
+  ;PRINT LIVE
+  compute-live(vm)
+
   ;First run the garbage collector,
   collect-garbage(vm)
   
@@ -1231,6 +1234,10 @@ lostanza defn resize-freespace (vm:ref<VirtualMachine>, space:long) -> int :
   vm.free = call-c clib/malloc(space)
   vm.free-limit = vm.free + space
   return 0
+
+;============================================================
+;==================== Garbage Collector =====================
+;============================================================
 
 lostanza defn collect-garbage (vm:ref<VirtualMachine>) -> long :
   ;Cap the current stack
@@ -1385,6 +1392,142 @@ lostanza defn copy-bytes-to-heap (p:ptr<?>, n:long, vm:ref<VirtualMachine>) -> i
   vm.heap-top = heap + n
   return 0
 
+;============================================================
+;==================== Liveness Detector =====================
+;============================================================
+
+lostanza var LIVENESS-BUFFER:ref<Buffer|False> = false
+
+lostanza defn mark-in-liveness-buffer (obj:ptr<ObjectLayout>) -> int :
+  if obj.tag == -1L : fatal("Already marked!")
+  val buffer = LIVENESS-BUFFER as ref<Buffer>
+  val offset = alloc(buffer, sizeof(BrokenHeartLayout))
+  val heart:ptr<BrokenHeartLayout> = buffer.mem + offset
+  heart.tag = obj.tag
+  heart.forward = obj as long
+  obj.tag = -1L
+  return 0
+
+lostanza defn mark-ref (ref:long) -> int :
+  val tagbits = ref & 7L
+  if tagbits == REF-TAG-BITS :
+    val obj = (ref - REF-TAG-BITS) as ptr<ObjectLayout>
+    ;If object is not already marked
+    if obj.tag != -1L :
+      mark-in-liveness-buffer(obj)
+  return 0
+
+lostanza defn mark-frames (frames:ptr<Frame>, f-end:ptr<Frame>, vm:ref<VirtualMachine>) -> int :
+  var f:ptr<Frame> = frames
+  while f <= f-end :
+    val map = get(live-map-table(vm.linker), new Int{f.liveness-map as int})
+    val live-slots = live-slots(map)
+    val num-live = length(live-slots).value
+    for (var i:int = 0, i < num-live, i = i + 1) :
+      val s = get(live-slots, new Int{i}).value
+      mark-ref(f.slots[s])
+    f = addr(f.slots[num-slots(map).value]) as ptr<Frame>
+  return 0
+
+lostanza defn mark-object (p:ptr<long>, tag:int, vm:ref<VirtualMachine>, class-table:ref<ClassTable>) -> int :
+  ;p is [tag, cells ...]
+  val class = get(class-table, new Int{tag})
+  match(class) :
+    (class:ref<VMLeafClass>) :
+      ;Mark the frames of a stack
+      if tag == STACK-TYPE-ID.value :
+        val s = (p + 8) as ptr<Stack>
+        mark-frames(s.frames, s.stack-pointer, vm)
+      ;Get properties
+      val size = size(class).value
+      val roots = roots(class)
+      val num-roots = length(roots).value
+      ;Mark slots
+      val obj = p as ptr<ObjectLayout>      
+      for (var i:int = 0, i < num-roots, i = i + 1) :
+        val r = get(roots, new Int{i}).value
+        mark-ref(obj.slots[r])
+    (class:ref<VMArrayClass>) :
+      ;Get properties
+      val base-roots = base-roots(class)
+      val item-roots = item-roots(class)
+      val base-size = base-size(class).value
+      val item-size = item-size(class).value
+      val num-base-roots = length(base-roots).value
+      val num-item-roots = length(item-roots).value
+      ;Mark base roots
+      val array = p as ptr<ObjectLayout>
+      val len = array.slots[0]
+      for (var i:int = 0, i < num-base-roots, i = i + 1) :
+        val r = get(base-roots, new Int{i}).value
+        mark-ref(array.slots[r])
+      ;Mark item roots
+      var items:ptr<long> = addr(array.slots) + base-size
+      if num-item-roots > 0 :
+        for (var n:long = 0, n < len, n = n + 1) :
+          for (var i:int = 0, i < num-item-roots, i = i + 1) :
+            val r = get(item-roots, new Int{i}).value
+            mark-ref(items[r])
+          items = items + item-size
+  return 0
+
+lostanza defn mark-liveness-buffer (vm:ref<VirtualMachine>) -> int :  
+  val class-table = vm.vmtable.class-table
+  val buffer = LIVENESS-BUFFER as ref<Buffer>
+  var offset:long = 0L
+  while offset < buffer.size :
+    val heart:ptr<BrokenHeartLayout> = buffer.mem + offset
+    mark-object(heart.forward as ptr<long>, heart.tag as int, vm, class-table)
+    offset = offset + sizeof(BrokenHeartLayout)
+  return 0
+
+lostanza defn compute-live (vm:ref<VirtualMachine>) -> long :
+  ;Cap the current stack
+  val s:ptr<Stack> = untag(vm.current-stack)
+  s.stack-pointer = vm.stack-pointer
+
+  ;Create liveness buffer for marking
+  val buffer = Buffer()
+  LIVENESS-BUFFER = buffer
+  
+  ;Get heap bounds
+  val heap = vm.heap
+  val heap-limit = vm.heap-limit
+
+  ;Scan global roots
+  val globals:ptr<long> = vm.vmtable.globals.mem
+  val roots = to-seq(vm.vmtable.global-roots)
+  while empty?(roots) == false :
+    val i = next(roots).value
+    mark-ref(globals[i])
+
+  ;Scan const roots
+  val nconsts = vm.vmtable.consts.size / 8
+  val consts:ptr<long> = vm.vmtable.consts.mem
+  for (var i:int = 0, i < nconsts, i = i + 1) :
+    mark-ref(consts[i])
+
+  ;Scan stack roots
+  mark-ref(vm.current-stack)
+
+  ;Scan heap
+  mark-liveness-buffer(vm)
+
+  ;Print out contents
+  call-c clib/printf("Live Objects:\n")
+  var offset:long = 0L
+  while offset < buffer.size :
+    val heart:ptr<BrokenHeartLayout> = buffer.mem + offset
+    call-c clib/printf("  Item with tag %ld at address %p\n", heart.tag, heart.forward)
+    offset = offset + sizeof(BrokenHeartLayout)
+
+  ;Delete buffer
+  LIVENESS-BUFFER = false
+  fatal("Done for now")
+  
+  ;Return
+  return 0
+  
 ;============================================================
 ;===================== Debugging ============================
 ;============================================================
