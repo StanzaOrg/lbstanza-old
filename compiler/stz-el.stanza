@@ -14,11 +14,18 @@ public defn lower (packageio:PackageIO, epackage:EPackage) :
   println(packageio)
   println("===== EPACKAGE =====")
   println(epackage)
+
+  var cur-package:EPackage = epackage
+  defn report (name:String) :
+    println("===== %_ =====" % [name])
+    println(cur-package)
   
-  val epackage2 = map-methods(epackage)
-  println("===== EPACKAGE2 =====")
-  println(epackage2)
-  
+  cur-package = map-methods(cur-package)
+  report("Mapped Methods")
+
+  val function-table = FunctionTable(packageio, cur-package)
+  cur-package = create-closures(function-table, cur-package)
+  report("Created Closures")  
 
 ;============================================================
 ;================== Method TArg Mapping =====================
@@ -69,3 +76,200 @@ defn map-methods (e:EPackage) :
       (x) : map(loop, x)
   loop(e) as EPackage  
 
+;============================================================
+;====================== Type Table ==========================
+;============================================================
+
+deftype TypeTable
+defmulti to-etype (t:TypeTable, d:DType, targs:Tuple<EType>) -> EType
+
+defn TypeTable (io:PackageIO) :
+  val type-ids = HashTable<TypeId,Int>()
+  for e in cat(imports(io), exports(io)) do :
+    match(rec(e):TypeRec|StructRec) :
+      type-ids[id(rec(e)) as TypeId] = n(e)
+  defn to-etype (d:DType, targs:Tuple<EType>) :
+    defn conv (f:False) : false
+    defn conv (ds:Tuple<DType>) : map(conv, ds)
+    defn conv (d:DType) :
+      match(d) :
+        (d:DByte) : EByte()
+        (d:DInt) : EInt()
+        (d:DLong) : ELong()
+        (d:DFloat) : EFloat()
+        (d:DDouble) : EDouble()
+        (d:DUnknown) : EUnknown()
+        (d:DPtrT) : EPtrT(conv(type(d)))
+        (d:DFnT) : EFnT(conv(a(d)), conv(r(d)), conv(b(d)))
+        (d:DStructT) : EStructT(type-ids[id(d)])
+        (d:DOf) : EOf(type-ids[id(d)])
+        (d:DTVar) : targs[index(d)]
+        (d:DAnd) : reduce(EAnd, seq(conv, types(d)))
+        (d:DOr) : reduce(EOr, seq(conv, types(d)))
+        (d:DTop) : ETop()
+        (d:DBot) : EBot()
+    conv(d)
+         
+  new TypeTable :
+    defmethod to-etype (this, d:DType, targs:Tuple<EType>) :
+      to-etype(d, targs)
+
+;============================================================
+;==================== Function Table ========================
+;============================================================
+
+deftype FnEntry
+defstruct EFnEntry <: FnEntry :
+  targs: Tuple<Int>
+  a1: Tuple<EType>
+  a2: EType
+defstruct DFnEntry <: FnEntry :
+  ntargs: Int
+  a1: Tuple<DType>
+  a2: DType
+defstruct EMultifnEntry <: FnEntry :
+  funcs: Tuple<EFnEntry>
+
+deftype FunctionTable
+defmulti register (t:FunctionTable, e:ELocalFn) -> False
+defmulti function? (t:FunctionTable, n:Int) -> True|False
+defmulti arity (t:FunctionTable, n:Int) -> Int
+
+defn FunctionTable (io:PackageIO, ep:EPackage) :
+  val entries = IntTable<FnEntry>()
+
+  ;Create entry
+  defn FnEntry (e:EFunction) :
+    match(e) :
+      (e:EFn) : EFnEntry(targs(e), a1(e), a2(e))
+      (e:EMultifn) : EMultifnEntry(map({FnEntry(_) as EFnEntry}, funcs(e)))
+
+  ;Initialize table using global definitions
+  for import in imports(io) do :
+    val r = rec(import)
+    match(r:FnRec|MultiRec) :
+      val id = id(r) as FnId
+      entries[n(import)] = DFnEntry(ntargs(id), a1(id), a2(r))
+  for e in exps(ep) do :
+    match(e) :
+      (e:EDefn) :
+        entries[n(e)] = FnEntry(func(e))
+      (e:EDefmulti) :
+        entries[n(e)] = EFnEntry(targs(e), a1(e), a2(e))
+      (e) : false
+
+  new FunctionTable :
+    defmethod register (this, e:ELocalFn) :
+      entries[n(e)] = FnEntry(func(e))
+    defmethod function? (this, n:Int) :
+      key?(entries, n)
+    defmethod arity (this, n:Int) :
+      match(entries[n]) :
+        (e:EFnEntry) : length(a1(e))
+        (e:DFnEntry) : length(a1(e))
+
+;============================================================
+;=================== Closure Creation =======================
+;============================================================
+
+defn create-closures (ft:FunctionTable, epackage:EPackage) -> EPackage :
+  ;Create a trampoline function that calls the given immediate
+  ;with known arity.
+  defn trampoline-fn (f:ECurry|EMix, arity:Int) :
+    defn times<?T> (n:Int, f:() -> ?T) :
+      to-tuple(repeatedly(f,n))
+    val ret = EVar(fresh-id())
+    val args = arity * fresh-id
+    val a1 = arity * ETop
+    val locals = [
+      ELocal(n(ret), ETop(), false)]
+    EFn([], args, a1, ETop(),
+      EBody(locals, [], [], [
+        ECheckedDo(ret, ETop(), f, map(EVar,args), a1)
+        EReturn(ret)]))
+      
+  ;Create a trampoline function that calls the given immediate
+  ;with unknown (and potentially multiple) arities.
+  defn trampoline-fn (f:ECurry|EMix) :
+    defn num-args (e:ECurry) : arity(ft, n(e))
+    match(f) :
+      (f:ECurry) :
+        trampoline-fn(f, num-args(f))
+      (f:EMix) :
+        val funcs = to-tuple $
+          for group in group-by(num-args, funcs(f)) seq :
+            val e* = switch(length(value(group))) :
+              1 : head(value(group))
+              else : EMix(to-tuple(value(group)))
+            trampoline-fn(e*, key(group))
+        EMultifn(funcs)
+        
+  ;Lift
+  defn analyze-body (body0:EBody) :
+    ;Recursively analyze sub-bodies first
+    val body = mapr(analyze-body, body0) as EBody
+    
+    ;Register all local functions first
+    do(register{ft, _}, localfns(body))
+
+    ;New definitions
+    val new-locals = Vector<ELocal>()
+    val new-localfns = Vector<ELocalFn>()
+    val new-ins = Vector<EIns>()
+
+    ;Lift a reference to a closure
+    defn lift (x:EImm) -> EVar :
+      defn ref-to-closure (n:Int) :
+        val x = fresh-id()
+        add(new-locals, ELocal(x, ETop(), false))
+        add(new-ins, ELetRec([EVar(x)], [EClosure(n)]))
+        EVar(x)      
+      match(x) :
+        (x:EVar) :
+          ref-to-closure(n(x))
+        (x:ECurry|EMix) :
+          val n = fresh-id()
+          add(new-localfns, ELocalFn(n, trampoline-fn(x)))
+          ref-to-closure(n)
+
+    ;Analyze an immediate, lifting when necessary
+    defn lift-imm (x:EImm) :
+      match(x) :
+        (x:EVar) : lift(x) when function?(ft,n(x)) else x
+        (x:ECurry|EMix) : lift(x)
+        (x) : x
+    defn lift-imms (xs:Tuple<EImm>) :
+      map(lift-imm, xs)
+
+    ;Analyze all instructions
+    for i in ins(body) do :
+      add{new-ins, _} $ match(i) :
+        (i:ECheckedDo) : ECheckedDo(x(i), xtype(i), f(i), lift-imms(ys(i)), ytypes(i))
+        (i:EDo) : EDo(x(i), xtype(i), f(i), lift-imms(ys(i)))
+        (i) : mapr(lift-imm, i) as EIns
+
+    ;Return analyzed function
+    if empty?(new-locals) :
+      body
+    else :
+      defn plus<?T> (xs:Seqable<?T>, ys:Seqable<?T>) : to-tuple(cat(xs,ys))
+      EBody(locals(body) + new-locals,
+            localfns(body) + new-localfns,
+            localobjs(body),
+            to-tuple(new-ins))
+
+  ;Create closures
+  mapr(analyze-body, epackage) as EPackage
+
+;============================================================
+;====================== Grouping ============================
+;============================================================
+
+public defn group-by<?T,?K,?V> (xkey:T -> ?K&Hashable&Equalable, xval:T -> ?V, xs:Seqable<?T>) :
+  val table = HashTable<K,List<V>>(List())
+  for x in xs do :
+    update(table, cons{xval(x), _}, xkey(x))
+  table
+
+public defn group-by<?T,?K> (xkey:T -> ?K&Hashable&Equalable, xs:Seqable<?T>) :
+  group-by(xkey, {_}, xs)
