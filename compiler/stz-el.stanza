@@ -25,12 +25,17 @@ public defn lower (packageio:PackageIO, epackage:EPackage) :
   cur-package = map-methods(cur-package)
   report("Mapped Methods")
 
-  val function-table = FunctionTable(packageio, cur-package)
+  val type-table = TypeTable(packageio)
+  val function-table = FunctionTable(type-table, packageio, cur-package)
   cur-package = create-closures(function-table, cur-package)
   report("Created Closures")
 
   cur-package = convert-mixes(function-table, cur-package)
   report("Converted Mixes")
+
+  val var-table = VarTable(type-table, packageio, cur-package)
+  cur-package = insert-guards(var-table, cur-package)
+  report("Inserted Guards")
 
 ;============================================================
 ;================== Method TArg Mapping =====================
@@ -141,9 +146,8 @@ defmulti function? (t:FunctionTable, n:Int) -> True|False
 defmulti arity (t:FunctionTable, n:Int) -> Int
 defmulti fn-types (t:FunctionTable, f:EVar|ECurry) -> [Tuple<EType>, EType]
 
-defn FunctionTable (io:PackageIO, ep:EPackage) :
+defn FunctionTable (type-table:TypeTable, io:PackageIO, ep:EPackage) :
   val entries = IntTable<FnEntry>()
-  val type-table = TypeTable(io)
 
   ;Create entry
   defn FnEntry (e:EFunction) :
@@ -201,6 +205,44 @@ defn sub-tvars (t:EType, table:IntTable<EType>) :
   let loop (t:EType = t) :
     match(t:ETVar) : get?(table, n(t), t)
     else : mapr(loop, t) as EType
+
+;============================================================
+;===================== Variable Table =======================
+;============================================================
+
+defstruct VarEntry :
+  mutable?: True|False
+  global?: True|False
+  type: EType
+
+deftype VarTable
+defmulti register (vt:VarTable, e:ELocal) -> False
+defmulti mutable? (vt:VarTable, n:Int) -> True|False
+defmulti global? (vt:VarTable, n:Int) -> True|False
+defmulti type (vt:VarTable, n:Int) -> EType
+
+defn VarTable (type-table:TypeTable, io:PackageIO, ep:EPackage) :
+  val entries = IntTable<VarEntry>()
+  for import in imports(io) do :
+    match(rec(import)) :
+      (r:ValRec) :
+        entries[n(import)] = VarEntry(mutable?(r), true, to-etype(type-table, type(r), []))
+      (r:ExternRec) :
+        entries[n(import)] = VarEntry(true, true, to-etype(type-table, type(r), []))
+      (r) : false
+  for e in exps(ep) do :
+    match(e) :
+      (e:EDef) :
+        entries[n(e)] = VarEntry(mutable?(e), true, type(e))
+      (e:EExtern) :
+        entries[n(e)] = VarEntry(true, true, type(e))
+      (e) : false
+  new VarTable :
+    defmethod register (this, e:ELocal) :
+      entries[n(e)] = VarEntry(mutable?(e), false, type(e))
+    defmethod mutable? (this, n:Int) : mutable?(entries[n])
+    defmethod global? (this, n:Int) : global?(entries[n])
+    defmethod type (this, n:Int) : type(entries[n])
 
 ;============================================================
 ;=================== Closure Creation =======================
@@ -344,26 +386,47 @@ public defn convert-mixes (ft:FunctionTable, epackage:EPackage) :
 ;===================== Boundary Guards ======================
 ;============================================================
 
-;Checked Do
-;Set
-;Branch Type Vars
-;Method Type Vars
-;Uninitialized Variables
-;Tuple for EnsureLength
-public defn guard-boundaries (ft:FunctionTable, epackage:EPackage) :
-  defn remove-tvars () :
-    ...
+public defn insert-guards (vt:VarTable, epackage:EPackage) :
+  ;Remove type variables from definition
+  defn has-tvar? (t:EType) :
+    var tvar? = false
+    let loop (t:EType = t) :
+      match(t:ETVar) : tvar? = true
+      else : dor(loop, t)
+    tvar?
+  defn remove-tvars (t:EType) :
+    let loop (t:EType = t) :
+      match(t) :
+        (t:ETVar) : ETop()
+        (t) : mapr(loop, t) as EType
+  defn remove-tvars (ts:Tuple<EType>) :
+    map(remove-tvars, ts)
+  defn remove-tvars (b:EBranch) :
+    sub-types(b, remove-tvars(types(b)))
+  defn remove-tvars (e:EMatch|EDispatch) :
+    sub-branches(e, map(remove-tvars, branches(e)))
 
   ;Insert guards for HiStanza body
   defn guard-histanza-body (body:EBody, prelude:Collection<EIns>) :
     ;Buffer for holding generated instructions
     val new-ins = Vector<EIns>()
-    add-all(new-ins, prelude)
+    defn emit (i:EIns) : add(new-ins, i)
+
+    ;Buffer for holding label entrance guards
+    val entry-blocks = IntTable<List<EIns>>(List())
+    defn add-entry (b:Int, i:EIns) : update(entry-blocks, cons{i, _}, b)
+    defn entry (b:Int) : reverse(entry-blocks[b])
+
+    ;Register locals
+    do(register{vt, _}, locals(body))
+
+    ;Add prelude
+    do(emit, prelude)
 
     ;Check that all used variables have been set
     defn check-vars (x:ELItem) :
       match(x) :
-        (x:EVar) : emit(ECheckSet(x)) when mutable?(vt, n(x)) or global?(vt, n(x))          
+        (x:EVar) : emit(ECheckSet(x)) when mutable?(vt, n(x)) or global?(vt, n(x))
         (x:EType) : false
         (x) : do(check-vars, x)
 
@@ -380,7 +443,7 @@ public defn guard-boundaries (ft:FunctionTable, epackage:EPackage) :
           emit(ECheck(y(i), type(vt, n(x(i)))))
         (i:ELabel) :
           emit(i)
-          do(emit, entry(n(b)))
+          do(emit, entry(n(i)))
         (i:EMatch|EDispatch) :
           for b in branches(i) do :
             for (t in types(b), y in ys(i)) do :
@@ -398,13 +461,14 @@ public defn guard-boundaries (ft:FunctionTable, epackage:EPackage) :
   ;Transform instructions for LoStanza body
   defn analyze-lostanza-body (body:EBody) :
     val ins* = for i in ins(body) map :
-      (i:EMatch|EDispatch) : remove-tvars(i)
-      (i) : i
+      match(i) :
+        (i:EMatch|EDispatch) : remove-tvars(i)
+        (i) : i
     sub-ins(body, ins*)
 
   ;Analysis for Methods
-  defn guard-method (f:EFn, histanza?:True|False) :
-    val a1* = map(remove-tvars, a1(f))
+  defn guard-method (f:EFn, histanza?:True|False) -> EFn :
+    val a1* = remove-tvars(a1(f))
     val body* = 
       if histanza? :
         val prelude = Vector<EIns>()
@@ -416,16 +480,17 @@ public defn guard-boundaries (ft:FunctionTable, epackage:EPackage) :
     EFn(targs(f), args(f), a1*, a2(f), body*)
 
   ;Analysis for Functions
-  defn guard-func (f:EFunction, histanza?:True|False) :
-    let loop (e:ELItem = f) :
+  defn guard-func (f:EFunction, histanza?:True|False) -> EFunction :
+    defn loop (e:ELItem) :
       match(e) :
         (e:EBody) :
           if histanza? : guard-histanza-body(e, [])
           else : analyze-lostanza-body(e)
         (e) : map(loop, e)
+    loop(f) as EFunction
 
   ;Overall driver
-  defn analyze (e:ELItem) :
+  defn analyze (e:ELItem) -> ELItem :
     match(e) :
       (e0:EDefmethod) :
         val e = map(analyze, e0) as EDefmethod
@@ -438,7 +503,7 @@ public defn guard-boundaries (ft:FunctionTable, epackage:EPackage) :
         sub-func(e, guard-func(func(e), not lostanza?(e)))
       (e0:EExternFn) :
         val e = map(analyze, e0) as EExternFn
-        sub-func(e, guard-func(func(e), false))
+        sub-func(e, guard-func(func(e), false) as EFn)
       (e0:ELocalFn) :
         val e = map(analyze, e0) as ELocalFn
         sub-func(e, guard-func(func(e), true))
