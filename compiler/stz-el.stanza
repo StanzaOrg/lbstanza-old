@@ -246,7 +246,37 @@ defn VarTable (type-table:TypeTable, io:PackageIO, ep:EPackage) :
     defmethod global? (this, n:Int) : global?(entries[n])
     defmethod type (this, n:Int) : type(entries[n])
 
-;<COMMENT>
+;============================================================
+;===================== Body Buffer ==========================
+;============================================================
+
+deftype BodyBuffer
+defmulti emit (b:BodyBuffer, x:ELocal|ELocalFn|ELocalObj|EIns) -> False
+defmulti to-body (b:BodyBuffer) -> EBody
+
+defn BodyBuffer (body:EBody) :
+  val new-locals = Vector<ELocal>()
+  val new-localfns = Vector<ELocalFn>()
+  val new-localobjs = Vector<ELocalObj>()
+  val new-ins = Vector<EIns>()
+  new BodyBuffer :
+    defmethod emit (this, x:ELocal|ELocalFn|ELocalObj|EIns) :
+      val xs = match(x) :
+        (x:ELocal) : new-locals
+        (x:ELocalFn) : new-localfns
+        (x:ELocalObj) : new-localobjs
+        (x:EIns) : new-ins
+      add(xs, x)
+    defmethod to-body (this) :
+      defn append?<?T> (xs:Tuple<?T>, ys:Vector<?T>) :
+        if empty?(ys) : xs
+        else : to-tuple(cat(xs,ys))
+      val locals* = append?(locals(body), new-locals)
+      val localfns* = append?(localfns(body), new-localfns)
+      val localobjs* = append?(localobjs(body), new-localobjs)
+      val ins* = to-tuple(new-ins)
+      EBody(locals*, localfns*, localobjs*, ins*)
+
 ;============================================================
 ;=================== Closure Creation =======================
 ;============================================================
@@ -254,95 +284,80 @@ defn VarTable (type-table:TypeTable, io:PackageIO, ep:EPackage) :
 defn create-closures (ft:FunctionTable, epackage:EPackage) -> EPackage :
   ;Create a trampoline function that calls the given immediate
   ;with known arity.
-  defn trampoline-fn (f:EVar|ECurry|EMix, arity:Int) :
+  defn trampoline-fn (f:EFVar|EMix, arity:Int) :
     defn times<?T> (n:Int, f:() -> ?T) :
       to-tuple(repeatedly(f,n))
-    val ret = EVar(fresh-id())
+    val ret = fresh-id()
     val args = arity * fresh-id
     val [a1, a2] = match(f) :
-      (f:EVar|ECurry) : fn-types(ft, f)
+      (f:EFVar) : fn-types(ft, f)
       (f:EMix) : [arity * ETop, ETop()]    
     val locals = [
-      ELocal(n(ret), ETop(), false)]
+      ELocal(ret, ETop(), false)]
     EFn([], args, arity * ETop, ETop(),
       EBody(locals, [], [], [
-        ECheckedDo(ret, a2, f, map(EVar,args), a1)
-        EReturn(ret)]))
+        ECheckedDo(EVarLoc(ret), a2, f, map(EVar,args), a1)
+        EReturn(EVar(ret))]))
       
   ;Create a trampoline function that calls the given immediate
   ;with unknown (and potentially multiple) arities.
-  defn trampoline-fn (f:EVar|ECurry|EMix) :
-    defn num-args (e:EVar|ECurry) : arity(ft, n(e))
+  defn trampoline-fn (f:EFVar|EMix) :
+    defn num-args (e:EFVar) : arity(ft, n(e))
     match(f) :
-      (f:EVar|ECurry) :
+      (f:EFVar) :
         trampoline-fn(f, num-args(f))
       (f:EMix) :
         val funcs = to-tuple $
           for group in group-by(num-args, funcs(f)) seq :
-            val e* = switch(length(value(group))) :
-              1 : head(value(group))
-              else : EMix(to-tuple(value(group)))
-            trampoline-fn(e*, key(group))
+            trampoline-fn{_, key(group)} $
+              switch(length(value(group))) :
+                1 : head(value(group))
+                else : EMix(to-tuple(value(group)))
         EMultifn(funcs)
         
   ;Lift
-  defn analyze-body (body0:EBody) :
-    ;Recursively analyze sub-bodies first
-    val body = mapr(analyze-body, body0) as EBody
-    
+  defn analyze-body (body:EBody) :    
     ;Register all local functions first
     do(register{ft, _}, localfns(body))
 
     ;New definitions
-    val new-locals = Vector<ELocal>()
-    val new-localfns = Vector<ELocalFn>()
-    val new-ins = Vector<EIns>()
+    val buffer = BodyBuffer(body)
 
     ;Lift a reference to a closure
-    defn lift (x:EVar|ECurry|EMix) -> EVar :
+    defn lift (x:EFVar|EMix) -> EVar :
       val n = fresh-id()
       val v = fresh-id()
-      add(new-localfns, ELocalFn(n, trampoline-fn(x)))
-      add(new-locals, ELocal(v, ETop(), false))
-      add(new-ins, ELetRec([EVar(v)], [EClosure(n)]))
+      emit(buffer, ELocalFn(n, trampoline-fn(x)))
+      emit(buffer, ELocal(v, EOf(VM-FN-TYPE-ID), false))
+      emit(buffer, ELetRec([EVarLoc(v)], [EClosure(n)]))
       EVar(v)
 
     ;Analyze an immediate, lifting when necessary
     defn lift-imm (x:EImm) :
       match(x) :
-        (x:EVar) : lift(x) when function?(ft,n(x)) else x
-        (x:ECurry|EMix) : lift(x)
-        (x) : x        
+        (x:EFVar|EMix) : lift(x)
+        (x) : x
     defn lift-imms (xs:Tuple<EImm>) :
       map(lift-imm, xs)
-    defn lift-loc (x:ELoc) :
-      {_ as ELoc} $ let loop (x:ELItem = x) :
-        match(x) :
-          (x:EImm) : lift-imm(x)
-          (x:EVarLoc) : x
-          (x) : map(loop, x)
 
     ;Analyze all instructions
     for i in ins(body) do :
-      add{new-ins, _} $ match(i) :
+      emit{buffer, _} $ match(i) :
         (i:ECheckedDo) : ECheckedDo(x(i), xtype(i), f(i), lift-imms(ys(i)), ytypes(i))
         (i:EDo) : EDo(x(i), xtype(i), f(i), lift-imms(ys(i)))
-        (i:EPtr) : EPtr(x(i), lift-loc(loc(i)))
-        (i) : map(lift-imm, i) as EIns
+        (i) : mapr(lift-imm, i)
 
     ;Return analyzed function
-    if empty?(new-locals) :
-      body
-    else :
-      defn plus<?T> (xs:Seqable<?T>, ys:Seqable<?T>) : to-tuple(cat(xs,ys))
-      EBody(locals(body) + new-locals,
-            localfns(body) + new-localfns,
-            localobjs(body),
-            to-tuple(new-ins))
+    to-body(buffer)
 
-  ;Create closures
-  mapr(analyze-body, epackage) as EPackage
+  ;Recursive Analysis
+  defn analyze (x:ELBigItem) :
+    match(mapr(analyze,x)) :
+      (x:EBody) : analyze-body(x)
+      (x) : x
+  mapr(analyze, epackage)
 
+;<COMMENT>
 ;============================================================
 ;===================== Mix Conversion =======================
 ;============================================================
