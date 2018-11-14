@@ -37,6 +37,9 @@ public defn lower (packageio:PackageIO, epackage:EPackage) :
   cur-package = insert-guards(var-table, cur-package)
   report("Inserted Guards")
 
+  cur-package = box-mutables(VarTable(type-table, packageio, cur-package), cur-package)
+  report("Boxed Mutables")
+
 ;============================================================
 ;================== Method TArg Mapping =====================
 ;============================================================
@@ -311,16 +314,23 @@ defn create-closures (ft:FunctionTable, epackage:EPackage) -> EPackage :
       match(x) :
         (x:EVar) : lift(x) when function?(ft,n(x)) else x
         (x:ECurry|EMix) : lift(x)
-        (x) : x
+        (x) : x        
     defn lift-imms (xs:Tuple<EImm>) :
       map(lift-imm, xs)
+    defn lift-loc (x:ELoc) :
+      {_ as ELoc} $ let loop (x:ELItem = x) :
+        match(x) :
+          (x:EImm) : lift-imm(x)
+          (x:EVarLoc) : x
+          (x) : map(loop, x)
 
     ;Analyze all instructions
     for i in ins(body) do :
       add{new-ins, _} $ match(i) :
         (i:ECheckedDo) : ECheckedDo(x(i), xtype(i), f(i), lift-imms(ys(i)), ytypes(i))
         (i:EDo) : EDo(x(i), xtype(i), f(i), lift-imms(ys(i)))
-        (i) : mapr(lift-imm, i) as EIns
+        (i:EPtr) : EPtr(x(i), lift-loc(loc(i)))
+        (i) : map(lift-imm, i) as EIns
 
     ;Return analyzed function
     if empty?(new-locals) :
@@ -426,13 +436,12 @@ public defn insert-guards (vt:VarTable, epackage:EPackage) :
     do(emit, prelude)
 
     ;Check that all used variables have been set
-    defn check-vars (x:ELItem) :
+    defn check-vars (x:EImm) :
       match(x) :
         (x:EVar) :
           if variable?(vt,n(x)) and (mutable?(vt, n(x)) or global?(vt, n(x))) :
-            emit(ECheckSet(x))
-        (x:EType) : false
-        (x) : do(check-vars, x)
+            emit(ECheckSet(x))            
+        (x) : false
 
     ;Emit instructions for checks
     for i in ins(body) do :
@@ -443,8 +452,9 @@ public defn insert-guards (vt:VarTable, epackage:EPackage) :
             emit(ECheck(y,t))
           emit(EDo(x(i), xtype(i), f(i), ys(i)))
           emit(ECheck(x(i), xtype(i)))
-        (i:ESet) :
-          emit(ECheck(y(i), type(vt, n(x(i)))))
+        (i:ESet|EDefSet) :
+          match(y(i):EImm) :
+            emit(ECheck(y(i) as EImm, type(vt, n(x(i)))))
           emit(i)
         (i:ELabel) :
           emit(i)
@@ -523,6 +533,116 @@ public defn insert-guards (vt:VarTable, epackage:EPackage) :
   analyze(epackage) as EPackage
 
 ;============================================================
+;=================== Freevar Analysis =======================
+;============================================================
+
+defn analyze-freevars (el:ELItem) -> ELItem :
+  defn analyze-usages (e:EFn) :
+    ;Gather all uses in the function
+    val var-uses = IntSet()
+    val tvar-uses = IntSet()
+    defn loop (e:ELItem) :
+      match(e) :
+        (e:EVar) :
+          add(var-uses, n(e))
+          e
+        (e:ETVar) :
+          add(tvar-uses, n(e))
+          e
+        (e:EFn) :
+          val e* = analyze-usages(e) as EFn
+          add-all(var-uses, free-vars(e*))
+          add-all(tvar-uses, free-tvars(e*))
+          e*
+        (e:EType) :
+          e
+        (e) :
+          map(loop, e)
+    val e* = map(loop,e) as EFn
+    
+    ;Remove all locally defined quantities
+    defn remove-all (xs:IntSet, ys:Seqable<Int>) :
+      do(remove{xs, _}, ys)
+    remove-all(tvar-uses, targs(e))
+    remove-all(var-uses, args(e))
+    remove-all(var-uses, seq(n, locals(body(e))))
+    remove-all(var-uses, seq(n, localfns(body(e))))
+    
+    ;Record free
+    sub-free-tvars{_, to-tuple(tvar-uses)} $
+    sub-free-vars(e*, to-tuple(var-uses))
+
+  match(el) :
+    (el:EFn) : analyze-usages(el)
+    (el) : mapr(analyze-usages, el)
+
+;============================================================
+;===================== Mutable Boxing =======================
+;============================================================
+
+defn box-mutables (vt:VarTable, epackage:EPackage) -> EPackage :
+  val boxed = IntSet()
+  defn box (e:ELItem) :
+    match(e) :
+      (e0:EBody) :
+        ;Find all closed-over variables
+        val closed-over = IntSet()
+        defn add-to-closed (e:ELItem) :
+          match(e:EFn) : add-all(closed-over, free-vars(e))
+          else : do(add-to-closed, e)
+        do(add-to-closed, localfns(e0))
+        do(add-to-closed, localobjs(e0))
+
+        ;Add all locally closed-over mutable items to boxed set
+        for l in locals(e0) do :
+          if mutable?(l) and closed-over[n(l)] :
+            add(boxed, n(l))
+            
+        ;Recursively analyze sub-bodies
+        val e = map(box, e0) as EBody
+
+        ;Register local variables
+        do(register{vt, _}, locals(e))
+
+        ;Perform boxing
+        val new-locals = Vector<ELocal>()
+        val new-ins = Vector<EIns>()
+        defn emit (e:ELocal) : add(new-locals, e)
+        defn emit (e:EIns) : add(new-ins, e)
+        defn plus<?T> (xs:Seqable<?T>, ys:Seqable<?T>) : to-tuple(cat(xs,ys))
+
+        ;Convert a boxed var retrieval into a BoxGet instruction
+        defn retrieve-var (e:EImm) :
+          match(e:EVar) :
+            if boxed[n(e)] :
+              val x = EVar(fresh-id())
+              emit(ELocal(n(x), type(vt, n(e)), false))
+              emit(EBoxGet(x, e))
+              x
+            else : e
+          else : e
+        
+        ;Convert instructions for operating with boxed variables
+        for i in ins(e) do :
+          match(map-args(retrieve-var, i)) :
+            (i:ESet) :
+              if boxed[n(x(i))] : emit(EBoxSet(x(i), y(i)))
+              else : emit(i)
+            (i:EDefSet) :
+              if boxed[n(x(i))] : emit(EBox(x(i), y(i)))
+              else : emit(i)
+            (i) : emit(i)
+
+        ;Return new body
+        sub-locals{_, locals(e) + new-locals} $
+        sub-ins(e, to-tuple(new-ins))
+      (e) :
+        map(box, e)
+
+  ;Perform freevar analysis and then boxing
+  map(box, analyze-freevars(epackage)) as EPackage                  
+
+;============================================================
 ;================== Specialized Mappers =====================
 ;============================================================
 
@@ -538,6 +658,7 @@ defn map-args (f:EImm -> EImm, e:EIns) :
   defn g (x:Tuple<EImm>) : map(g,x)
   match(e) :
     (e:ESet) : ESet(x(e), g(y(e)))
+    (e:EDefSet) : EDefSet(x(e), g(y(e)))
     (e:EShuffle) : EShuffle(xs(e), g(ys(e)))
     (e:ELetRec) : ELetRec(xs(e), closures(e))
     (e:ECheckedDo) : ECheckedDo(x(e), xtype(e), g(/f(e)), g(ys(e)), ytypes(e))
