@@ -46,6 +46,11 @@ public defn lower (packageio:PackageIO, epackage:EPackage) :
                   cur-package)
   report("Lifting Objects")
 
+  cur-package = lift-closures(
+                  VarTable(type-table, packageio, cur-package),
+                  cur-package)
+  report("Lifting Closures")
+
 ;============================================================
 ;================== Consistency Check =======================
 ;============================================================
@@ -229,6 +234,9 @@ defmulti variable? (vt:VarTable, n:Int) -> True|False
 defmulti mutable? (vt:VarTable, n:Int) -> True|False
 defmulti global? (vt:VarTable, n:Int) -> True|False
 defmulti type (vt:VarTable, n:Int) -> EType
+
+defn register (vt:VarTable, x:Int, t:EType) :
+  register(vt, ELocal(x, t, false))
 
 defn VarTable (type-table:TypeTable, io:PackageIO, ep:EPackage) :
   val entries = IntTable<VarEntry>()
@@ -631,7 +639,13 @@ defn box-mutables (vt:VarTable, epackage:EPackage) -> EPackage :
             (i) :
               emit(buffer,i)
 
+        ;Change local type
+        defn change-to-box-type (e:ELocal) :
+          if boxed[n(e)] : ELocal(n(e), EOf(VM-BOX-TYPE-ID), false)
+          else : e
+        
         ;Return new body
+        sub-locals{_, map(change-to-box-type, locals(e))} $
         to-body(buffer)
       (e) :
         map(box, e)
@@ -646,6 +660,13 @@ defn box-mutables (vt:VarTable, epackage:EPackage) -> EPackage :
 defn lift-objects (vt:VarTable, ft:FunctionTable, epackage:EPackage) -> EPackage :
   ;Buffer for new top level expressions
   val new-texps = Vector<ETExp>()
+
+  ;Register all locals
+  defn register-locals (e:ELBigItem) :
+    match(e) :
+      (e:EFn) : do(register{vt, _, _}, args(e), a1(e))
+      (e:EBody) : do(register{vt, _}, locals(e))
+    do*(register-locals, e)      
 
   ;Lift an instance method to the top level
   ;objfree contains the freevars stored in the object
@@ -666,11 +687,13 @@ defn lift-objects (vt:VarTable, ft:FunctionTable, epackage:EPackage) -> EPackage
       val i = index-of(vars(objfree), v)
       match(i:Int) :
         val v* = rename-var(v)
+        emit(buffer, ELocal(v*, type(vt,v), false))
         emit(buffer, EObjectGet(EVarLoc(v*), EVar(thisn(m)), i))
     ;Emit freetypes
     for v in tvars(free(func(m))) do :
       val i = index-of!(tvars(objfree), v)
       val v* = rename-var(v)
+      emit(buffer, ELocalType(v*))
       emit(buffer, EObjectTGet(ETVarLoc(v*), EVar(thisn(m)), i))
     
     ;Emit renamed body
@@ -750,7 +773,128 @@ defn lift-objects (vt:VarTable, ft:FunctionTable, epackage:EPackage) -> EPackage
     match(map(analyze, e)) :
       (e:EBody) : lift-body(e)
       (e) : e
-  map(analyze, epackage)
+  val exps* = map(analyze{analyze-freevars(_)}, exps(epackage)) as Tuple<ETExp>
+  EPackage(name(epackage), to-tuple(cat(exps*, new-texps)))
+
+;============================================================
+;=================== Closure Lifting ========================
+;============================================================
+
+defn lift-closures (vt:VarTable, epackage:EPackage) -> EPackage :
+  ;Track new top level expressions
+  val new-texps = Vector<ETExp>()
+
+  ;Lift the given function with the computed free vars to the top-level.
+  ;- Use closure as the identifier of the closure argument.
+  ;- Write a recursive function to compute translated EFn.
+  ;  - For every EFn:
+  ;    - Retrieve the free variables from closure argument
+  ;    - Retrieve the type variables from closure argument
+  ;    - Rename all instructions, input types, and output types
+  ;- Construct EDefClosure expression and add to top level
+  defn lift-function (fid:Int, f:EFunction, fnfree:Free) :
+    ;Closure argument
+    val closure = fresh-id()
+
+    ;Helper function for processing the body of an EFunction
+    defn lift (e:ELBigItem) -> ELBigItem :
+      match(e:EFn) :
+        ;Track necessary renames
+        val rename-table = IntTable<Int>()
+        defn rename-var (v:Int) :
+          val v* = fresh-id()
+          rename-table[v] = v*
+          v*
+          
+        ;Create buffer
+        val buffer = BodyBuffer(body(e))
+
+        ;Retrieve free variables from closure argument
+        for v in vars(free(e)) do :
+          val i = index-of(vars(fnfree), v)
+          match(i:Int) :
+            val v* = rename-var(v)
+            emit(buffer, ELocal(v*, type(vt,v), false))
+            emit(buffer, EClosureGet(EVarLoc(v*), EVar(closure), i))
+            
+        ;Retrieve type variables from closure argument
+        for v in tvars(free(e)) do :
+          val i = index-of!(tvars(fnfree), v)
+          val v* = rename-var(v)
+          emit(buffer, ELocalType(v*))
+          emit(buffer, EClosureTGet(ETVarLoc(v*), EVar(closure), i))
+
+        ;Emit renamed body
+        defn rename (e:ELItem) :
+          defn f (x:Int) : get?(rename-table, x, x)
+          match(map(rename,e)) :
+            (e:EVar) : EVar(f(n(e)))
+            (e:EVarLoc) : EVarLoc(f(n(e)))
+            (e:ETVar) : ETVar(f(n(e)))
+            (e:ETVarLoc) : ETVarLoc(f(n(e)))
+            (e) : e
+        for i in ins(body(e)) do :
+          emit(buffer, rename(i) as EIns)
+          
+        ;Return new function
+        defn remove-nonlocal-tvars (t:EType) -> EType :
+          match(t:ETVar) : ETop() when key?(rename-table,n(t)) else t
+          else : map(remove-nonlocal-tvars, t)
+        val a1* = map(remove-nonlocal-tvars, a1(e))
+        val a2* = rename(a2(e)) as EType
+        EFn(targs(e), args(e), a1*, a2*, to-body(buffer))          
+      else :
+        map(lift, e)
+
+    ;Construct EDefClosure and push to top level
+    val ntargs = length(vars(fnfree))
+    val nargs = length(vars(fnfree))
+    val func* = lift(f) as EFunction
+    add(new-texps, EDefClosure(fid, closure, ntargs, nargs, func*))
+
+  ;<COMMENT>
+  ;Sweep through the body and lift out declarations of local functions
+  ;- Lift each function to the top level
+  ;- Sweep through instructions, and convert EInitClosures into ELetRec statements.
+  ;  - Create each closure by looking up its freevars in free-table
+  ;- Return new function
+  ;  - The local functions are now empty, and moved over to local definitions
+  ;  - Use the new instructions
+  defn lift-body (e:EBody) :
+    ;Compute free table for each function
+    val free-table = to-inttable<Free> $
+      for f in localfns(e) seq :
+        n(f) => free(f)
+
+    ;Lift each function to the top level
+    do(lift-function, localfns(e))
+
+    ;Generate new instructions
+    val ins* = for i in ins(e) map :
+      match(i) :
+        (i:EInitClosures) :
+          val closures = for x in xs(i) map :
+            val free = free-table[n(x)]
+            val targs = map(ETVar, tvars(free))
+            val ys = map(EVar, vars(free))
+            EClosure(n(x), targs, ys)
+          ELetRec(xs(i), closures)
+        (i) : i
+
+    ;Return new function
+    defn to-local (e:ELocalFn) : ELocal(n(e), EOf(VM-FN-TYPE-ID), false)
+    val locals* = to-tuple(cat(locals(e), seq(to-local, localfns(e))))
+    EBody(locals*, localtypes(e), [], localobjs(e), ins*)
+
+  defn analyze (e:ELBigItem) -> ELBigItem :
+    match(map(analyze,e)) :
+      (e:EBody) : lift-body(e)
+      (e) : e
+  val exps* = map(analyze{analyze-freevars(_)}, exps(epackage))
+  EPackage(name(epackage), to-tuple(cat(exps*, new-texps)))
+  ;<COMMENT>
+
+  epackage
 
 ;============================================================
 ;====================== Utilities ===========================
