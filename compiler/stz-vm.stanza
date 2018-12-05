@@ -424,6 +424,19 @@ defn Linker (branch-table:BranchTable) :
               val [format, ns] = DispatchFormat(branches(ins*))
               val format-index = add(branch-table, format)
               LinkedDispatchIns(format-index, ys(ins*), ns, default(ins*), amb(ins*))
+          (ins:MatchIns) :
+            within pos = delayed-ins() :
+              val ins* = link-ins(ins, pos)
+              val [format, ns] = MatchFormat(branches(ins*))
+              val format-index = add(branch-table, format)
+              LinkedDispatchIns(format-index, ys(ins*), ns, default(ins*), -1)
+          (ins:MethodDispatchIns) :
+            set-regs(to-tuple(cat(ys(ins*), zs(ins*)))) where :
+              val ins* = link-ins(ins, -1)            
+            within pos = delayed-ins() :
+              val ins* = link-ins(ins, pos)
+              val format-index = add(branch-table, MultiFormat(multi(ins*)))
+              LinkedDispatchIns(format-index, zs(ins*), [], default(ins*), amb(ins*))
           (ins:JumpIns&VMIns) :
             within pos = delayed-ins() :
               link-ins(ins, pos)
@@ -1147,8 +1160,11 @@ public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:re
           else : goto step(pc + n2(ins).value)
         (ins:ref<LinkedDispatchIns>) :
           val ytypes = eval-types(ys(ins), stack-pointer, vmtable)
-          val n = dispatch(vmtable.branch-table, format(ins), ytypes, ns(ins), default(ins), amb(ins))
-          goto step(pc + n.value)
+          match(dispatch(vmtable.branch-table, format(ins), ytypes)) :
+            (r:ref<Int>) : goto step(pc + get(ns(ins), r).value)
+            (r:ref<CodeId>) : goto tcall-function(id(r).value)
+            (r:ref<Default>) : goto step(pc + default(ins).value)
+            (r:ref<Amb>) : goto step(pc + amb(ins).value)
         (ins:ref<SetReg>) :
           regs[reg(ins).value] = eval-imm(x(ins), stack-pointer, vmtable)
           goto step(pc + 1)
@@ -1172,12 +1188,12 @@ public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:re
           goto call-function(fid, pc + 1)
         (ins:ref<LinkedTCall>) :          
           val fid = eval-imm(f(ins), stack-pointer, vmtable) as int
-          goto tcall-function(fid, pc + 1)
+          goto tcall-function(fid)
         (ins:ref<LinkedTCallClosure>) :
           val fref = eval-imm(f(ins), stack-pointer, vmtable)
           val fptr = untag(fref) as ptr<Function>
           val fid = fptr.code as int
-          goto tcall-function(fid, pc + 1)
+          goto tcall-function(fid)
         (ins:ref<LinkedCallC>) :
           val faddr = eval-imm(f(ins), stack-pointer, vmtable)
           val launcher = launcher(ins).value as ptr<((long, ptr<long>) -> long)>
@@ -1241,92 +1257,98 @@ public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:re
 ;============================================================
 
 public deftype BranchTable
+deftype BranchFormat <: Hashable&Equalable
 defmulti add (t:BranchTable, f:BranchFormat) -> Int
-defmulti dispatch (t:BranchTable, f:Int, types:Tuple<Int>, targets:Tuple<Int>, default:Int, amb:Int) -> Int
-defmulti update-branch-sets (t:BranchTable) -> False
+defmulti add (t:BranchTable, m:VMMethod) -> False
+defmulti dispatch (t:BranchTable, f:Int, types:Tuple<Int>) -> DispatchResult
+defmulti update (t:BranchTable) -> False
+
+deftype DispatchResult :
+  Int <: DispatchResult
+  CodeId <: DispatchResult
+defstruct Default <: DispatchResult
+defstruct Amb <: DispatchResult
+
+deftype DispatchAction
+defmulti dispatch (a:DispatchAction, types:Tuple<Int>) -> DispatchResult
+
+
 
 defn BranchTable (ct:ClassTable) :
-  ;Store formats in table
+  ;Store formats in ctable
   val formats = Vector<BranchFormat>()
-  val table = HashTable<BranchFormat,Int>()
-  defn store-format (f:BranchFormat) :
-    match(get?(table,f)) :
-      (i:Int) :
-        i
-      (_:False) :
-        val i = length(formats)
-        table[f] = i
-        add(formats, f)
-        i
+  val actions = Vector<DispatchAction|False>()
+  val format-table = HashTable<BranchFormat,Int>()
+  val methods = Vector<VMMethod>()
 
-  ;Store all methods
-  val methods = Vector<VMMethod>()  
-
-  ;Update all branch tests
-  defn update-branch-sets () :
-    for f in filter-by<DispatchFormat>(formats) do :
-      update-branch-set(ct, f)
+  ;Compute dispatch actions
+  defn DispatchAction (f:BranchFormat) :
+    defn match? (xtypes:Tuple<Int>, types:Tuple<TypeSet>) :
+      all?(instanceof?{ct, _, _}, xtypes, types)
+    match(f) :
+      (f:DispatchFormat) :
+        val indexed-branches = to-tuple $ seq(KeyValue, branches(f), 0 to false)
+        val dispatch-branches = dispatch-ordering(ct, indexed-branches, key)
+        new DispatchAction :
+          defmethod dispatch (this, xtypes:Tuple<Int>) :
+            label<DispatchResult> return :
+              for b in dispatch-branches do :
+                match(b) :
+                  (b:KeyValue<Tuple<TypeSet>,Int>) :
+                    return(value(b)) when match?(xtypes, key(b))
+                  (bs:Tuple<KeyValue<Tuple<TypeSet>,Int>>) :
+                    val c = for b in bs count :
+                      match?(xtypes, key(b))
+                    return(Amb()) when c > 1
+              Default()
+      (f:MatchFormat) :
+        new DispatchAction :
+          defmethod dispatch (this, xtypes:Tuple<Int>) :
+            label<DispatchResult> return :
+              for (types in branches(f), i in 0 to false) do :
+                return(i) when match?(xtypes, types)
+              Default()
+      (f:MultiFormat) :
+        val methods = to-tuple(filter({multi(_) == multi(f)}, methods))
+        val dispatch-methods = dispatch-ordering(ct, methods, types)
+        new DispatchAction :
+          defmethod dispatch (this, xtypes:Tuple<Int>) :
+            label<DispatchResult> return :
+              for m in dispatch-methods do :
+                match(m) :
+                  (m:VMMethod) :
+                    return(CodeId(fid(m))) when match?(xtypes, types(m))
+                  (ms:Tuple<VMMethod>) :
+                    val c = for m in ms count :
+                      match?(xtypes, types(m))
+                    return(Amb()) when c > 1
+              Default()
+  defn update-actions () :
+    for (f in formats, i in 0 to false) do :
+      actions[i] = DispatchAction(f)
 
   new BranchTable :
     defmethod add (this, f:BranchFormat) :
-      store-format(f)
-    defmethod dispatch (this, f:Int, ys:Tuple<Int>, targets:Tuple<Int>, default:Int, amb:Int) :
-      dispatch(ct, branch-set!(formats[f]),
-               ys, targets, default, amb)
-    defmethod update-branch-sets (this) :
-      update-branch-sets()
-
-defn dispatch (class-table:ClassTable, b:BranchSet,
-               xtypes:Tuple<Int>, targets:Tuple<Int>,
-               default:Int, amb:Int) :  
-  label<Int> return :
-    for test in tests(b) do :
-      match(test) :
-        (test:TryBranch) :
-          val match? = all?(instanceof?{class-table, _, _}, xtypes, types(test))
-          return(targets[index(test)]) when match?
-        (test:AmbBranch) :
-          var matched?:True|False = false
-          for types in types(test) do :
-            val match? = all?(instanceof?{class-table, _, _}, xtypes, types)
-            if match? :
-              if matched? : return(amb)
-              else : matched? = true
-    default
-
-deftype BranchFormat <: Hashable&Equalable
-defmulti branch-set (f:BranchFormat) -> BranchSet|False
-defmulti set-branch-set (f:BranchFormat, s:BranchSet|False) -> False
+      match(get?(format-table, f)) :
+        (i:Int) :
+          i
+        (_:False) :
+          val i = length(formats)
+          add(formats, f)
+          add(actions, false)
+          format-table[f] = i
+          i
+    defmethod add (this, m:VMMethod) :
+      add(methods, m)
+    defmethod dispatch (this, f:Int, types:Tuple<Int>) :
+      dispatch(actions[f] as DispatchAction, types)
+    defmethod update (this) :
+      update-actions()
 
 defstruct DispatchFormat <: BranchFormat :
   branches: Tuple<Tuple<TypeSet>>
-  branch-set: BranchSet|False with: (default => false, setter => set-branch-set, as-method => true)
-with:
-  printer => true
-
-defstruct MultiFormat <: BranchFormat :
-  multi: Int
-  branch-set: BranchSet|False with: (default => false, setter => set-branch-set, as-method => true)
-with:
-  printer => true
-  
-defstruct MatchFormat <: BranchFormat :
-  branches: Tuple<Tuple<TypeSet>>
-  branch-set: BranchSet|False with: (default => false, setter => set-branch-set, as-method => true)
-with:
-  printer => true
-
-defn update-branch-set (class-table:ClassTable, f:DispatchFormat) :
-  val indexed-branches = to-tuple $ seq(KeyValue, branches(f), 0 to false)
-  val dispatch-branches = dispatch-ordering(class-table, indexed-branches, key)
-  val branch-set = BranchSet $ to-tuple $
-    for b in dispatch-branches seq :
-      match(b) :
-        (b:KeyValue<Tuple<TypeSet>,Int>) :
-          TryBranch(key(b), value(b))
-        (bs:Tuple<KeyValue<Tuple<TypeSet>,Int>>) :
-          AmbBranch(map(key,bs))
-  set-branch-set(f, branch-set)
+defmethod hash (f:DispatchFormat) : hash(branches(f))
+defmethod equal? (a:DispatchFormat, b:DispatchFormat) : branches(a) == branches(b)
 
 defn DispatchFormat (branches:Tuple<VMBranch>) -> [DispatchFormat, Tuple<Int>] :
   val bs = to-array<VMBranch> $
@@ -1338,47 +1360,25 @@ defn DispatchFormat (branches:Tuple<VMBranch>) -> [DispatchFormat, Tuple<Int>] :
   val targets = to-tuple(seq(n,bs))
   [format, targets]
 
+defstruct MatchFormat <: BranchFormat :
+  branches: Tuple<Tuple<TypeSet>>
+defmethod hash (f:MatchFormat) : hash(branches(f))
+defmethod equal? (a:MatchFormat, b:MatchFormat) : branches(a) == branches(b)
+
 defn MatchFormat (branches:Tuple<VMBranch>) -> [MatchFormat, Tuple<Int>] :
-  val types = for b in branches map :
+  val types* = for b in branches map :
     map(normalize, types(b))
-  val format = MatchFormat(types)
-  val targets = map(n, branches)
-  [format, targets]  
+  val format = MatchFormat(types*)
+  val targets = map(n,branches)
+  [format, targets]
 
-defn branch-set! (f:BranchFormat) :
-  branch-set(f) as BranchSet
+defstruct MultiFormat <: BranchFormat :
+  multi: Int
+defmethod hash (f:MultiFormat) : multi(f)
+defmethod equal? (a:MultiFormat, b:MultiFormat) : multi(a) == multi(b)
 
-defstruct BranchSet :
-  tests: Tuple<BranchTest>  
-with:
-  printer => true
-  
-deftype BranchTest
-defstruct TryBranch <: BranchTest :
-  types: Tuple<TypeSet>
-  index: Int
-with:
-  printer => true
-defstruct AmbBranch <: BranchTest :
-  types: Tuple<Tuple<TypeSet>>
-with:
-  printer => true
-
-defmethod equal? (a:BranchFormat, b:BranchFormat) :
-  match(a, b) :
-    (a:DispatchFormat, b:DispatchFormat) : branches(a) == branches(b)
-    (a:MatchFormat, b:MatchFormat) : branches(a) == branches(b)
-    (a:MultiFormat, b:MultiFormat) : multi(a) == multi(b)
-    (a, b) : false  
-defmethod hash (a:BranchFormat) :
-  match(a) :
-    (a:DispatchFormat) : hash(branches(a))
-    (a:MatchFormat) : hash(branches(a))
-    (a:MultiFormat) : multi(a)
-
-lostanza defn update-branch-sets (vm:ref<VirtualMachine>) -> ref<False> :
-  update-branch-sets(vm.vmtable.branch-table)
-  return false
+lostanza defn branch-table (vm:ref<VirtualMachine>) -> ref<BranchTable> :
+  return vm.vmtable.branch-table
 
 ;============================================================
 ;==================== Heap/Stack Extension ==================
@@ -1851,6 +1851,7 @@ public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>) :
     load-globals(vmt, map(resolve,globals(vmp)))
     load-classes(vmt, map(resolve,classes(vmp)))
     load-consts(vmt, map(resolve,consts(vmp)))
+    do(add{branch-table(vm), resolve(_)}, methods(vmp))
     do(load-data{vmt, _}, map(resolve,datas(vmp)))
     do(load-extern{vmt, _}, map(resolve,externs(vmp)))
     for f0 in funcs(vmp) do :
@@ -1858,7 +1859,7 @@ public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>) :
       val ins = link(linker(vm), f, pkgids)
       load-function(vmt, id(f), ins)
     set-init(vmt, package(vmp), resolve(init(vmp)))
-  update-branch-sets(vm)
+  update(branch-table(vm))
 
 public defn init-package (vm:VirtualMachine, package:Symbol) :
   val f = init(vmtable(vm), package)
