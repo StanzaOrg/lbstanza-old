@@ -9,8 +9,7 @@ defpackage stz/dl :
 
 public :
   deftype DEnv
-  defmulti set-live (e:DEnv, live:Seqable<Rec>) -> False
-  defmulti load (e:DEnv, ps:Tuple<PackageIO>) -> LoadResult
+  defmulti load (e:DEnv, ps:Tuple<PackageIO>, live-recs:Tuple<Rec>) -> LoadResult
 
   deftype LoadResult
   defstruct LoadErrors <: LoadResult : (errors: Tuple<LoadError>)
@@ -19,16 +18,15 @@ public :
   with: (printer => true)
 
   deftype LoadError
-  defstruct MissingDependency <: LoadError : (source:DependencySource)
+  defstruct MissingDependency <: LoadError : (source:DependencySource, expected:Rec)
   with: (printer => true)
   defstruct MismatchedDependency <: LoadError : (source:DependencySource, expected:Rec, actual:Rec)
   with: (printer => true)
 
-  defstruct Dependency : (source:DependencySource, rec:Rec)
   deftype DependencySource
-  defstruct PackageDependency <: DependencySource : (package:Symbol)
+  defstruct LoadedPackage <: DependencySource : (package:Symbol)
   with: (printer => true)
-  defstruct LiveDependency <: DependencySource
+  defstruct LiveObject <: DependencySource
   with: (printer => true)
 
 ;============================================================
@@ -38,78 +36,84 @@ public :
 public defn DEnv () :
   ;Initialize package table and live set
   val packages = HashTable<Symbol,PackageIO>()
-  var live:Tuple<Rec> = []
-
-  ;Utilities
-  defn exported-entries (p:PackageIO) :
-    for e in exports(p) seq :
-      val r = rec(e)
-      id(r) => r
 
   ;Sanity consistency check
   defn ensure-consistency () :
     #if-not-defined(OPTIMIZE) :
-      val rec-set = to-hashtable<RecId,Rec> $
-        seq-cat(exported-entries, values(packages))
-      for p in values(packages) do :
-        for import in imports(p) do :
-          val r = rec(import)
-          match(get?(rec-set, id(r))) :
-            (r2:Rec) : fatal("Mismatched dependency: %_ != %_" % [r, r2]) when not match?(r, r2)
-            (r2:False) : fatal("Missing dependency: %_" % [id(r)])
-    #else : (false)
+      ;Ensure that all imported records match the exported records exactly.
+      val rec-table = to-hashtable<RecId,Rec> $
+        seq-cat(exported-entries, values(packages))      
+      for import in seq-cat(imports,values(packages)) do :
+        val r = rec(import)
+        match(get?(rec-table, id(r))) :
+          (r2:Rec) : fatal("Mismatched dependency: %_ != %_" % [r, r2]) when not match?(r, r2)
+          (r2:False) : fatal("Missing dependency: %_" % [id(r)])
+    #else :
+      false
 
-  ;Load packages into environment
-  defn load (ps:Tuple<PackageIO>) :
-    ;Figure out dependencies
-    val reload-set = to-hashset<Symbol>(seq(package, ps))
-    val dependencies = cat(package-dependencies, live-dependencies) where :
-      val package-dependencies = for p in values(packages) seq-cat :
-        if not reload-set[package(p)] :
-          for import in imports(p) seq? :
-            val r = rec(import)
-            if reload-set[package(id(r))] :
-              val src = PackageDependency(package(p))
-              One(Dependency(src, r))
-            else : None()
-        else : []
-      val live-dependencies = for r in live seq :
-        Dependency(LiveDependency(), r)
+  ;Load packages into environment. Either load in the packages, or return
+  ;an error report indicating what has failed. 
+  ;We assume that the packages to load have successfully passed the typechecker.
+  ;This indicates two things:
+  ;1. The packages are internally consistent. All imports/exports
+  ;   from/to packages to be reloaded are guaranteed to be consistent by
+  ;   the typechecker.
+  ;2. The package imports are consistent. The typechecker imports the existing
+  ;   definitions from the environment and ensures that the code is consistent
+  ;   with these definitions.
+  ;Therefore there is only one thing to check. Whether the new exports
+  ;from the reloaded packages are consistent with the context.
+  defn load (ps:Tuple<PackageIO>, live-recs:Tuple<Rec>) :
+    ;These are the packages to be reloaded
+    val reloaded-packages = to-hashset<Symbol>(seq(package, ps))
 
-    ;Check dependencies
-    val errors = Vector<LoadError>()
-    val new-recs = to-hashtable<RecId,Rec> $
+    ;Here are the new exported entries from the reloaded packages
+    val export-table = to-hashtable<RecId,Rec> $
       seq-cat(exported-entries, ps)
-    for d in dependencies do :
-      match(get?(new-recs, id(rec(d)))) :
-        (r:Rec) : check-dependency(d, r)
-        (r:False) : missing-dependency(d)
-    where :
-      defn check-dependency (d:Dependency, r:Rec) :
-        if not match?(rec(d), r) :
-          add(errors, MismatchedDependency(source(d), rec(d), r))
-      defn missing-dependency (d:Dependency) :
-        add(errors, MissingDependency(source(d)))
 
-    ;If successful, put packages in table
+    ;Check whether the imported record, imported, from 'src-package'
+    ;is satisfied by the reloaded-packages.
+    val errors = Vector<LoadError>()
+    defn check-dependency (src:DependencySource, imported:Rec) :
+      val rid = id(imported)
+      if reloaded-packages[package(rid)] :
+        match(get?(export-table, rid)) :
+          (exported:Rec) :
+            if not match?(imported, exported) :
+              add(errors, MismatchedDependency(src, imported, exported))
+          (_:False) :
+            add(errors, MissingDependency(src, imported))
+
+    ;Check all the dependencies from existing packages
+    for p in values(packages) do :
+      val src = LoadedPackage(package(p))
+      do(check-dependency{src, rec(_)}, imports(p))
+    ;Check all the dependencies from the live objects
+    let :
+      val src = LiveObject()
+      do(check-dependency{src, _}, live-recs)
+
+    ;Load the new packages if no errors
     if empty?(errors) :
-      ;Put new packages in table
       for p in ps do : packages[package(p)] = p
-      ;Sanity check
       ensure-consistency()
-      ;Return success
       LoadSuccess()
+
+    ;Otherwise return the error report
     else :
-      ;If not successful, return errors
       LoadErrors(to-tuple(errors))
 
   ;Return new environment
   new DEnv :
-    defmethod set-live (this, recs:Seqable<Rec>) :
-      val ids = HashSet<RecId>()
-      live = to-tuple $ for r in recs seq? :
-        if add(ids, id(r)) : One(r)
-        else : None()
-    defmethod load (this, pkgs:Tuple<PackageIO>) :
-      load(pkgs)
+    defmethod load (this, packages:Tuple<PackageIO>, live-recs:Tuple<Rec>) :
+      load(packages, live-recs)
 
+;============================================================
+;======================= Utilities ==========================
+;============================================================
+
+;Utilities
+defn exported-entries (p:PackageIO) :
+  for e in exports(p) seq :
+    val r = rec(e)
+    id(r) => r
