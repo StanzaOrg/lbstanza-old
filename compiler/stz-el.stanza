@@ -166,7 +166,7 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
       ELocal(ret, a2, false)]
     EFn([], args, arity * ETop, ETop(),
       EBody(locals, [], [], [], [
-        ECheckedDo(EVarLoc(ret), f, map(EVar,args), a1)
+        ECall(EVarLoc(ret), f, map(EVar,args), CallGuarded(a1, a2))
         EReturn(EVar(ret))]))
 
   ;Create a trampoline function that calls the given immediate
@@ -212,8 +212,7 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
     ;Analyze all instructions
     for i in ins(body) do :
       emit{buffer, _} $ match(i) :
-        (i:ECheckedDo) : sub-ys(i, lift-imms(ys(i)))
-        (i:EDo|EDoC) : sub-ys(i, lift-imms(ys(i)))
+        (i:ECall|ETCall) : sub-ys(i, lift-imms(ys(i)))
         (i) : map(lift-imm, i)
 
     ;Return analyzed function
@@ -237,47 +236,50 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
     val buffer = BodyBuffer(body)
 
     ;Split a call into a dispatch branch
-    defn make-dispatch (Call:(EVarLoc, EImm, Tuple<EImm>, Tuple<EType>) -> EIns,
-                        x:EVarLoc|False, f:EMix, ys:Tuple<EImm>) :
+    defn make-dispatch (Call:(EVarLoc|False, EImm, Tuple<EImm>, CallGuarded) -> EIns,
+                        x:EVarLoc|False, f:EMix, ys:Tuple<EImm>, end?:True|False) :
       ;Construct branches and blocks
       val branches = Vector<EBranch>()
-      val blocks = Vector<(Int -> False)>()
+      val blocks = Vector<(() -> False)>()
       val refmask = map(reftype?, a1) where :
         val [a1, a2] = fn-types(vt, funcs(f)[0])
+      val end-lbl = fresh-id()
       for f in funcs(f) do :
         val [a1, a2] = fn-types(vt, f)
         val lbl = fresh-id()
-        val x* = fresh-id()
-        emit(buffer, ELocal(x*, a2, false))
+        val x* = fresh-id() when x is EVarLoc
+        match(x*:Int) :
+          emit(buffer, ELocal(x*, a2, false))
         add(branches, EBranch(select(a1,refmask), lbl))
-        add{blocks, _} $ fn (end-lbl) :
+        add{blocks, _} $ fn () :
           emit(buffer, ELabel(lbl))
-          emit(buffer, Call(EVarLoc(x*), f, ys, a1))
-          match(x:EVarLoc) :
-            emit(buffer, EDef(x, EVar(x*)))
-          emit(buffer, EGoto(end-lbl))
+          match(x*:Int) :
+            emit(buffer, Call(EVarLoc(x*), f, ys, CallGuarded(a1, a2)))
+            emit(buffer, EDef(x as EVarLoc, EVar(x*)))
+          else :
+            emit(buffer, Call(false, f, ys, CallGuarded(a1, a2)))            
+          emit(buffer, EGoto(end-lbl)) when not end?
       ;Yield branches
       emit(buffer, EDispatch(select(ys,refmask), to-tuple(branches)))
-      val end-lbl = fresh-id()
-      for b in blocks do : b(end-lbl)
-      emit(buffer, ELabel(end-lbl))
-
-    ;For instructions that do not require types of arguments
-    defn make-dispatch (Call:(EVarLoc, EImm, Tuple<EImm>) -> EIns,
-                        x:EVarLoc|False, f:EMix, ys:Tuple<EImm>) :
-      make-dispatch(fn (x, f, ys, ytypes) : Call(x, f, ys), x, f, ys)                  
+      for b in blocks do : b()
+      emit(buffer, ELabel(end-lbl)) when not end?
 
     ;Scan through instructions
     for i in ins(body) do :
       ;Dispatch needed?
-      val dispatch? = match(i:ECheckedDo|EDo|EDoC) :
-                        f(i) is EMix                        
+      val dispatch? = match(i:ECall|ETCall) : f(i) is EMix                        
       if dispatch? :
         match(i) :
-          (i:ECheckedDo) : make-dispatch(ECheckedDo, x(i), f(i) as EMix, ys(i))
-          (i:EDo) : make-dispatch(EDo{_, _, _, ptr?(i)}, x(i), f(i) as EMix, ys(i))
-          (i:EDoC) : make-dispatch(EDoC, x(i), f(i) as EMix, ys(i))
-      else : emit(buffer, i)
+          (i:ECall) :
+            within (x, f, ys, g) = make-dispatch(x(i), f(i) as EMix, ys(i), false) :
+              match(calltype(i):CallGuarded) : ECall(x, f, ys, g)
+              else : ECall(x, f, ys, calltype(i))
+          (i:ETCall) :
+            within (_, f, ys, g) = make-dispatch(false, f(i) as EMix, ys(i), true) :
+              match(calltype(i):CallGuarded) : ETCall(f, ys, g)
+              else : ETCall(f, ys, calltype(i))
+      else :
+        emit(buffer, i)
 
     ;Yield new body
     to-body(buffer)
@@ -320,11 +322,22 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable, core-types:HashTable
     for i in ins(body) do :
       do*(check-vars, i)
       match(i) :
-        (i:ECheckedDo) :
-          for (y in ys(i), t in ytypes(i)) do :
-            emit(ECheck(y,t))
-          emit(EDo(x(i), f(i), ys(i), false))
-          emit(ECheck(EVar(n(x(i))), type(vt, n(x(i)))))
+        ;TODO: Fix boundary guards
+        (i:ECall) :
+          val ct = match(calltype(i)) :
+            (ct:CallGuarded) : CallStanza()
+            (ct) : ct
+          ECall(x(i), f(i), ys(i), ct)        
+        (i:ETCall) :
+          val ct = match(calltype(i)) :
+            (ct:CallGuarded) : CallStanza()
+            (ct) : ct
+          ETCall(f(i), ys(i), ct)
+        ;(i:ECheckedDo) :
+        ;  for (y in ys(i), t in ytypes(i)) do :
+        ;    emit(ECheck(y,t))
+        ;  emit(EDo(x(i), f(i), ys(i), false))
+        ;  emit(ECheck(EVar(n(x(i))), type(vt, n(x(i)))))
         (i:EDef) :
           match(y(i):EImm) :
             emit(ECheck(y(i) as EImm, type(vt, n(x(i)))))
@@ -774,7 +787,7 @@ defn lift-type-objects (epackage:EPackage) :
     ;Reify all type arguments in instructions
     for i in ins(e) do :
       emit{buffer, _} $ match(i) :
-        (i:EDo) : sub-f(i, reify-type(f(i)))
+        (i:ECall|ETCall) : sub-f(i, reify-type(f(i)))
         (i:ELetRec) : sub-ys(i, map(reify-type,ys(i)))
         (i:ENewObject) : sub-targs(i, map(reify-type, targs(i)))
         (i) : i
