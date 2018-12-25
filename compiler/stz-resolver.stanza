@@ -25,16 +25,38 @@ public defstruct ResolvedPackages :
   packages: Tuple<IPackage>
 
 public defn resolve-il (ipackages:Tuple<IPackage>, env:Env) -> ResolvedPackages|ResolveErrors :
-  println("===== Resolving =====")
-  do(println, ipackages)
-  
+  ;Track all detected errors
+  val error-accum = Vector<ResolveError>()
+
+  ;Create base environments
   val symtables = SymbolTables(ipackages, env)
-  
-  for ipackage in ipackages do :
+  add-all(error-accum, errors(symtables))
+
+  ;Resolve individual packages
+  val ipackages* = for ipackage in ipackages map :
     val eng = Engine(symtables, name(ipackage))
-    for e in exps(ipackage) do :
-      resolve-exp(e, eng)
-  fatal("Done for now")
+    val exps* = map(resolve-exp{_, eng}, exps(ipackage))
+    val ipackage* = sub-exps(ipackage, exps*)
+    add-all(error-accum, errors(eng))
+    add-qualified-imports(ipackage*, import-qualified(eng))
+
+  ;Return result
+  if empty?(error-accum) : ResolvedPackages(imports(symtables), ipackages*)
+  else : ResolveErrors(error-accum)
+
+defn add-qualified-imports (ipackage:IPackage, imps:Tuple<Symbol>) :
+  ;Compute set of already imported packages
+  val import-set = to-hashset<Symbol> $
+    for imp in imports(ipackage) seq :
+      name!(package(imp))
+  ;Add additional packages
+  val imports* = to-list(cat(old-imports, new-imports)) where :
+    val old-imports = imports(ipackage)
+    val new-imports = for imp in imps seq? :
+      if not import-set[imp] : One(IImport(IVar(imp,false), List(), false))
+      else : None()
+  ;Add imports    
+  sub-imports(ipackage, imports*)  
 
 ;============================================================
 ;===================== Defresolver ==========================
@@ -239,6 +261,7 @@ defmulti pop-scope (eng:Engine) -> False
 defmulti resolve (e:IVar, eng:Engine, type:Symbol) -> IExp
 defmulti resolve (e:Int|False, eng:Engine, type:Symbol) -> Int|False
 defmulti errors (eng:Engine) -> Vector<ResolveError>
+defmulti import-qualified (eng:Engine) -> Tuple<Symbol>
 
 defn Engine (symtables:SymbolTables, current-package:Symbol) :
   ;Handling debug printing
@@ -249,6 +272,9 @@ defn Engine (symtables:SymbolTables, current-package:Symbol) :
 
   ;Symbol table of current package
   val symtable = symtables[current-package] as SymbolTable
+
+  ;All imports
+  val import-set = HashSet<Symbol>()  
 
   ;Type predicates
   defn type-pred (f: EType -> True|False) : fn* (e:VEntry) : f(type(e))
@@ -274,29 +300,24 @@ defn Engine (symtables:SymbolTables, current-package:Symbol) :
           resolve-top(local-name)        
         else : 
           match(symtables[package-name]) :
-            (t:SymbolTable) : resolve-qualified(t, local-name)
-            (_:False) : no-package()
+            (t:SymbolTable) : resolve-qualified(t, package-name, local-name)
+            (_:False) : throw(BadQualifyPackage(name(e), info(e)))
       (package-name:False) :
         resolve-unqualified(local-name)
     where :
       ;Return type-appropriate entries
       defn return (es:Seqable<VEntry>) :
         val es* = filter(pred?, es)
-        if empty?(es*) :
-          throw(NoResolve(name(e), info(e)))
-        else :
-          to-list(es*)
-        
-      ;Qualified with package but could not load package
-      defn no-package () :
-        throw(NoPackage(name(e), info(e)))
+        if empty?(es*) : throw(NoResolve(name(e), info(e)))
+        else : to-list(es*)
 
       ;Qualified form: /mysymbol
       defn resolve-top (name:Symbol) :
         return(base(symtable, name))
 
       ;Qualified form: mypackage/mysymbol
-      defn resolve-qualified (table:SymbolTable, name:Symbol) :
+      defn resolve-qualified (table:SymbolTable, package-name:Symbol, name:Symbol) :
+        add(import-set, package-name)
         return $ for e in table[name] filter :
           visibility(e) is Public|Protected and
           package(e) == package(table)
@@ -335,6 +356,8 @@ defn Engine (symtables:SymbolTables, current-package:Symbol) :
   new Engine :
     defmethod errors (this) :
       errors
+    defmethod import-qualified (this) :
+      to-tuple(import-set)
     defmethod new-definitions (this, e:IExp) :        
       iprintln("new-definitions(%_)" % [e])
       let loop (e:IExp = e) :
@@ -419,8 +442,7 @@ defn Engine (symtables:SymbolTables, current-package:Symbol) :
     defmethod resolve (e:Int|False, this, type:Symbol) :
       fatal("Illegal argument") when type != `this
       val es = to-list(filter(var?, immediate(symtable, `this)))
-      fatal("No this argument found.") when empty?(es)
-      fatal("Multiple this arguments found.") when length(es) > 1
+      fatal("Improper instance method.") when length(es) != 1
       n(head(es))
 
 ;============================================================
@@ -428,7 +450,9 @@ defn Engine (symtables:SymbolTables, current-package:Symbol) :
 ;============================================================
 
 deftype SymbolTables
+defmulti errors (st:SymbolTables) -> Vector<ResolveError>
 defmulti get (st:SymbolTables, package:Symbol) -> SymbolTable|False
+defmulti imports (st:SymbolTables) -> Tuple<Import>
 
 defn SymbolTables (ipackages:Tuple<IPackage>, env:Env) :
   val pkg-table = to-hashtable<Symbol, IPackage> $
@@ -450,6 +474,7 @@ defn SymbolTables (ipackages:Tuple<IPackage>, env:Env) :
     exports-table[package]
 
   ;Construct symbol tables
+  val errors = Vector<ResolveError>()
   val symtables = to-hashtable<Symbol, SymbolTable> $
     for ipackage in ipackages seq :
       val symtable = SymbolTable(name(ipackage), namemap(ipackage))
@@ -462,8 +487,10 @@ defn SymbolTables (ipackages:Tuple<IPackage>, env:Env) :
           else :
             match(get-env-exports(package-name)) :
               (es:Tuple<Export>) : import-env-package(es)
-              (_:False) : false
+              (_:False) : no-package(package-name, name(ipackage), info(imp))
         where :
+          defn no-package (name:Symbol, src-package:Symbol, info:FileInfo|False) :
+            add(errors, NoPackage(name, src-package, info))
           defn import-source-package () :      
             val namemap = namemap(pkg-table[package-name])
             import(symtable, namemap, imp)
@@ -473,6 +500,13 @@ defn SymbolTables (ipackages:Tuple<IPackage>, env:Env) :
 
   ;Return symbol tables structure
   new SymbolTables :
+    defmethod errors (this) :
+      errors
+    defmethod imports (this) :
+      defn to-import (e:Export) : Import(n(e), rec(e))
+      to-tuple $ for e in values(exports-table) seq-cat :
+        match(e:Tuple<Export>) : seq(to-import, e)
+        else : []
     defmethod get (this, package:Symbol) :
       get?(symtables, package)
 
@@ -1147,8 +1181,14 @@ defstruct NoResolve <: ResolveError :
   info:FileInfo|False
 with:
   printer => true
+defstruct BadQualifyPackage <: ResolveError :
+  name:Symbol
+  info:FileInfo|False
+with:
+  printer => true
 defstruct NoPackage <: ResolveError :
   name:Symbol
+  source-package:Symbol
   info:FileInfo|False
 with:
   printer => true
@@ -1205,7 +1245,7 @@ defstruct NotCapVar <: ResolveError :
 with:
   printer => true
 
-defstruct ResolveErrors <: Exception :
-   msgs: Seqable
+public defstruct ResolveErrors <: Exception :
+  errors: Vector<ResolveError>
 defmethod print (o:OutputStream, e:ResolveErrors) :
-   print-all(o, join(msgs(e), "\n"))
+  print(o, "%n" % [errors(e)])
