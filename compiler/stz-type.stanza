@@ -6,7 +6,6 @@ defpackage stz/type :
   import stz/il-ir
   import stz/tl-ir
   import stz/dl-ir
-  import stz/tl-to-dl
   import stz/namemap
   import stz/infer
   import stz/type-calculus
@@ -19,20 +18,69 @@ defpackage stz/type :
 ;====================== Driver ==============================
 ;============================================================
 
-public defn type-program (ipackages:Tuple<IPackage>, environment:Tuple<Export>) -> TProg|TypeErrors :
-  val nm = NameMap(seq(namemap, ipackages), environment)
-  val idtable = IDTable(nm)
-  within set-idtable(idtable) :
+public deftype Env
+public defmulti typedefs (e:Env, package:Symbol) -> TypeDefs
+public defmulti packageio (e:Env, package:Symbol) -> PackageIO
+
+public defn type-program (ipackages:Tuple<IPackage>, env:Env) -> TProg|TypeErrors :
+  ;Create environment
+  val [typedefs, exports] = create-environment(ipackages, env)
+  within retrieve-coreids(env) :
+    val nm = NameMap(seq(namemap, ipackages), exports)
     try :
-      val prog = to-tprog(ipackages, environment, nm)
+      val prog = to-tprog(ipackages, nm, typedefs, exports)
       set-current-hierarchy(hier(prog))
-      val [prog*, env, ls-env] = infer-types(prog, environment)
-      report-errors(nm, prog*, env, ls-env)
-      val tpackages* = for p in packages(prog*) map :
-        sub-packageio(p, to-dl(p, hier(prog*), nm))
-      sub-packages(prog*, tpackages*)
+      val [prog*, tenv, ls-tenv] = infer-types(prog)
+      report-errors(nm, prog*, tenv, ls-tenv)
+      prog*
     catch (e:TypeErrors) :
       e
+
+;============================================================
+;================ Consolidate Environment ===================
+;============================================================
+
+defn create-environment (ipackages:Tuple<IPackage>, env:Env) ->
+                        [Tuple<TypeDef>, Tuple<Export>] :
+  ;Set of packages that are already loaded
+  val package-set = to-hashset<Symbol>(seq(name, ipackages))
+  val typedef-list = Vector<TypeDef>()
+  val export-list = Vector<Export>()
+
+  ;Pull in declarations from package
+  defn include (package:Symbol) :
+    if add(package-set, package) :
+      val typedefs = typedefs(env, package)
+      val packageio = packageio(env, package)
+      add-all(typedef-list, defs(typedefs))
+      add-all(export-list, exports(packageio))
+      do(include, imported-packages(typedefs))
+      do(include, imported-packages(packageio))
+
+  ;Pull in imports
+  for p in ipackages do :
+    for import in imports(p) do :
+      include(name!(package(import)))
+      
+  ;Return lists
+  [to-tuple(typedef-list), to-tuple(export-list)]
+
+;============================================================
+;====================== Core Ids ============================
+;============================================================
+
+defn retrieve-coreids<?T> (f:() -> ?T, env:Env) :
+  val table = to-hashtable<TypeId,Int> $
+    for e in exports(packageio(env,`core)) seq? :
+      match(id(rec(e))) :
+        (id:TypeId) : One(id => n(e))
+        (id) : None()
+  let-var COREID-TABLE = table :
+    f()
+
+var COREID-TABLE:HashTable<TypeId,Int>|False = false
+defn coreid (id:TypeId) :
+  (COREID-TABLE as HashTable<TypeId,Int>)[id]
 
 ;============================================================
 ;=============== Conversion to Type IR ======================
@@ -46,7 +94,7 @@ defstruct DefChild :
   args: List<Int>
   parent: Type
 
-defn to-tprog (ipackages:Tuple<IPackage>, environment:Tuple<Export>, nm:NameMap) :  
+defn to-tprog (ipackages:Tuple<IPackage>, nm:NameMap, typedefs:Tuple<TypeDef>, exports:Tuple<Export>) :  
   ;     State
   ;     ===== 
   var accum = Vector<TComm>()
@@ -606,13 +654,12 @@ defn to-tprog (ipackages:Tuple<IPackage>, environment:Tuple<Export>, nm:NameMap)
 
   ;     Hierarchy Building
   ;     ==================
-  defn #hier (tpackages:Collection<TPackage>, environment:Tuple<Export>) :
+  defn #hier (tpackages:Collection<TPackage>) :
     ;Iterate over type commands
-    defn do-type-comms (f: TDefType|TLDefType|Export -> ?) :
+    defn do-type-comms (f: TDefType|TLDefType -> ?) :
       for tpackage in tpackages do :
         do(f, filter-by<TDefType|TLDefType>(comms(tpackage)))
-      for e in environment do :
-        f(e) when rec(e) is TypeRec|StructRec|TypeDecl
+      do(f, filter-by<TDefType|TLDefType>(typedefs))
                       
     ;Compute parents of all types
     val parents = IntTable<False|Type>()
@@ -621,15 +668,8 @@ defn to-tprog (ipackages:Tuple<IPackage>, environment:Tuple<Export>, nm:NameMap)
 
     defn calc-direct-parents () :
       within c = do-type-comms() :
-        match(c) :
-          (c:TDefType|TLDefType) :
-            parents[n(c)] = parent(c)
-            type-args[n(c)] = args(c)
-          (c:Export) :
-            val r = rec(c) as TypeRec|StructRec
-            val targs = TVars(ntargs(r))
-            parents[n(c)] = to-type?(parent(r), targs)
-            type-args[n(c)] = to-list(seq(n,targs))
+        parents[n(c)] = parent(c)
+        type-args[n(c)] = args(c)
 
     defn calc-child-parents () :
       defn add-parent (n:Int, t:Type) :
@@ -640,24 +680,10 @@ defn to-tprog (ipackages:Tuple<IPackage>, environment:Tuple<Export>, nm:NameMap)
         parents[n] = tand(parents[n], t)
 
       within c = do-type-comms() :
-        match(c) :
-          (c:TDefType) :
-            for c in children(c) do :
-              val env = map({_ => TVar(_)}, args(c), type-args[n(c)])
-              add-parent(n(c), sub(parent(c), env))
-          (c:Export) :
-            match(rec(c)) :
-              (r:TypeRec) :
-                for c in children(r) do :
-                  val n = coreid(id(c))
-                  val type-args =
-                    if ntargs(c) == length(type-args[n]) :
-                      to-tuple(seq(TVar{_, false}, type-args[n]))
-                    else :
-                      TVars(ntargs(c))
-                  add-parent(n, to-type(parent(c), type-args))                    
-              (r) : false
-          (c) : false
+        match(c:TDefType) :
+          for c in children(c) do :
+            val env = map({_ => TVar(_)}, args(c), type-args[n(c)])
+            add-parent(n(c), sub(parent(c), env))
 
     defn calc-hier-entries () :
       within c = do-type-comms() :
@@ -668,25 +694,6 @@ defn to-tprog (ipackages:Tuple<IPackage>, environment:Tuple<Export>, nm:NameMap)
             val fs = for f in fields(c) map :
               Field(n(f), name(f), type(f))
             LSHEntry(n(c), args(c), parents[n(c)], fs)
-          (c:Export) :            
-            val n = coreid(id(rec(c)) as TypeId)
-            match(rec(c)) :
-              (r:TypeRec|TypeDecl) :
-                val args = to-list(0 to ntargs(r))
-                HSHEntry(n, args, parents[n])
-              (r:StructRec) :                
-                ;Convert fields
-                defn to-field (Type:LSType -> LSType, f:StructField) :
-                  val type = Type(to-lstype(type(f), TVars(ntargs(r))))
-                  Field(fresh-id(), name(f), type)
-                val fs = Vector<Field>()                
-                for f in base(r) do : add(fs, to-field({_}, f))
-                val rf = items(r)
-                match(rf:StructField) :
-                  add(fs, to-field(RestT, rf))
-                ;Create entry                
-                val args = to-list(0 to ntargs(r))
-                LSHEntry(n, args, parents[n], to-list(fs))
         add(hier, hentry)
              
     ;Return Hierarchy
@@ -738,23 +745,20 @@ defn to-tprog (ipackages:Tuple<IPackage>, environment:Tuple<Export>, nm:NameMap)
   ;     Driver
   ;     ======
   val tpackages = map(#tpackage, ipackages)
-  val hier = #hier(tpackages, environment)  
+  val hier = #hier(tpackages)  
   report-errors(hier)
-  TProg(hier, to-list(tpackages), environment, nm)
+  TProg(to-list(tpackages), hier, nm, typedefs, exports)
 
-defn NameMap (nms:Seqable<NameMap>, environment:Seqable<Export>) :
+defn NameMap (nms:Seqable<NameMap>, exports:Tuple<Export>) :
   val namemap = NameMap()
   for nm in nms do :
     do(add{namemap, _}, nm)
-  for e in environment do :
+  for e in exports do :
     add(namemap, VEntry(e))
   namemap
 
 defn TVars (n:Int) :
   to-tuple(seq(TVar{_, false}, 0 to n))
-
-defn coreid (id:TypeId) :
-  current-idtable()[id]
 
 ;============================================================
 ;================= Primitives Types  ========================
@@ -941,7 +945,7 @@ defstruct Filler :
   fill-prog: TProg -> TProg
 
 
-defn infer-types (prog:TProg, environment:Tuple<Export>) :   
+defn infer-types (prog:TProg) :   
   ;======== Environment ========
   val env = IntTable<False|Type>()
   val ls-env = IntTable<False|LSType>()
@@ -1146,52 +1150,16 @@ defn infer-types (prog:TProg, environment:Tuple<Export>) :
 
   ;======== Build top level environment ========
   defn build-environment () :
-    ;Build environment from package declarations
-    for e in environment do :
-      match(rec(e)) :
-        (r:ValRec) :
-          if lostanza?(r) : lsval(n(e), type(r))
-          else : hsval(n(e), type(r))
-        (r:FnRec) :
-          if lostanza?(r) : lsfn(n(e), id(r) as FnId, a2(r))
-          else : hsfn(n(e), id(r) as FnId, a2(r))
-        (r:MultiRec) : hsfn(n(e), id(r) as FnId, a2(r))          
-        (r:ExternFnRec) : lsfn(n(e), id(r) as FnId, a2(r))
-        (r:ExternRec) : lsval(n(e), type(r))
-        (r) : false
-      where :
-        defn lsval (n:Int, t:DType) :
-          val t* = to-lstype(t, [])
-          set-ls-env(n, t*)
-          set-env(n, to-hs-type(t*))
-        defn hsval (n:Int, t:DType) :
-          val t* = to-type(t, [])
-          set-env(n, t*)
-          set-ls-env(n, RefT(t*))
-        defn make-targs (id:FnId) :
-          val targs* = to-list $ seq(fresh-id{}, 0 to ntargs(id))
-          val cargs* = to-list $ seq(fresh-id{}, 0 to ncargs(id))
-          val tcargs* = to-tuple $ seq(TVar{_, false}, cat(targs*,cargs*))
-          [targs*, cargs*, tcargs*]
-        defn hstype (id:FnId, a2:DType) :
-          val [targs*, cargs*, tcargs*] = make-targs(id)
-          wrap-poly(TArrow(TTuple(a*), b*), targs*, cargs*) where :
-            val a* = to-list(seq(to-type{_, tcargs*}, a1(id)))
-            val b* = to-type(a2, tcargs*)
-        defn hsfn (n:Int, id:FnId, a2:DType) :
-          val t = hstype(id,a2)
-          set-env(n, t)
-          set-ls-env(n, to-ls-fn(t))
-        defn lstype (id:FnId, a2:DType) :
-          val [targs*, cargs*, tcargs*] = make-targs(id)
-          wrap-poly(FnT(a*, false, b*), targs*, cargs*) where :
-            val a* = to-list(seq(to-lstype{_, tcargs*}, a1(id)))
-            val b* = to-lstype(a2, tcargs*)
-        defn lsfn (n:Int, id:FnId, a2:DType) :
-          val t = lstype(id,a2)
-          set-ls-env(n, t)
-          set-env(n, to-hs-fn(t))
-
+    ;Build environment from tenv
+    for c in typedefs(prog) do :
+      match(c) :
+        (c:TDecl) :
+          set-env(n(c), type(c))
+          set-ls-env(n(c), RefT(type(c)))
+        (c:TLDecl) :
+          set-env(n(c), to-hs-type(type(c)))
+          set-ls-env(n(c), type(c))
+        (c) : false
     ;Build environment from top-level commands
     for c in prog do :
       match(c) :
