@@ -31,7 +31,8 @@ public defn resolve-il (ipackages:Tuple<IPackage>, env:Env) -> Tuple<IPackage>|R
 
   ;Resolve individual packages
   val ipackages* = for ipackage in ipackages map :
-    val eng = Engine(symtables, error-accum, name(ipackage))
+    val symtable = symtables[name(ipackage)] as SymbolTable
+    val eng = Engine(symtable, symtables, false, error-accum)
     val exps* = map(resolve-exp{_, eng}, exps(ipackage))
     val ipackage* = sub-exps(ipackage, exps*)
     add-qualified-imports(ipackage*, qualified-imports(eng))
@@ -39,6 +40,34 @@ public defn resolve-il (ipackages:Tuple<IPackage>, env:Env) -> Tuple<IPackage>|R
   ;Return result
   if empty?(error-accum) : ipackages*
   else : ResolveErrors(error-accum)
+
+public defn resolve-repl-il (ipackage:IPackage, env:Env, replio:PackageIO) -> IPackage|ResolveErrors :
+  ;Track all detected errors
+  val error-accum = Vector<ResolveError>()
+
+  ;Create base environments
+  val symtables = SymbolTables([ipackage], env, error-accum)
+
+  ;Create repl symbol table
+  val symtable = symtables[name(ipackage)] as SymbolTable
+  import(symtable, exports(replio), IImport(IVar(package(replio), false), List(), false))
+
+  ;Construct priority mapping
+  val priority-table = IntTable<Int>()
+  for e in exports(replio) do : priority-table[n(e)] = 1
+  for e in namemap(ipackage) do : priority-table[n(e)] = 2
+  defn priority (n:Int) : get?(priority-table, n, 0)
+
+  ;Resolve package
+  val ipackage* = let :  
+    val eng = Engine(symtable, symtables, priority, error-accum)
+    val exps* = map(resolve-exp{_, eng}, exps(ipackage))
+    val ipackage* = sub-exps(ipackage, exps*)
+    add-qualified-imports(ipackage*, qualified-imports(eng))    
+
+  ;Return result
+  if empty?(error-accum) : ipackage*
+  else : ResolveErrors(error-accum)  
 
 ;============================================================
 ;===================== Defresolver ==========================
@@ -244,10 +273,10 @@ defmulti resolve (e:IVar, eng:Engine, type:Symbol) -> IExp
 defmulti resolve (e:Int|False, eng:Engine, type:Symbol) -> Int|False
 defmulti qualified-imports (eng:Engine) -> Tuple<Symbol>
 
-defn Engine (symtables:SymbolTables, errors:Vector<ResolveError>, current-package:Symbol) :
-  ;Symbol table of current package
-  val symtable = symtables[current-package] as SymbolTable
-
+defn Engine (current-symtable:SymbolTable,
+             symtables:SymbolTables,
+             priority:False|(Int -> Int),
+             errors:Vector<ResolveError>) :
   ;All packages that need to be imported
   ;due to package-qualified identifiers.
   val import-set = HashSet<Symbol>()  
@@ -281,15 +310,24 @@ defn Engine (symtables:SymbolTables, errors:Vector<ResolveError>, current-packag
       (package-name:False) :
         resolve-unqualified(local-name)
     where :
+      ;Prune by priority
+      defn prune-low-priority (es:Seqable<VEntry>) :
+        match(priority:Int -> Int) :
+          defn max-priority (es:Seqable<VEntry>) : maximum(seq(priority{n(_)}, es))
+          val [es, max-p] = fork-on-seq(es, to-tuple, max-priority)
+          filter({priority(n(_)) == max-p}, es)
+        else :
+          es
+        
       ;Return type-appropriate entries
       defn return (es:Seqable<VEntry>) :
         val es* = filter(pred?, es)
         if empty?(es*) : throw(NoResolve(name(e), info(e)))
-        else : to-list(es*)
+        else : to-list(prune-low-priority(es*))
 
       ;Qualified form: /mysymbol
       defn resolve-top (name:Symbol) :
-        return(base(symtable, name))
+        return(base(current-symtable, name))
 
       ;Qualified form: mypackage/mysymbol
       defn resolve-qualified (table:SymbolTable, package-name:Symbol, name:Symbol) :
@@ -300,8 +338,8 @@ defn Engine (symtables:SymbolTables, errors:Vector<ResolveError>, current-packag
 
       ;Standard unqualified symbol
       defn resolve-unqualified (name:Symbol) :
-        if base? : return(base(symtable,name))
-        else : return(symtable[name])
+        if base? : return(base(current-symtable,name))
+        else : return(current-symtable[name])
   defn resolve-many (e:IVar, pred?:VEntry -> True|False) -> List<VEntry> :
     resolve-many(e, pred?, false)
 
@@ -314,7 +352,7 @@ defn Engine (symtables:SymbolTables, errors:Vector<ResolveError>, current-packag
 
   ;Resolve a variable in the immediate scope.
   defn resolve-immediate (e:IVar, pred?:VEntry -> True|False) :
-    val es = to-list(filter(type?, immediate(symtable, name(e))))
+    val es = to-list(filter(type?, immediate(current-symtable, name(e))))
     if empty?(es) : throw(NoResolve(name(e), info(e)))
     else if one?(es) : head(es)
     else : throw(AmbResolve(name(e), info(e), es))
@@ -332,12 +370,12 @@ defn Engine (symtables:SymbolTables, errors:Vector<ResolveError>, current-packag
       to-tuple(import-set)
     defmethod new-definitions (this, e:IExp) :        
       let loop (e:IExp = e) :
-        match(e:VarN) : define(symtable, n(e))
+        match(e:VarN) : define(current-symtable, n(e))
         else : do(loop, e)
     defmethod push-scope (this) :
-      push-scope(symtable)
+      push-scope(current-symtable)
     defmethod pop-scope (this) :
-      pop-scope(symtable)
+      pop-scope(current-symtable)
     defmethod resolve (e:IVar, this, type:Symbol) :
       ;Return a list of entries
       defn return (es:List<VEntry>) :
@@ -405,7 +443,7 @@ defn Engine (symtables:SymbolTables, errors:Vector<ResolveError>, current-packag
             e
     defmethod resolve (e:Int|False, this, type:Symbol) :
       fatal("Illegal argument") when type != `this
-      val es = to-list(filter(var?, immediate(symtable, `this)))
+      val es = to-list(filter(var?, immediate(current-symtable, `this)))
       fatal("Improper instance method.") when length(es) != 1
       n(head(es))
 

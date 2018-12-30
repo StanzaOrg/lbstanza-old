@@ -4,6 +4,7 @@ defpackage stz/repl :
   import reader
   import parser
   import macro-utils
+  import stz/utils
   import stz/il-ir
   import stz/dl-ir
   import stz/tl-ir
@@ -29,6 +30,10 @@ defstruct Load <: RExp :
   filenames: Tuple<String>
 with:
   printer => true
+defstruct Eval <: RExp :
+  form
+with:
+  printer => true
 
 defstruct ReplSyntaxError <: Exception :
   info: FileInfo|False
@@ -43,8 +48,10 @@ defsyntax repl :
   fail-if rexp! = () : ReplSyntaxError(closest-info(), "Not a repl expression")
 
   defproduction rexp : RExp
-  defrule rexp = (load(?filenames:#string ...)) :
-    Load(to-tuple(filenames))  
+  defrule rexp = (: load(?filenames:#string ...)) :
+    Load(to-tuple(filenames))
+  defrule rexp = (?forms ...) :
+    Eval(forms)
 
   ;===== Primitives =====
   defproduction int : Int
@@ -60,12 +67,12 @@ defsyntax repl :
   defrule symbol = (?x) when unwrap-token(x) is Symbol : unwrap-token(x)
 
 public defn repl-exps () :
+  val input = BufferedInputStream(STANDARD-INPUT-STREAM)
   repeatedly $ fn () :
     let loop () :
       print("stz: ")
       val forms = read-line(STANDARD-INPUT-STREAM)
-      try :
-        parse-syntax[repl / #rexp!](forms)
+      try : parse-syntax[repl / #rexp!](forms)
       catch (e:NoMatchException) :
         do(println, causes(e))
         loop()
@@ -76,12 +83,14 @@ public defn repl-exps () :
 
 deftype REPL
 defmulti load-files (repl:REPL, filenames:Tuple<String>) -> False
+defmulti load-repl (repl:REPL, form) -> False
 
 defn REPL () :
   ;State of the repl
   val vm = VirtualMachine()
   val denv = DEnv()
   val tenv = HashTable<Symbol,TypeDefs>()
+  val repl-env = REPLEnv()
 
   ;Load files
   defn load-files (filenames:Tuple<String>) :
@@ -135,12 +144,81 @@ defn REPL () :
     check-load!(typed)
     save-to-tenv!(typed)
     load-vm!(typed)
-  
+
+  ;Load repl command
+  defn load-repl (form) :
+    defn macroexpand! (form) :
+      try : cons(`$begin, parse-syntax[core / #exps!](form))
+      catch (e:NoMatchException) : throw(ReplErrors(causes(e)))
+      catch (e:Exception) : throw(ReplErrors([e]))  ;TODO
+    defn to-input! (expanded) :
+      val pkgs = to-il(expanded)
+      fatal("Incorrect number of packages.") when length(pkgs) != 1
+      pkgs[0]
+    defn rename! (ipkg:IPackage) :
+      match(rename-il([ipkg])) :
+        (renamed:Tuple<IPackage>) : renamed[0]
+        (e:RenameErrors) : throw(ReplErrors(errors(e)))
+    defn resolve! (ipkg:IPackage) :
+      val env = new stz/resolver/Env :
+        defmethod packageio (this, package:Symbol) :
+          packageio(denv, package)
+      match(resolve-repl-il(ipkg, env, packageio(repl-env))) :
+        (resolved:IPackage) : resolved
+        (e:ResolveErrors) : throw(ReplErrors(errors(e)))
+    defn type! (ipkg:IPackage) :
+      val env = new stz/type/Env :
+        defmethod packageio (this, package:Symbol) : packageio(denv, package) as PackageIO
+        defmethod typedefs (this, package:Symbol) : tenv[package]      
+      match(type-repl(ipkg, env, typedefs(repl-env), packageio(repl-env))) :
+        (p:TProg) : p
+        (e:TypeErrors) : throw(ReplErrors(messages(e)))
+    defn save-to-repl-env! (tprog:TProg) :
+      val package = packages(tprog)[0]
+      add(repl-env, packageio(package))
+      add(repl-env, typedefs(package))
+    defn load-vm! (tprog:TProg) :
+      val epkgs = to-el(tprog)
+      val vmpkgs = map(compile{lower(_)}, epkgs)
+      load(vm, vmpkgs)
+      do(init-package{vm, package(_)}, vmpkgs)
+      
+    ;===== Driver =====
+    val typed = type! $ resolve! $ rename! $ to-input! $ macroexpand!(form)
+    save-to-repl-env!(typed)
+    load-vm!(typed)      
 
   ;Return REPL
   new REPL :
     defmethod load-files (this, filenames:Tuple<String>) :
       load-files(filenames)
+    defmethod load-repl (this, form) :
+      load-repl(form)
+
+deftype REPLEnv
+defmulti typedefs (e:REPLEnv) -> TypeDefs
+defmulti packageio (e:REPLEnv) -> PackageIO
+defmulti add (e:REPLEnv, packageio:PackageIO) -> False
+defmulti add (e:REPLEnv, typedefs:TypeDefs) -> False
+defn REPLEnv () :
+  val package-name = gensym(`repl)
+  val exports-table = HashTable<Symbol, List<Export>>(List())
+  val tdecls = IntTable<TDecl>()
+  new REPLEnv :
+    defmethod typedefs (this) :
+      TypeDefs(package-name, to-tuple(values(tdecls)))
+    defmethod packageio (this) :
+      PackageIO(package-name, [], [], to-tuple(cat-all(values(exports-table))))
+    defmethod add (this, typedefs:TypeDefs) :
+      for d in defs(typedefs) do :
+        val decl = d as TDecl
+        tdecls[n(decl)] = decl
+    defmethod add (this, packageio:PackageIO) :
+      val grouped = group-by(name{id(rec(_))}, exports(packageio))
+      for entry in grouped do :
+        val name = key(entry)
+        val entries = value(entry)
+        exports-table[name] = entries
 
 ;============================================================
 ;======================== Errors ============================
@@ -159,6 +237,7 @@ public defn repl () :
     try :
       match(exp) :
         (exp:Load) : load-files(repl, filenames(exp))
+        (exp:Eval) : load-repl(repl, form(exp))
     catch (e:ReplErrors) :
       do(println, messages(e))
   
