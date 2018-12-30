@@ -6,7 +6,8 @@ defpackage stz/repl :
   import macro-utils
   import stz/utils
   import stz/il-ir
-  import stz/dl-ir
+  import stz/dl-ir with:
+    prefix(Import) => DL
   import stz/tl-ir
   import stz/el-ir
   import stz/vm-ir
@@ -30,8 +31,17 @@ defstruct Load <: RExp :
   filenames: Tuple<String>
 with:
   printer => true
+defstruct Import <: RExp :
+  import: IImport
+with:
+  printer => true
+defstruct Unimport <: RExp :
+  package: Symbol
+with:
+  printer => true
 defstruct Eval <: RExp :
   form
+defstruct NoOp <: RExp 
 with:
   printer => true
 
@@ -43,15 +53,35 @@ defmethod print (o:OutputStream, e:ReplSyntaxError) :
   print-all(o, [infostr, message(e)])
 
 defsyntax repl :
-  public defproduction rexp! : RExp
-  defrule rexp! = (?x:#rexp) : x
-  fail-if rexp! = () : ReplSyntaxError(closest-info(), "Not a repl expression")
-
-  defproduction rexp : RExp
-  defrule rexp = (: load(?filenames:#string ...)) :
+  public defproduction rexp : RExp
+  defrule rexp = (load ?filenames:#string! ...) :
     Load(to-tuple(filenames))
+  defrule rexp = (?e:#import-clause) :
+    Import(e)
+  defrule rexp = (unimport ?name:#symbol!) :
+    Unimport(name)
   defrule rexp = (?forms ...) :
-    Eval(forms)
+    if empty?(forms) : NoOp()
+    else : Eval(forms)
+
+  ;===== Imports =====
+  defproduction prefix-clause! : IPrefix
+  defrule prefix-clause! = (prefix => ?p:#symbol!) :
+    IPrefix(false, IVar(p,closest-info(p)), closest-info())
+  defrule prefix-clause! = (prefix(?xs:#symbol! ...) => ?p:#symbol!) :
+    val names = for x in xs map : IVar(x,closest-info(x))
+    IPrefix(names, IVar(p,closest-info(p)), closest-info())
+  fail-if prefix-clause! = () :
+    ReplSyntaxError(closest-info(), "Expected a prefix clause here.")
+
+  defproduction prefix-clauses : List<IPrefix>
+  defrule prefix-clauses = (with #:! (?ps:#prefix-clause! ...)) : ps
+  defrule prefix-clauses = () : List()
+
+  defproduction import-clause : IImport
+  defrule import-clause = (import ?name:#symbol! ?ps:#prefix-clauses) :
+    val package = IVar(name, closest-info(name))
+    IImport(package, ps, closest-info())
 
   ;===== Primitives =====
   defproduction int : Int
@@ -66,13 +96,28 @@ defsyntax repl :
   defproduction symbol : Symbol
   defrule symbol = (?x) when unwrap-token(x) is Symbol : unwrap-token(x)
 
+  defproduction string! : String
+  defrule string! = (?x:#string) : x
+  fail-if string! = () : ReplSyntaxError(closest-info(), "Expected a string here.")
+
+  defproduction symbol! : Symbol
+  defrule symbol! = (?x:#symbol) : x
+  fail-if symbol! = () : ReplSyntaxError(closest-info(), "Expected a symbol here.")
+
+  defproduction :!
+  defrule :! = (?x: ~ :) : x
+  fail-if :! = () : ReplSyntaxError(closest-info(), "Colon expected here.")
+
 public defn repl-exps () :
   val input = BufferedInputStream(STANDARD-INPUT-STREAM)
   repeatedly $ fn () :
     let loop () :
-      print("stz: ")
+      print("> ")
       val forms = read-line(STANDARD-INPUT-STREAM)
-      try : parse-syntax[repl / #rexp!](forms)
+      try :
+        match(parse-syntax[repl / #rexp](forms)) :
+          (e:NoOp) : loop()
+          (e) : e
       catch (e:NoMatchException) :
         do(println, causes(e))
         loop()
@@ -84,6 +129,8 @@ public defn repl-exps () :
 deftype REPL
 defmulti load-files (repl:REPL, filenames:Tuple<String>) -> False
 defmulti load-repl (repl:REPL, form) -> False
+defmulti import (repl:REPL, import:IImport) -> False
+defmulti unimport (repl:REPL, package:Symbol) -> False
 
 defn REPL () :
   ;State of the repl
@@ -152,7 +199,7 @@ defn REPL () :
       catch (e:NoMatchException) : throw(ReplErrors(causes(e)))
       catch (e:Exception) : throw(ReplErrors([e]))  ;TODO
     defn to-input! (expanded) :
-      val pkgs = to-il(expanded)
+      val pkgs = to-il(expanded, imports(repl-env))
       fatal("Incorrect number of packages.") when length(pkgs) != 1
       pkgs[0]
     defn rename! (ipkg:IPackage) :
@@ -194,21 +241,40 @@ defn REPL () :
       load-files(filenames)
     defmethod load-repl (this, form) :
       load-repl(form)
+    defmethod import (this, import:IImport) :
+      val package = name!(package(import))
+      if packageio(denv,package) is False :
+        throw $ ReplErrors $ [PackageNotLoaded(package)]
+      else : add(repl-env, import)
+    defmethod unimport (this, package:Symbol) :
+      if not unimport(repl-env, package) :
+        throw $ ReplErrors $ [PackageNotImported(package)]
 
 deftype REPLEnv
 defmulti typedefs (e:REPLEnv) -> TypeDefs
 defmulti packageio (e:REPLEnv) -> PackageIO
+defmulti imports (e:REPLEnv) -> Collection<IImport>
 defmulti add (e:REPLEnv, packageio:PackageIO) -> False
 defmulti add (e:REPLEnv, typedefs:TypeDefs) -> False
+defmulti add (e:REPLEnv, import:IImport) -> False
+defmulti unimport (e:REPLEnv, package:Symbol) -> True|False
 defn REPLEnv () :
   val package-name = gensym(`repl)
   val exports-table = HashTable<Symbol, List<Export>>(List())
   val tdecls = IntTable<TDecl>()
-  new REPLEnv :
+  val imports = HashTable<Symbol, IImport>()  
+  val env = new REPLEnv :
     defmethod typedefs (this) :
       TypeDefs(package-name, to-tuple(values(tdecls)))
     defmethod packageio (this) :
       PackageIO(package-name, [], [], to-tuple(cat-all(values(exports-table))))
+    defmethod imports (this) :
+      to-tuple(values(imports))
+    defmethod add (this, import:IImport) :
+      val package = name!(package(import))
+      imports[package] = import
+    defmethod unimport (this, package:Symbol) -> True|False :
+      remove(imports, package)
     defmethod add (this, typedefs:TypeDefs) :
       for d in defs(typedefs) do :
         val decl = d as TDecl
@@ -219,6 +285,8 @@ defn REPLEnv () :
         val name = key(entry)
         val entries = value(entry)
         exports-table[name] = entries
+  do(add{env, _}, core-imports())
+  env
 
 ;============================================================
 ;======================== Errors ============================
@@ -226,6 +294,12 @@ defn REPLEnv () :
 
 defstruct ReplErrors <: Exception :
   messages: Collection
+
+defn PackageNotLoaded (package:Symbol) :
+  Exception $ "Could not import package %~. Package has not been loaded." % [package]
+
+defn PackageNotImported (package:Symbol) :
+  Exception $ "Could not unimport package %~. Package is not yet imported." % [package]
   
 ;============================================================
 ;======================= Driver =============================
@@ -238,6 +312,8 @@ public defn repl () :
       match(exp) :
         (exp:Load) : load-files(repl, filenames(exp))
         (exp:Eval) : load-repl(repl, form(exp))
+        (exp:Import) : import(repl, import(exp))
+        (exp:Unimport) : unimport(repl, package(exp))
     catch (e:ReplErrors) :
       do(println, messages(e))
   
