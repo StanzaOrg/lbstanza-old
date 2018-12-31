@@ -95,6 +95,10 @@ public defstruct FunctionEntry <: LinkedIns :
 public defstruct LinkedDump <: LinkedIns :
   x: Local
   ref?: True|False
+public defstruct LinkedVMCall <: LinkedIns :
+  x: Local
+  op: VMOp
+  y: VMImm
 public defstruct LinkedOp1Ins <: LinkedIns :
   type: VMType
   x: Local
@@ -126,8 +130,10 @@ public defstruct LinkedBranchRegIns <: LinkedIns :
   reg: Int
   value: Int  
 public defstruct LinkedReserveIns <: LinkedIns :
+  n: Int
   space: VMImm
   num-obj: Int
+  frame-size: Int
 public defstruct LinkedAllocIns <: LinkedIns :
   x: Local
   type: Int
@@ -143,7 +149,10 @@ public defstruct LinkedDispatchIns <: LinkedIns :
 ;======================= Printer ============================
 ;============================================================
 defmethod print (o:OutputStream, i:LinkedReserveIns) :
-  print(o, "reserve %_, %_" % [space(i), num-obj(i)])
+  print(o, "reserve %_, %_ and goto %_" % [space(i), num-obj(i), n(i)])
+
+defmethod print (o:OutputStream, i:LinkedVMCall) :
+  print(o, "%_ = callvm %_ %_" % [x(i), op(i), y(i)])
 
 defmethod print (o:OutputStream, i:LinkedAllocIns) :
   print(o, "%_ = alloc<%_> %_" % [x(i), type(i), size(i)])
@@ -401,6 +410,8 @@ defn Linker (branch-table:BranchTable) :
           (ins:Op1Ins) :
             val ins* = link-ins(ins, pos)
             match(op(ins*)) :
+              (op:GCOp) :
+                add(buffer, LinkedVMCall(x(ins*), op, y(ins*)))
               (op:ConvOp|InterpretOp) :
                 val xt = imm-type(x(ins))
                 val yt = imm-type(y(ins))
@@ -450,7 +461,8 @@ defn Linker (branch-table:BranchTable) :
               link-ins(ins, pos)
           (ins:NewStackIns) :
             val ins* = link-ins(ins, pos)
-            add(buffer, LinkedReserveIns(NumConst(SIZEOF-STACK), 1))
+            add(buffer, LinkedReserveIns(2, NumConst(SIZEOF-STACK), 1, frame-size))
+            add(buffer, PopFrameIns(frame-size))
             add(buffer, ins*)            
           (ins:AllocIns) :
             val ins* = link-ins(ins, pos)
@@ -458,14 +470,16 @@ defn Linker (branch-table:BranchTable) :
               val x = xs(ins*)[0]
               val type = types(ins*)[0]
               val size = sizes(ins*)[0]
-              add(buffer, LinkedReserveIns(size, 1))
+              add(buffer, LinkedReserveIns(2, size, 1, frame-size))
+              add(buffer, PopFrameIns(frame-size))
               add(buffer, LinkedAllocIns(x, type, size))
             else :
               val num-obj = length(sizes(ins*))
               val size = sum $
                 for s in sizes(ins*) seq :
                   value(s as NumConst) as Int
-              add(buffer, LinkedReserveIns(NumConst(size), num-obj))
+              add(buffer, LinkedReserveIns(2, NumConst(size), num-obj, frame-size))
+              add(buffer, PopFrameIns(frame-size))
               for (x in xs(ins*), t in types(ins*), s in sizes(ins*)) do :
                 add(buffer, LinkedAllocIns(x, t, s))
           (ins:LinkedIns&VMIns) :
@@ -615,6 +629,9 @@ lostanza defn tag (x:ptr<?>) -> long :
 
 public lostanza defn void-marker () -> long :
   return -1L << 3L + MARKER-TAG-BITS
+
+public lostanza defn false-marker () -> long :
+  return FALSE-TYPE.value << 3L + MARKER-TAG-BITS
 
 ;============================================================
 ;=================== VM Structures ==========================
@@ -1085,7 +1102,27 @@ public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:re
           goto step(pc + 1)
         (ins:ref<Op0Ins>) :
           assign(stack-pointer, x(ins), eval-op(op(ins), current-stack, stack-pointer, vmtable))
-          goto step(pc + 1)        
+          goto step(pc + 1)
+        (ins:ref<LinkedVMCall>) :
+          match(op(ins)) :
+            (op:ref<GCOp>) :            
+              ;Evaluate size
+              val total-size = eval-imm(y(ins), stack-pointer, vmtable)
+              ;Store required values
+              vm.heap-top = heap-top
+              vm.stack-pointer = stack-pointer
+              vm.current-stack = current-stack
+              ;Run garbage collector
+              extend-heap(vm, total-size)
+              ;Load required values
+              heap-limit = vm.heap-limit
+              heap-top = vm.heap-top
+              stack-pointer = vm.stack-pointer
+              current-stack = vm.current-stack
+              stack-end = /stack-end(current-stack)
+              goto step(pc + 1)
+            (op) :
+              fatal("Unreachable")
         (ins:ref<LinkedOp1Ins>) :
           val y = eval-imm(y(ins), stack-pointer, vmtable)
           assign(stack-pointer, x(ins), eval-op(type(ins), op(ins), y, vmtable))
@@ -1101,23 +1138,22 @@ public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:re
           assign(stack-pointer, x(ins), result)
           goto step(pc + 1)
         (ins:ref<LinkedReserveIns>) :
+          ;Compute size to allocate
           val size = eval-imm(space(ins), stack-pointer, vmtable)
           if size & 0x7L : fatal("Size is not a multiple of 8.")
           val total-size = size + 8 * num-obj(ins).value
-          if heap-top + total-size > heap-limit :
-            ;Store required values
-            vm.heap-top = heap-top
-            vm.stack-pointer = stack-pointer
-            vm.current-stack = current-stack
-            ;Run garbage collector
-            extend-heap(vm, total-size)
-            ;Load required values
-            heap-limit = vm.heap-limit
-            heap-top = vm.heap-top
-            stack-pointer = vm.stack-pointer
-            current-stack = vm.current-stack
-            stack-end = /stack-end(current-stack)
-          goto step(pc + 1)
+
+          ;If there is enough space
+          if heap-top + total-size <= heap-limit :
+            goto step(pc + n(ins).value)
+          else :
+            ;Set arguments
+            regs[0] = false-marker()  ;Closure is false
+            regs[1] = 1L              ;arity = 1
+            regs[2] = total-size      ;size argument
+            val fid = get(vm.loaded-ids, CORE-EXTEND-HEAP-ID).value
+            stack-pointer = stack-pointer + frame-size(ins).value
+            goto call-function(fid, pc + 1)          
         (ins:ref<LinkedAllocIns>) :
           val size = eval-imm(size(ins), stack-pointer, vmtable)
           if size < 8 : fatal("Invalid size for object.")
