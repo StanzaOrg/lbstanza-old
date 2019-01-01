@@ -240,6 +240,13 @@ defn to-body (b:BodyBuffer) :
 ;============================================================
 ;TODO: Do not create closures for local functions
 defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
+  ;Retrieve an info from the given immediate
+  defn first-info (f:EVar|ECurry|EMix) :
+    match(f) :
+      (f:EVar) : info(f)
+      (f:ECurry) : info(x(f))
+      (f:EMix) : find({_ is FileInfo}, seq(first-info, funcs(f)))
+          
   ;Create a trampoline function that calls the given immediate
   ;with known arity.
   defn trampoline-fn (f:EVar|ECurry|EMix, arity:Int, vt:VarTable) :
@@ -254,8 +261,9 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
       ELocal(ret, a2, false)]
     EFn([], args, arity * ETop, ETop(),
       EBody(locals, [], [], [], [
-        ECall(EVarLoc(ret), f, map(EVar,args), CallGuarded(a1, a2))
-        EReturn(EVar(ret))]))
+        ECall(EVarLoc(ret), f, map(EVar,args), CallGuarded(a1, a2), first-info(f))
+        EReturn(EVar(ret))])
+      false)
 
   ;Create a trampoline function that calls the given immediate
   ;with unknown (and potentially multiple) arities.
@@ -294,7 +302,7 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
     defn lift (x:EVar|ECurry|EMix) -> EVar :
       val v = uniqueid()
       emit(buffer, ELocalFn(v, trampoline-fn(x, vt)))
-      emit(buffer, EInitClosures([EVarLoc(v)]))
+      emit(buffer, EInitClosures([EVarLoc(v)], first-info(x)))
       EVar(v)
 
     ;Analyze an immediate, lifting when necessary
@@ -333,8 +341,8 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
     val buffer = BodyBuffer(body)
 
     ;Split a call into a dispatch branch
-    defn make-dispatch (Call:(EVarLoc|False, EImm, Tuple<EImm>, CallGuarded) -> EIns,
-                        x:EVarLoc|False, f:EMix, ys:Tuple<EImm>, end?:True|False) :
+    defn make-dispatch (Call:(EVarLoc|False, EImm, Tuple<EImm>, CallGuarded, False|FileInfo) -> EIns,
+                        x:EVarLoc|False, f:EMix, ys:Tuple<EImm>, info:False|FileInfo, end?:True|False) :
       ;Construct branches and blocks
       val branches = Vector<EBranch>()
       val blocks = Vector<(() -> False)>()
@@ -344,20 +352,13 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
       for f in funcs(f) do :
         val [a1, a2] = fn-types(vt, f, length(ys))
         val lbl = uniqueid()
-        val x* = uniqueid() when x is EVarLoc
-        match(x*:Int) :
-          emit(buffer, ELocal(x*, a2, false))
-        add(branches, EBranch(select(a1,refmask), lbl))
+        add(branches, EBranch(select(a1,refmask), lbl, false))
         add{blocks, _} $ fn () :
           emit(buffer, ELabel(lbl))
-          match(x*:Int) :
-            emit(buffer, Call(EVarLoc(x*), f, ys, CallGuarded(a1, a2)))
-            emit(buffer, EDef(x as EVarLoc, EVar(x*)))
-          else :
-            emit(buffer, Call(false, f, ys, CallGuarded(a1, a2)))            
+          emit(buffer, Call(x, f, ys, CallGuarded(a1, a2), info))
           emit(buffer, EGoto(end-lbl)) when not end?
       ;Yield branches
-      emit(buffer, EDispatch(select(ys,refmask), to-tuple(branches)))
+      emit(buffer, EDispatch(select(ys,refmask), to-tuple(branches), info))
       for b in blocks do : b()
       emit(buffer, ELabel(end-lbl)) when not end?
 
@@ -368,13 +369,13 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
       if dispatch? :
         match(i) :
           (i:ECall) :
-            within (x, f, ys, g) = make-dispatch(x(i), f(i) as EMix, ys(i), false) :
-              match(calltype(i):CallGuarded) : ECall(x, f, ys, g)
-              else : ECall(x, f, ys, calltype(i))
+            within (x, f, ys, g, info) = make-dispatch(x(i), f(i) as EMix, ys(i), info(i), false) :
+              match(calltype(i):CallGuarded) : ECall(x, f, ys, g, info)
+              else : ECall(x, f, ys, calltype(i), info)
           (i:ETCall) :
-            within (_, f, ys, g) = make-dispatch(false, f(i) as EMix, ys(i), true) :
-              match(calltype(i):CallGuarded) : ETCall(f, ys, g)
-              else : ETCall(f, ys, calltype(i))
+            within (_, f, ys, g, info) = make-dispatch(false, f(i) as EMix, ys(i), info(i), true) :
+              match(calltype(i):CallGuarded) : ETCall(f, ys, g, info)
+              else : ETCall(f, ys, calltype(i), info)
       else :
         emit(buffer, i)
 
@@ -412,7 +413,7 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable, iotable:IOTable) :
       match(x) :
         (x:EVar) :
           if variable?(vt, n(x)) and (mutable?(vt, n(x)) or global?(vt, n(x))) :
-            emit(ECheckSet(x))
+            emit(ECheckSet(x, info(x)))
         (x) : false
 
     ;Emit instructions for checks
@@ -420,23 +421,18 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable, iotable:IOTable) :
       do*(check-vars, i)
       match(i) :
         ;TODO: Fix boundary guards
-        (i:ECall) :
+        (i:ECall|ETCall) :
           val ct = match(calltype(i)) :
             (ct:CallGuarded) : CallStanza()
             (ct) : ct
-          emit(ECall(x(i), f(i), ys(i), ct))
-        (i:ETCall) :
-          val ct = match(calltype(i)) :
-            (ct:CallGuarded) : CallStanza()
-            (ct) : ct
-          emit(ETCall(f(i), ys(i), ct))
+          emit(sub-calltype(i, ct))
         (i:EDef) :
           match(y(i):EImm) :
-            emit(ECheck(y(i) as EImm, type(vt, n(x(i)))))
+            emit(ECheck(y(i) as EImm, type(vt, n(x(i))), info(i)))
           emit(i)
         (i:EStore) :
           val x = loc(i) as EVarLoc
-          emit(ECheck(y(i), type(vt, n(x))))
+          emit(ECheck(y(i), type(vt, n(x)), info(i)))
           emit(i)          
         (i:ELabel) :
           emit(i)
@@ -444,10 +440,10 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable, iotable:IOTable) :
         (i:EMatch|EDispatch) :
           for b in branches(i) do :
             for (t in types(b), y in ys(i)) do :
-              add-entry(n(b), ECheck(y,t)) when has-tvar?(t)
+              add-entry(n(b), ECheck(y,t,info(b))) when has-tvar?(t)
           emit(remove-tvars(i))
         (i:ECheckLength) :
-          emit(ECheck(y(i), EOf(n(iotable,CORE-TUPLE-ID))))
+          emit(ECheck(y(i), EOf(n(iotable,CORE-TUPLE-ID)), info(i)))
           emit(i)
         (i) :
           emit(i)
@@ -461,16 +457,11 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable, iotable:IOTable) :
       match(i) :
         (i:EMatch|EDispatch) :
           remove-tvars(i)
-        (i:ECall) :
+        (i:ECall|ETCall) :
           val ct* = match(calltype(i)) :
             (ct:CallGuarded) : CallStanza()
             (ct) : ct
-          ECall(x(i), f(i), ys(i), ct*)
-        (i:ETCall) :
-          val ct* = match(calltype(i)) :
-            (ct:CallGuarded) : CallStanza()
-            (ct) : ct
-          ETCall(f(i), ys(i), ct*)          
+          sub-calltype(i, ct*)
         (i) : i
     sub-ins(body, ins*)
 
@@ -491,11 +482,11 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable, iotable:IOTable) :
       if histanza? :
         val prelude = Vector<EIns>()
         for (x in args(f), t in a1(f)) do :
-          add(prelude, ECheck(EVar(x),t)) when has-tvar?(t)
+          add(prelude, ECheck(EVar(x),t,info(f))) when has-tvar?(t)
         guard-histanza-body(body(f), prelude, vt)
       else :
         analyze-lostanza-body(body(f))
-    EFn(targs(f), args(f), a1*, a2(f), body*)
+    EFn(targs(f), args(f), a1*, a2(f), body*, info(f))
 
   ;Overall driver
   defn analyze (e:ELBigItem, vt:VarTable) -> ELBigItem :
@@ -677,7 +668,7 @@ defn lift-objects (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
       for (x in args(f), t in a1(f)) seq :
         EOf(obj-n) when x == thisn(m) else remove-tvars(t)
     val a2* = remove-tvars(a2(f))
-    val f* = EFn(targs(f), args(f), a1*, a2*, to-body(buffer, true, false, false))
+    val f* = EFn(targs(f), args(f), a1*, a2*, to-body(buffer, true, false, false), info(f))
     val method-id = uniqueid()
     add(new-texps, EDefmethod(method-id, multi(m), [], f*, false))
     method-id
@@ -713,7 +704,7 @@ defn lift-objects (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
         val objfree = objfree-table[n(i)]
         val ys = map(EVar, vars(objfree))
         val targs = map(ETVar, tvars(objfree))
-        ENewObject(x(i), n(i), targs, ys)
+        ENewObject(x(i), n(i), targs, ys, info(i))
       else : i
 
     ;Return new body
@@ -798,7 +789,7 @@ defn lift-closures (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackag
           else : map(remove-nonlocal-tvars, t)
         val a1* = map(remove-nonlocal-tvars, a1(e))
         val a2* = rename-vars+tvars(a2(e), rename-table)
-        EFn(targs(e), args(e), a1*, a2*, to-body(buffer))
+        EFn(targs(e), args(e), a1*, a2*, to-body(buffer), info(e))
       else :
         map(lift, e)
 
@@ -845,7 +836,7 @@ defn lift-closures (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackag
             val targs = map(ETVar, tvars(free))
             val ys = map(EVar, vars(free))
             EClosure(closureid, targs, ys)
-          ELetRec(xs(i), closures)
+          ELetRec(xs(i), closures, info(i))
         (i) : i
 
     ;Return new function
