@@ -395,165 +395,281 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
   map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)    
 
 ;============================================================
-;================== Lambda Lifting ==========================
+;=============== Boundary Guard Derivations  ================
 ;============================================================
+;<DOC>
+Philosophy:
+- All possible boundary changes are checked.
+- There is only one exception: interaction with a LoStanza object
+  from within a LoStanza context.
 
-;============================================================
-;===================== Boundary Guards ======================
-;============================================================
-;Philosophy:
-; - All possible boundary changes are checked.
-; - There is only one exception:
-;     - interaction with a LoStanza object from
-;       within a LoStanza context.
-;
-;Expressions that require boundary guards:
-; - EDefn
-;   - Incoming arguments must be checked.
-;   - Returned value must be checked.
-; - EDefmethod
-;   - Incoming arguments must be checked.
-;   - Returned value must be checked.
-; - ELocalFn
-;   - Incoming arguments must be checked.
-;   - Returned value must be checked.
-; - EMethod
-;   - Incoming arguments must be checked.
-;   - Returned value must be checked.
-; - EVar
-;   - Variable must be assigned.
-;   - Variable must have correct type.
-; - EDef
-;   - Variable must be initialized to the correct type.
-; - ELoad
-;   - Variable must be assigned.
-;   - Variable must have correct type.
-; - EStore
-;   - Variable must be assigned the correct type.
-; - ETCall
-;   - Incoming arguments must be checked.
-; - ECall
-;   - Incoming arguments must be checked.
-;   - If return type is bottom:
-;     - Call should not return.
-;   - Otherwise:
-;     - Returned value must have correct type.
-; - EBranch
-;   - Incoming arguments must have correct type.
-; - ECheckLength
-;   - Expression must be tuple type.
-; - EReturn
-;   - Returned value must have correct type.
-;
-;Implementation:
-; - EDefn
-;   - Non-local functions will be lifted 
+All possible boundary guards:
+- EDefn
+  - Arguments must be correct type.
+- EDefmethod
+  - Arguments must be correct type.
+- ELocalFn
+  - Arguments must be correct type.
+- EMethod
+  - Arguments must be correct type.
+- EVar
+  - Variable must be assigned.
+  - Variable must have correct type.
+- EDef
+  - Initializing value must have correct type.
+- EStore to EVarLoc
+  - Value must have correct type.
+- ETCall
+  - Arguments must have correct type.
+  - Function must have Fn type.
+- ECall
+  - Arguments must have correct type.
+  - Function must have Fn type.
+  - If return type is bottom :
+    - Call should not return.
+  - Otherwise:
+    - Return value must have correct type.
+- EBranch
+  - Arguments must have correct type.
+- ECheckLength
+  - Expression must have Tuple type.
+- EReturn
+  - Value must have correct type.
 
+Implementation:
+- HiStanza functions :
+  - Arguments are checked before call.
+  - Return value is checked within function. (Unless tailcall.)
+- HiStanza variables :
+  - Values are checked before assignment. 
+;<DOC>
+;============================================================
+;==================== Boundary Guards =======================
+;============================================================
 
 public defn insert-guards (epackage:EPackage, gvt:VarTable, iotable:IOTable) :
-  ;Insert guards for HiStanza body
-  defn guard-histanza-body (body:EBody, prelude:Collection<EIns>, vt:VarTable) :
-    ;Buffer for holding generated instructions
-    val buffer = BodyBuffer(body)
-    defn emit (i:EIns) : /emit(buffer,i)
-
+  ;Guard expression for body
+  defn guard-body (body:EBody, buffer:BodyBuffer, vt:VarTable,
+                   lostanza-context?:True|False,
+                   return-type:EType|False, function-info:FileInfo|False) :    
     ;Buffer for holding label entrance guards
     val entry-blocks = IntTable<List<EIns>>(List())
     defn add-entry (b:Int, i:EIns) : update(entry-blocks, cons{i, _}, b)
-    defn entry (b:Int) : reverse(entry-blocks[b])
 
-    ;Add prelude
-    do(emit, prelude)
+    ;Set indicating that a variable was uninitialized
+    val uninitialized-vars = IntSet()
 
-    ;Check that all used variables have been set
-    defn check-vars (x:EImm) :
-      match(x) :
-        (x:EVar) :
-          if variable?(vt, n(x)) and (mutable?(vt, n(x)) or global?(vt, n(x))) :
-            emit(ECheckSet(x, info(x)))
-        (x) : false
+    ;Return true if n refers to a reference-typed variable.
+    defn refvar? (n:Int) :
+      variable?(vt,n) and reftype?(type(vt,n))
 
-    ;Emit instructions for checks
-    for i in ins(body) do :
-      do*(check-vars, i)
-      match(i) :
-        ;TODO: Fix boundary guards
-        (i:ECall|ETCall) :
-          val ct = match(calltype(i)) :
-            (ct:CallGuarded) : CallStanza()
-            (ct) : ct
-          emit(sub-calltype(i, ct))
-        (i:EDef) :
-          match(y(i):EImm) :
-            emit(ECheck(y(i) as EImm, type(vt, n(x(i))), info(i)))
-          emit(i)
-        (i:EStore) :
-          val x = loc(i) as EVarLoc
-          emit(ECheck(y(i), type(vt, n(x)), info(i)))
-          emit(i)          
-        (i:ELabel) :
-          emit(i)
-          do(emit, entry(n(i)))
-        (i:EMatch|EDispatch) :
-          for b in branches(i) do :
-            for (t in types(b), y in ys(i)) do :
-              add-entry(n(b), ECheck(y,t,info(b))) when has-tvar?(t)
-          emit(remove-tvars(i))
-        (i:ECheckLength) :
-          emit(ECheck(y(i), EOf(n(iotable,CORE-TUPLE-ID)), info(i)))
-          emit(i)
-        (i) :
-          emit(i)
+    ;Ensure that variable has been set
+    defn ensure-vars-set (x:EImm) :
+      match(x:EVar) :
+        ;Possible unset
+        val can-be-unset? =
+          if refvar?(n(x)) :
+            global?(vt,n(x)) or
+            (mutable?(vt,n(x)) and uninitialized-vars[n(x)])
+        ;Compute whether to emit check
+        val emit-check? =
+          if lostanza-context? and lostanza?(vt,n(x)) : false
+          else : can-be-unset?
+        ;Emit check
+        emit(buffer, ECheckSet(x,info(x))) when emit-check?
 
-    ;Return new body
-    to-body(buffer)
+    ;Ensure that variables have correct type
+    defn ensure-vars-type-consistent (x:EImm) :
+      match(x:EVar) :
+        ;Possible inconsistent
+        val can-be-inconsistent? =
+          refvar?(n(x)) and lostanza?(vt,n(x))
+        if not lostanza-context? and can-be-inconsistent? :
+          val t = type(vt,n(x))
+          emit(buffer, ECheck(x, t, info(x)))
 
-  ;Transform instructions for LoStanza body
-  defn analyze-lostanza-body (body:EBody) :
-    val ins* = for i in ins(body) map :
-      match(i) :
-        (i:EMatch|EDispatch) :
-          remove-tvars(i)
-        (i:ECall|ETCall) :
-          val ct* = match(calltype(i)) :
-            (ct:CallGuarded) : CallStanza()
-            (ct) : ct
-          sub-calltype(i, ct*)
-        (i) : i
-    sub-ins(body, ins*)
-
-  ;General analysis for bodies
-  defn guard-bodies<?T> (e:?T&ELBigItem, histanza?:True|False, vt:VarTable) :
-    defn loop (e:ELBigItem) :
-      match(e) :
-        (e:EBody) : 
-          if histanza? : guard-histanza-body(e, [], vt)
-          else : analyze-lostanza-body(e)
-        (e) : map(loop, e)
-    loop(e) as T&ELBigItem
-
-  ;Analysis for Methods
-  defn guard-method (f:EFn, histanza?:True|False, vt:VarTable) -> EFn :
-    val a1* = map(remove-tvars,a1(f))
-    val body* =
-      if histanza? :
-        val prelude = Vector<EIns>()
-        for (x in args(f), t in a1(f)) do :
-          add(prelude, ECheck(EVar(x),t,info(f))) when has-tvar?(t)
-        guard-histanza-body(body(f), prelude, vt)
-      else :
-        analyze-lostanza-body(body(f))
+    ;Emit guards for each instruction
+    for ins in ins(body) do :
+      ;Ensure that variables have been set
+      do*(ensure-vars-set, ins)
+      ;Ensure that variables are type-consistent
+      do*(ensure-vars-type-consistent, ins)
+      
+      match(ins) :
+        (ins:EDef) :
+          emit(buffer, ins)
+          if y(ins) is False :
+            add(uninitialized-vars, n(x(ins)))
+          if not lostanza-context? :
+            if y(ins) is-not False :
+              val t = type(vt,n(x(ins)))
+              val v = EVar(n(x(ins)))
+              emit(buffer, ECheck(v, t, info(ins)))                      
+        (ins:EStore) :
+          emit(buffer, ins)
+          match(loc(ins)) :
+            (l:EVarLoc) :
+              val check? =
+                if lostanza-context? and lostanza?(vt,n(l)) : false
+                else : true
+              if check? and refvar?(n(l)) :                
+                val t = type(vt,n(l))
+                val v = EVar(n(l))
+                emit(buffer, ECheck(v, t, info(ins)))
+            (l) : false
+        (ins:ECheckLength) :
+          if not lostanza-context? :
+            val tuple = EOf(n(iotable, CORE-TUPLE-ID))
+            emit(buffer, ECheck(y(ins), tuple, info(ins)))          
+          emit(buffer, ins)
+        (ins:EReturn) :
+          match(return-type:EType) :
+            emit(buffer, ECheck(y(ins), return-type, function-info))
+          emit(buffer, ins)
+        (ins:EMatch|EDispatch) :
+          val branches* = for b in branches(ins) map :
+            if not lostanza-context? :
+              for (y in ys(ins), t in types(b)) do :
+                if has-tvar?(t) :
+                  add-entry(n(b), ECheck(y, t, info(b)))
+            sub-types(b, map(remove-tvars, types(b)))
+          emit(buffer, sub-branches(ins, branches*))
+        (ins:ELabel) :
+          emit(buffer, ins)
+          for i in reverse(entry-blocks[n(ins)]) do :
+            emit(buffer, i)
+        (ins:ECall|ETCall) :
+          let :
+            if function?(f(ins)) :
+              if lostanza-context? and lostanza-function?(f(ins)) :
+                unguarded-call()
+              else :
+                val arity = length(ys(ins))
+                val [a1, a2] = fn-types(vt, f(ins) as EVar|ECurry, arity)            
+                guard-call(a1, a2)
+            else if calltype(ins) is CallGuarded :
+              if lostanza-context? :
+                unguarded-call()
+              else :
+                val ct = calltype(ins) as CallGuarded
+                guard-call(a1(ct), a2(ct))
+            else :
+              unguarded-call()
+          where :
+            defn function? (e:EImm) :
+              match(e) :
+                (e:EVar) : /function?(vt, n(e))
+                (e:ECurry) : /function?(vt, n(x(e)))
+                (e) : false
+            defn lostanza-function? (f:EImm) :
+              match(f) :
+                (f:EVar) : lostanza?(vt, n(f))
+                (f:ECurry) : lostanza?(vt, n(x(f)))                
+            defn guard-call (a1:Tuple<EType>, a2:EType) :
+              fatal("Incorrect call type") when calltype(ins) is-not CallGuarded
+              match(ins) :
+                (ins:ECall) :
+                  ;Create a temporary return location
+                  ;if there isn't one, and if the function returns.
+                  val xloc* = match(x(ins)) :
+                    (x:EVarLoc) :
+                      x
+                    (_:False) :
+                      if not bottom?(a2) : 
+                        val n = uniqueid()
+                        emit(buffer, ELocal(n, a2, false))
+                        EVarLoc(n)
+                  ;Check this variable if it is not false
+                  val x* = if not bottom?(a2) :
+                    EVar(n(xloc* as EVarLoc))
+                  ;Check arguments
+                  for (y in ys(ins), t in a1) do :
+                    emit(buffer, ECheck(y, t, info(ins)))
+                  ;Check function
+                  if not function?(f(ins)) :
+                    val t = EOf(n(iotable, CORE-FN-ID))
+                    emit(buffer, ECheck(f(ins), t, info(ins)))
+                  ;Make call
+                  emit(buffer, ECall(xloc*, f(ins), ys(ins), CallStanza(), info(ins)))
+                  ;Check return type
+                  match(x*:EVar) : emit(buffer, ECheck(x*, a2, info(ins)))
+                  else : emit(buffer, EEnd(info(ins)))
+                (ins:ETCall) :
+                  ;Check arguments
+                  for (y in ys(ins), t in a1) do :
+                    emit(buffer, ECheck(y, t, info(ins)))
+                  ;Check function
+                  if not function?(f(ins)) :
+                    val t = EOf(n(iotable, CORE-FN-ID))
+                    emit(buffer, ECheck(f(ins), t, info(ins)))
+                  ;Make call
+                  emit(buffer, ETCall(f(ins), ys(ins), CallStanza(), info(ins)))
+            defn unguarded-call () :
+              val ct* = match(calltype(ins)) :
+                (ct:CallGuarded) : CallStanza()
+                (ct) : ct
+              emit(buffer, sub-calltype(ins, ct*))
+        (ins) :
+          emit(buffer, ins)
+          
+  ;Guard functions
+  defn guard-fn (f:EFn, vt:VarTable, lostanza-context?:True|False) -> EFn :
+    val buffer = BodyBuffer(body(f))
+    for f in localfns(body(f)) do :
+      emit(buffer, guard-localfn(f,vt))
+    for o in localobjs(body(f)) do :
+      emit(buffer, guard-localobj(o,vt))
+    val return-type = a2(f) when not lostanza-context?
+    guard-body(body(f), buffer, vt, lostanza-context?, return-type, info(f))
+    sub-body(f, to-body(buffer, true, false, false))
+    
+  defn guard-method (f:EFn, vt:VarTable, lostanza-context?:True|False) -> EFn :
+    val buffer = BodyBuffer(body(f))
+    for f in localfns(body(f)) do :
+      emit(buffer, guard-localfn(f,vt))
+    for o in localobjs(body(f)) do :
+      emit(buffer, guard-localobj(o,vt))
+    if not lostanza-context? :
+      for (v in args(f), t in a1(f)) do :
+        if has-tvar?(t) :
+          emit(buffer, ECheck(EVar(v), t, info(f)))
+    guard-body(body(f), buffer, vt, lostanza-context?, a2(f), info(f))
+    val body* = to-body(buffer, true, false, false)
+    val a1* = map(remove-tvars, a1(f))
     EFn(targs(f), args(f), a1*, a2(f), body*, info(f))
+
+  defn map-fns<?T> (f:EFn -> EFn, x:?T&ELBigItem) -> T :
+    val result = let loop (x:ELBigItem = x) :
+      match(x:EFn) : f(x)
+      else : map(loop, x)
+    result as T&ELBigItem
+
+  defn guard-localfn (f:ELocalFn, vt:VarTable) :
+    ELocalFn(n(f), map-fns(guard-fn{_, vt, false}, func(f)))
+    
+  defn guard-localobj (o:ELocalObj, vt:VarTable) :
+    val methods* = for m in methods(o) map :
+      map-fns(guard-method{_, vt, false}, m)
+    ELocalObj(n(o), type(o), methods*)
+
+  defn guard-init (e:EInit, vt:VarTable) -> EInit :
+    val buffer = BodyBuffer(body(e))
+    for f in localfns(body(e)) do :
+      emit(buffer, guard-localfn(f, vt))
+    for o in localobjs(body(e)) do :
+      emit(buffer, guard-localobj(o,vt))
+    guard-body(body(e), buffer, vt, lostanza?(e), false, false)
+    val body* = to-body(buffer, true, false, false)
+    EInit(body*, lostanza?(e))
 
   ;Overall driver
   defn analyze (e:ELBigItem, vt:VarTable) -> ELBigItem :
-    match(map(analyze{_, vt},e)) :
-      (e:EDefmethod) : sub-func(e, guard-method(func(e), not lostanza?(e), vt))
-      (e:EMethod) : sub-func(e, guard-method(func(e), true, vt))
-      (e:EDefn) : guard-bodies(e, not lostanza?(e), vt)
-      (e:EExternFn) : guard-bodies(e, false, vt)
-      (e:ELocalFn) : guard-bodies(e, true, vt)
-      (e:EInit) : guard-bodies(e, not lostanza?(e), vt)
+    match(e) :
+      (e:EDefmethod) : map-fns(guard-method{_, vt, lostanza?(e)}, e)
+      (e:EMethod) : map-fns(guard-method{_, vt, false}, e)
+      (e:EDefn) : map-fns(guard-fn{_, vt, lostanza?(e)}, e)
+      (e:EExternFn) : map-fns(guard-fn{_, vt, true}, e)
+      (e:EInit) : guard-init(e,vt)
       (e) : e
   map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
 
@@ -1225,6 +1341,7 @@ defstruct EFnEntry <: FnEntry :
   a1: Tuple<EType>
   r: EType|False
   a2: EType
+  lostanza?: True|False
 with:
   printer => true
 
@@ -1233,6 +1350,7 @@ defstruct DFnEntry <: FnEntry :
   a1: Tuple<DType>
   r: DType|False
   a2: DType
+  lostanza?: True|False
 with:
   printer => true
 
@@ -1245,6 +1363,7 @@ with:
 defstruct VarEntry :
   mutable?: True|False
   type: EType|DType
+  lostanza?: True|False
 with:
   printer => true
 
@@ -1261,7 +1380,7 @@ defn VarTable (records:Seqable<VTRecord>, type-table:DTypeTable, parent:VarTable
           match(type(e)) :
             (t:DType) :
               val et = to-etype(type-table, t, [])
-              sub-entry(r, VarEntry(mutable?(e), et))
+              sub-entry(r, VarEntry(mutable?(e), et, lostanza?(e)))
             (t:EType) : r
         (e) : r
   new VarTable :
@@ -1284,6 +1403,13 @@ defn function? (vt:VarTable, n:Int) :
 
 defn variable? (vt:VarTable, n:Int) :
   entry(vt[n]) is VarEntry
+
+defn lostanza? (vt:VarTable, n:Int) :
+  match(entry(vt[n])) :
+    (e:EFnEntry) : lostanza?(e)
+    (e:DFnEntry) : lostanza?(e)
+    (e:VarEntry) : lostanza?(e)
+    (e:EMultifnEntry) : false
 
 defn global? (vt:VarTable, n:Int) :
   global?(vt[n])
@@ -1337,26 +1463,31 @@ defn GlobalVarTable (epackage:EPackage) -> VarTable :
     val e = match(rec(import)) :
       (r:FnRec|MultiRec|ExternFnRec) :
         val id = id(r) as FnId
-        DFnEntry(ntargs(id) + ncargs(id), a1(id), false, a2(r))
+        val lostanza? =
+          match(r) :
+            (r:FnRec) : lostanza?(r)
+            (r:MultiRec) : false
+            (r:ExternFnRec) : true
+        DFnEntry(ntargs(id) + ncargs(id), a1(id), false, a2(r), lostanza?)
       (r:ValRec) :
-        VarEntry(mutable?(r), type(r))
+        VarEntry(mutable?(r), type(r), lostanza?(r))
       (r:ExternRec) :
         match(type(r)) :
-          (t:DFnT) : DFnEntry(0, a(t), /r(t), b(t))
-          (t) : VarEntry(true, type(r))
+          (t:DFnT) : DFnEntry(0, a(t), /r(t), b(t), true)
+          (t) : VarEntry(true, type(r), true)
       (r) : false
     match(e:FnEntry|VarEntry) : One(VTRecord(true, n(import), e))
     else : None()
   val exported-records = for exp in exps(epackage) seq? :
     val [n, e] = match(exp) :
-      (e:EDefn) : [n(e) FnEntry(func(e))]
-      (e:EDefmulti) : [n(e), EFnEntry(targs(e), a1(e), false, a2(e))]
-      (e:EExternFn) : [n(e), FnEntry(func(e))]
-      (e:EDefGlobal) : [n(e), VarEntry(mutable?(e), type(e))]
+      (e:EDefn) : [n(e) FnEntry(func(e), lostanza?(e))]
+      (e:EDefmulti) : [n(e), EFnEntry(targs(e), a1(e), false, a2(e), false)]
+      (e:EExternFn) : [n(e), FnEntry(func(e), true)]
+      (e:EDefGlobal) : [n(e), VarEntry(mutable?(e), type(e), lostanza?(e))]
       (e:EExtern) :
         match(type(e)) :
-          (t:EFnT) : [n(e), EFnEntry([], a(t), r(t), b(t))]
-          (t) : [n(e), VarEntry(true, type(e))]
+          (t:EFnT) : [n(e), EFnEntry([], a(t), r(t), b(t), true)]
+          (t) : [n(e), VarEntry(true, type(e), true)]
       (e) : [0, false]
     match(e:FnEntry|VarEntry) : One(VTRecord(true, n, e))
     else : None()
@@ -1364,31 +1495,40 @@ defn GlobalVarTable (epackage:EPackage) -> VarTable :
   ;Return populated vartable
   VarTable(cat(imported-records, exported-records), type-table, false)
 
-defn LocalVarTable (gvt:VarTable, e:ELBigItem) -> VarTable :
+defn LocalVarTable (gvt:VarTable, e:ETExp) -> VarTable :
   ;Find records
   val records = generate<VTRecord> :
     defn found (n:Int, e:FnEntry|VarEntry) :
       yield(VTRecord(false, n, e))
+    ;Determine whether we are in a LoStanza context
+    val lostanza-context? = match(e) :
+      (e:EDefn) : lostanza?(e)
+      (e:EDefClosure) : false
+      (e:EDefmethod) : lostanza?(e)
+      (e:EExternFn) : true
+      (e:EInit) : lostanza?(e)
+      (e:EDefObject) : false
+      (e) : false
     let loop (e:ELBigItem = e) :
       match(e) :
         (e:EFn) :
           for (x in args(e), t in a1(e)) do :
-            found(x, VarEntry(false, t))
+            found(x, VarEntry(false, t, lostanza-context?))
         (e:EBody) :
           for e in localfns(e) do :
-            found(n(e), FnEntry(func(e)))
+            found(n(e), FnEntry(func(e), lostanza-context?))
           for e in locals(e) do :
-            found(n(e), VarEntry(mutable?(e), type(e)))
+            found(n(e), VarEntry(mutable?(e), type(e), lostanza-context?))
         (e) : false
       do*(loop, e)
 
   ;Return populated table
   VarTable(records, type-table(gvt), gvt)
 
-defn FnEntry (e:EFunction) :
+defn FnEntry (e:EFunction, lostanza?:True|False) :
   match(e) :
-    (e:EFn) : EFnEntry(targs(e), a1(e), false, a2(e))
-    (e:EMultifn) : EMultifnEntry(map({FnEntry(_) as EFnEntry}, funcs(e)))
+    (e:EFn) : EFnEntry(targs(e), a1(e), false, a2(e), lostanza?)
+    (e:EMultifn) : EMultifnEntry(map({FnEntry(_, lostanza?) as EFnEntry}, funcs(e)))
 
 ;============================================================
 ;====================== Utilities ===========================
