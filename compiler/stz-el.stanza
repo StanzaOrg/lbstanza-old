@@ -53,7 +53,7 @@ public defn lower (epackage:EPackage) -> EPackage :
   ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Lambda Lift") :
-    cur-package = lambda-lift(cur-package, global-vt)
+    cur-package = lambda-lift(cur-package, global-vt, iotable)
     global-vt = GlobalVarTable(cur-package)
   report("Lambda Lift")
   ensure-unique-identifiers!(cur-package)  
@@ -686,6 +686,16 @@ defn LiftTable (etexp:ETExp, allow-global-closures?:True|False) :
   val freevar-table = IntTable<Tuple<Int>>()
   val used-as-value = IntSet()
   val var-or-tvar = IntTable<True|False>()
+
+  defn record-free (n:Int, f:Free) :
+    freevar-table[n] = to-tuple(cat(vars(f), tvars(f)))
+    for v in vars(f) do : var-or-tvar[v] = true
+    for v in tvars(f) do : var-or-tvar[v] = false
+    
+  defn retrieve-free (n:Int) :
+    val vs = freevar-table[n]
+    val [vars, tvars] = split({var-or-tvar[_]}, vs)
+    Free(to-tuple(vars), to-tuple(tvars))
   
   scan(etexp) where :
     defn scan (e:ELBigItem) :
@@ -693,10 +703,7 @@ defn LiftTable (etexp:ETExp, allow-global-closures?:True|False) :
       match(e:EBody) :
         ;Record freevars of functions
         for e in localfns(e) do :
-          val free = fnfree(func(e))
-          freevar-table[n(e)] = to-tuple $ cat(vars(free), tvars(free))
-          for v in vars(free) do : var-or-tvar[v] = true
-          for v in tvars(free) do : var-or-tvar[v] = false
+          record-free(n(e), fnfree(func(e)))
         ;Record usages in value position
         if not empty?(localfns(e)) :
           ;Scan for variables
@@ -715,69 +722,46 @@ defn LiftTable (etexp:ETExp, allow-global-closures?:True|False) :
 
   ;Compute lifting parameters
   ;Initially assume that all functions are lifted.
-  val liftvar-table = IntTable<Tuple<Int>>()
-  let loop () :
+  val liftvar-table = let loop () :
     let :
       val num-lifted = length(freevar-table)
       identify-unlifted-functions()
       if length(freevar-table) < num-lifted :
         loop()
       else :
-        compute-lift-vars()
-        loop() when length(freevar-table) < num-lifted
+        val liftvars = compute-lift-vars()
+        if length(freevar-table) < num-lifted : loop()
+        else : liftvars
     where :
-      defn identify-unlifted-functions () :
+      defn forbid-lift? (f:Int, vars:Tuple<Int>) :
         defn unlifted? (n:Int) : not key?(freevar-table, n)
+        val max-lift-vars = 8
+        val num-free = count(unlifted?, vars)
+        if allow-global-closures? :
+          if num-free > 0 :
+            used-as-value[f] or num-free > max-lift-vars
+        else :
+          used-as-value[f] or num-free > max-lift-vars
+      
+      defn identify-unlifted-functions () :        
         for f in to-tuple(keys(freevar-table)) do :
           val free = freevar-table[f]
-          ;val vars = to-tuple(filter(unlifted?, vars(free)))
-          val num-free = count(unlifted?, free)
-          if allow-global-closures? :
-            ;If global closures are allowed, then global functions are allowed to be
-            ;used in value positions.
-            if num-free > 0 :          
-              remove(freevar-table,f) when used-as-value[f] or num-free > MAX-LIFT-VARS
-          else :
-            ;If global closures are not allowed, then no global functions are allowed
-            ;to be used in value positions.
-            if used-as-value[f] or num-free > MAX-LIFT-VARS :
-              remove(freevar-table,f)
-      defn compute-lift-vars () :
-        val entries = bipartite-closure(freevar-table)
-        clear(liftvar-table)
-        for e in entries do :
-          val f = key(e)
-          val vars = value(e)
-          liftvar-table[f] = vars
-          val num-free = length(vars)
+          remove(freevar-table,f) when forbid-lift?(f,free)
           
-          if allow-global-closures? :
-            if num-free > 0 :          
-              remove(freevar-table,f) when used-as-value[f] or num-free > MAX-LIFT-VARS
-          else :
-            if used-as-value[f] or num-free > MAX-LIFT-VARS :
-              remove(freevar-table,f)          
-
+      defn compute-lift-vars () :
+        to-inttable<Tuple<Int>> $
+          for e in bipartite-closure(freevar-table) seq :
+            val [f, free] = [key(e), value(e)]
+            remove(freevar-table,f) when forbid-lift?(f,free)
+            e
+            
   ;Return table
-  val table = new LiftTable :
+  new LiftTable :
     defmethod lift? (this, f:Int) : key?(freevar-table, f)
-    defmethod get (this, f:Int) :
-      val vs = liftvar-table[f]
-      val vars = to-tuple(filter({var-or-tvar[_]}, vs))
-      val tvars = to-tuple(filter({not var-or-tvar[_]}, vs))
-      Free(vars, tvars)
-
-  ;DEBUGGING
-  println("[===== Lift Table =====]")
-  for f in keys(freevar-table) do :
-    println("Lift %_ with %_" % [f, table[f]])
-
-  table
-
-val MAX-LIFT-VARS = 8
+    defmethod get (this, f:Int) : retrieve-free(f)
 
 ;TODO: Get transient working
-defn lambda-lift (epackage:EPackage, gvt:VarTable) :
+defn lambda-lift (epackage:EPackage, gvt:VarTable, iotable:IOTable) :
   ;Buffer for new top level expressions
   val new-texps = Vector<ETExp>()
 
@@ -828,9 +812,9 @@ defn lambda-lift (epackage:EPackage, gvt:VarTable) :
         match(x:EFn) :
           val targs* = to-tuple(cat(tvars(free), targs(x)))
           val args* = to-tuple(cat(vars(free), args(x)))
-          val vartypes = seq(type{vt, _}, vars(free))
+          val vartypes = seq(var-or-fn-type{vt, iotable, _}, vars(free))
           val a1* = to-tuple(cat(vartypes, a1(x)))
-          val body* = lift-bodies(body(x)) as EBody
+          val body* = lift-bodies(body(x))
           val func* = EFn(targs*, args*, a1*, a2(x), body*, info(x))
           rename-free(func*, free)
         else :
@@ -843,28 +827,24 @@ defn lambda-lift (epackage:EPackage, gvt:VarTable) :
     ;Process a body:
     ;  - Lift all local functions to top-level
     ;  - Transform instructions as necessary
-    defn lift-bodies (x:ELBigItem) :
+    defn lift-bodies<?T> (x:?T&ELBigItem) -> T :
       match(x) :
         (body:EBody) :
           val buffer = BodyBuffer(body)
           for f in localfns(body) do :
             if lifted?(f) : lift-function(f)
-            else : emit(buffer, lift-bodies(f) as ELocalFn)
+            else : emit(buffer, lift-bodies(f))
           for o in localobjs(body) do :
-            emit(buffer, lift-bodies(o) as ELocalObj)
+            emit(buffer, lift-bodies(o))
           for ins in ins(body) do :
             match(ins) :
               (ins:ECall|ETCall) :
-                println("Lifting %_" % [ins])
                 fatal("Expected guards to be removed.") when calltype(ins) is CallGuarded
                 match(lift-free(f(ins))) :
                   (free:Free) :
-                    println("Should lift with %_" % [free])
                     val f* = add-targs(f(ins), free)
                     val ys* = add-args(ys(ins), free)
-                    val ins* = sub-f(sub-ys(ins, ys*), f*)
-                    println("Transformed to %_" % [ins*])
-                    emit(buffer, ins*)
+                    emit(buffer, sub-f(sub-ys(ins, ys*), f*))
                   (_:False) :
                     emit(buffer, ins)
               (ins:EInitClosures) :
@@ -873,25 +853,18 @@ defn lambda-lift (epackage:EPackage, gvt:VarTable) :
                   emit(buffer, EInitClosures(xs*, info(ins)))
               (ins) :
                 emit(buffer, ins)
-          to-body(buffer, true, false, false)
+          to-body(buffer, true, false, false) as T&EBody
         (x) :
           map(lift-bodies, x)
 
     ;Driver: Recursively find all bodies and analyze them
-    ;val analyzed = let recur (x:ELBigItem = item) :
-    ;  match(x:EBody) : lift-body(x)
-    ;  else : map(recur,x)
-    lift-bodies(item) as ETExp
+    lift-bodies(item)
 
+  ;Drive with local var table and free var analysis
   val epackage* = within (texp, vt) = map-with-var-table(gvt, epackage) :
     val texp* = analyze-freevars(texp,vt)
-    println("[===== Lambda Lift =====]")
-    println(texp*)
     val lift-table = LiftTable(texp*, false)
-    val result = analyze(texp*, lift-table, vt)
-    println("[===== After Lambda Lift =====]")
-    println(result)
-    result
+    analyze(texp*, lift-table, vt)
   add-exps(epackage*, new-texps)
 
 ;============================================================
@@ -922,8 +895,7 @@ defn lift-objects (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
       val i = index-of(vars(objfree), v)
       match(i:Int) :
         val v* = rename-var(v)
-        val t = EOf(n(iotable,CORE-FN-ID)) when function?(vt,v)
-           else type(vt,v)               
+        val t = var-or-fn-type(vt, iotable, v)
         emit(buffer, ELocal(v*, t, false))
         emit(buffer, EObjectGet(EVarLoc(v*), EVar(thisn(m)), obj-n, i))
     ;Emit freetypes
@@ -1044,8 +1016,7 @@ defn lift-closures (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackag
           val i = index-of(vars(fnfree), v)
           match(i:Int) :
             val v* = rename-var(v)
-            val t = EOf(n(iotable,CORE-FN-ID)) when function?(vt,v)
-               else type(vt,v)
+            val t = var-or-fn-type(vt,iotable,v)
             emit(buffer, ELocal(v*, t, false))
             emit(buffer, EClosureGet(EVarLoc(v*), EVar(closure), fid, i))
 
@@ -1333,6 +1304,10 @@ defn mutable? (vt:VarTable, n:Int) :
 defn type (vt:VarTable, n:Int) :
   type(entry(vt[n]) as VarEntry) as EType
 
+defn var-or-fn-type (vt:VarTable, iotable:IOTable, v:Int) :
+  if function?(vt,v) : EOf(n(iotable,CORE-FN-ID))
+  else : type(vt,v)
+
 defn arities (vt:VarTable, n:Int) :
   match(entry(vt[n])) :
     (e:DFnEntry) : [length(a1(e))]
@@ -1403,7 +1378,6 @@ defn LocalVarTable (gvt:VarTable, e:ELBigItem) -> VarTable :
   ;Find records
   val records = generate<VTRecord> :
     defn found (n:Int, e:FnEntry|VarEntry) :
-      ;println("Found %_ => %_" % [n, e])
       yield(VTRecord(false, n, e))
     let loop (e:ELBigItem = e) :
       match(e) :
@@ -1419,7 +1393,6 @@ defn LocalVarTable (gvt:VarTable, e:ELBigItem) -> VarTable :
       do*(loop, e)
 
   ;Return populated table
-  ;println("[===== Local Var Table =====]")
   VarTable(records, type-table(gvt), gvt)
 
 defn FnEntry (e:EFunction) :
