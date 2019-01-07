@@ -196,117 +196,130 @@ defmulti unimport (repl:REPL, package:Symbol) -> False
 defmulti inside (repl:REPL, package:Symbol|False) -> False
 
 defn REPL () :
-  ;State of the repl
+  ;============================================================
+  ;===================== REPL State ===========================
+  ;============================================================
   val vm = VirtualMachine()
   val denv = DEnv()
   val repl-env = REPLEnv()
 
+  ;============================================================
+  ;================== Stages of Loading =======================
+  ;============================================================
+  ;Read from file
+  defn read! (filename:String) -> ? :
+    try : read-file(filename)
+    catch (e:IOException) : throw(ReplErrors([e]))
+    catch (e:LexerException) : throw(ReplErrors([e]))
+
+  ;Macroexpansion
+  defn macroexpand! (forms) -> ? :
+    try : cons(`$begin, parse-syntax[core / #exps!](forms))
+    catch (e:NoMatchException) : throw(ReplErrors(causes(e)))
+    catch (e:Exception) : throw(ReplErrors([e]))  ;TODO
+
+  ;Conversion to IL IR
+  defn to-ipackages! (expanded:Tuple) -> Tuple<IPackage> :
+    val check-errors = Vector<CheckError>()
+    val ipackages = to-tuple $
+      for e in expanded seq-cat :
+        try :
+          to-il(e, false, core-imports())
+        catch (e:CheckErrors) :
+          add-all(check-errors, errors(e))
+          []
+    throw(ReplErrors(check-errors)) when not empty?(check-errors)
+    ipackages
+  defn to-repl-ipackage! (expanded) -> IPackage :
+    try : to-il(expanded, true, imports(repl-env))[0]
+    catch (e:CheckErrors) : throw(ReplErrors(errors(e)))
+
+  ;Check that all required types are still defined
+  defn check-types-exist! (ipkgs:Tuple<IPackage>, live:Tuple<Rec>) :
+    val packages = to-hashset<Symbol>(seq(name, ipkgs))
+    val types = exported-types(ipkgs)
+    match(check-export-types(denv, packages, types, live)) :
+      (l:LoadSuccess) : false
+      (l:LoadErrors) : throw(ReplErrors(errors(l)))      
+
+  ;Renaming
+  defn rename! (ipkgs:Tuple<IPackage>) :
+    match(rename-il(ipkgs)) :
+      (renamed:Tuple<IPackage>) : renamed
+      (e:RenameErrors) : throw(ReplErrors(errors(e)))
+  defn rename! (ipkg:IPackage) :
+    rename!([ipkg])[0]  
+
+  ;Resolve
+  defn resolve-with-env<T> (f:stz/resolver/Env -> T|ResolveErrors) :
+    val env = new stz/resolver/Env :
+      defmethod packageio (this, package:Symbol) :
+        packageio(denv, package)
+    match(f(env)) :
+      (e:ResolveErrors) : throw(ReplErrors(errors(e)))
+      (e:T) : e
+  defn resolve! (ipkgs:Tuple<IPackage>) :
+    resolve-with-env<Tuple<IPackage>>(resolve-il{ipkgs, _})      
+  defn resolve-repl! (ipkg:IPackage) :
+    resolve-with-env<IPackage>(resolve-repl-il{ipkg, _, packageio(repl-env)})
+
+  ;Type Checking
+  defn typecheck-with-env (f:stz/type/Env -> TProg|TypeErrors) :
+    val env = new stz/type/Env :
+      defmethod packageio (this, package:Symbol) :
+        packageio(denv, package) as PackageIO
+    match(f(env)) :
+      (e:TProg) : e
+      (e:TypeErrors) : throw(ReplErrors(messages(e)))
+  defn type! (ipkgs:Tuple<IPackage>) :
+    typecheck-with-env(type-program{ipkgs, _})
+  defn type-repl! (ipkg:IPackage) :
+    typecheck-with-env(type-repl{ipkg, _, packageio(repl-env)})
+
+  ;Check packages can be loaded into existing environment
+  defn check-load! (tprog:TProg, live:Tuple<Rec>) :      
+    val ios = map(packageio, packages(tprog))      
+    match(check-exports(denv, ios, live)) :
+      (result:LoadErrors) : throw(ReplErrors(errors(result)))
+      (result:LoadSuccess) : false
+
+  ;Save definitions to repl environment
+  defn save-to-repl-env! (tprog:TProg) :
+    val package = packages(tprog)[0]
+    add(repl-env, packageio(package))
+
+  ;Load into Virtual Machine
+  defn load-vm! (tprog:TProg) :
+    val epkgs = to-el(tprog, true)
+    val vmpkgs = map(compile{lower(_)}, epkgs)
+    load(denv, seq(packageio, vmpkgs))
+    load(vm, vmpkgs, false)
+    for p in initialization-order(vmpkgs, denv) do :
+      init-package(vm, p)
+
+  ;============================================================
+  ;===================== File Loading =========================
+  ;============================================================
+
   ;Load files
   defn load-files (filenames:Tuple<String>) :
-    ;===== Stages =====
-    defn read! (filename:String) :
-      try : read-file(filename)
-      catch (e:IOException) : throw(ReplErrors([e]))
-      catch (e:LexerException) : throw(ReplErrors([e]))
-    defn macroexpand! (forms) :
-      try : cons(`$begin, parse-syntax[core / #exps!](forms))
-      catch (e:NoMatchException) : throw(ReplErrors(causes(e)))
-      catch (e:Exception) : throw(ReplErrors([e]))  ;TODO
-    defn to-input! (expanded:Seqable) :
-      try : to-tuple(seq-cat(to-il{_, false, core-imports()}, expanded))
-      catch (e:CheckErrors) : throw(ReplErrors(errors(e)))
-    defn check-types! (ipkgs:Tuple<IPackage>, live:Tuple<Rec>) :
-      val packages = to-hashset<Symbol>(seq(name, ipkgs))
-      val types = exported-types(ipkgs)
-      match(check-export-types(denv, packages, types, live)) :
-        (l:LoadSuccess) : false
-        (l:LoadErrors) : throw(ReplErrors(errors(l)))      
-    defn rename! (ipkgs:Tuple<IPackage>) :
-      match(rename-il(ipkgs)) :
-        (renamed:Tuple<IPackage>) : renamed
-        (e:RenameErrors) : throw(ReplErrors(errors(e)))
-    defn resolve! (ipkgs:Tuple<IPackage>) :
-      val env = new stz/resolver/Env :
-        defmethod packageio (this, package:Symbol) :
-          packageio(denv, package)
-      match(resolve-il(ipkgs, env)) :
-        (resolved:Tuple<IPackage>) : resolved
-        (e:ResolveErrors) : throw(ReplErrors(errors(e)))
-    defn type! (ipkgs:Tuple<IPackage>) :
-      val env = new stz/type/Env :
-        defmethod packageio (this, package:Symbol) : packageio(denv, package) as PackageIO
-      match(type-program(ipkgs, env)) :
-        (p:TProg) : p
-        (e:TypeErrors) : throw(ReplErrors(messages(e)))
-    defn check-load! (tprog:TProg, live:Tuple<Rec>) :      
-      val ios = map(packageio, packages(tprog))      
-      match(check-exports(denv, ios, live)) :
-        (result:LoadErrors) : throw(ReplErrors(errors(result)))
-        (result:LoadSuccess) : false
-    defn load-vm! (tprog:TProg) :
-      val epkgs = to-el(tprog, false)
-      val vmpkgs = map(compile{lower(_)}, epkgs)
-      load(denv, seq(packageio, vmpkgs))
-      load(vm, vmpkgs, false)
-      for p in initialization-order(vmpkgs, denv) do :
-        init-package(vm, p)
-      
-    ;===== Driver =====
-    val expanded = seq({macroexpand! $ read! $ _}, filenames)
-    val input = to-input! $ expanded    
+    val expanded = map({macroexpand! $ read! $ _}, filenames)
+    val input = to-ipackages! $ expanded
     val live = compute-live(vm, seq(name, input))
-    check-types!(input, live)    
+    check-types-exist!(input, live)    
     val typed =  type! $ resolve! $ rename! $ input
     check-load!(typed, live)
     load-vm!(typed)
 
-  ;Load repl command
-  defn load-repl (form) :
-    defn macroexpand! (form) :
-      try : cons(`$begin, parse-syntax[core / #exps!](form))
-      catch (e:NoMatchException) : throw(ReplErrors(causes(e)))
-      catch (e:Exception) : throw(ReplErrors([e]))  ;TODO
-    defn to-input! (expanded) :
-      try :
-        val pkgs = to-il(expanded, true, imports(repl-env))
-        fatal("Incorrect number of packages.") when length(pkgs) != 1
-        pkgs[0]
-      catch (e:CheckErrors) :
-        throw(ReplErrors(errors(e)))
-    defn rename! (ipkg:IPackage) :
-      match(rename-il([ipkg])) :
-        (renamed:Tuple<IPackage>) : renamed[0]
-        (e:RenameErrors) : throw(ReplErrors(errors(e)))
-    defn resolve! (ipkg:IPackage) :
-      val env = new stz/resolver/Env :
-        defmethod packageio (this, package:Symbol) :
-          packageio(denv, package)
-      match(resolve-repl-il(ipkg, env, packageio(repl-env))) :
-        (resolved:IPackage) : resolved
-        (e:ResolveErrors) : throw(ReplErrors(errors(e)))
-    defn type! (ipkg:IPackage) :
-      val env = new stz/type/Env :
-        defmethod packageio (this, package:Symbol) : packageio(denv, package) as PackageIO
-      match(type-repl(ipkg, env, packageio(repl-env))) :
-        (p:TProg) : p
-        (e:TypeErrors) : throw(ReplErrors(messages(e)))
-    defn save-to-repl-env! (tprog:TProg) :
-      val package = packages(tprog)[0]
-      add(repl-env, packageio(package))
-    defn load-vm! (tprog:TProg) :
-      val epkgs = to-el(tprog, true)
-      val vmpkgs = map(compile{lower(_)}, epkgs)
-      load(denv, seq(packageio, vmpkgs))
-      load(vm, vmpkgs, false)
-      for p in initialization-order(vmpkgs, denv) do :
-        init-package(vm, p)
-      
-    ;===== Driver =====
-    val typed = type! $ resolve! $ rename! $ to-input! $ macroexpand!(form)
+  ;Load from repl
+  defn load-repl (form) :      
+    val typed = type-repl! $ resolve-repl! $ rename! $ to-repl-ipackage! $ macroexpand! $ form
     save-to-repl-env!(typed)
-    load-vm!(typed)      
+    load-vm!(typed)
 
-  ;Return REPL
+  ;============================================================
+  ;===================== REPL Structure =======================
+  ;============================================================
   new REPL :
     defmethod load-files (this, filenames:Tuple<String>) :
       load-files(filenames)
@@ -327,6 +340,10 @@ defn REPL () :
       if current-inside(repl-env) is False :
         throw $ ReplErrors $ [NotInsidePackage()]
       inside(repl-env, false)
+
+;============================================================
+;=================== REPL User Environment ==================
+;============================================================
 
 deftype REPLEnv
 defmulti packageio (e:REPLEnv) -> PackageIO
@@ -380,10 +397,6 @@ defn REPLEnv () :
   ;Initialize with core imports (core and collections)
   do(add{env, _}, core-imports())
   env
-
-;============================================================
-;==================== Stage Utilities =======================
-;============================================================
 
 ;============================================================
 ;======================== Errors ============================
