@@ -37,6 +37,10 @@ defstruct Import <: RExp :
   import: IImport
 with:
   printer => true
+defstruct Inside <: RExp :
+  package: Symbol|False
+with:
+  printer => true
 defstruct Unimport <: RExp :
   package: Symbol
 with:
@@ -60,6 +64,10 @@ defsyntax repl :
     Load(to-tuple(filenames))
   defrule rexp = (?e:#import-clause) :
     Import(e)
+  defrule rexp = (inside -) :
+    Inside(false)
+  defrule rexp = (inside ?p:#symbol!) :
+    Inside(p)
   defrule rexp = (unimport ?name:#symbol!) :
     Unimport(name)
   defrule rexp = (?forms ...) :
@@ -69,21 +77,19 @@ defsyntax repl :
   ;===== Imports =====
   defproduction prefix-clause! : IPrefix
   defrule prefix-clause! = (prefix => ?p:#symbol!) :
-    IPrefix(false, IVar(p,closest-info(p)), closest-info())
-  defrule prefix-clause! = (prefix(?xs:#symbol! ...) => ?p:#symbol!) :
-    val names = for x in xs map : IVar(x,closest-info(x))
-    IPrefix(names, IVar(p,closest-info(p)), closest-info())
+    IPrefix(false, to-string(p))
+  defrule prefix-clause! = (prefix(?names:#symbol! ...) => ?p:#symbol!) :
+    IPrefix(to-tuple(names), to-string(p))
   fail-if prefix-clause! = () :
     ReplSyntaxError(closest-info(), "Expected a prefix clause here.")
 
-  defproduction prefix-clauses : List<IPrefix>
-  defrule prefix-clauses = (with #:! (?ps:#prefix-clause! ...)) : ps
-  defrule prefix-clauses = () : List()
+  defproduction prefix-clauses : Tuple<IPrefix>
+  defrule prefix-clauses = (with #:! (?ps:#prefix-clause! ...)) : to-tuple(ps)
+  defrule prefix-clauses = () : []
 
   defproduction import-clause : IImport
-  defrule import-clause = (import ?name:#symbol! ?ps:#prefix-clauses) :
-    val package = IVar(name, closest-info(name))
-    IImport(package, ps, closest-info())
+  defrule import-clause = (import ?package:#symbol! ?ps:#prefix-clauses) :
+    IImport(package, ps)
 
   ;===== Primitives =====
   defproduction int : Int
@@ -172,6 +178,13 @@ defn initialization-order (vmps:Tuple<VMPackage>, denv:DEnv) -> Collection<Symbo
   initialization-order(import-graph, to-tuple(seq(package,vmps)))      
 
 ;============================================================
+;=================== Default Imports ========================
+;============================================================
+
+defn core-imports () :
+  [IImport(`core), IImport(`collections)]
+
+;============================================================
 ;======================= Loading ============================
 ;============================================================
 
@@ -180,6 +193,7 @@ defmulti load-files (repl:REPL, filenames:Tuple<String>) -> False
 defmulti load-repl (repl:REPL, form) -> False
 defmulti import (repl:REPL, import:IImport) -> False
 defmulti unimport (repl:REPL, package:Symbol) -> False
+defmulti inside (repl:REPL, package:Symbol|False) -> False
 
 defn REPL () :
   ;State of the repl
@@ -199,7 +213,7 @@ defn REPL () :
       catch (e:NoMatchException) : throw(ReplErrors(causes(e)))
       catch (e:Exception) : throw(ReplErrors([e]))  ;TODO
     defn to-input! (expanded:Seqable) :
-      try : to-tuple(seq-cat(to-il, expanded))
+      try : to-tuple(seq-cat(to-il{_, false, core-imports()}, expanded))
       catch (e:CheckErrors) : throw(ReplErrors(errors(e)))
     defn check-types! (ipkgs:Tuple<IPackage>, live:Tuple<Rec>) :
       val packages = to-hashset<Symbol>(seq(name, ipkgs))
@@ -299,13 +313,20 @@ defn REPL () :
     defmethod load-repl (this, form) :
       load-repl(form)
     defmethod import (this, import:IImport) :
-      val package = name!(package(import))
-      if packageio(denv,package) is False :
-        throw $ ReplErrors $ [PackageNotLoaded(package)]
+      if packageio(denv,package(import)) is False :
+        throw $ ReplErrors $ [PackageNotLoaded(package(import))]
       else : add(repl-env, import)
     defmethod unimport (this, package:Symbol) :
       if not unimport(repl-env, package) :
         throw $ ReplErrors $ [PackageNotImported(package)]
+    defmethod inside (this, package:Symbol) :
+      if packageio(denv,package) is False :
+        throw $ ReplErrors $ [PackageNotLoaded(package)]
+      else : inside(repl-env, package)
+    defmethod inside (this, package:False) :
+      if current-inside(repl-env) is False :
+        throw $ ReplErrors $ [NotInsidePackage()]
+      inside(repl-env, false)
 
 deftype REPLEnv
 defmulti packageio (e:REPLEnv) -> PackageIO
@@ -313,6 +334,8 @@ defmulti imports (e:REPLEnv) -> Collection<IImport>
 defmulti add (e:REPLEnv, packageio:PackageIO) -> False
 defmulti add (e:REPLEnv, import:IImport) -> False
 defmulti unimport (e:REPLEnv, package:Symbol) -> True|False
+defmulti inside (e:REPLEnv, package:Symbol|False) -> False
+defmulti current-inside (e:REPLEnv) -> Symbol|False
 defn REPLEnv () :
   ;Name of repl package
   val package-name = gensym(`repl)
@@ -321,6 +344,8 @@ defn REPLEnv () :
   val imports-set = HashSet<Symbol>()
   ;Current imported packages
   val imports = HashTable<Symbol, IImport>()
+  ;Currently inside package
+  var inside-package:Symbol|False = false
 
   ;Construct environment object
   val env = new REPLEnv :
@@ -329,10 +354,15 @@ defn REPLEnv () :
       val exports = to-tuple(cat-all(values(exports-table)))
       PackageIO(package-name, imported-packages, [], exports)
     defmethod imports (this) :
-      to-tuple(values(imports))
+      val accum = Vector<IImport>()
+      match(inside-package:Symbol) :
+        add(accum, IImport(inside-package, [], false, true))
+      for import in values(imports) do :
+        if package(import) != inside-package :
+          add(accum, import)
+      to-tuple(accum)        
     defmethod add (this, import:IImport) :
-      val package = name!(package(import))
-      imports[package] = import
+      imports[package(import)] = import
     defmethod unimport (this, package:Symbol) -> True|False :
       remove(imports, package)
     defmethod add (this, packageio:PackageIO) :
@@ -342,6 +372,10 @@ defn REPLEnv () :
         val entries = value(entry)
         exports-table[name] = entries
       add-all(imports-set, imported-packages(packageio))
+    defmethod inside (this, package:Symbol|False) :
+      inside-package = package
+    defmethod current-inside (this) :
+      inside-package
 
   ;Initialize with core imports (core and collections)
   do(add{env, _}, core-imports())
@@ -359,6 +393,9 @@ defn PackageNotLoaded (package:Symbol) :
 
 defn PackageNotImported (package:Symbol) :
   Exception $ "Could not unimport package %~. Package is not yet imported." % [package]
+
+defn NotInsidePackage () :
+  Exception $ "Not currently inside any package."
   
 ;============================================================
 ;======================= Driver =============================
@@ -373,6 +410,7 @@ public defn repl () :
         (exp:Eval) : load-repl(repl, form(exp))
         (exp:Import) : import(repl, import(exp))
         (exp:Unimport) : unimport(repl, package(exp))
+        (exp:Inside) : inside(repl, package(exp))
     catch (e:ReplErrors) :
       do(println, messages(e))
   
