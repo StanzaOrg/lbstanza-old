@@ -33,6 +33,7 @@ defstruct Load <: RExp :
   filenames: Tuple<String>
 with:
   printer => true
+defstruct Update <: RExp  
 defstruct Import <: RExp :
   import: IImport
 with:
@@ -70,6 +71,8 @@ defsyntax repl :
     Inside(p)
   defrule rexp = (unimport ?name:#symbol!) :
     Unimport(name)
+  defrule rexp = (update) :
+    Update()
   defrule rexp = (?forms ...) :
     if empty?(forms) : NoOp()
     else : Eval(forms)
@@ -190,6 +193,7 @@ defn core-imports () :
 
 deftype REPL
 defmulti load-files (repl:REPL, filenames:Tuple<String>) -> False
+defmulti update-files (repl:REPL) -> False
 defmulti load-repl (repl:REPL, form) -> False
 defmulti import (repl:REPL, import:IImport) -> False
 defmulti unimport (repl:REPL, package:Symbol) -> False
@@ -251,10 +255,12 @@ defn REPL () :
     [input, packages]
 
   ;Check that all required types are still defined
-  defn check-types-exist! (ipkgs:Tuple<IPackage>, live:Tuple<Rec>) :
+  defn check-types-exist (ipkgs:Tuple<IPackage>, live:Tuple<Rec>) :
     val packages = to-hashset<Symbol>(seq(name, ipkgs))
     val types = exported-types(ipkgs)
-    match(check-export-types(denv, packages, types, live)) :
+    check-export-types(denv, packages, types, live)
+  defn check-types-exist! (ipkgs:Tuple<IPackage>, live:Tuple<Rec>) :
+    match(check-types-exist(ipkgs, live)) :
       (l:LoadSuccess) : false
       (l:LoadErrors) : throw(ReplErrors(errors(l)))
 
@@ -293,9 +299,11 @@ defn REPL () :
     typecheck-with-env(type-repl{ipkg, _, packageio(repl-env)})
 
   ;Check packages can be loaded into existing environment
-  defn check-load! (tprog:TProg, live:Tuple<Rec>) :
+  defn check-load (tprog:TProg, live:Tuple<Rec>) :
     val ios = map(packageio, packages(tprog))
-    match(check-exports(denv, ios, live)) :
+    check-exports(denv, ios, live)
+  defn check-load! (tprog:TProg, live:Tuple<Rec>) :
+    match(check-load(tprog, live)) :
       (result:LoadErrors) : throw(ReplErrors(errors(result)))
       (result:LoadSuccess) : false
 
@@ -317,6 +325,13 @@ defn REPL () :
     for p in initialization-order(vmpkgs, denv) do :
       init-package(vm, p)
 
+  ;Load into virtual machine without initialization
+  defn update-vm! (tprog:TProg) :
+    val epkgs = to-el(tprog, true)
+    val vmpkgs = map(compile{lower(_)}, epkgs)
+    load(denv, seq(packageio, vmpkgs))
+    load(vm, vmpkgs, true)
+
   ;============================================================
   ;===================== File Loading =========================
   ;============================================================
@@ -327,10 +342,49 @@ defn REPL () :
     val [input, file-pkgs] = to-ipackages! $ expanded
     val live = compute-live(vm, seq(name, input))
     check-types-exist!(input, live)
-    val typed =  type! $ resolve! $ rename! $ input
+    val typed = type! $ resolve! $ rename! $ input
     check-load!(typed, live)
     save-to-file-env!(file-pkgs)
     load-vm!(typed)
+
+  ;Update files
+  defn update-files () :
+    ;Compute the changed files
+    val changed-files = changed-files(file-env)
+    if empty?(changed-files) :
+      throw $ ReplErrors([NoChangedFiles()])
+    else :
+      ;Track the files to reload.
+      ;Initialize them with the set of all changed files.
+      val reload-files = to-hashset<String>(changed-files)
+      let loop () :
+        val done? = label<True|False> break :
+          let :
+            val filenames = to-tuple(reload-files)
+            val expanded = map({macroexpand! $ read! $ _}, filenames)
+            val [input, file-pkgs] = to-ipackages! $ expanded
+            val live = compute-live(vm, [])
+            check-load-errors!(check-types-exist(input, live))
+            val typed = type! $ resolve! $ rename! $ input
+            check-load-errors!(check-load(typed, live))
+            save-to-file-env!(file-pkgs)
+            update-vm!(typed)
+            true
+          where :
+            defn check-load-errors! (e:LoadResult) :
+              match(e:LoadErrors) :
+                ;Categorize errors into being caused by packages or by live objects
+                defn package-source? (e:LoadError) : source(e) is LoadedPackage
+                val [package-errors, live-errors] = split!(package-source?,errors(e))
+                ;Nothing we can do about errors from live objects
+                throw(ReplErrors(live-errors)) when length(live-errors) > 0
+                ;If there are package errors then add their source files to the
+                ;reload set, and try again
+                for e in package-errors do :
+                  val package = package(source(e) as LoadedPackage)
+                  add(reload-files, source-file(file-env, package))
+                break(false)                
+        loop() when not done?
 
   ;Load from repl
   defn load-repl (form) :
@@ -344,6 +398,8 @@ defn REPL () :
   new REPL :
     defmethod load-files (this, filenames:Tuple<String>) :
       load-files(filenames)
+    defmethod update-files (this) :
+      update-files()
     defmethod load-repl (this, form) :
       load-repl(form)
     defmethod import (this, import:IImport) :
@@ -373,6 +429,8 @@ defstruct FileForm<T> :
 
 deftype FileEnv
 defmulti register (e:FileEnv, file-pkg:FileForm<Symbol>) -> False
+defmulti changed-files (e:FileEnv) -> Tuple<String>
+defmulti source-file (e:FileEnv, package:Symbol) -> String
 
 defn FileEnv () :
   ;Track which source file each package came from
@@ -383,6 +441,17 @@ defn FileEnv () :
     defmethod register (this, file-pkg:FileForm<Symbol>) :
       source-file-table[form(file-pkg)] = filename(file-pkg)
       timestamp-table[filename(file-pkg)] = timestamp(file-pkg)
+    defmethod changed-files (this) :
+      to-tuple $ for file in values(source-file-table) seq? :
+        try :
+          val new-timestamp = time-modified(file)
+          val old-timestamp = timestamp-table[file]
+          if new-timestamp != old-timestamp : One(file)
+          else : None()
+        catch (e:FileStatException) :
+          None()
+    defmethod source-file (this, package:Symbol) :
+      source-file-table[package]
 
 ;============================================================
 ;=================== REPL User Environment ==================
@@ -457,6 +526,9 @@ defn PackageNotImported (package:Symbol) :
 defn NotInsidePackage () :
   Exception $ "Not currently inside any package."
 
+defn NoChangedFiles () :
+  Exception $ "No changes detected in any loaded file."
+
 ;============================================================
 ;======================= Driver =============================
 ;============================================================
@@ -471,5 +543,6 @@ public defn repl () :
         (exp:Import) : import(repl, import(exp))
         (exp:Unimport) : unimport(repl, package(exp))
         (exp:Inside) : inside(repl, package(exp))
+        (exp:Update) : update-files(repl)
     catch (e:ReplErrors) :
       do(println, messages(e))
