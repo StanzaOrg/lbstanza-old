@@ -246,7 +246,7 @@ defn REPL () :
     val file-pkgs = Vector<FileForm<Symbol>>()
     for e in expanded do :
       try :
-        val pkgs = to-il(form(e), DefaultPackage)
+        val pkgs = to-ipackages(form(e), core-imports())
         for p in pkgs do :
           add(ipackages, p)
           add(file-pkgs, sub-form(e, name(p)))
@@ -254,9 +254,9 @@ defn REPL () :
         add-all(check-errors, errors(e))
     throw(ReplErrors(check-errors)) when not empty?(check-errors)
     [to-tuple(ipackages), to-tuple(file-pkgs)]
-  ;defn to-repl-ipackage! (expanded) -> IPackage :
-  ;  try : to-il(expanded, true, imports(repl-env))[0]
-  ;  catch (e:CheckErrors) : throw(ReplErrors(errors(e)))
+  defn to-repl-ipackage! (expanded) -> IPackage :
+    try : ReplPackage(repl-env, to-il(expanded))
+    catch (e:CheckErrors) : throw(ReplErrors(errors(e)))
 
   ;Extract IPackage
   defn extract-input (file+inputs:Tuple<FileForm<IPackage>>) -> [Tuple<IPackage>, Tuple<FileForm<Symbol>>] :
@@ -293,8 +293,10 @@ defn REPL () :
       (e:T) : e
   defn resolve! (ipkgs:Tuple<IPackage>) :
     resolve-with-env<Tuple<IPackage>>(resolve-il{ipkgs, _, false})
-  ;defn resolve-repl! (ipkg:IPackage) :
-  ;  resolve-with-env<IPackage>(resolve-repl-il{ipkg, _, packageio(repl-env)})
+  defn resolve-repl! (ipkg:IPackage) :
+    defn priority (package:Symbol) :
+      package-priority(repl-env, name(ipkg), package)
+    resolve-with-env<Tuple<IPackage>>(resolve-il{[ipkg], _, priority})
 
   ;Type Checking
   defn typecheck-with-env (f:stz/type/Env -> TProg|TypeErrors) :
@@ -306,8 +308,8 @@ defn REPL () :
       (e:TypeErrors) : throw(ReplErrors(messages(e)))
   defn type! (ipkgs:Tuple<IPackage>) :
     typecheck-with-env(type-program{ipkgs, _})
-  ;defn type-repl! (ipkg:IPackage) :
-  ;  typecheck-with-env(type-repl{ipkg, _, packageio(repl-env)})
+  defn type! (ipkg:IPackage) :
+    typecheck-with-env(type-program{[ipkg], _})
 
   ;Check whether any globals have been redefined to be a different type
   defn check-globals! (tprog:TProg) :
@@ -324,11 +326,6 @@ defn REPL () :
     match(check-load(tprog, live)) :
       (result:LoadErrors) : throw(ReplErrors(errors(result)))
       (result:LoadSuccess) : false
-
-  ;Save definitions to repl environment
-  defn save-to-repl-env! (tprog:TProg) :
-    val package = packages(tprog)[0]
-    add(repl-env, packageio(package))
 
   ;Save associations to file environment
   defn save-to-file-env! (file-pkgs:Tuple<FileForm<Symbol>>) :
@@ -432,11 +429,10 @@ defn REPL () :
 
   ;Load from repl
   defn load-repl (form) :
-    fatal("Not yet implemented")
-    ;val typed = type-repl! $ resolve-repl! $ rename! $ to-repl-ipackage! $ macroexpand! $ form
-    ;save-to-repl-env!(typed)
-    ;load-vm!(typed)
-    ;run-vm!(seq(name, packages(typed)))
+    val typed = type! $ resolve-repl! $ rename! $ to-repl-ipackage! $ macroexpand! $ form    
+    register(repl-env, packageio(packages(typed)[0]))
+    load-vm!(typed)
+    run-vm!([name(packages(typed)[0])])
 
   ;============================================================
   ;===================== REPL Structure =======================
@@ -453,7 +449,7 @@ defn REPL () :
     defmethod import (this, import:IImport) :
       if not loaded?(pkg-env, package(import)) :
         throw $ ReplErrors $ [PackageNotLoaded(package(import))]
-      else : add(repl-env, import)
+      else : /import(repl-env, import)
     defmethod unimport (this, package:Symbol) :
       if not unimport(repl-env, package) :
         throw $ ReplErrors $ [PackageNotImported(package)]
@@ -525,118 +521,108 @@ defn FileEnv () :
 ;============================================================
 
 deftype REPLEnv
-defmulti packageio (e:REPLEnv) -> PackageIO
-defmulti imports (e:REPLEnv) -> Collection<IImport>
-defmulti add (e:REPLEnv, packageio:PackageIO) -> False
-defmulti add (e:REPLEnv, import:IImport) -> False
+
+;For registering successfully loaded packages
+defmulti register (e:REPLEnv, packageio:PackageIO) -> False
+
+;For import/unimport commands
+defmulti import (e:REPLEnv, import:IImport) -> False
 defmulti unimport (e:REPLEnv, package:Symbol) -> True|False
+
+;For inside command
 defmulti inside (e:REPLEnv, package:Symbol|False) -> False
 defmulti current-inside (e:REPLEnv) -> Symbol|False
+
+;For resolution
+defmulti package-priority (e:REPLEnv, self:Symbol, package:Symbol) -> Int
+
+;For constructing the IPackage
+defmulti ReplPackage (e:REPLEnv, exp:IExp) -> IPackage
+
 defn REPLEnv () :
-  ;Name of repl package
-  val package-name = gensym(`repl)
-  ;PackageIO of repl environment
-  val exports-table = HashTable<Symbol, List<Export>>(List())
-  val imports-set = HashSet<Symbol>()
-  ;Current imported packages
+  ;Previous repl packages
+  val previous-packages = Vector<PackageIO>()
+  val package-index = HashTable<Symbol,Int>()
+  ;Current desired imports
   val imports = HashTable<Symbol, IImport>()
   ;Currently inside package
   var inside-package:Symbol|False = false
 
+  ;Initialize imports
+  for i in core-imports() do :
+    imports[package(i)] = i
+
+  ;Construct IPackage
+  defn make-repl-package (exp:IExp) :
+    ;First ensure legitimacy
+    ensure-repl-expression(exp)
+    
+    ;Next create import list
+    val package-imports = Vector<IImport>()    
+    ;Import all previous repl packages
+    for p in previous-packages do :
+      add(package-imports, IImport(package(p), [], false, true))
+    ;Import all current imports
+    for i in values(imports) do :
+      if package(i) != inside-package :
+        add(package-imports, i)
+    ;Import the current 'inside' package
+    match(inside-package:Symbol) :
+      add(package-imports, IImport(inside-package, [], false, true))
+
+    ;Create IPackage
+    IPackage(gensym(`repl), to-tuple(package-imports), List(exp), info(exp))
+
+  ;Resolution priority of IPackage
+  defn package-priority (self:Symbol, p:Symbol) -> Int :
+    if p == inside-package : 1
+    else if p == self : INT-MAX
+    else if key?(package-index, p) : package-index[p] + 2
+    else : 0
+
   ;Construct environment object
-  val env = new REPLEnv :
-    defmethod packageio (this) :
-      val imported-packages = to-tuple(imports-set)
-      val exports = to-tuple(cat-all(values(exports-table)))
-      PackageIO(package-name, imported-packages, [], exports)
-    defmethod imports (this) :
-      val accum = Vector<IImport>()
-      match(inside-package:Symbol) :
-        add(accum, IImport(inside-package, [], false, true))
-      for import in values(imports) do :
-        if package(import) != inside-package :
-          add(accum, import)
-      to-tuple(accum)
-    defmethod add (this, import:IImport) :
+  new REPLEnv :
+    defmethod import (this, import:IImport) :
       imports[package(import)] = import
     defmethod unimport (this, package:Symbol) -> True|False :
       remove(imports, package)
-    defmethod add (this, packageio:PackageIO) :
-      val grouped = group-by(name{id(rec(_))}, exports(packageio))
-      for entry in grouped do :
-        val name = key(entry)
-        val entries = value(entry)
-        exports-table[name] = entries
-      add-all(imports-set, imported-packages(packageio))
     defmethod inside (this, package:Symbol|False) :
       inside-package = package
     defmethod current-inside (this) :
       inside-package
+    defmethod register (this, packageio:PackageIO) :
+      add(previous-packages, packageio)
+      package-index[package(packageio)] = length(previous-packages) - 1
+    defmethod package-priority (this, self:Symbol, package:Symbol) -> Int :
+      package-priority(self, package)
+    defmethod ReplPackage (this, exp:IExp) :
+      make-repl-package(exp)
 
-  ;Initialize with core imports (core and collections)
-  do(add{env, _}, core-imports())
-  env
+defn ensure-repl-expression (expression:IExp) :
+  ;Detect illegal expressions
+  val errors = Vector<Exception>()
+  defn not-allowed! (e:IExp) :
+    val type-str = match(e) :
+      (e:IDefPackage) : "defpackage"
+      (e:IDefType) : "deftype"
+      (e:IDefmulti) : "defmulti"
+      (e:IDefmethod) : "defmethod"
+      (e:ILSDefType) : "lostanza deftype"
+      (e:ILSDefmethod) : "lostanza defmethod"
+      (e:ILSExternFn) : "externfn"
+    add(errors, InvalidExp(type-str))        
 
-;============================================================
-;=================== Default Packages =======================
-;============================================================
+  ;Sweep through expressions and detect invalid expressions
+  let loop (e:IExp = expression) :
+    match(e) :
+      (e:IBegin) : do(loop, exps(e))
+      (e:IVisibility) : loop(exp(e))
+      (e:IDefPackage|IDefType|IDefmulti|IDefmethod|
+         ILSDefType|ILSDefmethod|ILSExternFn) : not-allowed!(e)
+      (e) : false
 
-defn DefaultPackage (exps:List<IExp>, info:FileInfo|False) :
-  val name = gensym(`default)
-  IPackage(name, core-imports(), exps, info)
-
-;val REPL-COUNTER = to-seq(0 to false)
-;defn DefaultReplPackage (exps:List<IExp>, info:FileInfo|False) :
-;  ;Detect illegal expressions
-;  val errors = Vector<Exception>()
-;  defn not-allowed! (e:IExp) :
-;    val type-str = match(e) :
-;      (e:IDefPackage) : "defpackage"
-;      (e:IDefType) : "deftype"
-;      (e:IDefmulti) : "defmulti"
-;      (e:IDefmethod) : "defmethod"
-;      (e:ILSDefType) : "lostanza deftype"
-;      (e:ILSDefmethod) : "lostanza defmethod"
-;      (e:ILSExternFn) : "externfn"
-;    add(errors, InvalidExp(type-str))        
-;
-;  ;Sweep through expressions and detect invalid expressions
-;  for e in exps do :
-;    let loop (e:IExp = e) :
-;      match(e) :
-;        (e:IBegin) : do(loop, exps(e))
-;        (e:IVisibility) : loop(exp(e))
-;        (e:IDefPackage|IDefType|IDefmulti|IDefmethod|
-;           ILSDefType|ILSDefmethod|ILSExternFn) : not-allowed!(e)
-;        (e) : false
-;
-;  ;Throw errors if there are any
-;  throw(ReplErrors(errors)) when not empty?(errors)
-;
-;  ;Create package
-;  val name = symbol-join(["repl", next(REPL-COUNTER)])
-;  IPackage(name, ???, exps, info)
-
-defn ensure-repl-expressions (e:IExp) :
-  within e = lang/check/run-check(e) :
-    defn not-allowed! (e:IExp) :
-      val type-str = match(e) :
-        (e:IDefPackage) : "defpackage"
-        (e:IDefType) : "deftype"
-        (e:IDefmulti) : "defmulti"
-        (e:IDefmethod) : "defmethod"
-        (e:ILSDefType) : "lostanza deftype"
-        (e:ILSDefmethod) : "lostanza defmethod"
-        (e:ILSExternFn) : "externfn"
-      lang/check/error!(info(e), "The interactive REPL does not support %_ statements." % [type-str])
-    
-    let loop (e:IExp = e) :
-      match(e) :
-        (e:IBegin) : do(loop, exps(e))
-        (e:IVisibility) : loop(exp(e))
-        (e:IDefPackage|IDefType|IDefmulti|IDefmethod|
-           ILSDefType|ILSDefmethod|ILSExternFn) : not-allowed!(e)
-        (e) : false
+  ;Throw errors if there are any
+  throw(ReplErrors(errors)) when not empty?(errors)
 
 ;============================================================
 ;======================== Errors ============================
