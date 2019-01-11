@@ -51,10 +51,10 @@ public defn lower (epackage:EPackage) -> EPackage :
     dump(".el.guarded")
   ensure-unique-identifiers!(cur-package)
 
-  ;within time-ms!("Elide Checks") :
-  ;  cur-package = elide-checks(cur-package, global-vt, iotable)
-  ;  dump(".el.elided")
-  ;ensure-unique-identifiers!(cur-package)
+  within time-ms!("Elide Checks") :
+    cur-package = elide-checks(cur-package, global-vt)
+    dump(".el.elided")
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Box Mutables") :
     cur-package = box-mutables(cur-package, global-vt)
@@ -1000,6 +1000,7 @@ defn lambda-lift (epackage:EPackage, gvt:VarTable) :
 
 deftype BasicBlockTable <: Collection<BBlock>
 defmulti get (t:BasicBlockTable, lbl:Int) -> BBlock
+defmulti instructions (t:BasicBlockTable, b:BBlock) -> Seqable<EIns>
 
 defstruct BBlock :
   lbl: Int
@@ -1078,7 +1079,7 @@ defn analyze-basic-blocks (ins:Tuple<EIns>) :
   ;Reverse Post Order
   val ordered = Vector<BBlock>()
   val visited = IntSet()
-  let loop (n:Int = -1) :
+  let loop (n:Int = final-successor(-1)) :
     if not visited[n] :
       add(visited, n)
       val b = blocks[n]
@@ -1104,18 +1105,36 @@ defn analyze-basic-blocks (ins:Tuple<EIns>) :
   new BasicBlockTable :
     defmethod to-seq (this) : to-seq(ordered)
     defmethod get (this, lbl:Int) : blocks[lbl]
+    defmethod instructions (this, b:BBlock) :
+      generate<EIns> :
+        defn emit (i:EIns) :
+          defn S (n:Int) : final-successor(n)
+          defn B (b:EBranch) : EBranch(types(b), S(n(b)), info(b))
+          yield $ match(i) :
+            (i:EGoto) : EGoto(S(n(i)))
+            (i:EIf) : EIf(S(n1(i)), S(n2(i)), op(i), ys(i))
+            (i:EMatch|EDispatch) : sub-branches(i, map(B,branches(i)))
+            (i) : i
+            
+        emit(ELabel(lbl(b))) when lbl(b) > 0
+        for i in start(b) through end(b) do :      
+          emit(ins[i])
+        if goto?(b) :
+          val b2 = this[/successors(b)[0]]
+          if index(b2) != index(b) + 1 :
+            emit(EGoto(lbl(b2)))
+
 
 ;============================================================
 ;==================== Check Elision =========================
 ;============================================================
-;<COMMENT>
 defstruct TypeState :
   n: Int
   type: EType
 with:
   printer => true
 
-defn elide-checks (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage :
+defn elide-checks (epackage:EPackage, gvt:VarTable) -> EPackage :
   ;Erase type if reference type
   ;LoStanza types are trusted.
   defn erase (t:EType) :
@@ -1142,10 +1161,9 @@ defn elide-checks (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
   defn analyze-body (e:EBody, initial-state:Seqable<TypeState>, vt:VarTable) -> EBody :
     ;Generate instructions in buffer            
     val buffer = BodyBuffer(e)
-    val instructions = ins(e)
 
     println("[===== Analyze Body =====]")
-    do(println, instructions)
+    do(println, ins(e))
     println("==========================")
 
     ;Guard table holds the entering assumptions for different
@@ -1164,7 +1182,7 @@ defn elide-checks (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
     ;Scan through blocks in reverse-post-order, compute
     ;types of variables as we go, and elide the checks that
     ;are unnecessary.
-    val basic-blocks = analyze-basic-blocks(instructions)
+    val basic-blocks = analyze-basic-blocks(ins(e))
     for b in basic-blocks do :
       println("PROCESSING BLOCK: %_" % [lbl(b)])
         
@@ -1195,23 +1213,22 @@ defn elide-checks (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
               (_:False) : t
 
       ;Initialize state of entering block
-      if lbl(b) == -1 :
+      if index(b) == 0 :
         println("Initialize")
         for s in initial-state do :
           println("init with %_" % [s])
           type-state[n(s)] = type(s)
-      ;Initialize state to union of state from predecessor
-      ;states.
-      val num-predecessors = for p in predecessors(b) count :
-        index(basic-blocks[p]) < index(b)
-      for entry in merge-states(seq-cat({exit-state[_]}, predecessors(b))) do :
+      ;Initialize state to union of state from entry blocks.
+      ;Entry blocks are blocks that are predecessors that have already run.
+      val entry-blocks = to-tuple $
+        for p in predecessors(b) filter :
+          index(basic-blocks[p]) < index(b)
+      val num-predecessors = length(entry-blocks)
+      for entry in merge-states(seq-cat({exit-state[_]}, entry-blocks)) do :
         val v = key(entry)
         val states = value(entry)
         if length(states) == num-predecessors :
           type-state[v] = reduce(EOr, seq(type, states))
-        else :
-          if not global?(vt, v) :
-            fatal("Variable %_ not defined in every predecessor." % [v])
       ;Restrict state of entering variables according to their guards
       for s in enter-state[lbl(b)] do :
         restrict(n(s), type(s))
@@ -1259,15 +1276,17 @@ defn elide-checks (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
           (i) : false
 
       ;Sweep through instructions of block
-      for i in start(b) through end(b) do :
-        val instruction = instructions[i]
-
+      for instruction in instructions(basic-blocks,b) do :
         println("PROCESSING INSTRUCTION: %_" % [instruction])
 
         ;Analyze local objects and functions
         match(instruction) :
-          (i:ENew) : analyze-localobj(n(i))
-          (i:EInitClosures) : do(analyze-localfn{n(_)}, xs(i))
+          (i:ENew) :
+            analyze-localobj(n(i))
+          (i:EInitClosures) :
+            for x in xs(i) do :
+              type-state[n(x)] = EOf(n(iotable(vt), CORE-FN-ID))
+            do(analyze-localfn{n(_)}, xs(i))
           (i) : false
           
         match(definition?(instruction)) :
@@ -1280,10 +1299,6 @@ defn elide-checks (epackage:EPackage, gvt:VarTable, iotable:IOTable) -> EPackage
           ;Otherwise
           (_:False) :
             match(instruction) :
-              (i:EInitClosures) :
-                for x in xs(i) do :
-                  type-state[n(x)] = EOf(n(iotable, CORE-FN-ID))
-                emit(buffer, i)
               (i:EMatch|EDispatch) :
                 for b in branches(i) do :
                   for (y in ys(i), t in types(b)) do :
@@ -1325,7 +1340,6 @@ defn merge-states (states:Seqable<TypeState>) :
   val table = IntListTable<TypeState>()
   for s in states do : add(table, n(s), s)
   table
-;<COMMENT>
 ;============================================================
 ;=================== Object Lifting =========================
 ;============================================================
