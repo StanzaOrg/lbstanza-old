@@ -8,6 +8,8 @@ defpackage stz/vm-encoder :
 public deftype EncodingResolver
 public defmulti callc-format (r:EncodingResolver, xtypes:Tuple<VMType|False>, ytypes:Tuple<VMType>) -> Int
 public defmulti liveness-map (r:EncodingResolver, live:Tuple<Int>, num-locals:Int) -> Int
+public defmulti object-header-size (r:EncodingResolver) -> Int
+public defmulti stack-size (r:EncodingResolver) -> Int
   
 public defn encode (func:VMFunction,
                     pkgids:PackageIds
@@ -18,6 +20,18 @@ public defn encode (func:VMFunction,
   ;Encode instructions into this byte buffer
   val buffer = ByteBuffer()
   defn buffer-pos () : length(buffer) / 4
+
+  ;Delay the generation of this instruction
+  defn delayed-ins (f:() -> ?, instruction-size:Int) :
+    val h = write-position(buffer)
+    switch(instruction-size) :
+      32 : put(buffer, -1) 
+      64 : put(buffer, -1L)
+    within delay() :
+      val h0 = write-position(buffer)
+      set-write-position(buffer, h)
+      f()
+      set-write-position(buffer, h0)
 
   ;Accumulate file information entries for implementing
   ;stack traces.
@@ -37,6 +51,8 @@ public defn encode (func:VMFunction,
   ;   [  8    | 14 | 10] +   64
   ;E: [OPCODE | X  | Y  |   Z   | CONST ]
   ;   [  8    | 10 | 10 | 4 + 6 |   26  ]
+  ;F: [OPCODE | X  | Y  |    N1  | N2]
+  ;   [  8    | 10 | 10 | 4 + 14 | 18]
   defn emit-ins-a (opcode:Int, value:Int) :
     println("A: [%_ | %_]" % [opcode, value])
     put(buffer, opcode | (value << 8))
@@ -58,7 +74,17 @@ public defn encode (func:VMFunction,
   defn emit-ins-e (opcode:Int, x:Int, y:Int, z:Int, const:Int) :
     println("E: [%_ | %_ | %_ | %_ | %_]" % [opcode, x, y, z, const])
     put(buffer, opcode | (x << 8) | (y << 18) | (z << 28))
-    put(buffer, (z >> 4) | (const << 6))    
+    put(buffer, (z >> 4) | (const << 6))
+  defn emit-ins-f (opcode:Int, x:Int, y:Int, n1:Int, n2:Int) :
+    println("F: [%_ | %_ | %_ | %_ | %_]" % [opcode, x, y, n1, n2])
+    put(buffer, opcode | (x << 8) | (y << 18) | (n1 << 28))
+    put(buffer, ((n1 & 0x3FFFF) >> 4) | (n2 << 14))
+
+  ;Calculation of sizes
+  defn object-size (num-obj:Int, size:Int) :
+    num-obj * object-header-size(resolver) + size
+  defn stack-size () :
+    object-size(1, /stack-size(resolver))
 
   ;Retrieve the corresponding bits for the given immediate
   defn to-bits (y:VMImm) -> Int|Long :
@@ -221,6 +247,10 @@ public defn encode (func:VMFunction,
             (z:False) :
               val y* = to-local(y(ins),0)
               emit-ins-e(code, index(x(ins*)), y*, 0, offset(ins*))
+        (ins:Op0Ins) :
+          val ins* = resolve-ins(ins, pos)
+          val code = op0-opcode(op(ins))
+          emit-ins-a(code, index(x(ins*)))
         (ins:Op1Ins) :
           val ins* = resolve-ins(ins, pos)
           match(op(ins*)) :
@@ -233,7 +263,7 @@ public defn encode (func:VMFunction,
                 val y* = to-local(y(ins*), 0)
                 emit-ins-b(opcode, x*, y*)
               else :
-                println("Not yet encoded")          
+                println("Not yet encoded")
         (ins:Op2Ins) :
           val ins* = resolve-ins(ins, pos)
           val opcode = op2-opcode(op(ins), imm-type(x(ins)), imm-type(y(ins)))
@@ -241,11 +271,60 @@ public defn encode (func:VMFunction,
           val y* = to-local(y(ins*), 0)
           val z* = to-local(z(ins*), 1)
           emit-ins-c(opcode, x*, y*, z*)
+        (ins:GotoIns) :
+          within delayed-ins(32) :
+            val ins* = resolve-ins(ins, pos)
+            emit-ins-a(GOTO-OPCODE, n(ins*))
+        (ins:Branch1Ins) :
+          match(op(ins)) :
+            (op:InstanceofOp) :
+              println("Not yet encoded")
+            (op:False) :
+              within delayed-ins(64) :
+                val ins* = resolve-ins(ins, pos)
+                val x* = to-local(x(ins*), 0)
+                emit-ins-f(BRANCH-SET-OPCODE, x*, 0, n1(ins*), n2(ins*))
+        (ins:Branch2Ins) :
+          within delayed-ins(64) :
+            val ins* = resolve-ins(ins, pos)
+            val code = branch2-opcode(op(ins), imm-type(x(ins)))
+            val x* = to-local(x(ins*), 0)
+            val y* = to-local(y(ins*), 1)
+            emit-ins-f(code, x*, y*, n1(ins*), n2(ins*))
+        (ins:NewStackIns) :
+          val ins* = resolve-ins(ins, pos)
+          emit-ins-c(RESERVE-OPCODE-CONST, 3, num-locals, stack-size())
+          record-info(info(ins*))
+          emit-ins-a(POP-FRAME-OPCODE, num-locals)
+          emit-ins-b(NEW-STACK-OPCODE, index(x(ins*)), to-local(fid(ins*),0))
+        (ins:AllocIns) :
+          val ins* = resolve-ins(ins, pos)
+          if all?({_ is NumConst}, sizes(ins*)) :
+            val num-obj = length(sizes(ins*))
+            val size = sum $
+              for s in sizes(ins*) seq :
+                value(s as NumConst) as Int
+            emit-ins-c(RESERVE-OPCODE-CONST, 3, num-locals, object-size(num-obj,size))
+            record-info(info(ins*))
+            emit-ins-a(POP-FRAME-OPCODE, num-locals)
+            for (x in xs(ins*), t in types(ins*), sz in sizes(ins*)) do :
+              val s = value(sz as NumConst) as Int
+              emit-ins-c(ALLOC-OPCODE-CONST, index(x), s, t)
+          else :
+            fatal("Multiple variable-sized allocations.") when length(sizes(ins*)) > 1
+            val x = xs(ins*)[0]
+            val type = types(ins*)[0]
+            val size = to-local(sizes(ins*)[0], 0)
+            emit-ins-c(RESERVE-OPCODE-LOCAL, 3, num-locals, size)
+            record-info(info(ins*))
+            emit-ins-a(POP-FRAME-OPCODE, num-locals)
+            emit-ins-c(ALLOC-OPCODE-LOCAL, index(x), size, type)            
         (ins) :
           println("Not yet encoded")
 
-  match(func:VMFunc) :
-    encode(func)
+  within delay-actions() :
+    match(func:VMFunc) :
+      encode(func)
 
   println("BUFFER: %s" % [buffer])
   buffer
@@ -318,6 +397,9 @@ val CALLC-OPCODE-CODE = next(opcode-counter)
 val CALLC-OPCODE-EXTERN = next(opcode-counter)
 val POP-FRAME-OPCODE = next(opcode-counter)
 val LIVE-OPCODE = next(opcode-counter)
+val YIELD-OPCODE = next(opcode-counter)
+val RETURN-OPCODE = next(opcode-counter)
+val DUMP-OPCODE = next(opcode-counter)
 ;2-arity operations
 val INT-ADD-OPCODE = next(opcode-counter)
 val INT-SUB-OPCODE = next(opcode-counter)
@@ -417,9 +499,6 @@ val UGT-OPCODE-LONG = next(opcode-counter)
 val UGE-OPCODE-BYTE = next(opcode-counter)
 val UGE-OPCODE-INT = next(opcode-counter)
 val UGE-OPCODE-LONG = next(opcode-counter)
-val YIELD-OPCODE = next(opcode-counter)
-val RETURN-OPCODE = next(opcode-counter)
-val DUMP-OPCODE = next(opcode-counter)
 ;1-arity operations
 val INT-NOT-OPCODE = next(opcode-counter)
 val INT-NEG-OPCODE = next(opcode-counter)
@@ -431,6 +510,9 @@ val NEG-OPCODE-LONG = next(opcode-counter)
 val NEG-OPCODE-FLOAT = next(opcode-counter)
 val NEG-OPCODE-DOUBLE = next(opcode-counter)
 val DEREF-OPCODE = next(opcode-counter)
+;branch operation
+val BRANCH-SET-OPCODE = next(opcode-counter)
+val GOTO-OPCODE = next(opcode-counter)
 ;conversion operations
 val CONV-OPCODE-BYTE-FLOAT = next(opcode-counter)
 val CONV-OPCODE-BYTE-DOUBLE = next(opcode-counter)
@@ -465,10 +547,65 @@ val LOAD-OPCODE = next(opcode-counter)
 val LOAD-OPCODE-VAR-OFFSET = next(opcode-counter)
 val LOAD-OPCODE-REF = next(opcode-counter)
 val LOAD-OPCODE-REF-VAR-OFFSET = next(opcode-counter)
-
+;Allocation
+val RESERVE-OPCODE-LOCAL = next(opcode-counter)
+val RESERVE-OPCODE-CONST = next(opcode-counter)
+val NEW-STACK-OPCODE = next(opcode-counter)
+val ALLOC-OPCODE-CONST = next(opcode-counter)
+val ALLOC-OPCODE-LOCAL = next(opcode-counter)
 ;system operations
 val GC-OPCODE = next(opcode-counter)
 val PRINT-STACK-TRACE-OPCODE = next(opcode-counter)
+val CURRENT-STACK-OPCODE = next(opcode-counter)
+val FLUSH-VM-OPCODE = next(opcode-counter)
+val GLOBALS-OPCODE = next(opcode-counter)
+val CONSTS-OPCODE = next(opcode-counter)
+val CONSTS-DATA-OPCODE = next(opcode-counter)
+;2-arity branch operations
+val JUMP-INT-LT-OPCODE = next(opcode-counter)
+val JUMP-INT-GT-OPCODE = next(opcode-counter)
+val JUMP-INT-LE-OPCODE = next(opcode-counter)
+val JUMP-INT-GE-OPCODE = next(opcode-counter)
+val JUMP-EQ-OPCODE-REF = next(opcode-counter)
+val JUMP-EQ-OPCODE-BYTE = next(opcode-counter)
+val JUMP-EQ-OPCODE-INT = next(opcode-counter)
+val JUMP-EQ-OPCODE-LONG = next(opcode-counter)
+val JUMP-EQ-OPCODE-FLOAT = next(opcode-counter)
+val JUMP-EQ-OPCODE-DOUBLE = next(opcode-counter)
+val JUMP-NE-OPCODE-REF = next(opcode-counter)
+val JUMP-NE-OPCODE-BYTE = next(opcode-counter)
+val JUMP-NE-OPCODE-INT = next(opcode-counter)
+val JUMP-NE-OPCODE-LONG = next(opcode-counter)
+val JUMP-NE-OPCODE-FLOAT = next(opcode-counter)
+val JUMP-NE-OPCODE-DOUBLE = next(opcode-counter)
+val JUMP-LT-OPCODE-INT = next(opcode-counter)
+val JUMP-LT-OPCODE-LONG = next(opcode-counter)
+val JUMP-LT-OPCODE-FLOAT = next(opcode-counter)
+val JUMP-LT-OPCODE-DOUBLE = next(opcode-counter)
+val JUMP-GT-OPCODE-INT = next(opcode-counter)
+val JUMP-GT-OPCODE-LONG = next(opcode-counter)
+val JUMP-GT-OPCODE-FLOAT = next(opcode-counter)
+val JUMP-GT-OPCODE-DOUBLE = next(opcode-counter)
+val JUMP-LE-OPCODE-INT = next(opcode-counter)
+val JUMP-LE-OPCODE-LONG = next(opcode-counter)
+val JUMP-LE-OPCODE-FLOAT = next(opcode-counter)
+val JUMP-LE-OPCODE-DOUBLE = next(opcode-counter)
+val JUMP-GE-OPCODE-INT = next(opcode-counter)
+val JUMP-GE-OPCODE-LONG = next(opcode-counter)
+val JUMP-GE-OPCODE-FLOAT = next(opcode-counter)
+val JUMP-GE-OPCODE-DOUBLE = next(opcode-counter)
+val JUMP-ULE-OPCODE-BYTE = next(opcode-counter)
+val JUMP-ULE-OPCODE-INT = next(opcode-counter)
+val JUMP-ULE-OPCODE-LONG = next(opcode-counter)
+val JUMP-ULT-OPCODE-BYTE = next(opcode-counter)
+val JUMP-ULT-OPCODE-INT = next(opcode-counter)
+val JUMP-ULT-OPCODE-LONG = next(opcode-counter)
+val JUMP-UGT-OPCODE-BYTE = next(opcode-counter)
+val JUMP-UGT-OPCODE-INT = next(opcode-counter)
+val JUMP-UGT-OPCODE-LONG = next(opcode-counter)
+val JUMP-UGE-OPCODE-BYTE = next(opcode-counter)
+val JUMP-UGE-OPCODE-INT = next(opcode-counter)
+val JUMP-UGE-OPCODE-LONG = next(opcode-counter)
 
 defn set-reg-opcode (y:VMImm) :
   match(y) :
@@ -521,6 +658,14 @@ defn load-opcode (offset:VMImm|False, base-type:VMType) :
     (bt:VMRef, offset:False) : LOAD-OPCODE-REF
     (bt, offset:VMImm) : LOAD-OPCODE-VAR-OFFSET
     (bt, offset:False) : LOAD-OPCODE
+
+defn op0-opcode (op:VMOp) :
+  match(op) :
+    (op:CurrentStackOp) : CURRENT-STACK-OPCODE
+    (op:FlushVMOp) : FLUSH-VM-OPCODE
+    (op:GlobalsOp) : GLOBALS-OPCODE
+    (op:ConstsOp) : CONSTS-OPCODE
+    (op:ConstsDataOp) : CONSTS-DATA-OPCODE
 
 ;Returns false if operation becomes a set operation.
 defn op1-opcode (op:VMOp, xt:VMType, yt:VMType) -> Int|False :
@@ -672,6 +817,53 @@ defn op2-opcode (op:VMOp, xt:VMType, yt:VMType) :
     (op:UgeOp, xt:VMLong, yt:VMInt) : UGE-OPCODE-INT
     (op:UgeOp, xt:VMLong, yt:VMLong) : UGE-OPCODE-LONG
 
+defn branch2-opcode (op:VMOp, xt:VMType) :
+  match(op, xt) :
+    (op:IntLtOp, xt:VMRef) : JUMP-INT-LT-OPCODE
+    (op:IntGtOp, xt:VMRef) : JUMP-INT-GT-OPCODE
+    (op:IntLeOp, xt:VMRef) : JUMP-INT-LE-OPCODE
+    (op:IntGeOp, xt:VMRef) : JUMP-INT-GE-OPCODE
+    (op:EqOp, xt:VMRef) : JUMP-EQ-OPCODE-REF
+    (op:EqOp, xt:VMByte) : JUMP-EQ-OPCODE-BYTE
+    (op:EqOp, xt:VMInt) : JUMP-EQ-OPCODE-INT
+    (op:EqOp, xt:VMLong) : JUMP-EQ-OPCODE-LONG
+    (op:EqOp, xt:VMFloat) : JUMP-EQ-OPCODE-FLOAT
+    (op:EqOp, xt:VMDouble) : JUMP-EQ-OPCODE-DOUBLE
+    (op:NeOp, xt:VMRef) : JUMP-NE-OPCODE-REF
+    (op:NeOp, xt:VMByte) : JUMP-NE-OPCODE-BYTE
+    (op:NeOp, xt:VMInt) : JUMP-NE-OPCODE-INT
+    (op:NeOp, xt:VMLong) : JUMP-NE-OPCODE-LONG
+    (op:NeOp, xt:VMFloat) : JUMP-NE-OPCODE-FLOAT
+    (op:NeOp, xt:VMDouble) : JUMP-NE-OPCODE-DOUBLE
+    (op:LtOp, xt:VMInt) : JUMP-LT-OPCODE-INT
+    (op:LtOp, xt:VMLong) : JUMP-LT-OPCODE-LONG
+    (op:LtOp, xt:VMFloat) : JUMP-LT-OPCODE-FLOAT
+    (op:LtOp, xt:VMDouble) : JUMP-LT-OPCODE-DOUBLE
+    (op:GtOp, xt:VMInt) : JUMP-GT-OPCODE-INT
+    (op:GtOp, xt:VMLong) : JUMP-GT-OPCODE-LONG
+    (op:GtOp, xt:VMFloat) : JUMP-GT-OPCODE-FLOAT
+    (op:GtOp, xt:VMDouble) : JUMP-GT-OPCODE-DOUBLE
+    (op:LeOp, xt:VMInt) : JUMP-LE-OPCODE-INT
+    (op:LeOp, xt:VMLong) : JUMP-LE-OPCODE-LONG
+    (op:LeOp, xt:VMFloat) : JUMP-LE-OPCODE-FLOAT
+    (op:LeOp, xt:VMDouble) : JUMP-LE-OPCODE-DOUBLE
+    (op:GeOp, xt:VMInt) : JUMP-GE-OPCODE-INT
+    (op:GeOp, xt:VMLong) : JUMP-GE-OPCODE-LONG
+    (op:GeOp, xt:VMFloat) : JUMP-GE-OPCODE-FLOAT
+    (op:GeOp, xt:VMDouble) : JUMP-GE-OPCODE-DOUBLE
+    (op:UltOp, xt:VMByte) : JUMP-ULT-OPCODE-BYTE
+    (op:UltOp, xt:VMInt) : JUMP-ULT-OPCODE-INT
+    (op:UltOp, xt:VMLong) : JUMP-ULT-OPCODE-LONG
+    (op:UleOp, xt:VMByte) : JUMP-ULE-OPCODE-BYTE
+    (op:UleOp, xt:VMInt) : JUMP-ULE-OPCODE-INT
+    (op:UleOp, xt:VMLong) : JUMP-ULE-OPCODE-LONG
+    (op:UgtOp, xt:VMByte) : JUMP-UGT-OPCODE-BYTE
+    (op:UgtOp, xt:VMInt) : JUMP-UGT-OPCODE-INT
+    (op:UgtOp, xt:VMLong) : JUMP-UGT-OPCODE-LONG
+    (op:UgeOp, xt:VMByte) : JUMP-UGE-OPCODE-BYTE
+    (op:UgeOp, xt:VMInt) : JUMP-UGE-OPCODE-INT
+    (op:UgeOp, xt:VMLong) : JUMP-UGE-OPCODE-LONG
+
 ;============================================================
 ;==================== Tag Bits ==============================
 ;============================================================
@@ -687,9 +879,22 @@ defn marker (type:Int) :
   type << 3 + MARKER-TAG-BITS
 
 ;============================================================
+;====================== Utilities ===========================
 ;============================================================
-;============================================================
+
+var delay : (() -> ?) -> False =
+  fn (f) : fatal("Not within delay-actions block.")
+defn delay-actions<?T> (f:() -> ?T) :
+  val delays = Vector<(() -> ?)>()
+  defn delay-action (action:() -> ?)  : add(delays, action)
+  val result = let-var delay = delay-action : f()
+  for d in delays do : d()
+  clear(delays)
+  result
     
+;============================================================
+;====================== Driver ==============================
+;============================================================
 
 defn resolve (pkgids:PackageIds, vmp:VMPackage) :
   defn resolve (n:Int) : pkgids[n]
@@ -711,6 +916,8 @@ public defn main () :
   val dummy-resolver = new EncodingResolver :
     defmethod callc-format (this, xtypes:Tuple<False|VMType>, ytypes:Tuple<VMType>) : 42
     defmethod liveness-map (this, live:Tuple<Int>, num-locals:Int) : 42
+    defmethod object-header-size (this) : 8
+    defmethod stack-size (this) : 4 * 8
     
   val filenames = command-line-arguments()[1 to false]
   val vmpackages = to-tuple $ seq(read-vm-package, filenames)
