@@ -10,6 +10,9 @@ public defmulti callc-format (r:EncodingResolver, xtypes:Tuple<VMType|False>, yt
 public defmulti liveness-map (r:EncodingResolver, live:Tuple<Int>, num-locals:Int) -> Int
 public defmulti object-header-size (r:EncodingResolver) -> Int
 public defmulti stack-size (r:EncodingResolver) -> Int
+public defmulti dispatch-format (r:EncodingResolver, branches:Tuple<Tuple<TypeSet>>) -> Int
+public defmulti match-format (r:EncodingResolver, branches:Tuple<Tuple<TypeSet>>) -> Int
+public defmulti method-format (r:EncodingResolver, multi:Int, num-header-args:Int) -> Int
   
 public defn encode (func:VMFunction,
                     pkgids:PackageIds
@@ -22,15 +25,20 @@ public defn encode (func:VMFunction,
   defn buffer-pos () : length(buffer) / 4
 
   ;Delay the generation of this instruction
-  defn delayed-ins (f:() -> ?, instruction-size:Int) :
+  defn delayed-ins (f:() -> ?, instruction-words:Int) :
     val h = write-position(buffer)
-    switch(instruction-size) :
-      32 : put(buffer, -1) 
-      64 : put(buffer, -1L)
+    for i in 0 to instruction-words do :
+      put(buffer, -1)
     within delay() :
       val h0 = write-position(buffer)
       set-write-position(buffer, h)
+      println("Start writing from %_" % [h])
+      println("Expected %_ bytes" % [instruction-words * 4])
       f()
+      println("Finished writing at %_" % [write-position(buffer)])
+      val written = write-position(buffer) - h
+      println("Wrote %_ bytes" % [written])
+      fatal("Incorrect size.") when written != instruction-words * 4
       set-write-position(buffer, h0)
 
   ;Accumulate file information entries for implementing
@@ -79,6 +87,8 @@ public defn encode (func:VMFunction,
     println("F: [%_ | %_ | %_ | %_ | %_]" % [opcode, x, y, n1, n2])
     put(buffer, opcode | (x << 8) | (y << 18) | (n1 << 28))
     put(buffer, ((n1 & 0x3FFFF) >> 4) | (n2 << 14))
+  defn emit-ins-targets (dests:Seqable<Int>) :
+    for d in dests do : put(buffer, d)
 
   ;Calculation of sizes
   defn object-size (num-obj:Int, size:Int) :
@@ -107,31 +117,47 @@ public defn encode (func:VMFunction,
       (y:DataId) : id(y)
       (y:ConstId) : id(y)
 
+  ;Split a tuple of VMBranch into typesets and destinations
+  defn split-types-and-dests (bs:Tuple<VMBranch>) -> [Tuple<Tuple<TypeSet>>, Tuple<Int>] :
+    val types = for b in bs map :
+      map(normalize, types(b))
+    val targets = map(n, bs)
+    [types, targets]
+
   ;Set register
   defn set-reg (i:Int, y:VMImm) :
     match(to-bits(y)) :
       (v:Int) : emit-ins-c(set-reg-opcode(y), i, v)
       (v:Long) : emit-ins-d(set-reg-opcode(y), i, v)    
-  defn set-regs (ys:Tuple<VMImm>) :
+  defn set-regs (ys:Seqable<VMImm>) :
     do(set-reg, 0 to false, ys)
   defn get-reg (x:Local|False, i:Int) :
     match(x:Local) :
       emit-ins-b(GET-REG-OPCODE, index(x), i)
-  defn get-regs (xs:Tuple<Local|False>) :
+  defn get-regs (xs:Seqable<Local|False>) :
     do(get-reg, xs, 0 to false)
+
+  ;Set local
+  defn set-local (x:Int, y:VMImm) :
+    match(to-bits(y)) :
+      (v:Int) : emit-ins-c(set-opcode(y), x, v)
+      (v:Long) : emit-ins-d(set-opcode(y), x, v)
 
   ;Encode function instructions
   defn encode (func:VMFunc) :
     ;Compute num locals
-    val num-locals = maximum(-1, seq(local, defs(func))) + 1
+    ;Reserve extra 3 locals for temporary moving
+    val max-local = maximum(-1, seq(local, defs(func)))
+    val num-locals = max-local + 1 + 3
 
-    ;Put immediate in register if not a local
-    defn to-local (x:VMImm, reg:Int) :
+    ;Put immediate in temporary local if not a local
+    defn to-local (x:VMImm, num:Int) :
       match(x:Local) :
         index(x)
       else :
-        set-reg(reg, x)
-        reg
+        val index = max-local + num + 1
+        set-local(index, x)
+        index
 
     ;Put immediate in register if not a function immediate
     defn to-function (f:VMImm) :
@@ -170,6 +196,8 @@ public defn encode (func:VMFunction,
 
     for ins in ins(func) do :
       println("Encoding: %_" % [ins])
+
+      ;Retrieve position of current instruction
       val pos = buffer-pos()
       match(ins) :
         (ins:LabelIns) :
@@ -272,24 +300,24 @@ public defn encode (func:VMFunction,
           val z* = to-local(z(ins*), 1)
           emit-ins-c(opcode, x*, y*, z*)
         (ins:GotoIns) :
-          within delayed-ins(32) :
-            val ins* = resolve-ins(ins, pos)
+          val ins* = resolve-ins(ins, pos)
+          within delayed-ins(1) :            
             emit-ins-a(GOTO-OPCODE, n(ins*))
         (ins:Branch1Ins) :
           match(op(ins)) :
             (op:InstanceofOp) :
               println("Not yet encoded")
             (op:False) :
-              within delayed-ins(64) :
-                val ins* = resolve-ins(ins, pos)
-                val x* = to-local(x(ins*), 0)
+              val ins* = resolve-ins(ins, pos)
+              val x* = to-local(x(ins*), 0)
+              within delayed-ins(2) :
                 emit-ins-f(BRANCH-SET-OPCODE, x*, 0, n1(ins*), n2(ins*))
         (ins:Branch2Ins) :
-          within delayed-ins(64) :
-            val ins* = resolve-ins(ins, pos)
-            val code = branch2-opcode(op(ins), imm-type(x(ins)))
-            val x* = to-local(x(ins*), 0)
-            val y* = to-local(y(ins*), 1)
+          val ins* = resolve-ins(ins, pos)
+          val code = branch2-opcode(op(ins), imm-type(x(ins)))
+          val x* = to-local(x(ins*), 0)
+          val y* = to-local(y(ins*), 1)
+          within delayed-ins(2) :
             emit-ins-f(code, x*, y*, n1(ins*), n2(ins*))
         (ins:NewStackIns) :
           val ins* = resolve-ins(ins, pos)
@@ -318,7 +346,43 @@ public defn encode (func:VMFunction,
             emit-ins-c(RESERVE-OPCODE-LOCAL, 3, num-locals, size)
             record-info(info(ins*))
             emit-ins-a(POP-FRAME-OPCODE, num-locals)
-            emit-ins-c(ALLOC-OPCODE-LOCAL, index(x), size, type)            
+            emit-ins-c(ALLOC-OPCODE-LOCAL, index(x), size, type)
+        (ins:DispatchIns) :
+          ;Resolve instruction
+          val ins* = resolve-ins(ins, pos)
+          ;Push arguments onto registers
+          set-regs(ys(ins*))
+          val [types, dests] = split-types-and-dests(branches(ins*))
+          val format = dispatch-format(resolver, types)
+          emit-ins-a(DISPATCH-OPCODE, format)
+          ;Two targets for default and amb and then each branch for dispatch.
+          val num-targets = 2 + length(branches(ins*))
+          within delayed-ins(num-targets) :
+            emit-ins-targets(cat([default(ins*), amb(ins*)], dests))
+        (ins:MatchIns) :
+          ;Resolve instruction
+          val ins* = resolve-ins(ins, pos)
+          ;Push arguments onto registers
+          set-regs(ys(ins*))
+          val [types, dests] = split-types-and-dests(branches(ins*))
+          val format = match-format(resolver, types)
+          emit-ins-a(DISPATCH-OPCODE, format)
+          ;One target for default and then each branch for dispatch.
+          val num-targets = 1 + length(branches(ins*))
+          within delayed-ins(num-targets) :
+            emit-ins-targets(cat([default(ins*)], dests))            
+        (ins:MethodDispatchIns) :
+          ;Resolve instruction
+          val ins* = resolve-ins(ins, pos)
+          ;Push arguments onto registers
+          set-regs(cat(ys(ins*), zs(ins*)))
+          ;Emit dispatch instruction
+          val format = method-format(resolver, multi(ins*), length(ys(ins*)))
+          emit-ins-a(DISPATCH-METHOD-OPCODE, format)
+          ;Only two targets for default and amb
+          val num-targets = 2
+          within delayed-ins(num-targets) :
+            emit-ins-targets([default(ins*), amb(ins*)])          
         (ins) :
           println("Not yet encoded")
 
@@ -606,6 +670,9 @@ val JUMP-UGT-OPCODE-LONG = next(opcode-counter)
 val JUMP-UGE-OPCODE-BYTE = next(opcode-counter)
 val JUMP-UGE-OPCODE-INT = next(opcode-counter)
 val JUMP-UGE-OPCODE-LONG = next(opcode-counter)
+;dispatch operation
+val DISPATCH-OPCODE = next(opcode-counter)
+val DISPATCH-METHOD-OPCODE = next(opcode-counter)
 
 defn set-reg-opcode (y:VMImm) :
   match(y) :
@@ -626,6 +693,26 @@ defn set-reg-opcode (y:VMImm) :
     (y:DataId) : SET-REG-OPCODE-DATA
     (y:ConstId) : SET-REG-OPCODE-CONST
     (y:VoidMarker) : SET-REG-OPCODE-UNSIGNED
+
+defn set-opcode (y:VMImm) :
+  match(y) :
+    (y:Local) : SET-OPCODE-LOCAL
+    (y:NumConst) :
+      match(value(y)) :
+        (v:Char) : SET-OPCODE-UNSIGNED
+        (v:Byte) : SET-OPCODE-UNSIGNED
+        (v:Int) : SET-OPCODE-UNSIGNED
+        (v:Long) : SET-OPCODE-WIDE  ;OR SIGNED
+        (v:Float) : SET-OPCODE-UNSIGNED
+        (v:Double) : SET-OPCODE-WIDE
+    (y:Marker) : SET-OPCODE-UNSIGNED
+    (y:Tag) : SET-OPCODE-UNSIGNED
+    (y:CodeId) : SET-OPCODE-CODE
+    (y:ExternId) : SET-OPCODE-EXTERN
+    (y:GlobalId) : SET-OPCODE-GLOBAL
+    (y:DataId) : SET-OPCODE-DATA
+    (y:ConstId) : SET-OPCODE-CONST
+    (y:VoidMarker) : SET-OPCODE-UNSIGNED
 
 defn call-opcode (f:VMImm) :
   match(f) :
@@ -918,6 +1005,9 @@ public defn main () :
     defmethod liveness-map (this, live:Tuple<Int>, num-locals:Int) : 42
     defmethod object-header-size (this) : 8
     defmethod stack-size (this) : 4 * 8
+    defmethod dispatch-format (this, branches:Tuple<Tuple<TypeSet>>) -> Int : 42
+    defmethod match-format (this, branches:Tuple<Tuple<TypeSet>>) -> Int : 42
+    defmethod method-format (this, multi:Int, num-header-args:Int) -> Int : 42
     
   val filenames = command-line-arguments()[1 to false]
   val vmpackages = to-tuple $ seq(read-vm-package, filenames)
