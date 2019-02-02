@@ -247,12 +247,12 @@
 //============================================================
 
 #define PC_INT() \
-  ({int _x = *(int*)pc; \
+  ({unsigned int _x = *(unsigned int*)pc; \
     pc += 4; \
     _x;}); 
 
 #define PC_LONG() \
-  ({int64_t _x = *(int64_t*)pc; \
+  ({uint64_t _x = *(uint64_t*)pc; \
     pc += 8; \
     _x;}); 
 
@@ -277,6 +277,15 @@
   long value = PC_LONG(); \
   printf("[%d | %d | %d | %ld]\n", opcode, x, y, value);
 
+#define DECODE_E() \
+  unsigned int W2 = PC_INT(); \
+  uint64_t W12 = W1 | ((uint64_t)W2 << 32); \
+  int x = (int)(W12 >> 8) & 0x3FF;  \
+  int y = (int)(W12 >> 18) & 0x3FF; \
+  int z = (int)(W12 >> 28) & 0x3FF; \
+  int value = (int)((int64_t)W12 >> 38); \
+  printf("[%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
+
 //============================================================
 //===================== MAIN LOOP ============================
 //============================================================
@@ -289,20 +298,47 @@ void vmloop (char* instructions, int n){
 
   //Machine Parameters
   char* pc = instructions;  
-  
-  while(1){
-    int W1 = PC_INT();
+  char* pc_end = instructions+n;
+  while(pc < pc_end){
+    unsigned int W1 = PC_INT();
     int opcode = W1 & 0xFF;
     switch(opcode){
-    case SET_OPCODE_LOCAL : {break;}
-    case SET_OPCODE_UNSIGNED : {break;}
-    case SET_OPCODE_SIGNED : {break;}
-    case SET_OPCODE_CODE : {break;}
-    case SET_OPCODE_EXTERN : {break;}
-    case SET_OPCODE_GLOBAL : {break;}
-    case SET_OPCODE_DATA : {break;}
-    case SET_OPCODE_CONST : {break;}
-    case SET_OPCODE_WIDE : {break;}
+    case SET_OPCODE_LOCAL : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_UNSIGNED : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_SIGNED : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_CODE : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_EXTERN : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_GLOBAL : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_DATA : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_CONST : {
+      DECODE_C();
+      continue;
+    }
+    case SET_OPCODE_WIDE : {
+      DECODE_D();
+      continue;
+    }
     case SET_REG_OPCODE_LOCAL : {
       DECODE_C();
       continue;
@@ -340,9 +376,18 @@ void vmloop (char* instructions, int n){
       DECODE_B_UNSIGNED();
       continue;
     }
-    case CALL_OPCODE_LOCAL : {break;}
-    case CALL_OPCODE_CODE : {break;}
-    case CALL_OPCODE_EXTERN : {break;}
+    case CALL_OPCODE_LOCAL : {
+      DECODE_C();
+      continue;
+    }
+    case CALL_OPCODE_CODE : {
+      DECODE_C();
+      continue;
+    }
+    case CALL_OPCODE_EXTERN : {
+      DECODE_C();
+      continue;
+    }
     case CALL_CLOSURE_OPCODE : {break;}
     case TCALL_OPCODE_LOCAL : {break;}
     case TCALL_OPCODE_CODE : {break;}
@@ -351,7 +396,10 @@ void vmloop (char* instructions, int n){
     case CALLC_OPCODE_LOCAL : {break;}
     case CALLC_OPCODE_CODE : {break;}
     case CALLC_OPCODE_EXTERN : {break;}
-    case POP_FRAME_OPCODE : {break;}
+    case POP_FRAME_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
     case LIVE_OPCODE : {
       DECODE_A_UNSIGNED();
       continue;
@@ -492,14 +540,38 @@ void vmloop (char* instructions, int n){
     case TAG_OPCODE_CHAR : {break;}
     case TAG_OPCODE_INT : {break;}
     case TAG_OPCODE_FLOAT : {break;}
-    case STORE_OPCODE : {break;}
-    case STORE_OPCODE_VAR_OFFSET : {break;}
-    case STORE_OPCODE_REF : {break;}
-    case STORE_OPCODE_REF_VAR_OFFSET : {break;}
-    case LOAD_OPCODE : {break;}
-    case LOAD_OPCODE_VAR_OFFSET : {break;}
-    case LOAD_OPCODE_REF : {break;}
-    case LOAD_OPCODE_REF_VAR_OFFSET : {break;}
+    case STORE_OPCODE : {
+      DECODE_E();
+      continue;
+    }
+    case STORE_OPCODE_VAR_OFFSET : {
+      DECODE_E();
+      continue;
+    }
+    case STORE_OPCODE_REF : {
+      DECODE_E();
+      continue;
+    }
+    case STORE_OPCODE_REF_VAR_OFFSET : {
+      DECODE_E();
+      continue;
+    }
+    case LOAD_OPCODE : {
+      DECODE_E();
+      continue;
+    }
+    case LOAD_OPCODE_VAR_OFFSET : {
+      DECODE_E();
+      continue;
+    }
+    case LOAD_OPCODE_REF : {
+      DECODE_E();
+      continue;
+    }
+    case LOAD_OPCODE_REF_VAR_OFFSET : {
+      DECODE_E();
+      continue;
+    }
     case RESERVE_OPCODE_LOCAL : {break;}
     case RESERVE_OPCODE_CONST : {break;}
     case NEW_STACK_OPCODE : {break;}
@@ -563,6 +635,7 @@ void vmloop (char* instructions, int n){
     
     //Done
     printf("opcode = %d\n", opcode);
+    exit(-1);
     return;
   }
 }
