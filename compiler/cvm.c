@@ -1,5 +1,6 @@
 #include<stdio.h>
 #include<stdlib.h>
+#include<sys/types.h>
 
 //============================================================
 //=================== OPCODES ================================
@@ -245,13 +246,36 @@
 //===================== READ MACROS ==========================
 //============================================================
 
-#define PC_INT()        \
+#define PC_INT() \
   ({int _x = *(int*)pc; \
-    pc += 4;            \
+    pc += 4; \
     _x;}); 
 
-#define DECODE_A_UNSIGNED()  \
-  int value = W1 >> 8;
+#define PC_LONG() \
+  ({int64_t _x = *(int64_t*)pc; \
+    pc += 8; \
+    _x;}); 
+
+#define DECODE_A_UNSIGNED() \
+  int value = W1 >> 8; \
+  printf("[%d | %d]\n", opcode, value);
+
+#define DECODE_B_UNSIGNED() \
+  int x = (W1 >> 8) & 0x3FF; \
+  int value = W1 >> 18; \
+  printf("[%d | %d | %d]\n", opcode, x, value);
+
+#define DECODE_C() \
+  int x = (W1 >> 8) & 0x3FF; \
+  int y = (W1 >> 22) & 0x3FF; \
+  int value = PC_INT(); \
+  printf("[%d | %d | %d | %d]\n", opcode, x, y, value);
+
+#define DECODE_D() \
+  int x = (W1 >> 8) & 0x3FF; \
+  int y = (W1 >> 22) & 0x3FF; \
+  long value = PC_LONG(); \
+  printf("[%d | %d | %d | %ld]\n", opcode, x, y, value);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -279,16 +303,43 @@ void vmloop (char* instructions, int n){
     case SET_OPCODE_DATA : {break;}
     case SET_OPCODE_CONST : {break;}
     case SET_OPCODE_WIDE : {break;}
-    case SET_REG_OPCODE_LOCAL : {break;}
-    case SET_REG_OPCODE_UNSIGNED : {break;}
-    case SET_REG_OPCODE_SIGNED : {break;}
-    case SET_REG_OPCODE_CODE : {break;}
-    case SET_REG_OPCODE_EXTERN : {break;}
-    case SET_REG_OPCODE_GLOBAL : {break;}
-    case SET_REG_OPCODE_DATA : {break;}
-    case SET_REG_OPCODE_CONST : {break;}
+    case SET_REG_OPCODE_LOCAL : {
+      DECODE_C();
+      continue;
+    }
+    case SET_REG_OPCODE_UNSIGNED : {
+      DECODE_C();
+      continue;
+    }
+    case SET_REG_OPCODE_SIGNED : {
+      DECODE_C();
+      continue;
+    }
+    case SET_REG_OPCODE_CODE : {
+      DECODE_C();
+      continue;
+    }
+    case SET_REG_OPCODE_EXTERN : {
+      DECODE_C();
+      continue;
+    }
+    case SET_REG_OPCODE_GLOBAL : {
+      DECODE_C();
+      continue;
+    }
+    case SET_REG_OPCODE_DATA : {
+      DECODE_C();
+      continue;
+    }
+    case SET_REG_OPCODE_CONST : {
+      DECODE_C();
+      continue;
+    }
     case SET_REG_OPCODE_WIDE : {break;}
-    case GET_REG_OPCODE : {break;}
+    case GET_REG_OPCODE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
     case CALL_OPCODE_LOCAL : {break;}
     case CALL_OPCODE_CODE : {break;}
     case CALL_OPCODE_EXTERN : {break;}
@@ -303,8 +354,6 @@ void vmloop (char* instructions, int n){
     case POP_FRAME_OPCODE : {break;}
     case LIVE_OPCODE : {
       DECODE_A_UNSIGNED();
-      //int value = W1 >> 8;
-      printf("[%d | %d]\n", opcode, value);
       continue;
     }
     case YIELD_OPCODE : {break;}
