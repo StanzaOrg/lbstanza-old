@@ -321,968 +321,1459 @@
 //- Pointer to end of stack (for knowing when to build stack)
 //- Current stack
 
+typedef struct{
+  uint64_t returnpc;
+  uint64_t liveness_map;
+  uint64_t slots[];
+} StackFrame;
 
-void vmloop (char* instructions, int n){
+typedef struct{
+  uint64_t size;
+  StackFrame* frames;
+  StackFrame* stack_pointer;
+  int pc;
+} Stack;
+
+Stack* untag_stack (uint64_t current_stack){
+  return (Stack*)(current_stack - 1 + 8);
+}
+
+void vmloop (char* instructions, int n,
+             uint64_t* heap_top,
+             uint64_t* heap_limit,
+             uint64_t* registers,
+             uint64_t current_stack){
   printf("VM Loop!\n");
   printf("Instructions = %p\n", instructions);
   printf("Total = %d bytes\n", n);
+  printf("heap_top = %p\n", heap_top);
+  printf("heap_limit = %p\n", heap_limit);
+  printf("heap_registers = %p\n", registers);
+  printf("current_stack = %llx\n", current_stack);
 
-//  //Print out characters
-//  for(int i=0; i<n; i+=4){
-//    int* pc = (int*)(instructions + i);
-//    int word = *pc;
-//    printf("%d ", word);
-//  }
-//  printf("\n");
-
+  //Retrieve starting program counter
+  Stack* stk = untag_stack(current_stack);
+  StackFrame* stack_pointer = stk->stack_pointer;
+  char* pc = instructions + stk->pc * 4;
 
   //Machine Parameters
-  char* pc = instructions;
-  char* pc_end = instructions+n;
-  while(pc < pc_end){
+  //char* pc = instructions;
+  //char* pc_end = instructions+n;
+  //while(pc < pc_end){
+  while(1){
     unsigned int W1 = PC_INT();
     int opcode = W1 & 0xFF;
     switch(opcode){
     case SET_OPCODE_LOCAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_UNSIGNED : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_SIGNED : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_CODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_EXTERN : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_GLOBAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_DATA : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_CONST : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_OPCODE_WIDE : {
       DECODE_D();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_LOCAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_UNSIGNED : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_SIGNED : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_CODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_EXTERN : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_GLOBAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_DATA : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_CONST : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SET_REG_OPCODE_WIDE : {
       DECODE_D();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GET_REG_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALL_OPCODE_LOCAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALL_OPCODE_CODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALL_OPCODE_EXTERN : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALL_CLOSURE_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TCALL_OPCODE_LOCAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TCALL_OPCODE_CODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TCALL_OPCODE_EXTERN : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TCALL_CLOSURE_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALLC_OPCODE_LOCAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALLC_OPCODE_CODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALLC_OPCODE_EXTERN : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case POP_FRAME_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LIVE_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case YIELD_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case RETURN_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DUMP_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_ADD_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_SUB_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_MUL_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_DIV_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_MOD_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_AND_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_OR_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_XOR_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_SHL_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_SHR_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_ASHR_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_LT_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_GT_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_LE_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_GE_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case EQ_OPCODE_REF_REF : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case EQ_OPCODE_REF : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case EQ_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case EQ_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case EQ_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case EQ_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case EQ_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NE_OPCODE_REF_REF : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NE_OPCODE_REF : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NE_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NE_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NE_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NE_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NE_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ADD_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ADD_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ADD_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ADD_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ADD_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SUB_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SUB_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SUB_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SUB_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SUB_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MUL_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MUL_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MUL_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MUL_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MUL_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DIV_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DIV_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DIV_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DIV_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DIV_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MOD_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MOD_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case MOD_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case AND_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case AND_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case AND_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case OR_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case OR_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case OR_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case XOR_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case XOR_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case XOR_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SHL_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SHL_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SHL_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SHR_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SHR_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case SHR_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ASHR_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ASHR_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ASHR_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LT_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LT_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LT_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LT_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GT_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GT_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GT_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GT_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LE_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LE_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LE_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LE_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GE_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GE_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GE_OPCODE_FLOAT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GE_OPCODE_DOUBLE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ULE_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ULE_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ULE_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ULT_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ULT_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ULT_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case UGT_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case UGT_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case UGT_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case UGE_OPCODE_BYTE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case UGE_OPCODE_INT : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case UGE_OPCODE_LONG : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_NOT_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case INT_NEG_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NOT_OPCODE_BYTE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NOT_OPCODE_INT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NOT_OPCODE_LONG : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NEG_OPCODE_INT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NEG_OPCODE_LONG : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NEG_OPCODE_FLOAT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NEG_OPCODE_DOUBLE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DEREF_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TYPEOF_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_SET_OPCODE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GOTO_OPCODE : {
       DECODE_A_SIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_BYTE_FLOAT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_BYTE_DOUBLE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_INT_BYTE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_INT_FLOAT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_INT_DOUBLE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_LONG_BYTE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_LONG_INT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_LONG_FLOAT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_LONG_DOUBLE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_FLOAT_BYTE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_FLOAT_INT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_FLOAT_LONG : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_FLOAT_DOUBLE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_DOUBLE_BYTE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_DOUBLE_INT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_DOUBLE_LONG : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONV_OPCODE_DOUBLE_FLOAT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DETAG_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TAG_OPCODE_BYTE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TAG_OPCODE_CHAR : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TAG_OPCODE_INT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case TAG_OPCODE_FLOAT : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case STORE_OPCODE : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case STORE_OPCODE_VAR_OFFSET : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case STORE_OPCODE_REF : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case STORE_OPCODE_REF_VAR_OFFSET : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LOAD_OPCODE : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LOAD_OPCODE_VAR_OFFSET : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LOAD_OPCODE_REF : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case LOAD_OPCODE_REF_VAR_OFFSET : {
       DECODE_E();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case RESERVE_OPCODE_LOCAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case RESERVE_OPCODE_CONST : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case NEW_STACK_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ALLOC_OPCODE_CONST : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case ALLOC_OPCODE_LOCAL : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GC_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case PRINT_STACK_TRACE_OPCODE : {
       DECODE_B_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CURRENT_STACK_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case FLUSH_VM_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case GLOBALS_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONSTS_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CONSTS_DATA_OPCODE : {
       DECODE_A_UNSIGNED();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_INT_LT_OPCODE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_INT_GT_OPCODE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_INT_LE_OPCODE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_INT_GE_OPCODE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_EQ_OPCODE_REF : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_EQ_OPCODE_BYTE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_EQ_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_EQ_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_EQ_OPCODE_FLOAT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_EQ_OPCODE_DOUBLE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_NE_OPCODE_REF : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_NE_OPCODE_BYTE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_NE_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_NE_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_NE_OPCODE_FLOAT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_NE_OPCODE_DOUBLE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LT_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LT_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LT_OPCODE_FLOAT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LT_OPCODE_DOUBLE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GT_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GT_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GT_OPCODE_FLOAT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GT_OPCODE_DOUBLE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LE_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LE_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LE_OPCODE_FLOAT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_LE_OPCODE_DOUBLE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GE_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GE_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GE_OPCODE_FLOAT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_GE_OPCODE_DOUBLE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_ULE_OPCODE_BYTE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_ULE_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_ULE_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_ULT_OPCODE_BYTE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_ULT_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_ULT_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_UGT_OPCODE_BYTE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_UGT_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_UGT_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_UGE_OPCODE_BYTE : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_UGE_OPCODE_INT : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_UGE_OPCODE_LONG : {
       DECODE_F();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DISPATCH_OPCODE : {
       DECODE_A_UNSIGNED();
       DECODE_TGTS();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case DISPATCH_METHOD_OPCODE : {
       DECODE_A_UNSIGNED();
       DECODE_TGTS();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case JUMP_REG_OPCODE : {
       DECODE_C();
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     }
