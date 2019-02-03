@@ -312,6 +312,16 @@
 //===================== MAIN LOOP ============================
 //============================================================
 
+//What does the machine need to run?
+//- Pointer to instructions
+//- Pointer to registers
+//- Pointer to top of heap (for allocation)
+//- Pointer to limit of heap (for knowing when to call gc)
+//- Pointer to stack (for call frames)
+//- Pointer to end of stack (for knowing when to build stack)
+//- Current stack
+
+
 void vmloop (char* instructions, int n){
   printf("VM Loop!\n");
   printf("Instructions = %p\n", instructions);
