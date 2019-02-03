@@ -249,15 +249,19 @@
 #define PC_INT() \
   ({unsigned int _x = *(unsigned int*)pc; \
     pc += 4; \
-    _x;}); 
+    _x;});
 
 #define PC_LONG() \
   ({uint64_t _x = *(uint64_t*)pc; \
     pc += 8; \
-    _x;}); 
+    _x;});
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
+  printf("[%d | %d]\n", opcode, value);
+
+#define DECODE_A_SIGNED() \
+  int value = (int)W1 >> 8; \
   printf("[%d | %d]\n", opcode, value);
 
 #define DECODE_B_UNSIGNED() \
@@ -286,6 +290,24 @@
   int value = (int)((int64_t)W12 >> 38); \
   printf("[%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
 
+#define DECODE_F() \
+  unsigned int W2 = PC_INT(); \
+  uint64_t W12 = W1 | ((uint64_t)W2 << 32); \
+  int x = (int)(W12 >> 8) & 0x3FF;  \
+  int y = (int)(W12 >> 18) & 0x3FF; \
+  int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
+  int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
+  int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
+  printf("[%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
+
+#define DECODE_TGTS() \
+  int n = PC_INT(); \
+  for(int i=0; i<n; i++){ \
+    int tgt = PC_INT(); \
+    printf("  tgt: %d\n", tgt); \
+  }
+    
+
 //============================================================
 //===================== MAIN LOOP ============================
 //============================================================
@@ -295,9 +317,17 @@ void vmloop (char* instructions, int n){
   printf("Instructions = %p\n", instructions);
   printf("Total = %d bytes\n", n);
 
+//  //Print out characters
+//  for(int i=0; i<n; i+=4){
+//    int* pc = (int*)(instructions + i);
+//    int word = *pc;
+//    printf("%d ", word);
+//  }
+//  printf("\n");
+
 
   //Machine Parameters
-  char* pc = instructions;  
+  char* pc = instructions;
   char* pc_end = instructions+n;
   while(pc < pc_end){
     unsigned int W1 = PC_INT();
@@ -371,7 +401,10 @@ void vmloop (char* instructions, int n){
       DECODE_C();
       continue;
     }
-    case SET_REG_OPCODE_WIDE : {break;}
+    case SET_REG_OPCODE_WIDE : {
+      DECODE_D();
+      continue;
+    }
     case GET_REG_OPCODE : {
       DECODE_B_UNSIGNED();
       continue;
@@ -388,14 +421,38 @@ void vmloop (char* instructions, int n){
       DECODE_C();
       continue;
     }
-    case CALL_CLOSURE_OPCODE : {break;}
-    case TCALL_OPCODE_LOCAL : {break;}
-    case TCALL_OPCODE_CODE : {break;}
-    case TCALL_OPCODE_EXTERN : {break;}
-    case TCALL_CLOSURE_OPCODE : {break;}
-    case CALLC_OPCODE_LOCAL : {break;}
-    case CALLC_OPCODE_CODE : {break;}
-    case CALLC_OPCODE_EXTERN : {break;}
+    case CALL_CLOSURE_OPCODE : {
+      DECODE_C();
+      continue;
+    }
+    case TCALL_OPCODE_LOCAL : {
+      DECODE_C();
+      continue;
+    }
+    case TCALL_OPCODE_CODE : {
+      DECODE_C();
+      continue;
+    }
+    case TCALL_OPCODE_EXTERN : {
+      DECODE_C();
+      continue;
+    }
+    case TCALL_CLOSURE_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case CALLC_OPCODE_LOCAL : {
+      DECODE_C();
+      continue;
+    }
+    case CALLC_OPCODE_CODE : {
+      DECODE_C();
+      continue;
+    }
+    case CALLC_OPCODE_EXTERN : {
+      DECODE_C();
+      continue;
+    }
     case POP_FRAME_OPCODE : {
       DECODE_A_UNSIGNED();
       continue;
@@ -404,9 +461,18 @@ void vmloop (char* instructions, int n){
       DECODE_A_UNSIGNED();
       continue;
     }
-    case YIELD_OPCODE : {break;}
-    case RETURN_OPCODE : {break;}
-    case DUMP_OPCODE : {break;}
+    case YIELD_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case RETURN_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case DUMP_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
     case INT_ADD_OPCODE : {break;}
     case INT_SUB_OPCODE : {break;}
     case INT_MUL_OPCODE : {break;}
@@ -505,41 +571,140 @@ void vmloop (char* instructions, int n){
     case UGE_OPCODE_BYTE : {break;}
     case UGE_OPCODE_INT : {break;}
     case UGE_OPCODE_LONG : {break;}
-    case INT_NOT_OPCODE : {break;}
-    case INT_NEG_OPCODE : {break;}
-    case NOT_OPCODE_BYTE : {break;}
-    case NOT_OPCODE_INT : {break;}
-    case NOT_OPCODE_LONG : {break;}
-    case NEG_OPCODE_INT : {break;}
-    case NEG_OPCODE_LONG : {break;}
-    case NEG_OPCODE_FLOAT : {break;}
-    case NEG_OPCODE_DOUBLE : {break;}
-    case DEREF_OPCODE : {break;}
+    case INT_NOT_OPCODE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case INT_NEG_OPCODE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case NOT_OPCODE_BYTE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case NOT_OPCODE_INT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case NOT_OPCODE_LONG : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case NEG_OPCODE_INT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case NEG_OPCODE_LONG : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case NEG_OPCODE_FLOAT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case NEG_OPCODE_DOUBLE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case DEREF_OPCODE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
     case TYPEOF_OPCODE : {break;}
     case JUMP_SET_OPCODE : {break;}
-    case GOTO_OPCODE : {break;}
-    case CONV_OPCODE_BYTE_FLOAT : {break;}
-    case CONV_OPCODE_BYTE_DOUBLE : {break;}
-    case CONV_OPCODE_INT_BYTE : {break;}
-    case CONV_OPCODE_INT_FLOAT : {break;}
-    case CONV_OPCODE_INT_DOUBLE : {break;}
-    case CONV_OPCODE_LONG_BYTE : {break;}
-    case CONV_OPCODE_LONG_INT : {break;}
-    case CONV_OPCODE_LONG_FLOAT : {break;}
-    case CONV_OPCODE_LONG_DOUBLE : {break;}
-    case CONV_OPCODE_FLOAT_BYTE : {break;}
-    case CONV_OPCODE_FLOAT_INT : {break;}
-    case CONV_OPCODE_FLOAT_LONG : {break;}
-    case CONV_OPCODE_FLOAT_DOUBLE : {break;}
-    case CONV_OPCODE_DOUBLE_BYTE : {break;}
-    case CONV_OPCODE_DOUBLE_INT : {break;}
-    case CONV_OPCODE_DOUBLE_LONG : {break;}
-    case CONV_OPCODE_DOUBLE_FLOAT : {break;}
-    case DETAG_OPCODE : {break;}
-    case TAG_OPCODE_BYTE : {break;}
-    case TAG_OPCODE_CHAR : {break;}
-    case TAG_OPCODE_INT : {break;}
-    case TAG_OPCODE_FLOAT : {break;}
+    case GOTO_OPCODE : {
+      DECODE_A_SIGNED();
+      continue;
+    }
+    case CONV_OPCODE_BYTE_FLOAT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_BYTE_DOUBLE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_INT_BYTE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_INT_FLOAT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_INT_DOUBLE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_LONG_BYTE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_LONG_INT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_LONG_FLOAT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_LONG_DOUBLE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_FLOAT_BYTE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_FLOAT_INT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_FLOAT_LONG : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_FLOAT_DOUBLE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_DOUBLE_BYTE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_DOUBLE_INT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_DOUBLE_LONG : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CONV_OPCODE_DOUBLE_FLOAT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case DETAG_OPCODE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case TAG_OPCODE_BYTE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case TAG_OPCODE_CHAR : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case TAG_OPCODE_INT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case TAG_OPCODE_FLOAT : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
     case STORE_OPCODE : {
       DECODE_E();
       continue;
@@ -577,64 +742,226 @@ void vmloop (char* instructions, int n){
     case NEW_STACK_OPCODE : {break;}
     case ALLOC_OPCODE_CONST : {break;}
     case ALLOC_OPCODE_LOCAL : {break;}
-    case GC_OPCODE : {break;}
-    case PRINT_STACK_TRACE_OPCODE : {break;}
-    case CURRENT_STACK_OPCODE : {break;}
-    case FLUSH_VM_OPCODE : {break;}
-    case GLOBALS_OPCODE : {break;}
-    case CONSTS_OPCODE : {break;}
-    case CONSTS_DATA_OPCODE : {break;}
-    case JUMP_INT_LT_OPCODE : {break;}
-    case JUMP_INT_GT_OPCODE : {break;}
-    case JUMP_INT_LE_OPCODE : {break;}
-    case JUMP_INT_GE_OPCODE : {break;}
-    case JUMP_EQ_OPCODE_REF : {break;}
-    case JUMP_EQ_OPCODE_BYTE : {break;}
-    case JUMP_EQ_OPCODE_INT : {break;}
-    case JUMP_EQ_OPCODE_LONG : {break;}
-    case JUMP_EQ_OPCODE_FLOAT : {break;}
-    case JUMP_EQ_OPCODE_DOUBLE : {break;}
-    case JUMP_NE_OPCODE_REF : {break;}
-    case JUMP_NE_OPCODE_BYTE : {break;}
-    case JUMP_NE_OPCODE_INT : {break;}
-    case JUMP_NE_OPCODE_LONG : {break;}
-    case JUMP_NE_OPCODE_FLOAT : {break;}
-    case JUMP_NE_OPCODE_DOUBLE : {break;}
-    case JUMP_LT_OPCODE_INT : {break;}
-    case JUMP_LT_OPCODE_LONG : {break;}
-    case JUMP_LT_OPCODE_FLOAT : {break;}
-    case JUMP_LT_OPCODE_DOUBLE : {break;}
-    case JUMP_GT_OPCODE_INT : {break;}
-    case JUMP_GT_OPCODE_LONG : {break;}
-    case JUMP_GT_OPCODE_FLOAT : {break;}
-    case JUMP_GT_OPCODE_DOUBLE : {break;}
-    case JUMP_LE_OPCODE_INT : {break;}
-    case JUMP_LE_OPCODE_LONG : {break;}
-    case JUMP_LE_OPCODE_FLOAT : {break;}
-    case JUMP_LE_OPCODE_DOUBLE : {break;}
-    case JUMP_GE_OPCODE_INT : {break;}
-    case JUMP_GE_OPCODE_LONG : {break;}
-    case JUMP_GE_OPCODE_FLOAT : {break;}
-    case JUMP_GE_OPCODE_DOUBLE : {break;}
-    case JUMP_ULE_OPCODE_BYTE : {break;}
-    case JUMP_ULE_OPCODE_INT : {break;}
-    case JUMP_ULE_OPCODE_LONG : {break;}
-    case JUMP_ULT_OPCODE_BYTE : {break;}
-    case JUMP_ULT_OPCODE_INT : {break;}
-    case JUMP_ULT_OPCODE_LONG : {break;}
-    case JUMP_UGT_OPCODE_BYTE : {break;}
-    case JUMP_UGT_OPCODE_INT : {break;}
-    case JUMP_UGT_OPCODE_LONG : {break;}
-    case JUMP_UGE_OPCODE_BYTE : {break;}
-    case JUMP_UGE_OPCODE_INT : {break;}
-    case JUMP_UGE_OPCODE_LONG : {break;}
-    case DISPATCH_OPCODE : {break;}
-    case DISPATCH_METHOD_OPCODE : {break;}
+    case GC_OPCODE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case PRINT_STACK_TRACE_OPCODE : {
+      DECODE_B_UNSIGNED();
+      continue;
+    }
+    case CURRENT_STACK_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case FLUSH_VM_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case GLOBALS_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case CONSTS_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case CONSTS_DATA_OPCODE : {
+      DECODE_A_UNSIGNED();
+      continue;
+    }
+    case JUMP_INT_LT_OPCODE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_INT_GT_OPCODE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_INT_LE_OPCODE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_INT_GE_OPCODE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_EQ_OPCODE_REF : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_EQ_OPCODE_BYTE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_EQ_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_EQ_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_EQ_OPCODE_FLOAT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_EQ_OPCODE_DOUBLE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_NE_OPCODE_REF : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_NE_OPCODE_BYTE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_NE_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_NE_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_NE_OPCODE_FLOAT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_NE_OPCODE_DOUBLE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LT_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LT_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LT_OPCODE_FLOAT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LT_OPCODE_DOUBLE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GT_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GT_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GT_OPCODE_FLOAT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GT_OPCODE_DOUBLE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LE_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LE_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LE_OPCODE_FLOAT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_LE_OPCODE_DOUBLE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GE_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GE_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GE_OPCODE_FLOAT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_GE_OPCODE_DOUBLE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_ULE_OPCODE_BYTE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_ULE_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_ULE_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_ULT_OPCODE_BYTE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_ULT_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_ULT_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_UGT_OPCODE_BYTE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_UGT_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_UGT_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_UGE_OPCODE_BYTE : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_UGE_OPCODE_INT : {
+      DECODE_F();
+      continue;
+    }
+    case JUMP_UGE_OPCODE_LONG : {
+      DECODE_F();
+      continue;
+    }
+    case DISPATCH_OPCODE : {
+      DECODE_A_UNSIGNED();
+      DECODE_TGTS();
+      continue;
+    }
+    case DISPATCH_METHOD_OPCODE : {
+      DECODE_A_UNSIGNED();
+      DECODE_TGTS();
+      continue;
+    }
     case JUMP_REG_OPCODE : {break;}
     }
-    
+
     //Done
     printf("opcode = %d\n", opcode);
+    printf("W1 = %x\n", W1);
     exit(-1);
     return;
   }
