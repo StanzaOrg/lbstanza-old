@@ -245,6 +245,7 @@
 #define DISPATCH_OPCODE 236
 #define DISPATCH_METHOD_OPCODE 237
 #define JUMP_REG_OPCODE 238
+#define FNENTRY_OPCODE 239
 
 //============================================================
 //===================== READ MACROS ==========================
@@ -390,6 +391,7 @@ void vmloop (char* instructions, int n,
   //Retrieve starting program counter
   Stack* stk = untag_stack(current_stack);
   StackFrame* stack_pointer = stk->stack_pointer;
+  char* stack_end = (char*)(stk->frames) + stk->size;
   char* pc = instructions + stk->pc * 4;
 
   //Machine Parameters
@@ -501,14 +503,22 @@ void vmloop (char* instructions, int n,
     }
     case CALL_OPCODE_LOCAL : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int num_locals = y;
+      uint64_t fid = LOCAL(value);
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
+      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      stack_pointer->returnpc = (uint64_t)pc;
+      pc = instructions + fpos;
       continue;
     }
     case CALL_OPCODE_CODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int num_locals = y;
+      uint64_t fid = value;
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
+      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      stack_pointer->returnpc = (uint64_t)pc;
+      pc = instructions + fpos;
       continue;
     }
     case CALL_OPCODE_EXTERN : {
@@ -559,13 +569,8 @@ void vmloop (char* instructions, int n,
     }
     case CALLC_OPCODE_CODE : {
       DECODE_C();
-      int offset = code_offsets[value];
-      uint64_t faddr = (uint64_t)(instructions + offset * 4);
-      int format = x;
-      int num_locals = y;
-      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
-      call_c_launcher(format, faddr, registers);
-      stack_pointer = (StackFrame*)((char*)stack_pointer - num_locals * 8);
+      printf("Not yet implemented.\n");
+      exit(-1);
       continue;
     }
     case CALLC_OPCODE_EXTERN : {
@@ -1846,6 +1851,16 @@ void vmloop (char* instructions, int n,
       DECODE_C();
       printf("Not yet implemented.\n");
       exit(-1);
+      continue;
+    }
+    case FNENTRY_OPCODE : {
+      DECODE_A_UNSIGNED();
+      int frame_size = value * 8 + sizeof(StackFrame);
+      int size_required = frame_size + sizeof(StackFrame);
+      if((char*)stack_pointer + size_required > stack_end){
+        printf("Stack extension not yet implemented.\n");
+        exit(-1);
+      }
       continue;
     }
     }
