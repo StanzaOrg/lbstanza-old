@@ -365,7 +365,16 @@ void vmloop (char* instructions, int n,
              char* heap_top,
              char* heap_limit,
              uint64_t* registers,
-             uint64_t current_stack){
+             uint64_t current_stack,
+             uint64_t* global_offsets,
+             char* global_mem,
+             uint64_t* consts_table,
+             uint64_t* new_consts,
+             char* consts_data_mem,
+             uint64_t* data_offsets,
+             char* data_mem,
+             uint64_t* extern_table,
+             uint32_t* code_offsets){
   printf("VM Loop!\n");
   printf("Instructions = %p\n", instructions);
   printf("Total = %d bytes\n", n);
@@ -389,110 +398,96 @@ void vmloop (char* instructions, int n,
     switch(opcode){
     case SET_OPCODE_LOCAL : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(y, LOCAL(value));      
       continue;
     }
     case SET_OPCODE_UNSIGNED : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(y, (uint64_t)value);      
       continue;
     }
     case SET_OPCODE_SIGNED : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(y, (int64_t)value);      
       continue;
     }
     case SET_OPCODE_CODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(y, value);
       continue;
     }
     case SET_OPCODE_EXTERN : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(y, extern_table[value]);
       continue;
     }
     case SET_OPCODE_GLOBAL : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      char* address = global_mem + global_offsets[value];
+      SET_LOCAL(y, (uint64_t)address);
       continue;
     }
     case SET_OPCODE_DATA : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      char* address = data_mem + data_offsets[value];
+      SET_LOCAL(y, (uint64_t)address);
       continue;
     }
     case SET_OPCODE_CONST : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(y, consts_table[value]);
       continue;
     }
     case SET_OPCODE_WIDE : {
       DECODE_D();
-      printf("SET_LOCAL(%d, %lx)\n", y, value);
       SET_LOCAL(y, value);      
       continue;
     }
     case SET_REG_OPCODE_LOCAL : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_REG(y, LOCAL(value));      
       continue;
     }
     case SET_REG_OPCODE_UNSIGNED : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_REG(y, (uint64_t)value);   
       continue;
     }
     case SET_REG_OPCODE_SIGNED : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_REG(y, (int64_t)value); 
       continue;
     }
     case SET_REG_OPCODE_CODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_REG(y, value);
       continue;
     }
     case SET_REG_OPCODE_EXTERN : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_REG(y, extern_table[value]);
       continue;
     }
     case SET_REG_OPCODE_GLOBAL : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      char* address = global_mem + global_offsets[value];
+      SET_REG(y, (uint64_t)address);
       continue;
     }
     case SET_REG_OPCODE_DATA : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      char* address = data_mem + data_offsets[value];
+      SET_REG(y, (uint64_t)address);
       continue;
     }
     case SET_REG_OPCODE_CONST : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_REG(y, consts_table[value]);
       continue;
     }
     case SET_REG_OPCODE_WIDE : {
       DECODE_D();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_REG(y, value);      
       continue;
     }
     case GET_REG_OPCODE : {
@@ -1410,22 +1405,8 @@ void vmloop (char* instructions, int n,
     }
     case STORE_OPCODE_8 : {
       DECODE_E();
-      uint64_t base = LOCAL(x);
-      int offset = value;
-      printf("base LOCAL(%d) = %llx\n", x, base);
-      printf("offset = %d\n", offset);
-
-      
       int64_t* address = (int64_t*)(LOCAL(x) + value);
-      printf("address = %p\n", address);
-
-
-      
       int64_t storeval = (int64_t)(LOCAL(z));
-      printf("storeval LOCAL(%d) = %llx\n", z, storeval);
-
-
-      
       *address = storeval;     
       continue;
     }
