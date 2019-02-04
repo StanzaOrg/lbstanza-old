@@ -496,8 +496,7 @@ void vmloop (char* instructions, int n,
     }
     case GET_REG_OPCODE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, registers[value]);
       continue;
     }
     case CALL_OPCODE_LOCAL : {
