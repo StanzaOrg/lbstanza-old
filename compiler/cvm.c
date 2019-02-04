@@ -343,7 +343,7 @@
   stack_pointer = (StackFrame*)((char*)stack_pointer + sizeof(StackFrame) + (num_locals) * 8);  
 
 #define POP_FRAME(num_locals) \
-  stack_pointer = (StackFrame*)((char*)stack_pointer + sizeof(StackFrame) - (num_locals) * 8);  
+  stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);  
 
 #define BOOLREF(x) (((x) << 3) + 2)
 
@@ -397,7 +397,7 @@ void vmloop (char* instructions, int n,
              uint64_t* consts_table,
              uint64_t* new_consts,
              char* consts_data_mem,
-             uint64_t* data_offsets,
+             uint32_t* data_offsets,
              char* data_mem,
              uint64_t* extern_table,
              uint32_t* code_offsets){
@@ -456,7 +456,7 @@ void vmloop (char* instructions, int n,
     }
     case SET_OPCODE_DATA : {
       DECODE_C();
-      char* address = data_mem + data_offsets[value];
+      char* address = data_mem + 8 * data_offsets[value];
       SET_LOCAL(y, (uint64_t)address);
       continue;
     }
@@ -503,7 +503,7 @@ void vmloop (char* instructions, int n,
     }
     case SET_REG_OPCODE_DATA : {
       DECODE_C();
-      char* address = data_mem + data_offsets[value];
+      char* address = data_mem + 8 * data_offsets[value];
       SET_REG(y, (uint64_t)address);
       continue;
     }
