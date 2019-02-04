@@ -325,7 +325,11 @@
   stack_pointer->slots[l] = v;
 #define LOCAL(l) (stack_pointer->slots[l])
 
-//  printf("SET_LOCAL(%d, %llx)\n", l, v); \
+//============================================================
+//========================= TRAPS ============================
+//============================================================
+
+int call_c_launcher (int index, uint64_t faddr, uint64_t* registers);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -558,8 +562,12 @@ void vmloop (char* instructions, int n,
     }
     case CALLC_OPCODE_EXTERN : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      uint64_t faddr = extern_table[value];
+      int format = x;
+      int num_locals = y;
+      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      call_c_launcher(format, faddr, registers);
+      stack_pointer = (StackFrame*)((char*)stack_pointer - num_locals * 8);
       continue;
     }
     case POP_FRAME_OPCODE : {
