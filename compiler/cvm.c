@@ -633,8 +633,13 @@ void vmloop (char* instructions, int n,
     }
     case DUMP_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int64_t xl = (int64_t)LOCAL(value);
+      char xb = (char)xl;
+      int xi = (int)xl;        
+      float xf = LOCAL_FLOAT(value);
+      float xd = LOCAL_DOUBLE(value);
+      printf("DUMP LOCAL %d: (byte = %d, int = %d, long = %d, float = %f, double = %f)\n",
+             value, xb, xi, xl, xf, xd);
       continue;
     }
     case INT_ADD_OPCODE : {
