@@ -339,6 +339,12 @@
   ({double* addr = (double*)&(stack_pointer->slots[l]); \
     *addr;})
 
+#define PUSH_FRAME(num_locals) \
+  stack_pointer = (StackFrame*)((char*)stack_pointer + sizeof(StackFrame) + (num_locals) * 8);  
+
+#define POP_FRAME(num_locals) \
+  stack_pointer = (StackFrame*)((char*)stack_pointer + sizeof(StackFrame) - (num_locals) * 8);  
+
 //============================================================
 //========================= TRAPS ============================
 //============================================================
@@ -518,8 +524,8 @@ void vmloop (char* instructions, int n,
       DECODE_C();
       int num_locals = y;
       uint64_t fid = LOCAL(value);
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
-      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      PUSH_FRAME(num_locals);
       stack_pointer->returnpc = (uint64_t)pc;
       pc = instructions + fpos;
       continue;
@@ -529,7 +535,7 @@ void vmloop (char* instructions, int n,
       int num_locals = y;
       uint64_t fid = value;
       uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
-      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      PUSH_FRAME(num_locals);
       stack_pointer->returnpc = (uint64_t)pc;
       pc = instructions + fpos;
       continue;
@@ -575,9 +581,9 @@ void vmloop (char* instructions, int n,
       uint64_t faddr = LOCAL(value);
       int format = x;
       int num_locals = y;
-      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      PUSH_FRAME(num_locals);
       call_c_launcher(format, faddr, registers);
-      stack_pointer = (StackFrame*)((char*)stack_pointer - num_locals * 8);
+      POP_FRAME(num_locals);
       continue;
     }
     case CALLC_OPCODE_CODE : {
@@ -591,15 +597,15 @@ void vmloop (char* instructions, int n,
       uint64_t faddr = extern_table[value];
       int format = x;
       int num_locals = y;
-      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      PUSH_FRAME(num_locals);
       call_c_launcher(format, faddr, registers);
-      stack_pointer = (StackFrame*)((char*)stack_pointer - num_locals * 8);
+      POP_FRAME(num_locals);
       continue;
     }
     case POP_FRAME_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int num_locals = value;
+      POP_FRAME(num_locals);
       continue;
     }
     case LIVE_OPCODE : {
@@ -615,8 +621,12 @@ void vmloop (char* instructions, int n,
     }
     case RETURN_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int64_t retpc = stack_pointer->returnpc;
+      if(retpc < 0){
+        printf("RETURN\n");
+        return;
+      }
+      pc = (char*)retpc;
       continue;
     }
     case DUMP_OPCODE : {
@@ -1217,9 +1227,14 @@ void vmloop (char* instructions, int n,
     }
     case JUMP_SET_OPCODE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      if(LOCAL(x)){
+        pc += (n1 * 4) - FSIZE;
+        continue;
+      }
+      else{
+        pc += (n2 * 4) - FSIZE;
+        continue;
+      }
     }
     case GOTO_OPCODE : {
       DECODE_A_SIGNED();
