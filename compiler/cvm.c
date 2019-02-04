@@ -1541,8 +1541,7 @@ void vmloop (char* instructions, int n,
     }
     case CURRENT_STACK_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(value, current_stack);
       continue;
     }
     case FLUSH_VM_OPCODE : {
@@ -1559,14 +1558,12 @@ void vmloop (char* instructions, int n,
     }
     case CONSTS_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(value, (uint64_t)new_consts);
       continue;
     }
     case CONSTS_DATA_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(value, (uint64_t)consts_data_mem);
       continue;
     }
     case JUMP_INT_LT_OPCODE : {
