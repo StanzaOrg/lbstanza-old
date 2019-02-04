@@ -174,73 +174,77 @@
 #define TAG_OPCODE_CHAR 165
 #define TAG_OPCODE_INT 166
 #define TAG_OPCODE_FLOAT 167
-#define STORE_OPCODE 168
-#define STORE_OPCODE_VAR_OFFSET 169
-#define STORE_OPCODE_REF 170
-#define STORE_OPCODE_REF_VAR_OFFSET 171
-#define LOAD_OPCODE 172
-#define LOAD_OPCODE_VAR_OFFSET 173
-#define LOAD_OPCODE_REF 174
-#define LOAD_OPCODE_REF_VAR_OFFSET 175
-#define RESERVE_OPCODE_LOCAL 176
-#define RESERVE_OPCODE_CONST 177
-#define NEW_STACK_OPCODE 178
-#define ALLOC_OPCODE_CONST 179
-#define ALLOC_OPCODE_LOCAL 180
-#define GC_OPCODE 181
-#define PRINT_STACK_TRACE_OPCODE 182
-#define CURRENT_STACK_OPCODE 183
-#define FLUSH_VM_OPCODE 184
-#define GLOBALS_OPCODE 185
-#define CONSTS_OPCODE 186
-#define CONSTS_DATA_OPCODE 187
-#define JUMP_INT_LT_OPCODE 188
-#define JUMP_INT_GT_OPCODE 189
-#define JUMP_INT_LE_OPCODE 190
-#define JUMP_INT_GE_OPCODE 191
-#define JUMP_EQ_OPCODE_REF 192
-#define JUMP_EQ_OPCODE_BYTE 193
-#define JUMP_EQ_OPCODE_INT 194
-#define JUMP_EQ_OPCODE_LONG 195
-#define JUMP_EQ_OPCODE_FLOAT 196
-#define JUMP_EQ_OPCODE_DOUBLE 197
-#define JUMP_NE_OPCODE_REF 198
-#define JUMP_NE_OPCODE_BYTE 199
-#define JUMP_NE_OPCODE_INT 200
-#define JUMP_NE_OPCODE_LONG 201
-#define JUMP_NE_OPCODE_FLOAT 202
-#define JUMP_NE_OPCODE_DOUBLE 203
-#define JUMP_LT_OPCODE_INT 204
-#define JUMP_LT_OPCODE_LONG 205
-#define JUMP_LT_OPCODE_FLOAT 206
-#define JUMP_LT_OPCODE_DOUBLE 207
-#define JUMP_GT_OPCODE_INT 208
-#define JUMP_GT_OPCODE_LONG 209
-#define JUMP_GT_OPCODE_FLOAT 210
-#define JUMP_GT_OPCODE_DOUBLE 211
-#define JUMP_LE_OPCODE_INT 212
-#define JUMP_LE_OPCODE_LONG 213
-#define JUMP_LE_OPCODE_FLOAT 214
-#define JUMP_LE_OPCODE_DOUBLE 215
-#define JUMP_GE_OPCODE_INT 216
-#define JUMP_GE_OPCODE_LONG 217
-#define JUMP_GE_OPCODE_FLOAT 218
-#define JUMP_GE_OPCODE_DOUBLE 219
-#define JUMP_ULE_OPCODE_BYTE 220
-#define JUMP_ULE_OPCODE_INT 221
-#define JUMP_ULE_OPCODE_LONG 222
-#define JUMP_ULT_OPCODE_BYTE 223
-#define JUMP_ULT_OPCODE_INT 224
-#define JUMP_ULT_OPCODE_LONG 225
-#define JUMP_UGT_OPCODE_BYTE 226
-#define JUMP_UGT_OPCODE_INT 227
-#define JUMP_UGT_OPCODE_LONG 228
-#define JUMP_UGE_OPCODE_BYTE 229
-#define JUMP_UGE_OPCODE_INT 230
-#define JUMP_UGE_OPCODE_LONG 231
-#define DISPATCH_OPCODE 232
-#define DISPATCH_METHOD_OPCODE 233
-#define JUMP_REG_OPCODE 234
+#define STORE_OPCODE_1 168
+#define STORE_OPCODE_4 169
+#define STORE_OPCODE_8 170
+#define STORE_OPCODE_1_VAR_OFFSET 171
+#define STORE_OPCODE_4_VAR_OFFSET 172
+#define STORE_OPCODE_8_VAR_OFFSET 173
+#define LOAD_OPCODE_1 174
+#define LOAD_OPCODE_4 175
+#define LOAD_OPCODE_8 176
+#define LOAD_OPCODE_1_VAR_OFFSET 177
+#define LOAD_OPCODE_4_VAR_OFFSET 178
+#define LOAD_OPCODE_8_VAR_OFFSET 179
+#define RESERVE_OPCODE_LOCAL 180
+#define RESERVE_OPCODE_CONST 181
+#define NEW_STACK_OPCODE 182
+#define ALLOC_OPCODE_CONST 183
+#define ALLOC_OPCODE_LOCAL 184
+#define GC_OPCODE 185
+#define PRINT_STACK_TRACE_OPCODE 186
+#define CURRENT_STACK_OPCODE 187
+#define FLUSH_VM_OPCODE 188
+#define GLOBALS_OPCODE 189
+#define CONSTS_OPCODE 190
+#define CONSTS_DATA_OPCODE 191
+#define JUMP_INT_LT_OPCODE 192
+#define JUMP_INT_GT_OPCODE 193
+#define JUMP_INT_LE_OPCODE 194
+#define JUMP_INT_GE_OPCODE 195
+#define JUMP_EQ_OPCODE_REF 196
+#define JUMP_EQ_OPCODE_BYTE 197
+#define JUMP_EQ_OPCODE_INT 198
+#define JUMP_EQ_OPCODE_LONG 199
+#define JUMP_EQ_OPCODE_FLOAT 200
+#define JUMP_EQ_OPCODE_DOUBLE 201
+#define JUMP_NE_OPCODE_REF 202
+#define JUMP_NE_OPCODE_BYTE 203
+#define JUMP_NE_OPCODE_INT 204
+#define JUMP_NE_OPCODE_LONG 205
+#define JUMP_NE_OPCODE_FLOAT 206
+#define JUMP_NE_OPCODE_DOUBLE 207
+#define JUMP_LT_OPCODE_INT 208
+#define JUMP_LT_OPCODE_LONG 209
+#define JUMP_LT_OPCODE_FLOAT 210
+#define JUMP_LT_OPCODE_DOUBLE 211
+#define JUMP_GT_OPCODE_INT 212
+#define JUMP_GT_OPCODE_LONG 213
+#define JUMP_GT_OPCODE_FLOAT 214
+#define JUMP_GT_OPCODE_DOUBLE 215
+#define JUMP_LE_OPCODE_INT 216
+#define JUMP_LE_OPCODE_LONG 217
+#define JUMP_LE_OPCODE_FLOAT 218
+#define JUMP_LE_OPCODE_DOUBLE 219
+#define JUMP_GE_OPCODE_INT 220
+#define JUMP_GE_OPCODE_LONG 221
+#define JUMP_GE_OPCODE_FLOAT 222
+#define JUMP_GE_OPCODE_DOUBLE 223
+#define JUMP_ULE_OPCODE_BYTE 224
+#define JUMP_ULE_OPCODE_INT 225
+#define JUMP_ULE_OPCODE_LONG 226
+#define JUMP_ULT_OPCODE_BYTE 227
+#define JUMP_ULT_OPCODE_INT 228
+#define JUMP_ULT_OPCODE_LONG 229
+#define JUMP_UGT_OPCODE_BYTE 230
+#define JUMP_UGT_OPCODE_INT 231
+#define JUMP_UGT_OPCODE_LONG 232
+#define JUMP_UGE_OPCODE_BYTE 233
+#define JUMP_UGE_OPCODE_INT 234
+#define JUMP_UGE_OPCODE_LONG 235
+#define DISPATCH_OPCODE 236
+#define DISPATCH_METHOD_OPCODE 237
+#define JUMP_REG_OPCODE 238
 
 //============================================================
 //===================== READ MACROS ==========================
@@ -255,6 +259,14 @@
   ({uint64_t _x = *(uint64_t*)pc; \
     pc += 8; \
     _x;});
+
+//Instruction sizes
+#define ASIZE 4
+#define BSIZE 4
+#define CSIZE 8
+#define DSIZE 12
+#define ESIZE 8
+#define FSIZE 8
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
@@ -306,7 +318,14 @@
     int tgt = PC_INT(); \
     printf("  tgt: %d\n", tgt); \
   }
-    
+
+#define SET_REG(r,v) \
+  registers[r] = v    
+#define SET_LOCAL(l,v) \
+  stack_pointer->slots[l] = v;
+#define LOCAL(l) (stack_pointer->slots[l])
+
+//  printf("SET_LOCAL(%d, %llx)\n", l, v); \
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -338,9 +357,13 @@ Stack* untag_stack (uint64_t current_stack){
   return (Stack*)(current_stack - 1 + 8);
 }
 
+uint64_t ptr_to_ref (void* p){
+  return (uint64_t)p + 1;
+}
+
 void vmloop (char* instructions, int n,
-             uint64_t* heap_top,
-             uint64_t* heap_limit,
+             char* heap_top,
+             char* heap_limit,
              uint64_t* registers,
              uint64_t current_stack){
   printf("VM Loop!\n");
@@ -414,8 +437,8 @@ void vmloop (char* instructions, int n,
     }
     case SET_OPCODE_WIDE : {
       DECODE_D();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      printf("SET_LOCAL(%d, %lx)\n", y, value);
+      SET_LOCAL(y, value);      
       continue;
     }
     case SET_REG_OPCODE_LOCAL : {
@@ -552,8 +575,7 @@ void vmloop (char* instructions, int n,
     }
     case LIVE_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      stack_pointer->liveness_map = value;
       continue;
     }
     case YIELD_OPCODE : {
@@ -1372,49 +1394,93 @@ void vmloop (char* instructions, int n,
       exit(-1);
       continue;
     }
-    case STORE_OPCODE : {
+    case STORE_OPCODE_1 : {
+      DECODE_E();
+      char* address = (char*)(LOCAL(x) + value);
+      char storeval = (char)(LOCAL(z));
+      *address = storeval;
+      continue;
+    }
+    case STORE_OPCODE_4 : {
+      DECODE_E();
+      int32_t* address = (int32_t*)(LOCAL(x) + value);
+      int32_t storeval = (int32_t)(LOCAL(z));
+      *address = storeval;     
+      continue;
+    }
+    case STORE_OPCODE_8 : {
+      DECODE_E();
+      uint64_t base = LOCAL(x);
+      int offset = value;
+      printf("base LOCAL(%d) = %llx\n", x, base);
+      printf("offset = %d\n", offset);
+
+      
+      int64_t* address = (int64_t*)(LOCAL(x) + value);
+      printf("address = %p\n", address);
+
+
+      
+      int64_t storeval = (int64_t)(LOCAL(z));
+      printf("storeval LOCAL(%d) = %llx\n", z, storeval);
+
+
+      
+      *address = storeval;     
+      continue;
+    }
+    case STORE_OPCODE_1_VAR_OFFSET : {
+      DECODE_E();
+      char* address = (char*)(LOCAL(x) + LOCAL(y) + value);
+      char storeval = (char)(LOCAL(z));
+      *address = storeval;
+      continue;
+    }
+    case STORE_OPCODE_4_VAR_OFFSET : {
+      DECODE_E();
+      int32_t* address = (int32_t*)(LOCAL(x) + LOCAL(y) + value);
+      int32_t storeval = (int32_t)(LOCAL(z));
+      *address = storeval;
+      continue;
+    }
+    case STORE_OPCODE_8_VAR_OFFSET : {
+      DECODE_E();
+      int64_t* address = (int64_t*)(LOCAL(x) + LOCAL(y) + value);
+      int64_t storeval = (int64_t)(LOCAL(z));
+      *address = storeval;     
+      continue;
+    }
+    case LOAD_OPCODE_1 : {
       DECODE_E();
       printf("Not yet implemented.\n");
       exit(-1);
       continue;
     }
-    case STORE_OPCODE_VAR_OFFSET : {
+    case LOAD_OPCODE_4 : {
       DECODE_E();
       printf("Not yet implemented.\n");
       exit(-1);
       continue;
     }
-    case STORE_OPCODE_REF : {
+    case LOAD_OPCODE_8 : {
       DECODE_E();
       printf("Not yet implemented.\n");
       exit(-1);
       continue;
     }
-    case STORE_OPCODE_REF_VAR_OFFSET : {
+    case LOAD_OPCODE_1_VAR_OFFSET : {
       DECODE_E();
       printf("Not yet implemented.\n");
       exit(-1);
       continue;
     }
-    case LOAD_OPCODE : {
+    case LOAD_OPCODE_4_VAR_OFFSET : {
       DECODE_E();
       printf("Not yet implemented.\n");
       exit(-1);
       continue;
     }
-    case LOAD_OPCODE_VAR_OFFSET : {
-      DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
-    case LOAD_OPCODE_REF : {
-      DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
-    case LOAD_OPCODE_REF_VAR_OFFSET : {
+    case LOAD_OPCODE_8_VAR_OFFSET : {
       DECODE_E();
       printf("Not yet implemented.\n");
       exit(-1);
@@ -1428,9 +1494,15 @@ void vmloop (char* instructions, int n,
     }
     case RESERVE_OPCODE_CONST : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      int size = value;
+      int offset = x * 4;
+      if(heap_top + size <= heap_limit){
+        pc += offset - CSIZE;
+        continue;
+      }else{
+        printf("GC Not yet implemented.\n");
+        exit(-1);
+      }
     }
     case NEW_STACK_OPCODE : {
       DECODE_B_UNSIGNED();
@@ -1440,8 +1512,11 @@ void vmloop (char* instructions, int n,
     }
     case ALLOC_OPCODE_CONST : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int num_bytes = y;
+      int type = value;
+      *(uint64_t*)heap_top = type;
+      SET_LOCAL(x, ptr_to_ref(heap_top));
+      heap_top = heap_top + num_bytes;
       continue;
     }
     case ALLOC_OPCODE_LOCAL : {
