@@ -324,7 +324,20 @@
   registers[r] = v    
 #define SET_LOCAL(l,v) \
   stack_pointer->slots[l] = v;
+#define SET_LOCAL_FLOAT(l,v) \
+  float* addr = (float*)&(stack_pointer->slots[l]); \
+  *addr = v;
+#define SET_LOCAL_DOUBLE(l,v) \
+  double* addr = (double*)&(stack_pointer->slots[l]); \
+  *addr = v;
+
 #define LOCAL(l) (stack_pointer->slots[l])
+#define LOCAL_FLOAT(l) \
+  ({float* addr = (float*)&(stack_pointer->slots[l]); \
+    *addr;})
+#define LOCAL_DOUBLE(l) \
+  ({double* addr = (double*)&(stack_pointer->slots[l]); \
+    *addr;})
 
 //============================================================
 //========================= TRAPS ============================
@@ -788,230 +801,192 @@ void vmloop (char* instructions, int n,
     }
     case ADD_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) + (char)(LOCAL(value)));
       continue;
     }
     case ADD_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) + (int32_t)(LOCAL(value)));
       continue;
     }
     case ADD_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) + (int64_t)(LOCAL(value)));
       continue;
     }
     case ADD_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_FLOAT(x, LOCAL_FLOAT(y) + LOCAL_FLOAT(value));
       continue;
     }
     case ADD_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_DOUBLE(x, LOCAL_DOUBLE(y) + LOCAL_DOUBLE(value));
       continue;
     }
     case SUB_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) - (char)(LOCAL(value)));
       continue;
     }
     case SUB_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) - (int32_t)(LOCAL(value)));
       continue;
     }
     case SUB_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) - (int64_t)(LOCAL(value)));
       continue;
     }
     case SUB_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_FLOAT(x, LOCAL_FLOAT(y) - LOCAL_FLOAT(value));
       continue;
     }
     case SUB_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_DOUBLE(x, LOCAL_DOUBLE(y) - LOCAL_DOUBLE(value));
       continue;
     }
     case MUL_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) * (char)(LOCAL(value)));
       continue;
     }
     case MUL_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) * (int32_t)(LOCAL(value)));
       continue;
     }
     case MUL_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) * (int64_t)(LOCAL(value)));
       continue;
     }
     case MUL_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_FLOAT(x, LOCAL_FLOAT(y) * LOCAL_FLOAT(value));
       continue;
     }
     case MUL_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_DOUBLE(x, LOCAL_DOUBLE(y) * LOCAL_DOUBLE(value));
       continue;
-    }
+    }      
     case DIV_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) / (char)(LOCAL(value)));
       continue;
     }
     case DIV_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) / (int32_t)(LOCAL(value)));
       continue;
     }
     case DIV_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) / (int64_t)(LOCAL(value)));
       continue;
     }
     case DIV_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_FLOAT(x, LOCAL_FLOAT(y) / LOCAL_FLOAT(value));
       continue;
     }
     case DIV_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_DOUBLE(x, LOCAL_DOUBLE(y) / LOCAL_DOUBLE(value));
       continue;
-    }
+    }            
     case MOD_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) % (char)(LOCAL(value)));
       continue;
     }
     case MOD_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) % (int32_t)(LOCAL(value)));
       continue;
     }
     case MOD_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) % (int64_t)(LOCAL(value)));
       continue;
     }
     case AND_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) & (char)(LOCAL(value)));
       continue;
     }
     case AND_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) & (int32_t)(LOCAL(value)));
       continue;
     }
     case AND_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) & (int64_t)(LOCAL(value)));
       continue;
     }
     case OR_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) | (char)(LOCAL(value)));
       continue;
     }
     case OR_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) | (int32_t)(LOCAL(value)));
       continue;
     }
     case OR_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) | (int64_t)(LOCAL(value)));
       continue;
     }
     case XOR_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) ^ (char)(LOCAL(value)));
       continue;
     }
     case XOR_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) ^ (int32_t)(LOCAL(value)));
       continue;
     }
     case XOR_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) ^ (int64_t)(LOCAL(value)));
       continue;
     }
     case SHL_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (char)(LOCAL(y)) << (char)(LOCAL(value)));
       continue;
     }
     case SHL_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) << (int32_t)(LOCAL(value)));
       continue;
     }
     case SHL_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) << (int64_t)(LOCAL(value)));
       continue;
     }
     case SHR_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (unsigned char)(LOCAL(y)) >> (unsigned char)(LOCAL(value)));
       continue;
     }
     case SHR_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint32_t)(LOCAL(y)) >> (uint32_t)(LOCAL(value)));
       continue;
     }
     case SHR_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint64_t)(LOCAL(y)) >> (uint64_t)(LOCAL(value)));
       continue;
     }
     case ASHR_OPCODE_BYTE : {
@@ -1022,184 +997,158 @@ void vmloop (char* instructions, int n,
     }
     case ASHR_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) >> (int32_t)(LOCAL(value)));
       continue;
     }
     case ASHR_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) >> (int64_t)(LOCAL(value)));
       continue;
     }
     case LT_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) < (int32_t)(LOCAL(value)));
       continue;
     }
     case LT_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) < (int64_t)(LOCAL(value)));
       continue;
     }
     case LT_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_FLOAT(y) < LOCAL_FLOAT(value));
       continue;
     }
     case LT_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_DOUBLE(y) < LOCAL_DOUBLE(value));
       continue;
     }
     case GT_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) > (int32_t)(LOCAL(value)));
       continue;
     }
     case GT_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) > (int64_t)(LOCAL(value)));
       continue;
     }
     case GT_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_FLOAT(y) > LOCAL_FLOAT(value));
       continue;
     }
     case GT_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_DOUBLE(y) > LOCAL_DOUBLE(value));
       continue;
     }
     case LE_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) <= (int32_t)(LOCAL(value)));
       continue;
     }
     case LE_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) <= (int64_t)(LOCAL(value)));
       continue;
     }
     case LE_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_FLOAT(y) <= LOCAL_FLOAT(value));
       continue;
     }
     case LE_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_DOUBLE(y) <= LOCAL_DOUBLE(value));
       continue;
     }
     case GE_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int32_t)(LOCAL(y)) >= (int32_t)(LOCAL(value)));
       continue;
     }
     case GE_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (int64_t)(LOCAL(y)) >= (int64_t)(LOCAL(value)));
       continue;
     }
     case GE_OPCODE_FLOAT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_FLOAT(y) >= LOCAL_FLOAT(value));
       continue;
     }
     case GE_OPCODE_DOUBLE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL_DOUBLE(y) >= LOCAL_DOUBLE(value));
       continue;
     }
+
     case ULE_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint8_t)(LOCAL(y)) <= (uint8_t)(LOCAL(value)));
       continue;
     }
     case ULE_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint32_t)(LOCAL(y)) <= (uint32_t)(LOCAL(value)));
       continue;
     }
     case ULE_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint64_t)(LOCAL(y)) <= (uint64_t)(LOCAL(value)));
       continue;
     }
     case ULT_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint8_t)(LOCAL(y)) < (uint8_t)(LOCAL(value)));
       continue;
     }
     case ULT_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint32_t)(LOCAL(y)) < (uint32_t)(LOCAL(value)));
       continue;
     }
     case ULT_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint64_t)(LOCAL(y)) < (uint64_t)(LOCAL(value)));
       continue;
     }
     case UGT_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint8_t)(LOCAL(y)) > (uint8_t)(LOCAL(value)));
       continue;
     }
     case UGT_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint32_t)(LOCAL(y)) > (uint32_t)(LOCAL(value)));
       continue;
     }
     case UGT_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint64_t)(LOCAL(y)) > (uint64_t)(LOCAL(value)));
       continue;
     }
     case UGE_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint8_t)(LOCAL(y)) >= (uint8_t)(LOCAL(value)));
       continue;
     }
     case UGE_OPCODE_INT : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint32_t)(LOCAL(y)) >= (uint32_t)(LOCAL(value)));
       continue;
     }
     case UGE_OPCODE_LONG : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, (uint64_t)(LOCAL(y)) >= (uint64_t)(LOCAL(value)));
       continue;
     }
+
+
+
     case INT_NOT_OPCODE : {
       DECODE_B_UNSIGNED();
       printf("Not yet implemented.\n");
@@ -1454,38 +1403,38 @@ void vmloop (char* instructions, int n,
     }
     case LOAD_OPCODE_1 : {
       DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      char* address = (char*)(LOCAL(y) + value);
+      SET_LOCAL(x, *address);
       continue;
     }
     case LOAD_OPCODE_4 : {
       DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int32_t* address = (int32_t*)(LOCAL(y) + value);
+      SET_LOCAL(x, *address);
       continue;
     }
     case LOAD_OPCODE_8 : {
       DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int64_t* address = (int64_t*)(LOCAL(y) + value);
+      SET_LOCAL(x, *address);
       continue;
     }
     case LOAD_OPCODE_1_VAR_OFFSET : {
       DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      char* address = (char*)(LOCAL(y) + LOCAL(z) + value);
+      SET_LOCAL(x, *address);
       continue;
     }
     case LOAD_OPCODE_4_VAR_OFFSET : {
       DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int32_t* address = (int32_t*)(LOCAL(y) + LOCAL(z) + value);
+      SET_LOCAL(x, *address);
       continue;
     }
     case LOAD_OPCODE_8_VAR_OFFSET : {
       DECODE_E();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int64_t* address = (int64_t*)(LOCAL(y) + LOCAL(z) + value);
+      SET_LOCAL(x, *address);
       continue;
     }
     case RESERVE_OPCODE_LOCAL : {
