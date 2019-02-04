@@ -550,14 +550,23 @@ void vmloop (char* instructions, int n,
     }
     case CALLC_OPCODE_LOCAL : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      uint64_t faddr = LOCAL(value);
+      int format = x;
+      int num_locals = y;
+      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      call_c_launcher(format, faddr, registers);
+      stack_pointer = (StackFrame*)((char*)stack_pointer - num_locals * 8);
       continue;
     }
     case CALLC_OPCODE_CODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int offset = code_offsets[value];
+      uint64_t faddr = (uint64_t)(instructions + offset * 4);
+      int format = x;
+      int num_locals = y;
+      stack_pointer = (StackFrame*)((char*)stack_pointer + num_locals * 8);
+      call_c_launcher(format, faddr, registers);
+      stack_pointer = (StackFrame*)((char*)stack_pointer - num_locals * 8);
       continue;
     }
     case CALLC_OPCODE_EXTERN : {
