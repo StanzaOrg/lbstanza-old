@@ -346,6 +346,7 @@
   stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);  
 
 #define BOOLREF(x) (((x) << 3) + 2)
+#define REF_BITS 1
 
 //============================================================
 //========================= TRAPS ============================
@@ -384,7 +385,7 @@ Stack* untag_stack (uint64_t current_stack){
 }
 
 uint64_t ptr_to_ref (void* p){
-  return (uint64_t)p + 1;
+  return (uint64_t)p + REF_BITS;
 }
 
 void vmloop (char* instructions, int n,
@@ -1166,50 +1167,42 @@ void vmloop (char* instructions, int n,
     }
     case NOT_OPCODE_BYTE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, ~ ((uint8_t)LOCAL(value)));
       continue;
     }
     case NOT_OPCODE_INT : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, ~ ((uint32_t)LOCAL(value)));
       continue;
     }
     case NOT_OPCODE_LONG : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, ~ ((uint64_t)LOCAL(value)));
       continue;
     }
     case NEG_OPCODE_INT : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, - ((int32_t)LOCAL(value)));
       continue;
     }
     case NEG_OPCODE_LONG : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, - ((int64_t)LOCAL(value)));
       continue;
     }
     case NEG_OPCODE_FLOAT : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_FLOAT(x, - LOCAL_FLOAT(value));      
       continue;
     }
     case NEG_OPCODE_DOUBLE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL_DOUBLE(x, - LOCAL_DOUBLE(value));      
       continue;
     }
     case DEREF_OPCODE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      SET_LOCAL(x, LOCAL(value) + 8 - REF_BITS);
       continue;
     }
     case TYPEOF_OPCODE : {
