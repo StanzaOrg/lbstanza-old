@@ -354,6 +354,17 @@
 #define BYTE_TAG_BITS 3
 #define CHAR_TAG_BITS 4
 #define FLOAT_TAG_BITS 5  
+
+#define FALSE_TYPE 0
+#define TRUE_TYPE 1
+#define BYTE_TYPE 2
+#define CHAR_TYPE 3
+#define INT_TYPE 4
+#define FLOAT_TYPE 5
+#define STACK_TYPE 6
+#define FN_TYPE 7
+#define TYPE_TYPE 8
+
 #define BOOLREF(x) (((x) << 3) + MARKER_TAG_BITS)
 
 //============================================================
@@ -659,8 +670,15 @@ void vmloop (char* instructions, int n,
     }
     case YIELD_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      //Save current stack
+      stk->stack_pointer = stack_pointer;
+      stk->pc = pc;
+      //Load next stack
+      current_stack = LOCAL(value);
+      stk = untag_stack(current_stack);
+      stack_pointer = stk->stack_pointer;
+      stack_end = (char*)(stk->frames) + stk->size;
+      pc = instructions + stk->pc * 4;
       continue;
     }
     case RETURN_OPCODE : {
@@ -1490,8 +1508,30 @@ void vmloop (char* instructions, int n,
     }
     case NEW_STACK_OPCODE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+
+      //Retrieve starting pc of stack
+      int fid = value;
+      uint64_t stk_pc = (uint64_t)(instructions + code_offsets[fid] * 4);
+
+      //Allocate on heap
+      *((uint64_t*)heap_top) = STACK_TYPE;        
+      Stack* stk = (Stack*)(heap_top + 8);
+      heap_top = heap_top + 8 + sizeof(Stack);
+
+      //Allocate stack frames
+      int stack_size = 4 * 1024;
+      StackFrame* frames = (StackFrame*)malloc(stack_size);
+
+      //Populate stack attributes      
+      stk->size = stack_size;
+      stk->frames = frames;
+      stk->stack_pointer = frames;
+      stk->pc = stk_pc;
+      stk->frames->returnpc = -1L;
+      stk->frames->liveness_map = 0L;
+
+      //Return the tagged stack
+      SET_LOCAL(x, ptr_to_ref((char*)stk - 8));
       continue;
     }
     case ALLOC_OPCODE_CONST : {
