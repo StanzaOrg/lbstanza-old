@@ -403,6 +403,7 @@ void call_garbage_collector (char* heap_top,
                              char** new_heap_limit,
                              uint64_t* new_current_stack);
 int dispatch_branch (int format, uint64_t* registers);
+void call_print_stack_trace (uint64_t stack);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -572,7 +573,7 @@ void vmloop (char* instructions, int n,
       uint64_t fid = LOCAL(value);
       uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = (uint64_t)pc;
+      stack_pointer->returnpc = (uint64_t)(pc - instructions);
       pc = instructions + fpos;
       continue;
     }
@@ -582,7 +583,7 @@ void vmloop (char* instructions, int n,
       uint64_t fid = value;
       uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = (uint64_t)pc;
+      stack_pointer->returnpc = (uint64_t)(pc - instructions);
       pc = instructions + fpos;
       continue;
     }
@@ -599,7 +600,7 @@ void vmloop (char* instructions, int n,
       uint64_t fid = clo->code;
       uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = (uint64_t)pc;
+      stack_pointer->returnpc = (uint64_t)(pc - instructions);
       pc = instructions + fpos;
       continue;
     }
@@ -692,7 +693,7 @@ void vmloop (char* instructions, int n,
         *new_current_stack = current_stack;
         return;
       }
-      pc = (char*)retpc;
+      pc = instructions + retpc;
       continue;
     }
     case DUMP_OPCODE : {
@@ -1483,7 +1484,7 @@ void vmloop (char* instructions, int n,
         SET_REG(2, size);
         uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_ID]) * 4;
         PUSH_FRAME(num_locals);
-        stack_pointer->returnpc = (uint64_t)pc;
+        stack_pointer->returnpc = (uint64_t)(pc - instructions);
         pc = instructions + fpos;
         continue;
       }
@@ -1502,7 +1503,7 @@ void vmloop (char* instructions, int n,
         SET_REG(2, size);
         uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_ID]) * 4;
         PUSH_FRAME(num_locals);
-        stack_pointer->returnpc = (uint64_t)pc;
+        stack_pointer->returnpc = (uint64_t)(pc - instructions);
         pc = instructions + fpos;
         continue;
       }
@@ -1580,8 +1581,9 @@ void vmloop (char* instructions, int n,
     }
     case PRINT_STACK_TRACE_OPCODE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      uint64_t stack = LOCAL(value);
+      call_print_stack_trace(stack);
+      SET_REG(x, 0);
       continue;
     }
     case CURRENT_STACK_OPCODE : {
@@ -1591,8 +1593,8 @@ void vmloop (char* instructions, int n,
     }
     case FLUSH_VM_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      stk->stack_pointer = stack_pointer;
+      stk->pc = pc - instructions;
       continue;
     }
     case GLOBALS_OPCODE : {
