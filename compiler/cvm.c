@@ -589,7 +589,7 @@ void vmloop (char* instructions, int n,
     case CALL_OPCODE_EXTERN : {
       DECODE_C();
       printf("DELETE THIS OPCODE.\n");
-      exit(-1);
+      exit(-1); //DELETE
       continue;
     }
     case CALL_CLOSURE_OPCODE : {
@@ -622,7 +622,7 @@ void vmloop (char* instructions, int n,
     case TCALL_OPCODE_EXTERN : {
       DECODE_C();
       printf("DELETE THIS OPCODE.\n");
-      exit(-1);
+      exit(-1); //DELETE
       continue;
     }
     case TCALL_CLOSURE_OPCODE : {
@@ -646,7 +646,7 @@ void vmloop (char* instructions, int n,
     case CALLC_OPCODE_CODE : {
       DECODE_C();
       printf("DELETE THIS OPCODE.\n");
-      exit(-1);
+      exit(-1); //DELETE
       continue;
     }
     case CALLC_OPCODE_EXTERN : {
@@ -1052,7 +1052,7 @@ void vmloop (char* instructions, int n,
     case ASHR_OPCODE_BYTE : {
       DECODE_C();
       printf("DELETE THIS OPCODE.\n");
-      exit(-1);
+      exit(-1); //DELETE
       continue;
     }
     case ASHR_OPCODE_INT : {
@@ -1597,8 +1597,8 @@ void vmloop (char* instructions, int n,
     }
     case GLOBALS_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      printf("DELETE THIS OPCODE.\n");
+      exit(-1); //DELETE
       continue;
     }
     case CONSTS_OPCODE : {
@@ -1613,265 +1613,179 @@ void vmloop (char* instructions, int n,
     }
     case JUMP_INT_LT_OPCODE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) < (int64_t)LOCAL(y));
     }
     case JUMP_INT_GT_OPCODE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) > (int64_t)LOCAL(y));
     }
     case JUMP_INT_LE_OPCODE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) <= (int64_t)LOCAL(y));
     }
     case JUMP_INT_GE_OPCODE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
+      F_JUMP((int64_t)LOCAL(x) >= (int64_t)LOCAL(y));
+    }      
     case JUMP_EQ_OPCODE_REF : {
-      DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      DECODE_F();      
+      F_JUMP(LOCAL(x) == LOCAL(y));
     }
     case JUMP_EQ_OPCODE_BYTE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int8_t)LOCAL(x) == (int8_t)LOCAL(y));
     }
     case JUMP_EQ_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int32_t)LOCAL(x) == (int32_t)LOCAL(y));
     }
     case JUMP_EQ_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) == (int64_t)LOCAL(y));
     }
     case JUMP_EQ_OPCODE_FLOAT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_FLOAT(x) == LOCAL_FLOAT(y));
     }
     case JUMP_EQ_OPCODE_DOUBLE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
+      F_JUMP(LOCAL_DOUBLE(x) == LOCAL_DOUBLE(y));
+    }      
     case JUMP_NE_OPCODE_REF : {
       DECODE_F();      
       F_JUMP(LOCAL(x) != LOCAL(y));
     }
     case JUMP_NE_OPCODE_BYTE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int8_t)LOCAL(x) != (int8_t)LOCAL(y));
     }
     case JUMP_NE_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int32_t)LOCAL(x) != (int32_t)LOCAL(y));
     }
     case JUMP_NE_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) != (int64_t)LOCAL(y));
     }
     case JUMP_NE_OPCODE_FLOAT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_FLOAT(x) != LOCAL_FLOAT(y));
     }
     case JUMP_NE_OPCODE_DOUBLE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
+      F_JUMP(LOCAL_DOUBLE(x) != LOCAL_DOUBLE(y));
+    }      
     case JUMP_LT_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int32_t)LOCAL(x) < (int32_t)LOCAL(y));
     }
     case JUMP_LT_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) < (int64_t)LOCAL(y));
     }
     case JUMP_LT_OPCODE_FLOAT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_FLOAT(x) < LOCAL_FLOAT(y));
     }
     case JUMP_LT_OPCODE_DOUBLE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_DOUBLE(x) < LOCAL_DOUBLE(y));
     }
     case JUMP_GT_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int32_t)LOCAL(x) > (int32_t)LOCAL(y));
     }
     case JUMP_GT_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) > (int64_t)LOCAL(y));
     }
     case JUMP_GT_OPCODE_FLOAT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_FLOAT(x) > LOCAL_FLOAT(y));
     }
     case JUMP_GT_OPCODE_DOUBLE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_DOUBLE(x) > LOCAL_DOUBLE(y));
     }
     case JUMP_LE_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int32_t)LOCAL(x) <= (int32_t)LOCAL(y));
     }
     case JUMP_LE_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) <= (int64_t)LOCAL(y));
     }
     case JUMP_LE_OPCODE_FLOAT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_FLOAT(x) <= LOCAL_FLOAT(y));
     }
     case JUMP_LE_OPCODE_DOUBLE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_DOUBLE(x) <= LOCAL_DOUBLE(y));
     }
     case JUMP_GE_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int32_t)LOCAL(x) >= (int32_t)LOCAL(y));
     }
     case JUMP_GE_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((int64_t)LOCAL(x) >= (int64_t)LOCAL(y));
     }
     case JUMP_GE_OPCODE_FLOAT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_FLOAT(x) >= LOCAL_FLOAT(y));
     }
     case JUMP_GE_OPCODE_DOUBLE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP(LOCAL_DOUBLE(x) >= LOCAL_DOUBLE(y));
     }
     case JUMP_ULE_OPCODE_BYTE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((uint8_t)LOCAL(x) <= (uint8_t)LOCAL(y));
     }
     case JUMP_ULE_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((uint32_t)LOCAL(x) <= (uint32_t)LOCAL(y));
     }
     case JUMP_ULE_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
+      F_JUMP((uint64_t)LOCAL(x) <= (uint64_t)LOCAL(y));
+    }      
     case JUMP_ULT_OPCODE_BYTE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((uint8_t)LOCAL(x) < (uint8_t)LOCAL(y));
     }
     case JUMP_ULT_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((uint32_t)LOCAL(x) < (uint32_t)LOCAL(y));
     }
     case JUMP_ULT_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
-    case JUMP_UGT_OPCODE_BYTE : {
-      DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
-    case JUMP_UGT_OPCODE_INT : {
-      DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
-    case JUMP_UGT_OPCODE_LONG : {
-      DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
-    }
+      F_JUMP((uint64_t)LOCAL(x) < (uint64_t)LOCAL(y));
+    }      
     case JUMP_UGE_OPCODE_BYTE : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((uint8_t)LOCAL(x) >= (uint8_t)LOCAL(y));
     }
     case JUMP_UGE_OPCODE_INT : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((uint32_t)LOCAL(x) >= (uint32_t)LOCAL(y));
     }
     case JUMP_UGE_OPCODE_LONG : {
       DECODE_F();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      F_JUMP((uint64_t)LOCAL(x) >= (uint64_t)LOCAL(y));
+    }
+    case JUMP_UGT_OPCODE_BYTE : {
+      DECODE_F();
+      F_JUMP((uint8_t)LOCAL(x) > (uint8_t)LOCAL(y));
+    }
+    case JUMP_UGT_OPCODE_INT : {
+      DECODE_F();
+      F_JUMP((uint32_t)LOCAL(x) > (uint32_t)LOCAL(y));
+    }
+    case JUMP_UGT_OPCODE_LONG : {
+      DECODE_F();
+      F_JUMP((uint64_t)LOCAL(x) > (uint64_t)LOCAL(y));
     }
     case DISPATCH_OPCODE : {
       DECODE_A_UNSIGNED();
@@ -1902,9 +1816,15 @@ void vmloop (char* instructions, int n,
     }
     case JUMP_REG_OPCODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
-      continue;
+      int reg = x;
+      uint64_t arity = y;
+      int offset = value * 4;
+      if(registers[reg] == arity){
+        pc = pc0 + offset;
+        continue;
+      }else{
+        continue;
+      }
     }
     case FNENTRY_OPCODE : {
       DECODE_A_UNSIGNED();
