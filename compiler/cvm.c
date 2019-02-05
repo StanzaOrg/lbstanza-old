@@ -439,7 +439,9 @@ void vmloop (char* instructions, int n,
              char* data_mem,
              uint64_t* extern_table,
              uint32_t* code_offsets,
-             int EXTEND_HEAP_ID){
+             int EXTEND_HEAP_ID,
+             char** new_heap_top,
+             uint64_t* new_current_stack){
   printf("VM Loop!\n");
   printf("Instructions = %p\n", instructions);
   printf("Total = %d bytes\n", n);
@@ -452,7 +454,7 @@ void vmloop (char* instructions, int n,
   Stack* stk = untag_stack(current_stack);
   StackFrame* stack_pointer = stk->stack_pointer;
   char* stack_end = (char*)(stk->frames) + stk->size;
-  char* pc = instructions + stk->pc * 4;
+  char* pc = instructions + stk->pc;
 
   //Machine Parameters
   //char* pc = instructions;
@@ -672,20 +674,22 @@ void vmloop (char* instructions, int n,
       DECODE_A_UNSIGNED();
       //Save current stack
       stk->stack_pointer = stack_pointer;
-      stk->pc = pc;
+      stk->pc = pc - instructions;
       //Load next stack
       current_stack = LOCAL(value);
       stk = untag_stack(current_stack);
       stack_pointer = stk->stack_pointer;
       stack_end = (char*)(stk->frames) + stk->size;
-      pc = instructions + stk->pc * 4;
+      pc = instructions + stk->pc;
       continue;
     }
     case RETURN_OPCODE : {
       DECODE_A_UNSIGNED();
       int64_t retpc = stack_pointer->returnpc;
       if(retpc < 0){
-        printf("RETURN\n");
+        stk->stack_pointer = stack_pointer;
+        *new_heap_top = heap_top;
+        *new_current_stack = current_stack;
         return;
       }
       pc = (char*)retpc;
@@ -1918,6 +1922,7 @@ void vmloop (char* instructions, int n,
     }
 
     //Done
+    
     printf("opcode = %d\n", opcode);
     printf("W1 = %x\n", W1);
     exit(-1);
