@@ -1514,8 +1514,8 @@ void vmloop (char* instructions, int n,
       DECODE_B_UNSIGNED();
 
       //Retrieve starting pc of stack
-      int fid = value;
-      uint64_t stk_pc = (uint64_t)(instructions + code_offsets[fid] * 4);
+      uint64_t fid = LOCAL(value);
+      uint64_t stk_pc = code_offsets[fid] * 4;
 
       //Allocate on heap
       *((uint64_t*)heap_top) = STACK_TYPE;        
