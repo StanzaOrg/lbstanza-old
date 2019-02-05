@@ -345,27 +345,14 @@
 #define POP_FRAME(num_locals) \
   stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);  
 
-#define BOOLREF(x) (((x) << 3) + 2)
+
 #define REF_BITS 1
+#define MARKER_BITS 2
+#define BOOLREF(x) (((x) << 3) + MARKER_BITS)
 
 //============================================================
-//========================= TRAPS ============================
+//==================== Machine Types =========================
 //============================================================
-
-int call_c_launcher (int index, uint64_t faddr, uint64_t* registers);
-
-//============================================================
-//===================== MAIN LOOP ============================
-//============================================================
-
-//What does the machine need to run?
-//- Pointer to instructions
-//- Pointer to registers
-//- Pointer to top of heap (for allocation)
-//- Pointer to limit of heap (for knowing when to call gc)
-//- Pointer to stack (for call frames)
-//- Pointer to end of stack (for knowing when to build stack)
-//- Current stack
 
 typedef struct{
   uint64_t returnpc;
@@ -379,6 +366,32 @@ typedef struct{
   StackFrame* stack_pointer;
   int pc;
 } Stack;
+
+//============================================================
+//========================= TRAPS ============================
+//============================================================
+
+void call_c_launcher (int index, uint64_t faddr, uint64_t* registers);
+void call_garbage_collector (char* heap_top,
+                             StackFrame* stack_pointer,
+                             uint64_t current_stack,
+                             uint64_t total_size,
+                             char** new_heap_top,
+                             char** new_heap_limit,
+                             uint64_t* new_current_stack);
+
+//============================================================
+//===================== MAIN LOOP ============================
+//============================================================
+
+//What does the machine need to run?
+//- Pointer to instructions
+//- Pointer to registers
+//- Pointer to top of heap (for allocation)
+//- Pointer to limit of heap (for knowing when to call gc)
+//- Pointer to stack (for call frames)
+//- Pointer to end of stack (for knowing when to build stack)
+//- Current stack
 
 Stack* untag_stack (uint64_t current_stack){
   return (Stack*)(current_stack - 1 + 8);
@@ -401,7 +414,8 @@ void vmloop (char* instructions, int n,
              uint32_t* data_offsets,
              char* data_mem,
              uint64_t* extern_table,
-             uint32_t* code_offsets){
+             uint32_t* code_offsets,
+             int EXTEND_HEAP_ID){
   printf("VM Loop!\n");
   printf("Instructions = %p\n", instructions);
   printf("Total = %d bytes\n", n);
@@ -639,7 +653,7 @@ void vmloop (char* instructions, int n,
       int xi = (int)xl;        
       float xf = LOCAL_FLOAT(value);
       float xd = LOCAL_DOUBLE(value);
-      printf("DUMP LOCAL %d: (byte = %d, int = %d, long = %d, float = %f, double = %f)\n",
+      printf("DUMP LOCAL %d: (byte = %d, int = %d, long = %ld, float = %f, double = %f)\n",
              value, xb, xi, xl, xf, xd);
       continue;
     }
@@ -1422,28 +1436,40 @@ void vmloop (char* instructions, int n,
     }
     case RESERVE_OPCODE_LOCAL : {
       DECODE_C();
-      uint64_t size = LOCAL(value);
+      uint64_t size = 8 + LOCAL(value);
+      int num_locals = y;
       int offset = x * 4;
       if(heap_top + size <= heap_limit){
         pc += offset - CSIZE;
         continue;
       }else{
-        printf("Allocating %ld bytes\n", size);
-        printf("GC Not yet implemented.\n");
-        exit(-1);
+        SET_REG(0, BOOLREF(0));
+        SET_REG(1, 1L);
+        SET_REG(2, size);
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_ID]) * 4;
+        PUSH_FRAME(num_locals);
+        stack_pointer->returnpc = (uint64_t)pc;
+        pc = instructions + fpos;
+        continue;
       }
-      continue;
     }
     case RESERVE_OPCODE_CONST : {
       DECODE_C();
-      int size = value;
+      uint64_t size = value;
+      int num_locals = y;
       int offset = x * 4;
       if(heap_top + size <= heap_limit){
         pc += offset - CSIZE;
         continue;
       }else{
-        printf("GC Not yet implemented.\n");
-        exit(-1);
+        SET_REG(0, BOOLREF(0));
+        SET_REG(1, 1L);
+        SET_REG(2, size);
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_ID]) * 4;
+        PUSH_FRAME(num_locals);
+        stack_pointer->returnpc = (uint64_t)pc;
+        pc = instructions + fpos;
+        continue;
       }
     }
     case NEW_STACK_OPCODE : {
@@ -1454,26 +1480,45 @@ void vmloop (char* instructions, int n,
     }
     case ALLOC_OPCODE_CONST : {
       DECODE_C();
-      int num_bytes = y;
+      int num_bytes = 8 + y;
       int type = value;
       *(uint64_t*)heap_top = type;
-      SET_LOCAL(x, ptr_to_ref(heap_top));
+      uint64_t obj = ptr_to_ref(heap_top);
+      SET_LOCAL(x, obj);
       heap_top = heap_top + num_bytes;
       continue;
     }
     case ALLOC_OPCODE_LOCAL : {
       DECODE_C();
-      uint64_t num_bytes = LOCAL(y);
+      uint64_t num_bytes = 8 + LOCAL(y);
       int type = value;
       *(uint64_t*)heap_top = type;
-      SET_LOCAL(x, ptr_to_ref(heap_top));
+      uint64_t obj = ptr_to_ref(heap_top);
+      SET_LOCAL(x, obj);
       heap_top = heap_top + num_bytes;
       continue;
     }
     case GC_OPCODE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      //Size to extend
+      uint64_t size = LOCAL(value);
+      
+      //Return values
+      char* new_heap_top;
+      char* new_heap_limit;
+      uint64_t new_current_stack;
+      //Call GC
+      call_garbage_collector(heap_top, stack_pointer, current_stack, size,
+                             &new_heap_top, &new_heap_limit, &new_current_stack);
+      //Recover values
+      heap_top = new_heap_top;
+      heap_limit = new_heap_limit;
+      current_stack = new_current_stack;
+      stk = untag_stack(current_stack);
+      stack_pointer = stk->stack_pointer;
+      stack_end = (char*)(stk->frames) + stk->size;
+      //Return 0
+      SET_REG(0, 0);
       continue;
     }
     case PRINT_STACK_TRACE_OPCODE : {
