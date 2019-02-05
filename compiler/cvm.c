@@ -261,14 +261,6 @@
     pc += 8; \
     _x;});
 
-//Instruction sizes
-#define ASIZE 4
-#define BSIZE 4
-#define CSIZE 8
-#define DSIZE 12
-#define ESIZE 8
-#define FSIZE 8
-
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
   printf("[%d | %d]\n", opcode, value);
@@ -379,6 +371,7 @@ void call_garbage_collector (char* heap_top,
                              char** new_heap_top,
                              char** new_heap_limit,
                              uint64_t* new_current_stack);
+int dispatch_branch (int format, uint64_t* registers);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -435,6 +428,9 @@ void vmloop (char* instructions, int n,
   //char* pc_end = instructions+n;
   //while(pc < pc_end){
   while(1){
+    //Save pre-decode PC because jump offsets are relative to
+    //pre-decode PC.
+    char* pc0 = pc;
     unsigned int W1 = PC_INT();
     int opcode = W1 & 0xFF;
     switch(opcode){
@@ -1228,17 +1224,17 @@ void vmloop (char* instructions, int n,
     case JUMP_SET_OPCODE : {
       DECODE_F();
       if(LOCAL(x)){
-        pc += (n1 * 4) - FSIZE;
+        pc = pc0 + (n1 * 4);
         continue;
       }
       else{
-        pc += (n2 * 4) - FSIZE;
+        pc = pc0 + (n2 * 4);
         continue;
       }
     }
     case GOTO_OPCODE : {
       DECODE_A_SIGNED();
-      pc += (value * 4) - ASIZE;
+      pc = pc0 + (value * 4);
       continue;
     }
     case CONV_OPCODE_BYTE_FLOAT : {
@@ -1440,7 +1436,7 @@ void vmloop (char* instructions, int n,
       int num_locals = y;
       int offset = x * 4;
       if(heap_top + size <= heap_limit){
-        pc += offset - CSIZE;
+        pc = pc0 + offset;
         continue;
       }else{
         SET_REG(0, BOOLREF(0));
@@ -1459,7 +1455,7 @@ void vmloop (char* instructions, int n,
       int num_locals = y;
       int offset = x * 4;
       if(heap_top + size <= heap_limit){
-        pc += offset - CSIZE;
+        pc = pc0 + offset;
         continue;
       }else{
         SET_REG(0, BOOLREF(0));
@@ -1819,10 +1815,14 @@ void vmloop (char* instructions, int n,
       continue;
     }
     case DISPATCH_OPCODE : {
+      char* pc0 = pc;
       DECODE_A_UNSIGNED();
+      uint32_t* tgts = (uint32_t*)(pc + 4);
       DECODE_TGTS();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int format = value;
+      int index = dispatch_branch(format, registers);
+      int tgt = tgts[index];
+      pc = pc0 + (tgt * 4);
       continue;
     }
     case DISPATCH_METHOD_OPCODE : {
