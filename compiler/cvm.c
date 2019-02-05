@@ -1224,8 +1224,7 @@ void vmloop (char* instructions, int n,
     }
     case GOTO_OPCODE : {
       DECODE_A_SIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      pc += (value * 4) - ASIZE;
       continue;
     }
     case CONV_OPCODE_BYTE_FLOAT : {
