@@ -1801,7 +1801,7 @@ void vmloop (char* instructions, int n,
     case DISPATCH_OPCODE : {
       DECODE_A_UNSIGNED();
       uint32_t* tgts = (uint32_t*)(pc + 4);
-      DECODE_TGTS();
+      //DECODE_TGTS();
       int format = value;
       int index = dispatch_branch(format, registers);
       int tgt = tgts[index];
@@ -1811,7 +1811,7 @@ void vmloop (char* instructions, int n,
     case DISPATCH_METHOD_OPCODE : {
       DECODE_A_UNSIGNED();
       uint32_t* tgts = (uint32_t*)(pc + 4);
-      DECODE_TGTS();
+      //DECODE_TGTS();
       int format = value;
       int index = dispatch_branch(format, registers);
       if(index < 2){
