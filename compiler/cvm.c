@@ -588,7 +588,7 @@ void vmloop (char* instructions, int n,
     }
     case CALL_OPCODE_EXTERN : {
       DECODE_C();
-      printf("Not yet implemented.\n");
+      printf("DELETE THIS OPCODE.\n");
       exit(-1);
       continue;
     }
@@ -621,7 +621,7 @@ void vmloop (char* instructions, int n,
     }
     case TCALL_OPCODE_EXTERN : {
       DECODE_C();
-      printf("Not yet implemented.\n");
+      printf("DELETE THIS OPCODE.\n");
       exit(-1);
       continue;
     }
@@ -645,7 +645,7 @@ void vmloop (char* instructions, int n,
     }
     case CALLC_OPCODE_CODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
+      printf("DELETE THIS OPCODE.\n");
       exit(-1);
       continue;
     }
@@ -1051,7 +1051,7 @@ void vmloop (char* instructions, int n,
     }
     case ASHR_OPCODE_BYTE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
+      printf("DELETE THIS OPCODE.\n");
       exit(-1);
       continue;
     }
@@ -1206,9 +1206,6 @@ void vmloop (char* instructions, int n,
       SET_LOCAL(x, (uint64_t)(LOCAL(y)) >= (uint64_t)(LOCAL(value)));
       continue;
     }
-
-
-
     case INT_NOT_OPCODE : {
       DECODE_B_UNSIGNED();
       printf("Not yet implemented.\n");
