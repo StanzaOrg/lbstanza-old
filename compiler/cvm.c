@@ -1205,19 +1205,19 @@ void vmloop (char* instructions, int n,
       DECODE_C();
       SET_LOCAL(x, (uint64_t)(LOCAL(y)) >= (uint64_t)(LOCAL(value)));
       continue;
-    }
+    }      
     case INT_NOT_OPCODE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      uint64_t y = LOCAL(value);
+      SET_LOCAL(x, ((~ y) >> 32L) << 32L);
       continue;
     }
     case INT_NEG_OPCODE : {
       DECODE_B_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int64_t y = LOCAL(value);
+      SET_LOCAL(x, - y);
       continue;
-    }
+    }      
     case NOT_OPCODE_BYTE : {
       DECODE_B_UNSIGNED();
       SET_LOCAL(x, ~ ((uint8_t)LOCAL(value)));
