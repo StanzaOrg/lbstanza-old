@@ -263,28 +263,28 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  printf("          [%d | %d]\n", opcode, value);
+  /*printf("          [%d | %d]\n", opcode, value);*/
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  printf("          [%d | %d]\n", opcode, value);
+  /*printf("          [%d | %d]\n", opcode, value);*/
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  printf("          [%d | %d | %d]\n", opcode, x, value);
+  /*printf("          [%d | %d | %d]\n", opcode, x, value);*/
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);
+  /*printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
 
 #define DECODE_D() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);
+  /*printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);*/
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -293,7 +293,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
+  /*printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -303,7 +303,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
+  /*printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -319,7 +319,7 @@
   int n = PC_INT(); \
   for(int i=0; i<n; i++){ \
     int tgt = PC_INT(); \
-    printf("            tgt: %d\n", tgt); \
+    /*printf("            tgt: %d\n", tgt);*/ \
   }
 
 #define SET_REG(r,v) \
@@ -450,13 +450,13 @@ void vmloop (char* instructions, int n,
              int EXTEND_HEAP_ID,
              char** new_heap_top,
              uint64_t* new_current_stack){
-  printf("VM Loop!\n");
-  printf("Instructions = %p\n", instructions);
-  printf("Total = %d bytes\n", n);
-  printf("heap_top = %p\n", heap_top);
-  printf("heap_limit = %p\n", heap_limit);
-  printf("heap_registers = %p\n", registers);
-  printf("current_stack = %llx\n", current_stack);
+  //printf("VM Loop!\n");
+  //printf("Instructions = %p\n", instructions);
+  //printf("Total = %d bytes\n", n);
+  //printf("heap_top = %p\n", heap_top);
+  //printf("heap_limit = %p\n", heap_limit);
+  //printf("heap_registers = %p\n", registers);
+  //printf("current_stack = %llx\n", current_stack);
 
   //Retrieve starting program counter
   Stack* stk = untag_stack(current_stack);
@@ -731,7 +731,9 @@ void vmloop (char* instructions, int n,
     }
     case INT_DIV_OPCODE : {
       DECODE_C();
-      SET_LOCAL(x, (int64_t)(LOCAL(y)) / ((int64_t)(LOCAL(value)) << 32L));
+      int64_t sy = (int64_t)LOCAL(y);
+      int64_t sz = (int64_t)LOCAL(value);
+      SET_LOCAL(x, (sy / sz) << 32L);
       continue;
     }
     case INT_MOD_OPCODE : {
@@ -1391,12 +1393,12 @@ void vmloop (char* instructions, int n,
     }
     case TAG_OPCODE_INT : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL(x, ((uint64_t)(uint8_t)(LOCAL(value)) << 32L) + INT_TAG_BITS);
+      SET_LOCAL(x, ((uint64_t)LOCAL(value) << 32L) + INT_TAG_BITS);
       continue;
     }
     case TAG_OPCODE_FLOAT : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL(x, ((uint64_t)(uint32_t)(LOCAL(value)) << 32L) + FLOAT_TAG_BITS);
+      SET_LOCAL(x, ((uint64_t)LOCAL(value) << 32L) + FLOAT_TAG_BITS);
       continue;
     }
     case STORE_OPCODE_1 : {
