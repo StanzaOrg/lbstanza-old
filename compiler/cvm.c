@@ -263,28 +263,28 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  printf("[%d | %d]\n", opcode, value);
+  printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  printf("[%d | %d]\n", opcode, value);
+  printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  printf("[%d | %d | %d]\n", opcode, x, value);
+  printf("          [%d | %d | %d]\n", opcode, x, value);
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  printf("[%d | %d | %d | %d]\n", opcode, x, y, value);
+  printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);
 
 #define DECODE_D() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  printf("[%d | %d | %d | %ld]\n", opcode, x, y, value);
+  printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -293,7 +293,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  printf("[%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
+  printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -303,7 +303,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  printf("[%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
+  printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -319,7 +319,7 @@
   int n = PC_INT(); \
   for(int i=0; i<n; i++){ \
     int tgt = PC_INT(); \
-    printf("  tgt: %d\n", tgt); \
+    printf("            tgt: %d\n", tgt); \
   }
 
 #define SET_REG(r,v) \
@@ -728,7 +728,7 @@ void vmloop (char* instructions, int n,
       DECODE_C();
       int64_t sy = (int64_t)LOCAL(y);
       int64_t sz = (int64_t)LOCAL(value);
-      SET_LOCAL(x, y << (sz >> 32L));
+      SET_LOCAL(x, sy << (sz >> 32L));
       continue;
     }
     case INT_SHR_OPCODE : {
@@ -1241,8 +1241,9 @@ void vmloop (char* instructions, int n,
     }
     case TYPEOF_OPCODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int format = value;
+      int index = dispatch_branch(format, registers);
+      SET_LOCAL(x, index);
       continue;
     }
     case JUMP_SET_OPCODE : {
