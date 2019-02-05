@@ -402,6 +402,13 @@ void call_garbage_collector (char* heap_top,
                              char** new_heap_top,
                              char** new_heap_limit,
                              uint64_t* new_current_stack);
+void call_stack_extender (char* heap_top,
+                          StackFrame* stack_pointer,
+                          uint64_t current_stack,
+                          uint64_t total_size,
+                          char** new_heap_top,
+                          char** new_heap_limit,
+                          uint64_t* new_current_stack);
 int dispatch_branch (int format, uint64_t* registers);
 void call_print_stack_trace (uint64_t stack);
 
@@ -1832,19 +1839,31 @@ void vmloop (char* instructions, int n,
       DECODE_A_UNSIGNED();
       int frame_size = value * 8 + sizeof(StackFrame);
       int size_required = frame_size + sizeof(StackFrame);
-      if((char*)stack_pointer + size_required > stack_end){
-        printf("Stack extension not yet implemented.\n");
-        exit(-1);
+      if((char*)stack_pointer + size_required > stack_end){        
+        //Return values
+        char* new_heap_top;
+        char* new_heap_limit;
+        uint64_t new_current_stack;
+        //Call Extender
+        call_stack_extender(heap_top, stack_pointer, current_stack, size_required,
+                            &new_heap_top, &new_heap_limit, &new_current_stack);
+        //Recover values
+        heap_top = new_heap_top;
+        heap_limit = new_heap_limit;
+        current_stack = new_current_stack;
+        stk = untag_stack(current_stack);
+        stack_pointer = stk->stack_pointer;
+        stack_end = (char*)(stk->frames) + stk->size;
+        //Return 0
+        SET_REG(0, 0);
+        continue;
       }
       continue;
     }
     }
 
-    //Done
-    
-    printf("opcode = %d\n", opcode);
-    printf("W1 = %x\n", W1);
+    //Done    
+    printf("Invalid opcode: %d\n", opcode);
     exit(-1);
-    return;
   }
 }
