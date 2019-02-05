@@ -367,6 +367,12 @@ typedef struct{
 } StackFrame;
 
 typedef struct{
+  uint64_t num_slots;
+  uint64_t code;
+  uint64_t slots[];
+} Function;
+
+typedef struct{
   uint64_t size;
   StackFrame* frames;
   StackFrame* stack_pointer;
@@ -575,20 +581,29 @@ void vmloop (char* instructions, int n,
     }
     case CALL_CLOSURE_OPCODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int num_locals = y;
+      Function* clo = (Function*)(LOCAL(value) - REF_TAG_BITS + 8);
+      uint64_t fid = clo->code;
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      PUSH_FRAME(num_locals);
+      stack_pointer->returnpc = (uint64_t)pc;
+      pc = instructions + fpos;
       continue;
     }
     case TCALL_OPCODE_LOCAL : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int num_locals = y;
+      uint64_t fid = LOCAL(value);
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      pc = instructions + fpos;
       continue;
     }
     case TCALL_OPCODE_CODE : {
       DECODE_C();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      int num_locals = y;
+      uint64_t fid = value;
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
+      pc = instructions + fpos;
       continue;
     }
     case TCALL_OPCODE_EXTERN : {
@@ -599,8 +614,10 @@ void vmloop (char* instructions, int n,
     }
     case TCALL_CLOSURE_OPCODE : {
       DECODE_A_UNSIGNED();
-      printf("Not yet implemented.\n");
-      exit(-1);
+      Function* clo = (Function*)(LOCAL(value) - REF_TAG_BITS + 8);
+      uint64_t fid = clo->code;
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      pc = instructions + fpos;
       continue;
     }
     case CALLC_OPCODE_LOCAL : {
