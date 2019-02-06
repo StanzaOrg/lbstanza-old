@@ -347,7 +347,6 @@
 #define POP_FRAME(num_locals) \
   stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);  
 
-
 #define INT_TAG_BITS 0
 #define REF_TAG_BITS 1
 #define MARKER_TAG_BITS 2
@@ -458,22 +457,32 @@ void vmloop (char* instructions, int n,
   //printf("heap_registers = %p\n", registers);
   //printf("current_stack = %llx\n", current_stack);
 
-  //Retrieve starting program counter
+  //Machine Parameters
   Stack* stk = untag_stack(current_stack);
   StackFrame* stack_pointer = stk->stack_pointer;
   char* stack_end = (char*)(stk->frames) + stk->size;
   char* pc = instructions + stk->pc;
 
-  //Machine Parameters
-  //char* pc = instructions;
-  //char* pc_end = instructions+n;
-  //while(pc < pc_end){
+  //Timing
+  //uint64_t* timings = (uint64_t*)malloc(255 * sizeof(uint64_t));
+  //for(int i=0; i<255; i++) timings[i] = 0;
+  //int last_opcode = -1;
+  //uint64_t last_time;
+
+  //Repl Loop
   while(1){
     //Save pre-decode PC because jump offsets are relative to
     //pre-decode PC.
     char* pc0 = pc;
     unsigned int W1 = PC_INT();
     int opcode = W1 & 0xFF;
+
+    //uint64_t curtime = current_time_ms();
+    //if(last_opcode >= 0)
+    //  timings[last_opcode] += curtime - last_time;
+    //last_opcode = opcode;
+    //last_time = curtime;
+    
     switch(opcode){
     case SET_OPCODE_LOCAL : {
       DECODE_C();
@@ -698,6 +707,8 @@ void vmloop (char* instructions, int n,
         stk->stack_pointer = stack_pointer;
         *new_heap_top = heap_top;
         *new_current_stack = current_stack;
+        //for(int i=0; i<255; i++)
+        //  printf("Time of opcode %d = %llu\n", i, timings[i]);
         return;
       }
       pc = instructions + retpc;
