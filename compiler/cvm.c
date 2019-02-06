@@ -440,7 +440,6 @@ void vmloop (char* instructions, int n,
              uint64_t* global_offsets,
              char* global_mem,
              uint64_t* consts_table,
-             uint64_t* new_consts,
              char* consts_data_mem,
              uint32_t* data_offsets,
              char* data_mem,
@@ -1625,7 +1624,7 @@ void vmloop (char* instructions, int n,
     }
     case CONSTS_OPCODE : {
       DECODE_A_UNSIGNED();
-      SET_LOCAL(value, (uint64_t)new_consts);
+      SET_LOCAL(value, (uint64_t)consts_table);
       continue;
     }
     case CONSTS_DATA_OPCODE : {
