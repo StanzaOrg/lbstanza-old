@@ -4,29 +4,64 @@ defpackage stz/dyn-tree :
   import stz/utils
 
 public deftype DynTree
+public defmulti add (t:DynTree, nodes:Seqable<NodeState>) -> False
 public defmulti all-children (t:DynTree, n:Int) -> Tuple<Int>
 public defmulti all-parents (t:DynTree, n:Int) -> Tuple<Int>
-public defmulti add-parent (t:DynTree, x:Int, p:Int) -> False
-public defmulti remove-parent (t:DynTree, x:Int, p:Int) -> False
-public defmulti add-node (t:DynTree, x:Int, leaf?:True|False) -> False
 
 public deftype TreeListener
 public defmulti children-changed (t:TreeListener, n:Int) -> False
 public defmulti parents-changed (t:TreeListener, n:Int) -> False
 
-public defn DynTree (l:TreeListener) :
-  val nodes = IntTable<TreeNode>()  
+public defstruct NodeState :
+  id: Int
+  parents: Tuple<Int> with: (ensure => sorted!)
+  children: Tuple<Int> with: (ensure => sorted!)
+  leaf?: True|False
+
+defn sorted! (description:String, xs:False|Tuple<Int>) :
+  match(xs:Tuple<Int>) :
+    for i in 0 to length(xs) - 1 do :
+      if not xs[i] < xs[i + 1] :
+        fatal("Value %_ given to %_ is not sorted." % [xs, description])
+
+public defn DynTree (listen:TreeListener) :
+  val nodes = IntTable<TreeNode>()
+  val node-states = IntTable<NodeState>()
+
+  ;Track changed nodes for updating purposes
+  val update-children = Vector<Int>()
+  val update-parents = Vector<Int>()
   defn children-changed (p:Int) :
-    /children-changed(l, p)
-    set-all-children(nodes[p], false)
-    do(children-changed, parents(nodes[p]))
+    val node = nodes[p]
+    if all-children(node) is-not False :
+      set-all-children(node, false)
+      /children-changed(listen, p)
+      add(update-children, p)
+      do(children-changed, parents(node))
   defn parents-changed (c:Int) :
-    /parents-changed(l, c)
-    set-all-parents(nodes[c], false)
-    do(parents-changed, children(nodes[c]))
+    val node = nodes[c]
+    if all-parents(node) is-not False :
+      set-all-parents(node, false)
+      /parents-changed(listen, c)
+      add(update-parents, c)
+      do(parents-changed, children(node))
+
+  ;Guard conditions
+  defn ensure-not-leaf! (x:Int) :
+    #if-not-defined(OPTIMIZE) :
+      if leaf?(nodes[x]) :
+        fatal("Node %_ is a leaf node." % [x])
+  defn ensure-no-children! (x:Int) :
+    #if-not-defined(OPTIMIZE) :
+      if not empty?(children(nodes[x])) :
+        fatal("Node %_ has children." % [x])
+  defn ensure-not-exists! (x:Int) :
+    if key?(nodes,x) :
+      fatal("Node %_ already exists." % [x])
+
+  ;Functions for changing the state of existing nodes
   defn add-parent (x:Int, p:Int) :
-    if leaf?(nodes[p]) :
-      fatal("Cannot add child to leaf node %_." % [p])      
+    ensure-not-leaf!(p)
     children-changed(p)
     parents-changed(x)
     /add-parent(nodes[x], p)
@@ -36,10 +71,22 @@ public defn DynTree (l:TreeListener) :
     parents-changed(x)
     /remove-parent(nodes[x], p)
     remove-child(nodes[p], x)
+  defn set-leaf? (x:Int, leaf?:True|False) :
+    ensure-no-children!(x) when leaf?
+    val node = nodes[x]
+    if leaf? != /leaf?(node) :
+      /set-leaf?(node, leaf?)
+      children-changed(x)
+
+  ;Add a new node to the tree
   defn add-node (x:Int, leaf?:True|False) :
-    if key?(nodes,x) :
-      fatal("Node %_ already exists." % [x])
-    nodes[x] = TreeNode(leaf?)
+    ensure-not-exists!(x)
+    val node = TreeNode(leaf?)
+    set-all-children(node, [x] when leaf? else [])
+    set-all-parents(node, [x])
+    nodes[x] = node
+      
+  ;Functions for computing the children and parents of each node
   defn compute-children (x:Int) -> Tuple<Int> :
     val nx = nodes[x]
     defn compute () :
@@ -58,19 +105,97 @@ public defn DynTree (l:TreeListener) :
       set-all-parents(nx, compute())
     all-parents(nx) as Tuple<Int>
 
+  defn add-nodes (new-nodes:Seqable<NodeState>) :
+    ;Steps:
+    ;1. Remove existing connections from existing nodes.
+    ;2. Create new nodes.
+    ;3. Create new connections for nodes.
+    ;4. Set the leaf state for nodes.
+
+    ;Action buffers
+    val connect-buffer = Vector<(() -> ?)>()
+    val new-node-buffer = Vector<(() -> ?)>()
+    val change-leaf-buffer = Vector<(() -> ?)>()
+    defn add-to-buffer (f:() -> ?, buffer:Vector<(() -> ?)>) : add(buffer, f)
+    defn exec-buffer (buffer:Vector<(() -> ?)>) : for f in buffer do : f()
+
+    ;Prepare actions
+    val exists-buffer = Vector<True|False>()
+    defn init-exists-buffer (n:Int) :
+      clear(exists-buffer)
+      lengthen(exists-buffer, n, false)
+    
+    for ns in new-nodes do :
+      if key?(node-states,id(ns)) :
+        val node = node-states[id(ns)]
+        ;Scan through parents and adjust if necessary
+        init-exists-buffer(length(parents(ns)))
+        for p in parents(node) do :
+          match(bsearch(parents(ns), p)) :
+            (i:Int) : exists-buffer[i] = true
+            (_:False) : remove-parent(id(ns), p)
+        for (p in parents(ns), old? in exists-buffer) do :
+          if not old? :
+            within add-to-buffer(connect-buffer) :
+              add-parent(id(ns), p)
+        ;Scan through children and adjust if necessary
+        init-exists-buffer(length(children(ns)))
+        for c in children(node) do :
+          match(bsearch(children(ns), c)) :
+            (i:Int) : exists-buffer[i] = true
+            (_:False) : remove-parent(c, id(ns))
+        for (c in children(ns), old? in exists-buffer) do :
+          if not old? :
+            within add-to-buffer(connect-buffer) :
+              add-parent(c, id(ns))
+        ;Set the leaf state for node
+        if leaf?(node) != leaf?(ns) :
+          within add-to-buffer(change-leaf-buffer) :
+            set-leaf?(id(ns), leaf?(ns))
+      else :
+        within add-to-buffer(new-node-buffer) :
+          add-node(id(ns), leaf?(ns))
+        within add-to-buffer(connect-buffer) :          
+          do(add-parent{id(ns), _}, parents(ns))
+        within add-to-buffer(connect-buffer) :          
+          do(add-parent{_, id(ns)}, children(ns))
+      ;Record new node state      
+      node-states[id(ns)] = ns
+
+    ;Execute actions
+    exec-buffer(new-node-buffer)
+    exec-buffer(connect-buffer)
+    exec-buffer(change-leaf-buffer)
+
+    ;Recompute children and parents
+    do(compute-children, update-children)
+    do(compute-parents, update-parents)
+    clear(update-children)
+    clear(update-parents)
+
   new DynTree :
-    defmethod all-children (this, n:Int) : compute-children(n)
-    defmethod all-parents (this, n:Int) : compute-parents(n)
-    defmethod add-parent (this, x:Int, p:Int) : add-parent(x,p)
-    defmethod remove-parent (this, x:Int, p:Int) : remove-parent(x, p)
-    defmethod add-node (this, x:Int, leaf?:True|False) : add-node(x, leaf?)
+    defmethod add (this, nodes:Seqable<NodeState>) : add-nodes(nodes)
+    defmethod all-children (this, n:Int) : all-children(nodes[n]) as Tuple<Int>
+    defmethod all-parents (this, n:Int) : all-parents(nodes[n]) as Tuple<Int>
+    defmethod print (o:OutputStream, this) :
+      print(o, "DynTree :")
+      if empty?(nodes) :
+        print(o, " ()")
+      else :
+        val o2 = IndentedStream(o)
+        for (entry in nodes, i in 0 to false) do :
+          val n = value(entry)
+          val nodestr = "Leaf" when leaf?(n) else "Node"
+          print(o2, "\n%_ %_ :" % [nodestr, key(entry)])
+          print(o2, "\n  children = %," % [children(n)])
+          print(o2, "\n  parents = %," % [parents(n)])
 
 defstruct TreeNode :
   parents: List<Int> with: (init => List(), setter => set-parents)
   children: List<Int> with: (init => List(), setter => set-children)
   all-children: False|Tuple<Int> with: (init => false, setter => set-all-children)
   all-parents: False|Tuple<Int> with: (init => false, setter => set-all-parents)
-  leaf?: True|False
+  leaf?: True|False with: (setter => set-leaf?)
 defn add-parent (n:TreeNode, p:Int) :
   set-parents(n, cons(p, parents(n)))
 defn remove-parent (n:TreeNode, p:Int) :
@@ -84,14 +209,6 @@ defn remove (xs:List<Int>, x:Int) :
   else if head(xs) == x : tail(xs)
   else : cons(head(xs), remove(tail(xs), x))
 
-public defn add-child (t:DynTree, x:Int, c:Int) :
-  add-parent(t, c, x)
-public defn remove-child (t:DynTree, x:Int, c:Int) :
-  remove-parent(t, c, x)
-public defn add-children (t:DynTree, x:Int, cs:Seqable<Int>) :
-  do(add-child{t, x, _}, cs)
-public defn add-parents (t:DynTree, x:Int, ps:Seqable<Int>) :
-  do(add-parent{t, x, _}, ps)
 public defn parent? (t:DynTree, x:Int, p:Int) :
   bsearch(all-parents(t,x), p) is Int
 
@@ -140,17 +257,36 @@ defn merge-all (xxs0:Seqable<Tuple<Int>>) :
 ;      println("Children of %_ changed." % [n])
 ;    defmethod parents-changed (this, n:Int) :
 ;      println("Parents of %_ changed." % [n])
+;
 ;  val t = DynTree(listen)
-;  for i in 1 through 7 do :
-;    add-node(t, i, contains?([2, 7], i))
-;  add-children(t, 1, [2 3 4])
-;  add-children(t, 3, [5 6])
-;  add-parents(t, 7, [5 6])
+;  defn print-state (name) :
+;    println(name)
+;    println(t)
+;    for i in 1 through 7 do :
+;      println("All leaves of %_ = %," % [i, all-children(t,i)])
+;      println("All parents of %_ = %," % [i, all-parents(t,i)])
 ;
-;  for i in 1 through 7 do :
-;    println("Node %_ has children %_" % [i, all-children(t,i)])
-;    println("Node %_ has parents %_" % [i, all-parents(t,i)])
+;  add(t, [
+;    NodeState(1, [], [2, 3, 4], false)
+;    NodeState(2, [], [], true)
+;    NodeState(3, [], [5,6], false)
+;    NodeState(4, [], [], false)
+;    NodeState(5, [], [], false)
+;    NodeState(6, [], [], false)
+;    NodeState(7, [5,6], [], true)
+;  ])
+;  print-state("Initial Tree")
 ;
-;  remove-parent(t, 7, 6)
+;  add(t, [
+;    NodeState(7, [4,5], [], true)
+;    NodeState(1, [], [3,4], false)
+;    NodeState(2, [3], [], true)
+;  ])
+;  print-state("After Moving")
+;
+;  add(t, [
+;    NodeState(3, [], [2,5,6], false)
+;    NodeState(2, [], [], true)])
+;  print-state("Done")   
 ;
 ;main()
