@@ -54,6 +54,7 @@ $STANZA \
     compiler/stz-dec-table.stanza \
     compiler/stz-kform-to-tgt.stanza \
     compiler/stz-khier.stanza \
+    compiler/stz-trie.stanza \
     compiler/stz-backend.stanza \
     compiler/stz-reg-alloc.stanza \
     compiler/stz-codegen.stanza \
