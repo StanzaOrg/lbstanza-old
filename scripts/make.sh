@@ -95,3 +95,10 @@ echo "Compiling Windows Pkgs"
 $STANZA $FILES -pkg wpkgs -platform windows
 echo "Compiling Windows Executable"
 $STANZA $FILES -pkg wfast-pkgs -optimize -s wstanza.s -platform windows
+
+#Finish on osx
+#gcc -std=gnu99 runtime/driver.c stanza.s -o stanza -DPLATFORM_OS_X -lm
+#Finish on linux
+#gcc -std=gnu99 runtime/driver.c lstanza.s -o lstanza -DPLATFORM_LINUX -lm -ldl -fPIC
+#Finish on windows
+#gcc -std=gnu99 runtime/driver.c wstanza.s -o wstanza -DPLATFORM_WINDOWS -lm
