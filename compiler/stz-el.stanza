@@ -22,9 +22,9 @@ public defn lower (epackage:EPackage) -> EPackage :
 
   defn dump (suffix:String) :
     ;DEBUGGING
-    ;val [package, local-name] = qualifier(name(cur-package))
-    ;val filename = append(to-string(local-name), suffix)
-    ;spit(filename, cur-package)
+    val [package, local-name] = qualifier(name(cur-package))
+    val filename = append(to-string(local-name), suffix)
+    spit(filename, cur-package)
     false
 
   dump(".el.input")
@@ -32,7 +32,7 @@ public defn lower (epackage:EPackage) -> EPackage :
   within time-ms!("Map Methods") :
     cur-package = map-methods(cur-package)
     dump(".el.mapped-methods")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   var global-vt:VarTable = GlobalVarTable(cur-package, iotable)
   val ehier = EHier(packageio(epackage), iotable)
@@ -40,48 +40,53 @@ public defn lower (epackage:EPackage) -> EPackage :
   within time-ms!("Create Closures") :
     cur-package = create-closures(cur-package, global-vt)
     dump(".el.closures")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Convert Mixes") :
     cur-package = convert-mixes(cur-package, global-vt)
     dump(".el.mixes")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Insert Guards") :
     cur-package = insert-guards(cur-package, global-vt)
     dump(".el.guarded")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Elide Checks") :
     cur-package = elide-checks(cur-package, ehier, global-vt)
     dump(".el.elided")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Box Mutables") :
     cur-package = box-mutables(cur-package, global-vt)
     dump(".el.boxed")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Detect Loops") :
+    cur-package = detect-loops(cur-package)
+    dump(".el.looped")
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Lambda Lift") :
     cur-package = lambda-lift(cur-package, global-vt)
     global-vt = GlobalVarTable(cur-package, iotable)
     dump(".el.lambda")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Lift Objects") :
     cur-package = lift-objects(cur-package, global-vt)
     dump(".el.objlifted")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Lift Closures") :
     cur-package = lift-closures(cur-package, global-vt)
     dump(".el.closurelifted")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Lift Type Objects") :
     cur-package = lift-type-objects(cur-package)
     dump(".el.typelifted")
-  ;ensure-unique-identifiers!(cur-package)
+  ensure-unique-identifiers!(cur-package)
 
   cur-package
 
@@ -580,7 +585,7 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable) :
             defn guard-call (a1:Tuple<EType>, a2:EType) :
               ;Sanity check
               fatal("Incorrect call type") when calltype(ins) is-not CallGuarded
-              
+
               match(ins) :
                 (ins:ECall) :
                   ;Create a temporary return location
@@ -800,6 +805,103 @@ defn box-mutables (epackage:EPackage, gvt:VarTable) -> EPackage :
   ;Perform freevar analysis and then boxing
   within (texp, vt) = map-with-var-table(gvt, epackage) :
     box(analyze-freevars(texp, vt), vt) as ETExp
+
+;============================================================
+;=================== Detect Loops ===========================
+;============================================================
+
+defn detect-loops (epackage:EPackage) -> EPackage :
+  ;Does the given immediate match the given function id?
+  defn matches-fid? (e:EImm, fid:Int|False) :
+    match(e) :
+      (e:EVar) : n(e) == fid
+      (e:ECurry) : n(x(e)) == fid
+      (e) : false
+
+  ;Scan the given body for tail calls
+  defn has-loop? (e:EFn, fid:Int) :
+    if empty?(targs(e)) :
+      val farity = length(args(e))
+      for i in ins(body(e)) any? :
+        match(i:ETCall) :
+          matches-fid?(f(i), fid) and
+          length(ys(i)) == farity
+
+  ;Transform tail calls
+  defn transform-loops (e:ELBigItem, fid:Int|False) -> ELBigItem :
+    ;First recursively evaluate all the subfunctions in the item, then
+    ;work on the transformations.
+    ;If we need to transform the body, then:
+    ;- Introduce dummy expressions for the arguments and type arguments.
+    ;- Introduce the loop label
+    ;- Copy the dummy arguments into the real arguments
+    ;- Scan through the instructions and generate the looping instructions when necessary.
+
+    ;Recursively evaluate all the subfunctions in the item
+    defn recurse () :
+      val fid* = match(e) :
+                   (e:ELocalFn) : n(e)
+                   (e:EDefn) : n(e)
+                   (e) : fid
+      map(transform-loops{_, fid*}, e)
+
+    ;Detect any loops in the item, and transform them
+    defn detect-loop (e:ELBigItem) :
+      match(e:EFn, fid:Int) :
+        if has-loop?(e,fid) : transform-loop(e, fid)
+        else : e
+      else : e
+
+    ;Transform the given function into a loop
+    defn transform-loop (e:EFn, fid:Int) :
+      val farity = length(args(e))
+      val buffer = BodyBuffer(body(e))
+      
+      ;Create dummy arguments
+      val targs0 = map(uniqueid{}, targs(e))
+      val args0 = map(uniqueid{}, args(e))
+      val loop-lbl = uniqueid()
+      for (a in args(e), t in a1(e)) do :
+        emit(buffer, ELocal(a, t, false))
+      for (ta0 in targs0) do :
+        emit(buffer, ELocalType(ta0))
+      
+      ;Emit loop start and entry prologue
+      emit(buffer, ELabel(loop-lbl))
+      for (a0 in args0, a in args(e)) do :
+        emit(buffer, EDef(EVarLoc(a), EVar(a0)))
+      
+      ;Emit instructions and generate looping instructions
+      ;for matching tail calls.
+      for i in ins(body(e)) do :
+        ;Classify the instruction into either a loop call
+        ;or a standard instruction.
+        defn* classify () :
+          match(i:ETCall) :
+            if matches-fid?(f(i), fid) and length(ys(i)) == farity :
+              loop-call(f(i), ys(i))
+            else : standard-ins()
+          else : standard-ins()
+        ;For standard instructions just emit them to the buffer
+        defn standard-ins () :
+          emit(buffer, i)
+        ;For loop calls, generate the appropriate instructions.
+        defn loop-call (f:EImm, ys:Tuple<EImm>) :        
+          for (a0 in args0, y in ys) do :
+            emit(buffer, EDef(EVarLoc(a0), y))
+          emit(buffer, EGoto(loop-lbl))
+        ;Start with classify
+        classify()        
+      
+      ;Substitute the new body and arguments
+      val body* = to-body(buffer)
+      sub-args(sub-body(e, body*), args0)
+
+    ;Driver
+    detect-loop(recurse())
+
+  ;Transform all functions
+  map(transform-loops{_, false}, epackage)
 
 ;============================================================
 ;=================== Lambda Lifting =========================
@@ -1112,9 +1214,9 @@ defn analyze-basic-blocks (ins:Tuple<EIns>) :
             (i:EIf) : EIf(S(n1(i)), S(n2(i)), op(i), ys(i))
             (i:EMatch|EDispatch) : sub-branches(i, map(B,branches(i)))
             (i) : i
-            
+
         emit(ELabel(lbl(b))) when lbl(b) > 0
-        for i in start(b) through end(b) do :      
+        for i in start(b) through end(b) do :
           emit(ins[i])
         if goto?(b) :
           val b2 = this[/successors(b)[0]]
@@ -1134,7 +1236,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
   ;LoStanza types are trusted.
   defn erase (t:EType) :
     ETop() when reftype?(t) else t
-        
+
   ;Elide all checks in function.
   ;Assumes that free variables have been calculated.
   ;parent-type-state is the state of the free variables at the time
@@ -1149,7 +1251,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
 
   ;Elide checks in body.
   defn analyze-body (e:EBody, initial-state:Seqable<TypeState>, vt:VarTable) -> EBody :
-    ;Generate instructions in buffer            
+    ;Generate instructions in buffer
     val buffer = BodyBuffer(e)
 
     ;Guard table holds the entering assumptions for different
@@ -1177,12 +1279,12 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
       defn* analyze-inner-fns (x:ELBigItem) :
         match(x:EFn) : analyze-function(x, type-state, vt)
         else : map(analyze-inner-fns,x)
-          
+
       ;Analyze a local function
       defn analyze-localfn (f:Int) :
         emit(buffer, analyze-inner-fns(localfn-table[f]) as ELocalFn)
       defn analyze-localobj (o:Int) :
-        emit(buffer, analyze-inner-fns(localobj-table[o]) as ELocalObj)        
+        emit(buffer, analyze-inner-fns(localobj-table[o]) as ELocalObj)
 
       ;Variable v has now been restricted to
       ;be a subtype of the given type. If the variable
@@ -1207,7 +1309,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
       if index(b) == 0 :
         for s in initial-state do :
           type-state[n(s)] = type(s)
-          
+
       ;Initialize state to union of state from entry blocks.
       ;Entry blocks are blocks that are predecessors that have already run.
       val entry-blocks = to-tuple $
@@ -1223,7 +1325,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
           val states = value(entry)
           if length(states) == num-predecessors :
             val t0 = type(head(states))
-            type-state[v] = 
+            type-state[v] =
               if reftype?(t0) : normalize(reduce(EOr, seq(type, states)))
               else : t0
       ;Restrict state of entering variables according to their guards
@@ -1238,7 +1340,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
         defn untrusted (x:EVarLoc) : [n(x), false]
         match(i) :
           (i:ENew) : trusted(x(i))
-          (i:ETuple) : trusted(x(i))          
+          (i:ETuple) : trusted(x(i))
           (i:EVoidTuple) : trusted(x(i))
           (i:ETupleGet) : untrusted(x(i))
           (i:EObject) : trusted(x(i))
@@ -1263,7 +1365,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
                 match(f(i)) :
                   (f:EVar) : check-func(n(f))
                   (f:ECurry) : check-func(n(/x(f)))
-                  (f:EImm) : untrusted(x)            
+                  (f:EImm) : untrusted(x)
               (_:False) :
                 false
           (i) : false
@@ -1279,7 +1381,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
               type-state[n(x)] = EOf(n(iotable(vt), CORE-FN-ID))
             do(analyze-localfn{n(_)}, xs(i))
           (i) : false
-          
+
         match(definition?(instruction)) :
           ;Add the variables entry to the type state
           ;if it is defined.
@@ -1295,7 +1397,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
                 type-state[n] =
                   if mutable?(vt, n) :
                     if lostanza?(vt,n) : erase(type(vt,n))
-                    else : type(vt,n)                    
+                    else : type(vt,n)
                   else : immtype(y(i) as EImm)
                 emit(buffer, i)
               (i:EMatch|EDispatch) :
@@ -1327,7 +1429,7 @@ defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
       match(x) :
         (x:EFn) : analyze-function(x, empty-table, vt)
         (x:EBody) : analyze-body(x, [], vt)
-        (x) : map(analyze, x)        
+        (x) : map(analyze, x)
     analyze(analyze-freevars(texp,vt)) as ETExp
 
 defn merge-states (states:Seqable<TypeState>) :
@@ -1348,7 +1450,7 @@ defn EHier (packageio:PackageIO, iotable:IOTable) :
 
   ;Construct parent table
   defn add-to-parent-table (n:Int, p:Int) :
-    update(parent-table, cons{p, _}, n)    
+    update(parent-table, cons{p, _}, n)
   for e in cat(imports(packageio), exports(packageio)) do :
     val r = rec(e)
     match(r:StructRec|TypeRec|TypeDecl) :
@@ -1729,7 +1831,7 @@ public defn to-etype (table:IOTable, t:DType, targs:Tuple<EType>) -> EType :
       (d:DArrow) : EOf(n(table,CORE-FN-ID))
       (d:DTuple) : EOf(n(table,CORE-TUPLE-ID))
   conv(t)
-  
+
 ;============================================================
 ;======================== VarTable ==========================
 ;============================================================
@@ -1809,7 +1911,7 @@ defn tail? (vt:VarTable, n:Int, arity:Int) :
       (e:EFnEntry) : /tail?(e)
       (e:DFnEntry) : /tail?(e)
       (e:EMultifnEntry) :
-        tail?(find!({length(a1(_)) == arity}, funcs(e)))  
+        tail?(find!({length(a1(_)) == arity}, funcs(e)))
   tail?(entry(vt[n]) as FnEntry)
 
 defn variable? (vt:VarTable, n:Int) :
@@ -1890,7 +1992,7 @@ defn fn-types (vt:VarTable, f:EVar|ECurry, arity:Int) :
     match(e) :
       (e:DFnEntry) :
         fatal("Incorrect type arity.") when ntargs(e) != length(targs)
-        val a1* = to-tuple $ take-n{arity, _} $ 
+        val a1* = to-tuple $ take-n{arity, _} $
           seq(to-etype, ex(a1(e), r(e)))
         val a2* = to-etype(a2(e))
         [a1*, a2*]
