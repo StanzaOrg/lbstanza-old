@@ -861,7 +861,7 @@ defn detect-loops (epackage:EPackage) -> EPackage :
     defn transform-loop (e:EFn, fid:Int) :
       val farity = length(args(e))
       val buffer = BodyBuffer(body(e))
-      
+
       ;Create dummy arguments
       val targs0 = map(uniqueid{}, targs(e))
       val args0 = map(uniqueid{}, args(e))
@@ -870,12 +870,12 @@ defn detect-loops (epackage:EPackage) -> EPackage :
         emit(buffer, ELocal(a, t, false))
       for (ta0 in targs0) do :
         emit(buffer, ELocalType(ta0))
-      
+
       ;Emit loop start and entry prologue
       emit(buffer, ELabel(loop-lbl))
       for (a0 in args0, a in args(e)) do :
         emit(buffer, EDef(EVarLoc(a), EVar(a0)))
-      
+
       ;Emit instructions and generate looping instructions
       ;for matching tail calls.
       for i in ins(body(e)) do :
@@ -891,13 +891,13 @@ defn detect-loops (epackage:EPackage) -> EPackage :
         defn standard-ins () :
           emit(buffer, i)
         ;For loop calls, generate the appropriate instructions.
-        defn loop-call (f:EImm, ys:Tuple<EImm>) :        
+        defn loop-call (f:EImm, ys:Tuple<EImm>) :
           for (a0 in args0, y in ys) do :
             emit(buffer, EDef(EVarLoc(a0), y))
           emit(buffer, EGoto(loop-lbl))
         ;Start with classify
-        classify()        
-      
+        classify()
+
       ;Substitute the new body and arguments
       val body* = to-body(buffer)
       sub-args(sub-body(e, body*), args0)
@@ -910,6 +910,267 @@ defn detect-loops (epackage:EPackage) -> EPackage :
 
 ;============================================================
 ;=================== Simple Inlining ========================
+;============================================================
+
+;Utility for deconstructing an immediate into the function called
+;and the type arguments.
+defn deconstruct-function (return:(Int, Tuple<EType>) -> ?, f:EImm) :
+  match(f) :
+    (f:EVar) : return(n(f), [])
+    (f:ECurry) : return(n(x(f)), targs(f))
+    (f) : false
+
+defn increment<?K> (t:Table<?K,Int>, k:K) :
+  update(t, {_ + 1}, k)
+
+defn add<?K,?V> (t:Table<?K,List<?V>>, k:K, v:V) :
+  update(t, cons{v, _}, k)
+
+defn efns (f:EFunction) :
+  match(f) :
+    (f:EFn) : [f]
+    (f:EMultifn) : funcs(f)
+
+deftype Ctxt <: Hashable&Equalable
+defstruct Top <: Ctxt with: (printer => true)
+defstruct LocalFn <: Ctxt : (n:Int) with: (printer => true)
+defmethod hash (id:Ctxt) :
+  match(id) :
+    (id:Top) : 0
+    (id:LocalFn) : 27 * n(id)
+defmethod equal? (a:Ctxt, b:Ctxt) :
+  match(a,b) :
+    (a:Top, b:Top) : true
+    (a:LocalFn, b:LocalFn) : n(a) == n(b)
+    (a,b) : false
+
+defstruct InlineFnRec :
+  n: Int
+  func: EFunction
+  level: Int
+  parent: Ctxt
+
+defn inlining-order (return:ELocalFn -> ?, e:ELBigItem) :
+  ;Tables for keeping track of all calls
+  val callee-count = IntTable<Int>(0)
+  val usage-count = IntTable<Int>(0)
+  val callers = IntTable<List<Ctxt>>(List())
+
+  ;Table for holding all the defined functions
+  val fn-recs = IntTable<InlineFnRec>()
+  defn in-fn-table? (n:Int, farity:Int) :
+    val f = get?(fn-recs, n)
+    match(f:InlineFnRec) :
+      for efn in efns(func(f)) any? :
+        farity == length(args(efn))
+
+  ;Returns true if a is a child of b
+  defn* child? (a:Ctxt, b:Ctxt) :
+    if a == b :
+      true
+    else :
+      match(a) :
+        (a:LocalFn) :
+          val p = parent(fn-recs[n(a)])
+          child?(p, b)
+        (a:Top) : false
+  
+  ;Returns the parent of a that lives at the same level as b.
+  defn* match-level (a:LocalFn, b:LocalFn) :
+    val ar = fn-recs[n(a)]
+    val br = fn-recs[n(b)]
+    if level(ar) == level(br) :
+      a
+    else if level(ar) > level(br) :
+      match-level(parent(ar) as LocalFn, b)
+
+  ;Loop through each item to fill the above tables
+  defn loop (e:ELBigItem, fid:Ctxt, level:Int) :
+    ;Register in fn table
+    defn register-in-fn-table () :
+      match(e:EBody) :
+        for f in localfns(e) do :
+          fn-recs[n(f)] = InlineFnRec(n(f), func(f), level + 1, fid)
+    ;Recursively loop on subitems
+    defn recurse () :
+      val [fid*, level*] = match(e) :
+        (e:ELocalFn) : [LocalFn(n(e)), level + 1]
+        (e) : [fid, level]
+      do*(loop{_, fid*, level*}, e)
+    ;Look for usages
+    defn look-for-usages () :
+      defn loop (e:ELItem) :
+        do(loop, e)
+        match(e) :
+          (e:EVar) :
+            increment(usage-count, n(e))
+          (e:ECall) :
+            within (callee, targs) = deconstruct-function(f(e)) :
+              if in-fn-table?(callee, length(ys(e))) :
+                increment(callee-count, callee)
+                add(callers, callee, fid)
+          (e) : false
+      match(e:EBody) :
+        do(loop, ins(e))
+
+    ;Driver
+    register-in-fn-table()
+    recurse()
+    look-for-usages()
+
+  ;Compute all inlined functions.
+  ;Compute all the call graph at each level.
+  val inlined? = IntSet()
+  val called = IntTable<List<Int>>(List())
+  defn compute-inlined () :
+    for fid in keys(fn-recs) do :
+      if callee-count[fid] == 1 and usage-count[fid] == 1 :
+        val callee = LocalFn(fid)
+        val caller = head(callers[fid])
+        if not child?(caller, callee) :
+          add(inlined?, fid)
+          match(caller:LocalFn) :
+            val parent-caller = match-level(caller, callee)
+            match(parent-caller:LocalFn) :
+              add(called, n(parent-caller), n(callee))
+
+  ;Order children before roots
+  defn post-order (roots:Seqable<Int>, children:Int -> Seqable<Int>) :
+    generate<Int> :
+      val visited = IntSet()
+      defn loop (n:Int) :
+        if not visited[n] :
+          add(visited,n)
+          do(loop, children(n))
+          yield(n)
+      do(loop, roots)
+  
+  ;Output the functions in inlining order
+  defn compute-inlining-order () :
+    defn loop (e:ELBigItem) :
+      match(e:EBody) :
+        ;Retrieve all the local functions to be inlined
+        val inlined-fns = filter({inlined?[_]}, seq(n, localfns(e)))
+        val ordered-fns = post-order(inlined-fns, {called[_]})
+        for f in ordered-fns do :
+          val func = func(fn-recs[f])
+          loop(func)
+          return(ELocalFn(f, func))
+      else :
+        do*(loop, e)
+    loop(e)
+
+  ;Driver
+  loop(e, Top(), 0)
+  compute-inlined()
+  compute-inlining-order()
+
+defn inline-call (buffer:BodyBuffer,
+                  ret:EVarLoc|False, f:EFn, call-targs:Tuple<EType>, call-args:Tuple<EImm>) :
+  ;Utilities for substituting type arguments
+  val targ-table = IntTable<EType>()
+  for (ta in targs(f), v in call-targs) do :
+    targ-table[ta] = v
+  defn substitute-targs (x:ELItem) :
+    if empty?(call-targs) :
+      x
+    else :
+      match(x) :
+        (x:ETVar) : get?(targ-table, n(x), x)
+        (x) : map(substitute-targs, x)
+
+  ;Create locals for inlining
+  defn create-locals () :
+    ;Define locals for arguments
+    for (a in args(f), t in a1(f)) do :
+      val t* = substitute-targs(t) as EType
+      emit(buffer, ELocal(a, t*, false))
+    ;Add all locals from function
+    do(emit{buffer, substitute-targs(_) as ELocal}, locals(body(f)))
+    do(emit{buffer, _}, localtypes(body(f)))
+    do(emit{buffer, substitute-targs(_) as ELocalFn}, localfns(body(f)))
+    do(emit{buffer, substitute-targs(_) as ELocalObj}, localobjs(body(f)))
+
+  ;Generate instructions
+  defn gen-instructions () :
+    ;Label for end of function
+    val end-lbl = uniqueid()
+
+    ;Put arguments into argument locals
+    for (a in args(f), v in call-args) do :
+      emit(buffer, EDef(EVarLoc(a), v))
+
+    ;Emit instructions
+    for i in ins(body(f)) do :
+      match(substitute-targs(i) as EIns) :
+        (i:EReturn) :
+          match(ret:EVarLoc) :
+            emit(buffer, EDef(ret, y(i)))
+          emit(buffer, EGoto(end-lbl))
+        (i:ETCall) :
+          match(ret:EVarLoc) :
+            emit(buffer, ECall(ret, /f(i), ys(i), calltype(i), info(i)))
+          emit(buffer, EGoto(end-lbl))
+        (i) :
+          emit(buffer, i)
+
+    ;Emit ending label
+    emit(buffer, ELabel(end-lbl))
+
+  ;Create locals
+  create-locals()
+  gen-instructions()
+
+defn simple-inline (epackage:EPackage) :
+  defn inline-texp (e:ETExp) :
+    ;Inlining a single function
+    ;Table for holding inlined functions
+    val inlined-functions = IntTable<ELocalFn>()
+    defn get-inlined-function (return:EFn -> ?, fid:Int, arity:Int) :
+      if key?(inlined-functions, fid) :
+        val efns = efns(func(inlined-functions[fid]))
+        for f in efns do :
+          return(f) when arity == length(args(f))
+          
+    ;Inlining of a body
+    defn inline (e:ELBigItem) :
+      match(e) :
+        (e:EBody) :
+          val buffer = BodyBuffer(e)
+          for l in localfns(e) do :
+            if not key?(inlined-functions, n(l)) :
+              emit(buffer, inline(l) as ELocalFn)
+          for o in localobjs(e) do :
+            emit(buffer, inline(o) as ELocalObj)
+          for i in ins(e) do :
+            match(i) :
+              (i:ECall) :
+                within (fid, targs) = deconstruct-function(f(i)) :
+                  within func = get-inlined-function(fid, length(ys(i))) :
+                    inline-call(buffer, x(i), func, targs, ys(i))
+              (i:EInitClosures) :
+                val xs* = for x in xs(i) filter : not key?(inlined-functions, n(x))
+                if not empty?(xs*) :
+                  emit(buffer, EInitClosures(to-tuple(xs*), info(i)))
+              (i) :
+                emit(buffer, i)
+          to-body(buffer, true, false, false)
+        (e) :
+          map(inline, e)
+
+    ;Inline in the proper inlining order
+    within f = inlining-order(e) :
+      val f* = inline(f) as ELocalFn
+      inlined-functions[n(f*)] = f*
+      
+    ;Inline the top level
+    inline(e) as ETExp
+
+  ;Inline all top-level expressions
+  sub-exps(epackage, map(inline-texp, exps(epackage)))
+
+;============================================================
+;================== Renaming ================================
 ;============================================================
 
 defn rename-fn (f:EFn) -> EFn :
@@ -961,61 +1222,14 @@ defn rename-fn (f:EFn) -> EFn :
       (e:EBranch) : EBranch(types(e), label*(n(e)), info(e))
       ;Fall through
       (e) : e
-    
+
   create-definitions(f)
   rename(f) as EFn
 
-;defn inline-call (buffer:BodyBuffer,
-;                  ret:EVarLoc|False, f:EFn, call-targs:Tuple<EType>, call-args:Tuple<EImm>) :
-;  ;Construct renaming table:
-;  ;Put calling arguments into the function argument holders.
-;  ;For each instruction, apply renames, and output to buffer
-;  ;Special case: for return statements, put the return values in ret
-;  ;and jump to the return label.
-;
-;  ;Utilities for renaming
-;  val targ-table = IntTable<EType>()
-;  val label-table = IntTable<Int>()
-;  val var-table = IntTable<Int>()
-;  
-;  for (ta in targs(f), v in call-targs) do :
-;    targ-table[ta] = v
-;  
-;  
-;
-;  defn substitute-targs (x:EItem) :
-;    if empty?(call-targs) :
-;      x
-;    else :
-;      match(x) :
-;        (x:ETVar) : get?(targ-table, n(x), x)
-;        (x) : map(substitute-targs, x)
-;
-;  ;Generate instructions
-;  defn gen-instructions () :
-;    ;Put arguments into argument locals
-;    for (a in args(f), v in call-args) do :
-;      emit(buffer, EDef(EVarLoc(a), v))
-;
-;    ;Emit instructions
-;    for i in ins(body(f)) do :
-;      match(substitute-targs(i)) :
-;        (i:EReturn) :
-;          match(ret:EVarLoc) :
-;            emit(buffer, EDef(ret, y(i)))
-;          emit(buffer, EGoto(end-lbl))
-;        (i:ETCall) :
-;          match(ret:EVarLoc) :
-;            emit(buffer, ECall(ret, f(i), ys(i), calltype(i), info(i)))
-;          emit(buffer, EGoto(end-lbl))
-;        (i) :
-;          emit(buffer, i)
 
-defn simple-inline (epackage:EPackage) :
-  defn rename (e:ELBigItem) :
-    match(e:EFn) : rename-fn(e)
-    else : map(rename, e)
-  rename(epackage) as EPackage
+
+
+
 
 ;============================================================
 ;=================== Lambda Lifting =========================
