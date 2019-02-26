@@ -1867,9 +1867,6 @@ void vmloop (char* instructions, int n,
         stk = untag_stack(current_stack);
         stack_pointer = stk->stack_pointer;
         stack_end = (char*)(stk->frames) + stk->size;
-        //Return 0
-        SET_REG(0, 0);
-        continue;
       }
       continue;
     }
