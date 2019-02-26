@@ -656,6 +656,7 @@ void vmloop (char* instructions, int n,
       int format = x;
       int num_locals = y;
       PUSH_FRAME(num_locals);
+      stack_pointer->returnpc = -1L;
       call_c_launcher(format, faddr, registers);
       POP_FRAME(num_locals);
       continue;
@@ -672,6 +673,7 @@ void vmloop (char* instructions, int n,
       int format = x;
       int num_locals = y;
       PUSH_FRAME(num_locals);
+      stack_pointer->returnpc = -1L;
       call_c_launcher(format, faddr, registers);
       POP_FRAME(num_locals);
       continue;
