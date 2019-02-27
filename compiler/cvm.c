@@ -28,14 +28,11 @@
 #define GET_REG_OPCODE 18
 #define CALL_OPCODE_LOCAL 19
 #define CALL_OPCODE_CODE 20
-#define CALL_OPCODE_EXTERN 21
 #define CALL_CLOSURE_OPCODE 22
 #define TCALL_OPCODE_LOCAL 23
 #define TCALL_OPCODE_CODE 24
-#define TCALL_OPCODE_EXTERN 25
 #define TCALL_CLOSURE_OPCODE 26
 #define CALLC_OPCODE_LOCAL 27
-#define CALLC_OPCODE_CODE 28
 #define CALLC_OPCODE_EXTERN 29
 #define POP_FRAME_OPCODE 30
 #define LIVE_OPCODE 31
@@ -109,7 +106,6 @@
 #define SHR_OPCODE_BYTE 99
 #define SHR_OPCODE_INT 100
 #define SHR_OPCODE_LONG 101
-#define ASHR_OPCODE_BYTE 102
 #define ASHR_OPCODE_INT 103
 #define ASHR_OPCODE_LONG 104
 #define LT_OPCODE_INT 105
@@ -196,7 +192,6 @@
 #define PRINT_STACK_TRACE_OPCODE 186
 #define CURRENT_STACK_OPCODE 187
 #define FLUSH_VM_OPCODE 188
-#define GLOBALS_OPCODE 189
 #define CONSTS_OPCODE 190
 #define CONSTS_DATA_OPCODE 191
 #define JUMP_INT_LT_OPCODE 192
@@ -445,6 +440,7 @@ void vmloop (char* instructions, int n,
              uint32_t* data_offsets,
              char* data_mem,
              uint64_t* extern_table,
+             uint64_t* extern_defn_addresses,             
              uint32_t* code_offsets,
              int EXTEND_HEAP_ID,
              char** new_heap_top,
@@ -509,6 +505,11 @@ void vmloop (char* instructions, int n,
       SET_LOCAL(y, extern_table[value]);
       continue;
     }
+    case SET_OPCODE_EXTERN_DEFN : {
+      DECODE_C();
+      SET_LOCAL(y, extern_defn_addresses[value]);
+      continue;
+    }
     case SET_OPCODE_GLOBAL : {
       DECODE_C();
       char* address = global_mem + global_offsets[value];
@@ -554,6 +555,11 @@ void vmloop (char* instructions, int n,
     case SET_REG_OPCODE_EXTERN : {
       DECODE_C();
       SET_REG(y, extern_table[value]);
+      continue;
+    }
+    case SET_REG_OPCODE_EXTERN_DEFN : {
+      DECODE_C();
+      SET_REG(y, extern_defn_addresses[value]);
       continue;
     }
     case SET_REG_OPCODE_GLOBAL : {
@@ -603,12 +609,6 @@ void vmloop (char* instructions, int n,
       pc = instructions + fpos;
       continue;
     }
-    case CALL_OPCODE_EXTERN : {
-      DECODE_C();
-      printf("DELETE THIS OPCODE.\n");
-      exit(-1); //DELETE
-      continue;
-    }
     case CALL_CLOSURE_OPCODE : {
       DECODE_C();
       int num_locals = y;
@@ -636,12 +636,6 @@ void vmloop (char* instructions, int n,
       pc = instructions + fpos;
       continue;
     }
-    case TCALL_OPCODE_EXTERN : {
-      DECODE_C();
-      printf("DELETE THIS OPCODE.\n");
-      exit(-1); //DELETE
-      continue;
-    }
     case TCALL_CLOSURE_OPCODE : {
       DECODE_A_UNSIGNED();
       Function* clo = (Function*)(LOCAL(value) - REF_TAG_BITS + 8);
@@ -661,15 +655,20 @@ void vmloop (char* instructions, int n,
       POP_FRAME(num_locals);
       continue;
     }
-    case CALLC_OPCODE_CODE : {
-      DECODE_C();
-      printf("DELETE THIS OPCODE.\n");
-      exit(-1); //DELETE
-      continue;
-    }
     case CALLC_OPCODE_EXTERN : {
       DECODE_C();
       uint64_t faddr = extern_table[value];
+      int format = x;
+      int num_locals = y;
+      PUSH_FRAME(num_locals);
+      stack_pointer->returnpc = -1L;
+      call_c_launcher(format, faddr, registers);
+      POP_FRAME(num_locals);
+      continue;
+    }
+    case CALLC_OPCODE_EXTERN_DEFN : {
+      DECODE_C();
+      uint64_t faddr = extern_defn_addresses[value];
       int format = x;
       int num_locals = y;
       PUSH_FRAME(num_locals);
@@ -1070,12 +1069,6 @@ void vmloop (char* instructions, int n,
     case SHR_OPCODE_LONG : {
       DECODE_C();
       SET_LOCAL(x, (uint64_t)(LOCAL(y)) >> (uint64_t)(LOCAL(value)));
-      continue;
-    }
-    case ASHR_OPCODE_BYTE : {
-      DECODE_C();
-      printf("DELETE THIS OPCODE.\n");
-      exit(-1); //DELETE
       continue;
     }
     case ASHR_OPCODE_INT : {
@@ -1617,12 +1610,6 @@ void vmloop (char* instructions, int n,
       DECODE_A_UNSIGNED();
       stk->stack_pointer = stack_pointer;
       stk->pc = pc - instructions;
-      continue;
-    }
-    case GLOBALS_OPCODE : {
-      DECODE_A_UNSIGNED();
-      printf("DELETE THIS OPCODE.\n");
-      exit(-1); //DELETE
       continue;
     }
     case CONSTS_OPCODE : {
