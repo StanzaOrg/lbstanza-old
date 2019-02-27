@@ -409,6 +409,7 @@ void call_stack_extender (char* heap_top,
                           uint64_t* new_current_stack);
 int dispatch_branch (int format, uint64_t* registers);
 void call_print_stack_trace (uint64_t stack);
+void save_vm_state (char* new_heap_top, uint64_t new_current_stack);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -445,9 +446,7 @@ void vmloop (char* instructions, int n,
              uint64_t* extern_table,
              uint64_t* extern_defn_addresses,             
              uint32_t* code_offsets,
-             int EXTEND_HEAP_ID,
-             char** new_heap_top,
-             uint64_t* new_current_stack){
+             int EXTEND_HEAP_ID){
   //printf("VM Loop!\n");
   //printf("Instructions = %p\n", instructions);
   //printf("Total = %d bytes\n", n);
@@ -654,6 +653,10 @@ void vmloop (char* instructions, int n,
       int num_locals = y;
       PUSH_FRAME(num_locals);
       stack_pointer->returnpc = -1L;
+      //Save registers
+      stk->stack_pointer = stack_pointer;
+      save_vm_state(heap_top, current_stack);
+      //Call launcher
       call_c_launcher(format, faddr, registers);
       POP_FRAME(num_locals);
       continue;
@@ -665,6 +668,10 @@ void vmloop (char* instructions, int n,
       int num_locals = y;
       PUSH_FRAME(num_locals);
       stack_pointer->returnpc = -1L;
+      //Save registers
+      stk->stack_pointer = stack_pointer;
+      save_vm_state(heap_top, current_stack);
+      //Call launcher
       call_c_launcher(format, faddr, registers);
       POP_FRAME(num_locals);
       continue;
@@ -676,6 +683,10 @@ void vmloop (char* instructions, int n,
       int num_locals = y;
       PUSH_FRAME(num_locals);
       stack_pointer->returnpc = -1L;
+      //Save registers
+      stk->stack_pointer = stack_pointer;
+      save_vm_state(heap_top, current_stack);
+      //Call launcher
       call_c_launcher(format, faddr, registers);
       POP_FRAME(num_locals);
       continue;
@@ -708,9 +719,9 @@ void vmloop (char* instructions, int n,
       DECODE_A_UNSIGNED();
       int64_t retpc = stack_pointer->returnpc;
       if(retpc < 0){
+        //Save registers
         stk->stack_pointer = stack_pointer;
-        *new_heap_top = heap_top;
-        *new_current_stack = current_stack;
+        save_vm_state(heap_top, current_stack);
         //for(int i=0; i<255; i++)
         //  printf("Time of opcode %d = %llu\n", i, timings[i]);
         return;
