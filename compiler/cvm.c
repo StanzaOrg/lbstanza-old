@@ -192,6 +192,7 @@
 #define ALLOC_OPCODE_CONST 183
 #define ALLOC_OPCODE_LOCAL 184
 #define GC_OPCODE 185
+#define HEAP_REMAINING_OPCODE 240
 #define PRINT_STACK_TRACE_OPCODE 186
 #define CURRENT_STACK_OPCODE 187
 #define FLUSH_VM_OPCODE 188
@@ -1594,6 +1595,12 @@ void vmloop (VMState* vms){
       RESTORE_STATE();
       //Return heap remaining
       SET_LOCAL(x, remaining);
+      continue;
+    }
+    case HEAP_REMAINING_OPCODE : {
+      DECODE_A_UNSIGNED();
+      int64_t remaining = heap_limit - heap_top;
+      SET_LOCAL(value, remaining);
       continue;
     }
     case PRINT_STACK_TRACE_OPCODE : {
