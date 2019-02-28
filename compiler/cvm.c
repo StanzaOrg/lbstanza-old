@@ -431,7 +431,7 @@ typedef struct{
 //============================================================
 
 void call_c_launcher (VMState* vms, int index, uint64_t faddr);
-void call_garbage_collector (VMState* vms, uint64_t total_size);
+int call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
 int dispatch_branch (VMState* vms, int format);
@@ -1590,10 +1590,10 @@ void vmloop (VMState* vms){
       uint64_t size = LOCAL(value);
       //Call GC
       SAVE_STATE();
-      call_garbage_collector(vms, size);
+      int64_t remaining = call_garbage_collector(vms, size);
       RESTORE_STATE();
-      //Return 0
-      SET_REG(0, 0);
+      //Return heap remaining
+      SET_REG(0, remaining);
       continue;
     }
     case PRINT_STACK_TRACE_OPCODE : {
