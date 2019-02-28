@@ -341,7 +341,8 @@
     *addr;})
 
 #define PUSH_FRAME(num_locals) \
-  stack_pointer = (StackFrame*)((char*)stack_pointer + sizeof(StackFrame) + (num_locals) * 8);  
+  stack_pointer = (StackFrame*)((char*)stack_pointer + sizeof(StackFrame) + (num_locals) * 8); \
+  stack_pointer->returnpc = (uint64_t)(pc - instructions);
 
 #define POP_FRAME(num_locals) \
   stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);  
@@ -349,16 +350,14 @@
 #define SAVE_STATE() \
   vms->heap_top = heap_top; \
   vms->current_stack = current_stack; \
-  stk->stack_pointer = stack_pointer; \
-  stk->pc = pc - instructions;
+  stk->stack_pointer = stack_pointer; 
 
 #define RESTORE_STATE() \
   heap_top = vms->heap_top; \
   heap_limit = vms->heap_limit; \
   current_stack = vms->current_stack; \
   stk = untag_stack(current_stack); \
-  stack_pointer = stk->stack_pointer; \
-  pc = instructions + stk->pc;
+  stack_pointer = stk->stack_pointer; 
 
 #define INT_TAG_BITS 0
 #define REF_TAG_BITS 1
@@ -431,7 +430,7 @@ typedef struct{
 //========================= TRAPS ============================
 //============================================================
 
-void call_c_launcher (int index, uint64_t faddr, uint64_t* registers);
+void call_c_launcher (VMState* vms, int index, uint64_t faddr);
 void call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
@@ -609,7 +608,6 @@ void vmloop (VMState* vms){
       uint64_t fid = LOCAL(value);
       uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = (uint64_t)(pc - instructions);
       pc = instructions + fpos;
       continue;
     }
@@ -619,7 +617,6 @@ void vmloop (VMState* vms){
       uint64_t fid = value;
       uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = (uint64_t)(pc - instructions);
       pc = instructions + fpos;
       continue;
     }
@@ -630,7 +627,6 @@ void vmloop (VMState* vms){
       uint64_t fid = clo->code;
       uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = (uint64_t)(pc - instructions);
       pc = instructions + fpos;
       continue;
     }
@@ -664,10 +660,10 @@ void vmloop (VMState* vms){
       int format = x;
       int num_locals = y;
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = -1L;
       SAVE_STATE();
-      call_c_launcher(format, faddr, registers);
+      call_c_launcher(vms, format, faddr);
       RESTORE_STATE();
+      pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
       continue;
     }
@@ -677,10 +673,10 @@ void vmloop (VMState* vms){
       int format = x;
       int num_locals = y;
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = -1L;
       SAVE_STATE();
-      call_c_launcher(format, faddr, registers);
+      call_c_launcher(vms, format, faddr);
       RESTORE_STATE();
+      pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
       continue;
     }
@@ -690,10 +686,10 @@ void vmloop (VMState* vms){
       int format = x;
       int num_locals = y;
       PUSH_FRAME(num_locals);
-      stack_pointer->returnpc = -1L;
       SAVE_STATE();
-      call_c_launcher(format, faddr, registers);
+      call_c_launcher(vms, format, faddr);
       RESTORE_STATE();
+      pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
       continue;
     }
@@ -1518,7 +1514,6 @@ void vmloop (VMState* vms){
         SET_REG(2, size);
         uint64_t fpos = (uint64_t)(code_offsets[extend_heap_id]) * 4;
         PUSH_FRAME(num_locals);
-        stack_pointer->returnpc = (uint64_t)(pc - instructions);
         pc = instructions + fpos;
         continue;
       }
@@ -1537,7 +1532,6 @@ void vmloop (VMState* vms){
         SET_REG(2, size);
         uint64_t fpos = (uint64_t)(code_offsets[extend_heap_id]) * 4;
         PUSH_FRAME(num_locals);
-        stack_pointer->returnpc = (uint64_t)(pc - instructions);
         pc = instructions + fpos;
         continue;
       }
