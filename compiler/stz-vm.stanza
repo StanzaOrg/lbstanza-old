@@ -572,6 +572,34 @@ defn ExternTable () :
 public val EXTERN-TABLE = ExternTable()
 
 ;============================================================
+;===================== ExternDefn Table =====================
+;============================================================
+
+public deftype ExternDefnTable
+public defmulti index (t:ExternDefnTable, name:Symbol) -> Int
+public defmulti set (t:ExternDefnTable, name:Symbol, index:Int, addr:Long) -> False
+public defmulti address-array (t:ExternDefnTable) -> StableLongArray
+
+defn ExternDefnTable () :
+  val indices = HashTable<Symbol,Int>()
+  var addresses:StableLongArray = StableLongArray(32, -1L)
+  new ExternDefnTable :
+    defmethod index (this, name:Symbol) :
+      if not key?(indices,name) :
+        fatal("External function %_ has not been registered." % [name])
+      indices[name]
+    defmethod set (this, name:Symbol, index:Int, addr:Long) :
+      indices[name] = index
+      addresses = put(addresses, index, addr, -1L)
+    defmethod address-array (this) :
+      addresses
+
+lostanza defn addresses (t:ref<ExternDefnTable>) -> ptr<long> :
+  return address-array(t).data
+
+public val EXTERN-DEFN-TABLE = ExternDefnTable()
+
+;============================================================
 ;===================== Format Table =========================
 ;============================================================
 
@@ -686,15 +714,31 @@ public lostanza deftype VirtualMachine :
   vmtable: ref<VMTable>
   loaded-ids: ref<LoadedIds>
   linker: ref<Linker>
+  vmstate: ptr<VMState>
+
+public lostanza deftype VMState :
+  ;Permanent State
+  ;Changes in-between each code load
+  instructions: ptr<byte>
   registers: ptr<long>
-  heap: ptr<long>                ;[semi-variable]
-  heap-top: ptr<long>            ;[variable]
-  heap-limit: ptr<long>          ;[semi-variable]
-  free: ptr<long>                ;[semi-variable]
-  free-limit: ptr<long>          ;[semi-variable]
-  current-stack: long            ;[variable]
-  stack-pointer: ptr<StackFrame> ;[variable]
-  pc: int                        ;[variable]
+  global-offsets: ptr<long>
+  global-mem: ptr<byte>
+  const-table: ptr<long>
+  const-mem: ptr<byte>
+  data-offsets: ptr<int>
+  data-mem: ptr<byte>
+  extern-addresses: ptr<long>
+  extern-defn-addresses: ptr<long>
+  code-offsets: ptr<int>
+  extend-heap-id: int
+  ;Variable State
+  ;Changes in-between each boundary change
+  heap: ptr<long>      
+  heap-top: ptr<long>  
+  heap-limit: ptr<long>
+  free: ptr<long>      
+  free-limit: ptr<long>
+  current-stack: long  
 
 lostanza deftype StackFrame :
   return: long
@@ -736,33 +780,59 @@ lostanza defn loaded-ids (vm:ref<VirtualMachine>) -> ref<LoadedIds> :
 lostanza defn vmtable (vm:ref<VirtualMachine>) -> ref<VMTable> :
   return vm.vmtable
 
+lostanza defn update-vmstate (vm:ref<VirtualMachine>) -> ref<False> :
+  val vms = vm.vmstate
+  val vmt = vm.vmtable
+  vms.instructions = vmt.bytecode.mem
+  vms.global-offsets = vmt.global-offsets.data
+  vms.global-mem = vmt.globals.mem
+  vms.const-table = vmt.consts.mem
+  vms.const-mem = vmt.consts-data.mem
+  vms.data-offsets = vmt.data-positions.data
+  vms.data-mem = vmt.data.mem
+  vms.extern-addresses = vmt.extern-addresses.data
+  vms.extern-defn-addresses = addresses(EXTERN-DEFN-TABLE)
+  vms.code-offsets = vmt.function-addresses.data
+  if key?(vm.loaded-ids, CORE-EXTEND-HEAP-ID) == true :
+    vms.extend-heap-id = get(vm.loaded-ids, CORE-EXTEND-HEAP-ID).value
+  return false
+
 ;============================================================
 ;==================== VM Implementation =====================
 ;============================================================
 
+public defn LoadedIds () :
+  val env = new IdEnvironment :
+    defmethod extern-defn-index (this, lbl:Symbol) :
+      index(EXTERN-DEFN-TABLE, lbl)
+  LoadedIds(env)
+
 public lostanza defn VirtualMachine () -> ref<VirtualMachine> :
-  val registers = call-c clib/malloc(8 * 256)
   val heap-size = 4 * 1024
-  val heap = call-c clib/malloc(heap-size)
-  val heap-limit = heap + heap-size
-  val free = call-c clib/malloc(heap-size)
-  val free-limit = free + heap-size
-  val null = 0L as ptr<?>
+  val vmstate:ptr<VMState> = call-c clib/malloc(sizeof(VMState))
+  vmstate.registers = call-c clib/malloc(8 * 256)
+  vmstate.heap = call-c clib/malloc(heap-size)
+  vmstate.heap-limit = vmstate.heap + heap-size
+  vmstate.free = call-c clib/malloc(heap-size)
+  vmstate.free-limit = vmstate.free + heap-size
+  vmstate.heap-top = vmstate.heap
+  vmstate.current-stack = void-marker()
   val class-table = ClassTable()
   val branch-table = BranchTable(class-table)
+  val vmtable = VMTable(class-table, branch-table)
   val linker = Linker(branch-table)
-  return new VirtualMachine{VMTable(class-table, branch-table), LoadedIds(), linker,
-                            registers, heap, heap, heap-limit,
-                            free, free-limit, void-marker(), null, 0}
+  val vm = new VirtualMachine{vmtable, LoadedIds(), linker, vmstate}
+  update-vmstate(vm)
+  return vm
 
-lostanza defn alloc-heap (vm:ref<VirtualMachine>, tag:long, size:long) -> ptr<?> :
+lostanza defn alloc-heap (vm:ptr<VMState>, tag:long, size:long) -> ptr<?> :
   ;Make space on heap
   val obj = vm.heap-top + 8
   [vm.heap-top] = tag
   vm.heap-top = vm.heap-top + 8 + size
   return obj
 
-lostanza defn alloc-stack (vm:ref<VirtualMachine>, pc:int) -> long :
+lostanza defn alloc-stack (vm:ptr<VMState>) -> long :
   ;Allocate stack
   val sptr:ptr<Stack> = alloc-heap(vm, STACK-TYPE.value, sizeof(Stack))
 
@@ -774,473 +844,434 @@ lostanza defn alloc-stack (vm:ref<VirtualMachine>, pc:int) -> long :
   sptr.size = stack-size
   sptr.frames = frames
   sptr.stack-pointer = frames
-  sptr.pc = pc * 4
+  sptr.pc = 0
   sptr.frames.return = -1L
   sptr.frames.liveness-map = 0L
 
   ;Return stack
   return tag(sptr - 8)
 
-lostanza defn eval-imm (x:ref<VMImm>, frame:ptr<StackFrame>, vmtable:ref<VMTable>) -> long :
-  match(x) :
-    (x:ref<Local>) :
-      return frame.slots[index(x).value]
-    (x:ref<NumConst>) :
-      match(value(x)) :
-        (v:ref<Char>) : return v.value
-        (v:ref<Byte>) : return v.value
-        (v:ref<Int>) : return v.value
-        (v:ref<Long>) : return v.value
-        (v:ref<Float>) : return float-to-bits(v.value)
-        (v:ref<Double>) : return double-to-bits(v.value)
-    (x:ref<CodeId>) :
-      return id(x).value
-    (x:ref<ExternId>) :
-      return get(vmtable.extern-addresses, id(x)).value
-    (x:ref<GlobalId>) :
-      val offset = global-offset(vmtable, id(x)).value
-      return (vmtable.globals.mem + offset) as long
-    (x:ref<DataId>) :
-      val pos = get(vmtable.data-positions, id(x)).value
-      return addr!(vmtable.data.mem[pos]) as long
-    (x:ref<ConstId>) :
-      val n = id(x).value
-      val mem:ptr<long> = vmtable.consts.mem
-      return mem[n]
-    (x:ref<Marker>) :
-      return (typeid(x).value << 3L) + MARKER-TAG-BITS
-    (x:ref<VoidMarker>) :
-      return void-marker()
-    (x:ref<Tag>) :
-      return typeid(x).value
-
-lostanza defn eval-op (op:ref<VMOp>, current-stack:long,
-                       stack-pointer:ptr<StackFrame>, vmtable:ref<VMTable>) -> long :
-  match(op) :
-    (op:ref<CurrentStackOp>) : return current-stack
-    (op:ref<GlobalsOp>) : return vmtable.globals.mem as long
-    (op:ref<ConstsDataOp>) : return vmtable.consts-data as long
-    (op:ref<ConstsOp>) : return vmtable.consts.mem as long
-    (op:ref<FlushVMOp>) :
-      val stk:ptr<Stack> = untag(current-stack)
-      stk.stack-pointer = stack-pointer
-      return 0
-  return 0
-
-lostanza defn eval-type (y:long) -> ref<Int> :
-  val tagbits = y & 7L
-  if tagbits == REF-TAG-BITS :
-    return new Int{[(y - REF-TAG-BITS) as ptr<long>] as int}
-  else if tagbits == MARKER-TAG-BITS :
-    return new Int{(y >> 3L) as int}
-  else if tagbits == INT-TAG-BITS :
-    return INT-TYPE
-  else if tagbits == BYTE-TAG-BITS :
-    return BYTE-TYPE
-  else if tagbits == CHAR-TAG-BITS :
-    return CHAR-TYPE
-  else if tagbits == FLOAT-TAG-BITS :
-    return FLOAT-TYPE
-  else :
-    return fatal("Unrecognized tag bits.")
-
-lostanza defn eval-types (ys:ref<Tuple<VMImm>>, frame:ptr<StackFrame>, vmtable:ref<VMTable>) -> ref<Tuple<Int>> :
-  ;Create void tuple
-  val n = ys.length
-  val ret = new Tuple{n}
-  for (var i:int = 0, i < n, i = i + 1) :
-    ret.items[i] = false
-  ;Evaluate type of each y and store in tuple
-  for (var i:int = 0, i < n, i = i + 1) :
-    val t = eval-type(eval-imm(ys.items[i], frame, vmtable))
-    ret.items[i] = t
-  ;Return tuple
-  return ret
-
-lostanza defn eval-op (type:ref<VMType>, op:ref<VMOp>, y:long, vmtable:ref<VMTable>, livemap:ref<LiveMapTable>) -> long :
-  match(type) :
-    (type:ref<VMByte>) :
-      val y = y as byte
-      match(op) :
-        (op:ref<NotOp>) : return (~ y)
-        (op) : (fatal("Illegal op."), return 0)
-    (type:ref<VMInt>) :
-      val y = y as int
-      match(op) :
-        (op:ref<NotOp>) : return (~ y)
-        (op:ref<NegOp>) : return (- y)
-        (op) : (fatal("Illegal op."), return 0)
-    (type:ref<VMLong>) :
-      match(op) :
-        (op:ref<NotOp>) : return (~ y)
-        (op:ref<NegOp>) : return (- y)
-        (op:ref<InstanceofOp>) :
-          val type = eval-type(y)
-          return instanceof?(vmtable.class-table, type, /type(op)) == true
-        (op:ref<PrintStackTraceOp>) :
-          val stk:ptr<Stack> = untag(y)
-          print-stack-trace(stk, vmtable, livemap)
-          return 0
-        (op) : (fatal("Illegal op."), return 0)
-    (type:ref<VMFloat>) :
-      val yint = y as int
-      val y = ($ls-prim fnum yint)
-      match(op) :
-        (op:ref<NegOp>) : return float-to-bits((- y))
-        (op) : (fatal("Illegal op."), return 0)
-    (type:ref<VMDouble>) :
-      val y = ($ls-prim fnum y)
-      match(op) :
-        (op:ref<NegOp>) : return double-to-bits((- y))
-        (op) : (fatal("Illegal op."), return 0)
-    (type:ref<VMRef>) :
-      match(op) :
-        (op:ref<TagOp>) :
-          val t = /type(op).value
-          if t == BYTE-TYPE.value :
-            return y << 32L + BYTE-TAG-BITS
-          else if t == CHAR-TYPE.value :
-            return y << 32L + CHAR-TAG-BITS
-          else if t == INT-TYPE.value :
-            return y << 32L
-          else if t == FLOAT-TYPE.value :
-            return y << 32L + FLOAT-TAG-BITS
-          else :
-            fatal("Illegal op.")
-            return 0
-        (op:ref<DetagOp>) :
-          return y >> 32L
-        (op:ref<DerefOp>) :
-          return untag(y) as long
-        (op:ref<IntNotOp>) :
-          return (~ y) & (-1L << 32L)
-        (op:ref<IntNegOp>) :
-          return (- y)
-
-
-lostanza defn bit-to-bool (x:long) -> long :
-  return (x << 3L) + MARKER-TAG-BITS
-
-lostanza defn eval-op (type:ref<VMType>, op:ref<VMOp>, y:long, z:long) -> long :
-  match(type) :
-    (type:ref<VMRef>) :
-      match(op) :
-        (op:ref<IntAddOp>) : return y + z
-        (op:ref<IntSubOp>) : return y - z
-        (op:ref<IntMulOp>) : return (y >>> 32L) * z
-        (op:ref<IntDivOp>) : return (y / z) << 32L
-        (op:ref<IntModOp>) : return y % z
-        (op:ref<IntAndOp>) : return y & z
-        (op:ref<IntOrOp>) : return y | z
-        (op:ref<IntXorOp>) : return y ^ z
-        (op:ref<IntShlOp>) : return y << (z >>> 32L)
-        (op:ref<IntShrOp>) : return ((y >> (z >>> 32L)) >> 32L) << 32L
-        (op:ref<IntAshrOp>) : return ((y >>> (z >>> 32L)) >> 32L)
-        (op:ref<IntLtOp>) : return bit-to-bool(y < z)
-        (op:ref<IntGtOp>) : return bit-to-bool(y > z)
-        (op:ref<IntLeOp>) : return bit-to-bool(y <= z)
-        (op:ref<IntGeOp>) : return bit-to-bool(y >= z)
-        (op:ref<EqOp>) : return bit-to-bool(y == z)
-        (op:ref<NeOp>) : return bit-to-bool(y != z)
-    (type:ref<VMByte>) :
-      val y = y as byte
-      val z = z as byte
-      match(op) :
-        (op:ref<AddOp>) : return y + z
-        (op:ref<SubOp>) : return y - z
-        (op:ref<MulOp>) : return y * z
-        (op:ref<DivOp>) : return y / z
-        (op:ref<ModOp>) : return y % z
-        (op:ref<AndOp>) : return y & z
-        (op:ref<OrOp>) : return y | z
-        (op:ref<XorOp>) : return y ^ z
-        (op:ref<ShlOp>) : return y << z
-        (op:ref<ShrOp>) : return y >> z
-        (op:ref<AshrOp>) : return y >>> z
-        (op:ref<EqOp>) : return y == z
-        (op:ref<NeOp>) : return y != z
-        (op:ref<UleOp>) : return ($ls-prim ule y z)
-        (op:ref<UltOp>) : return ($ls-prim ult y z)
-        (op:ref<UgtOp>) : return ($ls-prim ugt y z)
-        (op:ref<UgeOp>) : return ($ls-prim uge y z)
-        (op) : (fatal("Illegal operand."), return 0)
-    (type:ref<VMInt>) :
-      val y = y as int
-      val z = z as int
-      match(op) :
-        (op:ref<AddOp>) : return y + z
-        (op:ref<SubOp>) : return y - z
-        (op:ref<MulOp>) : return y * z
-        (op:ref<DivOp>) : return y / z
-        (op:ref<ModOp>) : return y % z
-        (op:ref<AndOp>) : return y & z
-        (op:ref<OrOp>) : return y | z
-        (op:ref<XorOp>) : return y ^ z
-        (op:ref<ShlOp>) : return y << z
-        (op:ref<ShrOp>) : return y >> z
-        (op:ref<AshrOp>) : return y >>> z
-        (op:ref<EqOp>) : return y == z
-        (op:ref<NeOp>) : return y != z
-        (op:ref<LtOp>) : return y < z
-        (op:ref<GtOp>) : return y > z
-        (op:ref<LeOp>) : return y <= z
-        (op:ref<GeOp>) : return y >= z
-        (op:ref<UleOp>) : return ($ls-prim ule y z)
-        (op:ref<UltOp>) : return ($ls-prim ult y z)
-        (op:ref<UgtOp>) : return ($ls-prim ugt y z)
-        (op:ref<UgeOp>) : return ($ls-prim uge y z)
-    (type:ref<VMLong>) :
-      match(op) :
-        (op:ref<AddOp>) : return y + z
-        (op:ref<SubOp>) : return y - z
-        (op:ref<MulOp>) : return y * z
-        (op:ref<DivOp>) : return y / z
-        (op:ref<ModOp>) : return y % z
-        (op:ref<AndOp>) : return y & z
-        (op:ref<OrOp>) : return y | z
-        (op:ref<XorOp>) : return y ^ z
-        (op:ref<ShlOp>) : return y << z
-        (op:ref<ShrOp>) : return y >> z
-        (op:ref<AshrOp>) : return y >>> z
-        (op:ref<EqOp>) : return y == z
-        (op:ref<NeOp>) : return y != z
-        (op:ref<LtOp>) : return y < z
-        (op:ref<GtOp>) : return y > z
-        (op:ref<LeOp>) : return y <= z
-        (op:ref<GeOp>) : return y >= z
-        (op:ref<UleOp>) : return ($ls-prim ule y z)
-        (op:ref<UltOp>) : return ($ls-prim ult y z)
-        (op:ref<UgtOp>) : return ($ls-prim ugt y z)
-        (op:ref<UgeOp>) : return ($ls-prim uge y z)
-    (type:ref<VMFloat>) :
-      val yint = y as int
-      val zint = z as int
-      val y = ($ls-prim fnum yint)
-      val z = ($ls-prim fnum zint)
-      match(op) :
-        (op:ref<AddOp>) : return float-to-bits(y + z)
-        (op:ref<SubOp>) : return float-to-bits(y - z )
-        (op:ref<MulOp>) : return float-to-bits(y * z)
-        (op:ref<DivOp>) : return float-to-bits(y / z)
-        (op:ref<EqOp>) : return y == z
-        (op:ref<NeOp>) : return y != z
-        (op:ref<LtOp>) : return y < z
-        (op:ref<GtOp>) : return y > z
-        (op:ref<LeOp>) : return y <= z
-        (op:ref<GeOp>) : return y >= z
-        (op) : (fatal("Illegal operand."), return 0)
-    (type:ref<VMDouble>) :
-      val y = ($ls-prim fnum y)
-      val z = ($ls-prim fnum z)
-      match(op) :
-        (op:ref<AddOp>) : return double-to-bits(y + z)
-        (op:ref<SubOp>) : return double-to-bits(y - z)
-        (op:ref<MulOp>) : return double-to-bits(y * z)
-        (op:ref<DivOp>) : return double-to-bits(y / z)
-        (op:ref<EqOp>) : return y == z
-        (op:ref<NeOp>) : return y != z
-        (op:ref<LtOp>) : return y < z
-        (op:ref<GtOp>) : return y > z
-        (op:ref<LeOp>) : return y <= z
-        (op:ref<GeOp>) : return y >= z
-        (op) : (fatal("Illegal operand."), return 0)
-
-lostanza defn eval-conv (op:ref<VMOp>, xtype:ref<VMType>, ytype:ref<VMType>, y:long) -> long :
-  match(op) :
-    (op:ref<ConvOp>) :
-      match(xtype, ytype) :
-        ;Integer <- Integer conversions
-        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMByte>) : return y as byte
-        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMInt>) : return y as int
-        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMLong>) : return y
-        ;Float <- Integer conversions
-        (xtype:ref<VMDouble>, ytype:ref<VMByte|VMInt|VMLong>) :
-          val ylong = eval-conv(op, VMLong(), ytype, y)
-          return double-to-bits(ylong as double)
-        (xtype:ref<VMFloat>, ytype:ref<VMByte|VMInt|VMLong>) :
-          val ylong = eval-conv(op, VMLong(), ytype, y)
-          return float-to-bits(ylong as float)
-        ;Integer <- Float conversions
-        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMFloat>) :
-          val ylong = bits-to-float(y as int) as long
-          return eval-conv(op, xtype, VMLong(), ylong)
-        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMDouble>) :
-          val ylong = bits-to-double(y) as long
-          return eval-conv(op, xtype, VMLong(), ylong)
-        ;Float <- Float conversions
-        (xtype:ref<VMFloat>, ytype:ref<VMFloat>) : return y
-        (xtype:ref<VMDouble>, ytype:ref<VMDouble>) : return y
-        (xtype:ref<VMDouble>, ytype:ref<VMFloat>) :
-          return double-to-bits(bits-to-float(y as int) as double)
-        (xtype:ref<VMFloat>, ytype:ref<VMDouble>) :
-          return float-to-bits(bits-to-double(y) as float)
-    (op:ref<InterpretOp>) :
-      return y
-
-defn print-ins (i:Int, ins:LinkedIns) :
-  println("Trace (%_) %_" % [i, ins])
-
-lostanza defn assign (frame:ptr<StackFrame>, l:ref<Local>, value:long) -> long :
-  frame.slots[index(l).value] = value
-  return 0
-
-public defn run (vm:VirtualMachine, fid:Int) :
-  run(vm, fid, false)
-
-lostanza defn load-tag (y:long) -> ref<Int> :
-  val tagbits = y & 7L
-  if tagbits != REF-TAG-BITS :
-    fatal("Not a heap-allocated object!")
-  return new Int{[(y - REF-TAG-BITS) as ptr<int>]}
-
-lostanza defn object-size (y:long, c:ref<VMClass>) -> long :
-  match(c) :
-    (c:ref<VMLeafClass>) :
-      return size(c).value
-    (c:ref<VMArrayClass>) :
-      val obj = (y - REF-TAG-BITS) as ptr<ObjectLayout>
-      val length = obj.slots[0]
-      if length < 0 : fatal("Negative length!")
-      return base-size(c).value + length * item-size(c).value
-
-
-val NEW-STACK = 0
-val SET = 1
-val OP0 = 2
-val VMCALL = 3
-val OP1 = 4
-val OP2 = 5
-val CONV = 6
-val RESERVE = 7
-val ALLOC = 8
-val REFSTORE = 9
-val REFLOAD = 10
-val STORE = 11
-val LOAD = 12
-val GOTO = 13
-val BRANCH1 = 14
-val BRANCH2 = 15
-val DISPATCH = 16
-val SETREG = 17
-val GETREG = 18
-val POPFRAME = 19
-val CALL = 20
-val CALLCLO = 21
-val TCALL = 22
-val TCALLCLO = 23
-val CALLC = 24
-val YIELD = 25
-val RETURN = 26
-val FNENTRY = 27
-val DUMP = 28
-val LIVE = 29
-val BRANCHREG = 30
-val COMMENT = 31
-val FN-SECTION = 32
-val TOTAL = 33
-val DISPATCH-EVAL = 34
-val DISPATCH-KEY = 35
-val DISPATCH-RETRIEVE = 36
-
-
-val NUM-CATEGORIES = 37
-
-val CATEGORY-NAMES = ["NEW-STACK", "SET", "OP0", "VMCALL", "OP1", "OP2", "CONV", "RESERVE",
-                      "ALLOC", "REFSTORE", "REFLOAD", "STORE", "LOAD", "GOTO", "BRANCH1",
-                      "BRANCH2", "DISPATCH", "SETREG", "GETREG", "POPFRAME", "CALL", "CALLCLO",
-                      "TCALL", "TCALLCLO", "CALLC", "YIELD", "RETURN", "FNENTRY", "DUMP",
-                      "LIVE", "BRANCHREG", "COMMENT", "FN-SECTION", "TOTAL", "DISPATCH-EVAL",
-                      "DISPATCH-KEY", "DISPATCH-RETRIEVE"]
-
-val INS-TIMES = Array<Long>(NUM-CATEGORIES, 0L)
-val INS-COUNTS = Array<Int>(NUM-CATEGORIES, 0)
-defn start-timer (i:Int) :
-  INS-TIMES[i] = INS-TIMES[i] - current-time-us()
-  INS-COUNTS[i] = INS-COUNTS[i] + 1
-defn stop-timer (i:Int) :
-  INS-TIMES[i] = INS-TIMES[i] + current-time-us()
-defn print-timers () :
-  for i in 0 to NUM-CATEGORIES do :
-    println("%_: %_ times, %_ us" % [CATEGORY-NAMES[i], INS-COUNTS[i], INS-TIMES[i]])
+;lostanza defn eval-imm (x:ref<VMImm>, frame:ptr<StackFrame>, vmtable:ref<VMTable>) -> long :
+;  match(x) :
+;    (x:ref<Local>) :
+;      return frame.slots[index(x).value]
+;    (x:ref<NumConst>) :
+;      match(value(x)) :
+;        (v:ref<Char>) : return v.value
+;        (v:ref<Byte>) : return v.value
+;        (v:ref<Int>) : return v.value
+;        (v:ref<Long>) : return v.value
+;        (v:ref<Float>) : return float-to-bits(v.value)
+;        (v:ref<Double>) : return double-to-bits(v.value)
+;    (x:ref<CodeId>) :
+;      return id(x).value
+;    (x:ref<ExternId>) :
+;      return get(vmtable.extern-addresses, id(x)).value
+;    (x:ref<GlobalId>) :
+;      val offset = global-offset(vmtable, id(x)).value
+;      return (vmtable.globals.mem + offset) as long
+;    (x:ref<DataId>) :
+;      val pos = get(vmtable.data-positions, id(x)).value
+;      return addr!(vmtable.data.mem[pos]) as long
+;    (x:ref<ConstId>) :
+;      val n = id(x).value
+;      val mem:ptr<long> = vmtable.consts.mem
+;      return mem[n]
+;    (x:ref<Marker>) :
+;      return (typeid(x).value << 3L) + MARKER-TAG-BITS
+;    (x:ref<VoidMarker>) :
+;      return void-marker()
+;    (x:ref<Tag>) :
+;      return typeid(x).value
+;
+;lostanza defn eval-op (op:ref<VMOp>, current-stack:long,
+;                       stack-pointer:ptr<StackFrame>, vmtable:ref<VMTable>) -> long :
+;  match(op) :
+;    (op:ref<CurrentStackOp>) : return current-stack
+;    (op:ref<GlobalsOp>) : return vmtable.globals.mem as long
+;    (op:ref<ConstsDataOp>) : return vmtable.consts-data as long
+;    (op:ref<ConstsOp>) : return vmtable.consts.mem as long
+;    (op:ref<FlushVMOp>) :
+;      val stk:ptr<Stack> = untag(current-stack)
+;      stk.stack-pointer = stack-pointer
+;      return 0
+;  return 0
+;
+;lostanza defn eval-type (y:long) -> ref<Int> :
+;  val tagbits = y & 7L
+;  if tagbits == REF-TAG-BITS :
+;    return new Int{[(y - REF-TAG-BITS) as ptr<long>] as int}
+;  else if tagbits == MARKER-TAG-BITS :
+;    return new Int{(y >> 3L) as int}
+;  else if tagbits == INT-TAG-BITS :
+;    return INT-TYPE
+;  else if tagbits == BYTE-TAG-BITS :
+;    return BYTE-TYPE
+;  else if tagbits == CHAR-TAG-BITS :
+;    return CHAR-TYPE
+;  else if tagbits == FLOAT-TAG-BITS :
+;    return FLOAT-TYPE
+;  else :
+;    return fatal("Unrecognized tag bits.")
+;
+;lostanza defn eval-types (ys:ref<Tuple<VMImm>>, frame:ptr<StackFrame>, vmtable:ref<VMTable>) -> ref<Tuple<Int>> :
+;  ;Create void tuple
+;  val n = ys.length
+;  val ret = new Tuple{n}
+;  for (var i:int = 0, i < n, i = i + 1) :
+;    ret.items[i] = false
+;  ;Evaluate type of each y and store in tuple
+;  for (var i:int = 0, i < n, i = i + 1) :
+;    val t = eval-type(eval-imm(ys.items[i], frame, vmtable))
+;    ret.items[i] = t
+;  ;Return tuple
+;  return ret
+;
+;lostanza defn eval-op (type:ref<VMType>, op:ref<VMOp>, y:long, vmtable:ref<VMTable>, livemap:ref<LiveMapTable>) -> long :
+;  match(type) :
+;    (type:ref<VMByte>) :
+;      val y = y as byte
+;      match(op) :
+;        (op:ref<NotOp>) : return (~ y)
+;        (op) : (fatal("Illegal op."), return 0)
+;    (type:ref<VMInt>) :
+;      val y = y as int
+;      match(op) :
+;        (op:ref<NotOp>) : return (~ y)
+;        (op:ref<NegOp>) : return (- y)
+;        (op) : (fatal("Illegal op."), return 0)
+;    (type:ref<VMLong>) :
+;      match(op) :
+;        (op:ref<NotOp>) : return (~ y)
+;        (op:ref<NegOp>) : return (- y)
+;        (op:ref<InstanceofOp>) :
+;          val type = eval-type(y)
+;          return instanceof?(vmtable.class-table, type, /type(op)) == true
+;        (op:ref<PrintStackTraceOp>) :
+;          val stk:ptr<Stack> = untag(y)
+;          print-stack-trace(stk, vmtable, livemap)
+;          return 0
+;        (op) : (fatal("Illegal op."), return 0)
+;    (type:ref<VMFloat>) :
+;      val yint = y as int
+;      val y = ($ls-prim fnum yint)
+;      match(op) :
+;        (op:ref<NegOp>) : return float-to-bits((- y))
+;        (op) : (fatal("Illegal op."), return 0)
+;    (type:ref<VMDouble>) :
+;      val y = ($ls-prim fnum y)
+;      match(op) :
+;        (op:ref<NegOp>) : return double-to-bits((- y))
+;        (op) : (fatal("Illegal op."), return 0)
+;    (type:ref<VMRef>) :
+;      match(op) :
+;        (op:ref<TagOp>) :
+;          val t = /type(op).value
+;          if t == BYTE-TYPE.value :
+;            return y << 32L + BYTE-TAG-BITS
+;          else if t == CHAR-TYPE.value :
+;            return y << 32L + CHAR-TAG-BITS
+;          else if t == INT-TYPE.value :
+;            return y << 32L
+;          else if t == FLOAT-TYPE.value :
+;            return y << 32L + FLOAT-TAG-BITS
+;          else :
+;            fatal("Illegal op.")
+;            return 0
+;        (op:ref<DetagOp>) :
+;          return y >> 32L
+;        (op:ref<DerefOp>) :
+;          return untag(y) as long
+;        (op:ref<IntNotOp>) :
+;          return (~ y) & (-1L << 32L)
+;        (op:ref<IntNegOp>) :
+;          return (- y)
+;
+;
+;lostanza defn bit-to-bool (x:long) -> long :
+;  return (x << 3L) + MARKER-TAG-BITS
+;
+;lostanza defn eval-op (type:ref<VMType>, op:ref<VMOp>, y:long, z:long) -> long :
+;  match(type) :
+;    (type:ref<VMRef>) :
+;      match(op) :
+;        (op:ref<IntAddOp>) : return y + z
+;        (op:ref<IntSubOp>) : return y - z
+;        (op:ref<IntMulOp>) : return (y >>> 32L) * z
+;        (op:ref<IntDivOp>) : return (y / z) << 32L
+;        (op:ref<IntModOp>) : return y % z
+;        (op:ref<IntAndOp>) : return y & z
+;        (op:ref<IntOrOp>) : return y | z
+;        (op:ref<IntXorOp>) : return y ^ z
+;        (op:ref<IntShlOp>) : return y << (z >>> 32L)
+;        (op:ref<IntShrOp>) : return ((y >> (z >>> 32L)) >> 32L) << 32L
+;        (op:ref<IntAshrOp>) : return ((y >>> (z >>> 32L)) >> 32L)
+;        (op:ref<IntLtOp>) : return bit-to-bool(y < z)
+;        (op:ref<IntGtOp>) : return bit-to-bool(y > z)
+;        (op:ref<IntLeOp>) : return bit-to-bool(y <= z)
+;        (op:ref<IntGeOp>) : return bit-to-bool(y >= z)
+;        (op:ref<EqOp>) : return bit-to-bool(y == z)
+;        (op:ref<NeOp>) : return bit-to-bool(y != z)
+;    (type:ref<VMByte>) :
+;      val y = y as byte
+;      val z = z as byte
+;      match(op) :
+;        (op:ref<AddOp>) : return y + z
+;        (op:ref<SubOp>) : return y - z
+;        (op:ref<MulOp>) : return y * z
+;        (op:ref<DivOp>) : return y / z
+;        (op:ref<ModOp>) : return y % z
+;        (op:ref<AndOp>) : return y & z
+;        (op:ref<OrOp>) : return y | z
+;        (op:ref<XorOp>) : return y ^ z
+;        (op:ref<ShlOp>) : return y << z
+;        (op:ref<ShrOp>) : return y >> z
+;        (op:ref<AshrOp>) : return y >>> z
+;        (op:ref<EqOp>) : return y == z
+;        (op:ref<NeOp>) : return y != z
+;        (op:ref<UleOp>) : return ($ls-prim ule y z)
+;        (op:ref<UltOp>) : return ($ls-prim ult y z)
+;        (op:ref<UgtOp>) : return ($ls-prim ugt y z)
+;        (op:ref<UgeOp>) : return ($ls-prim uge y z)
+;        (op) : (fatal("Illegal operand."), return 0)
+;    (type:ref<VMInt>) :
+;      val y = y as int
+;      val z = z as int
+;      match(op) :
+;        (op:ref<AddOp>) : return y + z
+;        (op:ref<SubOp>) : return y - z
+;        (op:ref<MulOp>) : return y * z
+;        (op:ref<DivOp>) : return y / z
+;        (op:ref<ModOp>) : return y % z
+;        (op:ref<AndOp>) : return y & z
+;        (op:ref<OrOp>) : return y | z
+;        (op:ref<XorOp>) : return y ^ z
+;        (op:ref<ShlOp>) : return y << z
+;        (op:ref<ShrOp>) : return y >> z
+;        (op:ref<AshrOp>) : return y >>> z
+;        (op:ref<EqOp>) : return y == z
+;        (op:ref<NeOp>) : return y != z
+;        (op:ref<LtOp>) : return y < z
+;        (op:ref<GtOp>) : return y > z
+;        (op:ref<LeOp>) : return y <= z
+;        (op:ref<GeOp>) : return y >= z
+;        (op:ref<UleOp>) : return ($ls-prim ule y z)
+;        (op:ref<UltOp>) : return ($ls-prim ult y z)
+;        (op:ref<UgtOp>) : return ($ls-prim ugt y z)
+;        (op:ref<UgeOp>) : return ($ls-prim uge y z)
+;    (type:ref<VMLong>) :
+;      match(op) :
+;        (op:ref<AddOp>) : return y + z
+;        (op:ref<SubOp>) : return y - z
+;        (op:ref<MulOp>) : return y * z
+;        (op:ref<DivOp>) : return y / z
+;        (op:ref<ModOp>) : return y % z
+;        (op:ref<AndOp>) : return y & z
+;        (op:ref<OrOp>) : return y | z
+;        (op:ref<XorOp>) : return y ^ z
+;        (op:ref<ShlOp>) : return y << z
+;        (op:ref<ShrOp>) : return y >> z
+;        (op:ref<AshrOp>) : return y >>> z
+;        (op:ref<EqOp>) : return y == z
+;        (op:ref<NeOp>) : return y != z
+;        (op:ref<LtOp>) : return y < z
+;        (op:ref<GtOp>) : return y > z
+;        (op:ref<LeOp>) : return y <= z
+;        (op:ref<GeOp>) : return y >= z
+;        (op:ref<UleOp>) : return ($ls-prim ule y z)
+;        (op:ref<UltOp>) : return ($ls-prim ult y z)
+;        (op:ref<UgtOp>) : return ($ls-prim ugt y z)
+;        (op:ref<UgeOp>) : return ($ls-prim uge y z)
+;    (type:ref<VMFloat>) :
+;      val yint = y as int
+;      val zint = z as int
+;      val y = ($ls-prim fnum yint)
+;      val z = ($ls-prim fnum zint)
+;      match(op) :
+;        (op:ref<AddOp>) : return float-to-bits(y + z)
+;        (op:ref<SubOp>) : return float-to-bits(y - z )
+;        (op:ref<MulOp>) : return float-to-bits(y * z)
+;        (op:ref<DivOp>) : return float-to-bits(y / z)
+;        (op:ref<EqOp>) : return y == z
+;        (op:ref<NeOp>) : return y != z
+;        (op:ref<LtOp>) : return y < z
+;        (op:ref<GtOp>) : return y > z
+;        (op:ref<LeOp>) : return y <= z
+;        (op:ref<GeOp>) : return y >= z
+;        (op) : (fatal("Illegal operand."), return 0)
+;    (type:ref<VMDouble>) :
+;      val y = ($ls-prim fnum y)
+;      val z = ($ls-prim fnum z)
+;      match(op) :
+;        (op:ref<AddOp>) : return double-to-bits(y + z)
+;        (op:ref<SubOp>) : return double-to-bits(y - z)
+;        (op:ref<MulOp>) : return double-to-bits(y * z)
+;        (op:ref<DivOp>) : return double-to-bits(y / z)
+;        (op:ref<EqOp>) : return y == z
+;        (op:ref<NeOp>) : return y != z
+;        (op:ref<LtOp>) : return y < z
+;        (op:ref<GtOp>) : return y > z
+;        (op:ref<LeOp>) : return y <= z
+;        (op:ref<GeOp>) : return y >= z
+;        (op) : (fatal("Illegal operand."), return 0)
+;
+;lostanza defn eval-conv (op:ref<VMOp>, xtype:ref<VMType>, ytype:ref<VMType>, y:long) -> long :
+;  match(op) :
+;    (op:ref<ConvOp>) :
+;      match(xtype, ytype) :
+;        ;Integer <- Integer conversions
+;        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMByte>) : return y as byte
+;        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMInt>) : return y as int
+;        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMLong>) : return y
+;        ;Float <- Integer conversions
+;        (xtype:ref<VMDouble>, ytype:ref<VMByte|VMInt|VMLong>) :
+;          val ylong = eval-conv(op, VMLong(), ytype, y)
+;          return double-to-bits(ylong as double)
+;        (xtype:ref<VMFloat>, ytype:ref<VMByte|VMInt|VMLong>) :
+;          val ylong = eval-conv(op, VMLong(), ytype, y)
+;          return float-to-bits(ylong as float)
+;        ;Integer <- Float conversions
+;        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMFloat>) :
+;          val ylong = bits-to-float(y as int) as long
+;          return eval-conv(op, xtype, VMLong(), ylong)
+;        (xtype:ref<VMByte|VMInt|VMLong>, ytype:ref<VMDouble>) :
+;          val ylong = bits-to-double(y) as long
+;          return eval-conv(op, xtype, VMLong(), ylong)
+;        ;Float <- Float conversions
+;        (xtype:ref<VMFloat>, ytype:ref<VMFloat>) : return y
+;        (xtype:ref<VMDouble>, ytype:ref<VMDouble>) : return y
+;        (xtype:ref<VMDouble>, ytype:ref<VMFloat>) :
+;          return double-to-bits(bits-to-float(y as int) as double)
+;        (xtype:ref<VMFloat>, ytype:ref<VMDouble>) :
+;          return float-to-bits(bits-to-double(y) as float)
+;    (op:ref<InterpretOp>) :
+;      return y
+;
+;defn print-ins (i:Int, ins:LinkedIns) :
+;  println("Trace (%_) %_" % [i, ins])
+;
+;lostanza defn assign (frame:ptr<StackFrame>, l:ref<Local>, value:long) -> long :
+;  frame.slots[index(l).value] = value
+;  return 0
+;
+;public defn run (vm:VirtualMachine, fid:Int) :
+;  run(vm, fid, false)
+;
+;lostanza defn load-tag (y:long) -> ref<Int> :
+;  val tagbits = y & 7L
+;  if tagbits != REF-TAG-BITS :
+;    fatal("Not a heap-allocated object!")
+;  return new Int{[(y - REF-TAG-BITS) as ptr<int>]}
+;
+;lostanza defn object-size (y:long, c:ref<VMClass>) -> long :
+;  match(c) :
+;    (c:ref<VMLeafClass>) :
+;      return size(c).value
+;    (c:ref<VMArrayClass>) :
+;      val obj = (y - REF-TAG-BITS) as ptr<ObjectLayout>
+;      val length = obj.slots[0]
+;      if length < 0 : fatal("Negative length!")
+;      return base-size(c).value + length * item-size(c).value
+;
+;
+;val NEW-STACK = 0
+;val SET = 1
+;val OP0 = 2
+;val VMCALL = 3
+;val OP1 = 4
+;val OP2 = 5
+;val CONV = 6
+;val RESERVE = 7
+;val ALLOC = 8
+;val REFSTORE = 9
+;val REFLOAD = 10
+;val STORE = 11
+;val LOAD = 12
+;val GOTO = 13
+;val BRANCH1 = 14
+;val BRANCH2 = 15
+;val DISPATCH = 16
+;val SETREG = 17
+;val GETREG = 18
+;val POPFRAME = 19
+;val CALL = 20
+;val CALLCLO = 21
+;val TCALL = 22
+;val TCALLCLO = 23
+;val CALLC = 24
+;val YIELD = 25
+;val RETURN = 26
+;val FNENTRY = 27
+;val DUMP = 28
+;val LIVE = 29
+;val BRANCHREG = 30
+;val COMMENT = 31
+;val FN-SECTION = 32
+;val TOTAL = 33
+;val DISPATCH-EVAL = 34
+;val DISPATCH-KEY = 35
+;val DISPATCH-RETRIEVE = 36
+;
+;
+;val NUM-CATEGORIES = 37
+;
+;val CATEGORY-NAMES = ["NEW-STACK", "SET", "OP0", "VMCALL", "OP1", "OP2", "CONV", "RESERVE",
+;                      "ALLOC", "REFSTORE", "REFLOAD", "STORE", "LOAD", "GOTO", "BRANCH1",
+;                      "BRANCH2", "DISPATCH", "SETREG", "GETREG", "POPFRAME", "CALL", "CALLCLO",
+;                      "TCALL", "TCALLCLO", "CALLC", "YIELD", "RETURN", "FNENTRY", "DUMP",
+;                      "LIVE", "BRANCHREG", "COMMENT", "FN-SECTION", "TOTAL", "DISPATCH-EVAL",
+;                      "DISPATCH-KEY", "DISPATCH-RETRIEVE"]
+;
+;val INS-TIMES = Array<Long>(NUM-CATEGORIES, 0L)
+;val INS-COUNTS = Array<Int>(NUM-CATEGORIES, 0)
+;defn start-timer (i:Int) :
+;  INS-TIMES[i] = INS-TIMES[i] - current-time-us()
+;  INS-COUNTS[i] = INS-COUNTS[i] + 1
+;defn stop-timer (i:Int) :
+;  INS-TIMES[i] = INS-TIMES[i] + current-time-us()
+;defn print-timers () :
+;  for i in 0 to NUM-CATEGORIES do :
+;    println("%_: %_ times, %_ us" % [CATEGORY-NAMES[i], INS-COUNTS[i], INS-TIMES[i]])
 
 ;============================================================
 ;================= Bytecode Loop ============================
 ;============================================================
 
-extern vmloop: (ptr<byte>, ;instructions
-                int,       ;length of instructions
-                ptr<long>, ;heap-top
-                ptr<long>, ;heap-limit
-                ptr<long>, ;registers
-                long,      ;current-stack
-                ptr<long>, ;global offset table
-                ptr<long>, ;global memory
-                ptr<long>, ;const offset table
-                ptr<byte>, ;const memory
-                ptr<int>,  ;data offset table
-                ptr<long>, ;data memory
-                ptr<long>, ;extern address table
-                ptr<int>,  ;code offset table
-                int,       ;EXTEND_HEAP_ID
-                ptr<ptr<long>> ;new-heap-top
-                ptr<long>      ;new-current-stack
-                ) -> int   ;void return
+extern vmloop: (ptr<VMState>) -> int   ;void return
 
-extern defn call_c_launcher (index:int, faddr:long, registers:ptr<long>) -> int :
+extern defn call_c_launcher (vms:ptr<VMState>, index:int, faddr:long) -> int :
+  ;Retrieve return address
+  var stk:ptr<Stack> = untag(vms.current-stack)
+  val retpc = stk.stack-pointer.return
+  ;Call launcher (with return set to -1L)
+  stk.stack-pointer.return = -1L
   val launcher-address = address(FORMAT-TABLE, new Int{index}).value
   val launcher = launcher-address as ptr<((long, ptr<long>) -> long)>
-  [launcher](faddr, registers)
+  [launcher](faddr, vms.registers)
+  ;Restore return address and return
+  stk = untag(vms.current-stack)
+  stk.stack-pointer.return = retpc
   return 0
 
-extern defn call_garbage_collector (heap-top:ptr<long>,
-                                    stack-pointer:ptr<StackFrame>,
-                                    current-stack:long,
-                                    total-size:long,
-                                    new-heap-top:ptr<ptr<long>>,
-                                    new-heap-limit:ptr<ptr<long>>,
-                                    new-current-stack:ptr<long>) -> int :
-  ;Save attributes
+extern defn call_garbage_collector (vms:ptr<VMState>, size:long) -> long :
   val vm = VIRTUAL-MACHINE as ref<VirtualMachine>
-  vm.heap-top = heap-top
-  vm.stack-pointer = stack-pointer
-  vm.current-stack = current-stack
-  ;Call GC
-  extend-heap(vm, total-size)
-  ;Return values
-  [new-heap-top] = vm.heap-top
-  [new-heap-limit] = vm.heap-limit
-  [new-current-stack] = vm.current-stack
-  return 0
+  extend-heap(vm, size)
+  return vms.heap-limit - vms.heap-top
 
-extern defn call_stack_extender (heap-top:ptr<long>,
-                                 stack-pointer:ptr<StackFrame>,
-                                 current-stack:long,
-                                 size:long,
-                                 new-heap-top:ptr<ptr<long>>,
-                                 new-heap-limit:ptr<ptr<long>>,
-                                 new-current-stack:ptr<long>) -> int :
-  ;Save attributes
+extern defn call_stack_extender (vms:ptr<VMState>, size:long) -> int :
   val vm = VIRTUAL-MACHINE as ref<VirtualMachine>
-  vm.heap-top = heap-top
-  vm.stack-pointer = stack-pointer
-  vm.current-stack = current-stack
-  ;Call GC
   extend-stack(vm, size)
-  ;Return values
-  [new-heap-top] = vm.heap-top
-  [new-heap-limit] = vm.heap-limit
-  [new-current-stack] = vm.current-stack
   return 0
 
-extern defn call_print_stack_trace (stack:long) -> int :
+extern defn call_print_stack_trace (vms:ptr<VMState>, stack:long) -> int :
   val vm = VIRTUAL-MACHINE as ref<VirtualMachine>
   val stk:ptr<Stack> = untag(stack)
   print-stack-trace(stk, vmtable(vm), live-map-table(vm.linker))
   return 0
 
-extern defn dispatch_branch (format:int, registers:ptr<long>) -> int :
+extern defn dispatch_branch (vms:ptr<VMState>, format:int) -> int :
   val vm = VIRTUAL-MACHINE as ref<VirtualMachine>
-  val typeids = typeids(format, registers)
+  val typeids = typeids(format, vms.registers)
   val result = dispatch(branch-table(vm), new Int{format}, typeids)
   match(get(branch-table(vm), new Int{format}), result) :
     (bf:ref<DispatchFormat>, result:ref<Default>) : return 0
@@ -1290,564 +1321,548 @@ defn num-dispatch-args (branch-format:Int) :
     (f:DispatchFormat) : length(branches(f)[0])
     (f:MultiFormat) : num-args(f)
 
+;Run the given virtual machine starting from the given starting function.
 var VIRTUAL-MACHINE : VirtualMachine|False = false
-lostanza var new-heap-top:ptr<long>
-lostanza var new-current-stack:long
 public lostanza defn run-bytecode (vm:ref<VirtualMachine>, start-func:ref<Int>) -> ref<False> :
-  ;Set global variable
   VIRTUAL-MACHINE = vm
-
-  ;Retrieve vmtable
-  val vmtable = vm.vmtable
-
-  ;Retrieve pc of starting function
-  val mainpc = get(vmtable.function-addresses, start-func).value
-
-  ;Initialize starting stack
-  if vm.current-stack == void-marker() :
-    vm.current-stack = alloc-stack(vm, mainpc)
-  else :
-    val stk:ptr<Stack> = untag(vm.current-stack)
-    stk.pc = mainpc * 4
-
-  ;Retrieve GC id
-  val extend-heap-id = get(vm.loaded-ids, CORE-EXTEND-HEAP-ID).value
-
-  ;Start virtual machine loop
-  call-c vmloop(vmtable.bytecode.mem,
-                vmtable.bytecode.size as int,
-                vm.heap-top,
-                vm.heap-limit,
-                vm.registers,
-                vm.current-stack,
-                vmtable.global-offsets.data,
-                vmtable.globals.mem,
-                vmtable.consts.mem,
-                vmtable.consts-data.mem,
-                vmtable.data-positions.data,
-                vmtable.data.mem,
-                vmtable.extern-addresses.data,
-                vmtable.function-addresses.data,
-                extend-heap-id,
-                addr(new-heap-top),
-                addr(new-current-stack))
-  vm.heap-top = new-heap-top
-  vm.current-stack = new-current-stack
-  val stk:ptr<Stack> = untag(vm.current-stack)
-  vm.stack-pointer = stk.stack-pointer
-
-  ;Clear globals
+  ensure-stack-allocated(vm.vmstate)
+  set-starting-func(vm, start-func)
+  call-c vmloop(vm.vmstate)
   VIRTUAL-MACHINE = false
-
-  ;Done
   return false
 
-;public lostanza defn continue-bytecode (start-func:ref<Int>) -> ref<False> :
-;  ...
-
-;============================================================
-;============================================================
-;============================================================
-
-var TRACE?:True|False = false
-
-public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:ref<True|False>) -> ref<False> :
-  TRACE? = trace?
-  ;Define machine quantities
-  val vmtable = vm.vmtable
-  val instructions = vmtable.instructions
-  val regs = vm.registers
-  var heap-limit:ptr<long> = vm.heap-limit          ;[LOAD]
-  var heap-top:ptr<long>                            ;[STORE/LOAD]
-  var stack-pointer:ptr<StackFrame>                 ;[STORE/LOAD]
-  var stack-end:ptr<StackFrame>                     ;[LOAD]
-  var current-stack:long                            ;[STORE/LOAD]
-
-  ;Speed characteristics
-  var num-gc:long = 0
-  var num-alloc:long = 0
-  var num-ins:long = 0
-  var num-reg-set:long = 0
-
-  start-timer(TOTAL)
-  labels :
-    begin :
-      ;Retrieve pc of starting function
-      val mainpc = get(vmtable.function-addresses, start-func).value
-
-      ;Initialize starting stack
-      if vm.current-stack == void-marker() :
-        vm.current-stack = alloc-stack(vm, mainpc)
-      else :
-        val stk:ptr<Stack> = untag(vm.current-stack)
-        stk.pc = mainpc
-
-      ;Set heap-top
-      heap-top = vm.heap-top
-      goto load-stack(vm.current-stack)
-    load-stack (stack:long) :
-      current-stack = stack
-      val sptr:ptr<Stack> = untag(current-stack)
-      stack-pointer = sptr.stack-pointer
-      stack-end = /stack-end(current-stack)
-      goto step(sptr.pc)
-    call-function (fid:int, return:int) :
-      start-timer(FN-SECTION)
-      stack-pointer.return = return
-      val pos = get(vmtable.function-addresses, new Int{fid}).value
-      stop-timer(FN-SECTION)
-      goto step(pos)
-    tcall-function (fid:int) :
-      start-timer(FN-SECTION)
-      val pos = get(vmtable.function-addresses, new Int{fid}).value
-      stop-timer(FN-SECTION)
-      goto step(pos)
-    step (pc:int) :
-      ;Retrieve instruction
-      val ins = get(instructions, new Int{pc})
-
-      ;Speed counter
-      num-ins = num-ins + 1
-      match(ins) :
-        (ins:ref<SetReg|GetReg>) : num-reg-set = num-reg-set + 1
-        (ins:ref<LinkedAllocIns>) : num-alloc = num-alloc + 1
-        (ins:ref<LinkedVMCall>) :
-          match(op(ins)) :
-            (op:ref<GCOp>) : num-gc = num-gc + 1
-            (op) : ()
-        (ins) : ()
-
-      ;Trace
-      if trace? == true :
-        call-c clib/printf(" In frame %p: ", stack-pointer)
-        print-ins(new Int{pc}, ins)
-
-      match(ins) :
-        (ins:ref<NewStackIns>) :
-          start-timer(NEW-STACK)
-          val fid = eval-imm(fid(ins), stack-pointer, vmtable) as int
-          val fpc = get(vmtable.function-addresses, new Int{fid}).value
-          vm.heap-top = heap-top
-          val stk = alloc-stack(vm, fpc)
-          heap-top = vm.heap-top
-          assign(stack-pointer, x(ins), stk)
-          stop-timer(NEW-STACK)
-          goto step(pc + 1)
-        (ins:ref<SetIns>) :
-          start-timer(SET)
-          assign(stack-pointer, x(ins), eval-imm(y(ins), stack-pointer, vmtable))
-          stop-timer(SET)
-          goto step(pc + 1)
-        (ins:ref<Op0Ins>) :
-          start-timer(OP0)
-          assign(stack-pointer, x(ins), eval-op(op(ins), current-stack, stack-pointer, vmtable))
-          stop-timer(OP0)
-          goto step(pc + 1)
-        (ins:ref<LinkedVMCall>) :
-          match(op(ins)) :
-            (op:ref<GCOp>) :
-              start-timer(VMCALL)
-              ;Evaluate size
-              val total-size = eval-imm(y(ins), stack-pointer, vmtable)
-              ;Store required values
-              vm.heap-top = heap-top
-              vm.stack-pointer = stack-pointer
-              vm.current-stack = current-stack
-              ;Run garbage collector
-              extend-heap(vm, total-size)
-              ;Load required values
-              heap-limit = vm.heap-limit
-              heap-top = vm.heap-top
-              stack-pointer = vm.stack-pointer
-              current-stack = vm.current-stack
-              stack-end = /stack-end(current-stack)
-              ;Return 0
-              regs[0] = 0L
-              stop-timer(VMCALL)
-              goto step(pc + 1)
-            (op) :
-              fatal("Unreachable")
-        (ins:ref<LinkedOp1Ins>) :
-          start-timer(OP1)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          assign(stack-pointer, x(ins), eval-op(type(ins), op(ins), y, vmtable, live-map-table(vm.linker)))
-          stop-timer(OP1)
-          goto step(pc + 1)
-        (ins:ref<LinkedOp2Ins>) :
-          start-timer(OP2)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          val z = eval-imm(z(ins), stack-pointer, vmtable)
-          assign(stack-pointer, x(ins), eval-op(type(ins), op(ins), y, z))
-          stop-timer(OP2)
-          goto step(pc + 1)
-        (ins:ref<LinkedConvIns>) :
-          start-timer(CONV)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          val result = eval-conv(op(ins), xtype(ins), ytype(ins), y)
-          assign(stack-pointer, x(ins), result)
-          stop-timer(CONV)
-          goto step(pc + 1)
-        (ins:ref<LinkedReserveIns>) :
-          start-timer(RESERVE)
-          ;Compute size to allocate
-          val size = eval-imm(space(ins), stack-pointer, vmtable)
-          if size & 0x7L : fatal("Size is not a multiple of 8.")
-          val total-size = size + 8 * num-obj(ins).value
-
-          ;If there is enough space
-          if heap-top + total-size <= heap-limit :
-            stop-timer(RESERVE)
-            goto step(pc + n(ins).value)
-          else :
-            ;Set arguments
-            regs[0] = false-marker()  ;Closure is false
-            regs[1] = 1L              ;arity = 1
-            regs[2] = total-size      ;size argument
-            val fid = get(vm.loaded-ids, CORE-EXTEND-HEAP-ID).value
-            stack-pointer = stack-pointer + frame-size(ins).value
-            stop-timer(RESERVE)
-            goto call-function(fid, pc + 1)
-        (ins:ref<LinkedAllocIns>) :
-          start-timer(ALLOC)
-          val size = eval-imm(size(ins), stack-pointer, vmtable)
-          if size < 8 : fatal("Invalid size for object.")
-          val total-size = size + 8
-          [heap-top] = type(ins).value
-          val obj = tag(heap-top)
-          if trace? == true : print-tag(obj)
-          assign(stack-pointer, x(ins), obj)
-          heap-top = heap-top + total-size
-          if heap-top > heap-limit : fatal("Beyond heap limits.")
-          stop-timer(ALLOC)
-          goto step(pc + 1)
-        (ins:ref<LinkedRefStoreIns>) :
-          start-timer(REFSTORE)
-          val x = eval-imm(x(ins), stack-pointer, vmtable)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          val z = eval-imm(z(ins), stack-pointer, vmtable)
-          val o = offset(ins).value
-          val sz = size(ins).value
-
-          ;Sanity checks
-          ;- x is a heap-allocated reference.
-          ;- x has the expected tag.
-          ;- the store value has size 8, if a store to the length
-          ;  field of an array.
-          ;- the store offset is within bounds of the object (if not a
-          ;   store to the length field of an array.)
-          ;- the store offset is aligned with the size.
-          val xtype = load-tag(x)
-          if class(ins) != false :
-            if xtype != class(ins) :
-              fatal("Object has unexpected tag.")
-          val class = get(vm.vmtable.class-table, xtype)
-          if y + o < 0 : fatal("Load from negative index.")
-          if (y + o) & (sz - 1) : fatal("Unaligned load.")
-          match(class) :
-            (class:ref<VMArrayClass>) :
-              if y + o == 0 :
-                if sz != 8 : fatal("Inappropriate length field.")
-              else :
-                val xsize = object-size(x, class)
-                if y + o + sz > xsize : fatal("Load out of bounds.")
-            (class:ref<VMLeafClass>) :
-              val xsize = object-size(x, class)
-              if y + o + sz > xsize : fatal("Load out of bounds.")
-
-          ;Execution
-          val xptr = untag(x)
-          if sz == 1 : [xptr as ptr<byte> + y + o] = z as byte
-          else if sz == 4 : [xptr as ptr<int> + y + o] = z as int
-          else if sz == 8 : [xptr as ptr<long> + y + o] = z as long
-          else : fatal("Invalid size.")
-          stop-timer(REFSTORE)
-          goto step(pc + 1)
-        (ins:ref<LinkedRefLoadIns>) :
-          start-timer(REFLOAD)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          val z = eval-imm(z(ins), stack-pointer, vmtable)
-          val o = offset(ins).value
-          val sz = size(ins).value
-
-          ;Sanity checks
-          ;- y is a heap-allocated reference.
-          ;- y has the expected tag.
-          ;- the load offset is within bounds of the object.
-          ;- the load offset is aligned with the size.
-          val ytype = load-tag(y)
-          if class(ins) != false :
-            if ytype != class(ins) :
-              fatal("Object has unexpected tag.")
-          val ysize = object-size(y, get(vm.vmtable.class-table, ytype))
-          if z + o < 0 : fatal("Load from negative index.")
-          if z + o + sz > ysize : fatal("Load out of bounds.")
-          if (z + o) & (sz - 1) : fatal("Unaligned load.")
-
-          ;Execution
-          val yptr:ptr<long> = untag(y)
-          var value:long
-          if sz == 1 : value = [yptr as ptr<byte> + z + o]
-          else if sz == 4 : value = [yptr as ptr<int> + z + o]
-          else if sz == 8 : value = [yptr as ptr<long> + z + o]
-          else : fatal("Invalid size.")
-          assign(stack-pointer, x(ins), value)
-          stop-timer(REFLOAD)
-          goto step(pc + 1)
-        (ins:ref<LinkedStoreIns>) :
-          start-timer(STORE)
-          val x = eval-imm(x(ins), stack-pointer, vmtable)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          val z = eval-imm(z(ins), stack-pointer, vmtable)
-          val o = offset(ins).value
-          val sz = size(ins).value
-
-          ;Sanity checks
-          ;- the store value has size 8, if a store to the length
-          ;  field of an array.
-          ;- the store offset is within bounds of the object (if not a
-          ;   store to the length field of an array.)
-          ;- the store offset is aligned with the size.
-          if class(ins) != false :
-            val xtype = class(ins) as ref<Int>
-            val class = get(vm.vmtable.class-table, xtype)
-            if y + o < 0 : fatal("Load from negative index.")
-            if (y + o) & (sz - 1) : fatal("Unaligned load.")
-            match(class) :
-              (class:ref<VMArrayClass>) :
-                if y + o == 0 :
-                  if sz != 8 : fatal("Inappropriate length field.")
-                else :
-                  val xsize = object-size(x, class)
-                  if y + o + sz > xsize : fatal("Load out of bounds.")
-              (class:ref<VMLeafClass>) :
-                val xsize = object-size(x, class)
-                if y + o + sz > xsize : fatal("Load out of bounds.")
-
-
-          ;Execution
-          if sz == 1 : [x as ptr<byte> + y + o] = z as byte
-          else if sz == 4 : [x as ptr<int> + y + o] = z as int
-          else if sz == 8 : [x as ptr<long> + y + o] = z as long
-          else : fatal("Invalid size.")
-          stop-timer(STORE)
-          goto step(pc + 1)
-        (ins:ref<LinkedLoadIns>) :
-          start-timer(LOAD)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          val z = eval-imm(z(ins), stack-pointer, vmtable)
-          val o = offset(ins).value
-          val sz = size(ins).value
-
-          ;Sanity checks
-          ;- the load offset is within bounds of the object.
-          ;- the load offset is aligned with the size.
-          if class(ins) != false :
-            val ytype = class(ins) as ref<Int>
-            val ysize = object-size(y, get(vm.vmtable.class-table, ytype))
-            if z + o < 0 : fatal("Load from negative index.")
-            if z + o + sz > ysize : fatal("Load out of bounds.")
-            if (z + o) & (sz - 1) : fatal("Unaligned load.")
-
-          ;Execution
-          var value:long
-          if sz == 1 : value = [y as ptr<byte> + z + o]
-          else if sz == 4 : value = [y as ptr<int> + z + o]
-          else if sz == 8 : value = [y as ptr<long> + z + o]
-          else : fatal("Invalid size.")
-          assign(stack-pointer, x(ins), value)
-          stop-timer(LOAD)
-          goto step(pc + 1)
-        (ins:ref<GotoIns>) :
-          start-timer(GOTO)
-          stop-timer(GOTO)
-          goto step(pc + n(ins).value)
-        (ins:ref<Branch1Ins>) :
-          start-timer(BRANCH1)
-          val x = eval-imm(x(ins), stack-pointer, vmtable)
-          match(op(ins)) :
-            (op:ref<VMOp>) :
-              val r = eval-op(VMLong(), op, x, vmtable, live-map-table(vm.linker))
-              stop-timer(BRANCH1)
-              if r : goto step(pc + n1(ins).value)
-              else : goto step(pc + n2(ins).value)
-            (op:ref<False>) :
-              stop-timer(BRANCH1)
-              if x : goto step(pc + n1(ins).value)
-              else : goto step(pc + n2(ins).value)
-        (ins:ref<LinkedBranch2Ins>) :
-          start-timer(BRANCH2)
-          val x = eval-imm(x(ins), stack-pointer, vmtable)
-          val y = eval-imm(y(ins), stack-pointer, vmtable)
-          val r = eval-op(type(ins), op(ins), x, y)
-          stop-timer(BRANCH2)
-          if r : goto step(pc + n1(ins).value)
-          else : goto step(pc + n2(ins).value)
-        (ins:ref<LinkedDispatchIns>) :
-          start-timer(DISPATCH-EVAL)
-          val ytypes = eval-types(ys(ins), stack-pointer, vmtable)
-          stop-timer(DISPATCH-EVAL)
-          start-timer(DISPATCH)
-          val d = dispatch(vmtable.branch-table, format(ins), ytypes)
-          stop-timer(DISPATCH)
-          match(d) :
-            (r:ref<Int>) : goto step(pc + get(ns(ins), r).value)
-            (r:ref<CodeId>) : goto tcall-function(id(r).value)
-            (r:ref<Default>) : goto step(pc + default(ins).value)
-            (r:ref<Amb>) : goto step(pc + amb(ins).value)
-        (ins:ref<SetReg>) :
-          start-timer(SETREG)
-          regs[reg(ins).value] = eval-imm(x(ins), stack-pointer, vmtable)
-          stop-timer(SETREG)
-          goto step(pc + 1)
-        (ins:ref<GetReg>) :
-          start-timer(GETREG)
-          assign(stack-pointer, x(ins), regs[reg(ins).value])
-          if trace? == true and ref?(ins) == true :
-            print-tag(regs[reg(ins).value])
-          stop-timer(GETREG)
-          goto step(pc + 1)
-        (ins:ref<PopFrameIns>) :
-          start-timer(POPFRAME)
-          stack-pointer = stack-pointer - frame-size(ins).value
-          stop-timer(POPFRAME)
-          goto step(pc + 1)
-        (ins:ref<LinkedCall>) :
-          start-timer(CALL)
-          val fid = eval-imm(f(ins), stack-pointer, vmtable) as int
-          stack-pointer = stack-pointer + frame-size(ins).value
-          stop-timer(CALL)
-          goto call-function(fid, pc + 1)
-        (ins:ref<LinkedCallClosure>) :
-          start-timer(CALLCLO)
-          val fref = eval-imm(f(ins), stack-pointer, vmtable)
-
-          ;Sanity check: Check that f is actually a function
-          val ftype = load-tag(fref)
-          if ftype != FN-TYPE and ftype != TYPE-TYPE :
-            call-c clib/printf("ftype = %d, fref = %p\n", ftype, fref)
-            fatal("Attempt to call non-closure.")
-
-          val fptr = untag(fref) as ptr<Function>
-          val fid = fptr.code as int
-          stack-pointer = stack-pointer + frame-size(ins).value
-          stop-timer(CALLCLO)
-          goto call-function(fid, pc + 1)
-        (ins:ref<LinkedTCall>) :
-          start-timer(TCALL)
-          val fid = eval-imm(f(ins), stack-pointer, vmtable) as int
-          stop-timer(TCALL)
-          goto tcall-function(fid)
-        (ins:ref<LinkedTCallClosure>) :
-          start-timer(TCALLCLO)
-          val fref = eval-imm(f(ins), stack-pointer, vmtable)
-
-          ;Sanity check: Check that f is actually a function
-          val ftype = load-tag(fref)
-          if ftype != FN-TYPE and ftype != TYPE-TYPE :
-            call-c clib/printf("ftype = %d, fref = %p\n", ftype, fref)
-            fatal("Attempt to call non-closure.")
-
-          ;Execution
-          val fptr = untag(fref) as ptr<Function>
-          val fid = fptr.code as int
-          stop-timer(TCALLCLO)
-          goto tcall-function(fid)
-        (ins:ref<LinkedCallC>) :
-          start-timer(CALLC)
-          val faddr = eval-imm(f(ins), stack-pointer, vmtable)
-          val launcher = launcher(ins).value as ptr<((long, ptr<long>) -> long)>
-          stack-pointer = stack-pointer + frame-size(ins).value
-          [launcher](faddr, regs)
-          stack-pointer = stack-pointer - frame-size(ins).value
-          stop-timer(CALLC)
-          goto step(pc + 1)
-        (ins:ref<LinkedYield>) :
-          start-timer(YIELD)
-          ;Save current stack
-          val s:ptr<Stack> = untag(current-stack)
-          s.stack-pointer = stack-pointer
-          s.pc = pc + 1
-          ;Load next next
-          val sref = eval-imm(f(ins), stack-pointer, vmtable)
-          ;Sanity check: Check that sref is a stack
-          val stype = load-tag(sref)
-          if stype != STACK-TYPE : fatal("Attempt to yield to non-stack.")
-          stop-timer(YIELD)
-          goto load-stack(sref)
-        (ins:ref<LinkedReturn>) :
-          start-timer(RETURN)
-          val ret = stack-pointer.return as int
-          stop-timer(RETURN)
-          if ret >= 0 : goto step(ret)
-        (ins:ref<FunctionEntry>) :
-          start-timer(FNENTRY)
-          val frame-size = (num-locals(ins).value * 8 + sizeof(StackFrame)) as int
-          val size-required = frame-size + sizeof(StackFrame)
-          if stack-pointer + size-required > stack-end :
-            ;Store required values
-            vm.heap-top = heap-top
-            vm.stack-pointer = stack-pointer
-            vm.current-stack = current-stack
-            ;Run garbage collector
-            extend-stack(vm, size-required)
-            ;Load required values
-            heap-limit = vm.heap-limit
-            heap-top = vm.heap-top
-            stack-pointer = vm.stack-pointer
-            current-stack = vm.current-stack
-            stack-end = /stack-end(current-stack)
-          if trace? == true : call-c clib/printf("Entered with stack pointer = %p\n", stack-pointer)
-          stop-timer(FNENTRY)
-          goto step(pc + 1)
-        (ins:ref<LinkedDump>) :
-          start-timer(DUMP)
-          val xvalue = eval-imm(x(ins), stack-pointer, vmtable)
-          val xint = xvalue as int
-          val xvaluef = ($ls-prim fnum xint)
-          val xvalued = ($ls-prim fnum xvalue)
-          call-c clib/printf("> L%d = %ld (float = %f, double = %f)\n",
-                             index(x(ins)).value, xvalue, xvaluef, xvalued)
-          if trace? == true and ref?(ins) == true : print-tag(xvalue)
-          stop-timer(DUMP)
-          goto step(pc + 1)
-        (ins:ref<LinkedLiveIns>) :
-          start-timer(LIVE)
-          stack-pointer.liveness-map = map(ins).value
-          if trace? == true : call-c clib/printf("Saved map to frame %p\n", stack-pointer)
-          stop-timer(LIVE)
-          goto step(pc + 1)
-        (ins:ref<LinkedBranchRegIns>) :
-          start-timer(BRANCHREG)
-          val rvalue = regs[reg(ins).value] as int
-          if rvalue == value(ins).value :
-            stop-timer(BRANCHREG)
-            goto step(pc + n(ins).value)
-          else :
-            stop-timer(BRANCHREG)
-            goto step(pc + 1)
-        (ins:ref<CommentIns>) :
-          start-timer(COMMENT)
-          stop-timer(COMMENT)
-          goto step(pc + 1)
-
-  val stk:ptr<Stack> = untag(current-stack)
-  vm.heap-top = heap-top
-  vm.current-stack = current-stack
-  vm.stack-pointer = stack-pointer
-  stk.stack-pointer = stack-pointer
-
-
-  ;Speed characteristics [DEBUG]
-  stop-timer(TOTAL)
-  print-timers()
-  ;call-c clib/printf("[===== Speed Counters =====]\n")
-  ;call-c clib/printf("Number of Instructions Executed = %ld\n", num-ins)
-  ;call-c clib/printf("Number of Register Instructions Executed = %ld\n", num-reg-set)
-  ;call-c clib/printf("Number of Allocations = %ld\n", num-alloc)
-  ;call-c clib/printf("Number of GC = %ld\n", num-gc)
-
+;Ensure that the main stack in the virtual machine is allocated.
+;This is safe to do, as we assume that the first thing that the vm does is load core.
+lostanza defn ensure-stack-allocated (vms:ptr<VMState>) -> ref<False> :
+  if vms.current-stack == void-marker() :
+    vms.current-stack = alloc-stack(vms)
   return false
 
+;Called by the extern defn callbacks defined in the generated bindings
+public lostanza defn call-extern (fid:int) -> ref<False> :
+  val vm = VIRTUAL-MACHINE as ref<VirtualMachine>
+  set-starting-func(vm, new Int{fid})
+  call-c vmloop(vm.vmstate)
+  return false
+
+;Called by the extern defn callbacks. Retrieve the registers array
+;from the currently active virtual machine.
+public lostanza defn vm-registers () -> ptr<long> :
+  ;Retrieve vm and vmtable
+  val vm = VIRTUAL-MACHINE as ref<VirtualMachine>
+  return vm.vmstate.registers
+
+;Set the starting pc of the virtual machine to fid. The virtual machine
+;will start executing from the given function.
+lostanza defn set-starting-func (vm:ref<VirtualMachine>, fid:ref<Int>) -> ref<False> :
+  val pc = get(vm.vmtable.function-addresses,fid).value
+  val stk:ptr<Stack> = untag(vm.vmstate.current-stack)
+  stk.pc = pc * 4
+  return false
+
+;============================================================
+;============================================================
+;============================================================
+;
+;var TRACE?:True|False = false
+;
+;public lostanza defn run (vm:ref<VirtualMachine>, start-func:ref<Int>, trace?:ref<True|False>) -> ref<False> :
+;  TRACE? = trace?
+;  ;Define machine quantities
+;  val vmtable = vm.vmtable
+;  val instructions = vmtable.instructions
+;  val regs = vm.registers
+;  var heap-limit:ptr<long> = vm.heap-limit          ;[LOAD]
+;  var heap-top:ptr<long>                            ;[STORE/LOAD]
+;  var stack-pointer:ptr<StackFrame>                 ;[STORE/LOAD]
+;  var stack-end:ptr<StackFrame>                     ;[LOAD]
+;  var current-stack:long                            ;[STORE/LOAD]
+;
+;  ;Speed characteristics
+;  var num-gc:long = 0
+;  var num-alloc:long = 0
+;  var num-ins:long = 0
+;  var num-reg-set:long = 0
+;
+;  start-timer(TOTAL)
+;  labels :
+;    begin :
+;      ;Retrieve pc of starting function
+;      val mainpc = get(vmtable.function-addresses, start-func).value
+;
+;      ;Initialize starting stack
+;      if vm.current-stack == void-marker() :
+;        vm.current-stack = alloc-stack(vm, mainpc)
+;      else :
+;        val stk:ptr<Stack> = untag(vm.current-stack)
+;        stk.pc = mainpc
+;
+;      ;Set heap-top
+;      heap-top = vm.heap-top
+;      goto load-stack(vm.current-stack)
+;    load-stack (stack:long) :
+;      current-stack = stack
+;      val sptr:ptr<Stack> = untag(current-stack)
+;      stack-pointer = sptr.stack-pointer
+;      stack-end = /stack-end(current-stack)
+;      goto step(sptr.pc)
+;    call-function (fid:int, return:int) :
+;      start-timer(FN-SECTION)
+;      stack-pointer.return = return
+;      val pos = get(vmtable.function-addresses, new Int{fid}).value
+;      stop-timer(FN-SECTION)
+;      goto step(pos)
+;    tcall-function (fid:int) :
+;      start-timer(FN-SECTION)
+;      val pos = get(vmtable.function-addresses, new Int{fid}).value
+;      stop-timer(FN-SECTION)
+;      goto step(pos)
+;    step (pc:int) :
+;      ;Retrieve instruction
+;      val ins = get(instructions, new Int{pc})
+;
+;      ;Speed counter
+;      num-ins = num-ins + 1
+;      match(ins) :
+;        (ins:ref<SetReg|GetReg>) : num-reg-set = num-reg-set + 1
+;        (ins:ref<LinkedAllocIns>) : num-alloc = num-alloc + 1
+;        (ins:ref<LinkedVMCall>) :
+;          match(op(ins)) :
+;            (op:ref<GCOp>) : num-gc = num-gc + 1
+;            (op) : ()
+;        (ins) : ()
+;
+;      ;Trace
+;      if trace? == true :
+;        call-c clib/printf(" In frame %p: ", stack-pointer)
+;        print-ins(new Int{pc}, ins)
+;
+;      match(ins) :
+;        (ins:ref<NewStackIns>) :
+;          start-timer(NEW-STACK)
+;          val fid = eval-imm(fid(ins), stack-pointer, vmtable) as int
+;          val fpc = get(vmtable.function-addresses, new Int{fid}).value
+;          vm.heap-top = heap-top
+;          val stk = alloc-stack(vm, fpc)
+;          heap-top = vm.heap-top
+;          assign(stack-pointer, x(ins), stk)
+;          stop-timer(NEW-STACK)
+;          goto step(pc + 1)
+;        (ins:ref<SetIns>) :
+;          start-timer(SET)
+;          assign(stack-pointer, x(ins), eval-imm(y(ins), stack-pointer, vmtable))
+;          stop-timer(SET)
+;          goto step(pc + 1)
+;        (ins:ref<Op0Ins>) :
+;          start-timer(OP0)
+;          assign(stack-pointer, x(ins), eval-op(op(ins), current-stack, stack-pointer, vmtable))
+;          stop-timer(OP0)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedVMCall>) :
+;          match(op(ins)) :
+;            (op:ref<GCOp>) :
+;              start-timer(VMCALL)
+;              ;Evaluate size
+;              val total-size = eval-imm(y(ins), stack-pointer, vmtable)
+;              ;Store required values
+;              vm.heap-top = heap-top
+;              vm.stack-pointer = stack-pointer
+;              vm.current-stack = current-stack
+;              ;Run garbage collector
+;              extend-heap(vm, total-size)
+;              ;Load required values
+;              heap-limit = vm.heap-limit
+;              heap-top = vm.heap-top
+;              stack-pointer = vm.stack-pointer
+;              current-stack = vm.current-stack
+;              stack-end = /stack-end(current-stack)
+;              ;Return 0
+;              regs[0] = 0L
+;              stop-timer(VMCALL)
+;              goto step(pc + 1)
+;            (op) :
+;              fatal("Unreachable")
+;        (ins:ref<LinkedOp1Ins>) :
+;          start-timer(OP1)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          assign(stack-pointer, x(ins), eval-op(type(ins), op(ins), y, vmtable, live-map-table(vm.linker)))
+;          stop-timer(OP1)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedOp2Ins>) :
+;          start-timer(OP2)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          val z = eval-imm(z(ins), stack-pointer, vmtable)
+;          assign(stack-pointer, x(ins), eval-op(type(ins), op(ins), y, z))
+;          stop-timer(OP2)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedConvIns>) :
+;          start-timer(CONV)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          val result = eval-conv(op(ins), xtype(ins), ytype(ins), y)
+;          assign(stack-pointer, x(ins), result)
+;          stop-timer(CONV)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedReserveIns>) :
+;          start-timer(RESERVE)
+;          ;Compute size to allocate
+;          val size = eval-imm(space(ins), stack-pointer, vmtable)
+;          if size & 0x7L : fatal("Size is not a multiple of 8.")
+;          val total-size = size + 8 * num-obj(ins).value
+;
+;          ;If there is enough space
+;          if heap-top + total-size <= heap-limit :
+;            stop-timer(RESERVE)
+;            goto step(pc + n(ins).value)
+;          else :
+;            ;Set arguments
+;            regs[0] = false-marker()  ;Closure is false
+;            regs[1] = 1L              ;arity = 1
+;            regs[2] = total-size      ;size argument
+;            val fid = get(vm.loaded-ids, CORE-EXTEND-HEAP-ID).value
+;            stack-pointer = stack-pointer + frame-size(ins).value
+;            stop-timer(RESERVE)
+;            goto call-function(fid, pc + 1)
+;        (ins:ref<LinkedAllocIns>) :
+;          start-timer(ALLOC)
+;          val size = eval-imm(size(ins), stack-pointer, vmtable)
+;          if size < 8 : fatal("Invalid size for object.")
+;          val total-size = size + 8
+;          [heap-top] = type(ins).value
+;          val obj = tag(heap-top)
+;          if trace? == true : print-tag(obj)
+;          assign(stack-pointer, x(ins), obj)
+;          heap-top = heap-top + total-size
+;          if heap-top > heap-limit : fatal("Beyond heap limits.")
+;          stop-timer(ALLOC)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedRefStoreIns>) :
+;          start-timer(REFSTORE)
+;          val x = eval-imm(x(ins), stack-pointer, vmtable)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          val z = eval-imm(z(ins), stack-pointer, vmtable)
+;          val o = offset(ins).value
+;          val sz = size(ins).value
+;
+;          ;Sanity checks
+;          ;- x is a heap-allocated reference.
+;          ;- x has the expected tag.
+;          ;- the store value has size 8, if a store to the length
+;          ;  field of an array.
+;          ;- the store offset is within bounds of the object (if not a
+;          ;   store to the length field of an array.)
+;          ;- the store offset is aligned with the size.
+;          val xtype = load-tag(x)
+;          if class(ins) != false :
+;            if xtype != class(ins) :
+;              fatal("Object has unexpected tag.")
+;          val class = get(vm.vmtable.class-table, xtype)
+;          if y + o < 0 : fatal("Load from negative index.")
+;          if (y + o) & (sz - 1) : fatal("Unaligned load.")
+;          match(class) :
+;            (class:ref<VMArrayClass>) :
+;              if y + o == 0 :
+;                if sz != 8 : fatal("Inappropriate length field.")
+;              else :
+;                val xsize = object-size(x, class)
+;                if y + o + sz > xsize : fatal("Load out of bounds.")
+;            (class:ref<VMLeafClass>) :
+;              val xsize = object-size(x, class)
+;              if y + o + sz > xsize : fatal("Load out of bounds.")
+;
+;          ;Execution
+;          val xptr = untag(x)
+;          if sz == 1 : [xptr as ptr<byte> + y + o] = z as byte
+;          else if sz == 4 : [xptr as ptr<int> + y + o] = z as int
+;          else if sz == 8 : [xptr as ptr<long> + y + o] = z as long
+;          else : fatal("Invalid size.")
+;          stop-timer(REFSTORE)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedRefLoadIns>) :
+;          start-timer(REFLOAD)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          val z = eval-imm(z(ins), stack-pointer, vmtable)
+;          val o = offset(ins).value
+;          val sz = size(ins).value
+;
+;          ;Sanity checks
+;          ;- y is a heap-allocated reference.
+;          ;- y has the expected tag.
+;          ;- the load offset is within bounds of the object.
+;          ;- the load offset is aligned with the size.
+;          val ytype = load-tag(y)
+;          if class(ins) != false :
+;            if ytype != class(ins) :
+;              fatal("Object has unexpected tag.")
+;          val ysize = object-size(y, get(vm.vmtable.class-table, ytype))
+;          if z + o < 0 : fatal("Load from negative index.")
+;          if z + o + sz > ysize : fatal("Load out of bounds.")
+;          if (z + o) & (sz - 1) : fatal("Unaligned load.")
+;
+;          ;Execution
+;          val yptr:ptr<long> = untag(y)
+;          var value:long
+;          if sz == 1 : value = [yptr as ptr<byte> + z + o]
+;          else if sz == 4 : value = [yptr as ptr<int> + z + o]
+;          else if sz == 8 : value = [yptr as ptr<long> + z + o]
+;          else : fatal("Invalid size.")
+;          assign(stack-pointer, x(ins), value)
+;          stop-timer(REFLOAD)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedStoreIns>) :
+;          start-timer(STORE)
+;          val x = eval-imm(x(ins), stack-pointer, vmtable)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          val z = eval-imm(z(ins), stack-pointer, vmtable)
+;          val o = offset(ins).value
+;          val sz = size(ins).value
+;
+;          ;Sanity checks
+;          ;- the store value has size 8, if a store to the length
+;          ;  field of an array.
+;          ;- the store offset is within bounds of the object (if not a
+;          ;   store to the length field of an array.)
+;          ;- the store offset is aligned with the size.
+;          if class(ins) != false :
+;            val xtype = class(ins) as ref<Int>
+;            val class = get(vm.vmtable.class-table, xtype)
+;            if y + o < 0 : fatal("Load from negative index.")
+;            if (y + o) & (sz - 1) : fatal("Unaligned load.")
+;            match(class) :
+;              (class:ref<VMArrayClass>) :
+;                if y + o == 0 :
+;                  if sz != 8 : fatal("Inappropriate length field.")
+;                else :
+;                  val xsize = object-size(x, class)
+;                  if y + o + sz > xsize : fatal("Load out of bounds.")
+;              (class:ref<VMLeafClass>) :
+;                val xsize = object-size(x, class)
+;                if y + o + sz > xsize : fatal("Load out of bounds.")
+;
+;
+;          ;Execution
+;          if sz == 1 : [x as ptr<byte> + y + o] = z as byte
+;          else if sz == 4 : [x as ptr<int> + y + o] = z as int
+;          else if sz == 8 : [x as ptr<long> + y + o] = z as long
+;          else : fatal("Invalid size.")
+;          stop-timer(STORE)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedLoadIns>) :
+;          start-timer(LOAD)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          val z = eval-imm(z(ins), stack-pointer, vmtable)
+;          val o = offset(ins).value
+;          val sz = size(ins).value
+;
+;          ;Sanity checks
+;          ;- the load offset is within bounds of the object.
+;          ;- the load offset is aligned with the size.
+;          if class(ins) != false :
+;            val ytype = class(ins) as ref<Int>
+;            val ysize = object-size(y, get(vm.vmtable.class-table, ytype))
+;            if z + o < 0 : fatal("Load from negative index.")
+;            if z + o + sz > ysize : fatal("Load out of bounds.")
+;            if (z + o) & (sz - 1) : fatal("Unaligned load.")
+;
+;          ;Execution
+;          var value:long
+;          if sz == 1 : value = [y as ptr<byte> + z + o]
+;          else if sz == 4 : value = [y as ptr<int> + z + o]
+;          else if sz == 8 : value = [y as ptr<long> + z + o]
+;          else : fatal("Invalid size.")
+;          assign(stack-pointer, x(ins), value)
+;          stop-timer(LOAD)
+;          goto step(pc + 1)
+;        (ins:ref<GotoIns>) :
+;          start-timer(GOTO)
+;          stop-timer(GOTO)
+;          goto step(pc + n(ins).value)
+;        (ins:ref<Branch1Ins>) :
+;          start-timer(BRANCH1)
+;          val x = eval-imm(x(ins), stack-pointer, vmtable)
+;          match(op(ins)) :
+;            (op:ref<VMOp>) :
+;              val r = eval-op(VMLong(), op, x, vmtable, live-map-table(vm.linker))
+;              stop-timer(BRANCH1)
+;              if r : goto step(pc + n1(ins).value)
+;              else : goto step(pc + n2(ins).value)
+;            (op:ref<False>) :
+;              stop-timer(BRANCH1)
+;              if x : goto step(pc + n1(ins).value)
+;              else : goto step(pc + n2(ins).value)
+;        (ins:ref<LinkedBranch2Ins>) :
+;          start-timer(BRANCH2)
+;          val x = eval-imm(x(ins), stack-pointer, vmtable)
+;          val y = eval-imm(y(ins), stack-pointer, vmtable)
+;          val r = eval-op(type(ins), op(ins), x, y)
+;          stop-timer(BRANCH2)
+;          if r : goto step(pc + n1(ins).value)
+;          else : goto step(pc + n2(ins).value)
+;        (ins:ref<LinkedDispatchIns>) :
+;          start-timer(DISPATCH-EVAL)
+;          val ytypes = eval-types(ys(ins), stack-pointer, vmtable)
+;          stop-timer(DISPATCH-EVAL)
+;          start-timer(DISPATCH)
+;          val d = dispatch(vmtable.branch-table, format(ins), ytypes)
+;          stop-timer(DISPATCH)
+;          match(d) :
+;            (r:ref<Int>) : goto step(pc + get(ns(ins), r).value)
+;            (r:ref<CodeId>) : goto tcall-function(id(r).value)
+;            (r:ref<Default>) : goto step(pc + default(ins).value)
+;            (r:ref<Amb>) : goto step(pc + amb(ins).value)
+;        (ins:ref<SetReg>) :
+;          start-timer(SETREG)
+;          regs[reg(ins).value] = eval-imm(x(ins), stack-pointer, vmtable)
+;          stop-timer(SETREG)
+;          goto step(pc + 1)
+;        (ins:ref<GetReg>) :
+;          start-timer(GETREG)
+;          assign(stack-pointer, x(ins), regs[reg(ins).value])
+;          if trace? == true and ref?(ins) == true :
+;            print-tag(regs[reg(ins).value])
+;          stop-timer(GETREG)
+;          goto step(pc + 1)
+;        (ins:ref<PopFrameIns>) :
+;          start-timer(POPFRAME)
+;          stack-pointer = stack-pointer - frame-size(ins).value
+;          stop-timer(POPFRAME)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedCall>) :
+;          start-timer(CALL)
+;          val fid = eval-imm(f(ins), stack-pointer, vmtable) as int
+;          stack-pointer = stack-pointer + frame-size(ins).value
+;          stop-timer(CALL)
+;          goto call-function(fid, pc + 1)
+;        (ins:ref<LinkedCallClosure>) :
+;          start-timer(CALLCLO)
+;          val fref = eval-imm(f(ins), stack-pointer, vmtable)
+;
+;          ;Sanity check: Check that f is actually a function
+;          val ftype = load-tag(fref)
+;          if ftype != FN-TYPE and ftype != TYPE-TYPE :
+;            call-c clib/printf("ftype = %d, fref = %p\n", ftype, fref)
+;            fatal("Attempt to call non-closure.")
+;
+;          val fptr = untag(fref) as ptr<Function>
+;          val fid = fptr.code as int
+;          stack-pointer = stack-pointer + frame-size(ins).value
+;          stop-timer(CALLCLO)
+;          goto call-function(fid, pc + 1)
+;        (ins:ref<LinkedTCall>) :
+;          start-timer(TCALL)
+;          val fid = eval-imm(f(ins), stack-pointer, vmtable) as int
+;          stop-timer(TCALL)
+;          goto tcall-function(fid)
+;        (ins:ref<LinkedTCallClosure>) :
+;          start-timer(TCALLCLO)
+;          val fref = eval-imm(f(ins), stack-pointer, vmtable)
+;
+;          ;Sanity check: Check that f is actually a function
+;          val ftype = load-tag(fref)
+;          if ftype != FN-TYPE and ftype != TYPE-TYPE :
+;            call-c clib/printf("ftype = %d, fref = %p\n", ftype, fref)
+;            fatal("Attempt to call non-closure.")
+;
+;          ;Execution
+;          val fptr = untag(fref) as ptr<Function>
+;          val fid = fptr.code as int
+;          stop-timer(TCALLCLO)
+;          goto tcall-function(fid)
+;        (ins:ref<LinkedCallC>) :
+;          start-timer(CALLC)
+;          val faddr = eval-imm(f(ins), stack-pointer, vmtable)
+;          val launcher = launcher(ins).value as ptr<((long, ptr<long>) -> long)>
+;          stack-pointer = stack-pointer + frame-size(ins).value
+;          [launcher](faddr, regs)
+;          stack-pointer = stack-pointer - frame-size(ins).value
+;          stop-timer(CALLC)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedYield>) :
+;          start-timer(YIELD)
+;          ;Save current stack
+;          val s:ptr<Stack> = untag(current-stack)
+;          s.stack-pointer = stack-pointer
+;          s.pc = pc + 1
+;          ;Load next next
+;          val sref = eval-imm(f(ins), stack-pointer, vmtable)
+;          ;Sanity check: Check that sref is a stack
+;          val stype = load-tag(sref)
+;          if stype != STACK-TYPE : fatal("Attempt to yield to non-stack.")
+;          stop-timer(YIELD)
+;          goto load-stack(sref)
+;        (ins:ref<LinkedReturn>) :
+;          start-timer(RETURN)
+;          val ret = stack-pointer.return as int
+;          stop-timer(RETURN)
+;          if ret >= 0 : goto step(ret)
+;        (ins:ref<FunctionEntry>) :
+;          start-timer(FNENTRY)
+;          val frame-size = (num-locals(ins).value * 8 + sizeof(StackFrame)) as int
+;          val size-required = frame-size + sizeof(StackFrame)
+;          if stack-pointer + size-required > stack-end :
+;            ;Store required values
+;            vm.heap-top = heap-top
+;            vm.stack-pointer = stack-pointer
+;            vm.current-stack = current-stack
+;            ;Run garbage collector
+;            extend-stack(vm, size-required)
+;            ;Load required values
+;            heap-limit = vm.heap-limit
+;            heap-top = vm.heap-top
+;            stack-pointer = vm.stack-pointer
+;            current-stack = vm.current-stack
+;            stack-end = /stack-end(current-stack)
+;          if trace? == true : call-c clib/printf("Entered with stack pointer = %p\n", stack-pointer)
+;          stop-timer(FNENTRY)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedDump>) :
+;          start-timer(DUMP)
+;          val xvalue = eval-imm(x(ins), stack-pointer, vmtable)
+;          val xint = xvalue as int
+;          val xvaluef = ($ls-prim fnum xint)
+;          val xvalued = ($ls-prim fnum xvalue)
+;          call-c clib/printf("> L%d = %ld (float = %f, double = %f)\n",
+;                             index(x(ins)).value, xvalue, xvaluef, xvalued)
+;          if trace? == true and ref?(ins) == true : print-tag(xvalue)
+;          stop-timer(DUMP)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedLiveIns>) :
+;          start-timer(LIVE)
+;          stack-pointer.liveness-map = map(ins).value
+;          if trace? == true : call-c clib/printf("Saved map to frame %p\n", stack-pointer)
+;          stop-timer(LIVE)
+;          goto step(pc + 1)
+;        (ins:ref<LinkedBranchRegIns>) :
+;          start-timer(BRANCHREG)
+;          val rvalue = regs[reg(ins).value] as int
+;          if rvalue == value(ins).value :
+;            stop-timer(BRANCHREG)
+;            goto step(pc + n(ins).value)
+;          else :
+;            stop-timer(BRANCHREG)
+;            goto step(pc + 1)
+;        (ins:ref<CommentIns>) :
+;          start-timer(COMMENT)
+;          stop-timer(COMMENT)
+;          goto step(pc + 1)
+;
+;  val stk:ptr<Stack> = untag(current-stack)
+;  vm.heap-top = heap-top
+;  vm.current-stack = current-stack
+;  vm.stack-pointer = stack-pointer
+;  stk.stack-pointer = stack-pointer
+;
+;
+;  ;Speed characteristics [DEBUG]
+;  stop-timer(TOTAL)
+;  print-timers()
+;  ;call-c clib/printf("[===== Speed Counters =====]\n")
+;  ;call-c clib/printf("Number of Instructions Executed = %ld\n", num-ins)
+;  ;call-c clib/printf("Number of Register Instructions Executed = %ld\n", num-reg-set)
+;  ;call-c clib/printf("Number of Allocations = %ld\n", num-alloc)
+;  ;call-c clib/printf("Number of GC = %ld\n", num-gc)
+;
+;  return false
+;
 ;============================================================
 ;==================== Dispatch ==============================
 ;============================================================
@@ -1899,21 +1914,20 @@ defn print-stack-buffer (buffer:Vector<FileInfo>) :
 extern memcpy : (ptr<?>, ptr<?>, long) -> int
 lostanza defn extend-stack (vm:ref<VirtualMachine>, size:long) -> long :
   ;Retrieve current stack
-  val s:ptr<Stack> = untag(vm.current-stack)
+  val s:ptr<Stack> = untag(vm.vmstate.current-stack)
   ;Compute new size of stack
-  val desired-size = vm.stack-pointer + size - s.frames
+  val desired-size = s.stack-pointer + size - s.frames
   var size*:long = s.size
   while size* < desired-size : size* = size* * 2
   ;Allocate new frames, and copy over old frames
   val frames* = call-c clib/malloc(size*)
   call-c memcpy(frames*, s.frames, s.size)
   ;Free old frames and swap in new frames
-  val sp-pos = vm.stack-pointer - s.frames
+  val sp-pos = s.stack-pointer - s.frames
   call-c clib/free(s.frames)
   s.size = size*
   s.frames = frames*
   s.stack-pointer = s.frames + sp-pos
-  vm.stack-pointer = s.stack-pointer
   ;Return
   return 0
 
@@ -1922,15 +1936,16 @@ lostanza defn extend-heap (vm:ref<VirtualMachine>, size:long) -> long :
   collect-garbage(vm)
 
   ;then check whether we're still out of space.
-  if vm.heap-top + size > vm.heap-limit :
+  val vms = vm.vmstate
+  if vms.heap-top + size > vms.heap-limit :
     ;Compute desired heap size
-    val desired-space = vm.heap-top + size - vm.heap
-    var space:long = vm.heap-limit - vm.heap
+    val desired-space = vms.heap-top + size - vms.heap
+    var space:long = vms.heap-limit - vms.heap
     while space < desired-space : space = space * 2
     ;Resize the heap and use the GC to move contents over
-    resize-freespace(vm, space)
+    resize-freespace(vms, space)
     collect-garbage(vm)
-    resize-freespace(vm, space)
+    resize-freespace(vms, space)
     ;Now we have enough space.
     return 0
 
@@ -1939,50 +1954,52 @@ lostanza defn extend-heap (vm:ref<VirtualMachine>, size:long) -> long :
   else :
     ;Expand the freeheap if we're using more than 50% of it,
     ;or if the heapspace is bigger than the freespace.
-    val used-space = vm.heap-top - vm.heap
-    val heap-space = vm.heap-limit - vm.heap
-    val free-space = vm.free-limit - vm.free
+    val used-space = vms.heap-top - vms.heap
+    val heap-space = vms.heap-limit - vms.heap
+    val free-space = vms.free-limit - vms.free
     val usage-ratio = (used-space as float) / (heap-space as float)
     ;Resize free if the usage-ratio is too high
     if usage-ratio > 0.5f :
-      resize-freespace(vm, heap-space * 2)
+      resize-freespace(vms, heap-space * 2)
     ;Otherwise resize free if the heap is larger than free
     else if heap-space > free-space :
-      resize-freespace(vm, heap-space)
+      resize-freespace(vms, heap-space)
     ;We have enough space to satisfy the request
     return 0
 
 lostanza defn ensure-heap-space (vm:ref<VirtualMachine>, size:long, num-objs:long) -> int :
   val total-size = size + num-objs * 8
-  if vm.heap-top + total-size > vm.heap-limit :
+  val vms = vm.vmstate
+  if vms.heap-top + total-size > vms.heap-limit :
     extend-heap(vm, total-size)
   return 0
 
-lostanza defn resize-freespace (vm:ref<VirtualMachine>, space:long) -> int :
-  call-c clib/free(vm.free)
-  vm.free = call-c clib/malloc(space)
-  vm.free-limit = vm.free + space
+lostanza defn resize-freespace (vms:ptr<VMState>, space:long) -> int :
+  call-c clib/free(vms.free)
+  vms.free = call-c clib/malloc(space)
+  vms.free-limit = vms.free + space
   return 0
 
 ;============================================================
 ;==================== Garbage Collector =====================
 ;============================================================
 
+lostanza var TRACKER-CHAIN:ptr<LivenessTrackerObj>
 lostanza defn collect-garbage (vm:ref<VirtualMachine>) -> long :
-  ;Cap the current stack
-  val s:ptr<Stack> = untag(vm.current-stack)
-  s.stack-pointer = vm.stack-pointer
-
   ;Swap free with heap
-  val heap = vm.heap
-  val heap-limit = vm.heap-limit
-  val free = vm.free
-  val free-limit = vm.free-limit
-  vm.heap = free
-  vm.heap-top = free
-  vm.heap-limit = free-limit
-  vm.free = heap
-  vm.free-limit = heap-limit
+  val vms = vm.vmstate
+  val heap = vms.heap
+  val heap-limit = vms.heap-limit
+  val free = vms.free
+  val free-limit = vms.free-limit
+  vms.heap = free
+  vms.heap-top = free
+  vms.heap-limit = free-limit
+  vms.free = heap
+  vms.free-limit = heap-limit
+
+  ;Initialize tracker chain
+  TRACKER-CHAIN = null
 
   ;Scan global roots
   val globals:ptr<long> = vm.vmtable.globals.mem
@@ -1998,10 +2015,13 @@ lostanza defn collect-garbage (vm:ref<VirtualMachine>) -> long :
     consts[i] = post-gc-object(consts[i], vm)
 
   ;Scan stack roots
-  vm.current-stack = post-gc-object(vm.current-stack, vm)
+  vms.current-stack = post-gc-object(vms.current-stack, vm)
 
   ;Scan heap
   scan-heap(vm)
+
+  ;Scan tracker chain
+  scan-tracker-chain(TRACKER-CHAIN)
 
   ;Return
   return 0
@@ -2023,11 +2043,39 @@ lostanza defn scan-frames (frames:ptr<StackFrame>, f-end:ptr<StackFrame>, vm:ref
   return 0
 
 lostanza defn scan-heap (vm:ref<VirtualMachine>) -> int :
-  var p:ptr<long> = vm.heap
+  val vms = vm.vmstate
+  var p:ptr<long> = vms.heap
   val class-table = vm.vmtable.class-table
-  while p < vm.heap-top :
+  while p < vms.heap-top :
     p = scan-object(p, vm, class-table)
   return 0
+
+lostanza deftype LivenessTrackerObj :
+  tag: long
+  value: long
+  tail: ptr<LivenessTrackerObj>
+
+lostanza defn scan-tracker-chain (tracker-chain:ptr<LivenessTrackerObj>) -> int :
+  var t:ptr<LivenessTrackerObj> = tracker-chain
+  while t != null :
+    t.value = post-gc-weak-object(t.value)
+    t = t.tail    
+  return 0
+
+lostanza defn post-gc-weak-object (ref:long) -> long :
+  val tagbits = ref & 7L
+  if tagbits == REF-TAG-BITS :
+    val obj = (ref - REF-TAG-BITS) as ptr<long>
+    val obj-tag = [obj]
+    ;Case: Broken Heart
+    if obj-tag == -1L :
+      val heart = obj as ptr<BrokenHeartLayout>
+      return heart.forward
+    ;Case: Uncopied object
+    else :
+      return false-marker()
+  else :
+    return ref
 
 lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>, class-table:ref<ClassTable>) -> ptr<long> :
   ;p is [tag, cells ...]
@@ -2035,21 +2083,28 @@ lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>, class-table:ref<
   val class = get(class-table, new Int{tag})
   match(class) :
     (class:ref<VMLeafClass>) :
-      ;Scan the frames of a stack
-      if tag == STACK-TYPE.value :
-        val s = (p + 8) as ptr<Stack>
-        scan-frames(s.frames, s.stack-pointer, vm)
-      ;Get properties
-      val size = size(class).value
-      val roots = roots(class)
-      val num-roots = length(roots).value
-      ;Scan slots
-      val obj = p as ptr<ObjectLayout>
-      for (var i:int = 0, i < num-roots, i = i + 1) :
-        val r = get(roots, new Int{i}).value
-        obj.slots[r] = post-gc-object(obj.slots[r], vm)
-      ;Return end of object
-      return p + 8 + size
+      ;If it's a LivenessTracker, then extend the chain
+      if tag == LIVENESS-TRACKER-TYPE.value :
+        val t = p as ptr<LivenessTrackerObj>
+        t.tail = TRACKER-CHAIN
+        TRACKER-CHAIN = t
+        return p + sizeof(LivenessTrackerObj)
+      else :
+        ;Scan the frames of a stack
+        if tag == STACK-TYPE.value :
+          val s = (p + 8) as ptr<Stack>
+          scan-frames(s.frames, s.stack-pointer, vm)
+        ;Get properties
+        val size = max(size(class).value, 8)
+        val roots = roots(class)
+        val num-roots = length(roots).value
+        ;Scan slots
+        val obj = p as ptr<ObjectLayout>
+        for (var i:int = 0, i < num-roots, i = i + 1) :
+          val r = get(roots, new Int{i}).value
+          obj.slots[r] = post-gc-object(obj.slots[r], vm)
+        ;Return end of object
+        return p + 8 + size
     (class:ref<VMArrayClass>) :
       ;Get properties
       val base-roots = base-roots(class)
@@ -2077,6 +2132,7 @@ lostanza defn scan-object (p:ptr<long>, vm:ref<VirtualMachine>, class-table:ref<
       return p + size
 
 lostanza defn post-gc-object (ref:long, vm:ref<VirtualMachine>) -> long :
+  val vms = vm.vmstate
   val tagbits = ref & 7L
   if tagbits == REF-TAG-BITS :
     val obj = (ref - REF-TAG-BITS) as ptr<long>
@@ -2087,9 +2143,9 @@ lostanza defn post-gc-object (ref:long, vm:ref<VirtualMachine>) -> long :
       return heart.forward
     ;Case: Uncopied object
     else :
-      val obj* = tag(vm.heap-top)
+      val obj* = tag(vms.heap-top)
       val class = get(vm.vmtable.class-table, new Int{obj-tag as int})
-      copy-bytes-to-heap(obj, num-bytes(obj, class, vm), vm)
+      copy-bytes-to-heap(obj, num-bytes(obj, class, vm), vms)
       set-broken-heart(obj, obj*)
       return obj*
   else :
@@ -2112,14 +2168,18 @@ lostanza defn num-bytes (obj:ptr<?>, class:ref<VMClass>, vm:ref<VirtualMachine>)
       val item-size = item-size(class).value
       return (8 + base-size + len * item-size + 7) & -8L
 
-lostanza defn copy-bytes-to-heap (p:ptr<?>, n:long, vm:ref<VirtualMachine>) -> int :
-  val heap = vm.heap-top
+lostanza defn copy-bytes-to-heap (p:ptr<?>, n:long, vms:ptr<VMState>) -> int :
+  val heap = vms.heap-top
   val nwords = n >>> 3
   val src = p as ptr<long>
   for (var i:long = 0, i < nwords, i = i + 1) :
     heap[i] = src[i]
-  vm.heap-top = heap + n
+  vms.heap-top = heap + n
   return 0
+
+lostanza defn max (x:int, y:int) -> int :
+  if x < y : return y
+  else : return x
 
 ;============================================================
 ;==================== Liveness Detector =====================
@@ -2162,19 +2222,21 @@ lostanza defn mark-object (p:ptr<long>, tag:int, vm:ref<VirtualMachine>, class-t
   val class = get(class-table, new Int{tag})
   match(class) :
     (class:ref<VMLeafClass>) :
-      ;Mark the frames of a stack
-      if tag == STACK-TYPE.value :
-        val s = (p + 8) as ptr<Stack>
-        mark-frames(s.frames, s.stack-pointer, vm)
-      ;Get properties
-      val size = size(class).value
-      val roots = roots(class)
-      val num-roots = length(roots).value
-      ;Mark slots
-      val obj = p as ptr<ObjectLayout>
-      for (var i:int = 0, i < num-roots, i = i + 1) :
-        val r = get(roots, new Int{i}).value
-        mark-ref(obj.slots[r])
+      ;If it's a LivenessTracker, then extend the chain
+      if tag != LIVENESS-TRACKER-TYPE.value :
+        ;Mark the frames of a stack
+        if tag == STACK-TYPE.value :
+          val s = (p + 8) as ptr<Stack>
+          mark-frames(s.frames, s.stack-pointer, vm)
+        ;Get properties
+        val size = size(class).value
+        val roots = roots(class)
+        val num-roots = length(roots).value
+        ;Mark slots
+        val obj = p as ptr<ObjectLayout>
+        for (var i:int = 0, i < num-roots, i = i + 1) :
+          val r = get(roots, new Int{i}).value
+          mark-ref(obj.slots[r])
     (class:ref<VMArrayClass>) :
       ;Get properties
       val base-roots = base-roots(class)
@@ -2213,10 +2275,11 @@ lostanza defn restore-tag (heart:ptr<BrokenHeartLayout>) -> int :
   return 0
 
 public lostanza defn compute-live (vm:ref<VirtualMachine>, exclude:ref<Seqable<Symbol>>) -> ref<Tuple<Rec>> :
+  val vms = vm.vmstate
   ;Use free memory for liveness buffer
   ;(Guaranteed to be large enough)
-  LIVENESS-BUFFER = vm.free as ptr<BrokenHeartLayout>
-  LIVENESS-BUFFER-TOP = vm.free as ptr<BrokenHeartLayout>
+  LIVENESS-BUFFER = vms.free as ptr<BrokenHeartLayout>
+  LIVENESS-BUFFER-TOP = vms.free as ptr<BrokenHeartLayout>
 
   ;Scan global roots
   val globals:ptr<long> = vm.vmtable.globals.mem
@@ -2232,7 +2295,7 @@ public lostanza defn compute-live (vm:ref<VirtualMachine>, exclude:ref<Seqable<S
     mark-ref(consts[i])
 
   ;Scan stack roots
-  mark-ref(vm.current-stack)
+  mark-ref(vms.current-stack)
 
   ;Scan liveness buffer
   mark-liveness-buffer(vm)
@@ -2263,7 +2326,8 @@ defn RecSet () :
 ;============================================================
 
 lostanza defn dump-heap (vm:ref<VirtualMachine>) -> int :
-  return dump-heap(vm.heap, vm.heap-top, vm)
+  val vms = vm.vmstate
+  return dump-heap(vms.heap, vms.heap-top, vm)
 
 lostanza defn dump-heap (pstart:ptr<long>, pend:ptr<long>, vm:ref<VirtualMachine>) -> int :
   val stackrefs = Vector<Long>()
@@ -2380,8 +2444,8 @@ lostanza defn function-addresses (vmt:ref<VMTable>) -> ref<StableIntArray> :
 defn resolve (pkgids:PackageIds, vmp:VMPackage) :
   defn resolve (n:Int) : pkgids[n]
   defn resolve (x:False) : false
-  defn resolve<?T> (x:?T&(VMGlobal|VMData|VMClass|VMFunction|VMMethod|VMExtern)) :
-    map-id(resolve,x) as T&(VMGlobal|VMData|VMClass|VMFunction|VMMethod|VMExtern)
+  defn resolve<?T> (x:?T&(VMGlobal|VMData|VMClass|VMDefn|VMMethod|VMExtern|VMExternDefn)) :
+    map-id(resolve,x) as T&(VMGlobal|VMData|VMClass|VMDefn|VMMethod|VMExtern|VMExternDefn)
   VMPackage(
     packageio(vmp)
     resolve(init(vmp))
@@ -2391,7 +2455,8 @@ defn resolve (pkgids:PackageIds, vmp:VMPackage) :
     map(resolve,classes(vmp))
     map(resolve,funcs(vmp))
     map(resolve,methods(vmp))
-    map(resolve,externs(vmp)))
+    map(resolve,externs(vmp))
+    map(resolve,extern-defns(vmp)))
 
 ;============================================================
 ;================= Instruction Encoding =====================
@@ -2454,7 +2519,7 @@ public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>,
     for f in funcs(vmp) do :
       ;val linked = link(linker(vm), f, pkgids)
       ;load-function(vmt, id(f), linked)
-      val ef = encode(f, pkgids, EncodingResolver(branch-table(vm), live-map-table(linker(vm))))
+      val ef = encode(func(f), pkgids, EncodingResolver(branch-table(vm), live-map-table(linker(vm))))
       load-function(vmt, id(f), ef)
 
     ;Stage constants and classes to be loaded together
@@ -2465,6 +2530,7 @@ public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>,
     load-globals(vmt, globals(vmp), package(vmp), keep-existing-globals?)
     load-datas(vmt, datas(vmp))
     load-externs(vmt, externs(vmp))
+    load-extern-defns(vmt, extern-defns(vmp))
     load-package-methods(branch-table(vm), package(vmp), methods(vmp))
 
     ;Register initialization function
@@ -2476,6 +2542,9 @@ public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>,
 
   ;Update the branch table
   update(branch-table(vm))
+
+  ;Update the virtual machine state
+  update-vmstate(vm)
 
   ;Initialize constants
   if none?({package(_) == `core}, vmps) :
@@ -2493,16 +2562,17 @@ public defn init-package (vm:VirtualMachine, package:Symbol) :
     else : run-bytecode(vm, f)
 
 lostanza defn launch-init (vm:ref<VirtualMachine>, fid:ref<Int>, trace?:ref<True|False>) -> ref<False> :
+  val vms = vm.vmstate
   ;Create the closure representing the initialization function
   val closure-size = 8 + 8
   ensure-heap-space(vm, closure-size, 1)
-  val closure:ptr<Function> = alloc-heap(vm, FN-TYPE.value, closure-size)
+  val closure:ptr<Function> = alloc-heap(vms, FN-TYPE.value, closure-size)
   closure.num-slots = 0L
   closure.code = fid.value
   ;Call closure using the launcher function
-  vm.registers[0] = false-marker()
-  vm.registers[1] = 1L
-  vm.registers[2] = tag(closure - 8L)
+  vms.registers[0] = false-marker()
+  vms.registers[1] = 1L
+  vms.registers[2] = tag(closure - 8L)
   val launcher-id = get(loaded-ids(vm), CORE-EXECUTE-TOPLEVEL-COMMAND-ID)
   run-bytecode(vm, launcher-id)
   ;Return
