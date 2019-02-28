@@ -1593,7 +1593,7 @@ void vmloop (VMState* vms){
       int64_t remaining = call_garbage_collector(vms, size);
       RESTORE_STATE();
       //Return heap remaining
-      SET_REG(0, remaining);
+      SET_LOCAL(x, remaining);
       continue;
     }
     case PRINT_STACK_TRACE_OPCODE : {
