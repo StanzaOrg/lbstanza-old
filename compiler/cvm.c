@@ -376,6 +376,7 @@
 #define STACK_TYPE 6
 #define FN_TYPE 7
 #define TYPE_TYPE 8
+#define LIVENESS_TRACKER_TYPE 9
 
 #define BOOLREF(x) (((x) << 3) + MARKER_TAG_BITS)
 
@@ -1504,6 +1505,7 @@ void vmloop (VMState* vms){
     case RESERVE_OPCODE_LOCAL : {
       DECODE_C();
       uint64_t size = 8 + LOCAL(value);
+      size = (size + 7) & -8;
       int num_locals = y;
       int offset = x * 4;
       if(heap_top + size <= heap_limit){
@@ -1578,6 +1580,7 @@ void vmloop (VMState* vms){
     case ALLOC_OPCODE_LOCAL : {
       DECODE_C();
       uint64_t num_bytes = 8 + LOCAL(y);
+      num_bytes = (num_bytes + 7) & -8;
       int type = value;
       *(uint64_t*)heap_top = type;
       uint64_t obj = ptr_to_ref(heap_top);
