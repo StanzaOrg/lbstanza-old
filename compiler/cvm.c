@@ -193,6 +193,7 @@
 #define ALLOC_OPCODE_LOCAL 184
 #define GC_OPCODE 185
 #define HEAP_REMAINING_OPCODE 240
+#define CLASS_NAME_OPCODE 241
 #define PRINT_STACK_TRACE_OPCODE 186
 #define CURRENT_STACK_OPCODE 187
 #define FLUSH_VM_OPCODE 188
@@ -437,6 +438,7 @@ int call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
 int dispatch_branch (VMState* vms, int format);
+char* retrieve_class_name (VMState* vms, long id);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -1604,6 +1606,13 @@ void vmloop (VMState* vms){
       DECODE_A_UNSIGNED();
       int64_t remaining = heap_limit - heap_top;
       SET_LOCAL(value, remaining);
+      continue;
+    }
+    case CLASS_NAME_OPCODE : {
+      DECODE_B_UNSIGNED();
+      long id = (long)LOCAL(value);
+      char* name = retrieve_class_name(vms, id);
+      SET_LOCAL(x, (uint64_t)name);
       continue;
     }
     case PRINT_STACK_TRACE_OPCODE : {
