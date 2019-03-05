@@ -311,6 +311,19 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
       (f:ECurry) : info(x(f))
       (f:EMix) : find({_ is FileInfo}, seq(first-info, funcs(f)))
 
+  ;Key utilities for EVar|ECurry
+  defn var-hash (e:EVar|ECurry) :
+    match(e) :
+      (e:EVar) : n(e)
+      (e:ECurry) : 11 * n(x(e)) + hash(targs(e))      
+  defn var-equal? (a:EVar|ECurry, b:EVar|ECurry) :
+    match(a, b) :
+      (a:EVar, b:EVar) : n(a) == n(b)
+      (a:ECurry, b:ECurry) : n(x(a)) == n(x(b)) and targs(a) == targs(b)
+      (a, b) : false      
+  defn var-table<T> () :
+    HashTable<EVar|ECurry, T>(var-hash, var-equal?)
+
   ;Create a trampoline function that calls the given immediate
   ;with known arity.
   defn trampoline-fn (f:EVar|ECurry|EMix, arity:Int, vt:VarTable) :
@@ -354,43 +367,95 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
               else : EMix(to-tuple(value(group)))
 
   ;Lift all first-class functions in body
-  defn analyze-body (body:EBody, vt:VarTable) :
-    ;New definitions
-    val buffer = BodyBuffer(body)
+  defn analyze-body (top-body:EBody, vt:VarTable) :
 
-    ;Lift a reference to a closure
-    defn lift (x:EVar|ECurry|EMix) -> EVar :
-      val v = uniqueid()
-      emit(buffer, ELocalFn(v, trampoline-fn(x, vt)))
-      emit(buffer, EInitClosures([EVarLoc(v)], first-info(x)))
-      EVar(v)
+    ;Create trampoline table
+    val trampoline-table = var-table<Int>()
+    val trampolines = IntListTable<ELocalFn>()
+    val initialized? = IntSet()
+    defn uninitialized-trampolines () :
+      for entry in trampolines seq-cat :
+        if initialized?[key(entry)] : []
+        else : value(entry)
 
-    ;Analyze an immediate, lifting when necessary
-    defn lift-imm (x:EImm) :
-      match(x) :
-        (x:EVar) :
-          if function?(vt,n(x)) : lift(x)
-          else : x
-        (x:ECurry|EMix) : lift(x)
-        (x) : x
-    defn lift-imms (xs:Tuple<EImm>) :
-      map(lift-imm, xs)
+    ;Lift all first-class functions in body to trampolines
+    defn lift-trampolines (e:ELBigItem, top?:True|False) :
+      match(map(lift-trampolines{_, false}, e)) :
+        (e:EBody) :
+          ;New definitions
+          val buffer = BodyBuffer(e)
 
-    ;Analyze all instructions
-    for i in ins(body) do :
-      val i* = match(i) :
-        (i:ECall|ETCall) : sub-ys(i, lift-imms(ys(i)))
-        (i) : map(lift-imm, i)
-      emit(buffer, i*)
+          ;Retrieve the wrapped identifier in EVar|ECurry
+          defn var-id (e:EVar) : n(e)
+          defn var-id (e:ECurry) : var-id(x(e))          
+          defn lift (x:EVar|ECurry|EMix) -> EVar :
+            match(x) :
+              ;These are collapsed together, and looked up through the
+              ;trampoline table.
+              (x:EVar|ECurry) :
+                if not key?(trampoline-table, x) :
+                  val v = uniqueid()
+                  add(trampolines, var-id(x), ELocalFn(v, trampoline-fn(x, vt)))
+                  trampoline-table[x] = v
+                EVar(trampoline-table[x])
+              ;Mixes are always allocated at use-site
+              (x:EMix) :
+                val v = uniqueid()
+                emit(buffer, ELocalFn(v, trampoline-fn(x, vt)))
+                emit(buffer, EInitClosures([EVarLoc(v)], first-info(x)))
+                EVar(v)          
 
-    ;Return analyzed function
-    to-body(buffer)
+          ;Analyze an immediate, lifting when necessary
+          defn lift-imm (x:EImm) :
+            match(x) :
+              (x:EVar) : lift(x) when function?(vt,n(x)) else x
+              (x:ECurry|EMix) : lift(x)
+              (x) : x
+
+          ;Analyze all instructions
+          for i in ins(e) do :
+            val i* = match(i) :
+              (i:ECall|ETCall) : sub-ys(i, map(lift-imm,ys(i)))
+              (i) : map(lift-imm, i)
+            emit(buffer, i*)
+
+          ;Return function with lifted closures
+          init-trampolines(to-body(buffer), top?)
+        ;Just return if not a body
+        (e) : e
+
+    ;Initialize trampolines.
+    defn init-trampolines (body:EBody, top?:True|False) :
+      val buffer = BodyBuffer(body)
+      ;Emit all trampolines for functions
+      for f in localfns(body) do :
+        for t in trampolines[n(f)] do :
+          add(initialized?, n(f))          
+          emit(buffer, t)
+      ;Emit remaining trampolines
+      if top? :
+        do(emit{buffer, _}, uninitialized-trampolines())
+        val locs = seq(EVarLoc{n(_)}, uninitialized-trampolines())
+        if not empty?(locs) :
+          emit(buffer, EInitClosures(to-tuple(locs), false))
+      ;Emit instructions with added initializations
+      for i in ins(body) do :
+        match(i:EInitClosures) :
+          val xs* = for x in xs(i) seq-cat :
+            val ts = seq(EVarLoc{n(_)}, trampolines[n(x)])              
+            cat([x], ts)
+          emit(buffer, EInitClosures(to-tuple(xs*), info(i)))
+        else : emit(buffer, i)
+      ;Return body
+      to-body(buffer)
+
+    ;Driver
+    lift-trampolines(top-body, true)
 
   ;Recursive Analysis
   defn analyze (x:ELBigItem, vt:VarTable) :
-    match(map(analyze{_, vt},x)) :
-      (x:EBody) : analyze-body(x, vt)
-      (x) : x
+    match(x:EBody) : analyze-body(x, vt)
+    else : map(analyze{_, vt}, x)
   map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
 
 ;============================================================
@@ -1429,23 +1494,14 @@ defn LiftTable (etexp:ETExp, allow-global-closures?:True|False) :
     Free(to-tuple(vars), to-tuple(tvars))
 
   scan(etexp) where :
-    defn scan (e:ELBigItem) :
-      do*(scan, e)
-      match(e:EBody) :
-        ;Record freevars of functions
-        for e in localfns(e) do :
+    defn scan (e:ELItem) :    
+      match(e) :
+        (e:ELocalFn) :
           record-free(n(e), fnfree(func(e)))
-        ;Record usages in value position
-        if not empty?(localfns(e)) :
-          ;Scan for variables
-          defn scan-var (e:ELItem) :
-            match(e:EVar) : add(used-as-value, n(e))
-            else : do(scan-var, e)
-          ;Scan instructions for usages of variables in value position
-          for ins in ins(e) do :
-            match(ins) :
-              (ins:ECall|ETCall) : do(scan-var,ys(ins))
-              (ins) : scan-var(ins)
+          do(scan, e)
+        (e:EVar) : add(used-as-value, n(e))
+        (e:ECall|ETCall) : do(scan, ys(e))
+        (e) : do(scan, e)
     defn fnfree (f:EFunction) :
       match(f) :
         (f:EFn) : free(f)
