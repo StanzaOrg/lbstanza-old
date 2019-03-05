@@ -359,7 +359,8 @@
   heap_limit = vms->heap_limit; \
   current_stack = vms->current_stack; \
   stk = untag_stack(current_stack); \
-  stack_pointer = stk->stack_pointer; 
+  stack_pointer = stk->stack_pointer; \
+  stack_limit = (char*)(stk->frames) + stk->size;
 
 #define INT_TAG_BITS 0
 #define REF_TAG_BITS 1
