@@ -264,28 +264,28 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  /*printf("          [%d | %d]\n", opcode, value);*/
+  if(iprint) printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  /*printf("          [%d | %d]\n", opcode, value);*/
+  if(iprint) printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  /*printf("          [%d | %d | %d]\n", opcode, x, value);*/
+  if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  /*printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
+  if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);
 
 #define DECODE_D() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  /*printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);*/
+  if(iprint) printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -294,7 +294,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  /*printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
+  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -304,7 +304,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  /*printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
+  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -344,6 +344,8 @@
 
 #define PUSH_FRAME(num_locals) \
   stack_pointer = (StackFrame*)((char*)stack_pointer + sizeof(StackFrame) + (num_locals) * 8); \
+  if(iprint) printf("push stack_pointer to %p\n", stack_pointer); \
+  if(stack_pointer >= stk->frames + stk->size) {printf("Stack overflow!!!!\n");} \
   stack_pointer->returnpc = (uint64_t)(pc - instructions);
 
 #define POP_FRAME(num_locals) \
@@ -359,7 +361,8 @@
   heap_limit = vms->heap_limit; \
   current_stack = vms->current_stack; \
   stk = untag_stack(current_stack); \
-  stack_pointer = stk->stack_pointer; 
+  stack_pointer = stk->stack_pointer; \
+  stack_limit = (char*)(stk->frames) + stk->size;
 
 #define INT_TAG_BITS 0
 #define REF_TAG_BITS 1
@@ -434,10 +437,10 @@ typedef struct{
 //============================================================
 
 void call_c_launcher (VMState* vms, int index, uint64_t faddr);
-int call_garbage_collector (VMState* vms, uint64_t total_size);
+int call_garbage_collector (VMState* vms, uint64_t total_size, int iprint);
 void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
-int dispatch_branch (VMState* vms, int format);
+int dispatch_branch (VMState* vms, int format, int iprint);
 char* retrieve_class_name (VMState* vms, long id);
 
 //============================================================
@@ -450,6 +453,19 @@ Stack* untag_stack (uint64_t current_stack){
 
 uint64_t ptr_to_ref (void* p){
   return (uint64_t)p + REF_TAG_BITS;
+}
+
+uint64_t icount;
+uint64_t istart;
+uint64_t iskip;
+void read_params () {
+  FILE* file = fopen("params.txt", "r");
+  int n = fscanf(file, "%ld %ld", &istart, &iskip);
+  if(n != 2){
+    printf("Could not read params.\n");
+    exit(-1);
+  }
+  icount = 0;
 }
 
 void vmloop (VMState* vms){
@@ -483,6 +499,7 @@ void vmloop (VMState* vms){
   //uint64_t last_time;
 
   //Repl Loop
+  read_params();
   while(1){
     //Save pre-decode PC because jump offsets are relative to
     //pre-decode PC.
@@ -495,6 +512,10 @@ void vmloop (VMState* vms){
     //  timings[last_opcode] += curtime - last_time;
     //last_opcode = opcode;
     //last_time = curtime;
+
+    int iprint = icount >= istart & (icount % iskip) == 0;
+    icount++;
+    if(iprint) printf("    execute instruction %ld\n", icount);
     
     switch(opcode){
     case SET_OPCODE_LOCAL : {
@@ -706,6 +727,8 @@ void vmloop (VMState* vms){
     case LIVE_OPCODE : {
       DECODE_A_UNSIGNED();
       stack_pointer->liveness_map = value;
+      if(iprint)
+        printf("Save liveness map %ld to %p\n", value, &stack_pointer->liveness_map);
       continue;
     }
     case YIELD_OPCODE : {
@@ -1296,7 +1319,7 @@ void vmloop (VMState* vms){
     case TYPEOF_OPCODE : {
       DECODE_C();
       int format = value;
-      int index = dispatch_branch(vms, format);
+      int index = dispatch_branch(vms, format, iprint);
       SET_LOCAL(x, index);
       continue;
     }
@@ -1596,7 +1619,7 @@ void vmloop (VMState* vms){
       uint64_t size = LOCAL(value);
       //Call GC
       SAVE_STATE();
-      int64_t remaining = call_garbage_collector(vms, size);
+      int64_t remaining = call_garbage_collector(vms, size, iprint);
       RESTORE_STATE();
       //Return heap remaining
       SET_LOCAL(x, remaining);
@@ -1823,7 +1846,7 @@ void vmloop (VMState* vms){
       uint32_t* tgts = (uint32_t*)(pc + 4);
       //DECODE_TGTS();
       int format = value;
-      int index = dispatch_branch(vms, format);
+      int index = dispatch_branch(vms, format, iprint);
       int tgt = tgts[index];
       pc = pc0 + (tgt * 4);
       continue;
@@ -1833,7 +1856,7 @@ void vmloop (VMState* vms){
       uint32_t* tgts = (uint32_t*)(pc + 4);
       //DECODE_TGTS();
       int format = value;
-      int index = dispatch_branch(vms, format);
+      int index = dispatch_branch(vms, format, iprint);
       if(index < 2){
         int tgt = tgts[index];
         pc = pc0 + (tgt * 4);
