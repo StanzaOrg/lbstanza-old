@@ -409,6 +409,9 @@ typedef struct{
   char* free;
   char* free_limit;
   uint64_t current_stack;
+  //System state
+  uint64_t system_stack;  
+  uint64_t* system_registers;
 } VMState;
 
 typedef struct{
