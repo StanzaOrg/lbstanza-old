@@ -382,6 +382,8 @@
 
 #define BOOLREF(x) (((x) << 3) + MARKER_TAG_BITS)
 
+#define SYSTEM_RETURN_STUB -2
+
 //============================================================
 //==================== Machine Types =========================
 //============================================================
@@ -401,6 +403,7 @@ typedef struct{
   uint64_t* extern_defn_addresses;
   uint32_t* code_offsets;
   int extend_heap_id;
+  int extend_stack_id;
   //Variable State
   //Changes in_between each boundary change
   char* heap;
@@ -469,7 +472,6 @@ void vmloop (VMState* vms){
   uint64_t* extern_table = vms->extern_table;
   uint64_t* extern_defn_addresses = vms->extern_defn_addresses;
   uint32_t* code_offsets = vms->code_offsets;
-  int extend_heap_id = vms->extend_heap_id;
   //Variable State
   //Changes in_between each boundary change
   char* heap_top = vms->heap_top;
@@ -728,15 +730,33 @@ void vmloop (VMState* vms){
     case RETURN_OPCODE : {
       DECODE_A_UNSIGNED();
       int64_t retpc = stack_pointer->returnpc;
-      if(retpc < 0){
+      if(retpc == SYSTEM_RETURN_STUB){
+        //System stack no longer needed
+        stk->stack_pointer = 0;
+        //Swap stack and registers
+        vms->current_stack = vms->system_stack;
+        vms->system_stack = current_stack;
+        vms->registers = vms->system_registers;
+        vms->system_registers = registers;
+        //Restore stack state
+        RESTORE_STATE();
+        registers = vms->registers;
+        //Continue where we were
+        retpc = stack_pointer->returnpc;
+        pc = instructions + retpc;
+        continue;        
+      }      
+      else if(retpc < 0){
         //Save registers
         SAVE_STATE();
         //for(int i=0; i<255; i++)
         //  printf("Time of opcode %d = %llu\n", i, timings[i]);
         return;
       }
-      pc = instructions + retpc;
-      continue;
+      else{
+        pc = instructions + retpc;
+        continue;
+      }
     }
     case DUMP_OPCODE : {
       DECODE_A_UNSIGNED();
@@ -1521,7 +1541,7 @@ void vmloop (VMState* vms){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1L);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[extend_heap_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_heap_id]) * 4;
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1539,7 +1559,7 @@ void vmloop (VMState* vms){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1L);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[extend_heap_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_heap_id]) * 4;
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1865,11 +1885,28 @@ void vmloop (VMState* vms){
       DECODE_A_UNSIGNED();
       int frame_size = value * 8 + sizeof(StackFrame);
       int size_required = frame_size + sizeof(StackFrame);
-      if((char*)stack_pointer + size_required > stack_limit){        
-        //Call Extender
-        SAVE_STATE();
-        call_stack_extender(vms, size_required);
+      if((char*)stack_pointer + size_required > stack_limit){
+        //Save current stack
+        stk->stack_pointer = stack_pointer;
+        stk->pc = pc - instructions;
+        //Swap stack and registers
+        vms->current_stack = vms->system_stack;
+        vms->system_stack = current_stack;
+        vms->registers = vms->system_registers;
+        vms->system_registers = registers;
+        //Restore stack state
         RESTORE_STATE();
+        registers = vms->registers;
+        //Set arguments        
+        SET_REG(0, BOOLREF(0));
+        SET_REG(1, 1L);
+        SET_REG(2, size_required);
+        stack_pointer = stk->frames;
+        stack_pointer->returnpc = SYSTEM_RETURN_STUB;
+        //Jump to stack extender          
+        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_stack_id]) * 4;
+        pc = instructions + fpos;
+        continue;        
       }
       continue;
     }
