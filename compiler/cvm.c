@@ -1654,6 +1654,7 @@ void vmloop (VMState* vms){
     case FLUSH_VM_OPCODE : {
       DECODE_A_UNSIGNED();
       SAVE_STATE();
+      SET_LOCAL(value, (uint64_t)vms);
       continue;
     }
     case CONSTS_OPCODE : {
