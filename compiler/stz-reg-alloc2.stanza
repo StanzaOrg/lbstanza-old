@@ -30,6 +30,7 @@ public defn allocate-registers (ins:VMFunction, backend:Backend) -> False :
   ;  do(println, ins)
 
   load-instructions(ins)
+  print-prog()
   ;if flag-defined?(`PRINT-REG-ALLOC) :
   ;  println("==== Load Instructions ====")
   ;  print-prog()
@@ -254,6 +255,9 @@ public defstruct CCall <: CallType :
 public defstruct StackSwitch <: CallType :
   func-reg?: False|Loc with: (default => false)
   reg?: False|Loc with: (default => false)
+public defstruct CollectGarbage <: CallType :
+  info: False|FileInfo
+  additional-size: Int
 
 public defn arg-regs (t:CallType) :
   match(t) :
@@ -315,6 +319,27 @@ defmethod print (o:OutputStream, op:NonZeroOp) :
 public defstruct NoOp <: VMOp
 defmethod print (o:OutputStream, op:NoOp) :
   print(o, "nop")
+
+public defstruct RecordLiveOp <: VMOp :
+  live-vars: Tuple<Var>
+defmethod print (o:OutputStream, op:RecordLiveOp) :
+  print(o, "live(%,)" % [live-vars(op)])
+
+public defstruct ReserveOp <: VMOp :
+  additional-size: Int
+defmethod print (o:OutputStream, op:ReserveOp) :
+  print(o, "reserve(%_)" % [additional-size(op)])
+
+public defstruct AllocOp <: VMOp :
+  additional-size: Int
+defmethod print (o:OutputStream, op:AllocOp) :
+  print(o, "alloc(%_)" % [additional-size(op)])
+
+public defstruct RegEqOp <: VMOp :
+  reg: Int
+  value: Int
+defmethod print (o:OutputStream, op:RegEqOp) :
+  print(o, "regeq(%_,%_)" % [reg(op), value(op)])
 
 ;public defstruct ConvOp <: VMOp
 ;defmethod print (o:OutputStream, op:ConvOp) :
@@ -456,6 +481,7 @@ defmethod print (o:OutputStream, c:CallType) :
     (c:StanzaTCall) : "ST(%_, %_)" % [arg-regs?(c), ret-regs?(c)]
     (c:CCall) : "C(%_, %_)" % [num-mem-args(c), arg-regs?(c)]
     (c:StackSwitch) : "STK(%_)" % [reg?(c)]
+    (c:CollectGarbage) : "GC(%_)" % [additional-size(c)]
 
 defmethod print (o:OutputStream, b:Block) :
   do(println{o, _}, ins(b))
@@ -668,6 +694,11 @@ defn unique-id () :
 ;============================================================
 ;================= Load into Working Set ====================
 ;============================================================
+
+defn object-size-on-heap (sz:Int) -> Int :
+  val ceiled = (8 + sz + 7) & -8
+  max(ceiled, 16)
+  
 defn load-instructions (function:VMFunction) :
   ;========================
   ;==== Variable Table ====
@@ -697,6 +728,8 @@ defn load-instructions (function:VMFunction) :
     to-list(seq(get-imm, vs))
   defn long-imm (x:Int) :
     Val(NumConst(to-long(x)))
+  defn int-imm (x:Int) :
+    Val(NumConst(x))
 
   ;=====================
   ;==== Block Table ====
@@ -770,7 +803,13 @@ defn load-instructions (function:VMFunction) :
       (f:VMMultifn) :        
         open-block(unique-id())
         for entry in funcs(f) do :
+          val pass-lbl = unique-id()
+          val fail-lbl = unique-id()
+          push(Branch(RegEqOp(1,key(entry)), List()))
+          close-block(List(pass-lbl, fail-lbl))
+          open-block(pass-lbl)
           emit-instructions(value(entry))
+          open-block(fail-lbl)
         emit-instructions(default(f))
 
   defn emit-instructions (f:VMFunc) :
@@ -866,8 +905,38 @@ defn load-instructions (function:VMFunction) :
           ;[Doable] Add new abstract instruction. 
           println("Not yet implemented: %_" % [e])
         (e:AllocIns) :
-          ;[Doable] Introduce a new op (with the registers needed)
-          println("Not yet implemented: %_" % [e])
+          ;Make labels
+          val has-space-lbl = unique-id()
+          val no-space-lbl = unique-id()
+          ;Constant size allocation
+          if all?({_ is NumConst}, sizes(e)) :
+            ;Compute the object sizes
+            val obj-sizes = for sz in sizes(e) map :
+              object-size-on-heap(value(sz as NumConst) as Int)
+            val sum-of-sizes = Val(NumConst(sum(obj-sizes)))
+            ;Branch depending on whether there is space
+            push(Branch(ReserveOp(0), List(sum-of-sizes)))
+            close-block(List(has-space-lbl, no-space-lbl))
+            ;If there is no space, then call the garbage collector
+            open-block(no-space-lbl)
+            push(Call(List(), Val(VoidMarker()), List(sum-of-sizes), CollectGarbage(info(e), 0)))
+            close-block(List(has-space-lbl))
+            ;If there is space, then allocate
+            open-block(has-space-lbl)
+            for (x in xs(e), sz in obj-sizes) do :
+              push(Op(AllocOp(0), List(get-var(x)), List(int-imm(sz))))            
+          ;Variable size allocation
+          else :          
+            fatal("Multiple variable-sized allocations.") when length(sizes(e)) > 1
+            val x = xs(e)[0]
+            val size = get-imm(sizes(e)[0])
+            push(Branch(ReserveOp(8), List(size)))
+            close-block(List(has-space-lbl, no-space-lbl))
+            open-block(no-space-lbl)
+            push(Call(List(), Val(VoidMarker()), List(size), CollectGarbage(info(e), 8)))
+            close-block(List(has-space-lbl))
+            open-block(has-space-lbl)
+            push(Op(AllocOp(8), List(get-var(x)), List(size)))            
         (e:StoreIns) :
           val [address, offset] = final-address(x(e), y(e), offset(e))
           push(Op(StoreOp(offset), List(), List(address, get-imm(z(e)))))
@@ -882,92 +951,14 @@ defn load-instructions (function:VMFunction) :
         (e:LiveIns) :
           push(Op(NoOp(), List(), get-imms(xs(e))))
         (e:RecordLiveIns) :
-          false
+          val op = RecordLiveOp(map(get-var,live(e)))
+          push(Op(op, List(), List()))
         (e:CommentIns) :
           false
         (e:UnreachableIns) :
           close-block(List())
-  ;<load instructions>
-        (e:TGDefData) :
-          add(CONSTANTS, e)
-        (e:TGArgs) :
-          push(Args(get-vars(xs(e)), StanzaContext()))
-        (e:TGReturn) :
-          push(Return(get-imms(xs(e)), StanzaContext()))
-          close-block(List())
-        (e:TGSet) :
-          push(Set(get-var(x(e)), get-imm(y(e))))
-        (e:TGConv) :
-          push(Op(ConvOp(), List(get-var(x(e))), List(get-imm(y(e)))))
-        (e:TGInterpret) :
-          push(Op(InterpretOp(), List(get-var(x(e))), List(get-imm(y(e)))))
-        (e:TGBinOp) :
-          push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)), get-imm(z(e)))))
-        (e:TGUnaOp) :
-          push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)))))
-        (e:TGLoad) :
-          push(Op(LoadOp(offset(e)), List(get-var(x(e))), List(get-imm(y(e)))))
-        (e:TGStore) :
-          push(Op(StoreOp(offset(e)), List(), List(get-imm(x(e)), get-imm(y(e)))))
-        (e:TGCall) :
-          val type = StanzaCall(arity(e), info(e))
-          push(Call(get-vars(xs(e)), get-imm(f(e)), get-imms(ys(e)), type))
-        (e:TGTCall) :
-          val type = StanzaTCall(arity(e))
-          push(Call(List(), get-imm(f(e)), get-imms(ys(e)), type))
-          close-block(List())
-        (e:TGSwitchStack) :
-          val type = StackSwitch()
-          push(Call(List(get-var(x(e))), get-imm(s(e)), List(get-imm(y(e))), type))
-        (e:TGLabel) :
-          close-block(List(n(e)))
-          open-block(n(e))
-        (e:TGGoto) :
-          close-block(List(n(e)))
-        (e:TGEnd) :
-          close-block(List())
-        (e:TGBinCmp) :
-          push(Branch(op(e), List(get-imm(x(e)), get-imm(y(e)))))
-          val alt = fresh-id()
-          close-block(List(n(e), alt))
-          open-block(alt)
-        (e:TGUnaCmp) :
-          push(Branch(op(e), List(get-imm(x(e)))))
-          val alt = fresh-id()
-          close-block(List(n(e), alt))
-          open-block(alt)
-        (e:TGNullCmp) :
-          push(Branch(op(e), List()))
-          val alt = fresh-id()
-          close-block(List(n(e), alt))
-          open-block(alt)
-        (e:TGMatch) :
-          val ts = map(tags, branches(e))
-          val ns = map(n, branches(e))
-          push(Match(false, ts, get-imms(xs(e))))
-          close-block(cons(no-branch(e), ns))
-        (e:TGDispatch) :
-          val ts = map(tags, branches(e))
-          val ns = map(n, branches(e))
-          push(Match(true, ts, get-imms(xs(e))))        
-          close-block(cons(no-branch(e), amb-branch(e), ns))
-        (e:TGCallC) :
-          val type = CCall(length(ys(e)))
-          val args = append(get-imms(ys(e)), get-imms(vs(e)))
-          push(Call(get-vars(xs(e)), get-imm(f(e)), args, type))
-        (e:TGArgsC) :
-          push(Args(get-vars(xs(e)), CContext()))
-        (e:TGReturnC) :
-          push(Return(get-imms(xs(e)), CContext()))
-          close-block(List())
-        (e:TGNewStack) :
-          push(Op(NewStackOp(), List(), List()))
-        (e:TGSaveCContext) :
-          push(Op(SaveCContextOp(), List(), List()))
-        (e:TGArityError) :
-          push(Op(ArityErrorOp(info(e)), List(), List()))
-          close-block(List())
-  ;<load instructions>
+
+  ;Driver
   load-defs(function)
   emit-function(function)
 
