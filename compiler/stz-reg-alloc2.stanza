@@ -264,6 +264,7 @@ public defstruct StackSwitch <: CallType :
 public defstruct CollectGarbage <: CallType :
   info: False|FileInfo
   additional-size: Int
+public defstruct ExtendStack <: CallType 
 
 public defn arg-regs (t:CallType) :
   match(t) :
@@ -347,6 +348,20 @@ public defstruct RegEqOp <: VMOp :
 defmethod print (o:OutputStream, op:RegEqOp) :
   print(o, "regeq(%_,%_)" % [reg(op), value(op)])
 
+public defstruct HasStackSpaceOp <: VMOp
+defmethod print (o:OutputStream, op:HasStackSpaceOp) :
+  print(o, "has-stack-space")
+
+public defstruct StoreArgOp <: VMOp :
+  index: Int
+defmethod print (o:OutputStream, op:StoreArgOp) :
+  print(o, "store-arg(%_)" % [index(op)])
+
+public defstruct LoadArgOp <: VMOp :
+  index: Int
+defmethod print (o:OutputStream, op:LoadArgOp) :
+  print(o, "load-arg(%_)" % [index(op)])
+  
 ;public defstruct ConvOp <: VMOp
 ;defmethod print (o:OutputStream, op:ConvOp) :
 ;  print(o, "conv")
@@ -490,6 +505,7 @@ defmethod print (o:OutputStream, c:CallType) :
     (c:CCall) : "C(%_, %_)" % [num-mem-args(c), arg-regs?(c)]
     (c:StackSwitch) : "STK(%_)" % [reg?(c)]
     (c:CollectGarbage) : "GC(%_)" % [additional-size(c)]
+    (c:ExtendStack) : "ExtendStack"
 
 defmethod print (o:OutputStream, b:Block) :
   do(println{o, _}, ins(b))
@@ -821,9 +837,29 @@ defn load-instructions (function:VMFunction) :
         emit-instructions(default(f))
 
   defn emit-instructions (f:VMFunc) :
+    ;Clear the var-table for this particular function
     clear(var-table)
+
+    ;Define all the local variables in the function
     for d in defs(f) do :
       make-var(id(d), type(d))
+
+    ;Check whether there is space for the function. Go to either
+    ;has-stack-lbl or no-stack-lbl depending.
+    val has-stack-lbl = unique-id()
+    val no-stack-lbl = unique-id()
+    push(Branch(HasStackSpaceOp(), List()))
+    close-block(List(has-stack-lbl, no-stack-lbl))
+    
+    ;If there is no stack space then call the stack extender,
+    ;and then go to the has-stack-lbl.    
+    open-block(no-stack-lbl)
+    push(Call(List(), Val(VoidMarker()), List(), ExtendStack()))
+    close-block(List(has-stack-lbl))
+
+    ;If there is stack space, then continue the function as normal.
+    open-block(has-stack-lbl)
+    for d in defs(f) do :
       push(Def(get-var(id(d))))
     val arg-vars = get-vars?(args(f))
     push(Args(arg-vars, StanzaContext()))
@@ -975,7 +1011,6 @@ defn load-instructions (function:VMFunction) :
 ;============================================================
 ;================== Backend Properties ======================
 ;============================================================
-;<remaining>
 defn frame-size (t:CCall, backend:Backend) :
   match(backend) :
     (backend:W64Backend) :
@@ -997,19 +1032,19 @@ defn mem-arg-offsets (t:CCall, backend:Backend) :
 ;============================================================
 ;=================== Normalization ==========================
 ;============================================================
-
+;<remaining>
 defn normalize (backend:Backend) :
   ;===============================================
   ;==== If a value is needed for saving C Rsp ====
   ;===============================================
-  val cached-var-table = HashTable-init<Symbol,Var>(make-var{TGLongT()})
-  defn cached-var (name:Symbol) : cached-var-table[name]
+  ;val cached-var-table = HashTable-init<Symbol,Var>(make-var{TGLongT()})
+  ;defn cached-var (name:Symbol) : cached-var-table[name]
     
   ;Normalize each block
   for (blk in BLOCKS, b in 0 to false) do :
-    normalize(blk, b, cached-var, backend)
+    normalize(blk, b, backend)
 
-defn normalize (blk:Block, b:Int, cached-var: Symbol -> Var, backend:Backend) :
+defn normalize (blk:Block, b:Int, backend:Backend) :
   ;============================
   ;==== Instruction Buffer ====
   ;============================
@@ -1019,7 +1054,6 @@ defn normalize (blk:Block, b:Int, cached-var: Symbol -> Var, backend:Backend) :
   ;======================
   ;==== Instructions ====
   ;======================
-  val #argspace = Val(TGMem(ARG-LBL))
   val #c-rsp = Val(TGMem(C-RSP-LBL))
   val #rsp = Val(TGMem(STACK-PTR-LBL))
   defn #load (x:Var, y:Imm, offset:Int) :
@@ -1115,37 +1149,37 @@ defn normalize (blk:Block, b:Int, cached-var: Symbol -> Var, backend:Backend) :
     for (x in mems(xs*), o in 0 to false by 8) do :
       #load(x as Var, #argspace, o)
 
-  defn norm-c-call (e:Call) :
-    val t = type(e) as CCall
-    ;Split up arguments
-    val ys* = match(backend) :
-      (backend:W64Backend) :
-        defn shadow (x:Imm) :
-          val x* = make-var(TGIntegerT(type(x)))
-          emit(Op(InterpretOp(), List(x*), List(force-var(x))))
-          x*
-        split-call-locs-shadow(map(force-new-var,ys(e)),
-                               arity(t),
-                               callc-regs(backend),
-                               callc-fregs(backend), shadow)
-      (backend:Backend) :
-        split-call-locs(map(force-new-var,ys(e)),
-          callc-regs(backend), callc-fregs(backend))
-    ;Return register
-    val ret-reg =
-      if empty?(xs(e)) : Reg(0)
-      else if type(head(xs(e))) is TGIntegerT : Reg(0)
-      else : FReg(0)
-    ;Annotated call type
-    val type* = CCall(arity(t), length(mems(ys*)), Reg(1), locs(ys*), ret-reg)
-    ;Store arguments
-    if not empty?(mems(ys*)) :
-      val csp = make-var(TGLongT())
-      #load(csp, #c-rsp, 0)
-      for (y in mems(ys*), o in mem-arg-offsets(type*,backend)) do :
-        #store(csp, y, o)
-    ;Emit call    
-    emit(Call(xs(e), f(e), regs(ys*), type*))
+  ;defn norm-c-call (e:Call) :
+  ;  val t = type(e) as CCall
+  ;  ;Split up arguments
+  ;  val ys* = match(backend) :
+  ;    (backend:W64Backend) :
+  ;      defn shadow (x:Imm) :
+  ;        val x* = make-var(TGIntegerT(type(x)))
+  ;        emit(Op(InterpretOp(), List(x*), List(force-var(x))))
+  ;        x*
+  ;      split-call-locs-shadow(map(force-new-var,ys(e)),
+  ;                             arity(t),
+  ;                             callc-regs(backend),
+  ;                             callc-fregs(backend), shadow)
+  ;    (backend:Backend) :
+  ;      split-call-locs(map(force-new-var,ys(e)),
+  ;        callc-regs(backend), callc-fregs(backend))
+  ;  ;Return register
+  ;  val ret-reg =
+  ;    if empty?(xs(e)) : Reg(0)
+  ;    else if type(head(xs(e))) is TGIntegerT : Reg(0)
+  ;    else : FReg(0)
+  ;  ;Annotated call type
+  ;  val type* = CCall(arity(t), length(mems(ys*)), Reg(1), locs(ys*), ret-reg)
+  ;  ;Store arguments
+  ;  if not empty?(mems(ys*)) :
+  ;    val csp = make-var(TGLongT())
+  ;    #load(csp, #c-rsp, 0)
+  ;    for (y in mems(ys*), o in mem-arg-offsets(type*,backend)) do :
+  ;      #store(csp, y, o)
+  ;  ;Emit call    
+  ;  emit(Call(xs(e), f(e), regs(ys*), type*))
 
   defn norm-stack-call (e:Call) :
     val reg = Reg(head(call-regs(backend)))
@@ -1163,23 +1197,23 @@ defn normalize (blk:Block, b:Int, cached-var: Symbol -> Var, backend:Backend) :
     val ctxt* = StanzaContext(locs(xs*))
     emit(Return(regs(xs*), ctxt*))
 
-  defn norm-c-return (e:Return) :
-    ;Load C pointer, and restore old one
-    val c-rsp = make-var(TGLongT())
-    #load(c-rsp, #c-rsp, 0)
-    #store(#c-rsp, cached-var(`saved-c-rsp), 0)
-    #store(#rsp, cached-var(`saved-rsp), 0)
-    ;Emit instruction
-    val xs* = cons(c-rsp, map(force-new-var,xs(e)))
-    val ret-reg =
-      if empty?(xs(e)) :
-        Reg(0)
-      else :
-        match(type(head(xs(e)))) :
-          (t:TGIntegerT) : Reg(0)
-          (t:TGRealT) : FReg(0)
-    val ctxt* = CContext(List(Reg(6), ret-reg))
-    emit(Return(xs*, ctxt*))
+  ;defn norm-c-return (e:Return) :
+  ;  ;Load C pointer, and restore old one
+  ;  val c-rsp = make-var(TGLongT())
+  ;  #load(c-rsp, #c-rsp, 0)
+  ;  #store(#c-rsp, cached-var(`saved-c-rsp), 0)
+  ;  #store(#rsp, cached-var(`saved-rsp), 0)
+  ;  ;Emit instruction
+  ;  val xs* = cons(c-rsp, map(force-new-var,xs(e)))
+  ;  val ret-reg =
+  ;    if empty?(xs(e)) :
+  ;      Reg(0)
+  ;    else :
+  ;      match(type(head(xs(e)))) :
+  ;        (t:TGIntegerT) : Reg(0)
+  ;        (t:TGRealT) : FReg(0)
+  ;  val ctxt* = CContext(List(Reg(6), ret-reg))
+  ;  emit(Return(xs*, ctxt*))
 
   ;===========================
   ;==== Arg Normalization ====
@@ -1192,26 +1226,26 @@ defn normalize (blk:Block, b:Int, cached-var: Symbol -> Var, backend:Backend) :
     for (x in mems(xs*), o in 0 to false by 8) do :
       #load(x as Var, #argspace, o)
 
-  defn norm-c-args (e:Args) :
-    ;Split up arguments
-    val arity = length(xs(e))
-    val xs* = match(backend) :
-      (backend:W64Backend) :
-        split-call-locs-shadow(xs(e), arity, callc-regs(backend),
-                               callc-fregs(backend), fatal{"No Shadow"})
-      (backend:Backend) :
-        split-call-locs(xs(e), callc-regs(backend), callc-fregs(backend))
-    ;Emit instruction
-    val c-rsp = make-var(TGLongT())
-    val ctxt* = CContext(cons(Reg(6), locs(xs*)))
-    emit(Args(cons(c-rsp, regs(xs*) as List<Var>), ctxt*))
-    ;Load arguments
-    for (x in mems(xs*), i in 0 to false) do :
-      #load(x as Var, c-rsp, 8 * (i + 1))
-    ;Save old C pointer and Set c-rsp as new C pointer
-    #load(cached-var(`saved-rsp), #rsp, 0)
-    #load(cached-var(`saved-c-rsp), #c-rsp, 0)
-    #store(#c-rsp, c-rsp, 0)
+  ;defn norm-c-args (e:Args) :
+  ;  ;Split up arguments
+  ;  val arity = length(xs(e))
+  ;  val xs* = match(backend) :
+  ;    (backend:W64Backend) :
+  ;      split-call-locs-shadow(xs(e), arity, callc-regs(backend),
+  ;                             callc-fregs(backend), fatal{"No Shadow"})
+  ;    (backend:Backend) :
+  ;      split-call-locs(xs(e), callc-regs(backend), callc-fregs(backend))
+  ;  ;Emit instruction
+  ;  val c-rsp = make-var(TGLongT())
+  ;  val ctxt* = CContext(cons(Reg(6), locs(xs*)))
+  ;  emit(Args(cons(c-rsp, regs(xs*) as List<Var>), ctxt*))
+  ;  ;Load arguments
+  ;  for (x in mems(xs*), i in 0 to false) do :
+  ;    #load(x as Var, c-rsp, 8 * (i + 1))
+  ;  ;Save old C pointer and Set c-rsp as new C pointer
+  ;  #load(cached-var(`saved-rsp), #rsp, 0)
+  ;  #load(cached-var(`saved-c-rsp), #c-rsp, 0)
+  ;  #store(#c-rsp, c-rsp, 0)
 
   ;=============================
   ;==== Match Normalization ====
@@ -1465,6 +1499,8 @@ defn split-match-locs (xs:List<Imm>, num-regs:Int) :
     else :
       add(imm-xs, x)
   [to-list(imm-xs), to-list(mem-xs)]
+
+
 
 ;============================================================
 ;================= Critical Edge Removal ====================
