@@ -27,8 +27,8 @@ public defn normalize (f:VMFunction, backend:Backend) :
   
   ;Load instructions for a single standard function
   defn load-instructions (f:VMFunc) :
-    load-prelude(f)
-    do(load-instruction, ins(f))
+    val all-ins = cat(prelude-instructions(f), ins(f))
+    load-instructions(all-ins)
 
   ;Load instructions for a multi
   defn load-multi-instructions (f:VMFunc) :
@@ -37,13 +37,14 @@ public defn normalize (f:VMFunction, backend:Backend) :
     val dispatch-ins = next(f-ins) as MethodDispatchIns
     val default-dispatch = default(dispatch-ins)
     val amb-dispatch = amb(dispatch-ins)
-    emit(buffer, MethodDispatchIns(multi(dispatch-ins), [], [], default-dispatch, amb-dispatch))
-    ;Emit other instructions
-    for i in f-ins do :
-      load-instruction(i)
-      match(i:LabelIns) :
-        if n(i) == default-dispatch or n(i) == amb-dispatch :
-          load-prelude(f)
+    val all-ins = generate<VMIns> :
+      yield(MethodDispatchIns(multi(dispatch-ins), [], [], default-dispatch, amb-dispatch))
+      for i in f-ins do :
+        yield(i)
+        match(i:LabelIns) :
+          if n(i) == default-dispatch or n(i) == amb-dispatch :
+            do(yield, prelude-instructions(f))
+    load-instructions(all-ins)
 
   ;Load instructions for a variable-arity multifn
   defn load-instructions (f:VMMultifn) :
@@ -51,28 +52,89 @@ public defn normalize (f:VMFunction, backend:Backend) :
     load-instructions(default(f))
 
   ;Load prelude to a function
-  defn load-prelude (f:VMFunc) :
-    ;Get arguments    
-    val ret = ret-records(buffer, args(f), backend)
-    emit(buffer, ArgIns(ret))
+  defn prelude-instructions (f:VMFunc) :
+    generate<VMIns> :
+      ;Get arguments    
+      val ret = ret-records(buffer, args(f), backend)
+      yield(ArgIns(ret))
+
+  ;Size of an object on heap
+  defn object-size-on-heap (sz:Int) :
+    max((sz + 8 + 7) & -8, 16)
+  defn object-size-on-heap (x:VMImm) :
+    object-size-on-heap(value(x as NumConst) as Int)
 
   ;Load single instruction
-  defn load-instruction (i:VMIns) :
-    match(i) :
-      (i:CallIns) :
-        val args = call-records(buffer, ys(i), backend)
-        val ret = ret-records(buffer, xs(i), backend)
-        emit(buffer, CallRecordIns(ret, /f(i), args, info(i), StanzaCall()))
-      (i:TCallIns) :
-        val args = call-records(buffer, ys(i), backend)
-        val ret = RetRecords([])
-        emit(buffer, CallRecordIns(ret, /f(i), args, info(i), StanzaTCall()))
-      (i:CallCIns) :
-        val args = callc-records(buffer, ys(i), backend)
-        val ret = retc-records(buffer, xs(i) backend)
-        emit(buffer, CallRecordIns(ret, /f(i), args, info(i), CCall()))
-      (i) :
-        emit(buffer, i)
+  defn load-instructions (ins:Seqable<VMIns>) :
+    for i in ins do :
+      match(i) :
+        (i:CallIns) :
+          val args = call-records(buffer, ys(i), backend)
+          val ret = ret-records(buffer, xs(i), backend)
+          emit(buffer, CallRecordIns(ret, /f(i), args, info(i), StanzaCall()))
+        (i:TCallIns) :
+          val args = call-records(buffer, ys(i), backend)
+          val ret = RetRecords([])
+          emit(buffer, CallRecordIns(ret, /f(i), args, info(i), StanzaTCall()))
+        (i:CallCIns) :
+          val args = callc-records(buffer, ys(i), backend)
+          val ret = retc-records(buffer, xs(i) backend)
+          emit(buffer, CallRecordIns(ret, /f(i), args, info(i), CCall()))
+        (i:AllocIns) :
+          if all?({_ is NumConst}, sizes(i)) :
+            val sizes-on-heap = map(object-size-on-heap, sizes(i))
+            val size-on-heap = NumConst(to-long(sum(sizes-on-heap)))
+            val has-space-lbl = make-label(buffer)
+            val no-space-lbl = make-label(buffer)
+            emit(buffer, Branch1Ins(has-space-lbl, no-space-lbl, HasHeapOp(), size-on-heap))
+            emit(buffer, LabelIns(no-space-lbl))
+            emit(buffer, ExtendHeapIns(size-on-heap, info(i)))
+            emit(buffer, GotoIns(has-space-lbl))
+            emit(buffer, LabelIns(has-space-lbl))
+            for (x in xs(i), type in types(i), size-on-heap in sizes-on-heap) do :
+              emit(buffer, AllocOnHeap(x, NumConst(size-on-heap)))
+              emit(buffer, StoreIns(x, false, -1, Tag(type)))
+          else :
+            fatal("Multiple variable-sized allocations.") when length(sizes(i)) > 1
+            val x = xs(i)[0]
+            val size = sizes(i)[0]
+            val type = types(i)[0]
+            val size-on-heap = make-local(buffer, VMLong())
+            emit(buffer, Op2Ins(size-on-heap, AddOp(), size, NumConst(15L)))
+            emit(buffer, Op2Ins(size-on-heap, AndOp(), size-on-heap, NumConst(-8L)))
+            val has-space-lbl = make-label(buffer)
+            val no-space-lbl = make-label(buffer)
+            emit(buffer, Branch1Ins(has-space-lbl, no-space-lbl, HasHeapOp(), size-on-heap))
+            emit(buffer, LabelIns(no-space-lbl))
+            emit(buffer, ExtendHeapIns(size-on-heap, info(i)))
+            emit(buffer, GotoIns(has-space-lbl))
+            emit(buffer, LabelIns(has-space-lbl))
+            emit(buffer, AllocOnHeap(x, size-on-heap))
+            emit(buffer, StoreIns(x, false, -1, Tag(type)))
+        (i:StoreIns) :
+          ;Compute new offset after factoring in ref tag
+          val offset* = (offset(i) + 8 - 1) when type(buffer,x(i)) is VMRef
+                   else offset(i)
+          match(y(i)) :
+            (y:False) :
+              emit(buffer, StoreIns(x(i), false, offset*, z(i), class(i)))
+            (y:VMImm) :
+              val base = make-local(buffer, VMLong())
+              emit(buffer, Op2Ins(base, AddOp(), x(i), y))
+              emit(buffer, StoreIns(base, false, offset*, z(i), class(i)))
+        (i:LoadIns) :
+          ;Compute new offset after factoring in ref tag
+          val offset* = (offset(i) + 8 - 1) when type(buffer,y(i)) is VMRef
+                   else offset(i)
+          match(z(i)) :
+            (z:False) :
+              emit(buffer, LoadIns(x(i), y(i), false, offset*, class(i)))
+            (z:VMImm) :
+              val base = make-local(buffer, VMLong())
+              emit(buffer, Op2Ins(base, AddOp(), y(i), z))
+              emit(buffer, LoadIns(x(i), base, false, offset*, class(i)))
+        (i) :
+          emit(buffer, i)
 
   ;A multi starts with a method-dispatch instruction
   defn multi? (f:VMFunc) :
@@ -112,11 +174,20 @@ public defstruct ArgIns <: VMIns :
   ret: RetRecords
 with: (printer => true)
 
-public defstruct CollectGarbageIns <: VMIns :  
+public defstruct AllocOnHeap <: VMIns :
+  x: Local
+  size: VMImm
+with: (printer => true)
+
+public defstruct ExtendHeapIns <: VMIns :
+  size: VMImm
   info: False|FileInfo with: (as-method => true)
 with: (printer => true)
 
 public defstruct ExtendStackIns <: VMIns
+with: (printer => true)
+
+public defstruct HasHeapOp <: VMOp
 with: (printer => true)
 
 public defstruct RegEqOp <: VMOp :
@@ -402,11 +473,15 @@ deftype InsBuffer
 defmulti type (b:InsBuffer, x:VMImm) -> VMType
 defmulti emit (b:InsBuffer, i:VMIns) -> False
 defmulti to-func (b:InsBuffer) -> VMFunc
+defmulti make-label (b:InsBuffer) -> Int
+defmulti make-local (b:InsBuffer, t:VMType) -> Local
 
-public defn InsBuffer (function:VMFunction) :
+defn InsBuffer (function:VMFunction) :
   val def-table = IntTable<VMDef>()
   val label-set = IntSet()
   val buffer = Vector<VMIns>()
+  val label-counter = to-seq(0 to false)
+  val def-counter = to-seq(0 to false)
   
   defn do-functions (f:VMFunc -> ?) :
     match(function) :
@@ -432,3 +507,16 @@ public defn InsBuffer (function:VMFunction) :
     defmethod to-func (this) :
       val all-defs = to-tuple(values(def-table))
       VMFunc([], all-defs, to-tuple(buffer))
+    defmethod make-label (this) :
+      let loop () :
+        val i = next(label-counter)
+        if label-set[i] : loop()
+        else : i
+    defmethod make-local (this, t:VMType) :
+      val n = let loop () :
+        val i = next(def-counter)
+        if key?(def-table, i) : loop()
+        else : i
+      def-table[n] = VMDef(n, t)
+      Local(n)
+     
