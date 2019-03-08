@@ -1,0 +1,183 @@
+defpackage stz/vm-normalize :
+  import core
+  import collections
+  import stz/vm-ir
+  import stz/basic-ops
+  import stz/backend
+
+;- HighStanza IntOps need to be lowered to sequences of primitive ops.
+;- Call commands need to be broken up into register and memory arguments.
+;- Large immediates need to be pushed to the constant tables.
+;- Alloc instructions need to be broken into a test instruction and an action instruction.
+;- Load/Store instructions need to be expressed with a single base and offset.
+;- Stack extension needs to be lowered.
+;- Multifns need to be lowered.
+;- CallClosures need to be lowered.
+;- External Memory Locations 
+
+public defn normalize (prog:VMPackage, backend:Backend) :
+  val funcs* = for f in funcs(prog) map :
+    val func* = normalize(func(f))
+    VMDefn(id(f), dependencies(f), func*)
+  sub-funcs(prog, funcs*)
+
+public defn normalize (f:VMFunction) :
+  ;Create instruction buffer
+  val buffer = InsBuffer(f)
+  
+  ;Load instructions for a single function
+  defn load-instructions (f:VMFunc) :
+    for i in ins(f) do :
+      emit(buffer, i)
+
+  ;Load instructions for a multifn
+  defn load-instructions (f:VMMultifn) :
+    do(load-instructions{value(_)}, funcs(f))
+    load-instructions(default(f))
+
+  ;Load instructions
+  load-instructions(f as VMFunc|VMMultifn)
+  
+  ;Convert buffer to function
+  val func = to-func(buffer)
+
+  ;Ensure we did normalization correctly
+  ensure-normalized(func)
+
+  ;Return normalized function
+  func
+
+;============================================================
+;==================== New Instructions ======================
+;============================================================
+
+;============================================================
+;============== Classification of Immediates ================
+;============================================================
+
+;x is a large immediate if it can fit in a x86 set instruction.
+defn large-immediate? (x:VMImm) :
+  match(x) :
+    (x:NumConst) : value(x) is-not Long|Double
+    (x) : true
+
+;x is a small immediate if it can fit as an x86 immediate operand.
+defn small-immediate? (x:VMImm) :
+  val max = 1 << 16
+  val min = -1 << 16
+  defn small? (v:Int) : v >= min and v <= max
+  defn small? (v:Long) : v >= to-long(min) and v <= to-long(max)
+  match(x) :
+    (x:NumConst) :
+      match(value(x)) :
+        (x:Byte) : true
+        (x:Int|Long) : small?(x)
+        (x) : false
+    (x:CodeId) : false
+    (x:ExternId) : false
+    (x:ExternDefnId) : false
+    (x:GlobalId) : false
+    (x:DataId) : false
+    (x:ConstId) : false
+    (x) : true
+
+;x is a function immediate if it can be used directly in an x86 call
+;instruction.
+defn function-immediate? (x:VMImm) :
+  match(x) :
+    (x:CodeId) : true
+    (x:ExternId) : true
+    (x:ExternDefnId) : true
+    (x) : small-immediate?(x)
+
+;============================================================
+;=================== Normalization Check ====================
+;============================================================
+
+defn ensure-normalized (prog:VMPackage, backend:Backend) :
+  for f in funcs(prog) do :
+    ensure-normalized(func(f))
+
+defn ensure-normalized (f0:VMFunction) :
+  ;Ensure that function is a VMFunc
+  val function = f0 as VMFunc
+  
+  ;Check that no arguments are remaining
+  fatal("Arguments remaining in function!") when not empty?(args(function))
+
+  ;Check that operand sizes are okay
+  defn ensure-operand-sizes (i:VMIns) :
+    defn ensure-function-immediate (f:VMImm) :
+      fatal("Not a function immediate") when not function-immediate?(f)
+    defn ensure-large-immediate (f:VMImm) :
+      fatal("Not a large immediate") when not large-immediate?(f)
+    defn ensure-small-immediate (f:VMImm) :
+      fatal("Not a small immediate") when not small-immediate?(f)
+    match(i) :
+      (i:CallIns|TCallIns|CallCIns) :
+        ensure-function-immediate(f(i))
+        do(ensure-large-immediate, ys(i))
+      (i:YieldIns) :
+        ensure-large-immediate(f(i))
+        do(ensure-large-immediate, ys(i))
+      (i) :
+        false
+
+  ;Check that extra arguments are in argspace
+  defn ensure-args-in-argspace (i:VMIns) :
+    false
+
+  ;Check each instruction
+  for i in ins(function) do :
+    ensure-operand-sizes(i)
+    ensure-args-in-argspace(i)
+
+    ;Instruction specific constraints
+    match(i) :
+      (i:CallClosureIns|TCallClosureIns) :
+        fatal("Closure call remaining")
+      (i:AllocIns) :
+        fatal("Alloc instruction remaining")
+      (i:StoreIns) :
+        fatal("Variable offset remaining") when y(i) is VMImm
+      (i:LoadIns) :
+        fatal("Variable offset remaining") when z(i) is VMImm
+      (i:CommentIns) :
+        fatal("Comment instruction remaining")
+      (i) :
+        false
+
+;============================================================
+;=================== Instruction Buffer =====================
+;============================================================
+
+deftype InsBuffer
+defmulti emit (b:InsBuffer, i:VMIns) -> False
+defmulti to-func (b:InsBuffer) -> VMFunc
+
+public defn InsBuffer (function:VMFunction) :
+  val def-table = IntTable<VMDef>()
+  val label-set = IntSet()
+  val buffer = Vector<VMIns>()
+  
+  defn do-functions (f:VMFunc -> ?) :
+    match(function) :
+      (func:VMFunc) :
+        f(func)
+      (func:VMMultifn) :
+        do(f{value(_)}, funcs(func))
+        f(default(func))  
+  defn load-defs (f:VMFunc) :  
+    for d in defs(f) do : def-table[id(d)] = d
+  defn load-labels (f:VMFunc) :
+    add-all(label-set, seq(n, filter-by<LabelIns>(ins(f))))
+
+  do-functions(load-defs)
+  do-functions(load-labels)
+
+  new InsBuffer :
+    defmethod emit (this, i:VMIns) :
+      add(buffer, i)
+    defmethod to-func (this) :
+      val all-defs = to-tuple(values(def-table))
+      VMFunc([], all-defs, to-tuple(buffer))
