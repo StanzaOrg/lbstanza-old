@@ -264,28 +264,28 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  /*printf("          [%d | %d]\n", opcode, value);*/
+  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  /*printf("          [%d | %d]\n", opcode, value);*/
+  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  /*printf("          [%d | %d | %d]\n", opcode, x, value);*/
+  /*if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);*/
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  /*printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
+  /*if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
 
 #define DECODE_D() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  /*printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);*/
+  /*if(iprint) printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);*/
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -294,7 +294,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  /*printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
+  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -304,7 +304,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  /*printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
+  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -739,10 +739,14 @@ void vmloop (VMState* vms){
         vms->registers = vms->system_registers;
         vms->system_registers = registers;
         //Restore stack state
-        RESTORE_STATE();
+        current_stack = vms->current_stack;
+        stk = untag_stack(current_stack);
+        stack_pointer = stk->stack_pointer;
+        stack_limit = (char*)(stk->frames) + stk->size;
         registers = vms->registers;
         //Continue where we were
-        retpc = stack_pointer->returnpc;
+        retpc = stk->pc;
+        
         pc = instructions + retpc;
         continue;        
       }      
@@ -1896,7 +1900,10 @@ void vmloop (VMState* vms){
         vms->registers = vms->system_registers;
         vms->system_registers = registers;
         //Restore stack state
-        RESTORE_STATE();
+        current_stack = vms->current_stack;
+        stk = untag_stack(current_stack);
+        stack_pointer = stk->stack_pointer;
+        stack_limit = (char*)(stk->frames) + stk->size;
         registers = vms->registers;
         //Set arguments        
         SET_REG(0, BOOLREF(0));
