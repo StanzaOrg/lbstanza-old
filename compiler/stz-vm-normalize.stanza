@@ -16,12 +16,13 @@ defpackage stz/vm-normalize :
 ;- External Memory Locations 
 
 public defn normalize (prog:VMPackage, backend:Backend) :
+  val progbuffer = ProgBuffer(prog)
   val funcs* = for f in funcs(prog) map :
-    val func* = normalize(func(f), backend)
+    val func* = normalize(func(f), progbuffer, backend)
     VMDefn(id(f), dependencies(f), func*)
   sub-funcs(prog, funcs*)
 
-public defn normalize (f:VMFunction, backend:Backend) :
+public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend) :
   ;Create instruction buffer
   val buffer = InsBuffer(f)
   
@@ -78,29 +79,75 @@ public defn normalize (f:VMFunction, backend:Backend) :
   defn object-size-on-heap (x:VMImm) :
     object-size-on-heap(value(x as NumConst) as Int)
 
+  ;Retrieve byte array representin long
+  defn binary-data (x:Long) :
+    val a = ByteArray(8)
+    a[0] = to-byte((x >> 0L) & 0xFFL)
+    a[1] = to-byte((x >> 8L) & 0xFFL)
+    a[2] = to-byte((x >> 16L) & 0xFFL)
+    a[3] = to-byte((x >> 24L) & 0xFFL)
+    a[4] = to-byte((x >> 32L) & 0xFFL)
+    a[5] = to-byte((x >> 40L) & 0xFFL)
+    a[6] = to-byte((x >> 48L) & 0xFFL)
+    a[7] = to-byte((x >> 56L) & 0xFFL)
+    a
+  defn binary-data (x:Double) :
+    binary-data(bits(x))
+
+  ;Force into temporary
+  defn ensure (f:VMImm -> True|False, x:VMImm) :
+    if f(x) :
+      x
+    else :
+      val x* = make-local(buffer, type(buffer,x))
+      if large-immediate?(x) :        
+        emit(buffer, SetIns(x*, x))
+      else :
+        val v = value(x as NumConst) as Long|Double
+        val id = make-id(progbuffer)
+        emit(progbuffer, VMData(id, binary-data(v)))
+        emit(buffer, LoadIns(x*, DataId(id), false, 0))
+      x*
+
+  ;Normalize record
+  defn normalize (r:CallRecords) :
+    val [mem-records, reg-records] = split!({loc(_) is CallMemArg}, records(r))
+    for r in mem-records do :
+      val l = loc(r) as CallMemArg
+      val a = arg(r) as VMImm
+      emit(buffer, StoreArgIns(index(l), a))
+    CallRecords(to-tuple(reg-records))
+    
+  defn normalize (return:RetRecords -> ?, r:RetRecords) :
+    val [mem-records, reg-records] = split!({loc(_) is CallMemArg}, records(r))
+    return(RetRecords(to-tuple(reg-records)))
+    for r in mem-records do :
+      val l = loc(r) as CallMemArg
+      emit(buffer, LoadArgIns(x(r), index(l)))    
+
   ;Load single instruction
   defn load-instruction (i:VMIns) :
     match(i) :
       (i:CallIns) :
-        val args = call-records(buffer, ys(i), backend)
-        val ret = ret-records(buffer, xs(i), backend)
-        emit(buffer, CallRecordIns(ret, /f(i), args, info(i), StanzaCall()))
+        val args = normalize(call-records(buffer, ys(i), backend))
+        within ret = normalize(ret-records(buffer, xs(i), backend)) :
+          emit(buffer, CallRecordIns(ret, /f(i), args, info(i), StanzaCall()))
       (i:TCallIns) :
-        val args = call-records(buffer, ys(i), backend)
+        val args = normalize(call-records(buffer, ys(i), backend))
         val ret = RetRecords([])
         emit(buffer, CallRecordIns(ret, /f(i), args, false, StanzaTCall()))
       (i:CallCIns) :
-        val args = callc-records(buffer, ys(i), backend)
+        val args = normalize(callc-records(buffer, ys(i), backend))
         val ret = retc-records(buffer, xs(i) backend)
         emit(buffer, CallRecordIns(ret, /f(i), args, info(i), CCall()))
       (i:CallClosureIns) :
-        val args = call-records(buffer, ys(i), backend)
-        val ret = ret-records(buffer, xs(i), backend)
-        val code = make-local(buffer, VMLong())
-        emit(buffer, LoadIns(code, /f(i), false, 16 - 1))
-        emit(buffer, CallRecordIns(ret, code, args, info(i), StanzaCall()))
-      (i:TCallClosureIns) :
-        val args = call-records(buffer, ys(i), backend)
+        val args = normalize(call-records(buffer, ys(i), backend))
+        within ret = normalize(ret-records(buffer, xs(i), backend)) :
+          val code = make-local(buffer, VMLong())
+          emit(buffer, LoadIns(code, /f(i), false, 16 - 1))
+          emit(buffer, CallRecordIns(ret, code, args, info(i), StanzaCall()))
+      (i:TCallClosureIns) :      
+        val args = normalize(call-records(buffer, ys(i), backend))
         val ret = RetRecords([])
         val code = make-local(buffer, VMLong())
         emit(buffer, LoadIns(code, /f(i), false, 16 - 1))
@@ -210,6 +257,16 @@ public defstruct ExtendHeapIns <: VMIns :
 with: (printer => true)
 
 public defstruct ExtendStackIns <: VMIns
+with: (printer => true)
+
+public defstruct LoadArgIns <: VMIns :
+  x: Local
+  index: Int
+with: (printer => true)
+
+public defstruct StoreArgIns <: VMIns :  
+  index: Int
+  y: VMImm
 with: (printer => true)
 
 public defstruct HasHeapOp <: VMOp
@@ -456,6 +513,8 @@ defn ensure-normalized (f0:VMFunction, backend:Backend) :
         ensure-small-immediate(z(i))
       (i:LoadIns) :
         ensure-storage-immediate(y(i))
+      (i:SetIns) :
+        ensure-large-immediate(y(i))
       (i) :
         false
 
@@ -517,6 +576,35 @@ defn ensure-normalized (f0:VMFunction, backend:Backend) :
 
     ;General checks
     ensure-operand-sizes(i)
+
+;============================================================
+;================== Prog Buffer =============================
+;============================================================
+
+deftype ProgBuffer
+defmulti make-id (p:ProgBuffer) -> Int
+defmulti emit (p:ProgBuffer, d:VMData) -> False
+
+defn ProgBuffer (p:VMPackage) :
+  val new-data = Vector<VMData>()
+  val ids = IntSet()
+  defn take-ids<?T> (id:T -> Int, xs:Seqable<?T>) :
+    add-all(ids, seq(id, xs))
+  take-ids(id, globals(p))
+  take-ids(id, datas(p))
+  take-ids(id, consts(p))
+  take-ids(id, classes(p))
+  take-ids(id, funcs(p))
+
+  val id-counter = to-seq(0 to false)
+  defn* make-id () :
+    val id = next(id-counter)
+    if ids[id] : make-id()
+    else : id
+    
+  new ProgBuffer :
+    defmethod make-id (this) : make-id()
+    defmethod emit (this, d:VMData) : add(new-data, d)      
 
 ;============================================================
 ;=================== Instruction Buffer =====================
