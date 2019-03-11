@@ -116,14 +116,23 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend) :
   defn #M (x:VMImm) : ensure(storage-immediate?, x)
 
   ;Convert byte to an integer
-  defn byte-to-int (x:VMImm) :
+  defn conv-to-int (x:VMImm) :
     val ix = make-local(buffer, VMInt())
+    emit(buffer, Op1Ins(ix, ConvOp(), #S(x)))
+    ix
+  defn conv-to-long (x:VMImm) :
+    val ix = make-local(buffer, VMLong())
     emit(buffer, Op1Ins(ix, ConvOp(), #S(x)))
     ix
   ;Convert arguments to int, perform operation, and cast down again.
   defn byte-op-as-int-op (f: (Local, VMImm, VMImm) -> False, x:Local, y:VMImm, z:VMImm) :
     val ix = make-local(buffer, VMInt())
-    f(ix, byte-to-int(y), byte-to-int(z))
+    f(ix, conv-to-int(y), conv-to-int(z))
+    emit(buffer, Op1Ins(x, ConvOp(), ix))
+  ;Convert arguments to int, perform operation, and cast down again.
+  defn byte-op-as-int-op (f: (Local, VMImm) -> False, x:Local, y:VMImm) :
+    val ix = make-local(buffer, VMInt())
+    f(ix, conv-to-int(y))
     emit(buffer, Op1Ins(x, ConvOp(), ix))
 
   ;Normalize a division operation
@@ -165,7 +174,20 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend) :
         emit(buffer, DualOp2Ins(tmp, x, DivModOp(), y*, z*))
         emit(buffer, LiveIns([z*]))
 
+  ;Normalize a commutative operation
+  defn norm-comm-op (x:Local, op:VMOp, y:VMImm, z:VMImm) :
+    emit(buffer, Op2Ins(x, op, #S(y), #S(z)))
+
+  ;Normalize a non-commutative operation
+  ;Second operand must be kept live after initial 3-address operation.
+  defn norm-noncomm-op (x:Local, op:VMOp, y:VMImm, z:VMImm) :
+    val y* = #S(y)
+    val z* = #S(z)
+    emit(buffer, Op2Ins(x, op, y*, z*))
+    emit(buffer, LiveIns([z*]))
+
   ;Normalize a multiplication operation
+  ;Can't be done for bytes (must be casted first.)
   defn norm-mul-op (x:Local, y:VMImm, z:VMImm) :
     match(type(buffer,x)) :
       (t:VMByte) :
@@ -173,6 +195,61 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend) :
           emit(buffer, Op2Ins(x, MulOp(), #S(y), #S(z)))
       (t) :
         emit(buffer, Op2Ins(x, MulOp(), #S(y), #S(z)))
+
+  ;Normalize a comparison operation
+  ;Ensure that at least one of the arguments is a local
+  defn norm-cmp-op (x:Local, op:VMOp, y:VMImm, z:VMImm) :
+    val any-var? = y is Local or z is Local
+    if any-var? : emit(buffer, Op2Ins(x, op, #S(y), #S(z)))
+    else : emit(buffer, Op2Ins(x, op, #V(y), #S(z)))
+
+  ;Normalize a unary operation
+  ;Cannot be done for bytes.
+  defn norm-unary-op (x:Local, op:VMOp, y:VMImm) :
+    match(type(buffer,x)) :
+      (t:VMByte) :
+        within (x, y) = byte-op-as-int-op(x, y) :
+          emit(buffer, Op1Ins(x, op, #S(y)))
+      (t) :
+        emit(buffer, Op1Ins(x, op, #S(y)))
+
+  ;Normalize a negation operation.
+  ;Must be converted to (0 - y) for real operations.
+  defn norm-neg-op (x:Local, y:VMImm) :
+    match(type(buffer,x)) :    
+      (t:VMType&RealT) :
+        val zero = make-local(buffer, t)
+        norm-conv-op(zero, NumConst(0))
+        norm-noncomm-op(x, SubOp(), zero, y)
+      (t) :
+        norm-unary-op(x, NegOp(), y)
+
+  ;Normalize a conversion operation
+  ;Operand must be a local.
+  defn norm-conv-op (x:Local, y0:VMImm) :
+    val y = #V(y0)
+    match(type(buffer,x), type(buffer,y)) :
+      ;Int to int conversions can be done directly
+      (xt:VMType&IntegerT, yt:VMType&IntegerT) :
+        emit(buffer, Op1Ins(x, ConvOp(), y))
+      ;Real to real conversions can be done directly
+      (xt:VMType&RealT, yt:VMType&RealT) :
+        emit(buffer, Op1Ins(x, ConvOp(), y))
+      ;Real to byte conversions must go to a long first
+      (xt:VMByte, yt:VMType&RealT) :
+        norm-conv-op(x, conv-to-long(y))
+      ;Byte to real conversions must go through an int first
+      (xt:VMType&RealT, yt:VMByte) :
+        norm-conv-op(x, conv-to-int(y))
+      ;Otherwise, conversion can be done directly
+      (xt, yt) :
+        emit(buffer, Op1Ins(x, ConvOp(), y))
+
+  ;Normalize an interpret operation.
+  ;Operand must be a local
+  defn norm-interpret-op (x:Local, y0:VMImm) :
+    val y = #V(y0)
+    emit(buffer, Op1Ins(x, InterpretOp(), y))
 
   ;Return the int type with the same number of bits
   ;as the given real type.
@@ -192,14 +269,14 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend) :
             val v = value(a)
             val int-type = to-int-type(type(buffer,v))
             val a* = make-local(buffer, int-type)
-            emit(buffer, Op1Ins(a*, ConvOp(), ensure(small-immediate?, v)))
+            emit(buffer, Op1Ins(a*, ConvOp(), #S(v)))
             CallRecord(a*, loc(r))
           (a:VMImm) :
             r
     for r in mem-records do :
       val l = loc(r) as CallMemArg
       val a = arg(r) as VMImm
-      emit(buffer, StoreArgIns(index(l), ensure(small-immediate?,a)))
+      emit(buffer, StoreArgIns(index(l), #S(a)))
     CallRecords(to-tuple(reg-records*))
 
   defn normalize (return:RetRecords -> ?, r:RetRecords) :
@@ -210,6 +287,7 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend) :
       emit(buffer, LoadArgIns(x(r), index(l)))
 
   ;Load single instruction
+  ;[normalize each instruction]
   defn load-instruction (i:VMIns) :
     match(i) :
       (i:CallIns) :
@@ -297,6 +375,21 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend) :
             val z* = ensure(small-immediate?, z)
             emit(buffer, Op2Ins(base, AddOp(), y*, z*))
             emit(buffer, LoadIns(x(i), base, false, offset*, class(i)))
+      (i:Op1Ins) :
+        match(op(i)) :
+          (op:ConvOp) : norm-conv-op(x(i), y(i))
+          (op:InterpretOp) : norm-interpret-op(x(i), y(i))
+          (op:NegOp) : norm-neg-op(x(i), y(i))
+          (op) : norm-unary-op(x(i), op, y(i))
+      (i:Op2Ins) :
+        match(op(i)) :
+          (op:DivOp) : norm-div-op(x(i), y(i), z(i))
+          (op:ModOp) : norm-mod-op(x(i), y(i), z(i))
+          (op:MulOp) : norm-mul-op(x(i), y(i), z(i))
+          (op:VMOp&Commutative) : norm-comm-op(x(i), op, y(i), z(i))
+          (op:VMOp&NonCommutative) : norm-noncomm-op(x(i), op, y(i), z(i))
+          (op:VMOp&Comparison) : norm-cmp-op(x(i), op, y(i), z(i))
+          (op) : fatal("Not yet supported: %_" % [op])
       (i) :
         emit(buffer, i)
 
@@ -392,6 +485,63 @@ public defstruct YieldCall <: CallType with: (printer => true)
 public deftype ArgType
 public defstruct StanzaArg <: ArgType with: (printer => true)
 public defstruct CArg <: ArgType with: (printer => true)
+
+;============================================================
+;================== Operator Classification =================
+;============================================================
+
+deftype Commutative :
+  AddOp <: Commutative
+  AndOp <: Commutative
+  OrOp <: Commutative
+  XorOp <: Commutative
+
+deftype NonCommutative :
+  SubOp <: NonCommutative
+  DivOp <: NonCommutative
+  ModOp <: NonCommutative
+  ShlOp <: NonCommutative
+  ShrOp <: NonCommutative
+  AshrOp <: NonCommutative
+
+deftype Comparison :  
+  EqOp <: Comparison
+  NeOp <: Comparison
+  LtOp <: Comparison
+  GtOp <: Comparison
+  LeOp <: Comparison
+  GeOp <: Comparison
+  UleOp <: Comparison
+  UltOp <: Comparison
+  UgtOp <: Comparison
+  UgeOp <: Comparison
+
+deftype Binary :
+  MulOp <: Binary
+  EqOp <: Binary
+  NeOp <: Binary
+  LtOp <: Binary
+  GtOp <: Binary
+  LeOp <: Binary
+  GeOp <: Binary
+  UleOp <: Binary
+  UltOp <: Binary
+  UgtOp <: Binary
+  UgeOp <: Binary
+  SubOp <: Binary
+  DivOp <: Binary
+  ModOp <: Binary
+  ShlOp <: Binary
+  ShrOp <: Binary
+  AshrOp <: Binary
+  AddOp <: Binary
+  AndOp <: Binary
+  OrOp <: Binary
+  XorOp <: Binary
+
+deftype Unary :
+  NotOp <: Unary
+  NegOp <: Unary
 
 ;============================================================
 ;============== Classification of Immediates ================
@@ -674,6 +824,14 @@ defn ensure-normalized (f0:VMFunction, backend:Backend) :
   ;Ensure that the given local does not have type byte
   defn ensure-not-byte (x:Local) :
     fatal("Local %_ has type byte." % [x]) when type(buffer,x) is VMByte
+  defn ensure-not-real (x:Local) :
+    fatal("Local %_ has a real type." % [x]) when type(buffer,x) is VMType&RealT
+
+  ;Ensure that the given operand is a local 
+  defn ensure-local (f:VMImm) :
+    fatal("Not a local: %_" % [f]) when not local-immediate?(f)
+  defn ensure-one-local (a:VMImm, b:VMImm) :
+    fatal("No locals: %_, %_" % [a, b]) when not local-immediate?(a) and not local-immediate?(b)
 
   ;Check each instruction
   for i in ins(function) do :
@@ -705,6 +863,14 @@ defn ensure-normalized (f0:VMFunction, backend:Backend) :
         fatal("Variable offset remaining") when y(i) is VMImm
       (i:LoadIns) :
         fatal("Variable offset remaining") when z(i) is VMImm
+      (i:Op1Ins) :
+        match(op(i)) :
+          (op:ConvOp|InterpretOp) : ensure-local(y(i))
+          (op:NotOp) : ensure-not-byte(x(i))
+          (op:NegOp) :
+            ensure-not-byte(x(i))
+            ensure-not-real(x(i))
+          (op) : false
       (i:Op2Ins) :
         match(op(i)) :
           (op:DivOp|ModOp) :
@@ -712,13 +878,13 @@ defn ensure-normalized (f0:VMFunction, backend:Backend) :
               fatal("Integral div/mod op remaining.")
           (op:MulOp) :
             ensure-not-byte(x(i))
+          (op:VMOp&Comparison) :
+            ensure-one-local(y(i), z(i))
           (op) :
             false
       (i:DualOp2Ins) :
         match(op(i)) :
           (op:DivModOp) :
-            defn ensure-local (f:VMImm) :
-              fatal("Not a local: %_" % [f]) when not local-immediate?(f)
             ensure-not-byte(x(i))
             ensure-not-byte(y(i))            
             ensure-local(z(i))
