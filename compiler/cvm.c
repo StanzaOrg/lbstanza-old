@@ -192,13 +192,9 @@
 #define ALLOC_OPCODE_CONST 183
 #define ALLOC_OPCODE_LOCAL 184
 #define GC_OPCODE 185
-#define HEAP_REMAINING_OPCODE 240
 #define CLASS_NAME_OPCODE 241
 #define PRINT_STACK_TRACE_OPCODE 186
-#define CURRENT_STACK_OPCODE 187
 #define FLUSH_VM_OPCODE 188
-#define CONSTS_OPCODE 190
-#define CONSTS_DATA_OPCODE 191
 #define JUMP_INT_LT_OPCODE 192
 #define JUMP_INT_GT_OPCODE 193
 #define JUMP_INT_LE_OPCODE 194
@@ -1618,12 +1614,6 @@ void vmloop (VMState* vms){
       SET_LOCAL(x, remaining);
       continue;
     }
-    case HEAP_REMAINING_OPCODE : {
-      DECODE_A_UNSIGNED();
-      int64_t remaining = heap_limit - heap_top;
-      SET_LOCAL(value, remaining);
-      continue;
-    }
     case CLASS_NAME_OPCODE : {
       DECODE_B_UNSIGNED();
       long id = (long)LOCAL(value);
@@ -1638,25 +1628,10 @@ void vmloop (VMState* vms){
       SET_REG(x, 0);
       continue;
     }
-    case CURRENT_STACK_OPCODE : {
-      DECODE_A_UNSIGNED();
-      SET_LOCAL(value, current_stack);
-      continue;
-    }
     case FLUSH_VM_OPCODE : {
       DECODE_A_UNSIGNED();
       SAVE_STATE();
       SET_LOCAL(value, (uint64_t)vms);
-      continue;
-    }
-    case CONSTS_OPCODE : {
-      DECODE_A_UNSIGNED();
-      SET_LOCAL(value, (uint64_t)const_table);
-      continue;
-    }
-    case CONSTS_DATA_OPCODE : {
-      DECODE_A_UNSIGNED();
-      SET_LOCAL(value, (uint64_t)const_mem);
       continue;
     }
     case JUMP_INT_LT_OPCODE : {
