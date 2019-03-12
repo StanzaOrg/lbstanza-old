@@ -188,7 +188,7 @@
 #define LOAD_OPCODE_8_VAR_OFFSET 179
 #define RESERVE_OPCODE_LOCAL 180
 #define RESERVE_OPCODE_CONST 181
-#define NEW_STACK_OPCODE 182
+#define ENTER_STACK_OPCODE 182
 #define ALLOC_OPCODE_CONST 183
 #define ALLOC_OPCODE_LOCAL 184
 #define GC_OPCODE 185
@@ -712,6 +712,22 @@ void vmloop (VMState* vms){
     case LIVE_OPCODE : {
       DECODE_A_UNSIGNED();
       stack_pointer->liveness_map = value;
+      continue;
+    }
+    case ENTER_STACK_OPCODE : {
+      DECODE_A_UNSIGNED();
+      //Save current stack
+      stk->stack_pointer = stack_pointer;
+      stk->pc = pc - instructions;
+      //Load next stack
+      current_stack = LOCAL(value);
+      stk = untag_stack(current_stack);
+      stack_pointer = stk->frames;
+      stack_limit = (char*)(stk->frames) + stk->size;
+      //Load starting address
+      uint64_t fid = stk->pc;
+      uint64_t stk_pc = code_offsets[fid] * 4;
+      pc = instructions + stk_pc;
       continue;
     }
     case YIELD_OPCODE : {
@@ -1568,34 +1584,6 @@ void vmloop (VMState* vms){
         pc = instructions + fpos;
         continue;
       }
-    }
-    case NEW_STACK_OPCODE : {
-      DECODE_B_UNSIGNED();
-
-      //Retrieve starting pc of stack
-      uint64_t fid = LOCAL(value);
-      uint64_t stk_pc = code_offsets[fid] * 4;
-
-      //Allocate on heap
-      *((uint64_t*)heap_top) = STACK_TYPE;        
-      Stack* stk = (Stack*)(heap_top + 8);
-      heap_top = heap_top + 8 + sizeof(Stack);
-
-      //Allocate stack frames
-      int stack_size = 4 * 1024;
-      StackFrame* frames = (StackFrame*)malloc(stack_size);
-
-      //Populate stack attributes      
-      stk->size = stack_size;
-      stk->frames = frames;
-      stk->stack_pointer = frames;
-      stk->pc = stk_pc;
-      stk->frames->returnpc = -1L;
-      stk->frames->liveness_map = 0L;
-
-      //Return the tagged stack
-      SET_LOCAL(x, ptr_to_ref((char*)stk - 8));
-      continue;
     }
     case ALLOC_OPCODE_CONST : {
       DECODE_C();
