@@ -27,11 +27,13 @@ public defn normalize (prog:VMPackage, backend:Backend) :
 public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iotable:IOTable) :
   ;Create instruction buffer
   val buffer = InsBuffer(f)
+  defn make-label-table () : IntTable-init<Int>(make-label{buffer})
 
   ;Load instructions for a single standard function
   defn load-instructions (f:VMFunc) :
     load-prelude(f)
-    do(load-instruction, ins(f))
+    val label-table = make-label-table()
+    do(load-instruction{_, label-table}, ins(f))
 
   ;Load instructions for a multi
   defn load-multi-instructions (f:VMFunc) :
@@ -41,8 +43,9 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
     val default-dispatch = default(dispatch-ins)
     val amb-dispatch = amb(dispatch-ins)
     emit(buffer, MethodDispatchIns(multi(dispatch-ins), [], [], default-dispatch, amb-dispatch))
+    val label-table = make-label-table()
     for i in f-ins do :
-      load-instruction(i)
+      load-instruction(i, label-table)
       match(i:LabelIns) :
         if n(i) == default-dispatch or n(i) == amb-dispatch :
           load-prelude(f)
@@ -417,6 +420,13 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
   ;Load single instruction
   ;[normalize each instruction]
   defn load-instruction (i:VMIns) :
+    load-instruction(i, false)
+  defn load-instruction (i:VMIns, label-table:False|IntTable<Int>) :
+    defn get-label (n:Int) :
+      match(label-table:IntTable<Int>) : label-table[n]
+      else : n
+    defn sub-label (b:VMBranch) :
+      sub-n(b, get-label(n(b)))
     match(i) :
       (i:CallIns) :
         val args = normalize(call-records(buffer, ys(i), backend))
@@ -445,12 +455,14 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
       (i:ReturnIns) :
         val args = normalize(call-records(buffer, xs(i), backend))
         emit(buffer, ReturnRecordIns(args, StanzaCall()))
-      (i:MatchIns) :
+      (i:MatchIns) :        
         val args = normalize(call-records(buffer, ys(i), backend))
-        emit(buffer, MatchRecordIns(false, args, branches(i), default(i), false))
+        val branches* = map(sub-label, branches(i))
+        emit(buffer, MatchRecordIns(false, args, branches*, get-label(default(i)), false))
       (i:DispatchIns) :
         val args = normalize(call-records(buffer, ys(i), backend))
-        emit(buffer, MatchRecordIns(true, args, branches(i), default(i), amb(i)))        
+        val branches* = map(sub-label, branches(i))
+        emit(buffer, MatchRecordIns(true, args, branches*, get-label(default(i)), get-label(amb(i))))        
       (i:AllocIns) :
         if all?({_ is NumConst}, sizes(i)) :
           val sizes-on-heap = map(object-size-on-heap, sizes(i))
@@ -536,12 +548,20 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
         match(op(i)) :
           (op:InstanceofOp) :
             val args = normalize(call-records(buffer, [x(i)], backend))
-            val true-branch = VMBranch([type(op)], n1(i))
-            emit(buffer, MatchRecordIns(false, args, [true-branch], n2(i), false))
+            val true-branch = VMBranch([type(op)], get-label(n1(i)))
+            emit(buffer, MatchRecordIns(false, args, [true-branch], get-label(n2(i)), false))
           (op:False) :
-            emit(buffer, Branch2Ins(n1(i), n2(i), NeOp(), #S(x(i)), NumConst(0)))
-          (op) :
-            emit(buffer,i)
+            emit(buffer, Branch2Ins(get-label(n1(i)), get-label(n2(i)), NeOp(), #S(x(i)), NumConst(0)))
+          (op) :            
+            emit(buffer, Branch1Ins(get-label(n1(i)), get-label(n2(i)), op, x(i)))
+      (i:Branch0Ins) :
+        emit(buffer, Branch0Ins(get-label(n1(i)), get-label(n2(i)), op(i)))
+      (i:Branch2Ins) :
+        emit(buffer, Branch2Ins(get-label(n1(i)), get-label(n2(i)), op(i), x(i), y(i)))
+      (i:GotoIns) :
+        emit(buffer, GotoIns(get-label(n(i))))
+      (i:LabelIns) :
+        emit(buffer, LabelIns(get-label(n(i))))
       (i) :
         emit(buffer, i)
 
@@ -1145,7 +1165,7 @@ defn ProgBuffer (p:VMPackage) :
     
   new ProgBuffer :
     defmethod make-id (this) : make-id()
-    defmethod emit (this, d:VMData) : add(new-data, d)      
+    defmethod emit (this, d:VMData) : add(new-data, d)  
 
 ;============================================================
 ;=================== Instruction Buffer =====================
@@ -1160,10 +1180,9 @@ defmulti make-local (b:InsBuffer, t:VMType) -> Local
 
 defn InsBuffer (function:VMFunction) :
   val def-table = IntTable<VMDef>()
-  val label-set = IntSet()
   val buffer = Vector<VMIns>()
-  val label-counter = to-seq(0 to false)
   val def-counter = to-seq(0 to false)
+  val label-counter = to-seq(0 to false)
   
   defn do-functions (f:VMFunc -> ?) :
     match(function) :
@@ -1174,11 +1193,7 @@ defn InsBuffer (function:VMFunction) :
         f(default(func))  
   defn load-defs (f:VMFunc) :  
     for d in defs(f) do : def-table[id(d)] = d
-  defn load-labels (f:VMFunc) :
-    add-all(label-set, seq(n, filter-by<LabelIns>(ins(f))))
-
   do-functions(load-defs)
-  do-functions(load-labels)
 
   new InsBuffer :
     defmethod type (this, x:VMImm) :
@@ -1190,10 +1205,7 @@ defn InsBuffer (function:VMFunction) :
       val all-defs = to-tuple(values(def-table))
       VMFunc([], all-defs, to-tuple(buffer))
     defmethod make-label (this) :
-      let loop () :
-        val i = next(label-counter)
-        if label-set[i] : loop()
-        else : i
+      next(label-counter)
     defmethod make-local (this, t:VMType) :
       val n = let loop () :
         val i = next(def-counter)
