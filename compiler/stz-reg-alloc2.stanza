@@ -247,11 +247,11 @@ public defstruct StanzaTCall <: CallType :
   func-reg: False|Loc with: (as-method => true)
   arg-regs: List<Loc> with: (as-method => true)
 defmethod ret-regs (c:StanzaTCall) : List()
-;public defstruct CCall <: CallType :
-;  num-mem-args: Int with: (default => 0)
-;  func-reg?: False|Loc with: (default => false)
-;  arg-regs?: False|List<Loc> with: (default => false)
-;  ret-reg?: False|Loc with: (default => false)
+public defstruct CCall <: CallType :
+  num-mem-args: Int
+  func-reg: False|Loc with: (as-method => true)
+  arg-regs: List<Loc> with: (as-method => true)
+  ret-regs: List<Loc> with: (as-method => true)
 ;public defstruct StackSwitch <: CallType :
 ;  func-reg?: False|Loc with: (default => false)
 ;  reg?: False|Loc with: (default => false)
@@ -472,7 +472,7 @@ defmethod print (o:OutputStream, c:CallType) :
   print{o, _} $ match(c) :
     (c:StanzaCall) : "S(%_, %_, %_)" % [func-reg(c), arg-regs(c), ret-regs(c)]
     (c:StanzaTCall) : "ST(%_, %_)" % [func-reg(c), arg-regs(c)]
-  ;  (c:CCall) : "C(%_, %_)" % [num-mem-args(c), arg-regs?(c)]
+    (c:CCall) : "C(%_, %_, %_, %_)" % [num-mem-args(c), func-reg(c), arg-regs(c), ret-regs(c)]
   ;  (c:StackSwitch) : "STK(%_)" % [reg?(c)]
     (c:ExtendHeap) : "ExtendHeap"
     (c:ExtendStack) : "ExtendStack"
@@ -683,8 +683,8 @@ defn load-instructions (function:VMFunc) :
   defn regs (r:CallRecords) :
     to-list $ for r in records(r) seq :
       to-reg(loc(r) as CallReg|CallFReg)
-  defn func-reg? (f:VMImm) :
-    match(f:Local) : Reg(0)
+  defn func-reg? (f:VMImm, i:Int) :
+    match(f:Local) : Reg(i)
 
   ;=========================
   ;===== Def Table =========
@@ -785,9 +785,9 @@ defn load-instructions (function:VMFunc) :
         val r = ret(e)
         val a = args(e)
         val calltype = match(type(e)) :
-          (t:vm-StanzaCall) : StanzaCall(info(e), func-reg?(f(e)), regs(a), regs(r))
-          (t:vm-StanzaTCall) : StanzaTCall(func-reg?(f(e)), regs(a))
-          (t:vm-CCall) : fatal("Not yet implemented")
+          (t:vm-StanzaCall) : StanzaCall(info(e), func-reg?(f(e), 0), regs(a), regs(r))
+          (t:vm-StanzaTCall) : StanzaTCall(func-reg?(f(e), 0), regs(a))
+          (t:vm-CCall) : CCall(num-mem-args(t), func-reg?(f(e),9), regs(a), regs(r))
           (t:vm-YieldCall) : fatal("Not yet implemented")
         push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
         close-block(List()) when type(e) is vm-StanzaTCall          
@@ -870,23 +870,21 @@ defn load-instructions (function:VMFunc) :
 ;============================================================
 ;================== Backend Properties ======================
 ;============================================================
-;defn frame-size (t:CCall, backend:Backend) :
-;  match(backend) :
-;    (backend:W64Backend) :
-;      val num-ctxt = length(c-preserved-regs(backend))
-;      8 * ((num-ctxt + num-mem-args(t) + 4) | 1)
-;    (backend) :
-;      val num-ctxt = length(c-preserved-regs(backend))
-;      8 * ((num-ctxt + num-mem-args(t)) | 1)
-;
-;defn mem-arg-offsets (t:CCall, backend:Backend) :
-;  match(backend) :
-;    (backend:W64Backend) :
-;      val offset = (- frame-size(t, backend))
-;      seq({offset + _}, 32 to false by 8)
-;    (backend) :
-;      val offset = (- frame-size(t, backend))
-;      seq({offset + _}, 0 to false by 8)
+defn frame-size (t:CCall, backend:Backend) :
+  match(backend) :
+    (backend:W64Backend) :
+      8 * ((num-mem-args(t) + 4) | 1)
+    (backend) :
+      8 * ((num-mem-args(t)) | 1)
+
+defn mem-arg-offsets (t:CCall, backend:Backend) :
+  match(backend) :
+    (backend:W64Backend) :
+      val offset = (- frame-size(t, backend))
+      seq({offset + _}, 32 to false by 8)
+    (backend) :
+      val offset = (- frame-size(t, backend))
+      seq({offset + _}, 0 to false by 8)
 
 ;============================================================
 ;=================== Normalization ==========================
@@ -2779,6 +2777,42 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
             E $ SubL(RSP, RSP, INT(size(stackmap) + 8))
           (t:StanzaTCall) :
             E $ asm-Goto(I(f(e)))
+          (t:CCall) :
+            ;Given: The arguments are in the proper C registers, and all memory
+            ;arguments have been saved.
+            ;Our goal is to call C with the right calling convention:
+            ;We need to save the current context.
+            ;  - Push the stack frame
+            ;  - Save the stack pointer
+            ;We need to restore the C context.
+            ;  - Load all the c preserved registers
+            ;  - Load the c stack register
+            ;Call the C function with the right convention.
+            ;  - Alter the C RSP to account for arguments
+            ;  - Set the number of floating point arguments
+            ;  - Call the function
+            ;Return to our context.
+            ;  - Return to our stack
+            ;  - Pop the stack frame
+            
+            ;Save current context:
+            E $ AddL(RSP, RSP, INT(size(stackmap)))
+            E $ StoreL(M(stack-pointer(stubs)), RSP)
+
+            ;Restore the C context:
+            for (i in c-preserved-regs(backend(stubs)), n in saved-c-regs(stubs)) do :
+              E $ LoadL(R(i), M(n))
+            E $ LoadL(RSP, M(saved-c-rsp(stubs)))
+              
+            ;Call C function with right convention
+            val num-float-args = for y in ys(e) count : reg?(y as Var) is FReg
+            E $ SubL(RSP, RSP, INT(frame-size(t, backend(stubs))))
+            E $ SetL(R0, INT(num-float-args))
+            E $ asm-Call(I(f(e)))
+
+            ;Return to our context:
+            E $ LoadL(RSP, M(stack-pointer(stubs)))
+            E $ SubL(RSP, RSP, INT(size(stackmap)))
 ;        match(type(e)) :
 ;          (t:StanzaTCall) :
 ;            #movl(R0, INT(arity(t)))
