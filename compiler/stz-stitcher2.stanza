@@ -11,6 +11,7 @@ defpackage stz/stitcher :
   import stz/dyn-tree
   import stz/trie
   import stz/typeset
+  import stz/backend
 
 ;<DOC>=======================================================
 ;===================== Documentation ========================
@@ -311,12 +312,16 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
   defn stackmap-index (m:StackMap) :
     0
 
-  ;Create a package-local emitter
-  defn emitter (package:Symbol) :
+  ;Accumulate info table
+  defn add-info-table (n:Int, info:FileInfo) :
+    false
+
+  ;Create a function-local emitter
+  defn emitter (package:Symbol, code-emitter:CodeEmitter) :
     val pkgids = package-ids[package]
     val label-table = IntTable-init<Int>(unique-id{stubs})
 
-    ;Resolve a LinkId
+    ;Link an immediate, remove all non-handled items.
     defn link (x:Imm) :
       match(x) :
         (x:LocalMem) :
@@ -346,62 +351,86 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
         (x) :
           x
 
-    false
-;      val gid = global-id(pkgids, id(x))
-;      match(global-props[gid]) :
-;        (p:CodeProps) :
-;          Mem(lbl(p), 0)
-;        (p:ExternProps) :
-;          ExMem(exlbl(p), 0)
-;        (p:ExternDefnProps) :
-;          ExMem(exlbl(p), 0)
-;        (p:DataProps) :
-;          Mem(lbl(p), 0)
-;        (p:ConstProps) :
-;          Mem(const-table(stubs), index(p) * 8)
-;        (p:GlobalProps) :
-;          Mem(globals(stubs), offset(p))
-;
-;    ;Resolve a typeset from package ids to global ids
-;    defn resolve (pkgids:PackageIds, t:TypeSet) :
-;      let loop (t:TypeSet = t) :
-;        match(t) :
-;          (t:TopType) : t
-;          (t:AndType) : AndType?(seq(loop,types(t)))
-;          (t:OrType) : OrType?(seq(loop,types(t)))
-;          (t:SingleType) : SingleType(global-id(pkgids,type(t)))
-;
-;    ;Convert a typeset into an ISet for the trie
-;    defn to-iset (t:TypeSet) :
-;      defn union (a:ISet, b:ISet) :
-;        a-or-b(compare(a,b))
-;      defn intersection (a:ISet, b:ISet) :
-;        a-and-b(compare(a,b))
-;      match(t) :
-;        (t:TopType) :
-;          IAll()
-;        (t:AndType) :
-;          reduce(intersection, seq(to-iset, types(t)))
-;        (t:OrType) :
-;          reduce(union, seq(to-iset, types(t)))
-;        (t:SingleType) :
-;          defn tag (n:Int) : /tag(global-props[n] as ClassProps)
-;          val leaves = all-children(class-tree, type(t))
-;          val tags = map(tag, leaves)
-;          ISubset(tags)
+    ;Resolve a typeset from package ids to global ids
+    defn resolve (t:TypeSet) :
+      let loop (t:TypeSet = t) :
+        match(t) :
+          (t:TopType) : t
+          (t:AndType) : AndType?(seq(loop,types(t)))
+          (t:OrType) : OrType?(seq(loop,types(t)))
+          (t:SingleType) : SingleType(global-id(pkgids,type(t)))
 
-  
-  ;Create emitter
-  ;defn emitter (pkgids:PackageIds) :
-  ;  defn link (x:Imm) :
-  ;    match(x) :
-  ;      (x:)
-  ;  
-  ;  new CodeEmitter :
-  ;    defmethod emit (this, i:Ins) :
-  ;      match(i) :
-  ;        
-  ;        ___
+    ;Convert a typeset into an ISet for the trie
+    defn to-iset (t:TypeSet) :
+      defn union (a:ISet, b:ISet) :
+        a-or-b(compare(a,b))
+      defn intersection (a:ISet, b:ISet) :
+        a-and-b(compare(a,b))
+      match(t) :
+        (t:TopType) :
+          IAll()
+        (t:AndType) :
+          reduce(intersection, seq(to-iset, types(t)))
+        (t:OrType) :
+          reduce(union, seq(to-iset, types(t)))
+        (t:SingleType) :
+          defn tag (n:Int) : /tag(global-props[n] as ClassProps)
+          val leaves = all-children(class-tree, type(t))
+          val tags = map(tag, leaves)
+          ISubset(tags)
+
+    ;Convert an asm branch into an ibranch
+    defn to-ibranch (b:Branch) :
+      val sets = for t in tags(b) map :
+        to-iset(resolve(t))
+      IBranch(sets, dst(b))
+
+    ;Emit code for producing trie
+    defn emit-trie (t:MTrie, default:Imm, args:List<Imm>) :
+      defn branch-on-set (s:ISet, pass:Imm) :
+        match(s) :
+          (s:ISubset) :
+            for x in xs(s) do :
+              val arg = head(args)
+              E $ Break(LT, pass, EqOp(), INT(x), arg)
+          (s:IAll) :
+            E $ Goto(pass)
+      match(t) :
+        (t:IfTrie) :
+          for entry in branches(t) do :
+            val pass = unique-id(stubs)
+            val fail = unique-id(stubs)
+            branch-on-set(key(entry), M(pass))
+            E $ Goto(M(fail))
+            E $ Label(pass)
+            emit-trie(value(entry), default, tail(args))
+            E $ Label(fail)
+          E $ Goto(default)  
+        (t:EndTrie) :
+          E $ Goto(target(t))
+    defn emit-trie (t:MTrie, default:Imm) :
+      val args = map(R, call-regs(backend(stubs)))
+      emit-trie(t, default, args)        
+
+    ;Return new code emitter
+    defn E (i:Ins) : emit(code-emitter, i)      
+    new CodeEmitter :
+      defmethod emit (this, i:Ins) :
+        match(map(link,i)) :
+          (i:Label) :
+            val n* = label-table[n(i)]
+            E $ Label(n*)
+            match(info(i)) :
+              (info:FileInfo) : add-info-table(n*, info)
+              (info:False) : false
+          (i:Match) :
+            val trie = to-trie(seq(to-ibranch, branches(i)))            
+            emit-trie(trie, no-branch(i))
+          (i:Dispatch) :
+            false
+          (i:MethodDispatch) :
+            false
+          (i) : E(i)    
 
   ;Initialize record tables
   initialize-record-tables()
@@ -411,7 +440,9 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
   initialize-class-props()
 
   ;Return new Stitcher
-  new Stitcher
+  new Stitcher :
+    defmethod emitter (this, package:Symbol, code-emitter:CodeEmitter) :
+      emitter(package, code-emitter)
   
 deftype GProps
 defstruct CodeProps <: GProps :
