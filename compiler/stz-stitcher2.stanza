@@ -162,26 +162,38 @@ public defmulti emitter (s:Stitcher, package:Symbol, emitter:CodeEmitter) -> Cod
 ;============================================================
 
 deftype PackageIds
-defmulti global-id (ids:PackageIds, lid:Int) -> Int
+defmulti global-id (ids:PackageIds, lid:Int) -> Int|False
+defmulti set-global-id (ids:PackageIds, lid:Int, gid:Int) -> False
+
+defn global-id! (ids:PackageIds, lid:Int) :
+  match(global-id(ids,lid)) :
+    (id:Int) : id
+    (id:False) : fatal("No global id registered for local id: %_" % [lid])
 
 public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
   ;Records
-  val global-records = Vector<Rec>()
+  ;val global-records = Vector<Rec>()
   val global-props = Vector<GProps|False>()
   val id-indices = HashTable<RecId,Int>()
   val package-ids = HashTable<Symbol,PackageIds>()
 
   ;Add a new global record
   defn add-global-record (r:Rec) -> Int :
-    val global-id = length(global-records)
-    add(global-records, r)
+    val global-id = length(global-props)
+    ;add(global-records, r)
     add(global-props, false)
     id-indices[id(r)] = global-id
     global-id
 
-  ;Retrieve the global id for a given RecId
-  defn get-global-id (id:RecId) :
-    id-indices[id]
+  ;Set the property of a given local id
+  defn set-global-prop (pkgids:PackageIds, lid:Int, p:GProps) :
+    match(global-id(pkgids, lid)) :
+      (gid:Int) :
+        global-props[gid] = p
+      (_:False) :
+        val gid = length(global-props)
+        add(global-props, p)
+        set-global-id(pkgids, lid, gid)
 
   ;Initialize record tables
   defn initialize-record-tables () :
@@ -198,10 +210,13 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
         local-ids[n(e)] = add-global-record(rec(e))
       within initialize() :
         for i in imports(packageio) do :
-          local-ids[n(i)] = get-global-id(id(rec(i)))
+          local-ids[n(i)] = id-indices[id(rec(i))]
       package-ids[package(packageio)] = new PackageIds :
         defmethod global-id (this, lid:Int) :
-          local-ids[lid]
+          get?(local-ids, lid)
+        defmethod set-global-id (this, lid:Int, gid:Int) :
+          println("Set local id %_ to correspond to global id %_" % [lid, gid])
+          local-ids[lid] = gid
         
     ;Run initializers
     for init in initializers do :
@@ -211,17 +226,15 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
   defn initialize-simple-props () :    
     for p in vmpackages do :
       val pkgids = package-ids[package(p)]
-      defn set-props (local-id:Int, props:GProps) :
-        val gid = global-id(pkgids, local-id)
-        global-props[gid] = props
       for f in funcs(p) do :
-        set-props(id(f), CodeProps(unique-id(stubs)))
+        set-global-prop(pkgids, id(f), CodeProps(unique-id(stubs)))
       for e in extern-defns(p) do :
-        set-props(fid(e), ExternDefnProps(lbl(e)))
+        set-global-prop(pkgids, fid(e), ExternDefnProps(lbl(e)))
       for e in externs(p) do :
-        set-props(id(e), ExternProps(name(e)))
+        set-global-prop(pkgids, id(e), ExternProps(name(e)))
+      println("===== Setting Data Props =====")
       for d in datas(p) do :
-        set-props(id(d), DataProps(unique-id(stubs)))
+        set-global-prop(pkgids, id(d), DataProps(unique-id(stubs)))
 
   ;Global table
   var total-global-size:Int = 0
@@ -240,8 +253,7 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
             next(offset-counter, size(g))
           (g:VMGlobal) :
             val offset = next(offset-counter, size(g))
-            val gid = global-id(pkgids, id(g))
-            global-props[gid] = GlobalProps(offset)
+            set-global-prop(pkgids, id(g), GlobalProps(offset))
             for r in roots(g) do :
               fatal("Unaligned global reference") when offset % 8 != 0
               add(global-roots, offset / 8 + r)
@@ -253,7 +265,7 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
     for p in vmpackages do :
       val pkgids = package-ids[package(p)]
       defn resolve-code-ids (v:VMValue) -> VMValue :
-        defn to-global (x:CodeId) : CodeId(global-id(pkgids, id(x)))
+        defn to-global (x:CodeId) : CodeId(global-id!(pkgids, id(x)))
         match(v) :
           (v:List) : map(resolve-code-ids, v)
           (v:VMTypeObject) : VMTypeObject(to-global(id(v)))
@@ -262,8 +274,7 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
       for c in consts(p) do :
         val v* = resolve-code-ids(value(c))
         val c* = intern(const-pool, value(c))
-        val gid = global-id(pkgids, id(c))
-        global-props[gid] = ConstProps(id(id(c*)))
+        set-global-prop(pkgids, id(c), ConstProps(id(id(c*))))
 
   ;Class properties
   val class-tree = DynTree()
@@ -288,21 +299,24 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
     val node-states = Vector<NodeState>()
     for p in vmpackages do :
       val pkgids = package-ids[package(p)]
-      defn gid (n:Int) : global-id(pkgids, n)
       for c in classes(p) do :
         ;Compute a tag if it doesn't already have one
-        val cid = gid(id(c))
-        if global-props[cid] is False :
-          global-props[cid] = ClassProps(next(tag-counter))
+        val has-tag? = 
+          match(global-id(pkgids,id(c))) :
+            (gid:Int) : global-props[gid] is-not False
+            (gid:False) : false
+        if not has-tag? :
+          set-global-prop(pkgids, id(c), ClassProps(next(tag-counter)))
         ;Compute a node state for the class tree
+        defn gid (n:Int) : global-id!(pkgids,n)
         match(c) :
           (c:VMArrayClass|VMLeafClass) :
             val parents* = map(gid,parents(c))
-            add(node-states, SortedNodeState(cid, parents*, [], true))
+            add(node-states, SortedNodeState(gid(id(c)), parents*, [], true))
           (c:VMAbstractClass) :
             val parents* = map(gid,parents(c))
             val children* = map(gid,children(c))
-            add(node-states, SortedNodeState(cid, parents*, children*, false))
+            add(node-states, SortedNodeState(gid(id(c)), parents*, children*, false))
 
     ;Populate the class tree
     add(class-tree, node-states)
@@ -327,14 +341,14 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
         (x:LocalMem) :
           Mem(label-table[n(x)],0)
         (x:TagImm) : 
-          val gid = global-id(pkgids, n(x))
+          val gid = global-id!(pkgids, n(x))
           val props = global-props[gid] as ClassProps
           if marker?(x) : IntImm(n(x) << 3 + 2)
           else : IntImm(n(x))
         (x:StackMap) :
           IntImm(stackmap-index(x))
         (x:LinkId) :
-          val gid = global-id(pkgids, id(x))
+          val gid = global-id!(pkgids, id(x))
           match(global-props[gid]) :
             (p:CodeProps) :
               Mem(lbl(p), 0)
@@ -358,7 +372,7 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
           (t:TopType) : t
           (t:AndType) : AndType?(seq(loop,types(t)))
           (t:OrType) : OrType?(seq(loop,types(t)))
-          (t:SingleType) : SingleType(global-id(pkgids,type(t)))
+          (t:SingleType) : SingleType(global-id!(pkgids,type(t)))
 
     ;Convert a typeset into an ISet for the trie
     defn to-iset (t:TypeSet) :
@@ -376,7 +390,7 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
         (t:SingleType) :
           defn tag (n:Int) : /tag(global-props[n] as ClassProps)
           val leaves = all-children(class-tree, type(t))
-          val tags = map(tag, leaves)
+          val tags = qsort(map(tag, leaves))
           ISubset(tags)
 
     ;Convert an asm branch into an ibranch
