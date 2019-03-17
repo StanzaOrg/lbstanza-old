@@ -34,6 +34,8 @@ defpackage stz/reg-alloc :
     prefix(CallType, StanzaCall, StanzaTCall, CCall, YieldCall) => vm-
   import stz/utils
   import stz/codegen
+  import stz/basic-blocks with :
+    prefix(Block) => Basic
 
 ;============================================================
 ;===================== Driver ===============================
@@ -644,12 +646,7 @@ defn load-instructions (function:VMFunc) :
       active-block = false
       active-block-index = false
 
-  defn push (e:Ins) :
-    println("Push: %_" % [e])
-    match(active-block:False) :
-      open-block(unique-id())
-    val b = active-block as Block
-    add(ins(b), e)
+
 
   ;=========================
   ;====== Convenience ======
@@ -672,115 +669,223 @@ defn load-instructions (function:VMFunc) :
   defn func-reg? (f:VMImm, i:Int) :
     match(f:Local) : Reg(i)
 
-  ;=====================================
-  ;======= Create Dummy Variables ======
-  ;=====================================
-  defn get-var? (v:Local|False) :
-    match(v:Local) :
-      get-var(v)
-    else :
-      val v = make-var(VMLong())
-      push(Def(v))
-      v
-  defn get-vars? (vs:Seqable<Local|False>) :
-    to-list(seq(get-var?,vs))
+  ;Perform basic block analysis
+  val blocks = analyze-basic-blocks $
+    new Instructions :
+      defmethod length (this) : length(ins(function))
+      defmethod unique-label (this) : unique-id()
+      defmethod classify (this, i:Int) :
+        match(ins(function)[i]) :
+          (ins:CallRecordIns) :
+            if type(ins) is vm-StanzaTCall : JumpInstruction([])
+            else : StandardInstruction()
+          (ins:ReturnRecordIns) :
+            JumpInstruction([])
+          (ins:MatchRecordIns) :
+            val branch-ns = seq(n, branches(ins))
+            JumpInstruction{to-tuple(_)} $ match(amb(ins)) :
+              (amb:Int) : cat([default(ins), amb], branch-ns)
+              (amb:False) : cat([default(ins)], branch-ns)
+          (ins:Branch0Ins) : JumpInstruction([n1(ins), n2(ins)])
+          (ins:Branch1Ins) : JumpInstruction([n1(ins), n2(ins)])
+          (ins:Branch2Ins) : JumpInstruction([n1(ins), n2(ins)])
+          (ins:MethodDispatchIns) : JumpInstruction([default(ins), amb(ins)])
+          (ins:UnreachableIns) : JumpInstruction([])          
+          (ins:LabelIns) : LabelInstruction(n(ins))
+          (ins:GotoIns) : GotoInstruction(n(ins))
+          (ins) : StandardInstruction()
+
+  ;Convert basic block into RegAlloc IR
+  defn to-block (b:BasicBlock) :
+    val ins-buffer = Vector<Ins>()
+    defn push (i:Ins) : add(ins-buffer, i)
+    if index(b) == 0 :
+      for d in defs(function) do :
+        make-var(id(d), type(d))
+        push(Def(get-var(id(d))))
+    for i in start(b) to start(b) + length(b) do :
+      match(ins(function)[i]) :
+        (e:ArgIns) :
+          val r = ret(e)
+          val xs = get-vars(locals(r))
+          val ctxt = StanzaContext(regs(r))
+          push(Args(xs, ctxt))
+        (e:CallRecordIns) :
+          val r = ret(e)
+          val a = args(e)
+          val calltype = match(type(e)) :
+            (t:vm-StanzaCall) : StanzaCall(info(e), func-reg?(f(e), 0), regs(a), regs(r))
+            (t:vm-StanzaTCall) : StanzaTCall(func-reg?(f(e), 0), regs(a))
+            (t:vm-CCall) : CCall(num-mem-args(t), func-reg?(f(e),9), regs(a), regs(r))
+            (t:vm-YieldCall) : YieldCall(enter?(t), info(e), Reg(0), regs(a), regs(r))
+          push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
+        (e:ReturnRecordIns) :
+          val r = args(e)
+          val xs = get-imms(imms(r))
+          val ctxt = match(type(e)) :
+            (t:vm-StanzaCall) : StanzaContext(regs(r))
+            (t:vm-CCall) : fatal("Not yet implemented")
+          push(Return(xs, ctxt))
+        (e:MatchRecordIns) :
+          val type-lists = to-list(seq(to-list{types(_)}, branches(e)))
+          val branch-ns = to-list(seq(n, branches(e)))
+          val ns = match(amb(e)) :
+                     (amb:Int) : cons(default(e), amb, branch-ns)
+                     (amb:False) : cons(default(e), branch-ns)                   
+          val r = args(e)
+          push(Match(dispatch?(e), type-lists, get-imms(imms(r)), regs(r)))
+        (e:ExtendStackIns) :
+          push(Call(List(), Val(VoidMarker()), List(), ExtendStack()))
+        (e:ExtendHeapIns) :
+          val size = get-imm(size(e))
+          push(Call(List(), Val(VoidMarker()), List(size), ExtendHeap(info(e))))
+        (e:AllocOnHeap) :
+          val size = get-imm(size(e))
+          push(Op(AllocOp(), List(get-var(x(e))), List(size)))
+        (e:SetIns) :
+          push(Set(get-var(x(e)), get-imm(y(e))))
+        (e:Op0Ins) :
+          push(Op(op(e), List(get-var(x(e))), List()))
+        (e:Op1Ins) :
+          push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)))))
+        (e:Op2Ins) :
+          push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)), get-imm(z(e)))))
+        (e:DualOp2Ins) :
+          push(Op(op(e), List(get-var(x(e)), get-var(y(e))), List(get-imm(z(e)), get-imm(w(e)))))
+        (e:LoadArgIns) :
+          push(Op(LoadArgOp(index(e)), List(get-var(x(e))), List()))      
+        (e:StoreArgIns) :
+          push(Op(StoreArgOp(index(e)), List(), List(get-imm(y(e)))))      
+        (e:Branch0Ins) :
+          push(Branch(op(e), List()))
+        (e:Branch1Ins) :
+          val op* = op(e) as VMOp
+          push(Branch(op*, List(get-imm(x(e)))))
+        (e:Branch2Ins) :
+          push(Branch(op(e), List(get-imm(x(e)), get-imm(y(e)))))
+        (e:MethodDispatchIns) :
+          push(MethodDispatch(multi(e), default(e), amb(e)))
+        (e:StoreIns) :      
+          push(Op(StoreOp(offset(e)), List(), List(get-imm(x(e)), get-imm(z(e)))))
+        (e:LoadIns) :
+          push(Op(LoadOp(offset(e)), List(get-var(x(e))), List(get-imm(y(e)))))
+        (e:DumpIns) :
+          false
+        (e:LiveIns) :
+          push(Op(NoOp(), List(), get-imms(xs(e))))
+        (e:RecordLiveIns) :
+          val op = RecordLiveOp(map(get-var,live(e)))
+          push(Op(op, List(), List()))
+        (e:CommentIns) :
+          false
+        (e:UnreachableIns) :
+          false
+    val next = to-list $
+      for s in succs(b) seq :
+        index(blocks[s])
+    Block(ins-buffer, next)
+
+  ;Add blocks to working set
+  add-all(BLOCKS, seq(to-block, /blocks(blocks)))
 
   ;Make vars for defs
-  for d in defs(function) do :
-    make-var(id(d), type(d))
-    push(Def(get-var(id(d))))
-    
-  ;Process each instruction
-  for e in ins(function) do :
-    println("Processing %_" % [e])
-    match(e) : ;[3]
-      (e:ArgIns) :
-        val r = ret(e)
-        val xs = get-vars(locals(r))
-        val ctxt = StanzaContext(regs(r))
-        push(Args(xs, ctxt))
-      (e:CallRecordIns) :
-        val r = ret(e)
-        val a = args(e)
-        val calltype = match(type(e)) :
-          (t:vm-StanzaCall) : StanzaCall(info(e), func-reg?(f(e), 0), regs(a), regs(r))
-          (t:vm-StanzaTCall) : StanzaTCall(func-reg?(f(e), 0), regs(a))
-          (t:vm-CCall) : CCall(num-mem-args(t), func-reg?(f(e),9), regs(a), regs(r))
-          (t:vm-YieldCall) : YieldCall(enter?(t), info(e), Reg(0), regs(a), regs(r))
-        push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
-        close-block(List()) when type(e) is vm-StanzaTCall          
-      (e:ReturnRecordIns) :
-        val r = args(e)
-        val xs = get-imms(imms(r))
-        val ctxt = match(type(e)) :
-          (t:vm-StanzaCall) : StanzaContext(regs(r))
-          (t:vm-CCall) : fatal("Not yet implemented")
-        push(Return(xs, ctxt))
-        close-block(List())          
-      (e:MatchRecordIns) :
-        val type-lists = to-list(seq(to-list{types(_)}, branches(e)))
-        val branch-ns = to-list(seq(n, branches(e)))
-        val ns = match(amb(e)) :
-                   (amb:Int) : cons(default(e), amb, branch-ns)
-                   (amb:False) : cons(default(e), branch-ns)                   
-        val r = args(e)
-        push(Match(dispatch?(e), type-lists, get-imms(imms(r)), regs(r)))
-        close-block(ns)        
-      (e:ExtendStackIns) :
-        push(Call(List(), Val(VoidMarker()), List(), ExtendStack()))
-      (e:ExtendHeapIns) :
-        val size = get-imm(size(e))
-        push(Call(List(), Val(VoidMarker()), List(size), ExtendHeap(info(e))))
-      (e:AllocOnHeap) :
-        val size = get-imm(size(e))
-        push(Op(AllocOp(), List(get-var(x(e))), List(size)))
-      (e:SetIns) :
-        push(Set(get-var(x(e)), get-imm(y(e))))
-      (e:Op0Ins) :
-        push(Op(op(e), List(get-var(x(e))), List()))
-      (e:Op1Ins) :
-        push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)))))
-      (e:Op2Ins) :
-        push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)), get-imm(z(e)))))
-      (e:DualOp2Ins) :
-        push(Op(op(e), List(get-var(x(e)), get-var(y(e))), List(get-imm(z(e)), get-imm(w(e)))))
-      (e:LoadArgIns) :
-        push(Op(LoadArgOp(index(e)), List(get-var(x(e))), List()))      
-      (e:StoreArgIns) :
-        push(Op(StoreArgOp(index(e)), List(), List(get-imm(y(e)))))      
-      (e:LabelIns) :
-        close-block(List(n(e)))
-        open-block(n(e))
-      (e:GotoIns) :
-        close-block(List(n(e)))
-      (e:Branch0Ins) :
-        push(Branch(op(e), List()))
-        close-block(List(n1(e), n2(e)))        
-      (e:Branch1Ins) :
-        val op* = op(e) as VMOp
-        push(Branch(op*, List(get-imm(x(e)))))
-        close-block(List(n1(e), n2(e)))
-      (e:Branch2Ins) :
-        push(Branch(op(e), List(get-imm(x(e)), get-imm(y(e)))))
-        close-block(List(n1(e), n2(e)))
-      (e:MethodDispatchIns) :
-        push(MethodDispatch(multi(e), default(e), amb(e)))
-        close-block(List(default(e), amb(e)))
-      (e:StoreIns) :      
-        push(Op(StoreOp(offset(e)), List(), List(get-imm(x(e)), get-imm(z(e)))))
-      (e:LoadIns) :
-        push(Op(LoadOp(offset(e)), List(get-var(x(e))), List(get-imm(y(e)))))
-      (e:DumpIns) :
-        false
-      (e:LiveIns) :
-        push(Op(NoOp(), List(), get-imms(xs(e))))
-      (e:RecordLiveIns) :
-        val op = RecordLiveOp(map(get-var,live(e)))
-        push(Op(op, List(), List()))
-      (e:CommentIns) :
-        false
-      (e:UnreachableIns) :
-        close-block(List())
+  ;for d in defs(function) do :
+  ;  make-var(id(d), type(d))
+  ;  push(Def(get-var(id(d))))
+  ;
+  ;
+  ;  
+  ;;Process each instruction
+  ;for e in ins(function) do :
+  ;  println("Processing %_" % [e])
+  ;  match(e) : ;[3]
+  ;    (e:ArgIns) :
+  ;      val r = ret(e)
+  ;      val xs = get-vars(locals(r))
+  ;      val ctxt = StanzaContext(regs(r))
+  ;      push(Args(xs, ctxt))
+  ;    (e:CallRecordIns) :
+  ;      val r = ret(e)
+  ;      val a = args(e)
+  ;      val calltype = match(type(e)) :
+  ;        (t:vm-StanzaCall) : StanzaCall(info(e), func-reg?(f(e), 0), regs(a), regs(r))
+  ;        (t:vm-StanzaTCall) : StanzaTCall(func-reg?(f(e), 0), regs(a))
+  ;        (t:vm-CCall) : CCall(num-mem-args(t), func-reg?(f(e),9), regs(a), regs(r))
+  ;        (t:vm-YieldCall) : YieldCall(enter?(t), info(e), Reg(0), regs(a), regs(r))
+  ;      push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
+  ;      close-block(List()) when type(e) is vm-StanzaTCall          
+  ;    (e:ReturnRecordIns) :
+  ;      val r = args(e)
+  ;      val xs = get-imms(imms(r))
+  ;      val ctxt = match(type(e)) :
+  ;        (t:vm-StanzaCall) : StanzaContext(regs(r))
+  ;        (t:vm-CCall) : fatal("Not yet implemented")
+  ;      push(Return(xs, ctxt))
+  ;      close-block(List())          
+  ;    (e:MatchRecordIns) :
+  ;      val type-lists = to-list(seq(to-list{types(_)}, branches(e)))
+  ;      val branch-ns = to-list(seq(n, branches(e)))
+  ;      val ns = match(amb(e)) :
+  ;                 (amb:Int) : cons(default(e), amb, branch-ns)
+  ;                 (amb:False) : cons(default(e), branch-ns)                   
+  ;      val r = args(e)
+  ;      push(Match(dispatch?(e), type-lists, get-imms(imms(r)), regs(r)))
+  ;      close-block(ns)        
+  ;    (e:ExtendStackIns) :
+  ;      push(Call(List(), Val(VoidMarker()), List(), ExtendStack()))
+  ;    (e:ExtendHeapIns) :
+  ;      val size = get-imm(size(e))
+  ;      push(Call(List(), Val(VoidMarker()), List(size), ExtendHeap(info(e))))
+  ;    (e:AllocOnHeap) :
+  ;      val size = get-imm(size(e))
+  ;      push(Op(AllocOp(), List(get-var(x(e))), List(size)))
+  ;    (e:SetIns) :
+  ;      push(Set(get-var(x(e)), get-imm(y(e))))
+  ;    (e:Op0Ins) :
+  ;      push(Op(op(e), List(get-var(x(e))), List()))
+  ;    (e:Op1Ins) :
+  ;      push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)))))
+  ;    (e:Op2Ins) :
+  ;      push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)), get-imm(z(e)))))
+  ;    (e:DualOp2Ins) :
+  ;      push(Op(op(e), List(get-var(x(e)), get-var(y(e))), List(get-imm(z(e)), get-imm(w(e)))))
+  ;    (e:LoadArgIns) :
+  ;      push(Op(LoadArgOp(index(e)), List(get-var(x(e))), List()))      
+  ;    (e:StoreArgIns) :
+  ;      push(Op(StoreArgOp(index(e)), List(), List(get-imm(y(e)))))      
+  ;    (e:LabelIns) :
+  ;      close-block(List(n(e)))
+  ;      open-block(n(e))
+  ;    (e:GotoIns) :
+  ;      close-block(List(n(e)))
+  ;    (e:Branch0Ins) :
+  ;      push(Branch(op(e), List()))
+  ;      close-block(List(n1(e), n2(e)))        
+  ;    (e:Branch1Ins) :
+  ;      val op* = op(e) as VMOp
+  ;      push(Branch(op*, List(get-imm(x(e)))))
+  ;      close-block(List(n1(e), n2(e)))
+  ;    (e:Branch2Ins) :
+  ;      push(Branch(op(e), List(get-imm(x(e)), get-imm(y(e)))))
+  ;      close-block(List(n1(e), n2(e)))
+  ;    (e:MethodDispatchIns) :
+  ;      push(MethodDispatch(multi(e), default(e), amb(e)))
+  ;      close-block(List(default(e), amb(e)))
+  ;    (e:StoreIns) :      
+  ;      push(Op(StoreOp(offset(e)), List(), List(get-imm(x(e)), get-imm(z(e)))))
+  ;    (e:LoadIns) :
+  ;      push(Op(LoadOp(offset(e)), List(get-var(x(e))), List(get-imm(y(e)))))
+  ;    (e:DumpIns) :
+  ;      false
+  ;    (e:LiveIns) :
+  ;      push(Op(NoOp(), List(), get-imms(xs(e))))
+  ;    (e:RecordLiveIns) :
+  ;      val op = RecordLiveOp(map(get-var,live(e)))
+  ;      push(Op(op, List(), List()))
+  ;    (e:CommentIns) :
+  ;      false
+  ;    (e:UnreachableIns) :
+  ;      close-block(List())
 
 ;============================================================
 ;================== Backend Properties ======================
