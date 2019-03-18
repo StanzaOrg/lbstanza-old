@@ -271,21 +271,22 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
 
   ;Class properties
   val class-tree = DynTree()
+  val unique-children = IntSet()
   defn initialize-class-props () :
     ;First compute tags for all core classes   
-    defn assign-core-tag (id:TypeId, tag:Int) :
+    defn assign-core-tag (id:TypeId, tag:Int, has-fields?:True|False) :
       val gid = id-indices[id]
-      global-props[gid] = ClassProps(tag)
-    assign-core-tag(CORE-FALSE-ID, FALSE-TYPE)
-    assign-core-tag(CORE-TRUE-ID, TRUE-TYPE)
-    assign-core-tag(CORE-BYTE-ID, BYTE-TYPE)
-    assign-core-tag(CORE-CHAR-ID, CHAR-TYPE)
-    assign-core-tag(CORE-INT-ID, INT-TYPE)
-    assign-core-tag(CORE-FLOAT-ID, FLOAT-TYPE)
-    assign-core-tag(CORE-STACK-ID, STACK-TYPE)
-    assign-core-tag(CORE-FN-ID, FN-TYPE)
-    assign-core-tag(CORE-TYPE-ID, TYPE-TYPE)
-    assign-core-tag(CORE-LIVENESS-TRACKER-ID, LIVENESS-TRACKER-TYPE)
+      global-props[gid] = ClassProps(tag, has-fields?)
+    assign-core-tag(CORE-FALSE-ID, FALSE-TYPE, false)
+    assign-core-tag(CORE-TRUE-ID, TRUE-TYPE, false)
+    assign-core-tag(CORE-BYTE-ID, BYTE-TYPE, true)
+    assign-core-tag(CORE-CHAR-ID, CHAR-TYPE, true)
+    assign-core-tag(CORE-INT-ID, INT-TYPE, true)
+    assign-core-tag(CORE-FLOAT-ID, FLOAT-TYPE, true)
+    assign-core-tag(CORE-STACK-ID, STACK-TYPE, true)
+    assign-core-tag(CORE-FN-ID, FN-TYPE, true)
+    assign-core-tag(CORE-TYPE-ID, TYPE-TYPE, true)
+    assign-core-tag(CORE-LIVENESS-TRACKER-ID, LIVENESS-TRACKER-TYPE, true)
     
     ;Next compute tags and node states for all classes
     val tag-counter = to-seq(NUM-BUILTIN-TYPES to false)
@@ -299,7 +300,11 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
             (gid:Int) : global-props[gid] is-not False
             (gid:False) : false
         if not has-tag? :
-          set-global-prop(pkgids, id(c), ClassProps(next(tag-counter)))
+          val has-fields? = match(c) :
+            (c:VMArrayClass) : true
+            (c:VMLeafClass) : size(c) > 0
+            (c:VMAbstractClass) : false
+          set-global-prop(pkgids, id(c), ClassProps(next(tag-counter), has-fields?))
         ;Compute a node state for the class tree
         defn gid (n:Int) : global-id!(pkgids,n)
         match(c) :
@@ -313,6 +318,10 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
 
     ;Populate the class tree
     add(class-tree, node-states)
+    
+    ;Compute all the children of Unique
+    val unique-id = id-indices[CORE-UNIQUE-ID]
+    add-all(unique-children, all-children(class-tree, unique-id))
 
   ;Create stackmap table
   val stackmap-table = HashTable<?,Int>()
@@ -334,10 +343,7 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
         (x:LocalMem) :
           Mem(label-table[n(x)],0)
         (x:TagImm) : 
-          val gid = global-id!(pkgids, n(x))
-          val props = global-props[gid] as ClassProps
-          if marker?(x) : IntImm(n(x) << 3 + 2)
-          else : IntImm(n(x))
+          tag-imm(global-id!(pkgids, n(x)), marker?(x))
         (x:StackMap) :
           IntImm(stackmap-index(x))
         (x:LinkId) :
@@ -357,6 +363,12 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
               Mem(globals(stubs), offset(p))
         (x) :
           x
+
+    ;Return the numerical tag for the given global id
+    defn tag-imm (gid:Int, marker?:True|False) :
+      val props = global-props[gid] as ClassProps
+      if marker? : INT(tag(props) << 3 + 2)
+      else : INT(tag(props))
 
     ;Resolve a typeset from package ids to global ids
     defn resolve (t:TypeSet) :
@@ -381,43 +393,115 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
         (t:OrType) :
           reduce(union, seq(to-iset, types(t)))
         (t:SingleType) :
-          defn tag (n:Int) : /tag(global-props[n] as ClassProps)
-          val leaves = all-children(class-tree, type(t))
-          val tags = qsort(map(tag, leaves))
-          ISubset(tags)
+          ISubset(all-children(class-tree, type(t)))
 
     ;Convert an asm branch into an ibranch
     defn to-ibranch (b:Branch) :
       val sets = for t in tags(b) map :
         to-iset(resolve(t))
-      IBranch(sets, dst(b))
+      IBranch(sets, dst(b))      
 
-    ;Emit code for producing trie
-    defn emit-trie (t:MTrie, default:Imm, args:List<Imm>) :
-      defn branch-on-set (s:ISet, pass:Imm) :
-        match(s) :
-          (s:ISubset) :
-            for x in xs(s) do :
-              val arg = head(args)
-              E $ Break(LT, pass, EqOp(), INT(x), arg)
-          (s:IAll) :
-            E $ Goto(pass)
-      match(t) :
-        (t:IfTrie) :
-          for entry in branches(t) do :
-            val pass = unique-id(stubs)
-            val fail = unique-id(stubs)
-            branch-on-set(key(entry), M(pass))
-            E $ Goto(M(fail))
-            E $ Label(pass)
-            emit-trie(value(entry), default, tail(args))
-            E $ Label(fail)
-          E $ Goto(default)  
-        (t:EndTrie) :
-          E $ Goto(target(t))
-    defn emit-trie (t:MTrie, default:Imm) :
-      val args = map(R, call-regs(backend(stubs)))
-      emit-trie(t, default, args)        
+    ;Emit code for producing trie (args is a helper)
+    defn emit-trie (t:IfTrie, default:Imm, args:List<Imm>) :
+      ;Is the given type a marker?
+      ;Is it both empty, and not a subtype of Unique?
+      defn marker? (x:Int) :
+        val props = global-props[x] as ClassProps
+        if has-fields?(props) : false
+        else : not unique-children[x]
+
+      ;Calculate targets of all branches
+      val targets = for entry in branches(t) map :
+        match(value(entry)) :
+          (v:IfTrie) : M(unique-id(stubs))
+          (v:EndTrie) : target(v) as Imm
+
+      ;Categorize branches
+      val prim-targets = Vector<KeyValue<Int,Imm>>()
+      val marker-targets = Vector<KeyValue<Int,Imm>>()
+      val ref-targets = Vector<KeyValue<Int,Imm>>()
+      var default-target = default
+      for (entry in branches(t), target in targets) do :
+        match(key(entry)) :
+          (iset:ISubset) :
+            for x in xs(iset) do :
+              if x == id-indices[CORE-BYTE-ID] : add(prim-targets, x => target)
+              else if x == id-indices[CORE-CHAR-ID] : add(prim-targets, x => target)
+              else if x == id-indices[CORE-INT-ID] : add(prim-targets, x => target)
+              else if x == id-indices[CORE-FLOAT-ID] : add(prim-targets, x => target)
+              else if marker?(x) : add(marker-targets, x => target)
+              else : add(ref-targets, x => target)              
+          (iset:IAll) :
+            default-target = target
+
+      ;Registers
+      val OBJ = R0
+      val BITS = R1
+      val TAG = R1
+
+      ;Load object
+      val object = match(head(args)) :
+        (a:Reg) :
+          a
+        (a:Mem) :
+          E $ LoadL(OBJ, a)
+          OBJ
+
+      ;Test bits
+      val marker-branches = unique-id(stubs)
+      val ref-branches = unique-id(stubs)
+      E $ AndL(BITS, object, INT(7))      
+      for entry in prim-targets do :
+        val x = key(entry)
+        val target = value(entry)
+        val tagbits =
+          if x == id-indices[CORE-BYTE-ID] : INT(3)
+          else if x == id-indices[CORE-CHAR-ID] : INT(4)
+          else if x == id-indices[CORE-INT-ID] : INT(0)
+          else if x == id-indices[CORE-FLOAT-ID] : INT(5)
+          else : fatal("Not a primitive type")
+        E $ BreakL(target, EqOp(), BITS, tagbits)
+      E $ BreakL(M(marker-branches), EqOp(), BITS, INT(2))
+      E $ BreakL(M(ref-branches), EqOp(), BITS, INT(1))
+      E $ Goto(default-target)
+
+      ;Marker branches
+      E $ Label(marker-branches)
+      for entry in marker-targets do :
+        val x = key(entry)
+        val target = value(entry)
+        E $ BreakL(target, EqOp(), object, tag-imm(x,true))
+      E $ Goto(default-target)
+
+      ;Ref branches
+      E $ Label(ref-branches)
+      E $ LoadL(TAG, object, -1)
+      for entry in ref-targets do :
+        val x = key(entry)
+        val target = value(entry)
+        E $ BreakL(target, EqOp(), TAG, tag-imm(x, false))
+      E $ Goto(default-target)
+
+      ;Further tries
+      for (entry in branches(t), target in targets) do :
+        val trie = value(entry)
+        match(trie:IfTrie) :
+          E $ Label(n(target as LocalMem))
+          emit-trie(trie, default, tail(args))
+
+    ;Retrieve the arguments to a trie for a match/dispatch statement
+    defn trie-args (t:MTrie, xs:List<Imm>) :
+      val reg-args = xs as List<Reg>
+      val mem-args = seq(Mem{registers(stubs), _}, 0 to false by 8)
+      val all-args = cat(reg-args, mem-args)
+      to-list(take-n(depth(t), all-args))      
+
+    ;Retrieve the arguments to a trie from a method-dispatch statement
+    defn trie-method-args (t:MTrie, num-header-args:Int) :
+      val reg-args = seq(R, tailn(call-regs(backend(stubs)), num-header-args))
+      val mem-args = seq(Mem{registers(stubs), _}, 0 to false by 8)
+      val all-args = cat(reg-args, mem-args)
+      to-list(take-n(depth(t), all-args))      
 
     ;Emit code for producing typeof
     defn emit-typeof (x:Loc, y:Imm, type:TypeSet) :
@@ -440,8 +524,8 @@ public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
               (info:FileInfo) : add-info-table(n*, info)
               (info:False) : false
           (i:Match) :
-            val trie = to-trie(seq(to-ibranch, branches(i)))            
-            emit-trie(trie, no-branch(i))
+            val trie = to-trie(seq(to-ibranch, branches(i)))
+            emit-trie(trie, no-branch(i), trie-args(trie,xs(i)))
           (i:Dispatch) :
             false
           (i:MethodDispatch) :
@@ -531,3 +615,4 @@ defstruct ConstProps <: GProps :
   index:Int
 defstruct ClassProps <: GProps :
   tag: Int
+  has-fields?: True|False
