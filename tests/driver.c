@@ -24,6 +24,7 @@ typedef struct{
   char* free;
   char* free_limit;
   uint64_t current_stack;  
+  uint64_t system_stack;  
 } VMInit;
 
 typedef struct{
@@ -60,6 +61,16 @@ void* alloc (VMInit* init, long type, long size){
   return ptr;  
 }
 
+uint64_t alloc_stack (VMInit* init){
+  Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
+  int initial_stack_size = 4 * 1024;
+  StackFrame* frames = (StackFrame*)malloc(initial_stack_size);
+  stack->size = initial_stack_size;
+  stack->frames = frames;
+  stack->stack_pointer = NULL;
+  return (uint64_t)stack - 8 + 1;  
+}
+
 int main (int argc, char* argv[]) {
   input_argc = argc;
   input_argv = argv;
@@ -69,18 +80,14 @@ int main (int argc, char* argv[]) {
   int initial_heap_size = 4 * 1024;
   init.heap = (char*)malloc(initial_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
+  printf("heap = %p, heap_limit = %p\n", init.heap, init.heap_limit);
   init.heap_top = init.heap;
   init.free = (char*)malloc(initial_heap_size);
   init.free_limit = init.free + initial_heap_size;
 
-  //Allocate initial stack
-  Stack* stack = alloc(&init, STACK_TYPE, sizeof(Stack));
-  int initial_stack_size = 4 * 1024;
-  StackFrame* frames = (StackFrame*)malloc(initial_stack_size);
-  stack->size = initial_stack_size;
-  stack->frames = frames;
-  stack->stack_pointer = NULL;
-  init.current_stack = (uint64_t)stack - 8 + 1;
+  //Allocate stacks
+  init.current_stack = alloc_stack(&init);
+  init.system_stack = alloc_stack(&init);   
 
   //Call Stanza entry
   int64_t ret = stanza_entry(&init);
@@ -208,7 +215,6 @@ int64_t file_time_modified (char* filename){
     return (int64_t)attrib.st_mtime;
   return 0;
 }
-
 
 //============================================================
 //================= Process Runtime ==========================
