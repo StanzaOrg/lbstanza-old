@@ -429,7 +429,7 @@ typedef struct{
   uint64_t size;
   StackFrame* frames;
   StackFrame* stack_pointer;
-  int pc;
+  long pc;
 } Stack;
 
 //============================================================
