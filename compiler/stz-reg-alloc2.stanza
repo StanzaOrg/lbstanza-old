@@ -409,6 +409,7 @@ public defstruct StanzaContext <: FnContext :
   regs: List<Loc> with: (as-method => true)
 public defstruct CContext <: FnContext :
   regs: List<Loc> with: (as-method => true)
+  scratch-reg: Loc
 
 ;===================
 ;==== Call Type ====
@@ -431,6 +432,7 @@ public defstruct CCall <: CallType :
   func-reg: False|Loc
   arg-regs: List<Loc>
   ret-regs: List<Loc>
+  scratch-reg: Loc
   
 public defstruct YieldCall <: CallType :
   enter?: True|False
@@ -480,6 +482,10 @@ public defstruct NoOp <: VMOp
 defmethod print (o:OutputStream, op:NoOp) :
   print(o, "nop")
 
+public defstruct SaveCContextOp <: VMOp
+defmethod print (o:OutputStream, op:SaveCContextOp) :
+  print(o, "save-c-ctxt")
+
 public defstruct RecordLiveOp <: VMOp :
   live-vars: Tuple<Var>
 defmethod print (o:OutputStream, op:RecordLiveOp) :
@@ -497,6 +503,10 @@ public defstruct StoreArgOp <: VMOp : (index:Int)
 defmethod print (o:OutputStream, op:StoreArgOp) :
   print(o, "storearg/%_" % [index(op)])
 
+public defstruct LoadCArgOp <: VMOp : (index:Int, num-mem-args:Int)
+defmethod print (o:OutputStream, op:LoadCArgOp) :
+  print(o, "loadcarg/%_ (num-mem-args = %_)" % [index(op), num-mem-args(op)])
+
 public defstruct StoreCArgOp <: VMOp : (index:Int, num-mem-args:Int)
 defmethod print (o:OutputStream, op:StoreCArgOp) :
   print(o, "storecarg/%_ (num-mem-args = %_)" % [index(op), num-mem-args(op)])
@@ -508,6 +518,12 @@ defmethod print (o:OutputStream, op:LoadArgOp) :
 public defstruct AllocOp <: VMOp
 defmethod print (o:OutputStream, op:AllocOp) :
   print(o, "alloc")  
+
+public defstruct StoreCRSPOp <: VMOp
+with: (printer => true)
+
+public defstruct CRSPOp <: VMOp
+with: (printer => true)
 
 public defstruct FlipOp <: VMOp : (op:VMOp)
 defmethod print (o:OutputStream, x:FlipOp) :
@@ -839,27 +855,17 @@ defn load-instructions (function:VMFunc, backend:Backend) :
       match(ins(function)[i]) :
         (e:ArgIns) :
           val r = ret(e)
+          defn scratch-reg () :
+            unused-regs(regs(r), 1, backend)[0]
           val xs = get-vars(locals(r))
-          val ctxt = StanzaContext(regs(r))
+          val ctxt = match(type(e)) :
+            (t:StanzaArg) : StanzaContext(regs(r))
+            (t:CArg) : CContext(regs(r), scratch-reg())
           push(Args(xs, ctxt))
         (e:CallRecordIns) :
-          ;Take num 'number' of unused registers
-          defn unused-regs (used:Seqable<Loc>, num:Int) :
-            val used-set = IntSet()
-            for x in used do :
-              match(x:Reg) : add(used-set, n(x))
-            defn find-unused () :
-              for i in 0 to num-regs(backend) find! :
-                not used-set[i]
-            val unused = Vector<Reg>()
-            for i in 0 to num do :
-              val n = find-unused()
-              add(unused, Reg(n))
-              add(used-set, n)
-            unused
           ;Retrieve a func register if necessary
           defn func-reg? (f:VMImm, used:Seqable<Loc>) :
-            match(f:Local) : unused-regs(used, 1)[0]            
+            match(f:Local) : unused-regs(used, 1, backend)[0]            
 
           val r = ret(e)
           val a = args(e)
@@ -870,18 +876,28 @@ defn load-instructions (function:VMFunc, backend:Backend) :
             (t:vm-StanzaTCall) :
               StanzaTCall(func-reg?(f(e), a-regs), a-regs)
             (t:vm-CCall) :
-              val freg = func-reg?(f(e), cat-all $ [a-regs, seq(Reg,c-preserved-regs(backend)), [Reg(0)]])
-              CCall(num-mem-args(t), freg, a-regs, regs(r))
+              val [freg, sreg] = match(f(e)) :
+                (f:Local) :
+                  val used = cat-all $ [a-regs, seq(Reg, c-preserved-regs(backend)), [Reg(0)]]
+                  val unused = unused-regs(used, 2, backend)
+                  [unused[0], unused[1]]                  
+                (f:VMImm) :
+                  val used = cat-all $ [a-regs, seq(Reg, c-preserved-regs(backend)), [Reg(0)]]
+                  val unused = unused-regs(used, 1, backend)
+                  [false, unused[0]]                  
+              CCall(num-mem-args(t), freg, a-regs, regs(r), sreg)              
             (t:vm-YieldCall) :
-              val rs = unused-regs(a-regs, 3)
+              val rs = unused-regs(a-regs, 3, backend)
               YieldCall(enter?(t), info(e), rs[0], a-regs, regs(r), List(rs[1], rs[2]))
           push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
         (e:ReturnRecordIns) :
           val r = args(e)
+          defn scratch-reg () :
+            unused-regs(regs(r), 1, backend)[0]
           val xs = get-imms(imms(r))
           val ctxt = match(type(e)) :
             (t:vm-StanzaCall) : StanzaContext(regs(r))
-            (t:vm-CCall) : fatal("Not yet implemented")
+            (t:vm-CCall) : CContext(regs(r), scratch-reg())
           push(Return(xs, ctxt))
         (e:MatchRecordIns) :
           val type-lists = to-list(seq(to-list{types(_)}, branches(e)))
@@ -916,6 +932,12 @@ defn load-instructions (function:VMFunc, backend:Backend) :
           push(Op(StoreArgOp(index(e)), List(), List(get-imm(y(e)))))
         (e:StoreCArgIns) :
           push(Op(StoreCArgOp(index(e), num-mem-args(e)), List(), List(get-imm(crsp(e)), get-imm(y(e)))))
+        (e:LoadCArgIns) :
+          push(Op(LoadCArgOp(index(e), num-mem-args(e)), List(get-var(x(e))), List(get-imm(crsp(e)))))
+        (e:CRSPIns) :
+          push(Op(CRSPOp(), List(get-var(x(e))), List()))
+        (e:StoreCRSPIns) :
+          push(Op(StoreCRSPOp(), List(), List(get-imm(y(e)))))
         (e:Branch0Ins) :
           push(Branch(op(e), List()))
         (e:Branch1Ins) :
@@ -936,6 +958,8 @@ defn load-instructions (function:VMFunc, backend:Backend) :
         (e:RecordLiveIns) :
           val op = RecordLiveOp(map(get-var,live(e)))
           push(Op(op, List(), List()))
+        (e:SaveCContextIns) :
+          push(Op(SaveCContextOp(), List(), List()))
         (e:CommentIns) :
           false
         (e:UnreachableIns) :
@@ -947,6 +971,21 @@ defn load-instructions (function:VMFunc, backend:Backend) :
 
   ;Add blocks to working set
   add-all(BLOCKS, seq(to-block, /blocks(blocks)))
+
+;Take num 'number' of unused registers
+defn unused-regs (used:Seqable<Loc>, num:Int, backend:Backend) :
+  val used-set = IntSet()
+  for x in used do :
+    match(x:Reg) : add(used-set, n(x))
+  defn find-unused () :
+    for i in 0 to num-regs(backend) find! :
+      not used-set[i]
+  val unused = Vector<Reg>()
+  for i in 0 to num do :
+    val n = find-unused()
+    add(unused, Reg(n))
+    add(used-set, n)
+  unused
 
 ;============================================================
 ;================= Critical Edge Removal ====================
@@ -1270,17 +1309,10 @@ defn add-annotations (blk:Block, b:Int) :
 
 defn num-scratch-registers (i:Ins) :
   match(i) :
-    (i:Args) :
-      match(ctxt(i)) :
-        (ctxt:StanzaContext) : 0
-        (ctxt:CContext) : fatal("Not yet implemented")
-    (i:Return) :
-      match(ctxt(i)) :
-        (ctxt:StanzaContext) : 0
-        (ctxt:CContext) : fatal("Not yet implemented")
     (i:Call) :
       match(type(i)) :
         (t:YieldCall) : 2
+        (t:CCall) : 1
         (t) : 0
     (i:Op) :
       match(op(i)) :
@@ -2317,22 +2349,26 @@ defn collapse-blocks () :
 ;============================================================
 ;================== Backend Properties ======================
 ;============================================================
-defn frame-size (t:CCall, backend:Backend) :
+defn frame-size (num-mem-args:Int, backend:Backend) :
   match(backend) :
     (backend:W64Backend) :
-      8 * ((num-mem-args(t) + 4) | 1)
+      val num-ctxt = length(c-preserved-regs(backend))
+      8 * ((num-ctxt + num-mem-args + 4) | 1)
     (backend) :
-      8 * ((num-mem-args(t)) | 1)
+      val num-ctxt = length(c-preserved-regs(backend))
+      8 * ((num-ctxt + num-mem-args) | 1)
 
-defn mem-arg-offset (op:StoreCArgOp, backend:Backend) :
+defn mem-arg-offset (num-mem-args:Int, index:Int, backend:Backend) :
   match(backend) :
     (backend:W64Backend) :
-      val frame-size = 8 * ((num-mem-args(op) + 4) | 1)
-      (- frame-size) + 32 + (8 * index(op))
+      val frame-size = frame-size(num-mem-args, backend)
+      (- frame-size) + (8 * index) + 32
     (backend) :
-      val frame-size = 8 * ((num-mem-args(op)) | 1)
-      (- frame-size) + (8 * index(op))
-  
+      val frame-size = frame-size(num-mem-args, backend)
+      (- frame-size) + (8 * index)  
+
+defn mem-arg-offset (op:StoreCArgOp|LoadCArgOp, backend:Backend) :
+  mem-arg-offset(num-mem-args(op), index(op), backend)  
 
 ;============================================================
 ;====================== Assemble ============================
@@ -2351,6 +2387,15 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
   ;==== Label Pool ====
   ;====================
   val label-table = IntTable-init<asm-LocalMem>(asm-LocalMem{unique-id(stubs)})
+
+  ;=========================
+  ;==== Special Offsets ====
+  ;=========================
+  val stack-offset-counter = Counter(-1 + 8)
+  val size-offset = next(stack-offset-counter, 8)
+  val frames-offset = next(stack-offset-counter, 8)
+  val sp-offset = next(stack-offset-counter, 8)
+  val pc-offset = next(stack-offset-counter, 8)
 
   ;==============
   ;==== Body ====
@@ -2379,14 +2424,26 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
           (c:StanzaContext) :
             E $ asm-Return()
           (c:CContext) :
-            fatal("Not yet implemented")
+            ;Save current context
+            val TMP = to-asm-loc(scratch-reg(c))
+            E $ LoadL(TMP, M(current-stack(stubs)))
+            E $ StoreL(TMP, RSP, sp-offset)
+
+            ;Restore C context
+            E $ SetL(RSP, R(c-rsp-arg(backend(stubs))))
+            for (reg in c-preserved-regs(backend(stubs)), i in 0 to false) do :
+              val o = -8 - (8 * i)
+              E $ LoadL(R(reg), RSP, o)
+            E $ asm-Return()
       (e:Args) :
         match(ctxt(e)) :
           (ctxt:StanzaContext) :
             ;Everything is set up already
             false
           (ctxt:CContext) :
-            fatal("C context not yet supported")
+            val TMP = to-asm-loc(scratch-reg(ctxt))
+            E $ LoadL(TMP, M(current-stack(stubs)))
+            E $ LoadL(RSP, TMP, sp-offset)
       (e:Call) :
         match(type(e)) :
           (t:ExtendStack) :
@@ -2410,25 +2467,32 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
           (t:StanzaTCall) :
             E $ asm-Goto(I(f(e)))
           (t:CCall) :            
-            ;Save current context:
+            ;Push frame
             E $ AddL(RSP, RSP, INT(size(stackmap)))
-            E $ StoreL(M(stack-pointer(stubs)), RSP)
+            
+            ;Save current context:
+            let :
+              val TMP = to-asm-loc(scratch-reg(t))
+              E $ LoadL(TMP, M(current-stack(stubs)))
+              E $ StoreL(TMP, RSP, sp-offset)
 
             ;Restore the C context:
-            for (i in c-preserved-regs(backend(stubs)), n in saved-c-regs(stubs)) do :
-              E $ LoadL(R(i), M(n))
             E $ LoadL(RSP, M(saved-c-rsp(stubs)))
               
             ;Call C function with right convention
             val num-float-args = for y in ys(e) count : reg?(y as Var) is FReg
-            E $ SubL(RSP, RSP, INT(frame-size(t, backend(stubs))))
+            E $ SubL(RSP, RSP, INT(frame-size(num-mem-args(t), backend(stubs))))
             E $ SetL(R0, INT(num-float-args))
             E $ asm-Call(I(f(e)))
 
-            ;Return to our context:
-            E $ LoadL(RSP, M(stack-pointer(stubs)))
-            E $ SubL(RSP, RSP, INT(size(stackmap)))
+            ;Restore context
+            let :
+              val TMP = to-asm-loc(Reg(1))
+              E $ LoadL(TMP, M(current-stack(stubs)))
+              E $ LoadL(RSP, TMP, sp-offset)
 
+            ;Pop frame
+            E $ SubL(RSP, RSP, INT(size(stackmap)))
           (t:YieldCall) :            
             val lbl = unique-id(stubs)
             val TMP = to-asm-loc(scratch-regs(t)[0])
@@ -2459,6 +2523,11 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
             E $ asm-Label(lbl, info(t))
       (e:Op) : ;[2]
         match(op(e)) :
+          (op:SaveCContextOp) :
+            for (reg in c-preserved-regs(backend(stubs)), i in 0 to false) do :
+              val o = -8 - (8 * i)
+              E $ StoreL(RSP, R(reg), o)
+            E $ SetL(R(c-rsp-arg(backend(stubs))), RSP)
           (op:RecordLiveOp) :
             val indices = for v in live-vars(op) map :
               val o = offset(stackmap, n(v)) - 16
@@ -2499,9 +2568,16 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
             val crsp = ys(e)[0]
             val y = ys(e)[1]
             E $ StoreL(I(crsp), I(y), mem-arg-offset(op,backend(stubs)))
+          (op:LoadCArgOp) :
+            val crsp = ys(e)[0]
+            val x = xs(e)[0]
+            E $ LoadL(V(x), I(crsp), mem-arg-offset(op,backend(stubs)))
           (op:CRSPOp) :
             val x = xs(e)[0]
             E $ LoadL(V(x), M(saved-c-rsp(stubs)))
+          (op:StoreCRSPOp) :
+            val y = ys(e)[0]
+            E $ StoreL(M(saved-c-rsp(stubs)), I(y))
           (op:VMOp&Binary) :
             val [x, y, z] = [head(xs(e)), ys(e)[0], ys(e)[1]]
             E $ asm-BinOp(T(y), V(x), to-asm-op(op), I(y), I(z))
