@@ -409,6 +409,7 @@ public defstruct StanzaContext <: FnContext :
   regs: List<Loc> with: (as-method => true)
 public defstruct CContext <: FnContext :
   regs: List<Loc> with: (as-method => true)
+  scratch-reg: Loc
 
 ;===================
 ;==== Call Type ====
@@ -431,6 +432,7 @@ public defstruct CCall <: CallType :
   func-reg: False|Loc
   arg-regs: List<Loc>
   ret-regs: List<Loc>
+  scratch-reg: Loc
   
 public defstruct YieldCall <: CallType :
   enter?: True|False
@@ -843,23 +845,9 @@ defn load-instructions (function:VMFunc, backend:Backend) :
           val ctxt = StanzaContext(regs(r))
           push(Args(xs, ctxt))
         (e:CallRecordIns) :
-          ;Take num 'number' of unused registers
-          defn unused-regs (used:Seqable<Loc>, num:Int) :
-            val used-set = IntSet()
-            for x in used do :
-              match(x:Reg) : add(used-set, n(x))
-            defn find-unused () :
-              for i in 0 to num-regs(backend) find! :
-                not used-set[i]
-            val unused = Vector<Reg>()
-            for i in 0 to num do :
-              val n = find-unused()
-              add(unused, Reg(n))
-              add(used-set, n)
-            unused
           ;Retrieve a func register if necessary
           defn func-reg? (f:VMImm, used:Seqable<Loc>) :
-            match(f:Local) : unused-regs(used, 1)[0]            
+            match(f:Local) : unused-regs(used, 1, backend)[0]            
 
           val r = ret(e)
           val a = args(e)
@@ -870,10 +858,18 @@ defn load-instructions (function:VMFunc, backend:Backend) :
             (t:vm-StanzaTCall) :
               StanzaTCall(func-reg?(f(e), a-regs), a-regs)
             (t:vm-CCall) :
-              val freg = func-reg?(f(e), cat-all $ [a-regs, seq(Reg,c-preserved-regs(backend)), [Reg(0)]])
-              CCall(num-mem-args(t), freg, a-regs, regs(r))
+              val [freg, sreg] = match(f(e)) :
+                (f:Local) :
+                  val used = cat-all $ [a-regs, seq(Reg, c-preserved-regs(backend)), [Reg(0)]]
+                  val unused = unused-regs(used, 2, backend)
+                  [unused[0], unused[1]]                  
+                (f:VMImm) :
+                  val used = cat-all $ [a-regs, seq(Reg, c-preserved-regs(backend)), [Reg(0)]]
+                  val unused = unused-regs(used, 1, backend)
+                  [false, unused[0]]                  
+              CCall(num-mem-args(t), freg, a-regs, regs(r), sreg)              
             (t:vm-YieldCall) :
-              val rs = unused-regs(a-regs, 3)
+              val rs = unused-regs(a-regs, 3, backend)
               YieldCall(enter?(t), info(e), rs[0], a-regs, regs(r), List(rs[1], rs[2]))
           push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
         (e:ReturnRecordIns) :
@@ -947,6 +943,21 @@ defn load-instructions (function:VMFunc, backend:Backend) :
 
   ;Add blocks to working set
   add-all(BLOCKS, seq(to-block, /blocks(blocks)))
+
+;Take num 'number' of unused registers
+defn unused-regs (used:Seqable<Loc>, num:Int, backend:Backend) :
+  val used-set = IntSet()
+  for x in used do :
+    match(x:Reg) : add(used-set, n(x))
+  defn find-unused () :
+    for i in 0 to num-regs(backend) find! :
+      not used-set[i]
+  val unused = Vector<Reg>()
+  for i in 0 to num do :
+    val n = find-unused()
+    add(unused, Reg(n))
+    add(used-set, n)
+  unused
 
 ;============================================================
 ;================= Critical Edge Removal ====================
@@ -1281,6 +1292,7 @@ defn num-scratch-registers (i:Ins) :
     (i:Call) :
       match(type(i)) :
         (t:YieldCall) : 2
+        (t:CCall) : 1
         (t) : 0
     (i:Op) :
       match(op(i)) :
@@ -2356,6 +2368,15 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
   ;====================
   val label-table = IntTable-init<asm-LocalMem>(asm-LocalMem{unique-id(stubs)})
 
+  ;=========================
+  ;==== Special Offsets ====
+  ;=========================
+  val stack-offset-counter = Counter(-1 + 8)
+  val size-offset = next(stack-offset-counter, 8)
+  val frames-offset = next(stack-offset-counter, 8)
+  val sp-offset = next(stack-offset-counter, 8)
+  val pc-offset = next(stack-offset-counter, 8)
+
   ;==============
   ;==== Body ====
   ;==============
@@ -2413,10 +2434,14 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
             E $ SubL(RSP, RSP, frame-size)
           (t:StanzaTCall) :
             E $ asm-Goto(I(f(e)))
-          (t:CCall) :            
-            ;Save current context:
+          (t:CCall) :
+            ;Push frame:
             E $ AddL(RSP, RSP, INT(size(stackmap)))
-            E $ StoreL(M(stack-pointer(stubs)), RSP)
+
+            ;Store RSP
+            val TMP = to-asm-loc(scratch-reg(t))
+            E $ LoadL(TMP, M(current-stack(stubs)))
+            E $ StoreL(TMP, RSP, sp-offset)
 
             ;Restore the C context:
             E $ LoadL(RSP, M(saved-c-rsp(stubs)))
@@ -2427,10 +2452,14 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
             E $ SetL(R0, INT(num-float-args))
             E $ asm-Call(I(f(e)))
 
-            ;Return to our context:
-            E $ LoadL(RSP, M(stack-pointer(stubs)))
-            E $ SubL(RSP, RSP, INT(size(stackmap)))
+            ;Return to our context
+            let :
+              val TMP = to-asm-loc(scratch-reg(t))
+              E $ LoadL(TMP, M(current-stack(stubs)))
+              E $ LoadL(RSP, TMP, sp-offset)
 
+            ;Pop frame:
+            E $ SubL(RSP, RSP, INT(size(stackmap)))
           (t:YieldCall) :            
             val lbl = unique-id(stubs)
             val TMP = to-asm-loc(scratch-regs(t)[0])
