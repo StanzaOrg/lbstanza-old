@@ -18,13 +18,15 @@ defpackage stz/vm-normalize :
 
 public defn normalize (prog:VMPackage, backend:Backend) :
   val iotable = IOTable(packageio(prog))
+  val extern-table = to-intset(seq(fid, extern-defns(prog)))
   val progbuffer = ProgBuffer(prog)
   val funcs* = for f in funcs(prog) map :
-    val func* = normalize(func(f), progbuffer, backend, iotable)
+    val func* = normalize(func(f), progbuffer, backend, iotable, extern-table[id(f)])
     VMDefn(id(f), dependencies(f), func*)
   add(sub-funcs(prog, funcs*), progbuffer)
 
-public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iotable:IOTable) :
+public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend,
+                       iotable:IOTable, extern?:True|False) :
   ;Create instruction buffer
   val buffer = InsBuffer(f)
   defn make-label-table () : IntTable-init<Int>(make-label{buffer})
@@ -32,6 +34,41 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
   ;Create a false marker
   defn false-marker () :
     Marker(n(iotable, CORE-FALSE-ID))
+
+  ;Load instructions for an extern defn function
+  defn load-extern-instructions (f:VMFunc) :
+    ;Create temporary argument to store C-RSP
+    val c-rsp-arg = make-local(buffer, VMLong())
+
+    ;Save the C Context
+    ;Save the preserved registers.
+    ;Put RSP into C-RSP-ARG register
+    emit(buffer, SaveCContextIns())
+    
+    ;Check stack extension
+    val has-stack-lbl = make-label(buffer)
+    val no-stack-lbl = make-label(buffer)
+    load-instruction(Branch0Ins(has-stack-lbl, no-stack-lbl, HasStackOp()))
+    load-instruction(LabelIns(no-stack-lbl))
+    load-instruction(ExtendStackIns())
+    load-instruction(GotoIns(has-stack-lbl))
+    load-instruction(LabelIns(has-stack-lbl))    
+
+    ;Get arguments
+    val arg-rec = arg-extern-records(buffer, args(f), c-rsp-arg, backend)
+    within ret = normalize-arg-extern(arg-rec, c-rsp-arg) :
+      load-instruction(ArgIns(ret))
+
+    ;Create label table
+    val label-table = make-label-table()
+    
+    ;Load instructions
+    for i in ins(f) do :
+      match(i:ReturnIns) :
+        val ret-rec = ret-extern-records(buffer, xs(i), c-rsp-arg, backend)
+        emit(buffer, ReturnRecordIns(ret-rec, CCall(0)))
+      else :
+        load-instruction(i, label-table)
 
   ;Load instructions for a single standard function
   defn load-instructions (f:VMFunc) :
@@ -372,6 +409,15 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
         emit(buffer, StoreCArgIns(index(l), crsp, #S(a), num-mem-args))
     [CallRecords(to-tuple(reg-records*)), num-mem-args]
 
+  ;Normalize arg extern record
+  defn normalize-arg-extern (return:RetRecords -> ?, r:RetRecords, crsp:Local) :
+    val [mem-records, reg-records] = split!({loc(_) is CallMemArg}, records(r))
+    val num-mem-args = length(mem-records)
+    return(RetRecords(to-tuple(reg-records)))
+    for r in mem-records do :
+      val l = loc(r) as CallMemArg
+      emit(buffer, LoadCArgIns(x(r), crsp, index(l), num-mem-args))
+
   defn normalize (return:RetRecords -> ?, r:RetRecords) :
     val [mem-records, reg-records] = split!({loc(_) is CallMemArg}, records(r))
     return(RetRecords(to-tuple(reg-records)))
@@ -631,6 +677,7 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
   match(f) :
     (f:VMFunc) :
       if multi?(f) : load-multi-instructions(f)
+      else if extern? : load-extern-instructions(f)
       else : load-instructions(f)
     (f:VMMultifn) :
       load-instructions(f)
@@ -648,6 +695,9 @@ public defn normalize (f:VMFunction, progbuffer:ProgBuffer, backend:Backend, iot
 ;============================================================
 ;==================== New Instructions ======================
 ;============================================================
+
+public defstruct SaveCContextIns <: VMIns 
+with: (printer => true)
 
 public defstruct CallRecordIns <: VMIns :
   ret: RetRecords
@@ -696,6 +746,13 @@ public defstruct StoreCArgIns <: VMIns :
   index: Int
   crsp: VMImm
   y: VMImm
+  num-mem-args: Int
+with: (printer => true)
+
+public defstruct LoadCArgIns <: VMIns :
+  x: Local
+  crsp: VMImm
+  index: Int
   num-mem-args: Int
 with: (printer => true)
 
@@ -908,6 +965,66 @@ public defstruct RetRecord :
   loc: CallLoc
 with: (printer => true)
 
+defn arg-extern-records (b:InsBuffer, xs:Seqable<Local|VMType>, crsp:Local, backend:Backend) -> RetRecords :
+  ;Accumulate records
+  val records = Vector<RetRecord>()
+  defn rec (x:Local, l:CallLoc) :
+    add(records, RetRecord(x,l))
+  defn rec (x:Local|VMType, ls:Seq<CallLoc>) :
+    match(x:Local) :
+      rec(x, next(ls))
+
+  ;Retrieve the type of an argument
+  defn type (x:Local|VMType) :
+    match(x) :
+      (x:Local) : /type(b,x)
+      (x:VMType) : x
+    
+  val regs = seq(CallReg, callc-regs(backend))
+  val fregs = seq(CallFReg, callc-fregs(backend))
+  val mems = seq(CallMemArg, 0 to false)
+  match(backend) :
+    (backend:W64Backend) :
+      for x in xs do :
+        match(type(x)) :
+          (t:VMType&IntegerT) :
+            if empty?(regs) :               ;If no more integer registers
+              rec(x, mems)                  ;place in mem argument
+            else :
+              rec(x, regs)                  ;Otherwise place in integer register
+              next(fregs)                   ;and eat real register
+          (t:VMType&RealT) :
+            if empty?(fregs) :              ;If no more real registers
+              rec(x, mems)                  ;place in mem argument
+            else :
+              rec(x, fregs)                 ;Otherwise place in real register
+              next(regs)                    ;and eat integer register
+    (backend) :
+      for x in xs do :
+        match(type(x)) :
+          (t:VMType&IntegerT) :
+            if empty?(regs) : rec(x, mems)
+            else : rec(x, regs)
+          (t:VMType&RealT) :
+            if empty?(fregs) : rec(x, mems)
+            else : rec(x, fregs)
+  rec(crsp, CallReg(c-rsp-arg(backend)))          
+
+  ;Return RetRecords struct
+  RetRecords(to-tuple(records))
+
+defn ret-extern-records (b:InsBuffer, xs0:Seqable<VMImm>, crsp:Local, backend:Backend) -> CallRecords :
+  val records = Vector<CallRecord>()
+  val xs = to-seq(xs0)
+  val x = next(xs)
+  match(type(b,x)) :
+    (t:VMType&IntegerT) :
+      add(records, CallRecord(x, CallReg(0)))
+    (t:VMType&RealT) :
+      add(records, CallRecord(x, CallFReg(0)))
+  add(records, CallRecord(crsp, CallReg(1)))
+  CallRecords(to-tuple(records))
+
 defn ret-records (b:InsBuffer, xs:Seqable<Local|VMType>, backend:Backend) -> RetRecords :
   val records = Vector<RetRecord>()
   val regs = seq(CallReg, call-regs(backend))
@@ -925,7 +1042,7 @@ defn ret-records (b:InsBuffer, xs:Seqable<Local|VMType>, backend:Backend) -> Ret
         else : next(fregs)
     match(x:Local) :
       add(records, RetRecord(x, loc))
-  RetRecords(to-tuple(records))    
+  RetRecords(to-tuple(records))
 
 defn retc-records (b:InsBuffer, xs0:Seqable<Local|VMType>, backend:Backend) -> RetRecords :
   val records = Vector<RetRecord>()
