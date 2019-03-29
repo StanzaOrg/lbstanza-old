@@ -71,18 +71,46 @@ uint64_t alloc_stack (VMInit* init){
   return (uint64_t)stack - 8 + 1;  
 }
 
+void alloc_fixed_mem (){
+  int tries = 1000;
+  char** mems = malloc(sizeof(char*) * tries);
+  for(int i=0; i<1000; i++){
+    int size = 1024 * 1024;
+    char* amin = (char*)0x10d000000L;
+    char* amax = amin + 2 * size;
+    
+    long bigsize = 8L * 1024L * 1024L * 1024L;
+    printf("bigsize = %ld\n", bigsize);
+    mems[i] = malloc(bigsize);
+    printf("try %p\n", mems[i]);
+    char* mem_max = mems[i] + bigsize;
+    if(amin >= mems[i] && amax <= mem_max){
+      for(int j=0; j<1000; j++){
+        if(i != j) free(mems[j]);
+      }
+      return;
+    }
+  }
+  printf("Fixed memory allocation failed\n");
+  exit(-1);
+}
+
 int main (int argc, char* argv[]) {
+  alloc_fixed_mem();
+  void* heap_memory = (void*)0x10d000000L;
+  void* free_memory = (void*)(0x10d000000L + 1024 * 1024);
+  
   input_argc = argc;
   input_argv = argv;
   VMInit init;
 
   //Allocate heap and free
-  int initial_heap_size = 4 * 1024;
-  init.heap = (char*)malloc(initial_heap_size);
+  int initial_heap_size = 1024 * 1024;
+  init.heap = heap_memory; //(char*)malloc(initial_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
   printf("heap = %p, heap_limit = %p\n", init.heap, init.heap_limit);
   init.heap_top = init.heap;
-  init.free = (char*)malloc(initial_heap_size);
+  init.free = free_memory; //(char*)malloc(initial_heap_size);
   init.free_limit = init.free + initial_heap_size;
 
   //Allocate stacks
@@ -670,3 +698,14 @@ void retrieve_process_state (long pid, ProcessState* s){
 //============================================================
 //============== End Process Runtime =========================
 //============================================================
+
+//============================================================
+//=============== Test Extern ================================
+//============================================================
+
+int testcallback (float (*f)(float), int (*g)(float)) {
+  float x = f(42.0f);
+  int y = g(x);
+  printf("y = %d\n", y);
+  return 42;
+}
