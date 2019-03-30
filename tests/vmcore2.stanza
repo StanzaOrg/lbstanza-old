@@ -589,6 +589,226 @@ public defn add-gc-notifier (f: () -> ?) :
    add(GC-NOTIFIERS, f)
 
 ;<doc>=======================================================
+;====================== Stack Pool ==========================
+;============================================================
+
+Concerns:
+  - How do we retrieve a new stack from the stack pool?
+  - How do we put a stack back into the stack pool?
+  - How are the initial stacks created by the driver tracked?
+  - What happens during stack extension? When we double the size of
+    the current stack?
+  - After GC, how do we release the frames used by all the dead
+    stacks?
+
+State of Stack Pool:
+  stacks:ptr<StackFrameHeader>
+    - Array holding the allocated pointers of all the frames in
+      the pool.
+    - The used stacks are all in the first half of the array.
+    - The free stacks are in the second half of the array.
+    - All stacks in the array are of size INITIAL-STACK-SIZE.
+  capacity:int
+    - The length of the stacks array.
+  num-used:int
+    - The number of used stacks in the stack pool.
+  big-stacks:ptr<StackFrameHeader>
+    - Array holding all the larger stacks.
+  big-capacity:int
+    - The length of the big-stacks array.
+  big-size:int
+    - The number of stacks stored in the big-stacks.
+
+Memory Layout of Stack Frame Header:
+  pool-index:int
+    - The index of the stack frame in the stack pool.
+    - This index is -1 if the frame does not exist in the stack pool.
+  mark:int
+    - This mark is 0 by default during normal operation.
+    - The mark will be set to 1 during GC to indicate that the frames
+      are currently in use.
+  frames:StackFrame ...
+    - The frames start immediately after the header. The stack size is
+      counted starting from here.
+
+Global Variables:
+  INITIAL-STACK-SIZE:long
+    - The size of all stacks in the stack pool.    
+  STACK-POOL:StackPool
+    - The global stack pool.
+Interface:  
+  take-next-stack(pool:ptr<StackPool>, size:long)
+    - Retrieve a stack of the desired size from the StackPool.
+  free-stack(pool:ptr<StackPool>, stack:ptr<StackFrameHeader>)
+    - Release the given stack into the StackPool.
+  gc-if-no-stacks(pool:ptr<StackPool>)
+    - If there are no stacks available, and it is appropriate to do so,
+      run the garbage collector in an effort to free up some stacks.      
+  free-unmarked-stacks(pool:ptr<StackPool>)
+    - Free all unmarked stacks. Meant as a hook to be used by the
+      garbage collector.
+
+TODO:
+  Compile
+  Fix driver.c
+  Fix virtual machine
+  Use new lib
+  Test
+
+;============================================================
+;=======================================================<doc>
+
+lostanza deftype StackFrameHeader :
+  pool-index:int
+  mark:int
+  frames:StackFrame ...
+
+lostanza deftype StackPool :
+  capacity:int
+  num-used:int
+  stacks:ptr<ptr<StackFrameHeader>>
+  big-capacity:int
+  big-size:int
+  big-stacks:ptr<ptr<StackFrameHeader>>
+
+lostanza defn StackPool () -> StackPool :
+  ;Allocate pool for small stacks
+  val capacity = 4
+  val stacks:ptr<ptr<StackFrameHeader>> = call-c clib/fmalloc(capacity * sizeof(ptr<?>))
+  for (var i:int = 0, i < capacity, i = i + 1) :
+    stacks[i] = alloc-stack-frames(i, INITIAL-STACK-SIZE)
+  ;Allocate pool for big stacks
+  val big-capacity = 4
+  val big-stacks = call-c clib/fmalloc(big-capacity * sizeof(ptr<?>))
+  return StackPool{capacity, 0, stacks, big-capacity, 0, big-stacks}
+
+lostanza defn ensure-capacity (pool:ptr<StackPool>, capacity:int) -> int :
+  ;Do something only if we are under capacity
+  if pool.capacity < capacity :
+    ;Double the capacity until it reaches desired capacity
+    var c:int = pool.capacity
+    while c < capacity : c = c * 2
+    ;Allocate a new stacks array, and copy the old contents over.
+    val new-stacks:ptr<ptr<StackFrameHeader>> = call-c clib/fmalloc(c * sizeof(ptr<?>))
+    call-c clib/memcpy(new-stacks, pool.stacks, pool.capacity * sizeof(ptr<?>))
+    call-c clib/ffree(pool.stacks)
+    pool.stacks = new-stacks
+    ;Fill the newly-allocated slots with new stacks
+    for (var i:int = pool.capacity, i < c, i = i + 1) :
+      pool.stacks[i] = alloc-stack-frames(i, INITIAL-STACK-SIZE)
+    ;Register the newly-increased capacity
+    pool.capacity = c
+  return 0
+
+lostanza defn ensure-big-capacity (pool:ptr<StackPool>, capacity:int) -> int :
+  ;Do something only if we are under capacity
+  if pool.big-capacity < capacity :
+    ;Double the capacity until it reaches desired capacity
+    var c:int = pool.big-capacity
+    while c < capacity : c = c * 2
+    ;Allocate a new stacks array, and copy the old contents over.
+    val new-stacks = call-c clib/fmalloc(c * sizeof(ptr<?>))
+    call-c clib/memcpy(new-stacks, pool.big-stacks, pool.big-capacity * sizeof(ptr<?>))
+    call-c clib/ffree(pool.big-stacks)
+    pool.big-stacks = new-stacks
+    ;Register the newly-increased capacity
+    pool.big-capacity = c
+  return 0
+
+lostanza defn alloc-stack-frames (index:int, size:long) -> ptr<StackFrameHeader> :
+  ;The total size of the StackFrame object is the size of the header
+  ;with the size of the stack frames.
+  val frame-size = sizeof(StackFrameHeader) + size
+  val fh:ptr<StackFrameHeader> = call-c clib/fmalloc(frame-size)
+  ;Initialize parameters and return
+  fh.pool-index = index
+  fh.mark = 0
+  return fh
+
+lostanza defn take-next-stack (pool:ptr<StackPool>, size:long) -> ptr<StackFrameHeader> :
+  ;If the size is equal to INITIAL-STACK-SIZE then allocate the stack
+  ;from the stack pool.
+  if size == INITIAL-STACK-SIZE :
+    ;Create more stacks if none available
+    ensure-capacity(pool, pool.num-used + 1)  
+    ;Retrieve the next free stack
+    val s = pool.stacks[pool.num-used]  
+    ;Increment the number of used stacks
+    pool.num-used = pool.num-used + 1
+    ;Return the stack
+    return s
+  ;Otherwise, allocate the stack from the big pool.
+  else :
+    ;Allocate the stack frame object
+    val s = alloc-stack-frames(-1, size)
+    ;And register it within the big pool
+    ensure-big-capacity(pool, pool.big-size + 1)
+    pool.big-stacks[pool.big-size] = s
+    pool.big-size = pool.big-size + 1
+    ;Return the stack
+    return s    
+
+lostanza defn free-stack (pool:ptr<StackPool>, stack:ptr<StackFrameHeader>) -> int :
+  ;This function does nothing if the stack is not in the stack pool.
+  if stack.pool-index < 0 : return 0
+  
+  ;A used stack is in the first half of the pool. 
+  ;To return the stack, it must be moved to the second half of the pool.
+  ;So swap its place with the last used one in the pool.
+  val swap-index = pool.num-used - 1
+  if swap-index != stack.pool-index :
+    val x = stack
+    val xi = stack.pool-index
+    val y = pool.stacks[swap-index]
+    val yi = swap-index
+    pool.stacks[xi] = y
+    pool.stacks[yi] = x
+    x.pool-index = yi
+    y.pool-index = xi
+  ;Decrement the number of used stacks
+  pool.num-used = pool.num-used - 1  
+  return 0
+
+lostanza defn gc-if-no-stacks (pool:ptr<StackPool>) -> int :
+  if pool.num-used == pool.capacity : extend-heap(0)
+  return 0
+
+lostanza defn free-unmarked-stacks (pool:ptr<StackPool>) -> int :
+  ;Free all stacks in small pool
+  labels :
+    begin : goto loop(0)
+    loop (i:int) :
+      if i < pool.num-used :
+        val s = pool.stacks[i]
+        if s.mark == 0 :
+          free-stack(pool, s)
+          goto loop(i)
+        else :
+          s.mark = 0
+          goto loop(i + 1)
+  ;Free all stacks in big pool
+  labels :
+    begin : goto loop(0, 0)
+    loop (n:int, i:int) :
+      if i < pool.big-size :
+        val s = pool.big-stacks[i]
+        if s.mark == 0 :
+          call-c clib/ffree(s)
+          goto loop(n, i + 1)
+        else :
+          s.mark = 0
+          pool.big-stacks[n] = s          
+          goto loop(n + 1, i + 1)
+      else :
+        pool.big-size = n      
+  ;All stacks are now unmarked.
+  return 0
+
+;Global stack pool
+lostanza val INITIAL-STACK-SIZE:long = 4L * 1024L
+lostanza val STACK-POOL:StackPool = StackPool()
+
+;<doc>=======================================================
 ;====================== Stack Extension =====================
 ;============================================================
 
