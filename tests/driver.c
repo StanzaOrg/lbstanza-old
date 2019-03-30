@@ -14,6 +14,7 @@
 #include<string.h>
 #include<sys/stat.h>
 #include<sys/types.h>
+#include<sys/mman.h>
 
 //     Stanza Defined Entities
 //     =======================
@@ -52,6 +53,11 @@ int64_t stanza_entry (VMInit* init);
 int input_argc;
 char** input_argv;
 
+//FMalloc Debugging
+void init_fmalloc ();
+void* fmalloc (long size);
+void ffree (void* ptr);
+
 //     Main Driver
 //     ===========
 void* alloc (VMInit* init, long type, long size){
@@ -64,41 +70,15 @@ void* alloc (VMInit* init, long type, long size){
 uint64_t alloc_stack (VMInit* init){
   Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
   int initial_stack_size = 4 * 1024;
-  StackFrame* frames = (StackFrame*)malloc(initial_stack_size);
+  StackFrame* frames = (StackFrame*)fmalloc(initial_stack_size);
   stack->size = initial_stack_size;
   stack->frames = frames;
   stack->stack_pointer = NULL;
   return (uint64_t)stack - 8 + 1;  
 }
 
-void alloc_fixed_mem (){
-  int tries = 1000;
-  char** mems = malloc(sizeof(char*) * tries);
-  for(int i=0; i<1000; i++){
-    int size = 1024 * 1024;
-    char* amin = (char*)0x10d000000L;
-    char* amax = amin + 2 * size;
-    
-    long bigsize = 8L * 1024L * 1024L * 1024L;
-    printf("bigsize = %ld\n", bigsize);
-    mems[i] = malloc(bigsize);
-    printf("try %p\n", mems[i]);
-    char* mem_max = mems[i] + bigsize;
-    if(amin >= mems[i] && amax <= mem_max){
-      for(int j=0; j<1000; j++){
-        if(i != j) free(mems[j]);
-      }
-      return;
-    }
-  }
-  printf("Fixed memory allocation failed\n");
-  exit(-1);
-}
-
 int main (int argc, char* argv[]) {
-  alloc_fixed_mem();
-  void* heap_memory = (void*)0x10d000000L;
-  void* free_memory = (void*)(0x10d000000L + 1024 * 1024);
+  init_fmalloc();
   
   input_argc = argc;
   input_argv = argv;
@@ -106,11 +86,11 @@ int main (int argc, char* argv[]) {
 
   //Allocate heap and free
   int initial_heap_size = 1024 * 1024;
-  init.heap = heap_memory; //(char*)malloc(initial_heap_size);
+  init.heap = (char*)fmalloc(initial_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
   printf("heap = %p, heap_limit = %p\n", init.heap, init.heap_limit);
   init.heap_top = init.heap;
-  init.free = free_memory; //(char*)malloc(initial_heap_size);
+  init.free = (char*)fmalloc(initial_heap_size);
   init.free_limit = init.free + initial_heap_size;
 
   //Allocate stacks
@@ -242,6 +222,43 @@ int64_t file_time_modified (char* filename){
   if(stat(filename, &attrib) == 0)
     return (int64_t)attrib.st_mtime;
   return 0;
+}
+
+//============================================================
+//================== Fixed Memory Allocator ==================
+//============================================================
+
+char* mem_top;
+char* mem_limit;
+
+void init_fmalloc () {
+  long size = 1024L * 1024L * 1024L;
+  mem_top = (char*)0x700000000L;
+  mem_limit = mem_top + size;
+  void* result = mmap(mem_top,
+                      size,            
+                      PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
+                      0,
+                      0);
+  if(!result){
+    printf("Could not allocate fixed memory.\n");
+    exit(-1);
+  }  
+}
+
+void* fmalloc (long size){
+  char* ret = mem_top;
+  mem_top += size;
+  if(mem_top > mem_limit){
+    printf("Out of fixed memory.\n");
+    exit(-1);    
+  }
+  return ret;
+}
+
+void ffree (void* ptr){
+  return;
 }
 
 //============================================================
@@ -698,14 +715,3 @@ void retrieve_process_state (long pid, ProcessState* s){
 //============================================================
 //============== End Process Runtime =========================
 //============================================================
-
-//============================================================
-//=============== Test Extern ================================
-//============================================================
-
-int testcallback (float (*f)(float), int (*g)(float)) {
-  float x = f(42.0f);
-  int y = g(x);
-  printf("y = %d\n", y);
-  return 42;
-}
