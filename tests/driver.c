@@ -35,6 +35,12 @@ typedef struct{
 } StackFrame;
 
 typedef struct{
+  int pool_index;
+  int mark;
+  StackFrame frames[];
+} StackFrameHeader;
+
+typedef struct{
   uint64_t size;
   StackFrame* frames;
   StackFrame* stack_pointer;
@@ -70,9 +76,12 @@ void* alloc (VMInit* init, long type, long size){
 uint64_t alloc_stack (VMInit* init){
   Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
   int initial_stack_size = 4 * 1024;
-  StackFrame* frames = (StackFrame*)fmalloc(initial_stack_size);
+  long size = initial_stack_size + sizeof(StackFrameHeader);
+  StackFrameHeader* frameheader = (StackFrameHeader*)fmalloc(size);
+  frameheader->pool_index = -1;
+  frameheader->mark = 0;
   stack->size = initial_stack_size;
-  stack->frames = frames;
+  stack->frames = frameheader->frames;
   stack->stack_pointer = NULL;
   return (uint64_t)stack - 8 + 1;  
 }
