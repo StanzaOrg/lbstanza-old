@@ -16,6 +16,14 @@
 #include<sys/types.h>
 #include<sys/mman.h>
 
+//       Forward Declarations
+//       ====================
+
+//FMalloc Debugging
+void init_fmalloc ();
+void* fmalloc (long size);
+void ffree (void* ptr);
+
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
@@ -58,11 +66,6 @@ int64_t stanza_entry (VMInit* init);
 //     ======================
 int input_argc;
 char** input_argv;
-
-//FMalloc Debugging
-void init_fmalloc ();
-void* fmalloc (long size);
-void ffree (void* ptr);
 
 //     Main Driver
 //     ===========
@@ -234,13 +237,66 @@ int64_t file_time_modified (char* filename){
 }
 
 //============================================================
+//======================= Free List ==========================
+//============================================================
+
+typedef struct {
+  int capacity;
+  int size;
+  void** items;
+} FreeList;
+
+FreeList make_freelist (int c){
+  void** items = (void**)malloc(c * sizeof(void*));
+  FreeList f = {c, 0, items};
+  return f;
+}
+
+void ensure_capacity (FreeList* list, int c){
+  if(list->capacity < c){
+    int c2 = list->capacity;
+    while(c2 < c) c2 *= 2;
+    void** items2 = (void**)malloc(c2 * sizeof(void*));
+    memcpy(items2, list->items, list->capacity * sizeof(void*));
+    free(list->items);
+    list->items = items2;
+    list->capacity = c2;
+  }
+}
+
+void delete_index (FreeList* list, int xi){
+  int yi = list->size - 1;
+  void* x = list->items[xi];
+  void* y = list->items[yi];
+  if(xi != yi){
+    list->items[xi] = y;
+    list->items[yi] = x;
+  }
+  list->size--;
+}
+
+void add_item (FreeList* list, void* item){
+  int i = list->size;
+  ensure_capacity(list, i + 1);
+  list->items[i] = item;
+  list->size++;
+}
+
+//============================================================
 //================== Fixed Memory Allocator ==================
 //============================================================
 
+typedef struct {
+  long size;
+  char bytes[];
+} Chunk;
+
 char* mem_top;
 char* mem_limit;
+FreeList mem_chunks;
 
 void init_fmalloc () {
+  mem_chunks = make_freelist(8);
   long size = 1024L * 1024L * 1024L;
   mem_top = (char*)0x700000000L;
   mem_limit = mem_top + size;
@@ -256,18 +312,47 @@ void init_fmalloc () {
   }  
 }
 
-void* fmalloc (long size){
-  char* ret = mem_top;
-  mem_top += size;
+Chunk* alloc_chunk (long size){
+  long total_size = (size + sizeof(Chunk) + 7) & -8;
+  Chunk* chunk = (Chunk*)mem_top;
+  mem_top += total_size;
   if(mem_top > mem_limit){
     printf("Out of fixed memory.\n");
-    exit(-1);    
+    exit(-1);
   }
-  return ret;
+  chunk->size = size;
+  return chunk;
+}
+
+Chunk* find_chunk (long size){
+  Chunk* best = 0;
+  int besti = 0;
+  for(int i=0; i<mem_chunks.size; i++){
+    Chunk* c = mem_chunks.items[i];
+    int is_best = 0;
+    if(c->size >= size){
+      if(best) is_best = c->size < best->size;
+      else is_best = 1;
+    }
+    if(is_best){
+      best = c;
+      besti = i;
+    }
+  }
+  if(best)
+    delete_index(&mem_chunks, besti);
+  return best;
+}
+
+void* fmalloc (long size){
+  Chunk* c = find_chunk(size);
+  if(!c) c = alloc_chunk(size);
+  return c->bytes;
 }
 
 void ffree (void* ptr){
-  return;
+  Chunk* c = (Chunk*)((char*)ptr - sizeof(Chunk));
+  add_item(&mem_chunks, c);
 }
 
 //============================================================
