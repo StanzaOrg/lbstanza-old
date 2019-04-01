@@ -21,8 +21,10 @@
 
 //FMalloc Debugging
 void init_fmalloc ();
-void* fmalloc (long size);
-void ffree (void* ptr);
+
+//Stanza Alloc
+void* stz_malloc (long size);
+void stz_free (void* ptr);
 
 //     Stanza Defined Entities
 //     =======================
@@ -80,7 +82,7 @@ uint64_t alloc_stack (VMInit* init){
   Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
   int initial_stack_size = 4 * 1024;
   long size = initial_stack_size + sizeof(StackFrameHeader);
-  StackFrameHeader* frameheader = (StackFrameHeader*)fmalloc(size);
+  StackFrameHeader* frameheader = (StackFrameHeader*)stz_malloc(size);
   frameheader->pool_index = -1;
   frameheader->mark = 0;
   stack->size = initial_stack_size;
@@ -98,11 +100,11 @@ int main (int argc, char* argv[]) {
 
   //Allocate heap and free
   int initial_heap_size = 1024 * 1024;
-  init.heap = (char*)fmalloc(initial_heap_size);
+  init.heap = (char*)stz_malloc(initial_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
   printf("heap = %p, heap_limit = %p\n", init.heap, init.heap_limit);
   init.heap_top = init.heap;
-  init.free = (char*)fmalloc(initial_heap_size);
+  init.free = (char*)stz_malloc(initial_heap_size);
   init.free_limit = init.free + initial_heap_size;
 
   //Allocate stacks
@@ -179,10 +181,10 @@ int64_t file_write_block (FILE* f, char* data, int64_t len) {
   char* resolve_path (char* filename){
     if(file_exists(filename)){
       char* fileext;
-      char* path = (char*)malloc(2048);
+      char* path = (char*)stz_malloc(2048);
       int ret = GetFullPathName(filename, 2048, path, &fileext);
       if(ret == 0){
-        free(path);
+        stz_free(path);
         return 0;
       }else{
         return path;
@@ -210,18 +212,18 @@ int64_t file_write_block (FILE* f, char* data, int64_t len) {
         return 0;
     }
     //(Over)write the environment variable.
-    char* buffer = (char*)malloc(strlen(name) + strlen(value) + 10);
+    char* buffer = (char*)stz_malloc(strlen(name) + strlen(value) + 10);
     sprintf(buffer, "%s=%s", name, value);
     int r = _putenv(buffer);
-    free(buffer);
+    stz_free(buffer);
     return r;
   }
 
   int unsetenv (char* name){
-    char* buffer = (char*)malloc(strlen(name) + 10);
+    char* buffer = (char*)stz_malloc(strlen(name) + 10);
     sprintf(buffer, "%s=", name);
     int r = _putenv(buffer);
-    free(buffer);
+    stz_free(buffer);
     return r;
   }
 #endif
@@ -297,7 +299,7 @@ FreeList mem_chunks;
 
 void init_fmalloc () {
   mem_chunks = make_freelist(8);
-  long size = 1024L * 1024L * 1024L;
+  long size = 8L * 1024L * 1024L * 1024L;
   mem_top = (char*)0x700000000L;
   mem_limit = mem_top + size;
   void* result = mmap(mem_top,
@@ -312,7 +314,7 @@ void init_fmalloc () {
   }  
 }
 
-Chunk* alloc_chunk (long size){
+Chunk* alloc_chunk (long size){  
   long total_size = (size + sizeof(Chunk) + 7) & -8;
   Chunk* chunk = (Chunk*)mem_top;
   mem_top += total_size;
@@ -353,6 +355,26 @@ void* fmalloc (long size){
 void ffree (void* ptr){
   Chunk* c = (Chunk*)((char*)ptr - sizeof(Chunk));
   add_item(&mem_chunks, c);
+}
+
+//============================================================
+//================= Stanza Memory Allocator ==================
+//============================================================
+
+void* stz_malloc (long size){
+  #if defined(FMALLOC)
+    return fmalloc(size);
+  #else
+    return malloc(size);
+  #endif
+}
+
+void stz_free (void* ptr){
+  #if defined(FMALLOC)
+    ffree(ptr);
+  #else
+    free(ptr);
+  #endif
 }
 
 //============================================================
@@ -418,7 +440,7 @@ int count_non_null (void** xs){
 
 char* string_join (char* a, char* b){
   int len = strlen(a) + strlen(b);
-  char* buffer = (char*)malloc(len + 1);
+  char* buffer = (char*)stz_malloc(len + 1);
   sprintf(buffer, "%s%s", a, b);
   return buffer;
 }
@@ -427,7 +449,7 @@ char* string_join (char* a, char* b){
 int open_pipe (char* prefix, char* suffix, int options){
   char* name = string_join(prefix, suffix);
   int fd = open(name, options);
-  free(name);
+  stz_free(name);
   return fd;
 }
 
@@ -505,7 +527,7 @@ char* read_string (FILE* f){
   if(n < 0)
     return NULL;
   else{    
-    char* s = (char*)malloc(n + 1);
+    char* s = (char*)stz_malloc(n + 1);
     bread(s, 1, n, f);
     s[n] = '\0';
     return s;
@@ -513,14 +535,14 @@ char* read_string (FILE* f){
 }
 char** read_strings (FILE* f){
   int n = read_int(f);
-  char** xs = (char**)malloc(sizeof(char*)*(n + 1));
+  char** xs = (char**)stz_malloc(sizeof(char*)*(n + 1));
   for(int i=0; i<n; i++)
     xs[i] = read_string(f);
   xs[n] = NULL;
   return xs;
 }
 EvalArg* read_earg (FILE* f){
-  EvalArg* earg = (EvalArg*)malloc(sizeof(EvalArg));
+  EvalArg* earg = (EvalArg*)stz_malloc(sizeof(EvalArg));
   earg->pipe = read_string(f);
   earg->in_pipe = read_string(f);
   earg->out_pipe = read_string(f);
@@ -536,14 +558,14 @@ void read_process_state (FILE* f, ProcessState* s){
 
 //===== Free =====
 void free_earg (EvalArg* arg){
-  free(arg->pipe);
-  if(arg->in_pipe != NULL) free(arg->in_pipe);
-  if(arg->out_pipe != NULL) free(arg->out_pipe);
-  if(arg->err_pipe != NULL) free(arg->err_pipe);
-  free(arg->file);
+  stz_free(arg->pipe);
+  if(arg->in_pipe != NULL) stz_free(arg->in_pipe);
+  if(arg->out_pipe != NULL) stz_free(arg->out_pipe);
+  if(arg->err_pipe != NULL) stz_free(arg->err_pipe);
+  stz_free(arg->file);
   for(int i=0; arg->argvs[i] != NULL; i++)
-    free(arg->argvs[i]);
-  free(arg->argvs);
+    stz_free(arg->argvs[i]);
+  stz_free(arg->argvs);
 }
 
 //------------------------------------------------------------
