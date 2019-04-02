@@ -1,0 +1,2591 @@
+defpackage stz/el :
+  import core
+  import collections
+  import stz/dl-ir
+  import stz/el-ir
+  import stz/utils
+  import stz/algorithms
+  import stz/ehier
+  import stz/basic-blocks
+
+;============================================================
+;========================= Lowering =========================
+;============================================================
+
+public defn lower (epackage:EPackage) -> EPackage :
+  ;Reset id generation
+  take-ids(epackage)
+
+  ;Retrieve core types
+  val iotable = IOTable(packageio(epackage))
+
+  var cur-package:EPackage = epackage
+  ;ensure-unique-identifiers!(cur-package)
+
+  defn dump (suffix:String) :
+    ;DEBUGGING
+    val [package, local-name] = qualifier(name(cur-package))
+    val filename = append(to-string(local-name), suffix)
+    spit(filename, cur-package)
+    false
+
+  dump(".el.input")
+
+  var global-vt:VarTable = GlobalVarTable(cur-package, iotable)
+  val ehier = EHier(packageio(epackage), iotable)
+
+  within time-ms!("Map Methods") :
+    cur-package = map-methods(cur-package, global-vt)
+    dump(".el.mapped-methods")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Create Closures") :
+    cur-package = create-closures(cur-package, global-vt)
+    dump(".el.closures")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Convert Mixes") :
+    cur-package = convert-mixes(cur-package, global-vt)
+    dump(".el.mixes")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Insert Guards") :
+    cur-package = insert-guards(cur-package, global-vt)
+    dump(".el.guarded")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Elide Checks") :
+    cur-package = elide-checks(cur-package, ehier, global-vt)
+    dump(".el.elided")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Annotate Live") :
+    cur-package = annotate-live(cur-package)
+    dump(".el.live")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Convert Checks to Typeof") :
+    cur-package = convert-checks-to-typeof(cur-package)
+    dump(".el.typeof")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Box Mutables") :
+    cur-package = box-mutables(cur-package, global-vt)
+    dump(".el.boxed")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Detect Loops") :
+    cur-package = detect-loops(cur-package)
+    dump(".el.looped")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Simple Inline") :
+    cur-package = simple-inline(cur-package)
+    dump(".el.inlined")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Within Package Inline") :
+    cur-package = within-package-inline(cur-package)
+    dump(".el.wp-inlined")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Lambda Lift") :
+    cur-package = lambda-lift(cur-package, global-vt)
+    global-vt = GlobalVarTable(cur-package, iotable)
+    dump(".el.lambda")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Lift Objects") :
+    cur-package = lift-objects(cur-package, global-vt)
+    dump(".el.objlifted")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Lift Closures") :
+    cur-package = lift-closures(cur-package, global-vt)
+    dump(".el.closurelifted")
+  ;ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Lift Type Objects") :
+    cur-package = lift-type-objects(cur-package)
+    dump(".el.typelifted")
+  ;ensure-unique-identifiers!(cur-package)
+
+  cur-package
+
+;============================================================
+;================= Sanity Checks ============================
+;============================================================
+
+defn ensure-unique-identifiers! (epackage:EPackage) :
+  ;Track used and nonused identifiers
+  val idset = IntSet()
+  val non-unique = IntSet()
+  within id = used-ids(epackage) :
+    if not add(idset, id) :
+      add(non-unique, id)
+
+  ;Issue errors
+  if not empty?(non-unique) :
+    fatal $ new Printable :
+      defmethod print (o:OutputStream, this) :
+        print(o, "The following identifiers are declared more than once: %," % [non-unique])
+        print(o, "\nThe program is as follows:\n%_" % [epackage])
+
+;============================================================
+;====================== Unique IDs ==========================
+;============================================================
+defn take-ids (epackage:EPackage) :
+  take-ids $ generate<Int> :
+    used-ids(yield, epackage)
+
+val TAKEN-IDS = IntSet()
+var ID-COUNTER:Seq<Int> = to-seq(0 to false)
+
+defn take-ids (ids:Seqable<Int>) :
+  clear(TAKEN-IDS)
+  add-all(TAKEN-IDS, ids)
+  ID-COUNTER = to-seq(0 to false)
+
+defn used-ids (return:Int -> ?, epackage:EPackage) :
+  ;Overloading
+  defn def (n:Int) : return(n)
+  defn def (ns:Tuple<Int>) : do(return, ns)
+
+  ;Look at imports
+  for import in imports(packageio(epackage)) do :
+    def(n(import))
+
+  ;Look at definitions
+  defn scan (e:ELItem) :
+    do(scan, e)
+    match(e) :
+      ;Top Level
+      (e:EDefGlobal) : def(n(e))
+      (e:EDefn) : def(n(e))
+      (e:EDefClosure) : (def(n(e)), def(closure(e)))
+      (e:EDefmulti) : (def(n(e)), def(targs(e)))
+      (e:EDefmethod) : def(n(e))
+      (e:EDefStruct) : def(n(e))
+      (e:EExternFn) : def(n(e))
+      (e:EDefType) : def(n(e))
+      (e:EDefObject) : def(n(e))
+      (e:EDefTypeObject) : def(n(e))
+      ;Locals
+      (e:EFn) : (def(targs(e)), def(args(e)))
+      (e:ELocal) : def(n(e))
+      (e:ELocalType) : def(n(e))
+      (e:ELocalFn) : def(n(e))
+      (e:ELocalObj) : def(n(e))
+      ;Remaining
+      (e) : false
+  do(scan, exps(epackage))
+
+;Generates a globally unique id.
+defn uniqueid () -> Int :
+  for i in ID-COUNTER find! :
+    not TAKEN-IDS[i]
+
+;============================================================
+;================== Method TArg Mapping =====================
+;============================================================
+
+;INPUT:
+;  input-xs: The type variables for the method.
+;  targs: The types passed to the multi
+;OUTPUT: [ys, ytypes]
+;  ys: The new type variables for the method
+;  xtypes: The values for the old input-xs, expressed in terms of ys.
+defn inverse-solve (input-xs:Tuple<Int>, targs:Tuple<EType>) -> [Tuple<Int>, Tuple<EType>] :
+  ;Created targs
+  val ys = map(uniqueid{}, targs)
+
+  ;Initialize solved table
+  val solved = IntTable<ETVar>()
+  ;Precise Solutions
+  for (t in targs, y in ys) do :
+    match(t:ETVar) : set?(solved, n(t), ETVar{y})
+  ;Approximate Solutions
+  for (t in targs, y in ys) do :
+    let loop (t:EType = t) :
+      match(t) :
+        (t:ETVar) : set?(solved, n(t), ETVar{y})
+        (t:EOr) : do*(loop, t)
+        (t) : false
+  ;Return solutions
+  val solns = map(get?{solved, _, ETop()}, input-xs)
+  [ys, solns]
+
+defn replace-tvars (f:EFn, xs:Tuple<Int>, ys:Tuple<EType>) :
+  val table = to-inttable<EType>(xs,ys)
+  defn loop (x:EType) :
+    match(x) :
+      (x:ETVar) : get?(table, n(x), ETop())
+      (x) : map(loop, x)
+  map(loop, f)
+
+defn replace-tvars (t:EType, xs:Tuple<Int>, ys:Tuple<EType>) :
+  val table = to-inttable<EType>(xs,ys)
+  defn loop (x:EType) :
+    match(x) :
+      (x:ETVar) : get?(table, n(x), ETop())
+      (x) : map(loop, x)
+  loop(t)
+
+defn map-methods (e:EPackage, gvt:VarTable) :
+  ;Return the return type of the given multi with the new
+  ;type arguments.
+  defn multi-return-type (multi:Int, arity:Int, new-targs:Tuple<Int>) :
+    val [a1, a2] = fn-types(gvt, multi, arity, map(ETVar,new-targs))
+    a2
+    
+  defn loop (x:ELBigItem) :
+    map{loop, _} $ match(x) :
+      (m:EDefmethod) :
+        val arity = length(args(func(m)))
+        val [targs*, tvals] = inverse-solve(targs(func(m)), targs(m))
+        val mrt = multi-return-type(multi(m), arity, targs*)        
+        var func*:EFn = replace-tvars(func(m), targs(func(m)), tvals)
+        func* = sub-targs(func*, targs*)
+        func* = sub-a2(func*, EAnd(a2(func*), mrt))
+        EDefmethod(n(m), multi(m), [], func*, lostanza?(m))
+      (m:EMethod) :
+        val arity = length(args(func(m)))
+        val [targs*, tvals] = inverse-solve(targs(func(m)), targs(m))
+        val mrt = multi-return-type(multi(m), arity, targs*)
+        var func*:EFn = replace-tvars(func(m), targs(func(m)), tvals)
+        func* = sub-targs(func*, targs*)
+        func* = sub-a2(func*, EAnd(a2(func*), mrt))
+        EMethod(multi(m), [], thisn(m), func*)
+      (x) :
+        x
+  map(loop, e)
+
+;============================================================
+;===================== Body Buffer ==========================
+;============================================================
+
+deftype BodyBuffer
+defmulti emit (b:BodyBuffer, x:ELocal|ELocalType|ELocalFn|ELocalObj|EIns) -> False
+defmulti to-body (b:BodyBuffer, append-locals?:True|False, append-fns?:True|False, append-objs?:True|False) -> EBody
+
+defn BodyBuffer (body:EBody) :
+  val new-locals = Vector<ELocal>()
+  val new-localtypes = Vector<ELocalType>()
+  val new-localfns = Vector<ELocalFn>()
+  val new-localobjs = Vector<ELocalObj>()
+  val new-ins = Vector<EIns>()
+  new BodyBuffer :
+    defmethod emit (this, x:ELocal|ELocalType|ELocalFn|ELocalObj|EIns) :
+      val xs = match(x) :
+        (x:ELocal) : new-locals
+        (x:ELocalType) : new-localtypes
+        (x:ELocalFn) : new-localfns
+        (x:ELocalObj) : new-localobjs
+        (x:EIns) : new-ins
+      add(xs, x)
+    defmethod to-body (this, append-locals?:True|False, append-fns?:True|False, append-objs?:True|False) :
+      defn append?<?T> (append?:True|False, xs:Tuple<?T>, ys:Vector<?T>) :
+        if not append? : to-tuple(ys)
+        else if empty?(ys) : xs
+        else : to-tuple(cat(xs,ys))
+      val locals* = append?(append-locals?, locals(body), new-locals)
+      val localtypes* = append?(append-locals?, localtypes(body), new-localtypes)
+      val localfns* = append?(append-fns?, localfns(body), new-localfns)
+      val localobjs* = append?(append-objs?, localobjs(body), new-localobjs)
+      val ins* = to-tuple(new-ins)
+      EBody(locals*, localtypes*, localfns*, localobjs*, ins*)
+
+defn emit-all (b:BodyBuffer, xs:Seqable<ELocal|ELocalType|ELocalFn|ELocalObj|EIns>) :
+  do(emit{b, _}, xs)
+
+defn to-body (b:BodyBuffer) :
+  to-body(b, true, true, true)
+
+;============================================================
+;=================== Closure Creation =======================
+;============================================================
+defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
+  ;Retrieve an info from the given immediate
+  defn first-info (f:EVar|ECurry|EMix) :
+    match(f) :
+      (f:EVar) : info(f)
+      (f:ECurry) : info(x(f))
+      (f:EMix) : find({_ is FileInfo}, seq(first-info, funcs(f)))
+
+  ;Key utilities for EVar|ECurry
+  defn var-hash (e:EVar|ECurry) :
+    match(e) :
+      (e:EVar) : n(e)
+      (e:ECurry) : 11 * n(x(e)) + hash(targs(e))      
+  defn var-equal? (a:EVar|ECurry, b:EVar|ECurry) :
+    match(a, b) :
+      (a:EVar, b:EVar) : n(a) == n(b)
+      (a:ECurry, b:ECurry) : n(x(a)) == n(x(b)) and targs(a) == targs(b)
+      (a, b) : false      
+  defn var-table<T> () :
+    HashTable<EVar|ECurry, T>(var-hash, var-equal?)
+
+  ;Create a trampoline function that calls the given immediate
+  ;with known arity.
+  defn trampoline-fn (f:EVar|ECurry|EMix, arity:Int, vt:VarTable) :
+    defn times<?T> (n:Int, f:() -> ?T) :
+      to-tuple(repeatedly(f,n))
+    val args = arity * uniqueid
+    val [a1, a2] = match(f) :
+      (f:EVar|ECurry) : fn-types(vt, f, arity)
+      (f:EMix) : [arity * ETop, ETop()]
+    EFn(true, [], args, arity * ETop, ETop(),
+      EBody([], [], [], [], [
+        ETCall(f, map(EVar,args), CallGuarded(a1,a2), first-info(f))])
+      false)
+
+  ;Create a trampoline function that calls the given immediate
+  ;with unknown (and potentially multiple) arities.
+  defn trampoline-fn (f:EVar|ECurry|EMix, vt:VarTable) :
+    ;Gather all branches
+    val branches = Vector<KeyValue<Int,EVar|ECurry>>()
+    let loop (f:EImm = f) :
+      match(f) :
+        (f:EVar) :
+          for a in arities(vt,n(f)) do :
+            add(branches, a => f)
+        (f:ECurry) :
+          for a in arities(vt,n(x(f))) do :
+            add(branches, a => f)
+        (f:EMix) :
+          do(loop, funcs(f))
+
+    ;If there's only one
+    if length(branches) == 1 :
+      val b = branches[0]
+      trampoline-fn(value(b), key(b), vt)
+    else :
+      EMultifn $ to-tuple $
+        for group in group-by(key, value, branches) seq :
+          trampoline-fn{_, key(group), vt} $
+            switch(length(value(group))) :
+              1 : head(value(group))
+              else : EMix(to-tuple(value(group)))
+
+  ;Lift all first-class functions in body
+  defn analyze-body (top-body:EBody, vt:VarTable) :
+
+    ;Create trampoline table
+    val trampoline-table = var-table<Int>()
+    val trampolines = IntListTable<ELocalFn>()
+    val initialized? = IntSet()
+    defn uninitialized-trampolines () :
+      for entry in trampolines seq-cat :
+        if initialized?[key(entry)] : []
+        else : value(entry)
+
+    ;Lift all first-class functions in body to trampolines
+    defn lift-trampolines (e:ELBigItem, top?:True|False) :
+      match(map(lift-trampolines{_, false}, e)) :
+        (e:EBody) :
+          ;New definitions
+          val buffer = BodyBuffer(e)
+
+          ;Retrieve the wrapped identifier in EVar|ECurry
+          defn var-id (e:EVar) : n(e)
+          defn var-id (e:ECurry) : var-id(x(e))          
+          defn lift (x:EVar|ECurry|EMix) -> EVar :
+            ;Closure is (conservatively) allocated at use-site if it is a EMix
+            ;or if it curries over type variables.
+            val allocate-at-use-site? = match(x) :
+              (x:EMix) : true
+              (x:ECurry) : any?(has-tvar?, targs(x))
+              (x:EVar) : false
+            ;If at use-site, then init here, otherwise lift to trampoline table
+            if allocate-at-use-site? :
+              val v = uniqueid()
+              emit(buffer, ELocalFn(v, trampoline-fn(x, vt)))
+              emit(buffer, EInitClosures([EVarLoc(v)], first-info(x)))
+              EVar(v)
+            else :
+              val x = x as EVar|ECurry
+              if not key?(trampoline-table, x) :
+                val v = uniqueid()
+                add(trampolines, var-id(x), ELocalFn(v, trampoline-fn(x, vt)))
+                trampoline-table[x] = v
+              EVar(trampoline-table[x])
+
+          ;Analyze an immediate, lifting when necessary
+          defn lift-imm (x:EImm) :
+            match(x) :
+              (x:EVar) : lift(x) when function?(vt,n(x)) else x
+              (x:ECurry|EMix) : lift(x)
+              (x) : x
+
+          ;Analyze all instructions
+          for i in ins(e) do :
+            val i* = match(i) :
+              (i:ECall|ETCall) : sub-ys(i, map(lift-imm,ys(i)))
+              (i) : map(lift-imm, i)
+            emit(buffer, i*)
+
+          ;Return function with lifted closures
+          init-trampolines(to-body(buffer), top?)
+        ;Just return if not a body
+        (e) : e
+
+    ;Initialize trampolines.
+    defn init-trampolines (body:EBody, top?:True|False) :
+      val buffer = BodyBuffer(body)
+      ;Emit all trampolines for functions
+      for f in localfns(body) do :
+        for t in trampolines[n(f)] do :
+          add(initialized?, n(f))          
+          emit(buffer, t)
+      ;Emit remaining trampolines
+      if top? :
+        do(emit{buffer, _}, uninitialized-trampolines())
+        val locs = seq(EVarLoc{n(_)}, uninitialized-trampolines())
+        if not empty?(locs) :
+          emit(buffer, EInitClosures(to-tuple(locs), false))
+      ;Emit instructions with added initializations
+      for i in ins(body) do :
+        match(i:EInitClosures) :
+          val xs* = for x in xs(i) seq-cat :
+            val ts = seq(EVarLoc{n(_)}, trampolines[n(x)])              
+            cat([x], ts)
+          emit(buffer, EInitClosures(to-tuple(xs*), info(i)))
+        else : emit(buffer, i)
+      ;Return body
+      to-body(buffer)
+
+    ;Driver
+    lift-trampolines(top-body, true)
+
+  ;Recursive Analysis
+  defn analyze (x:ELBigItem, vt:VarTable) :
+    match(x:EBody) : analyze-body(x, vt)
+    else : map(analyze{_, vt}, x)
+  map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
+
+;============================================================
+;===================== Mix Conversion =======================
+;============================================================
+
+public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
+  ;Analyze a given body
+  defn analyze-body (body:EBody, vt:VarTable) :
+    ;Create buffer
+    val buffer = BodyBuffer(body)
+
+    ;Split a call into a dispatch branch
+    defn make-dispatch (Call:(EVarLoc|False, EImm, Tuple<EImm>, CallGuarded, False|FileInfo) -> EIns,
+                        x:EVarLoc|False, f:EMix, ys:Tuple<EImm>, info:False|FileInfo, end?:True|False) :
+      ;Construct branches and blocks
+      val branches = Vector<EBranch>()
+      val blocks = Vector<(() -> False)>()
+      val refmask = map(reftype?, a1) where :
+        val [a1, a2] = fn-types(vt, funcs(f)[0], length(ys))
+      val end-lbl = uniqueid()
+      for f in funcs(f) do :
+        val [a1, a2] = fn-types(vt, f, length(ys))
+        val lbl = uniqueid()
+        add(branches, EBranch(select(a1,refmask), lbl, false))
+        add{blocks, _} $ fn () :
+          emit(buffer, ELabel(lbl))
+          emit(buffer, Call(x, f, ys, CallGuarded(a1, a2), info))
+          emit(buffer, EGoto(end-lbl)) when not end?
+      ;Yield branches
+      emit(buffer, EDispatch(select(ys,refmask), to-tuple(branches), info))
+      for b in blocks do : b()
+      emit(buffer, ELabel(end-lbl)) when not end?
+
+    ;Scan through instructions
+    for i in ins(body) do :
+      ;Dispatch needed?
+      val dispatch? = match(i:ECall|ETCall) : f(i) is EMix
+      if dispatch? :
+        match(i) :
+          (i:ECall) :
+            within (x, f, ys, g, info) = make-dispatch(x(i), f(i) as EMix, ys(i), info(i), false) :
+              match(calltype(i):CallGuarded) : ECall(x, f, ys, g, info)
+              else : ECall(x, f, ys, calltype(i), info)
+          (i:ETCall) :
+            within (_, f, ys, g, info) = make-dispatch(false, f(i) as EMix, ys(i), info(i), true) :
+              match(calltype(i):CallGuarded) : ETCall(f, ys, g, info)
+              else : ETCall(f, ys, calltype(i), info)
+      else :
+        emit(buffer, i)
+
+    ;Yield new body
+    to-body(buffer)
+
+  ;Recursively analyze body
+  defn analyze (x:ELBigItem, vt:VarTable) :
+    match(map(analyze{_, vt}, x)) :
+      (x:EBody) : analyze-body(x,vt)
+      (x) : x
+  map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
+
+;============================================================
+;=============== Boundary Guard Derivations  ================
+;============================================================
+;<DOC>
+Philosophy:
+- All possible boundary changes are checked.
+- There is only one exception: interaction with a LoStanza object
+  from within a LoStanza context.
+
+All possible boundary guards:
+- EDefn
+  - Arguments must be correct type.
+- EDefmethod
+  - Arguments must be correct type.
+- ELocalFn
+  - Arguments must be correct type.
+- EMethod
+  - Arguments must be correct type.
+- EVar
+  - Variable must be assigned.
+  - Variable must have correct type.
+- EDef
+  - Initializing value must have correct type.
+- EStore to EVarLoc
+  - Value must have correct type.
+- ETCall
+  - Arguments must have correct type.
+  - Function must have Fn type.
+- ECall
+  - Arguments must have correct type.
+  - Function must have Fn type.
+  - If return type is bottom :
+    - Call should not return.
+  - Otherwise:
+    - Return value must have correct type.
+- EBranch
+  - Arguments must have correct type.
+- ECheckLength
+  - Expression must have Tuple type.
+- EReturn
+  - Value must have correct type.
+
+Implementation:
+- HiStanza functions :
+  - Arguments are checked before call.
+  - Return value is checked within function. (Unless tailcall.)
+- HiStanza variables :
+  - Values are checked before assignment.
+;<DOC>
+;============================================================
+;==================== Boundary Guards =======================
+;============================================================
+
+public defn insert-guards (epackage:EPackage, gvt:VarTable) :
+  ;Guard expression for body
+  defn guard-body (body:EBody, buffer:BodyBuffer, vt:VarTable,
+                   lostanza-context?:True|False,
+                   return-type:EType|False, function-info:FileInfo|False) :
+    ;Buffer for holding label entrance guards
+    val entry-blocks = IntTable<List<EIns>>(List())
+    defn add-entry (b:Int, i:EIns) : update(entry-blocks, cons{i, _}, b)
+
+    ;Set indicating that a variable was uninitialized
+    val uninitialized-vars = IntSet()
+
+    ;Return true if n refers to a reference-typed variable.
+    defn refvar? (n:Int) :
+      variable?(vt,n) and reftype?(type(vt,n))
+
+    ;Ensure that variable has been set
+    defn ensure-vars-set (x:EImm) :
+      match(x:EVar) :
+        ;Possible unset
+        val can-be-unset? =
+          if refvar?(n(x)) :
+            global?(vt,n(x)) or
+            (mutable?(vt,n(x)) and uninitialized-vars[n(x)])
+        ;Compute whether to emit check
+        val emit-check? =
+          if lostanza-context? and lostanza?(vt,n(x)) : false
+          else : can-be-unset?
+        ;Emit check
+        emit(buffer, ECheckSet(x,name(x),info(x))) when emit-check?
+
+    ;Ensure that variables have correct type
+    defn ensure-vars-type-consistent (x:EImm) :
+      match(x:EVar) :
+        ;Possible inconsistent
+        val can-be-inconsistent? =
+          refvar?(n(x)) and lostanza?(vt,n(x))
+        if not lostanza-context? and can-be-inconsistent? :
+          val t = type(vt,n(x))
+          emit(buffer, ECheck(x, t, GetVarContext(), info(x)))
+
+    ;Emit guards for each instruction
+    for ins in ins(body) do :
+      ;Ensure that variables have been set
+      do*(ensure-vars-set, ins)
+      ;Ensure that variables are type-consistent
+      do*(ensure-vars-type-consistent, ins)
+
+      match(ins) :
+        (ins:EDef) :
+          ;Track whether x(ins) can be uninitialized.
+          if y(ins) is False :
+            add(uninitialized-vars, n(x(ins)))
+          ;Guard the initialization value
+          if not lostanza-context? and y(ins) is-not False :
+            val t = type(vt,n(x(ins)))
+            val y = y(ins) as EImm
+            emit(buffer, ECheck(y, t, DefContext(), info(ins)))
+          ;Initialize x
+          emit(buffer, ins)
+        (ins:EStore) :
+          ;Guard the assigned value
+          match(loc(ins)) :
+            (l:EVarLoc) :
+              val check? =
+                if lostanza-context? and lostanza?(vt,n(l)) : false
+                else : true
+              if check? and refvar?(n(l)) :
+                val t = type(vt,n(l))
+                emit(buffer, ECheck(y(ins), t, SetContext(), info(ins)))
+            (l) : false
+          ;Store
+          emit(buffer, ins)
+        (ins:ECheckLength) :
+          if not lostanza-context? :
+            val tuple = EOf(n(iotable(vt), CORE-TUPLE-ID))
+            emit(buffer, ECheck(y(ins), tuple, DetupleContext(), info(ins)))
+          emit(buffer, ins)
+        (ins:EReturn) :
+          match(return-type:EType) :
+            emit(buffer, ECheck(y(ins), return-type, ReturnContext(), function-info))
+          emit(buffer, ins)
+        (ins:EMatch|EDispatch) :
+          val branches* = for b in branches(ins) map :
+            if not lostanza-context? :
+              for (y in ys(ins), t in types(b)) do :
+                if has-tvar?(t) :
+                  add-entry(n(b), ECheck(y, t, BranchContext(), info(b)))
+            sub-types(b, map(remove-tvars, types(b)))
+          emit(buffer, sub-branches(ins, branches*))
+        (ins:ELabel) :
+          emit(buffer, ins)
+          for i in reverse(entry-blocks[n(ins)]) do :
+            emit(buffer, i)
+        (ins:ECall|ETCall) :
+          let :
+            if function?(f(ins)) :
+              val arity = length(ys(ins))
+              val [a1, a2] = fn-types(vt, f(ins) as EVar|ECurry, arity)
+              if lostanza-context? and lostanza-function?(f(ins)) :
+                unguarded-call(a2)
+              else : guard-call(a1, a2)
+            else if calltype(ins) is CallGuarded :
+              val ct = calltype(ins) as CallGuarded
+              if lostanza-context? : unguarded-call(a2(ct))
+              else : guard-call(a1(ct), a2(ct))
+            else : unguarded-call(EUnknown())
+          where :
+            defn function? (e:EImm) :
+              match(e) :
+                (e:EVar) : /function?(vt, n(e))
+                (e:ECurry) : /function?(vt, n(x(e)))
+                (e) : false
+            defn lostanza-function? (f:EImm) :
+              match(f) :
+                (f:EVar) : lostanza?(vt, n(f))
+                (f:ECurry) : lostanza?(vt, n(x(f)))
+            defn guard-call (a1:Tuple<EType>, a2:EType) :
+              ;Sanity check
+              fatal("Incorrect call type") when calltype(ins) is-not CallGuarded
+
+              match(ins) :
+                (ins:ECall) :
+                  ;Create a temporary return location
+                  ;if there isn't one, and if the function returns.
+                  val xloc* = match(x(ins)) :
+                    (x:EVarLoc) :
+                      x
+                    (_:False) :
+                      if not bottom?(a2) :
+                        val n = uniqueid()
+                        emit(buffer, ELocal(n, a2, false))
+                        EVarLoc(n)
+                  ;Check this variable if it is not false
+                  val x* = if not bottom?(a2) :
+                    EVar(n(xloc* as EVarLoc))
+                  ;Check arguments
+                  for (y in ys(ins), t in a1) do :
+                    emit(buffer, ECheck(y, t, ArgContext(), info(ins)))
+                  ;Check function
+                  if not function?(f(ins)) :
+                    val t = EOf(n(iotable(vt), CORE-FN-ID))
+                    emit(buffer, ECheck(f(ins), t, FuncContext(), info(ins)))
+                  ;Make call
+                  emit(buffer, ECall(xloc*, f(ins), ys(ins), CallStanza(), info(ins)))
+                  ;Check return type
+                  match(x*:EVar) : emit(buffer, ECheck(x*, a2, ReturnContext(), info(ins)))
+                  else : emit(buffer, EEnd(info(ins)))
+                (ins:ETCall) :
+                  ;Check arguments
+                  for (y in ys(ins), t in a1) do :
+                    emit(buffer, ECheck(y, t, ArgContext(), info(ins)))
+                  ;Check function
+                  if not function?(f(ins)) :
+                    val t = EOf(n(iotable(vt), CORE-FN-ID))
+                    emit(buffer, ECheck(f(ins), t, FuncContext(), info(ins)))
+                  ;Make call
+                  emit(buffer, ETCall(f(ins), ys(ins), CallStanza(), info(ins)))
+            defn unguarded-call (a2:EType) :
+              val ct* = CallStanza() when calltype(ins) is CallGuarded
+                   else calltype(ins)
+              emit(buffer, sub-calltype(ins, ct*))
+              emit(buffer, EEnd(info(ins))) when bottom?(a2)
+        (ins) :
+          emit(buffer, ins)
+
+  ;Guard functions
+  defn guard-fn (f:EFn, vt:VarTable, lostanza-context?:True|False) -> EFn :
+    val buffer = BodyBuffer(body(f))
+    for f in localfns(body(f)) do :
+      emit(buffer, guard-localfn(f,vt))
+    for o in localobjs(body(f)) do :
+      emit(buffer, guard-localobj(o,vt))
+    val return-type = a2(f) when not lostanza-context?
+    guard-body(body(f), buffer, vt, lostanza-context?, return-type, info(f))
+    sub-body(f, to-body(buffer, true, false, false))
+
+  defn guard-method (f:EFn, vt:VarTable, lostanza-context?:True|False) -> EFn :
+    val buffer = BodyBuffer(body(f))
+    for f in localfns(body(f)) do :
+      emit(buffer, guard-localfn(f,vt))
+    for o in localobjs(body(f)) do :
+      emit(buffer, guard-localobj(o,vt))
+    if not lostanza-context? :
+      for (v in args(f), t in a1(f)) do :
+        if has-tvar?(t) :
+          emit(buffer, ECheck(EVar(v), t, ArgContext(), info(f)))
+    guard-body(body(f), buffer, vt, lostanza-context?, a2(f), info(f))
+    val body* = to-body(buffer, true, false, false)
+    val a1* = map(remove-tvars, a1(f))
+    EFn(tail?(f), targs(f), args(f), a1*, a2(f), body*, info(f))
+
+  defn map-fns<?T> (f:EFn -> EFn, x:?T&ELBigItem) -> T :
+    val result = let loop (x:ELBigItem = x) :
+      match(x:EFn) : f(x)
+      else : map(loop, x)
+    result as T&ELBigItem
+
+  defn guard-localfn (f:ELocalFn, vt:VarTable) :
+    ELocalFn(n(f), map-fns(guard-fn{_, vt, false}, func(f)))
+
+  defn guard-localobj (o:ELocalObj, vt:VarTable) :
+    val methods* = for m in methods(o) map :
+      map-fns(guard-method{_, vt, false}, m)
+    ELocalObj(n(o), type(o), methods*)
+
+  defn guard-init (e:EInit, vt:VarTable) -> EInit :
+    val buffer = BodyBuffer(body(e))
+    for f in localfns(body(e)) do :
+      emit(buffer, guard-localfn(f, vt))
+    for o in localobjs(body(e)) do :
+      emit(buffer, guard-localobj(o,vt))
+    guard-body(body(e), buffer, vt, lostanza?(e), false, false)
+    val body* = to-body(buffer, true, false, false)
+    EInit(body*, lostanza?(e))
+
+  ;Overall driver
+  defn analyze (e:ELBigItem, vt:VarTable) -> ELBigItem :
+    match(e) :
+      (e:EDefmethod) : map-fns(guard-method{_, vt, lostanza?(e)}, e)
+      (e:EMethod) : map-fns(guard-method{_, vt, false}, e)
+      (e:EDefn) : map-fns(guard-fn{_, vt, lostanza?(e)}, e)
+      (e:EExternFn) : map-fns(guard-fn{_, vt, true}, e)
+      (e:EInit) : guard-init(e,vt)
+      (e) : e
+  map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
+
+;============================================================
+;=================== Freevar Analysis =======================
+;============================================================
+
+defn analyze-freevars<?T> (el:ELBigItem&?T, vt:VarTable) -> T :
+  defn analyze-usages (e:EFn) -> EFn :
+    ;Gather all uses in the function
+    val var-uses = IntSet()
+    val tvar-uses = IntSet()
+
+    defn loop (e:ELItem) :
+      match(e) :
+        (e:EVar|EVarLoc) :
+          add(var-uses, n(e))
+        (e:ETVar|ETVarLoc) :
+          add(tvar-uses, n(e))
+        (e:EFn) :
+          val free = free(e)
+          add-all(var-uses, vars(free))
+          add-all(tvar-uses, tvars(free))
+        (e) :
+          do(loop, e)
+    do(loop,e)
+
+    ;Remove all locally defined quantities
+    defn remove-all (xs:IntSet, ys:Seqable<Int>) : do(remove{xs, _}, ys)
+    remove-all(tvar-uses, targs(e))
+    remove-all(tvar-uses, seq(n, localtypes(body(e))))
+    remove-all(var-uses, args(e))
+    remove-all(var-uses, seq(n, locals(body(e))))
+    remove-all(var-uses, seq(n, localfns(body(e))))
+
+    ;Record free
+    defn local? (x:Int) : not global?(vt,x)
+    defn local? (xs:Seqable<Int>) : to-tuple(filter(local?,xs))
+    sub-free(e, Free(local?(var-uses), to-tuple(tvar-uses)))
+
+  ;Recursively analyze usages
+  defn analyze (e:ELBigItem) :
+    match(map(analyze, e)) :
+      (e:EFn) : analyze-usages(e)
+      (e) : e
+  analyze(el) as ELBigItem&T
+
+;============================================================
+;===================== Liveness Annotation ==================
+;============================================================
+
+defn annotate-live (epackage:EPackage) -> EPackage :
+  defn annotate (e0:ELBigItem) -> ELBigItem :
+    val e = map(annotate,e0)
+    val annotate? = match(e:EFn) :
+      not empty?(args(e))
+    if annotate? :
+      val e = e as EFn
+      val ref-args = to-tuple $
+        for (a in args(e), t in a1(e)) seq? :
+          if reftype?(t) : One(EVar(a))
+          else : None()
+      val buffer = BodyBuffer(body(e))
+      for i in ins(body(e)) do :
+        match(i:ETCall|EReturn|EEnd) :
+          emit(buffer, ELive(ref-args))
+        emit(buffer, i)
+      sub-body(e, to-body(buffer))
+    else :
+      e
+  annotate(epackage) as EPackage
+
+;============================================================
+;=============== Convert Checks to Typeof ===================
+;============================================================
+
+defn convert-checks-to-typeof (epackage:EPackage) -> EPackage :
+  defn convert (e0:ELBigItem) :
+    val e = map(convert, e0)
+    match(e:EBody) :
+      val buffer = BodyBuffer(e)
+      for i in ins(e) do :
+        match(i) :
+          (i:ECheck) :
+            val t = normalize(type(i))
+            match(normalize(type(i))) :
+              (t:ETop) :
+                false
+              (t:EBot) :
+                emit(buffer, ECheckFail(t, y(i), ctxt(i), info(i)))
+              (t) :
+                val pass-lbl = uniqueid()
+                val fail-lbl = uniqueid()
+                emit(buffer, ETypeof(pass-lbl, fail-lbl, t, y(i)))
+                emit(buffer, ELabel(fail-lbl))
+                emit(buffer, ECheckFail(t, y(i), ctxt(i), info(i)))
+                emit(buffer, ELabel(pass-lbl))
+          (i) :
+            emit(buffer, i)
+      to-body(buffer)    
+    else : e
+  convert(epackage) as EPackage
+
+;============================================================
+;===================== Mutable Boxing =======================
+;============================================================
+
+defn box-mutables (epackage:EPackage, gvt:VarTable) -> EPackage :
+  val boxed = IntSet()
+  defn box (e:ELBigItem, vt:VarTable) -> ELBigItem :
+    match(e) :
+      (e0:EBody) :
+        ;Find all closed-over variables
+        val closed-over = IntSet()
+        defn add-to-closed (e:ELBigItem) :
+          match(e:EFn) : add-all(closed-over, vars(free(e)))
+          else : do*(add-to-closed, e)
+        do*(add-to-closed, e0)
+
+        ;Add all locally closed-over mutable items to boxed set
+        for l in locals(e0) do :
+          if mutable?(l) and closed-over[n(l)] :
+            add(boxed, n(l))
+
+        ;Recursively analyze sub-bodies
+        val e = map(box{_, vt}, e0)
+
+        ;Perform boxing
+        val buffer = BodyBuffer(e)
+
+        ;Convert a boxed var retrieval into a BoxGet instruction
+        defn retrieve-var (e:EImm) :
+          match(e:EVar) :
+            if boxed[n(e)] :
+              val x = uniqueid()
+              emit(buffer, ELocal(x, type(vt, n(e)), false))
+              emit(buffer, EBoxGet(EVarLoc(x), e))
+              EVar(x)
+            else : e
+          else : e
+
+        ;Convert instructions for operating with boxed variables
+        for i in ins(e) do :
+          match(map(retrieve-var, i)) :
+            (i:EDef) :
+              if boxed[n(x(i))] : emit(buffer,EBox(x(i), y(i)))
+              else : emit(buffer,i)
+            (i:EStore) :
+              match(loc(i)) :
+                (x:EVarLoc) : box-store(x) when boxed[n(x)] else std-store()
+                (x) : std-store()
+              where :
+                defn box-store (x:EVarLoc) : emit(buffer,EBoxSet(EVar(n(x)), y(i)))
+                defn std-store () : emit(buffer, i)
+            (i) :
+              emit(buffer,i)
+
+        ;Change local types
+        defn change-to-box-type (e:EBody) :
+          val locals* = for x in locals(e) map :
+            if boxed[n(x)] : ELocal(n(x), EOf(n(iotable(vt),CORE-BOX-ID)), false)
+            else : x
+          sub-locals(e, locals*)
+
+        ;Return new body
+        change-to-box-type(to-body(buffer))
+      (e) :
+        map(box{_, vt}, e)
+
+  ;Perform freevar analysis and then boxing
+  within (texp, vt) = map-with-var-table(gvt, epackage) :
+    box(analyze-freevars(texp, vt), vt) as ETExp
+
+;============================================================
+;=================== Detect Loops ===========================
+;============================================================
+
+defn detect-loops (epackage:EPackage) -> EPackage :
+  ;Does the given immediate match the given function id?
+  defn matches-fid? (e:EImm, fid:Int|False) :
+    match(e) :
+      (e:EVar) : n(e) == fid
+      (e:ECurry) : n(x(e)) == fid
+      (e) : false
+
+  ;Scan the given body for tail calls
+  defn has-loop? (e:EFn, fid:Int) :
+    if empty?(targs(e)) :
+      val farity = length(args(e))
+      for i in ins(body(e)) any? :
+        match(i:ETCall) :
+          matches-fid?(f(i), fid) and
+          length(ys(i)) == farity
+
+  ;Transform tail calls
+  defn transform-loops (e:ELBigItem, fid:Int|False) -> ELBigItem :
+    ;First recursively evaluate all the subfunctions in the item, then
+    ;work on the transformations.
+    ;If we need to transform the body, then:
+    ;- Introduce dummy expressions for the arguments and type arguments.
+    ;- Introduce the loop label
+    ;- Copy the dummy arguments into the real arguments
+    ;- Scan through the instructions and generate the looping instructions when necessary.
+
+    ;Recursively evaluate all the subfunctions in the item
+    defn recurse () :
+      val fid* = match(e) :
+                   (e:ELocalFn) : n(e)
+                   (e:EDefn) : n(e)
+                   (e) : fid
+      map(transform-loops{_, fid*}, e)
+
+    ;Detect any loops in the item, and transform them
+    defn detect-loop (e:ELBigItem) :
+      match(e:EFn, fid:Int) :
+        if has-loop?(e,fid) : transform-loop(e, fid)
+        else : e
+      else : e
+
+    ;Transform the given function into a loop
+    defn transform-loop (e:EFn, fid:Int) :
+      val farity = length(args(e))
+      val buffer = BodyBuffer(body(e))
+
+      ;Create dummy arguments
+      val targs0 = map(uniqueid{}, targs(e))
+      val args0 = map(uniqueid{}, args(e))
+      val loop-lbl = uniqueid()
+      for (a in args(e), t in a1(e)) do :
+        emit(buffer, ELocal(a, t, false))
+      for (ta0 in targs0) do :
+        emit(buffer, ELocalType(ta0))
+
+      ;Emit loop start and entry prologue
+      emit(buffer, ELabel(loop-lbl))
+      for (a0 in args0, a in args(e)) do :
+        emit(buffer, EDef(EVarLoc(a), EVar(a0)))
+
+      ;Emit instructions and generate looping instructions
+      ;for matching tail calls.
+      for i in ins(body(e)) do :
+        ;Classify the instruction into either a loop call
+        ;or a standard instruction.
+        defn* classify () :
+          match(i:ETCall) :
+            if matches-fid?(f(i), fid) and length(ys(i)) == farity :
+              loop-call(f(i), ys(i))
+            else : standard-ins()
+          else : standard-ins()
+        ;For standard instructions just emit them to the buffer
+        defn standard-ins () :
+          emit(buffer, i)
+        ;For loop calls, generate the appropriate instructions.
+        defn loop-call (f:EImm, ys:Tuple<EImm>) :
+          for (a0 in args0, y in ys) do :
+            emit(buffer, EDef(EVarLoc(a0), y))
+          emit(buffer, EGoto(loop-lbl))
+        ;Start with classify
+        classify()
+
+      ;Substitute the new body and arguments
+      val body* = to-body(buffer)
+      sub-args(sub-body(e, body*), args0)
+
+    ;Driver
+    detect-loop(recurse())
+
+  ;Transform all functions
+  map(transform-loops{_, false}, epackage)
+
+;============================================================
+;=================== Simple Inlining ========================
+;============================================================
+
+;Utility for deconstructing an immediate into the function called
+;and the type arguments.
+defn deconstruct-function (f:EImm) -> Maybe<[Int, Tuple<EType>]> :
+  match(f) :
+    (f:EVar) : One([n(f), []])
+    (f:ECurry) : One([n(x(f)), targs(f)])
+    (f) : None()
+
+defn increment<?K> (t:Table<?K,Int>, k:K) :
+  update(t, {_ + 1}, k)
+
+defn add<?K,?V> (t:Table<?K,List<?V>>, k:K, v:V) :
+  update(t, cons{v, _}, k)
+
+defn efns (f:EFunction) :
+  match(f) :
+    (f:EFn) : [f]
+    (f:EMultifn) : funcs(f)
+
+deftype Ctxt <: Hashable&Equalable
+defstruct Top <: Ctxt with: (printer => true)
+defstruct LocalFn <: Ctxt : (n:Int) with: (printer => true)
+defmethod hash (id:Ctxt) :
+  match(id) :
+    (id:Top) : 0
+    (id:LocalFn) : 27 * n(id)
+defmethod equal? (a:Ctxt, b:Ctxt) :
+  match(a,b) :
+    (a:Top, b:Top) : true
+    (a:LocalFn, b:LocalFn) : n(a) == n(b)
+    (a,b) : false
+
+defstruct InlineFnRec :
+  n: Int
+  func: EFunction
+  level: Int
+  parent: Ctxt   
+
+defn inlining-order (return:ELocalFn -> ?, e:ELBigItem) :
+  ;Tables for keeping track of all calls
+  val callee-count = IntTable<Int>(0)
+  val usage-count = IntTable<Int>(0)
+  val callers = IntTable<List<Ctxt>>(List())
+
+  ;Table for holding all the defined functions
+  val fn-recs = IntTable<InlineFnRec>()
+  defn in-fn-table? (n:Int, farity:Int) :
+    val f = get?(fn-recs, n)
+    match(f:InlineFnRec) :
+      for efn in efns(func(f)) any? :
+        farity == length(args(efn))
+
+  ;Returns true if a is a child of b
+  defn* child? (a:Ctxt, b:Ctxt) :
+    if a == b :
+      true
+    else :
+      match(a) :
+        (a:LocalFn) :
+          val p = parent(fn-recs[n(a)])
+          child?(p, b)
+        (a:Top) : false
+  
+  ;Returns the parent of a that lives at the same level as b.
+  defn* match-level (a:LocalFn, b:LocalFn) :
+    val ar = fn-recs[n(a)]
+    val br = fn-recs[n(b)]
+    if level(ar) == level(br) :
+      a
+    else if level(ar) > level(br) :
+      match-level(parent(ar) as LocalFn, b)
+
+  ;Loop through each item to fill the above tables
+  defn loop (e:ELBigItem, fid:Ctxt, level:Int) :
+    ;Register in fn table
+    defn register-in-fn-table () :
+      match(e:EBody) :
+        for f in localfns(e) do :
+          fn-recs[n(f)] = InlineFnRec(n(f), func(f), level + 1, fid)
+    ;Recursively loop on subitems
+    defn recurse () :
+      val [fid*, level*] = match(e) :
+        (e:ELocalFn) : [LocalFn(n(e)), level + 1]
+        (e) : [fid, level]
+      do*(loop{_, fid*, level*}, e)
+    ;Look for usages
+    defn look-for-usages () :
+      defn loop (e:ELItem) :
+        if e is-not EInitClosures :
+          do(loop, e)
+        match(e) :
+          (e:EVar) :
+            increment(usage-count, n(e))
+          (e:ECall|ETCall) :
+            val f* = deconstruct-function(f(e))
+            if not empty?(f*) :
+              val [callee, targs] = value!(f*)
+              if in-fn-table?(callee, length(ys(e))) :
+                increment(callee-count, callee)
+                add(callers, callee, fid)
+          (e) : false
+      match(e:EBody) :
+        do(loop, ins(e))
+
+    ;Driver
+    register-in-fn-table()
+    recurse()
+    look-for-usages()
+
+  ;Compute all inlined functions.
+  ;Compute all the call graph at each level.
+  val inlined? = IntSet()
+  val called = IntTable<List<Int>>(List())
+  defn compute-inlined () :
+    for fid in keys(fn-recs) do :
+      if callee-count[fid] == 1 and usage-count[fid] == 1 :
+        val callee = LocalFn(fid)
+        val caller = head(callers[fid])
+        if not child?(caller, callee) :
+          add(inlined?, fid)
+          match(caller:LocalFn) :
+            val parent-caller = match-level(caller, callee)
+            match(parent-caller:LocalFn) :
+              add(called, n(parent-caller), n(callee))
+
+  ;Order children before roots
+  defn post-order (roots:Seqable<Int>, children:Int -> Seqable<Int>) :
+    generate<Int> :
+      val visited = IntSet()
+      defn loop (n:Int) :
+        if not visited[n] :
+          add(visited,n)
+          do(loop, children(n))
+          yield(n)
+      do(loop, roots)
+  
+  ;Output the functions in inlining order
+  defn compute-inlining-order () :
+    defn loop (e:ELBigItem) :
+      match(e:EBody) :
+        ;Retrieve all the local functions to be inlined
+        val inlined-fns = filter({inlined?[_]}, seq(n, localfns(e)))
+        val ordered-fns = post-order(inlined-fns, {called[_]})
+        for f in ordered-fns do :
+          val func = func(fn-recs[f])
+          loop(func)
+          return(ELocalFn(f, func))
+        ;Recurse on non-inlined items
+        for f in localfns(e) do :
+          loop(f) when not inlined?[n(f)]            
+        do(loop, localobjs(e))
+      else :
+        do*(loop, e)
+    loop(e)
+
+  ;Driver
+  loop(e, Top(), 0)
+  compute-inlined()
+  compute-inlining-order()
+
+defn inline-call (buffer:BodyBuffer,
+                  ret:EVarLoc|False, f:EFn, call-targs:Tuple<EType>, call-args:Tuple<EImm>,
+                  tail?:True|False) :
+  ;Utilities for substituting type arguments
+  val targ-table = IntTable<EType>()
+  for (ta in targs(f), v in call-targs) do :
+    targ-table[ta] = v
+  defn substitute-targs (x:ELItem) :
+    if empty?(call-targs) :
+      x
+    else :
+      match(x) :
+        (x:ETVar) : get?(targ-table, n(x), x)
+        (x) : map(substitute-targs, x)
+
+  ;Create locals for inlining
+  defn create-locals () :
+    ;Define locals for arguments
+    for (a in args(f), t in a1(f)) do :
+      val t* = substitute-targs(t) as EType
+      emit(buffer, ELocal(a, t*, false))
+    ;Add all locals from function
+    do(emit{buffer, substitute-targs(_) as ELocal}, locals(body(f)))
+    do(emit{buffer, _}, localtypes(body(f)))
+    do(emit{buffer, substitute-targs(_) as ELocalFn}, localfns(body(f)))
+    do(emit{buffer, substitute-targs(_) as ELocalObj}, localobjs(body(f)))
+
+  ;Generate instructions
+  defn gen-instructions () :
+    ;Label for end of function
+    val end-lbl = uniqueid()
+
+    ;Put arguments into argument locals
+    for (a in args(f), v in call-args) do :
+      emit(buffer, EDef(EVarLoc(a), v))
+
+    ;Emit instructions
+    for i in ins(body(f)) do :
+      match(substitute-targs(i) as EIns) :
+        (i:EReturn) :
+          if tail? :
+            emit(buffer, i)
+          else :
+            match(ret:EVarLoc) :
+              emit(buffer, EDef(ret, y(i)))
+            emit(buffer, EGoto(end-lbl))
+        (i:ETCall) :
+          if tail? :
+            emit(buffer, i)
+          else :
+            match(ret:EVarLoc) :
+              emit(buffer, ECall(ret, /f(i), ys(i), calltype(i), info(i)))
+            emit(buffer, EGoto(end-lbl))
+        (i) :
+          emit(buffer, i)
+
+    ;Emit ending label
+    if not tail? :
+      emit(buffer, ELabel(end-lbl))
+
+  ;Create locals
+  create-locals()
+  gen-instructions()
+
+defn simple-inline (epackage:EPackage) :
+  defn inline-texp (e:ETExp) :
+    ;Inlining a single function
+    ;Table for holding inlined functions
+    val inlined-functions = IntTable<ELocalFn>()
+    defn get-inlined-function (fid:Int, arity:Int) :
+      if key?(inlined-functions, fid) :
+        val efns = efns(func(inlined-functions[fid]))
+        for f in efns find :
+          arity == length(args(f))
+          
+    ;Inlining of a body
+    defn inline (e:ELBigItem) :
+      match(e:EBody) :
+        val buffer = BodyBuffer(e)
+        for l in localfns(e) do :
+          if not key?(inlined-functions, n(l)) :
+            emit(buffer, inline(l) as ELocalFn)
+        for o in localobjs(e) do :
+          emit(buffer, inline(o) as ELocalObj)
+        for i in ins(e) do :
+          match(i) :
+            (i:ECall|ETCall) :
+              val f* = deconstruct-function(f(i))
+              if empty?(f*) :
+                emit(buffer, i)
+              else :
+                val [fid, targs] = value!(f*)
+                match(get-inlined-function(fid, length(ys(i)))) :
+                  (func:EFn) :
+                    val [ret, tail?] = match(i) :
+                      (i:ECall) : [x(i), false]
+                      (i:ETCall) : [false, true]
+                    inline-call(buffer, ret, func, targs, ys(i), tail?)
+                  (_:False) :
+                    emit(buffer, i)
+            (i:EInitClosures) :
+              val xs* = for x in xs(i) filter : not key?(inlined-functions, n(x))
+              if not empty?(xs*) :
+                emit(buffer, EInitClosures(to-tuple(xs*), info(i)))
+            (i) :
+              emit(buffer, i)
+        to-body(buffer, true, false, false)
+      else :
+        map(inline, e)
+
+    ;Inline in the proper inlining order
+    within f = inlining-order(e) :    
+      val f* = inline(f) as ELocalFn
+      inlined-functions[n(f*)] = f*
+      
+    ;Inline the top level
+    inline(e) as ETExp
+
+  ;Inline all top-level expressions
+  sub-exps(epackage, map(inline-texp, exps(epackage)))
+
+;============================================================
+;================== Renaming ================================
+;============================================================
+
+defn within-package-inline (epackage:EPackage) :
+  defn inline-texp (e:ETExp) :
+    ;Inlining a single function
+    ;Table for holding inlined functions
+    val inlined-functions = IntTable<ELocalFn>()
+    defn add-to-inline-table (l:ELocalFn) :
+      inlined-functions[n(l)] = l
+      
+    defn get-inlined-function (fid:Int, arity:Int) :
+      if key?(inlined-functions, fid) :
+        val efns = efns(func(inlined-functions[fid]))
+        for f in efns find :
+          arity == length(args(f))
+
+    ;Determine whether a function should be inlined
+    defn inline? (f:EFunction) :
+      match(f) :
+        (f:EMultifn) :
+          all?(inline?, funcs(f))
+        (f:EFn) :
+          empty?(localfns(body(f))) and
+          empty?(localobjs(body(f))) and
+          length(ins(body(f))) < 8
+
+    defn inline (e:ELBigItem) :
+      match(e:EBody) :
+        ;Add to inline table if appropriate
+        for l in localfns(e) do :
+          add-to-inline-table(l) when inline?(func(l))
+        ;Create buffer
+        val buffer = BodyBuffer(e)
+        for l in localfns(e) do :
+          emit(buffer, inline(l) as ELocalFn)
+        for o in localobjs(e) do :
+          emit(buffer, inline(o) as ELocalObj)
+        for i in ins(e) do :
+          match(i:ECall|ETCall) :
+            val f* = deconstruct-function(f(i))
+            if empty?(f*) :
+              emit(buffer, i)
+            else :
+              val [fid, targs] = value!(f*)
+              match(get-inlined-function(fid, length(ys(i)))) :
+                (func:EFn) :
+                  val [ret, tail?] = match(i) :
+                    (i:ECall) : [x(i), false]
+                    (i:ETCall) : [false, true]
+                  inline-call(buffer, ret, rename-fn(func), targs, ys(i), tail?)
+                (_:False) :
+                  emit(buffer, i)          
+          else :
+            emit(buffer, i)
+        ;Return the body
+        to-body(buffer, true, false, false)
+      else :
+        map(inline, e)        
+
+    ;Inline the top level
+    inline(e) as ETExp
+
+  ;Inline all top-level expressions
+  sub-exps(epackage, map(inline-texp, exps(epackage)))  
+
+defn rename-fn (f:EFn) -> EFn :
+  ;Collect renamed identifiers
+  val id-table = IntTable<Int>()
+  val label-table = IntTable-init<Int>(uniqueid{})
+  defn make-id (x:Int) : id-table[x] = uniqueid()
+  defn make-ids (xs:Tuple<Int>) : do(make-id, xs)
+  defn id (x:Int) : get?(id-table, x, x)
+  defn ids (xs:Tuple<Int>) : map(id, xs)
+  defn label* (x:Int) : label-table[x]
+
+  ;Create new names for all local definitions
+  defn create-definitions (e:ELItem) :
+    match(e) :
+      (e:EFn) :
+        make-ids(targs(e))
+        make-ids(args(e))
+      (e:EBody) :
+        do(make-id{n(_)}, locals(e))
+        do(make-id{n(_)}, localtypes(e))
+        do(make-id{n(_)}, localfns(e))
+        do(make-id{n(_)}, localobjs(e))
+      (e) :
+        false
+    do(create-definitions, e)
+
+  ;Rename all references to local definitions
+  defn rename (e:ELItem) :
+    match(map(rename, e)) :
+      ;Local definitions
+      (e:EFn) : sub-args(sub-targs(e, ids(targs(e))), ids(args(e)))
+      (e:ELocal) : sub-n(e, id(n(e)))
+      (e:ELocalType) : sub-n(e, id(n(e)))
+      (e:ELocalFn) : sub-n(e, id(n(e)))
+      (e:ELocalObj) : sub-n(e, id(n(e)))
+      ;Local usages - immediates
+      (e:EMethod) : sub-thisn(e, id(thisn(e)))
+      (e:EVar) : EVar(id(n(e)))
+      (e:EVarLoc) : EVarLoc(id(n(e)))
+      (e:ETVar): ETVar(id(n(e)))
+      (e:ETVarLoc) : ETVarLoc(id(n(e)))
+      ;Local usages - operations
+      (e:ENew) : ENew(x(e), id(n(e)), info(e))
+      ;Local usages - labels
+      (e:ELabel) : ELabel(label*(n(e)))
+      (e:EGoto)  : EGoto(label*(n(e)))
+      (e:EIf) : EIf(label*(n1(e)), label*(n2(e)), op(e), ys(e))
+      (e:EBranch) : EBranch(types(e), label*(n(e)), info(e))
+      (e:ETypeof) : ETypeof(label*(n1(e)), label*(n2(e)), type(e), y(e))
+      ;Fall through
+      (e) : e
+
+  create-definitions(f)
+  rename(f) as EFn
+
+;============================================================
+;=================== Lambda Lifting =========================
+;============================================================
+
+deftype LiftTable
+defmulti lift? (t:LiftTable, f:Int) -> True|False
+defmulti get (t:LiftTable, f:Int) -> Free
+
+defn LiftTable (etexp:ETExp, allow-global-closures?:True|False) :
+  ;Populate freevar-table and value usage table
+  val freevar-table = IntTable<Tuple<Int>>()
+  val used-as-value = IntSet()
+  val var-or-tvar = IntTable<True|False>()
+
+  defn record-free (n:Int, f:Free) :
+    freevar-table[n] = to-tuple(cat(vars(f), tvars(f)))
+    for v in vars(f) do : var-or-tvar[v] = true
+    for v in tvars(f) do : var-or-tvar[v] = false
+
+  defn to-free (vs:Tuple<Int>) :
+    val [vars, tvars] = split({var-or-tvar[_]}, vs)
+    Free(to-tuple(vars), to-tuple(tvars))
+
+  scan(etexp) where :
+    defn scan (e:ELItem) :    
+      match(e) :
+        (e:ELocalFn) :
+          record-free(n(e), fnfree(func(e)))
+          do(scan, e)
+        (e:EVar) : add(used-as-value, n(e))
+        (e:ECall|ETCall) : do(scan, ys(e))
+        (e) : do(scan, e)
+    defn fnfree (f:EFunction) :
+      match(f) :
+        (f:EFn) : free(f)
+        (f:EMultifn) : join-free $ seq(free, funcs(f))
+
+  ;Compute lifting parameters
+  ;Initially assume that all functions are lifted.
+  val liftvar-table = let loop () :
+    let :
+      val num-lifted = length(freevar-table)
+      identify-unlifted-functions()
+      if length(freevar-table) < num-lifted :
+        loop()
+      else :
+        val liftvars = compute-lift-vars()
+        if length(freevar-table) < num-lifted : loop()
+        else : liftvars
+    where :
+      defn forbid-lift? (f:Int, vars:Tuple<Int>) :
+        defn unlifted? (n:Int) : not key?(freevar-table, n)
+        val max-lift-vars = 8
+        val num-free = count(unlifted?, vars)
+        if allow-global-closures? :
+          if num-free > 0 :
+            used-as-value[f] or num-free > max-lift-vars
+        else :
+          used-as-value[f] or num-free > max-lift-vars
+
+      defn identify-unlifted-functions () :
+        for f in to-tuple(keys(freevar-table)) do :
+          val free = freevar-table[f]
+          remove(freevar-table,f) when forbid-lift?(f,free)
+
+      defn compute-lift-vars () :
+        to-inttable<Tuple<Int>> $
+          for e in bipartite-closure(freevar-table) seq :
+            val [f, free] = [key(e), value(e)]
+            remove(freevar-table,f) when forbid-lift?(f,free)
+            e
+
+  ;Return table
+  new LiftTable :
+    defmethod lift? (this, f:Int) : key?(liftvar-table, f)
+    defmethod get (this, f:Int) : to-free(liftvar-table[f])
+
+defn lambda-lift (epackage:EPackage, gvt:VarTable) :
+  ;Buffer for new top level expressions
+  val new-texps = Vector<ETExp>()
+
+  defn analyze (item:ETExp, lift-table:LiftTable, vt:VarTable) -> ETExp :
+    ;Should the given local function be lifted?
+    defn lifted? (e:ELocalFn) :
+      lift?(lift-table, n(e))
+    defn lifted? (e:EVarLoc) :
+      lift?(lift-table, n(e))
+
+    ;Return the free vars to lift e with, if e refers to a lifted function
+    defn lift-free (e:EImm) -> Free|False :
+      match(e) :
+        (e:EVar) : lift-table[n(e)] when lift?(lift-table, n(e))
+        (e:ECurry) : lift-table[n(x(e))] when lift?(lift-table, n(x(e)))
+        (e) : false
+
+    ;Add lifted type arguments to the given function immediate
+    defn add-targs (e:EImm, free:Free) :
+      defn curry (v:EVar, targs:Seq<EType>) :
+        if empty?(targs) : v
+        else : ECurry(v, to-tuple(targs))
+      val free-targs = seq(ETVar, tvars(free))
+      match(e) :
+        (e:EVar) : curry(e, free-targs)
+        (e:ECurry) : curry(x(e), cat(free-targs, targs(e)))
+
+    ;Add lifted arguments to the given arguments
+    defn add-args (xs:Tuple<EImm>, free:Free) :
+      val vs = vars(free)
+      if empty?(vs) : xs
+      else : to-tuple(cat(seq(EVar, vs), xs))
+
+    ;Lift a locally-defined function to the top-level
+    defn lift-function (f:ELocalFn) -> False :
+      ;Rename the free variables used in the func
+      defn rename-free (func:EFn, free:Free) :
+        if empty?(vars(free)) and empty?(tvars(free)) :
+          func
+        else :
+          val rename-table = IntTable<Int>()
+          for v in cat(vars(free), tvars(free)) do :
+            rename-table[v] = uniqueid()
+          rename-vars+tvars(func, rename-table)
+
+      ;Lift all bodies in function
+      defn lift-inner-functions (x:ELBigItem, free:Free) :
+        match(x:EFn) :
+          val targs* = to-tuple(cat(tvars(free), targs(x)))
+          val args* = to-tuple(cat(vars(free), args(x)))
+          val vartypes = seq(type{vt, _}, vars(free))
+          val a1* = to-tuple(cat(vartypes, a1(x)))
+          val body* = lift-bodies(body(x))
+          val func* = EFn(tail?(x), targs*, args*, a1*, a2(x), body*, info(x))
+          rename-free(func*, free)
+        else :
+          map(lift-inner-functions{_, free}, x)
+
+      ;Driver
+      val func* = lift-inner-functions(func(f), lift-table[n(f)])
+      add(new-texps, EDefn(n(f), func* as EFunction, false))
+
+    ;Process a body:
+    ;  - Lift all local functions to top-level
+    ;  - Transform instructions as necessary
+    defn lift-bodies<?T> (x:?T&ELBigItem) -> T :
+      match(x) :
+        (body:EBody) :
+          val buffer = BodyBuffer(body)
+          for f in localfns(body) do :
+            if lifted?(f) : lift-function(f)
+            else : emit(buffer, lift-bodies(f))
+          for o in localobjs(body) do :
+            emit(buffer, lift-bodies(o))
+          for ins in ins(body) do :
+            match(ins) :
+              (ins:ECall|ETCall) :
+                fatal("Expected guards to be removed.") when calltype(ins) is CallGuarded
+                match(lift-free(f(ins))) :
+                  (free:Free) :
+                    val f* = add-targs(f(ins), free)
+                    val ys* = add-args(ys(ins), free)
+                    emit(buffer, sub-f(sub-ys(ins, ys*), f*))
+                  (_:False) :
+                    emit(buffer, ins)
+              (ins:EInitClosures) :
+                val xs* = to-tuple(filter({not lifted?(_)}, xs(ins)))
+                if not empty?(xs*) :
+                  emit(buffer, EInitClosures(xs*, info(ins)))
+              (ins) :
+                emit(buffer, ins)
+          to-body(buffer, true, false, false) as T&EBody
+        (x) :
+          map(lift-bodies, x)
+
+    ;Driver: Recursively find all bodies and analyze them
+    lift-bodies(item)
+
+  ;Drive with local var table and free var analysis
+  val epackage* = within (texp, vt) = map-with-var-table(gvt, epackage) :
+    val texp* = analyze-freevars(texp,vt)
+    val lift-table = LiftTable(texp*, false)
+    analyze(texp*, lift-table, vt)
+  add-exps(epackage*, new-texps)
+
+;============================================================
+;================== Basic Block Analysis ====================
+;============================================================
+
+deftype BasicBlockTable <: Collection<BBlock>
+defmulti get (t:BasicBlockTable, lbl:Int) -> BBlock
+
+deftype BBlock
+defmulti lbl (b:BBlock) -> Int
+defmulti index (b:BBlock) -> Int
+defmulti successors (b:BBlock) -> Tuple<Int>
+defmulti predecessors (b:BBlock) -> Tuple<Int>
+defmulti instructions (b:BBlock) -> Seqable<EIns>
+
+defn analyze-basic-blocks (ins:Tuple<EIns>) :
+  defn sub-label (e:EIns, f:Int -> Int) :
+    defn B (b:EBranch) : EBranch(types(b), f(n(b)), info(b))
+    match(e) :
+      (e:EIf) : EIf(f(n1(e)), f(n2(e)), op(e), ys(e))
+      (e:EMatch|EDispatch) : sub-branches(e, map(B,branches(e)))
+      (e:EGoto|ELabel) : fatal("Unreachable")
+      (e) : e
+
+  val bs = analyze-basic-blocks $ new Instructions :
+    defmethod length (this) : length(ins)
+    defmethod unique-label (this) : uniqueid()
+    defmethod classify (this, i:Int) :
+      match(ins[i]) :
+        (ins:EIf) : JumpInstruction([n1(ins), n2(ins)])
+        (ins:EMatch) : JumpInstruction(map(n,branches(ins)))
+        (ins:EDispatch) : JumpInstruction(map(n,branches(ins)))
+        (ins:EReturn) : JumpInstruction([])
+        (ins:EEnd) : JumpInstruction([])
+        (ins:ETCall) : JumpInstruction([])
+        (ins:EGoto) : GotoInstruction(n(ins))
+        (ins:ELabel) : LabelInstruction(n(ins))
+        (ins) : StandardInstruction()
+
+  defn BBlock (b:Block) :
+    new BBlock :
+      defmethod lbl (this) : n(b)
+      defmethod index (this) : index(b)
+      defmethod successors (this) : succs(b)
+      defmethod predecessors (this) : preds(b)
+      defmethod instructions (this) :
+        for i in instructions(b) seq :
+          match(i) :
+            (i:Int) : sub-label(ins[i], renamed-label{bs, _})
+            (ins:LabelInstruction) : ELabel(n(ins))
+            (ins:GotoInstruction) : EGoto(n(ins))
+  new BasicBlockTable :
+    defmethod to-seq (this) : seq(BBlock, blocks(bs))
+    defmethod get (this, lbl:Int) : BBlock(bs[lbl])
+
+;============================================================
+;==================== Check Elision =========================
+;============================================================
+defstruct TypeState :
+  n: Int
+  type: EType
+
+defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
+  ;Erase type if reference type
+  ;LoStanza types are trusted.
+  defn erase (t:EType) :
+    ETop() when reftype?(t) else t
+
+  ;Elide all checks in function.
+  ;Assumes that free variables have been calculated.
+  ;parent-type-state is the state of the free variables at the time
+  ;that the function is declared.
+  defn analyze-function (e:EFn, parent-type-state:IntTable<EType>, vt:VarTable) -> EFn :
+    val arg-states = for (a in args(e), t in a1(e)) seq :
+      if lostanza?(vt,a) : TypeState(a, erase(t))
+      else : TypeState(a,t)
+    val free-states = for v in vars(free(e)) seq :
+                        TypeState(v, parent-type-state[v])
+    sub-body(e, analyze-body(body(e), cat(arg-states, free-states), vt))
+
+  ;Elide checks in body.
+  defn analyze-body (e:EBody, initial-state:Seqable<TypeState>, vt:VarTable) -> EBody :
+    ;Generate instructions in buffer
+    val buffer = BodyBuffer(e)
+
+    ;Guard table holds the entering assumptions for different
+    ;basic blocks.
+    val enter-state = IntListTable<TypeState>()
+
+    ;Guard table holding the exiting type states of each basic block.
+    val exit-state = IntListTable<TypeState>()
+
+    ;Table holding local functions
+    val localfn-table = to-inttable<ELocalFn> $
+      for f in localfns(e) seq : n(f) => f
+    val localobj-table = to-inttable<ELocalObj> $
+      for o in localobjs(e) seq : n(o) => o
+
+    ;Scan through blocks in reverse-post-order, compute
+    ;types of variables as we go, and elide the checks that
+    ;are unnecessary.
+    val basic-blocks = analyze-basic-blocks(ins(e))
+    for b in basic-blocks do :
+      ;Current known types of all variables
+      val type-state = IntTable<EType>()
+
+      ;Analyze all EFns declared in item
+      defn* analyze-inner-fns (x:ELBigItem) :
+        match(x:EFn) : analyze-function(x, type-state, vt)
+        else : map(analyze-inner-fns,x)
+
+      ;Analyze a local function
+      defn analyze-localfn (f:Int) :
+        emit(buffer, analyze-inner-fns(localfn-table[f]) as ELocalFn)
+      defn analyze-localobj (o:Int) :
+        emit(buffer, analyze-inner-fns(localobj-table[o]) as ELocalObj)
+
+      ;Variable v has now been restricted to
+      ;be a subtype of the given type. If the variable
+      ;is not mutable, then it's type is now narrowed.
+      ;Mutable variable types are not affected because their
+      ;type can expand again during a reassignment.
+      defn restrict (v:Int, t:EType) :
+        if not mutable?(vt,v) :
+          if reftype?(t) :
+            type-state[v] = match(get?(type-state,v)) :
+              (t0:EType) : normalize(EAnd(t,t0))
+              (_:False) : t
+
+      ;Retrieve the current restricted type of the given immediate
+      defn immtype (e:EImm) :
+        match(e:EVar) :
+          if key?(type-state,n(e)) : type-state[n(e)]
+          else : type(vt, n(e))
+        else : type(vt,e)
+
+      ;Initialize state of entering block
+      if index(b) == 0 :
+        for s in initial-state do :
+          type-state[n(s)] = type(s)
+
+      ;Initialize state to union of state from entry blocks.
+      ;Entry blocks are blocks that are predecessors that have already run.
+      val entry-blocks = to-tuple $
+        for p in predecessors(b) filter :
+          index(basic-blocks[p]) < index(b)
+      val num-predecessors = length(entry-blocks)
+      if num-predecessors == 1 :
+        for s in exit-state[entry-blocks[0]] do :
+          type-state[n(s)] = type(s)
+      else if num-predecessors > 1 :
+        for entry in merge-states(seq-cat({exit-state[_]}, entry-blocks)) do :
+          val v = key(entry)
+          val states = value(entry)
+          if length(states) == num-predecessors :
+            val t0 = type(head(states))
+            type-state[v] =
+              if reftype?(t0) : normalize(reduce(EOr, seq(type, states)))
+              else : t0
+      ;Restrict state of entering variables according to their guards
+      for s in enter-state[lbl(b)] do :
+        restrict(n(s), type(s))
+
+      ;Does the given instruction define a value?
+      ;Returns false if it does not.
+      ;Returns its identifier, and whether it is trusted if it does.
+      defn definition? (i:EIns) -> False|[Int, True|False] :
+        defn trusted (x:EVarLoc) : [n(x), true]
+        defn untrusted (x:EVarLoc) : [n(x), false]
+        match(i) :
+          (i:ENew) : trusted(x(i))
+          (i:ETuple) : trusted(x(i))
+          (i:EVoidTuple) : trusted(x(i))
+          (i:ETupleGet) : untrusted(x(i))
+          (i:EObject) : trusted(x(i))
+          (i:EArray) : trusted(x(i))
+          (i:EStruct) : trusted(x(i))
+          (i:EPtr) : trusted(x(i))
+          (i:ELoad) : untrusted(x(i))
+          (i:EInterpret) : untrusted(x(i))
+          (i:EConv) : untrusted(x(i))
+          (i:EPrim) : trusted(x(i))
+          (i:ENewObject) : trusted(x(i))
+          (i:ECall) :
+            match(x(i)) :
+              (x:EVarLoc) :
+                defn check-func (n:Int) :
+                  val arity = length(ys(i))
+                  if function?(vt,n) :
+                    if lostanza?(vt,n) : untrusted(x)
+                    else if tail?(vt,n,arity) : untrusted(x)
+                    else : trusted(x)
+                  else : untrusted(x)
+                match(f(i)) :
+                  (f:EVar) : check-func(n(f))
+                  (f:ECurry) : check-func(n(/x(f)))
+                  (f:EImm) : untrusted(x)
+              (_:False) :
+                false
+          (i) : false
+
+      ;Sweep through instructions of block
+      for instruction in instructions(b) do :
+        ;Analyze local objects and functions
+        match(instruction) :
+          (i:ENew) :
+            analyze-localobj(n(i))
+          (i:EInitClosures) :
+            for x in xs(i) do :
+              type-state[n(x)] = EOf(n(iotable(vt), CORE-FN-ID))
+            do(analyze-localfn{n(_)}, xs(i))
+          (i) : false
+
+        match(definition?(instruction)) :
+          ;Add the variables entry to the type state
+          ;if it is defined.
+          ([n, trusted?]:[Int, True|False]) :
+            type-state[n] = type(vt,n) when trusted?
+                       else erase(type(vt,n))
+            emit(buffer, instruction)
+          ;Otherwise
+          (_:False) :
+            match(instruction) :
+              (i:EDef) :
+                val n = n(x(i))
+                type-state[n] =
+                  if mutable?(vt, n) :
+                    if lostanza?(vt,n) : erase(type(vt,n))
+                    else : type(vt,n)
+                  else : immtype(y(i) as EImm)
+                emit(buffer, i)
+              (i:EMatch|EDispatch) :
+                for b in branches(i) do :
+                  for (y in ys(i), t in types(b)) do :
+                    match(y:EVar) :
+                      add(enter-state, n(b), TypeState(n(y),t))
+                emit(buffer, i)
+              (i:ECheck) :
+                val y = y(i)
+                if not subtype?(ehier, immtype(y), type(i)) :
+                  emit(buffer, i)
+                  match(y:EVar) :
+                    restrict(n(y), type(i))
+              (i) :
+                emit(buffer, i)
+
+      ;Save exiting state of basic block
+      for entry in type-state do :
+        add(exit-state, lbl(b), TypeState(key(entry), value(entry)))
+
+    ;Generate instructions in buffer
+    to-body(buffer, true, false, false)
+
+  ;Analyze package with local var tables and free var analysis
+  within (texp, vt) = map-with-var-table(gvt, epackage) :
+    val empty-table = IntTable<EType>()
+    defn analyze (x:ELBigItem) :
+      match(x) :
+        (x:EFn) : analyze-function(x, empty-table, vt)
+        (x:EBody) : analyze-body(x, [], vt)
+        (x) : map(analyze, x)
+    analyze(analyze-freevars(texp,vt)) as ETExp
+
+defn merge-states (states:Seqable<TypeState>) :
+  val table = IntListTable<TypeState>()
+  for s in states do : add(table, n(s), s)
+  table
+  
+;============================================================
+;=================== Object Lifting =========================
+;============================================================
+
+defn lift-objects (epackage:EPackage, gvt:VarTable) -> EPackage :
+  ;Buffer for new top level expressions
+  val new-texps = Vector<ETExp>()
+
+  ;Lift an instance method to the top level
+  ;objfree contains the freevars stored in the object
+  ;obj-n is the identifier of the EDefObject of the object declaration
+  ;Returns the method id
+  defn lift-method (obj-n:Int, m:EMethod, objfree:Free, vt:VarTable) -> Int :
+    val fbody = body(func(m))
+    val buffer = BodyBuffer(fbody)
+
+    ;Track necessary renames
+    val rename-table = IntTable<Int>()
+    defn rename-var (v:Int) :
+      val v* = uniqueid()
+      rename-table[v] = v*
+      v*
+
+    ;Emit freevars for variables
+    for v in vars(free(func(m))) do :
+      val i = index-of(vars(objfree), v)
+      match(i:Int) :
+        val v* = rename-var(v)
+        val t = type(vt, v)
+        emit(buffer, ELocal(v*, t, false))
+        emit(buffer, EObjectGet(EVarLoc(v*), EVar(thisn(m)), obj-n, i))
+    ;Emit freetypes
+    for v in tvars(free(func(m))) do :
+      val i = index-of!(tvars(objfree), v)
+      val v* = rename-var(v)
+      emit(buffer, ELocalType(v*))
+      emit(buffer, EObjectTGet(ETVarLoc(v*), EVar(thisn(m)), obj-n, i))
+
+    ;Check that recursion has been done
+    fatal("Objects not yet lifted!") when not empty?(localobjs(fbody))
+
+    ;Emit renamed function and body
+    for f in localfns(fbody) do :
+      emit(buffer, rename-vars+tvars(f, rename-table))
+    for i in ins(fbody) do :
+      emit(buffer, rename-vars+tvars(i, rename-table))
+
+    ;Push new method to top level
+    val f = func(m)
+    val a1* = to-tuple $
+      for (x in args(f), t in a1(f)) seq :
+        EOf(obj-n) when x == thisn(m) else remove-tvars(t)
+    val a2* = remove-tvars(a2(f))
+    val f* = EFn(tail?(f), targs(f), args(f), a1*, a2*, to-body(buffer, true, false, false), info(f))
+    val method-id = uniqueid()
+    add(new-texps, EDefmethod(method-id, multi(m), [], f*, false))
+    method-id
+
+  ;Sweep through the body and lift out declarations of local objects.
+  defn lift-body (e:EBody, vt:VarTable) :
+    ;For each object, which we will lift to obj-n:
+    ;- calculate the freevars stored in the object
+    ;- then generate the object declaration
+    ;- then lift each instance method to the top level
+    ;- then sweep through instructions and replace ENew with ENewObject
+
+    ;Keep track of computed object freevars
+    val objfree-table = IntTable<Free>()
+
+    ;Lift each object
+    for obj in localobjs(e) do :
+      ;Compute object freevars
+      val objfree = join-free(seq(free{func(_)}, methods(obj)))
+      objfree-table[n(obj)] = objfree
+
+      ;Lift instance methods
+      val methods = map(lift-method{n(obj), _, objfree, vt}, methods(obj))
+
+      ;Generate object declaration
+      add(new-texps, EDefObject(n(obj), type(obj), ntargs, nargs, methods)) where :
+        val ntargs = length(tvars(objfree))
+        val nargs = length(vars(objfree))
+
+    ;Generate new instructions
+    val ins* = for i in ins(e) map :
+      match(i:ENew) :
+        val objfree = objfree-table[n(i)]
+        val ys = map(EVar, vars(objfree))
+        val targs = map(ETVar, tvars(objfree))
+        ENewObject(x(i), n(i), targs, ys, info(i))
+      else : i
+
+    ;Return new body
+    sub-localobjs{_, []} $
+    sub-ins(e, ins*)
+
+  ;Recursively analyze each body
+  defn analyze (e:ELBigItem, vt:VarTable) -> ELBigItem :
+    match(map(analyze{_, vt}, e)) :
+      (e:EBody) : lift-body(e, vt)
+      (e) : e
+
+  val epackage* = within (texp, vt) = map-with-var-table(gvt, epackage) :
+    val texp* = analyze-freevars(texp,vt)
+    analyze(texp*, vt) as ETExp
+  add-exps(epackage*, new-texps)
+
+;============================================================
+;=================== Closure Lifting ========================
+;============================================================
+
+defn lift-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
+  ;Track new top level expressions
+  val new-texps = Vector<ETExp>()
+
+  ;Lift the given function with the computed free vars to the top-level.
+  ;- Use closure as the identifier of the closure argument.
+  ;- Write a recursive function to compute translated EFn.
+  ;  - For every EFn:
+  ;    - Retrieve the free variables from closure argument
+  ;    - Retrieve the type variables from closure argument
+  ;    - Rename all instructions, input types, and output types
+  ;- Construct EDefClosure expression and add to top level.
+  ;- Returns the identifier used for the DefClosure expression.
+  defn lift-to-defclosure (f:EFunction, fnfree:Free, vt:VarTable) -> Int :
+    ;DefClosure identifier
+    val fid = uniqueid()
+
+    ;Closure argument
+    val closure = uniqueid()
+
+    ;Helper function for processing the body of an EFunction
+    defn lift (e:ELBigItem) -> ELBigItem :
+      match(e:EFn) :
+        ;Track necessary renames
+        val rename-table = IntTable<Int>()
+        defn rename-var (v:Int) :
+          val v* = uniqueid()
+          rename-table[v] = v*
+          v*
+
+        ;Create buffer
+        val buffer = BodyBuffer(body(e))
+
+        ;Retrieve free variables from closure argument
+        for v in vars(free(e)) do :
+          val i = index-of(vars(fnfree), v)
+          match(i:Int) :
+            val v* = rename-var(v)
+            val t = type(vt,v)
+            emit(buffer, ELocal(v*, t, false))
+            emit(buffer, EClosureGet(EVarLoc(v*), EVar(closure), fid, i))
+
+        ;Retrieve type variables from closure argument
+        for v in tvars(free(e)) do :
+          val i = index-of!(tvars(fnfree), v)
+          val v* = rename-var(v)
+          emit(buffer, ELocalType(v*))
+          emit(buffer, EClosureTGet(ETVarLoc(v*), EVar(closure), fid, i))
+
+        ;Check that recursion has been done
+        fatal("Closures not yet lifted!") when not empty?(localfns(body(e)))
+        fatal("Objects not yet lifted!") when not empty?(localobjs(body(e)))
+
+        ;Emit renamed body
+        for i in ins(body(e)) do :
+          emit(buffer, rename-vars+tvars(i,rename-table))
+
+        ;Return new function
+        defn remove-nonlocal-tvars (t:EType) -> EType :
+          match(t:ETVar) : ETop() when key?(rename-table,n(t)) else t
+          else : map(remove-nonlocal-tvars, t)
+        val a1* = map(remove-nonlocal-tvars, a1(e))
+        val a2* = rename-vars+tvars(a2(e), rename-table)
+        EFn(tail?(e), targs(e), args(e), a1*, a2*, to-body(buffer), info(e))
+      else :
+        map(lift, e)
+
+    ;Construct EDefClosure and push to top level
+    val ntargs = length(tvars(fnfree))
+    val nargs = length(vars(fnfree))
+    val func* = lift(f) as EFunction
+    add(new-texps, EDefClosure(fid, closure, ntargs, nargs, func*))
+
+    ;Return the DefClosure identifier
+    fid
+
+  ;Sweep through the body and lift out declarations of local functions
+  ;- Lift each function to the top level
+  ;- Sweep through instructions, and convert EInitClosures into ELetRec statements.
+  ;  - Create each closure by looking up its freevars in free-table
+  ;- Return new function
+  ;  - The local functions are now empty, and moved over to local definitions
+  ;  - Use the new instructions
+  defn lift-body (e:EBody, vt:VarTable) :
+    ;Track the freevars for each function
+    val free-table = IntTable<Free>()
+
+    ;Track the identifiers for each function
+    val closureid-table = IntTable<Int>()
+
+    ;Lift each function to the top level
+    for f in localfns(e) do :
+      ;Compute freevars
+      val fnfree = match(func(f)) :
+        (f:EFn) : free(f)
+        (f:EMultifn) : join-free(seq(free, funcs(f)))
+      free-table[n(f)] = fnfree
+      ;Lift function
+      closureid-table[n(f)] = lift-to-defclosure(func(f), fnfree, vt)
+
+    ;Generate new instructions
+    val buffer = BodyBuffer(e)
+    for i in ins(e) do :
+      match(i) :
+        (i:EInitClosures) :
+          val xs* = Vector<EVarLoc>()
+          val closures* = Vector<EClosure>()
+          for x in xs(i) do :
+            val free = free-table[n(x)]
+            val closureid = closureid-table[n(x)]
+            if empty?(free):
+              emit(buffer, EDef(x, EConstClosure(closureid)))
+            else :
+              val targs = map(ETVar, tvars(free))
+              val ys = map(EVar, vars(free))
+              add(xs*, x)
+              add(closures*, EClosure(closureid, targs, ys))
+            emit(buffer, ELocal(n(x), EOf(n(iotable(vt),CORE-FN-ID)), false))
+          if not empty?(xs*) :
+            emit(buffer, ELetRec(to-tuple(xs*), to-tuple(closures*), info(i)))
+        (i) :
+          emit(buffer, i)
+
+    ;Return body
+    to-body(buffer, true, false, true)
+
+  defn analyze (e:ELBigItem, vt:VarTable) -> ELBigItem :
+    match(map(analyze{_, vt},e)) :
+      (e:EBody) : lift-body(e,vt)
+      (e) : e
+  val epackage* = within (texp, vt) = map-with-var-table(gvt, epackage) :
+    val texp* = analyze-freevars(texp,vt)
+    analyze(texp*, vt) as ETExp
+  add-exps(epackage*, new-texps)
+
+;============================================================
+;================= Lifting Type Objects =====================
+;============================================================
+
+defn lift-type-objects (epackage:EPackage) :
+  ;Store lifted types
+  val type-table = HashTable<EType,EDefTypeObject>()
+
+  ;Lift a type to the top level
+  ;Returns the id of the deftype object.
+  defn lift-to-deftype-object (t:EType, nargs:Int) -> Int :
+    if not key?(type-table,t) :
+      val n = uniqueid()
+      type-table[t] = EDefTypeObject(n, nargs, t)
+    n(type-table[t])
+
+  ;Reindex a type
+  defn reindex (t:EType) -> [EType, Tuple<ETVar>] :
+    val table = IntTable<Int>()
+    val tvars = Vector<Int>()
+    val t* = let loop (t:EType = t) :
+      match(t:ETVar) :
+        if not key?(table, n(t)) :
+          val i = length(tvars)
+          table[n(t)] = i
+          add(tvars, n(t))
+        ETVar(table[n(t)])
+      else : map(loop, t)
+    [normalize(t*), to-tuple(seq(ETVar,tvars))]
+
+  ;Lift all first-class types in body
+  defn lift-body (e:EBody) :
+    val buffer = BodyBuffer(e)
+
+    ;Reify a type
+    defn reify-type (t:EType) -> ETVar :
+      match(t) :
+        (t:ETVar) :
+          t
+        (t) :
+          val [t*, tvars] = reindex(t)
+          val n = lift-to-deftype-object(t*, length(tvars))
+          val x = uniqueid()
+          emit(buffer, ELocalType(x))
+          if empty?(tvars) :
+            emit(buffer, ETDef(ETVarLoc(x), EConstType(n)))
+          else :
+            emit(buffer, ETypeObject(ETVarLoc(x), n, tvars))
+          ETVar(x)
+    defn reify-type (e:EImm) -> EImm :
+      match(e) :
+        (e:ECurry) : ECurry(x(e), map(reify-type,targs(e)))
+        (e) : e
+    defn reify-type (e:EClosure) :
+      sub-targs(e, map(reify-type,targs(e)))
+
+    ;Reify all type arguments in instructions
+    for i in ins(e) do :
+      emit{buffer, _} $ match(i) :
+        (i:ECall|ETCall) : sub-f(i, reify-type(f(i)))
+        (i:ELetRec) : sub-ys(i, map(reify-type,ys(i)))
+        (i:ENewObject) : sub-targs(i, map(reify-type, targs(i)))
+        (i:ECheckFail) : ECheckFail(reify-type(type(i)), y(i), ctxt(i), info(i))
+        (i) : i
+
+    ;Return new body
+    to-body(buffer)
+
+  ;Recursively lift all bodies
+  defn analyze (e:ELBigItem) -> ELBigItem :
+    match(map(analyze,e)) :
+      (e:EBody) : lift-body(e)
+      (e) : e
+  sub-exps(epackage, exps*) where :
+    val analyzed-exps = for e in exps(epackage) map :
+      analyze(e) as ETExp
+    val exps* = to-tuple(cat(analyzed-exps, values(type-table)))
+
+;============================================================
+;====================== EType Conversion ====================
+;============================================================
+
+public defn to-etype (table:IOTable, t:DType, targs:Tuple<EType>) -> EType :
+  defn conv (f:False) : false
+  defn conv (ds:Tuple<DType>) : map(conv, ds)
+  defn conv (d:DType) :
+    match(d) :
+      (d:DByte) : EByte()
+      (d:DInt) : EInt()
+      (d:DLong) : ELong()
+      (d:DFloat) : EFloat()
+      (d:DDouble) : EDouble()
+      (d:DUnknown) : EUnknown()
+      (d:DPtrT) : EPtrT()
+      (d:DFnT) : EFnT(conv(a(d)), conv(r(d)), conv(b(d)))
+      (d:DStructT) : EStructT(n(table,id(d)))
+      (d:DOf) : EOf(n(table,id(d)))
+      (d:DTVar) : targs[index(d)]
+      (d:DCap) : conv(tvar(d))
+      (d:DAnd) : reduce(EAnd, seq(conv, types(d)))
+      (d:DOr) : reduce(EOr, seq(conv, types(d)))
+      (d:DTop) : ETop()
+      (d:DBot) : EBot()
+      (d:DArrow) : EOf(n(table,CORE-FN-ID))
+      (d:DTuple) : EOf(n(table,CORE-TUPLE-ID))
+  conv(t)
+
+;============================================================
+;======================== VarTable ==========================
+;============================================================
+
+;For representing entries to declared functions
+deftype FnEntry
+defstruct EFnEntry <: FnEntry :
+  targs: Tuple<Int>
+  a1: Tuple<EType>
+  r: EType|False
+  a2: EType
+  lostanza?: True|False
+  tail?: True|False
+with:
+  printer => true
+
+defstruct DFnEntry <: FnEntry :
+  ntargs: Int
+  a1: Tuple<DType>
+  r: DType|False
+  a2: DType
+  lostanza?: True|False
+  tail?: True|False
+with:
+  printer => true
+
+defstruct EMultifnEntry <: FnEntry :
+  funcs: Tuple<EFnEntry>
+with:
+  printer => true
+
+;For representing entries to declared variables
+defstruct VarEntry :
+  mutable?: True|False
+  type: EType|DType
+  lostanza?: True|False
+with:
+  printer => true
+
+;Basic table for holding VTEntry
+deftype VarTable
+defmulti get (e:VarTable, n:Int) -> VTRecord
+defmulti iotable (e:VarTable) -> IOTable
+defn VarTable (records:Seqable<VTRecord>, iotable:IOTable, parent:VarTable|False) :
+  ;Initialize table, convert varentry if necessary
+  val table = to-inttable<VTRecord> $
+    for r in records seq :
+      n(r) => match(entry(r)) :
+        (e:VarEntry) :
+          match(type(e)) :
+            (t:DType) :
+              val et = to-etype(iotable, t, [])
+              sub-entry(r, VarEntry(mutable?(e), et, lostanza?(e)))
+            (t:EType) : r
+        (e) : r
+  new VarTable :
+    defmethod get (this, n:Int) :
+      match(get?(table, n), parent) :
+        (r:VTRecord, p) : r
+        (r:False, p:VarTable) : p[n]
+        (r:False, p:False) : fatal("No entry for %_" % [n])
+    defmethod iotable (this) :
+      iotable
+
+defstruct VTRecord :
+  global?: True|False
+  n: Int
+  entry: FnEntry|VarEntry with: (updater => sub-entry)
+
+;Convenience Functions
+defn function? (vt:VarTable, n:Int) :
+  entry(vt[n]) is FnEntry
+
+defn tail? (vt:VarTable, n:Int, arity:Int) :
+  defn tail? (e:FnEntry) :
+    match(e) :
+      (e:EFnEntry) : /tail?(e)
+      (e:DFnEntry) : /tail?(e)
+      (e:EMultifnEntry) :
+        tail?(find!({length(a1(_)) == arity}, funcs(e)))
+  tail?(entry(vt[n]) as FnEntry)
+
+defn variable? (vt:VarTable, n:Int) :
+  entry(vt[n]) is VarEntry
+
+defn lostanza? (vt:VarTable, n:Int) :
+  match(entry(vt[n])) :
+    (e:EFnEntry) : lostanza?(e)
+    (e:DFnEntry) : lostanza?(e)
+    (e:VarEntry) : lostanza?(e)
+    (e:EMultifnEntry) : false
+
+defn type (vt:VarTable, e:EImm) :
+  match(e) :
+    (e:ELSLiteral) :
+      match(value(e)) :
+        (v:Byte) : EByte()
+        (v:Char) : EByte()
+        (v:Int) : EInt()
+        (v:Long) : ELong()
+        (v:Float) : EFloat()
+        (v:Double) : EDouble()
+        (v:True) : EOf(n(iotable(vt), CORE-TRUE-ID))
+        (v:False) : EOf(n(iotable(vt), CORE-FALSE-ID))
+        (v:String) : EPtrT()
+    (e:ELiteral) :
+      match(value(e)) :
+        (v:Byte) : EOf(n(iotable(vt), CORE-BYTE-ID))
+        (v:Char) : EOf(n(iotable(vt), CORE-CHAR-ID))
+        (v:Int) : EOf(n(iotable(vt), CORE-INT-ID))
+        (v:Long) : EOf(n(iotable(vt), CORE-LONG-ID))
+        (v:Float) : EOf(n(iotable(vt), CORE-FLOAT-ID))
+        (v:Double) : EOf(n(iotable(vt), CORE-DOUBLE-ID))
+        (v:True) : EOf(n(iotable(vt), CORE-TRUE-ID))
+        (v:False) : EOf(n(iotable(vt), CORE-FALSE-ID))
+        (v:List) : EOf(n(iotable(vt), CORE-LIST-ID))
+        (v:String) : EOf(n(iotable(vt), CORE-STRING-ID))
+        (v:Symbol) : EOf(n(iotable(vt), CORE-SYMBOL-ID))
+    (e:EVar) : type(vt,n(e))
+    (e:ESizeof) : ELong()
+    (e:ETagof) : ELong()
+
+defn global? (vt:VarTable, n:Int) :
+  global?(vt[n])
+
+defn mutable? (vt:VarTable, n:Int) :
+  match(entry(vt[n])) :
+    (e:VarEntry) : mutable?(e)
+    (e:FnEntry) : false
+
+defn type (vt:VarTable, n:Int) :
+  match(entry(vt[n])) :
+    (e:VarEntry) : type(e) as EType
+    (e:FnEntry) : EOf(/n(iotable(vt), CORE-FN-ID))
+
+defn arities (vt:VarTable, n:Int) :
+  match(entry(vt[n])) :
+    (e:DFnEntry) : [length(a1(e))]
+    (e:EFnEntry) : [length(a1(e))]
+    (e:EMultifnEntry) : map(length{a1(_)}, funcs(e))
+
+;Retrieve the argument and return types of a function
+defn fn-types (vt:VarTable, f:EVar|ECurry, arity:Int) :
+  val [n, targs] = match(f) :
+    (f:EVar) : [n(f), []]
+    (f:ECurry) : [n(x(f)), targs(f)]
+  fn-types(vt, n, arity, targs)
+
+defn fn-types (vt:VarTable, n:Int, arity:Int, targs:Tuple<EType>) :
+  ;Extend with rest type indefinitely
+  defn ex<?T> (xs:Tuple<?T>, y:?T|False) :
+    match(y:False) : xs
+    else : cat(xs, repeat(y as T))
+
+  ;Conversion to etype
+  defn to-etype (t:DType) :
+    /to-etype(iotable(vt), t, targs)
+
+  let loop (e:FnEntry = entry(vt[n]) as FnEntry) :
+    match(e) :
+      (e:DFnEntry) :
+        fatal("Incorrect type arity.") when ntargs(e) != length(targs)
+        val a1* = to-tuple $ take-n{arity, _} $
+          seq(to-etype, ex(a1(e), r(e)))
+        val a2* = to-etype(a2(e))
+        [a1*, a2*]
+      (e:EFnEntry) :
+        fatal("Incorrect type arity.") when length(/targs(e)) != length(targs)
+        val table = to-inttable<EType>(/targs(e), targs)
+        val a1* = to-tuple $ take-n{arity, _} $
+          seq(sub-tvars{_, table}, ex(a1(e), r(e)))
+        val a2* = sub-tvars(a2(e), table)
+        [a1*, a2*]
+      (e:EMultifnEntry) :
+        loop(find!({length(a1(_)) == arity}, funcs(e)))
+
+defn GlobalVarTable (epackage:EPackage, iotable:IOTable) -> VarTable :
+  ;Find records
+  val imported-records = for import in imports(packageio(epackage)) seq? :
+    val e = match(rec(import)) :
+      (r:FnRec|MultiRec|ExternFnRec) :
+        val id = id(r) as FnId
+        val [lostanza?, tail?] =
+          match(r) :
+            (r:FnRec) : [lostanza?(r), tail?(r)]
+            (r:MultiRec) : [false, false]
+            (r:ExternFnRec) : [true, false]
+        DFnEntry(ntargs(id) + ncargs(id), a1(id), false, a2(r), lostanza?, tail?)
+      (r:ValRec) :
+        VarEntry(mutable?(r), type(r), lostanza?(r))
+      (r:ExternRec) :
+        match(type(r)) :
+          (t:DFnT) : DFnEntry(0, a(t), /r(t), b(t), true, false)
+          (t) : VarEntry(true, type(r), true)
+      (r) : false
+    match(e:FnEntry|VarEntry) : One(VTRecord(true, n(import), e))
+    else : None()
+  val exported-records = for exp in exps(epackage) seq? :
+    val [n, e] = match(exp) :
+      (e:EDefn) : [n(e) FnEntry(func(e), lostanza?(e))]
+      (e:EDefmulti) : [n(e), EFnEntry(targs(e), a1(e), false, a2(e), false, false)]
+      (e:EExternFn) : [n(e), FnEntry(func(e), true)]
+      (e:EDefGlobal) : [n(e), VarEntry(mutable?(e), type(e), lostanza?(e))]
+      (e:EExtern) :
+        match(type(e)) :
+          (t:EFnT) : [n(e), EFnEntry([], a(t), r(t), b(t), true, false)]
+          (t) : [n(e), VarEntry(true, type(e), true)]
+      (e) : [0, false]
+    match(e:FnEntry|VarEntry) : One(VTRecord(true, n, e))
+    else : None()
+
+  ;Return populated vartable
+  VarTable(cat(imported-records, exported-records), iotable, false)
+
+defn LocalVarTable (gvt:VarTable, e:ETExp) -> VarTable :
+  ;Find records
+  val records = generate<VTRecord> :
+    defn found (n:Int, e:FnEntry|VarEntry) :
+      yield(VTRecord(false, n, e))
+    ;Determine whether we are in a LoStanza context
+    val lostanza-context? = match(e) :
+      (e:EDefn) : lostanza?(e)
+      (e:EDefClosure) : false
+      (e:EDefmethod) : lostanza?(e)
+      (e:EExternFn) : true
+      (e:EInit) : lostanza?(e)
+      (e:EDefObject) : false
+      (e) : false
+    let loop (e:ELBigItem = e) :
+      match(e) :
+        (e:EFn) :
+          for (x in args(e), t in a1(e)) do :
+            found(x, VarEntry(false, t, lostanza-context?))
+        (e:EBody) :
+          for e in localfns(e) do :
+            found(n(e), FnEntry(func(e), lostanza-context?))
+          for e in locals(e) do :
+            found(n(e), VarEntry(mutable?(e), type(e), lostanza-context?))
+        (e) : false
+      do*(loop, e)
+
+  ;Return populated table
+  VarTable(records, iotable(gvt), gvt)
+
+defn FnEntry (e:EFunction, lostanza?:True|False) :
+  match(e) :
+    (e:EFn) : EFnEntry(targs(e), a1(e), false, a2(e), lostanza?, tail?(e))
+    (e:EMultifn) : EMultifnEntry(map({FnEntry(_, lostanza?) as EFnEntry}, funcs(e)))
+
+;============================================================
+;====================== Utilities ===========================
+;============================================================
+
+defn add-exps (ep:EPackage, exps*:Seqable<ETExp>) :
+  sub-exps(ep, to-tuple(cat(exps(ep), exps*)))
+
+;Join the sequence of Free structures.
+defn join-free (fs:Seqable<Free>) :
+  val var-set = IntSet()
+  val tvar-set = IntSet()
+  for f in fs do :
+    add-all(var-set, vars(f))
+    add-all(tvar-set, tvars(f))
+  Free(to-tuple(var-set), to-tuple(tvar-set))
+
+;Compute a local var table for each top level definition
+defn map-with-var-table (f:(ETExp, VarTable) -> ETExp, gvt:VarTable, epackage:EPackage) :
+  val exps* = for e in exps(epackage) map :
+    f(e, LocalVarTable(gvt, e))
+  sub-exps(epackage, exps*)
+
+;Rename all variables and type variables
+defn rename-vars+tvars<?T> (e:ELItem&?T, table:IntTable<Int>) -> T :
+  defn rename (e:ELItem) :
+    defn f (x:Int) : get?(table, x, x)
+    match(map(rename,e)) :
+      (e:EDefClosure) : EDefClosure(n(e), f(closure(e)), ntargs(e), nargs(e), func(e))
+      (e:EDefmulti) : EDefmulti(n(e), map(f,targs(e)), a1(e), a2(e), info(e))
+      (e:EFn) : EFn(tail?(e), map(f,targs(e)), map(f,args(e)), a1(e), a2(e), body(e), info(e), free?(e))
+      (e:EMethod) : EMethod(multi(e), targs(e), f(thisn(e)), func(e))
+      (e:EVar) : EVar(f(n(e)))
+      (e:EVarLoc) : EVarLoc(f(n(e)))
+      (e:ETVar) : ETVar(f(n(e)))
+      (e:ETVarLoc) : ETVarLoc(f(n(e)))
+      (e) : e
+  rename(e) as ELItem&T
+
+;Substitute tvars for types
+defn sub-tvars (t:EType, table:IntTable<EType>) :
+  let loop (t:EType = t) :
+    match(t:ETVar) : get?(table, n(t), t)
+    else : map(loop, t)
+
+;Type variable removal
+defn remove-tvars<?T> (e:ELItem&?T) :
+  defn loop (e:ELItem) -> ELItem :
+    match(e) :
+      (e:ETVar) : ETop()
+      (e:ELItem) : map(loop, e)
+  loop(e) as ELItem&T
+
+;Check whether type has type variable
+defn has-tvar? (t:EType) :
+  var tvar? = false
+  let loop (t:EType = t) :
+    match(t:ETVar) : tvar? = true
+    else : do*(loop, t)
+  tvar?
+
+public defn select<?T> (xs:Tuple<?T>, mask:Tuple<True|False>) -> Tuple<T> :
+  to-tuple(filter(xs, mask))

@@ -1,0 +1,424 @@
+;See License.txt for details about licensing
+
+defpackage stz/fuse :
+  import core
+  import collections
+  import stz/pl-ir
+  import stz/tgt-ir
+  import stz/tl-ir
+  import stz/type-calculus
+  import stz/namemap
+  import stz/asm-ir
+  import stz/kl-ir
+  import stz/ids
+
+;============================================================
+;==================== Stage0 Fusing =========================
+;============================================================
+
+val RESOLVE-MSG = "%_: Could not resolve type %_ in package %_."
+
+public defn resolve (nm:NameMap, filename:String, pkg:TGPackage) :
+  attach-ids(pkg, resolve-ids(nm, filename, ids(pkg)))
+
+public defn resolve (nm:NameMap, filename:String, pkg:KPackage) :
+  attach-ids(pkg, resolve-ids(nm, filename, ids(pkg)))
+
+defn resolve-ids (nm:NameMap, filename:String, ids:PkgIds) -> PkgIds :
+  ;================
+  ;==== Errors ====
+  ;================
+  val errors = Vector<?>()
+  defn no-type (type:Symbol, package:Symbol) :
+    add(errors, RESOLVE-MSG % [filename, type, package])
+  defn issue-errors () :
+    throw(PkgFuseErrors(errors)) when not empty?(errors)      
+    
+  ;==============================
+  ;==== Compute Rename Table ====
+  ;==============================
+  val table = to-hashtable<Int,Int> $
+    for d in declarations(ids) seq :
+      old-n(nm,d) => n(d)
+  for ip in imports(ids) do :
+    for i in imports(ip) do :
+      match(id(i)) :
+        (id:TypeId|LSTypeId) :
+          match(type-id(nm, package(ip), name(id))) :
+            (g:Int) : table[n(i)] = g
+            (g:False) : no-type(name(id), package(ip))
+        (id) : false
+  issue-errors()  
+
+  ;=====================
+  ;==== Resolve Ids ====
+  ;=====================
+  val r = Renamer(fn (i) : get?(table, i, i), true)
+  defn rename (d:Declare) : Declare(n(d), /rename(r, id(d)), info(d))
+  defn rename (i:Import) : Import(n(i), /rename(r, id(i)))
+  defn rename (i:ImportPackage) : ImportPackage(package(i), map(rename, imports(i)))
+
+  PkgIds(version(ids), platform(ids)
+         map(rename, declarations(ids)),
+         map(rename, imports(ids)))
+
+public defstruct PkgFuseErrors <: Exception :
+  msgs: Collection
+defmethod print (o:OutputStream, e:PkgFuseErrors) :
+  print-all(o, join(msgs(e), "\n"))
+
+;============================================================
+;==================== Stage1 Fusing =========================
+;============================================================
+
+defn no-import (nm:NameMap, dst-package:Symbol, src-package:Symbol, id:Id) :
+  new Printable :
+    defmethod print (o:OutputStream, this) :
+      println(o, "Package %_: Could not import the following definition from package %_:" % [
+        dst-package, src-package])
+      for io in o do-indented :
+        print(io, printable(nm,id,false))
+
+defn bad-import (nm:NameMap, dst-package:Symbol, src-package:Symbol, expected:Id, actual:Id) :
+  new Printable :
+    defmethod print (o:OutputStream, this) :
+      println(o, "Package %_: Expected to import the following definition from package %_:" % [
+        dst-package, src-package])
+      for io in o do-indented :
+        println(io, printable(nm,expected,false))
+      println(o, "but instead found the following definition:")
+      for io in o do-indented :
+        println(io, printable(nm,actual,true))
+
+public defn fuse-pkgs (nm:NameMap, pkgs:List<KPkgComm>) -> List<KPkgComm> :
+  ;Construct id tables
+  val id-tables = IdTables()
+  for pkg in pkgs do :
+    match(pkg) :
+      (pkg:KPackage) :
+        val table = id-tables[name(pkg)]
+        for d in declarations(ids(pkg)) do :
+          table[id(d)] = n(d)
+      (pkg:TGPackage) :
+        val table = id-tables[name(pkg)]
+        for d in declarations(ids(pkg)) do :
+          table[id(d)] = n(d)
+
+  val errors = Vector<PkgFuseErrors>()
+  defn issue-errors () :
+    if not empty?(errors) :
+      val msgs = to-vector<?>(seq-cat(msgs, errors))
+      throw(PkgFuseErrors(msgs))
+  defn rename-pkg? (pkg:TGPackage|KPackage) :
+    try :
+      rename-pkg(nm, id-tables, pkg)
+    catch (e:PkgFuseErrors) :
+      add(errors, e)
+      pkg
+
+  ;Rename all tgpackages
+  val pkgs* = for pkg in pkgs map :
+    match(pkg) :
+      (pkg:TGPackage) : rename-pkg?(pkg)
+      (pkg:KPackage) :
+        if loaded?(pkg) : rename-pkg?(pkg)
+        else : pkg
+        
+  issue-errors()      
+  pkgs*
+
+defn rename-pkg (nm:NameMap,
+                 id-tables:IdTables,
+                 pkg:TGPackage|KPackage) :
+  ;=======================
+  ;==== Rename Tables ====
+  ;=======================
+  val table = IntTable<Int>()
+
+  ;====================
+  ;==== ID Mapping ====
+  ;====================
+  defn map-over (src:Int, dst:Int) :
+    table[dst] = src
+  defn map-over (src:List<Int>, dst:List<Int>) :
+    do(map-over, src, dst)
+  defn map-over (src:Id, dst:Id) :
+    match(src, dst) :
+      (src:FnId, dst:FnId) :
+        map-over(append(targs(src), cargs(src)),
+                 append(targs(dst), cargs(dst)))
+      (src:MultiId, dst:MultiId) :
+        map-over(append(targs(src), cargs(src)),
+                 append(targs(dst), cargs(dst)))
+      (src:TypeId, dst:TypeId) :
+        map-over(args(src), args(dst))
+        map-over(seq-append(args, children(src))
+                 seq-append(args, children(dst)))
+      (src:LSFnId, dst:LSFnId) :
+        map-over(append(targs(src), cargs(src)),
+                 append(targs(dst), cargs(dst)))
+      (src:LSTypeId, dst:LSTypeId) :
+        map-over(args(src), args(dst))
+        map-over(map(n, fields(src))
+                 map(n, fields(dst)))
+
+  ;================
+  ;==== Errors ====
+  ;================
+  val errors = Vector<?>()
+  defn add-error (e) : add(errors, e)
+  defn issue-errors () : throw(PkgFuseErrors(errors)) when not empty?(errors)
+
+  ;===================================
+  ;==== Constructing Rename Table ====
+  ;===================================
+  for d in declarations(ids(pkg)) do :
+    table[old-n(nm,d)] = n(d)
+  for ip in imports(ids(pkg)) do :
+    val id-table = id-tables[package(ip)]
+    for i in imports(ip) do :
+      if key?(id-table, id(i)) :      
+        val g = id-table[id(i)]
+        table[n(i)] = g
+        match(id(i):FnId|MultiId|TypeId|LSFnId|LSTypeId) :
+          map-over(id-tables[g], id(i))
+      else :
+        add-error(no-import(nm, name(pkg), package(ip), id(i)))
+  issue-errors()
+
+  ;==============================================
+  ;==== Rename Imports and Check Consistency ====
+  ;==============================================
+  val r = Renamer({table[_]}, false)
+  defn rename (i:Import) : Import(table[n(i)], /rename(r,id(i)))
+  defn rename (i:ImportPackage) : ImportPackage(package(i), map(rename, imports(i)))
+  val imports* = map(rename, imports(ids(pkg)))
+  val ids* = attach-imports(ids(pkg), imports*)
+
+  for ip in imports* do :
+    for i in imports(ip) do :
+      if id(i) != id-tables[n(i)] :
+        add-error(bad-import(nm, name(pkg), package(ip), id(i), id-tables[n(i)]))
+  issue-errors()
+
+  ;========================
+  ;==== Rename Package ====
+  ;========================
+  defn rename? (x:Int) :
+    if stable-id?(x) :
+      x
+    else :
+      match(get?(table, x)) :
+        (y:Int) :
+          y
+        (_:False) :
+          val y = fresh-id()
+          table[x] = y
+          y
+
+  val renamer = Renamer(rename?, false)
+  match(pkg) :
+    (pkg:TGPackage) : 
+      val decls* = /rename(renamer, decls(pkg))
+      val entry* = rename?(entry(pkg))
+      TGPackage(name(pkg), ids*, entry*, decls*, loaded?(pkg))
+    (pkg:KPackage) :
+      val exps* = map(/rename{renamer, _}, exps(pkg))
+      attach-ids{_, ids*} $
+      attach-exps(pkg, exps*)
+
+;============================================================
+;==================== Renamer ===============================
+;============================================================
+
+deftype Renamer
+defmulti rename (r:Renamer, id:Id) -> Id
+defmulti rename (r:Renamer, e:Vector<TGDecl>) -> Vector<TGDecl>
+defmulti rename (r:Renamer, c:KTExp) -> KTExp
+
+defn Renamer (rename-int: Int -> Int,
+              rename-types?: True|False) :
+  defn rename (i:Int) : rename-int(i)
+  defn rename (x:Symbol) : x
+  defn rename (x:False) : false
+
+  defn rename (c:ChildDec) :
+    val n* = rename(n(c)) when rename-types? else n(c)
+    ChildDec(n*, rename(args(c)), rename(parent(c)))
+
+  defn rename (f:FieldDec) :
+    FieldDec(rename(n(f)), name(f), rename(type(f)))
+
+  defn rename (t:Type) :
+    match(map(rename,t)) :
+      (t:TOf) :
+        if rename-types? : TOf(rename(n(t)), type(t))
+        else : t
+      (t:TVar) : TVar(rename(n(t)))
+      (t:TCap) : TCap(rename(n(t)))
+      (t) : t
+
+  defn rename (t:LSType) :
+    match(map(rename{_:Type}, map(rename{_:LSType}, t))) :
+      (t:StructT) :
+        if rename-types? : StructT(rename(n(t)), type(t))
+        else : t
+      (t) : t
+
+  defn rename (b:Branch) :
+    Branch(rename(tags(b)), rename(n(b)))
+
+  defn rename (id:Id) :
+    match(id) :
+      (id:ValId) :
+        ValId(name(id), rename(type(id)), visibility(id))
+      (id:VarId) :
+        VarId(name(id), rename(type(id)), visibility(id))
+      (id:FnId) :
+        FnId(name(id), tail?(id), rename(targs(id)), rename(cargs(id)),
+          rename(a1(id)), rename(a2(id)), visibility(id))
+      (id:MultiId) :
+        MultiId(name(id), tail?(id), rename(targs(id)), rename(cargs(id)),
+          rename(a1(id)), rename(a2(id)), visibility(id)),
+      (id:TypeId) :
+        TypeId(name(id), rename(args(id)), rename(parent(id)),
+          rename(children(id)), visibility(id)),
+      (id:TArgId) :
+        id
+      (id:LSValId) :
+        LSValId(name(id), rename(type(id)), visibility(id))
+      (id:LSVarId) :
+        LSVarId(name(id), rename(type(id)), visibility(id))
+      (id:LSFnId) :
+        LSFnId(name(id), tail?(id), rename(targs(id)), rename(cargs(id)),
+          rename(a1(id)), rename(a2(id)), visibility(id))
+      (id:LSTypeId) :
+        LSTypeId(name(id), rename(args(id)), rename(parent(id)),
+          rename(fields(id)), visibility(id))
+      (id:FieldId) :
+        id
+      (id:LSExternFnId) :
+        LSExternFnId(name(id), lbl(id), rename(a1(id)),
+          rename(a2(id)), visibility(id))
+      (id:LSExternId) :
+        LSExternId(name(id), lbl(id), rename(type(id)), visibility(id))
+
+  defn rename (x:Imm) :
+    match(x) :
+      (x:Mem) : Mem(rename(n(x)), offset(x))
+      (x:TagImm) : TagImm(rename(n(x)), marker?(x))
+      (x) : x
+
+  defn rename (t:KType) :
+    match(map(rename, t)) :
+      (t:KStructT) : KStructT(rename(n(t)))
+      (t:KOf) : KOf(rename(n(t)))
+      (t:KTVar) : KTVar(rename(n(t)))
+      (t) : t
+
+  defn rename (x:Ins) :
+    match(map(rename, x)) :
+      (x:Label) : Label(rename(n(x)), info(x))
+      (x:DefLabel) : DefLabel(rename(n(x)))
+      (x:Match) : Match(xs(x), rename(branches(x)), rename(no-branch(x)))
+      (x:Dispatch) : Dispatch(xs(x), rename(branches(x)), rename(no-branch(x)), rename(amb-branch(x)))
+      (x) : x
+
+  defn rename (x:KExp) :
+    defn rename-loc (x:KLoc) :
+      match(x) :
+        (x:KField) : KField(rename-loc(exp(x)), rename(n(x)))
+        (x:KSlot) : KSlot(rename-loc(exp(x)), type(x), index(x))
+        (x:KVarLoc) : KVarLoc(rename(n(x)))
+        (x) : x        
+    match(map(rename{_:KType}, map(rename{_:KExp}, x))) :
+      (x:KFn*) : KFn*(tail?(x), rename(targs(x)), a1(x), a2(x), rename(args(x)), body(x), info(x))
+      (x:KVar*) : KVar*(rename(n(x)), info(x))
+      (x:KLet*) : KLet*(rename(n(x)), type(x), value(x), body(x), info(x))
+      (x:KLetVar*) : KLetVar*(rename(n(x)), type(x), value(x), body(x), info(x))
+      (x:KMethod*) : KMethod*(props(x), rename(multi(x)), targs(x), rename(thisn(x)), value(x))
+      (x:KBranch*) : KBranch*(rename(args(x)), types(x), body(x), info(x))
+      (x:KLet) : KLet(rename(n(x)), value(x), body(x))
+      (x:KLetVar) : KLetVar(rename(n(x)), type(x), value(x), body(x))
+      (x:KLetRec) : KLetRec(rename(ns(x)), values(x), body(x))
+      (x:KVar) : KVar(rename(n(x)))
+      (x:KObject) : KObject(rename(n(x)), args(x), info(x))
+      (x:KArray) : KArray(rename(n(x)), args(x), info(x))
+      (x:KStruct) : KStruct(rename(n(x)), args(x))
+      (x:KCurry) : KCurry(rename(n(x)), targs(x))
+      (x:KTagof) : KTagof(rename(n(x)))
+      (x:KBranch) : KBranch(rename(args(x)), types(x), body(x))
+      (x:KBlock) : KBlock(rename(n(x)), rename(targs(x)), rename(args(x)), types(x), body(x))
+      (x:KGoto) : KGoto(rename(n(x)), targs(x), args(x))
+      (x:KFn) : KFn(tail?(x), stack-properties(x), rename(targs(x)), a1(x), a2(x), rename(args(x)), body(x), info(x), stats(x))
+      (x:KMethod) : KMethod(props(x), rename(multi(x)), rename(thisn(x)), value(x))
+      (x:KSet*) : KSet*(rename-loc(loc(x)), type(x), value(x), info(x))
+      (x:KSet) : KSet(rename-loc(loc(x)), type(x), value(x))
+      (x:KPtr) : KPtr(rename-loc(loc(x)))
+      (x:KRead) : KRead(rename-loc(loc(x)), type(x))
+      (x) : x
+
+  defn rename (x:KTExp) :
+    match(map(rename{_:KExp}, map(rename{_:KType}, x))) :
+      (x:KDef*) : KDef*(rename(n(x)), type(x), value(x), info(x))
+      (x:KDefVar*) : KDefVar*(rename(n(x)), type(x), value(x), info(x))
+      (x:KDefmethod*) : KDefmethod*(props(x), rename(multi(x)), targs(x), value(x))
+      (x:KDef) : KDef(rename(n(x)), type(x), value(x))
+      (x:KDefVar) : KDefVar(rename(n(x)), type(x), value(x))
+      (x:KDefn) : KDefn(props(x), private?(x), rename(n(x)), value(x))
+      (x:KDefmulti) : KDefmulti(private?(x), rename(n(x)), tail?(x), rename(targs(x)), a1(x), a2(x), info(x))  
+      (x:KDefmethod) : KDefmethod(props(x), rename(n(x)), rename(multi(x)), value(x))
+      (x:KDefType) : KDefType(rename(n(x)), name(x), parent(x), rename(children(x)))
+      (x:KDefStruct) : KDefStruct(rename(n(x)), name(x), parent(x), rename(fields(x)), rename(rfield(x)))
+      (x:KExternFn) : KExternFn(props(x), rename(n(x)), lbl(x), value(x))
+      (x:KExtern) : KExtern(rename(n(x)), lbl(x), type(x))
+      (x) : x
+
+  defn rename (c:KChild) :
+    KChild(rename(n(c)), parent(c))
+
+  defn rename (c:KStructField) :
+    KStructField(rename(n(c)), type(c))
+
+  defn rename-const (c:TGConst) :
+    match(c) :
+      (c:TGTypeObject) : TGTypeObject(rename(n(c)))
+      (c:TGClosure) : TGClosure(rename(n(c)))
+      (c) : c
+
+  defn rename (e:TGDecl) :
+    match(e) :
+      (e:TGDefASM) :
+        TGDefASM(rename(n(e)), rename(ins(e)))
+      (e:TGDefmulti) :
+        TGDefmulti(rename(n(e)), tarity(e), arity(e), info(e))
+      (e:TGDefmethod) :
+        TGDefmethod(rename(multi(e)), rename(tags(e)), rename(code(e)))
+      (e:TGDefConst) :
+        TGDefConst(rename(n(e)), rename-const(value(e)))
+      (e:TGDefObject) :
+        TGDefObject(rename(n(e)), name(e), rename(parent(e)), size(e),
+          types(e), offsets(e), rsize(e), rtypes(e), roffsets(e))
+      (e:TGDefGlobal) :
+        TGDefGlobal(rename(n(e)), size(e), alignment(e),
+          types(e), offsets(e))
+
+  ;Plurals
+  defn rename (xs:List<Int>) : map(rename, xs)
+  defn rename (ts:List<LSType>) : map(rename, ts)
+  defn rename (ts:List<Type>) : map(rename, ts)
+  defn rename (xs:List<ChildDec>) : map(rename, xs)
+  defn rename (xs:List<FieldDec>) : map(rename, xs)
+  defn rename (xs:List<Branch>) : map(rename, xs)
+  defn rename (xs:List<KType>) : map(rename, xs)
+  defn rename (xs:List<KChild>) : map(rename, xs)
+  defn rename (xs:List<KStructField>) : map(rename, xs)
+  defn rename (xs:Vector<Ins>) : map<Ins>(rename, xs)
+  defn rename (xs:Vector<TGDecl>) : map<TGDecl>(rename, xs)  
+
+  ;Return renamer
+  new Renamer :
+    defmethod rename (this, id:Id) : rename(id)
+    defmethod rename (this, e:Vector<TGDecl>) : rename(e)
+    defmethod rename (this, e:KTExp) : rename(e)
+

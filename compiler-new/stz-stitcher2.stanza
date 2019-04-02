@@ -1,0 +1,1366 @@
+defpackage stz/stitcher :
+  import core
+  import collections
+  import stz/asm-ir
+  import stz/codegen
+  import stz/dl-ir
+  import stz/vm-ir
+  import stz/utils
+  import stz/padder
+  import stz/const-pool
+  import stz/dyn-tree
+  import stz/trie
+  import stz/typeset
+  import stz/backend
+  import stz/algorithms
+
+;<DOC>=======================================================
+;===================== Documentation ========================
+;============================================================
+
+Input:
+  Functions compiled into ASM IR.  
+Output:
+  Pure ASM IR
+
+Constructs that are removed:
+  LocalMem
+  TagImm
+  StackMap
+  LinkId
+  Match
+  Dispatch
+  MethodDispatch
+  TypeofOp
+
+Labels are unique-ified so that we can compile multiple packages into
+the same assembly file.
+
+Removal strategies for each construct:
+  TagImm:
+    Becomes integer immediates.
+    Requires each class to have an integer tag assigned to it.
+    If it is a marker, then becomes (tag << 3) + marker-ref-bits.
+    If it is not a marker, then becomes tag.
+  StackMap:
+    Becomes an integer immediate.
+    Requires every unique stackmap to have an integer id assigned to it.
+    Output the id.
+  LinkId:
+    The linkids can refer to one of the following:
+      CodeId:
+        Becomes a Mem immediate referencing the starting label of the function.
+        Requires all functions to have a unique label assigned to it.
+      ExternId:
+        Becomes an ExMem immediate referencing the external label of the variable.
+      ExternDefnId:
+        Becomes an ExMem immediate referencing the external label of the function.
+      DataId:
+        Becomes a Mem immediate referencing the label of the data packet.
+      GlobalId:
+        Becomes a Mem immediate referencing the global constant pool table, with
+        the appropriate offset. 
+      ConstId:
+        Becomes a Mem immediate referencing the global constant pool table, with
+        the appropriate offset.
+        Requires constants to be interned and assigned indices. 
+  Match, Dispatch:
+    Requires the class hierarchy to be indexed.
+    Convert the branches into a trie and then emit the instructions
+    for performing the branching.
+  MethodDispatch:
+    Requires the class hierarchy to be indexed.
+    Requires the method branches for each multi to be collected.
+    Convert the branches into a trie and then emit the instructions
+    for performing the branching.
+  TypeofOp :
+    Requires the class hierarchy to be indexed.
+    No trie is needed, just the list of concrete tags.
+
+Implementation of Global Table:
+  Input:
+    Sequence of VMGlobals:
+      defstruct VMGlobal :
+        id: Int
+        size: Int
+        roots: Tuple<Int>
+  Output:
+    For each global:
+      Compute an offset.
+    Compute the reference mask.
+    Compute the number of words in the mask.
+
+Implementation of Constant Table:
+  Input:
+    Sequence of VMConst:
+      defstruct VMConst :
+        id: Int
+        value: VMValue
+  Output:
+    The index of each interned VMConst.
+    The Consts corresponding to each index, ready to be
+    encoded as a table.
+
+Implementation of Class Table:
+  Goal:
+    The objective of the class table is to help compile the
+    match/dispatch statements. The key feature needed is the ability
+    to convert a TypeSet into an ISet to perform the trie conversion.
+  Therefore:
+    Given a single typeid, within a package. Convert it to an ISet.
+  Therefore:
+    Given a single typeid, we need to resolve it to a global typeid.
+  Therefore:
+    Each global typeid needs a node in the class dynamic tree.
+  Implementation:
+    Sweep through every vmclass definition in each package, and if it
+    is a concrete class, then assign its ClassProp property with its
+    assigned tag.
+    At the same time, for each vmclass definition, add a definition in
+    the class dynamic tree using its global id (not its tag).
+  Output:
+    For each TypeSet, its ISet mapping to its global tags, because we
+    need to distinguish marker objects from non-marker objects.
+
+Implementation of Match/Dispatch instructions:
+  Input:
+    Match :
+      xs: List<Imm>
+      branches: List<Branch>
+      no-branch: Int
+    Branch :
+      tags: List<TypeSet>
+      n: Int
+  Output:
+    Emitted code for performing the dispatch.
+  Assumptions:
+    We can assume that the arguments have been placed in the appropriate
+    registers and argument slots for the platform.
+  Implementation:
+    Requires conversion of a typeset to an ISet.
+    This can be done using the DynTree implementation, once we
+    have finished assigning class tags to all concrete classes.
+
+;============================================================
+;=======================================================<DOC>
+
+;============================================================
+;=================== StitcherEmitter ========================
+;============================================================
+
+public deftype Stitcher
+public defmulti emit-tables (s:Stitcher, emitter:CodeEmitter) -> False
+public defmulti emitter (s:Stitcher, package:Symbol, emitter:CodeEmitter) -> StitchEmitter
+defmulti stubs (s:Stitcher) -> AsmStubs
+defmulti core-fn (s:Stitcher, id:FnId) -> Imm
+
+public deftype StitchEmitter <: CodeEmitter
+public defmulti emit-label (e:StitchEmitter, id:Int) -> False
+
+;============================================================
+;=============== Create the Stitcher Tables =================
+;============================================================
+
+deftype PackageIds
+defmulti global-id (ids:PackageIds, lid:Int) -> Int|False
+defmulti set-global-id (ids:PackageIds, lid:Int, gid:Int) -> False
+
+defn global-id! (ids:PackageIds, lid:Int) :
+  match(global-id(ids,lid)) :
+    (id:Int) : id
+    (id:False) : fatal("No global id registered for local id: %_" % [lid])
+
+public defn Stitcher (vmpackages:Seqable<VMPackage>, stubs:AsmStubs) :
+  ;Records
+  val global-recs = Vector<Rec>()
+  val global-props = Vector<GProps|False>()
+  val id-indices = HashTable<RecId,Int>()
+  val package-ids = HashTable<Symbol,PackageIds>()
+
+  ;Add a new global record
+  defn add-global-record (r:Rec) -> Int :
+    val global-id = length(global-props)
+    add(global-recs, r)
+    add(global-props, false)
+    id-indices[id(r)] = global-id
+    global-id
+
+  ;Ensure that the following local id in the package
+  ;has a reserved global id. Returns its global-id.
+  defn ensure-global-id (pkgids:PackageIds, lid:Int) -> Int :
+    match(global-id(pkgids, lid)) :
+      (gid:Int) :
+        gid
+      (_:False) :
+        val gid = length(global-props)
+        add(global-props, false)
+        set-global-id(pkgids, lid, gid)
+        gid
+
+  ;Set the property of a given local id
+  defn set-global-prop (pkgids:PackageIds, lid:Int, p:GProps) :
+    val gid = ensure-global-id(pkgids, lid)
+    global-props[gid] = p
+
+  ;Initialize record tables
+  defn initialize-record-tables () :
+    ;Accumulate initializers to run after we populate
+    ;exported records.
+    val initializers = Vector<(() -> ?)>()
+    defn initialize (f:() -> ?) :
+      add(initializers, f)      
+
+    ;Initialize package ids
+    for packageio in seq(packageio, vmpackages) do :
+      val local-ids = IntTable<Int>()
+      for e in exports(packageio) do :
+        local-ids[n(e)] = add-global-record(rec(e))
+      within initialize() :
+        for i in imports(packageio) do :
+          local-ids[n(i)] = id-indices[id(rec(i))]
+      package-ids[package(packageio)] = new PackageIds :
+        defmethod global-id (this, lid:Int) :
+          get?(local-ids, lid)
+        defmethod set-global-id (this, lid:Int, gid:Int) :
+          local-ids[lid] = gid
+        
+    ;Run initializers
+    for init in initializers do :
+      init()
+
+  ;Simple properties
+  defn initialize-simple-props () :    
+    for p in vmpackages do :
+      val pkgids = package-ids[package(p)]
+      for f in funcs(p) do :
+        set-global-prop(pkgids, id(f), CodeProps(unique-id(stubs)))
+      for e in extern-defns(p) do :
+        set-global-prop(pkgids, fid(e), ExternDefnProps(lbl(e)))
+      for e in externs(p) do :
+        set-global-prop(pkgids, id(e), ExternProps(name(e)))
+      for d in datas(p) do :
+        set-global-prop(pkgids, id(d), DataProps(unique-id(stubs)))
+
+  ;Global table
+  var total-global-size:Int = 0
+  val global-roots = Vector<Int>()
+  defn initialize-global-table () :
+    val offset-counter = Counter(0)
+    for p in vmpackages do :
+      val pkgids = package-ids[package(p)]
+      defn global-alignment (g:VMGlobal) :
+        if size(g) >= 8 : 8
+        else : size(g)
+      val [padded-globals, _] = pad(global-alignment, size, globals(p), 8)      
+      for g in padded-globals do :
+        match(g) :
+          (g:Padding) :
+            next(offset-counter, size(g))
+          (g:VMGlobal) :
+            val offset = next(offset-counter, size(g))
+            set-global-prop(pkgids, id(g), GlobalProps(offset))
+            for r in roots(g) do :
+              fatal("Unaligned global reference") when offset % 8 != 0
+              add(global-roots, offset / 8 + r)
+    total-global-size = value(offset-counter)
+
+  ;Constant pool
+  val const-pool = ConstantPool()
+  defn initialize-const-table () :    
+    for p in vmpackages do :
+      val pkgids = package-ids[package(p)]
+      defn resolve-code-ids (v:VMValue) -> VMValue :
+        defn to-global (x:CodeId) : CodeId(global-id!(pkgids, id(x)))
+        match(v) :
+          (v:List) : map(resolve-code-ids, v)
+          (v:VMTypeObject) : VMTypeObject(to-global(id(v)))
+          (v:VMClosure) : VMClosure(to-global(id(v)))
+          (v) : v              
+      for c in consts(p) do :
+        val v* = resolve-code-ids(value(c))
+        val c* = intern(const-pool, v*)
+        set-global-prop(pkgids, id(c), ConstProps(id(id(c*))))
+
+  ;Class properties
+  val class-tree = DynTree()
+  val class-table = Vector<VMClass>()
+  var num-concrete-classes:Int 
+  
+  defn initialize-class-props () :
+    ;Compute mapping from global-ids to core tags
+    val core-tag-table = IntTable<Int>()
+    for entry in [CORE-FALSE-ID => FALSE-TYPE
+                  CORE-TRUE-ID => TRUE-TYPE
+                  CORE-BYTE-ID => BYTE-TYPE
+                  CORE-CHAR-ID => CHAR-TYPE
+                  CORE-INT-ID => INT-TYPE
+                  CORE-FLOAT-ID => FLOAT-TYPE
+                  CORE-STACK-ID => STACK-TYPE
+                  CORE-FN-ID => FN-TYPE
+                  CORE-TYPE-ID => TYPE-TYPE
+                  CORE-LIVENESS-TRACKER-ID => LIVENESS-TRACKER-TYPE] do :
+      val gid = id-indices[key(entry)]
+      core-tag-table[gid] = value(entry)
+
+    ;Resolve all parent and child links to their global ids.
+    defn resolve (pkgids:PackageIds, c:VMClass) :
+      defn gid (n:Int) : global-id!(pkgids, n)
+      defn gids (ns:Tuple<Int>) : map(gid, ns)
+      match(c) :
+        (c:VMArrayClass) : sub-id(sub-parents(c, gids(parents(c))), gid(id(c)))
+        (c:VMLeafClass) : sub-id(sub-parents(c, gids(parents(c))), gid(id(c)))
+        (c:VMAbstractClass) : VMAbstractClass(gid(id(c)), gids(parents(c)), gids(children(c)))
+
+    ;Categorize class definitions
+    val builtin-classes = Array<VMArrayClass|VMLeafClass>(NUM-BUILTIN-TYPES)
+    val concrete-classes = Vector<VMArrayClass|VMLeafClass>()
+    val abstract-classes = Vector<VMAbstractClass>()
+    for p in vmpackages do :
+      val pkgids = package-ids[package(p)]
+      for c in classes(p) do :
+        val cid = ensure-global-id(pkgids, id(c))
+        match(resolve(pkgids, c)) :
+          (c:VMArrayClass|VMLeafClass) :
+            match(get?(core-tag-table,cid)) :
+              (tag:Int) : builtin-classes[tag] = c
+              (_:False) : add(concrete-classes, c)             
+          (c:VMAbstractClass) :
+            add(abstract-classes, c)
+    num-concrete-classes = length(builtin-classes) + length(concrete-classes)
+    add-all(class-table, cat-all([builtin-classes, concrete-classes, abstract-classes]))
+
+    ;Build class tree
+    add(class-tree, node-states) where :
+      val node-states = for c in class-table seq :
+        match(c) :
+          (c:VMArrayClass|VMLeafClass) : SortedNodeState(id(c), parents(c), [], true)
+          (c:VMAbstractClass) : SortedNodeState(id(c), parents(c), children(c), false)
+
+    ;Determine whether a class is represented as a marker
+    val unique-id = id-indices[CORE-UNIQUE-ID]
+    defn marker? (c:VMClass) :
+      match(c:VMLeafClass) :
+        val no-fields = size(c) == 0
+        val unique = parent?(class-tree, id(c), unique-id)
+        no-fields and not unique
+
+    ;Add all classes to props table and assign tags for
+    ;each of them.
+    for (c in class-table, tag in 0 to false) do :
+      global-props[id(c)] = ClassProps(tag, marker?(c))
+
+  ;Method Table
+  val method-table = IntListTable<Branch>()
+  defn initialize-method-table () :
+    for p in vmpackages do :
+      val pkgids = package-ids[package(p)]
+      for m in methods(p) do :
+        val multi* = global-id!(pkgids, multi(m))
+        val fid* = global-id!(pkgids, fid(m))
+        val lbl = lbl(global-props[fid*] as CodeProps)
+        val types* = map(resolve{pkgids, _}, types(m))
+        val branch* = Branch(to-list(types*), M(lbl))
+        add(method-table, multi*, branch*)
+
+  ;Resolve a package-local TypeSet to use global ids
+  defn resolve (pkgids:PackageIds, t:TypeSet) -> TypeSet :
+    let loop (t:TypeSet = t) :
+      match(t) :
+        (t:TopType) : t
+        (t:AndType) : AndType?(seq(loop,types(t)))
+        (t:OrType) : OrType?(seq(loop,types(t)))
+        (t:SingleType) : SingleType(global-id!(pkgids,type(t)))
+
+  ;Determine whether one typeset is a subtype of another typeset
+  defn subtype? (a:TypeSet, b:TypeSet) :
+    match(a, b) :
+      (a, b:TopType) : true
+      (a:OrType, b) : all?(subtype?{_, b}, types(a))
+      (a, b:AndType) : all?(subtype?{a, _}, types(b))
+      (a, b:OrType) : any?(subtype?{a, _}, types(b))
+      (a:AndType, b) : any?(subtype?{_, b}, types(a))
+      (a:SingleType, b:SingleType) : parent?(class-tree, type(a), type(b))
+      (a, b) : false
+
+  ;Order branches by dispatch ordering
+  defn dispatch-ordering (branches:Tuple<Branch>) :
+    defn subbranch? (a:Int, b:Int) :
+      all?(subtype?, tags(branches[a]), tags(branches[b]))
+    to-tuple $ for item in ambiguity-ordering(length(branches), subbranch?) seq :
+      match(item) :
+        (item:Int) :
+          branches[item]
+        (item:List<Int>) :
+          to-tuple(seq({branches[_]}, item))
+
+  ;Create stackmap table
+  defn stackmap-hash (x:StackMap) :
+    hash $ [size(x), indices(x)]
+  val stackmap-table = HashTable<StackMap,Int>(stackmap-hash, equal?)
+  val stackmaps = Vector<StackMap>()
+  defn stackmap-index (m:StackMap) :
+    if not key?(stackmap-table,m) :
+      val i = length(stackmaps)
+      add(stackmaps, m)
+      stackmap-table[m] = i
+    stackmap-table[m]
+
+  ;Accumulate info table
+  val file-info-table = Vector<KeyValue<Int,FileInfo>>()
+  defn add-info-table (n:Int, info:FileInfo) :
+    add(file-info-table, n => info)
+
+  ;Create a function-local emitter
+  defn emitter (package:Symbol, code-emitter:CodeEmitter) :
+    val pkgids = package-ids[package]
+    val label-table = IntTable-init<Int>(unique-id{stubs})
+
+    ;Link an immediate, remove all non-handled items.
+    defn link (x:Imm) :
+      match(x) :
+        (x:LocalMem) :
+          Mem(label-table[n(x)],0)
+        (x:TagImm) : 
+          tag-imm(global-id!(pkgids, n(x)), marker?(x))
+        (x:StackMap) :
+          IntImm(stackmap-index(x))
+        (x:LinkId) :
+          val gid = global-id!(pkgids, id(x))
+          match(global-props[gid]) :
+            (p:CodeProps) :
+              Mem(lbl(p), 0)
+            (p:ExternProps) :
+              ExMem(exlbl(p), 0)
+            (p:ExternDefnProps) :
+              ExMem(exlbl(p), 0)
+            (p:DataProps) :
+              Mem(lbl(p), 0)
+            (p:ConstProps) :
+              Mem(const-table(stubs), index(p) * 8)
+            (p:GlobalProps) :
+              Mem(globals(stubs), offset(p))
+        (x) :
+          x
+
+    ;Return the numerical tag for the given global id
+    defn tag-imm (gid:Int, marker?:True|False) :
+      val props = global-props[gid] as ClassProps
+      if marker? : INT(tag(props) << 3 + 2)
+      else : INT(tag(props))
+
+    ;Resolve a typeset from package ids to global ids
+    defn resolve-branch (b:Branch) :
+      val tags* = map(resolve{pkgids, _}, tags(b))
+      Branch(tags*, dst(b))
+
+    ;Convert a typeset into an ISet for the trie
+    defn to-iset (t:TypeSet) :
+      defn union (a:ISet, b:ISet) :
+        a-or-b(compare(a,b))
+      defn intersection (a:ISet, b:ISet) :
+        a-and-b(compare(a,b))
+      match(t) :
+        (t:TopType) :
+          IAll()
+        (t:AndType) :
+          reduce(intersection, seq(to-iset, types(t)))
+        (t:OrType) :
+          reduce(union, seq(to-iset, types(t)))
+        (t:SingleType) :
+          ISubset(all-children(class-tree, type(t)))
+
+    ;Convert an asm branch into an ibranch
+    defn to-ibranch (b:Branch) :
+      val sets = map(to-iset, tags(b))
+      IBranch(sets, dst(b))
+    defn to-iamb (bs:Tuple<Branch>, amb:Imm) :
+      val sets = for b in bs map :
+        to-tuple $ seq(to-iset, tags(b))
+      IAmb(sets, amb)
+
+    ;Emit code for producing trie (args is a helper)
+    defn emit-trie (t:IfTrie, default:Imm, args:List<Imm>) :
+      ;Is the given type a marker?
+      ;Is it both empty, and not a subtype of Unique?
+      defn marker? (x:Int) :
+        /marker?(global-props[x] as ClassProps)
+
+      ;Calculate targets of all branches
+      val targets = for entry in branches(t) map :
+        match(value(entry)) :
+          (v:IfTrie) : M(unique-id(stubs))
+          (v:EndTrie) : target(v) as Imm
+
+      ;Categorize branches
+      val prim-targets = Vector<KeyValue<Int,Imm>>()
+      val marker-targets = Vector<KeyValue<Int,Imm>>()
+      val ref-targets = Vector<KeyValue<Int,Imm>>()
+      var default-target = default
+      for (entry in branches(t), target in targets) do :
+        match(key(entry)) :
+          (iset:ISubset) :
+            for x in xs(iset) do :
+              if x == id-indices[CORE-BYTE-ID] : add(prim-targets, x => target)
+              else if x == id-indices[CORE-CHAR-ID] : add(prim-targets, x => target)
+              else if x == id-indices[CORE-INT-ID] : add(prim-targets, x => target)
+              else if x == id-indices[CORE-FLOAT-ID] : add(prim-targets, x => target)
+              else if marker?(x) : add(marker-targets, x => target)
+              else : add(ref-targets, x => target)              
+          (iset:IAll) :
+            default-target = target
+
+      ;Registers
+      val OBJ = R0
+      val BITS = R1
+      val TAG = R1
+
+      ;Load object
+      val object = match(head(args)) :
+        (a:Reg) :
+          a
+        (a:Mem) :
+          E $ LoadL(OBJ, a)
+          OBJ
+
+      ;Test bits
+      val marker-branches = unique-id(stubs)
+      val ref-branches = unique-id(stubs)
+      E $ AndL(BITS, object, INT(7))      
+      for entry in prim-targets do :
+        val x = key(entry)
+        val target = value(entry)
+        val tagbits =
+          if x == id-indices[CORE-BYTE-ID] : INT(3)
+          else if x == id-indices[CORE-CHAR-ID] : INT(4)
+          else if x == id-indices[CORE-INT-ID] : INT(0)
+          else if x == id-indices[CORE-FLOAT-ID] : INT(5)
+          else : fatal("Not a primitive type")
+        E $ BreakL(target, EqOp(), BITS, tagbits)
+      E $ BreakL(M(marker-branches), EqOp(), BITS, INT(2))
+      E $ BreakL(M(ref-branches), EqOp(), BITS, INT(1))
+      E $ Goto(default-target)
+
+      ;Marker branches
+      E $ Label(marker-branches)
+      for entry in marker-targets do :
+        val x = key(entry)
+        val target = value(entry)
+        E $ BreakL(target, EqOp(), object, tag-imm(x,true))
+      E $ Goto(default-target)
+
+      ;Ref branches
+      E $ Label(ref-branches)
+      E $ LoadL(TAG, object, -1)
+      for entry in ref-targets do :
+        val x = key(entry)
+        val target = value(entry)
+        E $ BreakL(target, EqOp(), TAG, tag-imm(x, false))
+      E $ Goto(default-target)
+
+      ;Further tries
+      for (entry in branches(t), target in targets) do :
+        val trie = value(entry)
+        match(trie:IfTrie) :
+          E $ Label(n(target as Mem))
+          emit-trie(trie, default, tail(args))
+
+    ;Emit code for producing typeof
+    defn emit-typeof (x:Loc, y:Imm, iset:ISet) :
+      match(iset) :
+        ;Return true always
+        (iset:IAll) :
+          E $ SetL(x, INT(1))
+        ;Return false
+        (iset:ISubset) :
+          ;Is the given type a marker?
+          defn marker? (x:Int) :
+            /marker?(global-props[x] as ClassProps)
+
+          ;Categorize branches
+          val prims = Vector<Int>()
+          val markers = Vector<Int>()
+          val refs = Vector<Int>()
+          for x in xs(iset) do :
+            if x == id-indices[CORE-BYTE-ID] : add(prims, x)
+            else if x == id-indices[CORE-CHAR-ID] : add(prims, x)
+            else if x == id-indices[CORE-INT-ID] : add(prims, x)
+            else if x == id-indices[CORE-FLOAT-ID] : add(prims, x)
+            else if marker?(x) : add(markers, x)
+            else : add(refs, x)              
+
+          ;Registers
+          val OBJ = R0
+          val BITS = R1
+          val TAG = R1
+
+          ;Labels
+          val pass-lbl = unique-id(stubs)
+          val end-lbl = unique-id(stubs)
+
+          ;Load object
+          E $ SetL(OBJ, y)
+
+          ;Default is 0
+          E $ SetL(x, INT(0))
+
+          ;Test bits
+          val marker-branches = unique-id(stubs)
+          val ref-branches = unique-id(stubs)
+          E $ AndL(BITS, OBJ, INT(7))      
+          for x in prims do :
+            val tagbits =
+              if x == id-indices[CORE-BYTE-ID] : INT(3)
+              else if x == id-indices[CORE-CHAR-ID] : INT(4)
+              else if x == id-indices[CORE-INT-ID] : INT(0)
+              else if x == id-indices[CORE-FLOAT-ID] : INT(5)
+              else : fatal("Not a primitive type")
+            E $ BreakL(M(pass-lbl), EqOp(), BITS, tagbits)
+          E $ BreakL(M(marker-branches), EqOp(), BITS, INT(2))
+          E $ BreakL(M(ref-branches), EqOp(), BITS, INT(1))
+          E $ Goto(M(end-lbl))
+
+          ;Marker branches
+          E $ Label(marker-branches)
+          for x in markers do :
+            E $ BreakL(M(pass-lbl), EqOp(), OBJ, tag-imm(x,true))
+          E $ Goto(M(end-lbl))
+
+          ;Ref branches
+          E $ Label(ref-branches)
+          E $ LoadL(TAG, OBJ, -1)
+          for x in refs do :
+            E $ BreakL(M(pass-lbl), EqOp(), TAG, tag-imm(x, false))
+          E $ Goto(M(end-lbl))
+
+          ;Pass and failure labels
+          E $ Label(pass-lbl)
+          E $ SetL(x, INT(1))
+          E $ Label(end-lbl)
+
+    ;Retrieve the arguments to a trie for a match/dispatch statement
+    defn trie-args (t:MTrie, xs:List<Imm>) :
+      val reg-args = xs as List<Reg>
+      val mem-args = seq(Mem{registers(stubs), _}, 0 to false by 8)
+      val all-args = cat(reg-args, mem-args)
+      to-list(take-n(depth(t), all-args))      
+
+    ;Retrieve the arguments to a trie from a method-dispatch statement
+    defn trie-method-args (t:MTrie, num-header-args:Int) :
+      val reg-args = seq(R, tailn(call-regs(backend(stubs)), num-header-args))
+      val mem-args = seq(Mem{registers(stubs), _}, 0 to false by 8)
+      val all-args = cat(reg-args, mem-args)
+      to-list(take-n(depth(t), all-args))      
+
+    ;Return new code emitter
+    defn E (i:Ins) : emit(code-emitter, i)      
+    new StitchEmitter :
+      defmethod emit-label (this, id:Int) :
+        val gid = global-id!(pkgids, id)
+        match(global-props[gid]) :
+          (p:CodeProps) : E $ Label(lbl(p))
+          (p:ExternDefnProps) : E $ ExLabel(exlbl(p))
+      defmethod emit (this, i:Ins) :
+        match(map(link,i)) :
+          (i:Label) :
+            val n* = label-table[n(i)]
+            E $ Label(n*)
+            match(info(i)) :
+              (info:FileInfo) : add-info-table(n*, info)
+              (info:False) : false
+          (i:Match) :
+            val branches* = map(resolve-branch, branches(i))
+            if empty?(branches*) :
+              E $ Goto(no-branch(i))
+            else :
+              val trie = to-trie(seq(to-ibranch, branches*))
+              emit-trie(trie, no-branch(i), trie-args(trie,xs(i)))
+          (i:Dispatch) :
+            val branches* = map(resolve-branch, branches(i))
+            if empty?(branches*) :
+              E $ Goto(no-branch(i))
+            else :
+              val trie = to-trie $
+                for b in dispatch-ordering(to-tuple(branches*)) seq :
+                  match(b) :
+                    (b:Branch) : to-ibranch(b)
+                    (b:Tuple<Branch>) : to-iamb(b, amb-branch(i))
+              emit-trie(trie, no-branch(i), trie-args(trie,xs(i)))
+          (i:MethodDispatch) :
+            val multi-id = global-id!(pkgids, multi(i))
+            val branches = method-table[multi-id]
+            if empty?(branches) :
+              E $ Goto(no-branch(i))
+            else :
+              val trie = to-trie $
+                for b in dispatch-ordering(to-tuple(branches)) seq :
+                  match(b) :
+                    (b:Branch) : to-ibranch(b)
+                    (b:Tuple<Branch>) : to-iamb(b, amb-branch(i))
+              emit-trie(trie, no-branch(i), trie-method-args(trie, num-header-args(i)))            
+          (i:UnaOp) :
+            match(op(i)) :
+              (op:TypeofOp) :
+                val iset = to-iset(resolve(pkgids, tag(op)))
+                emit-typeof(x(i), y(i), iset)
+              (op) : E(i)
+          (i) : E(i)    
+
+  ;Initialization function
+  defn emit-initialization-function (code-emitter:CodeEmitter) :
+    defn E (i:Ins) : emit(code-emitter, i)
+    val frame-size = 16
+    val stackmap = stackmap-index(StackMap(frame-size, []))
+    E $ Label(init-function(stubs))
+    E $ StoreL(RSP, INT(stackmap), 8)    
+    for p in vmpackages do :
+      val pkgids = package-ids[package(p)]
+      val init = init(p)
+      match(init:Int) :
+        E $ AddL(RSP, RSP, INT(frame-size + 8))
+        val gid = global-id!(pkgids, init)
+        val code-id = lbl(global-props[gid] as CodeProps)
+        E $ Call(M(code-id))
+        E $ SubL(RSP, RSP, INT(frame-size + 8))
+    E $ SetL(R0, INT(0))
+    E $ Return()
+
+  ;Emit global table
+  defn emit-global-table (code-emitter:CodeEmitter) :
+    defn E (i:Ins) : emit(code-emitter, i)
+    ;Memory for globals
+    E $ DefData()
+    E $ Label(globals(stubs))
+    defn DefSpace? (sz:Int) :
+      E(DefSpace(sz)) when sz > 0
+    var current-size:Int = 0
+    for r in global-roots do :
+      val offset = r * 8
+      DefSpace?(offset - current-size)
+      E $ DefLong(to-long(-1 << 3 + 2))
+      current-size = offset + 8
+    DefSpace?(total-global-size - current-size)
+    E $ DefText()
+
+    ;Memory for global roots
+    E $ DefData()
+    E $ Label(global-root-table(stubs))
+    E $ DefInt(length(global-roots))
+    for r in global-roots do :
+      E $ DefInt(r)
+    E $ DefText()
+
+  ;Emit constant table
+  defn emit-const-table (code-emitter:CodeEmitter) :
+    defn E (i:Ins) : emit(code-emitter, i)
+    val consts = consts(const-pool)
+    
+    E $ DefData()
+    E $ Label(const-table(stubs))
+    for v in consts do :
+      E $ DefLong(to-long(-1 << 3 + 2))
+    E $ DefText()
+
+    val writer = new ConstWriter :
+      defmethod write (this, b:Byte) :
+        E $ DefByte(b)
+      defmethod write (this, i:Int) :
+        E $ DefInt(i)
+      defmethod write (this, l:Long) :
+        E $ DefLong(l)
+      defmethod write (this, cid:CodeId) :
+        val props = global-props[id(cid)] as CodeProps
+        E $ DefLabel(lbl(props))
+    
+    E $ DefData()
+    E $ Label(const-mem(stubs))
+    E $ DefInt(length(consts))
+    for v in consts do :
+      write-const(writer, v)
+    E $ DefText()
+
+  ;Emit data table
+  defn emit-data-table (code-emitter:CodeEmitter) :
+    defn E (i:Ins) : emit(code-emitter, i)      
+    for p in vmpackages do :
+      val pkgids = package-ids[package(p)]
+      for d in datas(p) do :
+        val props = global-props[global-id!(pkgids, id(d))] as DataProps
+        E $ DefData()
+        E $ Label(lbl(props))
+        E $ DefBytes(data(d))
+        E $ DefText()
+
+  ;Emit class table
+  ;Leaf Class Definition:
+  ;  name:ptr<long>, size:Int, item-size:Int (0), num-roots:Int, roots:Int ...
+  ;Array Class Definition:
+  ;  name:ptr<long>, base-size:Int, item-size:Int,
+  ;  num-base-roots:Int, num-item-roots:Int, base-roots:Int ..., item-roots:Int ...
+  defn emit-class-table (code-emitter:CodeEmitter) :
+    defn E (i:Ins) : emit(code-emitter, i)
+
+    ;Retrieve class name
+    defn class-name (c:VMClass) -> String :
+      defn name (x:Int) :
+        if x < length(global-recs) :
+          val tid = id(global-recs[x]) as TypeId
+          /name(tid)
+      match(name(id(c))) :
+        ;Has a user-given name
+        (name:Symbol) :
+          to-string(name)
+        ;Construct a name from parents
+        (_:False) :
+          val parent-names = seq(to-string{name(_)}, parents(c))
+          string-join(parent-names, "&")
+
+    ;Create class labels
+    val class-lbls = to-tuple $
+      repeatedly(unique-id{stubs}, num-concrete-classes)
+    E $ DefData()
+    E $ Label(/class-table(stubs))
+    for lbl in class-lbls do :
+      E $ DefLabel(lbl)
+    for (c in class-table, lbl in class-lbls, i in 0 to false) do :
+      val name-lbl = unique-id(stubs)
+      E $ Label(lbl)
+      E $ DefLabel(name-lbl)
+      match(c) :
+        (c:VMLeafClass) :
+          E $ DefInt(size(c))
+          E $ DefInt(0)
+          E $ DefInt(length(roots(c)))
+          do(E{DefInt(_)}, roots(c))
+        (c:VMArrayClass) :
+          E $ DefInt(base-size(c))
+          E $ DefInt(item-size(c))
+          E $ DefInt(length(base-roots(c)))
+          E $ DefInt(length(item-roots(c)))
+          do(E{DefInt(_)}, base-roots(c))
+          do(E{DefInt(_)}, item-roots(c))
+      E $ Label(name-lbl)
+      E $ DefString(class-name(c))
+      println("//Class %_ is %_" % [i, class-name(c)])
+    E $ DefText()
+
+  ;Emit stackmap table
+  defn emit-stackmap-table (code-emitter:CodeEmitter) :
+    defn E (i:Ins) : emit(code-emitter, i)
+    val map-lbls = to-tuple $
+      repeatedly(unique-id{stubs}, length(stackmaps))
+    E $ DefData()
+    E $ Label(/stackmap-table(stubs))
+    for lbl in map-lbls do :
+      E $ DefLabel(lbl)
+    for (m in stackmaps, lbl in map-lbls) do :
+      E $ Label(lbl)
+      E $ DefInt(size(m))
+      E $ DefInt(length(indices(m)))
+      for i in indices(m) do :
+        E $ DefInt(i)
+    E $ DefText()
+
+  ;Emit info table
+  defn emit-info-table (code-emitter:CodeEmitter) :
+    defn E (i:Ins) : emit(code-emitter, i)
+    val string-lbls = HashTable-init<String,Int>(unique-id{stubs})
+    E $ DefData()
+    E $ Label(info-table(stubs))
+    E $ DefLong(to-long(length(file-info-table)))
+    for entry in file-info-table do :
+      val [lbl, info] = [key(entry), value(entry)]
+      E $ DefLabel(lbl)
+      E $ DefLabel(string-lbls[filename(info)])
+      E $ DefInt(line(info))
+      E $ DefInt(column(info))
+    E $ DefText()
+    E $ DefData()
+    for entry in string-lbls do :
+      val [s, n] = [key(entry), value(entry)]
+      E $ Label(n)
+      E $ DefString(s)
+    E $ DefText()
+
+  ;Initialize record tables
+  initialize-record-tables()
+  initialize-simple-props()
+  initialize-global-table()
+  initialize-const-table()
+  initialize-class-props()
+  initialize-method-table()
+
+  ;Return new Stitcher
+  new Stitcher :
+    defmethod emitter (this, package:Symbol, code-emitter:CodeEmitter) :
+      emitter(package, code-emitter)
+    defmethod emit-tables (this, code-emitter:CodeEmitter) :
+      emit-initialization-function(code-emitter)
+      emit-global-table(code-emitter)
+      emit-const-table(code-emitter)
+      emit-data-table(code-emitter)
+      emit-class-table(code-emitter)
+      emit-stackmap-table(code-emitter)
+      emit-info-table(code-emitter)
+    defmethod stubs (this) :
+      stubs
+    defmethod core-fn (this, id:FnId) :
+      val gid = id-indices[id]
+      val lbl = lbl(global-props[gid] as CodeProps)
+      M(lbl)
+  
+deftype GProps
+defstruct CodeProps <: GProps :
+  lbl:Int
+defstruct ExternProps <: GProps :
+  exlbl:Symbol
+defstruct ExternDefnProps <: GProps :
+  exlbl:Symbol
+defstruct GlobalProps <: GProps :
+  offset: Int
+defstruct DataProps <: GProps :
+  lbl:Int
+defstruct ConstProps <: GProps :
+  index:Int
+defstruct ClassProps <: GProps :
+  tag: Int
+  marker?: True|False
+
+;============================================================
+;===================== Runtime Stubs ========================
+;============================================================
+
+public defn emit-stubs (s:Stitcher, emitter:CodeEmitter) :
+  compile-extend-stack-stub(s, emitter)
+  compile-collect-garbage-stub(s, emitter)
+
+;<doc>=======================================================
+;==================== Stack Extension =======================
+;============================================================
+
+Extend Stack Stub:
+  Input:
+    R0 is return address.
+    R1 is required stack size: (must satisfy: RSP + R1 <= stack-limit)
+    RSP still points to caller's stack frame.
+  Responsibilities:
+    Save the current registers.
+    Save the current stack parameters.
+      (Save RSP)
+      (Save return address)
+    Switch to using the system stack.
+      (Swap current stack with system stack)
+      (Swap registers with system registers)
+    Load the system stack parameters
+      (Load RSP)
+      (Load stack-limit)
+    Call extend-stack:
+      (argument 0 (unused) = ---)
+      (argument 1 (arity) = 1)
+      (argument 2 (size) = size)
+      (call)
+    Switch back to using the program stack.
+      (Null the system stack pointer)
+      (Swap current stack with system stack)
+      (Swap registers with system registers)
+    Load the stack parameters
+      (Load RSP)
+      (Load stack-limit)
+    Restore current registers.
+    Continue from stack.pc.
+
+  Pseudocode:
+    save R2 ... Rn
+    
+    current-stack.pc = return address (R0)
+    current-stack.sp = RSP
+      (use TMP:R2 for current-stack)
+      TMP = [current-stack]
+      TMP.pc = R0
+      TMP.sp = RSP
+      
+    swap [current-stack] with [system-stack]
+      (use TMP:R2)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      TMP2 = [system-stack]
+      [current-stack] = TMP2
+      [system-stack] = TMP
+
+    swap [registers] with [system_registers]
+      (use TMP:R2)
+      (use TMP2:R3)
+      TMP = [registers]
+      TMP2 = [system-registers]
+      [registers] = TMP
+      [system-registers] = TMP2
+
+    RSP = current-stack.frames
+    stack-limit = current-stack.frames + current-stack.size
+      (use TMP:R2)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      RSP = TMP.frames
+      TMP2 = TMP.size
+      TMP2 += RSP
+      [stack-limit] = TMP2
+
+    (use size:R1)
+    R3 = 1
+    R4 = size
+    
+    RSP += 8
+    call extend-stack
+    (RSP -= 8) (Elided: Not used again)
+    
+    current-stack.stack-pointer = null
+      (use TMP:R2)
+      TMP = [current-stack]
+      TMP.stack-pointer = null
+
+    swap [current-stack] with [system-stack]
+      (use TMP:R2)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      TMP2 = [system-stack]
+      [current-stack] = TMP2
+      [system-stack] = TMP
+
+    swap [registers] with [system_registers]
+      (use TMP:R2)
+      (use TMP2:R3)
+      TMP = [registers]
+      TMP2 = [system-registers]
+      [registers] = TMP
+      [system-registers] = TMP2
+
+    RSP = current-stack.sp
+    stack-limit = current-stack.frames + current-stack.size
+      (use TMP:R1)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      TMP2 = TMP.frames
+      TMP = TMP.size
+      TMP += TMP2
+      [stack-limit] = TMP
+      TMP = [current-stack]
+      RSP = TMP.sp
+
+    restore R2 ... Rn
+    
+    goto current-stack.pc
+      (use TMP:R2)
+      TMP = [current-stack]
+      TMP = TMP.pc
+      goto TMP
+
+;============================================================
+;=======================================================<doc>
+
+defn compile-extend-stack-stub (stitcher:Stitcher, emitter:CodeEmitter) :
+  val stubs = stubs(stitcher)
+  val backend = backend(stubs)
+  defn E (i:Ins) : emit(emitter, i)
+  
+  defn swap (r1:Reg, m1:Mem, r2:Reg, m2:Mem) :
+    E $ LoadL(r1, m1)
+    E $ LoadL(r2, m2)
+    E $ StoreL(m1, r2)
+    E $ StoreL(m2, r1)
+
+  ;Compute stack offsets
+  val stack-offset-counter = Counter(-1 + 8)
+  val size-offset = next(stack-offset-counter, 8)
+  val frames-offset = next(stack-offset-counter, 8)
+  val sp-offset = next(stack-offset-counter, 8)
+  val pc-offset = next(stack-offset-counter, 8)
+
+  E $ Label(extend-stack(stubs))
+
+  ;save R2 ... Rn
+  for (r in call-regs(backend), loc in saved-regs(stubs)) do :
+    E $ StoreL(M(loc), R(r))
+  for (r in call-fregs(backend), loc in saved-fregs(stubs)) do :
+    E $ StoreD(M(loc), F(r))
+
+  ;current-stack.pc = return address (R0)
+  ;current-stack.sp = RSP
+  let :
+    val TMP = R2
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ StoreL(TMP, R0, pc-offset)
+    E $ StoreL(TMP, RSP, sp-offset)
+
+  ;swap [current-stack] with [system-stack]
+  ;swap [registers] with [system_registers]
+  swap(R2, M(current-stack(stubs)), R3, M(system-stack(stubs)))  
+  swap(R2, M(registers(stubs)), R3, M(system-registers(stubs)))
+
+  ;RSP = current-stack.frames
+  ;stack-limit = current-stack.frames + current-stack.size
+  let :
+    val TMP = R2
+    val TMP2 = R3
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(RSP, TMP, frames-offset)
+    E $ LoadL(TMP2, TMP, size-offset)
+    E $ AddL(TMP2, TMP2, RSP)
+    E $ StoreL(M(stack-limit(stubs)), TMP2)
+
+  ;Call extend stack
+  E $ SetL(R3, INT(1))
+  E $ SetL(R4, R1)
+  E $ AddL(RSP, RSP, INT(8))
+  E $ Call(core-fn(stitcher, CORE-EXTEND-STACK-ID))
+
+  ;current-stack.stack-pointer = null
+  let :
+    val TMP = R2
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ StoreL(TMP, INT(0), sp-offset)
+
+  ;swap [current-stack] with [system-stack]
+  ;swap [registers] with [system_registers]
+  swap(R2, M(current-stack(stubs)), R3, M(system-stack(stubs)))  
+  swap(R2, M(registers(stubs)), R3, M(system-registers(stubs)))  
+
+  ;RSP = current-stack.sp
+  ;stack-limit = current-stack.frames + current-stack.size
+  let :
+    val TMP = R1
+    val TMP2 = R3
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(TMP2, TMP, frames-offset)
+    E $ LoadL(TMP, TMP, size-offset)
+    E $ AddL(TMP, TMP, TMP2)
+    E $ StoreL(M(stack-limit(stubs)), TMP)
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(RSP, TMP, sp-offset)
+
+  ;restore R2 ... Rn
+  for (r in call-regs(backend), loc in saved-regs(stubs)) do :
+    E $ LoadL(R(r), M(loc))
+  for (r in call-fregs(backend), loc in saved-fregs(stubs)) do :
+    E $ LoadD(F(r), M(loc))
+
+  ;goto current-stack.pc
+  let :
+    val TMP = R2
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(TMP, TMP, pc-offset)
+    E $ Goto(TMP)
+
+;<doc>=======================================================
+;==================== Garbage Collection ====================
+;============================================================
+
+Garbage Collection Stub:
+  Input:
+    R0 is return address.
+    R2 is required heap size: (must satisfy: heap-top + R1 <= heap-limit)
+    RSP still points to caller's stack frame.
+  Responsibilities:
+    Save the current registers.
+    Save the current stack parameters.
+      (Save RSP)
+      (Save return address)
+    Switch to using the system stack.
+      (Swap current stack with system stack)
+      (Swap registers with system registers)
+    Load the system stack parameters
+      (Load RSP)
+      (Load stack-limit)
+    Call collect-garbage:
+      (argument 0 (unused) = ---)
+      (argument 1 (arity) = 1)
+      (argument 2 (size) = size)
+      (call)
+    Switch back to using the program stack.
+      (Null the system stack pointer)
+      (Swap current stack with system stack)
+      (Swap registers with system registers)
+    Load the stack parameters
+      (Load RSP)
+      (Load stack-limit)
+    Restore current registers.
+    Continue from stack.pc.
+
+  Pseudocode:
+    save R2 ... Rn
+    
+    current-stack.pc = return address (R0)
+    current-stack.sp = RSP
+      (use TMP:R1 for current-stack)
+      TMP = [current-stack]
+      TMP.pc = R0
+      TMP.sp = RSP
+      
+    swap [current-stack] with [system-stack]
+      (use TMP:R1)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      TMP2 = [system-stack]
+      [current-stack] = TMP2
+      [system-stack] = TMP
+
+    swap [registers] with [system_registers]
+      (use TMP:R1)
+      (use TMP2:R3)
+      TMP = [registers]
+      TMP2 = [system-registers]
+      [registers] = TMP
+      [system-registers] = TMP2
+
+    RSP = current-stack.frames
+    stack-limit = current-stack.frames + current-stack.size
+      (use TMP:R1)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      RSP = TMP.frames
+      TMP2 = TMP.size
+      TMP2 += RSP
+      [stack-limit] = TMP2
+
+    (use size:R2)
+    R3 = 1
+    R4 = size
+    
+    RSP += 8
+    call collect-garbage
+    (RSP -= 8) (Elided: Not used again)
+    
+    current-stack.stack-pointer = null
+      (use TMP:R1)
+      TMP = [current-stack]
+      TMP.stack-pointer = null
+
+    swap [current-stack] with [system-stack]
+      (use TMP:R1)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      TMP2 = [system-stack]
+      [current-stack] = TMP2
+      [system-stack] = TMP
+
+    swap [registers] with [system_registers]
+      (use TMP:R1)
+      (use TMP2:R3)
+      TMP = [registers]
+      TMP2 = [system-registers]
+      [registers] = TMP
+      [system-registers] = TMP2
+
+    RSP = current-stack.sp
+    stack-limit = current-stack.frames + current-stack.size
+      (use TMP:R1)
+      (use TMP2:R3)
+      TMP = [current-stack]
+      TMP2 = TMP.frames
+      TMP = TMP.size
+      TMP += TMP2
+      [stack-limit] = TMP
+      TMP = [current-stack]
+      RSP = TMP.sp
+      
+    restore R2 ... Rn
+    
+    goto current-stack.pc
+      (use TMP:R1)
+      TMP = [current-stack]
+      TMP = TMP.pc
+      goto TMP
+
+;============================================================
+;=======================================================<doc>
+
+defn compile-collect-garbage-stub (stitcher:Stitcher, emitter:CodeEmitter) :
+  val stubs = stubs(stitcher)
+  val backend = backend(stubs)
+  defn E (i:Ins) : emit(emitter, i)
+  
+  defn swap (r1:Reg, m1:Mem, r2:Reg, m2:Mem) :
+    E $ LoadL(r1, m1)
+    E $ LoadL(r2, m2)
+    E $ StoreL(m1, r2)
+    E $ StoreL(m2, r1)
+
+  ;Compute stack offsets
+  val stack-offset-counter = Counter(-1 + 8)
+  val size-offset = next(stack-offset-counter, 8)
+  val frames-offset = next(stack-offset-counter, 8)
+  val sp-offset = next(stack-offset-counter, 8)
+  val pc-offset = next(stack-offset-counter, 8)
+
+  E $ Label(collect-garbage(stubs))
+
+  ;save R2 ... Rn
+  for (r in call-regs(backend), loc in saved-regs(stubs)) do :
+    E $ StoreL(M(loc), R(r))
+  for (r in call-fregs(backend), loc in saved-fregs(stubs)) do :
+    E $ StoreD(M(loc), F(r))
+
+  ;current-stack.pc = return address (R0)
+  ;current-stack.sp = RSP
+  let :
+    val TMP = R1
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ StoreL(TMP, R0, pc-offset)
+    E $ StoreL(TMP, RSP, sp-offset)
+
+  ;swap [current-stack] with [system-stack]
+  ;swap [registers] with [system_registers]
+  swap(R1, M(current-stack(stubs)), R3, M(system-stack(stubs)))  
+  swap(R1, M(registers(stubs)), R3, M(system-registers(stubs)))
+
+  ;RSP = current-stack.frames
+  ;stack-limit = current-stack.frames + current-stack.size
+  let :
+    val TMP = R1
+    val TMP2 = R3
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(RSP, TMP, frames-offset)
+    E $ LoadL(TMP2, TMP, size-offset)
+    E $ AddL(TMP2, TMP2, RSP)
+    E $ StoreL(M(stack-limit(stubs)), TMP2)
+
+  ;Call collect-garbage
+  E $ SetL(R3, INT(1))
+  E $ SetL(R4, R2)
+  E $ AddL(RSP, RSP, INT(8))
+  E $ Call(core-fn(stitcher, CORE-COLLECT-GARBAGE-ID))
+
+  ;current-stack.stack-pointer = null
+  let :
+    val TMP = R1
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ StoreL(TMP, INT(0), sp-offset)
+
+  ;swap [current-stack] with [system-stack]
+  ;swap [registers] with [system_registers]
+  swap(R1, M(current-stack(stubs)), R3, M(system-stack(stubs)))  
+  swap(R1, M(registers(stubs)), R3, M(system-registers(stubs)))  
+
+  ;RSP = current-stack.sp
+  ;stack-limit = current-stack.frames + current-stack.size
+  let :
+    val TMP = R1
+    val TMP2 = R3
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(TMP2, TMP, frames-offset)
+    E $ LoadL(TMP, TMP, size-offset)
+    E $ AddL(TMP, TMP, TMP2)
+    E $ StoreL(M(stack-limit(stubs)), TMP)
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(RSP, TMP, sp-offset)
+
+  ;restore R2 ... Rn
+  for (r in call-regs(backend), loc in saved-regs(stubs)) do :
+    E $ LoadL(R(r), M(loc))
+  for (r in call-fregs(backend), loc in saved-fregs(stubs)) do :
+    E $ LoadD(F(r), M(loc))
+
+  ;goto current-stack.pc
+  let :
+    val TMP = R1
+    E $ LoadL(TMP, M(current-stack(stubs)))
+    E $ LoadL(TMP, TMP, pc-offset)
+    E $ Goto(TMP)

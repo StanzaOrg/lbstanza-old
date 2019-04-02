@@ -1,0 +1,183 @@
+;See License.txt for details about licensing
+
+defpackage stz/tgt-utils :
+  import core
+  import collections
+  import stz/kl-ir
+  import stz/khier
+  import stz/tgt-ir
+  import stz/ids
+  import stz/utils
+
+;============================================================
+;====================== Emitter =============================
+;============================================================
+
+public var EMITTER : TGIns -> False =
+  fn (i) : fatal("No emitter set.")
+
+public defn emit (i:TGIns) :
+  EMITTER(i)
+
+public defn emit-to-buffer (f:() -> ?) -> Vector<TGIns> :
+  val buffer = Vector<TGIns>()
+  let-var EMITTER = add{buffer, _} :
+    f()
+  buffer
+
+;============================================================
+;==================== Make Variable =========================
+;============================================================
+
+public defn make-var (t:TGType) :
+  val n = fresh-id()
+  emit(TGDef(n, t))
+  TGVar(n)
+
+;============================================================
+;==================== Allocation ============================
+;============================================================
+
+defn call (f:Int, args:List<TGImm>, i:False|FileInfo) :
+  emit(TGCall(length(args), List(), TGMem(f,0), args, i))
+defn call (f:Int, i:False|FileInfo) :
+  call(f, List(), i)
+
+public defn allocate-ref (n:Int, size:Int, info:False|FileInfo) :
+  allocate-ref(n, TGLong(to-long(size)), info)
+public defn allocate-ref (n:Int, size:TGImm, info:False|FileInfo) :
+  val ref-tag = TGLong(to-long(REF-TAG-BITS))
+  val end-lbl = fresh-id()
+  val p = make-var(TGLongT())                                    ;  var p : long
+  val new-p = make-var(TGLongT())                                ;  var new-p : long
+  val limit = make-var(TGLongT())                                ;  var limit : long
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                      ;  p = [heap-ptr]
+  emit(TGLoad(limit, TGMem(HEAP-LIM-LBL,0), 0))                  ;  limit = [heap-lim]
+  emit(TGBinOp(new-p, TGAddOp(), p, size))                       ;  new-p = p + size
+  emit(TGBinCmp(end-lbl, TGUleOp(), new-p, limit))               ;  goto end-lbl if new-p <= limit
+  call(EXTEND-HEAP-ID, List(size), info)                         ;  extend-heap(size)
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                      ;  p = [heap-ptr]
+  emit(TGBinOp(new-p, TGAddOp(), p, size))                       ;  new-p = p + size
+  emit(TGLabel(end-lbl))                                         ;end-lbl:
+  emit(TGStore(TGMem(HEAP-PTR-LBL,0), new-p, 0))                 ;  [heap-ptr] = new-p
+  emit(TGBinOp(TGVar(n), TGAddOp(), p, ref-tag))                 ;  n = p + REF-TAG-BITS
+
+public defn allocate-refs (ns:List<Int>, sizes:List<Int>, info:False|FileInfo) :
+  val total = TGLong(to-long(sum(sizes)))
+  val end-lbl = fresh-id()
+  val p = make-var(TGLongT())                                     ;  var p : long
+  val new-p = make-var(TGLongT())                                 ;  var new-p : long
+  val limit = make-var(TGLongT())                                 ;  var limit : long
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                       ;  p = [heap-ptr]
+  emit(TGLoad(limit, TGMem(HEAP-LIM-LBL,0), 0))                   ;  limit = [heap-lim]
+  emit(TGBinOp(new-p, TGAddOp(), p, total))                       ;  new-p = p + total
+  emit(TGBinCmp(end-lbl, TGUleOp(), new-p, limit))                ;  goto end-lbl if new-p <= limit
+  call(EXTEND-HEAP-ID, List(total), info)                         ;  extend-heap(total)
+  emit(TGLoad(p, TGMem(HEAP-PTR-LBL,0), 0))                       ;  p = [heap-ptr]
+  emit(TGBinOp(new-p, TGAddOp(), p, total))                       ;  new-p = p + total
+  emit(TGLabel(end-lbl))                                          ;end-lbl:
+  emit(TGStore(TGMem(HEAP-PTR-LBL,0), new-p, 0))                  ;  [heap-ptr] = new-p
+  val offset-counter = Counter(REF-TAG-BITS)                      ;
+  for (n in ns, size in sizes) do :                               ;  (ns ...) = p + (sizes ...) + REF-TAG-BITS
+    val offset = next(offset-counter, size)
+    emit(TGBinOp(TGVar(n), TGAddOp(), p, TGLong(to-long(offset))))
+
+public defn allocate-tuple (args:Collection<TGImm>&Lengthable, info:False|FileInfo) :
+  val x = make-var(TGRefT())
+  allocate-tuple(n(x), args, info)
+  x
+  
+public defn allocate-tuple (n:Int, args:Collection<TGImm>&Lengthable, info:False|FileInfo) :
+  val len = length(args)
+  val size = 8 * (2 + len)
+  allocate-ref(n, size, info)
+  emit(TGStore(TGVar(n), TGTag(TUPLE-TYPE-ID), 0 - REF-TAG-BITS))
+  emit(TGStore(TGVar(n), TGLong(to-long(len)), 8 - REF-TAG-BITS))
+  for (x in args, i in 2 to false) do :
+    emit(TGStore(TGVar(n), x, 8 * i - REF-TAG-BITS))
+
+;============================================================
+;====================== Typeof ==============================
+;============================================================
+public defn compile-typeof (x:TGImm, t:KType, true-lbl:Int, false-lbl:Int,
+                            TypeVar: Int -> TGImm) :
+  defn TGIf (t:KType, true-lbl:Int, false-lbl:Int) :
+    val true-branch = TGBranch(List(t), true-lbl)
+    val false-branch = TGBranch(List(KTop()), false-lbl)
+    TGMatch(List(x), List(true-branch, false-branch), false-lbl)
+
+  defn typeof (t:KType, true-lbl:Int, false-lbl:Int) :
+    match(t) :
+      (t:KTVar) :
+        ;Load code
+        val code = make-var(TGLongT())
+        emit(TGLoad(code, TypeVar(n(t)), TYPE-CODE-OFFSET - REF-TAG-BITS))
+        ;Call code
+        val result = make-var(TGLongT())
+        emit(TGCall(2, List(result), code, List(TypeVar(n(t)), x), false))
+        ;Branch on result
+        emit(TGBinCmp(false-lbl, TGEqOp(), result, TGLong(0L)))
+        emit(TGGoto(true-lbl))
+      (t:KOf) :
+        emit(TGIf(t, true-lbl, false-lbl))
+      (t:KAnd) :
+        if has-var?(t) :
+          val next-lbl = fresh-id()
+          typeof(a(t), next-lbl, false-lbl)
+          emit(TGLabel(next-lbl))
+          typeof(b(t), true-lbl, false-lbl)
+        else :
+          emit(TGIf(t, true-lbl, false-lbl))
+      (t:KOr) :
+        if has-var?(t) :
+          val next-lbl = fresh-id()
+          typeof(a(t), true-lbl, next-lbl)
+          emit(TGLabel(next-lbl))
+          typeof(b(t), true-lbl, false-lbl)
+        else :
+          emit(TGIf(t, true-lbl, false-lbl))
+      (t:KTop) :
+        emit(TGGoto(true-lbl))
+      (t:KBot) :
+        emit(TGGoto(false-lbl))
+
+  typeof(t, true-lbl, false-lbl)
+
+;============================================================
+;================= Package Combination ======================
+;============================================================
+
+public defn combine (pkgs:List<TGPackage>) -> TGProg :
+  val hier = KHierarchy(seq-cat(hier-entries, pkgs))
+  val decls = to-vector<TGDecl>(seq-cat(decls, pkgs))
+  add(decls, compile-entry-function(map(entry, pkgs)))
+  TGProg(hier, decls)
+
+defn compile-entry-function (ns:List<Int>) -> TGDefCode :
+  ;Compile body
+  val body = emit-to-buffer $ fn () :
+    ;Enter from C
+    emit $ TGSaveCContext()
+    emit $ TGArgsC(List())
+
+    ;stk = rsp + REF-TAG - STACK-ITEMS-OFFSET
+    ;[stack] = stk
+    val stk = make-var(TGRefT())
+    emit $ TGBinOp(stk, TGAddOp(), TGRegSP(), TGLong(to-long(REF-TAG-BITS - STACK-ITEMS-OFFSET)))
+    emit $ TGStore(TGMem(STACK-LBL), stk, 0)
+
+    ;limit = stk + STACK-SIZE - REF-TAG
+    ;[stack-limit] = limit
+    val limit = make-var(TGLongT())
+    emit $ TGBinOp(limit, TGAddOp(), stk, TGLong(to-long(STACK-SIZE - REF-TAG-BITS)))
+    emit $ TGStore(TGMem(STACK-LIM-LBL), limit, 0)
+
+    ;Top Level Body
+    for n in ns do :
+      emit $ TGCall(0, List(), TGMem(n,0), List(), false)
+
+    ;Return to C
+    emit $ TGReturnC(List(TGLong(0L)))
+
+  ;Return function
+  TGDefCode(`stanza_entry, body)

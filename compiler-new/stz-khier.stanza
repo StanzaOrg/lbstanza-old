@@ -1,0 +1,384 @@
+;See License.txt for details about licensing.
+
+defpackage stz/khier :
+  import core
+  import collections
+  import stz/tgt-ir
+  import stz/pl-ir
+  import stz/tl-ir
+  import stz/kl-ir
+  import stz/ids
+  import stz/algorithms
+
+;============================================================
+;==================== Interface =============================
+;============================================================
+
+public deftype KHierarchy
+public defmulti types (h:KHierarchy) -> Seqable<Int>
+public defmulti leaf? (h:KHierarchy, n:Int) -> True|False
+public defmulti parents (h:KHierarchy, n:Int) -> List<Int>
+public defmulti children (h:KHierarchy, n:Int) -> List<Int>
+public defmulti leaves (h:KHierarchy, n:Int) -> List<Int>
+public defmulti marker? (h:KHierarchy, n:Int) -> True|False
+
+;============================================================
+;=============== Construction of Hierarchy ==================
+;============================================================
+
+public deftype HierEntry
+public defstruct TypeEntry <: HierEntry : (n:Int, leaf?:True|False, marker?:True|False)
+public defstruct ChildEntry <: HierEntry : (n:Int, parent:KType)
+  
+public defn KHierarchy (es:Seqable<HierEntry>) :
+  ;=========================
+  ;==== Populate Tables ====
+  ;=========================
+  val entries = IntTable<TypeEntry>()
+  val parents = IntTable<List<Int>>(List())
+  val children = IntTable<List<Int>>(List())
+  defn add-parent (n:Int, p:Int) :
+    update(parents, cons{p, _}, n)
+    update(children, cons{n, _}, p)
+  for entry in es do :
+    match(entry) :
+      (entry:TypeEntry) :
+        entries[n(entry)] = entry
+      (entry:ChildEntry) :
+        let loop (p:KType = parent(entry)) :
+          match(p) :
+            (p:KAnd) : do(loop, p)
+            (p:KOf) : add-parent(n(entry), n(p))
+
+  ;==========================
+  ;==== Leaf Calculation ====
+  ;==========================
+  val leaves-table = IntTable<List<Int>>()
+  defn leaves (n:Int) :
+    set?{leaves-table, n, _} $ fn () :
+      if leaf?(entries[n]) :
+        List(n)
+      else :
+        unique(seq-append(leaves, children[n]))
+            
+  new KHierarchy :
+    defmethod types (this) : keys(entries)
+    defmethod leaf? (this, n:Int) : leaf?(entries[n])
+    defmethod marker? (this, n:Int) : marker?(entries[n])
+    defmethod parents (this, n:Int) : parents[n]
+    defmethod children (this, n:Int) : children[n]
+    defmethod leaves (this, n:Int) : leaves(n)
+    defmethod print (o:OutputStream, this) :
+      print(o, "KHierarchy:")
+      for n in types(this) do :
+        print(o, "\n   Type %_ : (parents: %,, children: %,, leaves:%,)" %
+          [n, parents[n], children[n], leaves(n)])
+
+;============================================================
+;=================== Type Entries ===========================
+;============================================================
+
+defn yield-child-entry (yield:HierEntry -> ?, c:Int, parent:KType) :
+  yield(ChildEntry(c, parent))
+defn yield-child-entry (yield:HierEntry -> ?, c:Int, parent:Type) :
+  yield-child-entry(yield, c, to-ktype(parent))
+defn yield-child-entry (yield:HierEntry -> ?, c:Int, parent:False) :
+  false
+
+public defn hier-entries (c:KTExp) -> Seqable<HierEntry> :
+  generate<HierEntry> :
+    defn scan (e:KExp) :
+      do(scan, e)
+      match(e:KNew) :
+        val n = fresh-id()
+        yield(TypeEntry(n, true, empty?(methods(e))))
+        yield(ChildEntry(n, type(e)))
+    
+    match(c) :
+      (c:KDefType) :
+        yield(TypeEntry(n(c), false, false))
+        yield-child-entry(yield, n(c), parent(c))
+        for child in children(c) do :
+          yield-child-entry(yield, n(child), parent(child))
+      (c:KDefStruct) :
+        val marker? = empty?(fields(c)) and rfield(c) is False
+        yield(TypeEntry(n(c), true, marker?))
+        yield-child-entry(yield, n(c), parent(c))        
+      (c:KDefObject) :
+        val marker? = tarity(c) + arity(c) == 0
+        yield(TypeEntry(n(c), true, marker?))
+        yield-child-entry(yield, n(c), parent(c))
+      (c) : 
+        do(scan, c)
+
+public defn hier-entries (ids:PkgIds) -> Seqable<HierEntry> :
+  generate<HierEntry> :
+    for d in declarations(ids) do :
+      match(id(d)) :
+        (id:TypeId) :
+          yield(TypeEntry(n(d), false, false))          
+          yield-child-entry(yield, n(d), parent(id))
+          for child in children(id) do :
+            yield-child-entry(yield, n(child), parent(child))
+        (id:LSTypeId) :
+          val marker? = empty?(fields(id))
+          yield(TypeEntry(n(d), true, marker?))
+          yield-child-entry(yield, n(d), parent(id))
+        (id) : false
+
+public defn hier-entries (c:TGDecl) -> Seqable<HierEntry> :
+  generate<HierEntry> :
+    match(c:TGDefObject) :
+      val marker? = size(c) == 0 and rsize(c) == 0
+      yield(TypeEntry(n(c), true, marker?))
+      yield-child-entry(yield, n(c), parent(c))
+
+public defn hier-entries (p:KPkgComm) -> Seqable<HierEntry> :
+  match(p) :
+    (p:TGPackage) :
+      cat(hier-entries(ids(p))
+          seq-cat(hier-entries, decls(p)))
+    (p:KPackage) :
+      seq-cat(hier-entries, exps(p))
+
+;============================================================
+;======================= Subtyping ==========================
+;============================================================
+
+public defn subtype? (h:KHierarchy, x:KType, y:KType) :
+  ;Subtyping considering rest types
+  defn st? (x:List<KType>, rx:KType|False, y:List<KType>, ry:KType|False) :
+    defn ex (xs:List<KType>, r:KType) : cat(xs, repeat(r))
+    defn ex-1 (xs:List<KType>, r:KType) : cat(xs, [r])
+    val nx = length(x)
+    val ny = length(y)
+    match(rx, ry) :
+      (rx:False, ry:False) : all?(st?, x, y) when nx == ny
+      (rx:False, ry:KType) : all?(st?, x, ex(y,ry)) when nx >= ny
+      (rx:KType, ry:False) : all?(st?, ex(x,rx), y) when nx <= ny
+      (rx:KType, ry:KType) : all?(st?, ex(x,rx), ex-1(y,ry)) when nx <= ny else
+                             all?(st?, ex-1(x,rx), ex(y,ry))      
+  ;Subtyping between two types
+  defn st? (x:KType, y:KType) :
+    match(x, y) :
+      ;Fast paths
+      (x:KBot, y) : true
+      (x, y:KTop) : true
+      ;Combinatory types
+      (x:KOr, y) : st?(a(x), y) and st?(b(x), y)
+      (x, y:KAnd) : st?(x, a(y)) and st?(x, b(y))
+      (x:KAnd, y:KOr) : st?(x, a(y)) or st?(x, b(y)) or
+                        st?(a(x), y) or st?(b(x), y)
+      (x, y:KOr) : st?(x, a(y)) or st?(x, b(y))
+      (x:KAnd, y) : st?(a(x), y) or st?(b(x), y)
+      ;Unitary Types
+      (x:KTVar, y:KTVar) :
+        n(x) == n(y)
+      (x:KOf, y:KOf) :
+        n(x) == n(y) or
+        any?(st?{KOf(_), y}, parents(h,n(x)))
+      ;LoStanza Types
+      (x:KByteT, y:KByteT) : true
+      (x:KIntT, y:KIntT) : true
+      (x:KLongT, y:KLongT) : true
+      (x:KFloatT, y:KFloatT) : true
+      (x:KDoubleT, y:KDoubleT) : true
+      (x:KPtrT, y:KPtrT) : st?(type(x), type(y))
+      (x:KFnT, y:KFnT) : st?(b(x), b(y)) and st?(a(y), r(y), a(x), r(x))
+      (x:KStructT, y:KStructT) : n(x) == n(y)      
+      ;Otherwise
+      (x, y) : false
+  st?(x, y)
+
+;============================================================
+;================== Overlapping/Covered =====================
+;============================================================
+
+public defn overlap? (h:KHierarchy, x:KType, y:KType) :
+  not bottom?(intersect(x*, y*)) where :
+    val x* = kbits(h,x)
+    val y* = kbits(h,y)
+
+;Returns true if x covered by y.
+;Forall p . p in x => p in y.
+public defn covered? (h:KHierarchy, x:KType, y:KType) :
+  subset?(x*, y*) where :
+    val x* = kbits(h,x)
+    val y* = kbits(h,y)
+
+;============================================================
+;======================== KBits =============================
+;============================================================
+
+public deftype KBits <: Equalable
+public defstruct KSomeBits <: KBits : (ns:List<Int>)
+public defstruct KAllBits <: KBits
+
+public defn KNoBits () : KSomeBits(List())
+
+defmethod print (o:OutputStream, b:KBits) :
+  print{o, _} $ match(b) :
+    (b:KSomeBits) : "Some(%,)" % [ns(b)]
+    (b:KAllBits) : "All"
+
+public defn intersect (a:KBits, b:KBits) :
+  match(a, b) :
+    (a:KAllBits, b) : b
+    (a, b:KAllBits) : a
+    (a:KSomeBits, b:KSomeBits) :
+      val ns = filter(contains?{ns(a), _}, ns(b))
+      KSomeBits(to-list(ns))
+
+public defn union (a:KBits, b:KBits) :
+  match(a, b) :
+    (a:KAllBits, b) : a
+    (a, b:KAllBits) : b
+    (a:KSomeBits, b:KSomeBits) :
+      KSomeBits(unique(cat(ns(a), ns(b))))
+
+public defn subtract (a:KBits, b:KBits) :
+  match(a, b) :
+    (a:KAllBits, b) : a
+    (a, b:KAllBits) : KNoBits()
+    (a:KSomeBits, b:KSomeBits) :
+      val ns = filter({not contains?(ns(b), _)}, ns(a))
+      KSomeBits(to-list(ns))
+
+public defn subset? (a:KBits, b:KBits) :
+  match(a, b) :
+    (a, b:KAllBits) : true
+    (a:KAllBits, b) : false
+    (a:KSomeBits, b:KSomeBits) :
+      all?(contains?{ns(b), _}, ns(a))
+
+public defn disjoint? (a:KBits, b:KBits) :
+  bottom?(intersect(a, b))
+
+public defn bottom? (a:KBits) :
+  match(a:KSomeBits) : empty?(ns(a))
+
+public defn kbits (h:KHierarchy, t:KType) :
+  match(t) :
+    (t:KOf) : KSomeBits(leaves(h, n(t)))
+    (t:KAnd) : intersect(kbits(h,a(t)), kbits(h,b(t)))
+    (t:KOr) : union(kbits(h,a(t)), kbits(h,b(t)))
+    (t:KTop) : KAllBits()
+    (t:KBot) : KNoBits()
+    (t:KTVar) : KAllBits()
+
+defmethod equal? (a:KBits, b:KBits) :
+  defn sort (xs:List<Int>) : to-list(lazy-qsort(xs))
+  match(a, b) :
+    (a:KAllBits, b:KAllBits) : true
+    (a:KSomeBits, b:KSomeBits) : sort(ns(a)) == sort(ns(b))
+    (a, b) : false
+
+;============================================================
+;===================== Match Tries ==========================
+;============================================================
+
+deftype MTrie
+defstruct IfTrie <: MTrie :
+  branches: List<KeyValue<KBits, MTrie>>
+defstruct EndTrie <: MTrie :
+  lbl: Int
+
+defmethod print (o:OutputStream, t:MTrie) :
+  print{o, _} $ match(t) :
+    (t:IfTrie) : "(%*)" % [join(branches(t), " or ")]
+    (t:EndTrie) : lbl(t)
+
+;============================================================
+;===================== Trie Conversion ======================
+;============================================================
+
+defn to-trie (bs:List<KeyValue<List<KBits>, Int>>) -> MTrie :
+  ;Utilities
+  defn less? (a:KBits, b:KBits) : subset?(a, b)
+  defn minus (a:KBits, b:KBits) : subtract(a, b)
+  defn bit-and (a:KBits, b:KBits) : intersect(a, b)
+
+  ;Initial starting place
+  defn init (ts:List<KBits>, lbl:Int) -> MTrie :
+    if empty?(ts) :
+      EndTrie(lbl)
+    else : 
+      val [X, YZ] = [head(ts), tail(ts)]
+      IfTrie(List(X => init(YZ, lbl)))
+    
+  ;Add a branch to a trie
+  defn add (t:MTrie, ts:List<KBits>, lbl:Int) -> MTrie :
+    match(t) :
+      (t:IfTrie) : IfTrie(add(branches(t), ts, lbl))
+      (t:EndTrie) : t
+
+  ;Add X => Y => Z ... to (A => B => C, rest ...)
+  defn add (brs:List<KeyValue<KBits, MTrie>>,
+            ts:List<KBits>,
+            lbl:Int) ->
+            List<KeyValue<KBits, MTrie>> :
+    val [X, YZ] = [head(ts), tail(ts)]
+    if bottom?(X) :
+      brs    
+    else if empty?(brs) :
+      List(X => init(YZ, lbl))
+    else :
+      val [A, BC] = [key(head(brs)), value(head(brs))]
+      val rest = tail(brs)
+      if A < X :
+        val b1 = A => add(BC, YZ, lbl)
+        val b2 = add(rest, cons(X - A, YZ), lbl)
+        cons(b1, b2)     
+      else if X < A :
+        val b1 = X => add(BC, YZ, lbl)
+        val b2 = (A - X) => BC
+        cons(b1, b2, rest)
+      else if disjoint?(A, X) :
+        cons(
+          head(brs)
+          add(rest, ts, lbl))      
+      else :
+        val W = A & X
+        val ts1 = cons(W, tail(ts))
+        val ts2 = cons(X - W, tail(ts))
+        add(add(brs, ts1, lbl), ts2, lbl)
+
+  ;Driver
+  val b0 = head(bs)
+  reduce{_, init(key(b0), value(b0)), tail(bs)} $
+    fn (trie:MTrie, branch:KeyValue<List<KBits>,Int>) :
+      add(trie, key(branch), value(branch))
+
+;============================================================
+;================== Dispatch Ordering =======================
+;============================================================
+
+defn union-taglists (hier:KHierarchy, tag-lists:List<List<KBits>>) -> List<List<KBits>> :
+  defn compatible? (xs:List<KBits>, ys:List<KBits>) :
+    val n = for [x, y] in zip(xs, ys) count : x != y
+    n <= 1
+  val lists = Vector<List<KBits>>()
+  defn add-list (ts:List<KBits>) :
+    match(index-when(compatible?{ts, _}, lists)) :
+      (i:Int) : lists[i] = map(union, ts, lists[i])
+      (i:False) : add(lists, ts)
+  for [xs, ys] in all-pairs(tag-lists) do :
+    val ts = map(intersect, xs, ys)
+    add-list(ts) when none?(bottom?, ts)
+  to-list(lists)
+
+public defn dispatch-ordering (hier:KHierarchy, branches:Seqable<List<KType>>) ->
+                               List<KeyValue<List<KBits>, List<Int>|Int>> :
+  val lists = to-tuple(branches)
+  defn more-applicable? (a:Int, b:Int) :
+    all?(subtype?{hier, _, _}, lists[a], lists[b])
+    
+  defn kbits (xs:List<KType>) : map(/kbits{hier,_}, xs)
+  val ordering = ambiguity-ordering(length(lists), more-applicable?)
+  for entry in ordering seq-append :
+    match(entry) :
+      (i:Int) :
+        List(kbits(lists[i]) => i)
+      (idx:List<Int>) :
+        val lists = union-taglists(hier, map(kbits{lists[_]}, idx))
+        map({_ => idx}, lists)

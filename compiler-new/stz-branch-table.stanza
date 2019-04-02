@@ -1,0 +1,381 @@
+defpackage stz/branch-table :
+  import core
+  import collections
+  import stz/vm-ir
+  import stz/dyn-tree
+  import stz/dyn-bi-table
+  import stz/utils
+  import stz/vm-table
+  import stz/trie
+  import stz/typeset
+
+;============================================================
+;=================== Public Interface =======================
+;============================================================
+public deftype BranchTable
+public defmulti add (t:BranchTable, f:BranchFormat) -> Int
+public defmulti get (t:BranchTable, f:Int) -> BranchFormat
+public defmulti load-package-methods (t:BranchTable, package:Symbol, ms:Seqable<VMMethod>) -> False
+public defmulti dispatch (t:BranchTable, f:Int, types:Tuple<Int>) -> DispatchResult
+public defmulti update (t:BranchTable) -> False
+
+public deftype DispatchResult :
+  Int <: DispatchResult
+  CodeId <: DispatchResult
+public defstruct Default <: DispatchResult
+public defstruct Amb <: DispatchResult
+
+;============================================================
+;==================== Dispatch Formats ======================
+;============================================================
+
+public deftype BranchFormat <: Hashable&Equalable
+
+public defstruct MatchFormat <: BranchFormat :
+  branches: Tuple<Tuple<TypeSet>>
+with: (printer => true)
+
+public defstruct DispatchFormat <: BranchFormat :
+  branches: Tuple<Tuple<TypeSet>>
+with: (printer => true)
+
+public defstruct MultiFormat <: BranchFormat :
+  multi: Int
+  num-header-args: Int
+  num-args: Int
+with: (printer => true)
+
+;============================================================
+;================= Dispatch Format Creators  ================
+;============================================================
+
+public defn MatchFormat (branches:Tuple<VMBranch>) -> [MatchFormat, Tuple<Int>] :
+  val types* = map(types, branches)
+  val format = MatchFormat(types*)
+  val targets = map(n,branches)
+  [format, targets]
+
+public defn DispatchFormat (branches:Tuple<VMBranch>) -> [DispatchFormat, Tuple<Int>] :
+  val bs = to-array<VMBranch> $
+    for b in branches seq :
+      VMBranch(types(b), n(b))
+  qsort!(types, bs)
+  val format = DispatchFormat(to-tuple(seq(types,bs)))
+  val targets = to-tuple(seq(n,bs))
+  [format, targets]
+
+;============================================================
+;==================== Hashing and Equality ==================
+;============================================================
+
+defmethod hash (f:DispatchFormat) : hash(branches(f))
+defmethod equal? (a:DispatchFormat, b:DispatchFormat) : branches(a) == branches(b)
+
+defmethod hash (f:MatchFormat) : hash(branches(f))
+defmethod equal? (a:MatchFormat, b:MatchFormat) : branches(a) == branches(b)
+
+defmethod hash (f:MultiFormat) :
+  hash $ [multi(f), num-header-args(f), num-args(f)]
+defmethod equal? (a:MultiFormat, b:MultiFormat) :
+  multi(a) == multi(b) and
+  num-header-args(a) == num-header-args(b) and
+  num-args(a) == num-args(b)
+
+;============================================================
+;================= Table Implementation =====================
+;============================================================
+
+public defn BranchTable (ct:ClassTable) :
+  ;==================================================
+  ;=============== State of Table ===================
+  ;==================================================  
+  ;Store formats in ctable
+  val formats = Vector<BranchFormat>()
+  val format-table = HashTable<BranchFormat,Int>()
+  val methods = Vector<LoadedMethod|False>()
+
+  ;All compiled actions corresponding to each format
+  val actions = Vector<DispatchAction|False>()
+  val stale-actions = Vector<Int>()
+
+  ;Format dependencies
+  val format-class-dependencies = DynBiTable()
+  val method-class-dependencies = DynBiTable()
+  val multi-formats = IntListTable<Int>()
+  val method-multi-table = DynBiTable() ;Mapping from method to multis
+
+  ;==================================================
+  ;================ Action Invalidation =============
+  ;==================================================
+  ;Record an action as invalidated, so that it is updated next cycle
+  defn invalidate-action (i:Int) :
+    if i == length(actions) or actions[i] is-not False :
+      actions[i] = false
+      add(stale-actions, i)
+      
+  defn invalidate-actions-of-multi (multi:Int) :
+    do(invalidate-action, multi-formats[multi])
+
+  defn update-actions () :
+    while not empty?(stale-actions) :
+      val i = pop(stale-actions)
+      val f = formats[i]
+      actions[i] = DispatchAction(ct, f, methods-of-multi)
+    ensure-no-stale-actions!()
+        
+  defn ensure-no-stale-actions! () :
+    #if-not-defined(OPTIMIZE) :
+      for i in 0 to length(actions) do :
+        if actions[i] is False :
+          fatal("Action %_ is stale." % [i])
+    false
+
+  ;==================================================
+  ;================ Adding new Formats ==============
+  ;==================================================
+  defn add-format (bf:BranchFormat) -> Int :
+    add(formats, bf)
+    val i = length(formats) - 1
+    format-class-dependencies[i] = class-dependencies(bf)
+    format-table[bf] = i
+    match(bf:MultiFormat) :
+      add(multi-formats, multi(bf), i)
+    invalidate-action(i)
+    i
+
+  ;==================================================
+  ;===================== Methods ====================
+  ;==================================================
+  defn add-method (package-name:Symbol, m:VMMethod) :
+    add(methods, LoadedMethod(multi(m), types(m), fid(m), package-name, instance?(m)))
+    val id = length(methods) - 1
+    method-class-dependencies[id] = class-dependencies(m)
+    invalidate-actions-of-multi(multi(m))
+    method-multi-table[id] = [multi(m)]
+    
+  defn remove-method (i:Int) :
+    val m = methods[i] as LoadedMethod
+    invalidate-actions-of-multi(multi(m))
+    method-class-dependencies[i] = []
+    methods[i] = false
+    method-multi-table[i] = []
+    
+  defn top-level-method? (i:Int, p:Symbol) :
+    val m = methods[i]
+    match(m:LoadedMethod) :
+      not instance-method?(m) and package(m) == p
+
+  defn methods-of-multi (multi:Int) :
+    to-tuple $ 
+      for i in backward(method-multi-table, multi) seq :
+        methods[i] as LoadedMethod
+
+  defn load-package-methods (package-name:Symbol, ms:Seqable<VMMethod>) :
+    ;Remove old methods
+    for i in 0 to length(methods) do :
+      remove-method(i) when top-level-method?(i, package-name)
+    ;Add new methods
+    do(add-method{package-name, _}, ms)
+
+  ;==================================================
+  ;============ Add Class Change Listener ===========
+  ;==================================================
+  defn class-change-listener () :
+    ;Find all formats depending on a class
+    defn formats-dependent-on-class (c:Int) :
+      backward(format-class-dependencies, c)
+    ;Find all multis depending on a class
+    defn multis-dependent-on-class (c:Int) :
+      for i in backward(method-class-dependencies, c) seq :
+        multi(methods[i] as LoadedMethod)
+    ;Return listener that invalidates formats when
+    ;class tree changes.
+    new TreeListener :
+      defmethod children-changed (this, c:Int) :
+        do(invalidate-action, formats-dependent-on-class(c))
+        do(invalidate-actions-of-multi, multis-dependent-on-class(c))
+  add(ct, class-change-listener())
+
+  ;==================================================
+  ;=============== Create Structure =================
+  ;==================================================
+  new BranchTable :
+    defmethod get (this, f:Int) :
+      formats[f]
+    defmethod add (this, f:BranchFormat) :
+      match(get?(format-table, f)) :
+        (i:Int) : i
+        (_:False) : add-format(f)
+    defmethod dispatch (this, f:Int, types:Tuple<Int>) :
+      dispatch(actions[f] as DispatchAction, types)
+    defmethod update (this) :
+      update-actions()
+    defmethod load-package-methods (this, package:Symbol, ms:Seqable<VMMethod>) :
+      load-package-methods(package, ms)
+
+;============================================================
+;==================== Dispatch Actions ======================
+;============================================================
+
+val DEFAULT-ACTION = fn (xtypes:Tuple<Int>, t:Int) : Default()
+
+defn compile-trie (t:MTrie) -> (Tuple<Int>, Int) -> DispatchResult :
+  match(t) :
+    (t:IfTrie) :
+      ;Compile the actions
+      var default = DEFAULT-ACTION
+      val actions = Vector<KeyValue<Int, ((Tuple<Int>, Int) -> DispatchResult)>>()
+      for entry in branches(t) do :
+        val t = compile-trie(value(entry))
+        match(key(entry)) :
+          (s:IAll) :
+            default = t
+          (s:ISubset) :
+            for x in xs(s) do :
+              add(actions, x => t)
+
+      ;Compile differently depending upon the number of branches.
+      val num-actions = length(actions)
+      if num-actions == 0 :
+        ;Just call the default action
+        fn* (xtypes:Tuple<Int>, i:Int) :
+          default(xtypes, i + 1)
+      else if num-actions == 1 :
+        ;Check and call the default action if no match
+        val x0 = key(actions[0])
+        val a0 = value(actions[0])
+        fn* (xtypes:Tuple<Int>, i:Int) :
+          val x = xtypes[i]
+          if x == x0 : a0(xtypes, i + 1)
+          else : default(xtypes, i + 1)          
+      else if num-actions <= 4 :
+        ;Linear search
+        fn* (xtypes:Tuple<Int>, i:Int) :
+          val x = xtypes[i]
+          let loop (j:Int = 0) :
+            if j < num-actions :
+              if x == key(actions[j]) : value(actions[j])(xtypes, i + 1)
+              else : loop(j + 1)
+            else : default(xtypes, i + 1)
+      else :
+        ;Table lookup
+        val table = IntTable<((Tuple<Int>, Int) -> DispatchResult)>()
+        for entry in actions do :
+          table[key(entry)] = value(entry)
+        ;Cache of last taken
+        var last-x:Int|False = false
+        var last-a:((Tuple<Int>, Int) -> DispatchResult)|False = false
+        ;Return closure
+        fn* (xtypes:Tuple<Int>, i:Int) :
+          ;Retrieve i'th type tag
+          val x = xtypes[i]
+          ;Retrieve either cached action or lookup action
+          val a =
+            if x == last-x :
+              last-a as (Tuple<Int>, Int) -> DispatchResult
+            else :
+              val a = get?(table, xtypes[i], default)
+              last-x = x
+              last-a = a
+              a
+          ;Execute action
+          a(xtypes, i + 1)
+    (t:EndTrie) :
+      ;Return target
+      val tgt = target(t)
+      fn* (xtypes:Tuple<Int>, i:Int) :
+        tgt
+        
+defn compile-action (bs:Seq<IDispatchBranch>) :
+  val f = DEFAULT-ACTION when empty?(bs)
+     else compile-trie(to-trie(bs))
+  new DispatchAction :
+    defmethod dispatch (this, xtypes:Tuple<Int>) :
+      f(xtypes, 0)
+
+defn DispatchAction (ct:ClassTable, f:BranchFormat,
+                     methods:Int -> Tuple<LoadedMethod>) :
+  defn isets-list (ts:Seqable<TypeSet>) :
+    to-list(seq(to-iset{ct, _}, ts))
+  defn isets-tuple (ts:Seqable<TypeSet>) :
+    to-tuple(seq(to-iset{ct, _}, ts))
+    
+  compile-action $ match(f) :
+    (f:MatchFormat) :
+      seq(IBranch{isets-list(_), _}, branches(f), 0 to false)
+    (f:DispatchFormat) :
+      val indexed-branches = to-tuple $ seq(KeyValue, branches(f), 0 to false)
+      val dispatch-branches = dispatch-ordering(ct, indexed-branches, key)
+      for b in dispatch-branches seq :
+        match(b) :
+          (b:KeyValue<Tuple<TypeSet>,Int>) :
+            IBranch(isets-list(key(b)), value(b))
+          (bs:Tuple<KeyValue<Tuple<TypeSet>,Int>>) :
+            val sets = map(isets-tuple{key(_)}, bs)
+            IAmb(sets, Amb())
+    (f:MultiFormat) :
+      val dispatch-methods = dispatch-ordering(ct, methods(multi(f)), types)
+      for m in dispatch-methods seq :
+        match(m) :
+          (m:LoadedMethod) :
+            IBranch(isets-list(types(m)), CodeId(fid(m)))
+          (ms:Tuple<LoadedMethod>) :
+            val sets = map(isets-tuple{types(_)}, ms)
+            IAmb(sets, Amb())
+
+;============================================================
+;==================== Utilities =============================
+;============================================================
+
+deftype DispatchAction
+defmulti dispatch (a:DispatchAction, types:Tuple<Int>) -> DispatchResult
+
+defstruct LoadedMethod :
+  multi: Int
+  types: Tuple<TypeSet>
+  fid: Int
+  package: Symbol
+  instance-method?: True|False
+with:
+  printer => true
+
+;Compute the class dependencies of all branch formats and methods
+defn class-dependencies (ts:Seqable<TypeSet>) -> Tuple<Int> :
+  val ds = Vector<Int>()
+  let loop (ts:Seqable<TypeSet> = ts) :
+    for t in ts do :
+      match(t) :
+        (t:AndType) : loop(types(t))
+        (t:OrType) : loop(types(t))
+        (t:TopType) : false
+        (t:SingleType) : add(ds, type(t))
+  qsort!(ds)
+  remove-duplicates!(ds)
+  to-tuple(ds)
+  
+defn class-dependencies (f:BranchFormat) :
+  match(f) :
+    (f:DispatchFormat|MatchFormat) : class-dependencies $ cat-all(branches(f))
+    (f:MultiFormat) : []
+    
+defn class-dependencies (f:VMMethod) :
+  class-dependencies(types(f))
+
+;Compute all the multi dependencies of a format  
+defn multi-dependencies (f:BranchFormat) :
+  match(f) :
+    (f:MultiFormat) : [multi(f)]
+    (f:DispatchFormat|MatchFormat) : []
+
+;Convert a typeset to an iset
+defn to-iset (ct:ClassTable, t:TypeSet) :
+  defn union (a:ISet, b:ISet) :
+    a-or-b(compare(a,b))
+  defn intersection (a:ISet, b:ISet) :
+    a-and-b(compare(a,b))
+  let loop (t:TypeSet = t) :
+    match(t) :
+      (t:AndType) : reduce(intersection, seq(loop, types(t)))
+      (t:OrType) : reduce(union, seq(loop, types(t)))
+      (t:TopType) : IAll()
+      (t:SingleType) : ISubset(children(ct, type(t)))
