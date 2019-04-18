@@ -7,6 +7,8 @@ defpackage stz/el :
   import stz/algorithms
   import stz/ehier
   import stz/basic-blocks
+  import stz/dyn-tree
+  import stz/trie
 
 ;============================================================
 ;==================== Lower All =============================
@@ -114,7 +116,13 @@ public defn lower (epackage:EPackage) -> EPackage :
 
   within time-ms!("Lift Objects") :
     cur-package = lift-objects(cur-package, global-vt)
+    global-vt = GlobalVarTable(cur-package, iotable)
     dump(".el.objlifted")
+  ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Resolve Methods") :
+    cur-package = resolve-methods(cur-package, global-vt)
+    dump(".el.resolved-methods")
   ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Lift Closures") :
@@ -1590,32 +1598,6 @@ defn rename-fn (f:EFn) -> EFn :
   rename(f) as EFn
 
 ;============================================================
-;=============== Building the Method Table ==================
-;============================================================
-;
-;defn class-tree (epackage:EPackage) :
-;  ;Retrieve all ids in type
-;  defn parent-ids (t:False) : []
-;  defn parent-ids (t:EType) :
-;    match(t) :
-;      (t:EAnd) : to-tuple(cat(parent-ids(a(t)), parent-ids(b(t))))
-;      (t:EOf) : [n(t)]
-;
-;  ;Create class tree
-;  val class-tree = DynTree()
-;  add{class-tree, _} $ 
-;    for e in exps(epackage) seq? :
-;      match(e) :
-;        (e:EDefType) : One(NodeState(n(e), parent-ids(parent(e)), children(e), false))
-;        (e:EDefStruct) : One(NodeState(n(e), parent-ids(parent(e)), [], true))
-;        (e) : None()
-;
-;  ;Debug
-;  for e in exps(epackage) do :
-;    match(e:EDefType) :
-;      println("All children of %_ = %_" % [n(e), all-children(class-tree, n(e))])
-
-;============================================================
 ;=================== Lambda Lifting =========================
 ;============================================================
 
@@ -2173,6 +2155,154 @@ defn lift-objects (epackage:EPackage, gvt:VarTable) -> EPackage :
   add-exps(epackage*, new-texps)
 
 ;============================================================
+;=============== Building the Method Table ==================
+;============================================================
+
+deftype MethodTable
+defmulti resolve-target (t:MethodTable, multi:Int, args:Tuple<EType>) -> Int|False
+
+defn MethodTable (epackage:EPackage) :
+  ;Driver
+  defn driver () :
+    val class-tree = make-class-tree()
+    val method-table = create-method-table()
+    val trie-table = create-trie-table(class-tree, method-table)
+    build-method-table(class-tree, trie-table)
+
+  ;Create a class tree
+  defn make-class-tree () -> DynTree :
+    ;Retrieve all ids in type
+    defn parent-ids (t:EType|False) :
+      qsort $ let loop (t:EType|False = t) :
+        match(t) :
+          (t:EAnd) : cat(loop(a(t)), loop(b(t)))
+          (t:EOf) : [n(t)]
+          (t:False) : []
+
+    ;Create class tree
+    val class-tree = DynTree()
+    add{class-tree, _} $ 
+      for e in exps(epackage) seq? :
+        match(e) :
+          (e:EDefType) : One(NodeState(n(e), parent-ids(parent(e)), qsort(children(e)), false))
+          (e:EDefStruct) : One(NodeState(n(e), parent-ids(parent(e)), [], true))
+          (e:EDefObject): One(NodeState(n(e), parent-ids(parent(e)), [], true))
+          (e) : None()
+          
+    ;Return created class tree      
+    class-tree
+
+  ;Create method table
+  defn create-method-table () :
+    val method-table = IntListTable<EDefmethod>()    
+    for e in filter-by<EDefmethod>(exps(epackage)) do :
+      add(method-table, multi(e), e)
+    method-table
+
+  ;Determine whether one type is a subtype of another type
+  defn subtype? (tree:DynTree, x:EType, y:EType) :
+    match(x, y) :
+      (x, y:ETop|ETVar) : true
+      (x:EOr, y) : subtype?(tree, a(x), y) and subtype?(tree, b(x), y)
+      (x, y:EAnd) : subtype?(tree, x, a(y)) and subtype?(tree, x, b(y))
+      (x, y:EOr) : subtype?(tree, x, a(y)) or subtype?(tree, x, b(y))
+      (x:EAnd, y) : subtype?(tree, a(x), y) or subtype?(tree, b(x), y)
+      (x:EOf, y:EOf) : parent?(tree, n(x), n(y))
+      (x, y) : false
+
+  ;Compute dispatch ordering on methods
+  defn dispatch-ordering<?T> (class-tree:DynTree, ms:Tuple<EDefmethod>, one:EDefmethod -> ?T, amb:Tuple<EDefmethod> -> ?T) -> Seq<T> :
+    defn specific-method? (a:Int, b:Int) :
+      val ta = a1(func(ms[a]))
+      val tb = a1(func(ms[b]))
+      all?(subtype?{class-tree, _, _}, ta, tb)
+    for item in ambiguity-ordering(length(ms), specific-method?) seq :
+      match(item) :
+        (item:Int) : one(ms[item])
+        (item:List<Int>) : amb(to-tuple(seq({ms[_]}, item)))
+
+  ;Convert a EType to an ISet
+  defn to-iset (class-tree:DynTree, t:EType) :
+    match(t) :
+      (t:EOf) : ISubset(all-children(class-tree, n(t)))
+      (t:EAnd) : intersection(to-iset(class-tree, a(t)), to-iset(class-tree, b(t)))
+      (t:EOr) : union(to-iset(class-tree, a(t)), to-iset(class-tree, b(t)))
+      (t:ETVar|ETop) : IAll()
+      (t:EBot) : ISubset([])
+
+  ;Create a Trie
+  defn create-trie (class-tree:DynTree, ms:Tuple<EDefmethod>) -> IfTrie :
+    defn to-ibranch (m:EDefmethod) :
+      val method-types = a1(func(m))
+      IBranch(to-list(seq(to-iset{class-tree, _}, method-types)), n(m))
+    defn to-iamb (ms:Tuple<EDefmethod>) :
+      val sets = for m in ms map :
+        map(to-iset{class-tree, _}, a1(func(m)))
+      IAmb(sets, false)
+    to-trie $ dispatch-ordering(class-tree, ms, to-ibranch, to-iamb)      
+
+  ;Create multi trie table
+  defn create-trie-table (class-tree:DynTree, method-table:IntListTable<EDefmethod>) :
+    val trie-table = IntTable<IfTrie>()
+    for entry in method-table do :
+      trie-table[key(entry)] = create-trie(class-tree, to-tuple(value(entry)))
+    trie-table
+
+  ;Resolve through trie
+  defn resolve-target (class-tree:DynTree, trie-table:IntTable<IfTrie>, multi:Int, args:Tuple<EType>) -> Int|False :
+    if key?(trie-table, multi) :
+      val sets = map(to-iset{class-tree, _}, args)
+      val tgts = all-targets(trie-table[multi], sets)
+      val unique-tgts = unique(filter-by<Int>(tgts))
+      println("Resolved methods for multi %_ using arguments %_ = %_" % [multi, args, unique-tgts])
+      head(unique-tgts) when length(unique-tgts) == 1
+
+  ;Build the Method Table
+  defn build-method-table (class-tree:DynTree, trie-table:IntTable<IfTrie>) :
+    new MethodTable :
+      defmethod resolve-target (this, multi:Int, args:Tuple<EType>) :
+        resolve-target(class-tree, trie-table, multi, args)
+
+  ;Launch
+  driver()
+
+defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
+  val method-table = MethodTable(epackage)
+  defn resolve-in-body (e:EBody, vt:VarTable) -> EBody :
+    val ins* = for i in ins(e) map :
+      ;Resolve target of call
+      defn resolve-call (f:EImm, ys:Tuple<EImm>) -> EImm|False :
+        val fid = match(f) :
+          (f:EVar) : n(f)
+          (f:ECurry) : n(x(f))
+          (f) : false
+        defn sub-fid (n:Int) :
+          match(f) :
+            (f:EVar) : EVar(n)
+            (f:ECurry) : ECurry(EVar(n), targs(f))
+        match(fid:Int) :
+          val ys-types = map(type{vt, _}, ys)
+          match(resolve-target(method-table, fid, ys-types)) :
+            (n:Int) : sub-fid(n)
+            (n:False) : false
+            
+      ;Resolve calls and tcalls
+      match(i) :
+        (i:ECall|ETCall) :
+          val f* = resolve-call(f(i), ys(i))
+          match(f*:EImm) : sub-f(i, f*)
+          else : i
+        (i) : i
+    sub-ins(e, ins*)
+  defn resolve-texp (x:ETExp, vt:VarTable) :
+    val result = let loop (x:ELBigItem = x) :
+      match(map(loop, x)) :
+        (e:EBody) : resolve-in-body(e,vt)
+        (e) : e
+    result as ETExp
+  map-with-var-table(resolve-texp, gvt, epackage)
+
+;============================================================
 ;=================== Closure Lifting ========================
 ;============================================================
 
@@ -2618,6 +2748,7 @@ defn GlobalVarTable (epackage:EPackage, iotable:IOTable) -> VarTable :
   val exported-records = for exp in exps(epackage) seq? :
     val [n, e] = match(exp) :
       (e:EDefn) : [n(e) FnEntry(func(e), lostanza?(e))]
+      (e:EDefmethod) : [n(e), FnEntry(func(e), lostanza?(e))]
       (e:EDefmulti) : [n(e), EFnEntry(targs(e), a1(e), false, a2(e), false, false)]
       (e:EExternFn) : [n(e), FnEntry(func(e), true)]
       (e:EDefGlobal) : [n(e), VarEntry(mutable?(e), type(e), lostanza?(e))]
@@ -2639,7 +2770,7 @@ defn LocalVarTable (gvt:VarTable, e:ETExp) -> VarTable :
       yield(VTRecord(false, n, e))
     ;Determine whether we are in a LoStanza context
     val lostanza-context? = match(e) :
-      (e:EDefn) : lostanza?(e)
+      (e:EDefn) : lostanza?(e)      
       (e:EDefClosure) : false
       (e:EDefmethod) : lostanza?(e)
       (e:EExternFn) : true
