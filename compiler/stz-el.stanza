@@ -78,10 +78,10 @@ public defn lower (epackage:EPackage) -> EPackage :
     dump(".el.guarded")
   ensure-unique-identifiers!(cur-package)
 
-  within time-ms!("Annotate Types") :
-    cur-package = add-type-annotations(cur-package, global-vt)
-    dump(".el.annotated")
-  ensure-unique-identifiers!(cur-package)
+  ;within time-ms!("Annotate Types") :
+  ;  cur-package = add-type-annotations(cur-package, global-vt)
+  ;  dump(".el.annotated")
+  ;ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Elide Checks") :
     cur-package = elide-checks(cur-package, ehier, global-vt)
@@ -2015,7 +2015,7 @@ defn annotate-body (b:EBody, state:Table<Int,EType>, vt:VarTable) -> EBody :
     val methods* = for m in methods(o) map :
       val func* = annotate-function(func(m), state, vt)
       sub-func(m, func*)
-    sub-methods(o, methods*)
+    emit(buffer, sub-methods(o, methods*))
     
   val ins* = annotate-body-instructions(b, state, vt)
   for i in ins* do :
@@ -2098,220 +2098,269 @@ defn add-type-annotations (epackage:EPackage, gvt:VarTable) -> EPackage :
 ;============================================================
 ;==================== Check Elision =========================
 ;============================================================
-defstruct TypeState :
-  n: Int
-  type: EType
+;defstruct TypeState :
+;  n: Int
+;  type: EType
 
 defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
-  ;Erase type if reference type
-  ;LoStanza types are trusted.
-  defn erase (t:EType) :
-    ETop() when reftype?(t) else t
+  ;Retrieve the trusted declared type of a variable
+  defn var-type (v:Int, state:Table<Int,EType>, vt:VarTable) :
+    if key?(state,v) :
+      state[v]
+    else :
+      val t = type(vt,v)
+      if lostanza?(vt,v) : erase(t)
+      else : t
+      
+  ;Retrieve the type of the given immediate
+  defn imm-type (x:EImm, state:Table<Int,EType>, vt:VarTable) :
+    match(x:EVar) : var-type(n(x), state, vt)
+    else : type(vt, x)
 
-  ;Elide all checks in function.
-  ;Assumes that free variables have been calculated.
-  ;parent-type-state is the state of the free variables at the time
-  ;that the function is declared.
-  defn analyze-function (e:EFn, parent-type-state:IntTable<EType>, vt:VarTable) -> EFn :
-    val arg-states = for (a in args(e), t in a1(e)) seq :
-      if lostanza?(vt,a) : TypeState(a, erase(t))
-      else : TypeState(a,t)
-    val free-states = for v in vars(free(e)) seq :
-                        TypeState(v, parent-type-state[v])
-    sub-body(e, analyze-body(body(e), cat(arg-states, free-states), vt))
-
-  ;Elide checks in body.
-  defn analyze-body (e:EBody, initial-state:Seqable<TypeState>, vt:VarTable) -> EBody :
-    ;Generate instructions in buffer
+  ;Elide all checks in body
+  defn elide-checks (e:EBody, vt:VarTable) -> EBody :
     val buffer = BodyBuffer(e)
+    val state = IntTable<EType>()
+    for e in ins(e) do :
+      match(e) :
+        (e:EAnnotate) :
+          state[n(e)] = type(e)
+        (e:ECheck) :
+          if not subtype?(ehier, imm-type(y(e), state, vt), type(e)) :
+            emit(buffer, e)
+        (e) :
+          emit(buffer, e)
+    to-body(buffer)
 
-    ;Guard table holds the entering assumptions for different
-    ;basic blocks.
-    val enter-state = IntListTable<TypeState>()
+  ;Elide checks recursively in the given top level expression e
+  defn elide-texp (e:ETExp, vt:VarTable) :    
+    ;Elide checks in all bodies
+    defn elide-checks-in-bodies (e:ELBigItem) :
+      match(map(elide-checks-in-bodies, e)) :
+        (e:EBody) : elide-checks(e, vt)
+        (e) : e
+    ;Annotate and process
+    defn process (e:ELBigItem) :
+      match(e) :
+        (e:EFn) : elide-checks-in-bodies(annotate-function(e, IntTable<EType>(), vt))
+        (e:EBody) : elide-checks-in-bodies(annotate-body(e, IntTable<EType>(), vt))
+        (e) : map(process, e)
+    ;Compute free variables and then process
+    process(analyze-freevars(e,vt)) as ETExp
 
-    ;Guard table holding the exiting type states of each basic block.
-    val exit-state = IntListTable<TypeState>()
+  ;Launch
+  map-with-var-table(elide-texp, gvt, epackage)
 
-    ;Table holding local functions
-    val localfn-table = to-inttable<ELocalFn> $
-      for f in localfns(e) seq : n(f) => f
-    val localobj-table = to-inttable<ELocalObj> $
-      for o in localobjs(e) seq : n(o) => o
 
-    ;Scan through blocks in reverse-post-order, compute
-    ;types of variables as we go, and elide the checks that
-    ;are unnecessary.
-    val basic-blocks = analyze-basic-blocks(ins(e))
-    for b in basic-blocks do :
-      ;Current known types of all variables
-      val type-state = IntTable<EType>()
-
-      ;Analyze all EFns declared in item
-      defn* analyze-inner-fns (x:ELBigItem) :
-        match(x:EFn) : analyze-function(x, type-state, vt)
-        else : map(analyze-inner-fns,x)
-
-      ;Analyze a local function
-      defn analyze-localfn (f:Int) :
-        emit(buffer, analyze-inner-fns(localfn-table[f]) as ELocalFn)
-      defn analyze-localobj (o:Int) :
-        emit(buffer, analyze-inner-fns(localobj-table[o]) as ELocalObj)
-
-      ;Variable v has now been restricted to
-      ;be a subtype of the given type. If the variable
-      ;is not mutable, then it's type is now narrowed.
-      ;Mutable variable types are not affected because their
-      ;type can expand again during a reassignment.
-      defn restrict (v:Int, t:EType) :
-        if not mutable?(vt,v) :
-          if reftype?(t) :
-            type-state[v] = match(get?(type-state,v)) :
-              (t0:EType) : normalize(EAnd(t,t0))
-              (_:False) : t
-
-      ;Retrieve the current restricted type of the given immediate
-      defn immtype (e:EImm) :
-        match(e:EVar) :
-          if key?(type-state,n(e)) : type-state[n(e)]
-          else : type(vt, n(e))
-        else : type(vt,e)
-
-      ;Initialize state of entering block
-      if index(b) == 0 :
-        for s in initial-state do :
-          type-state[n(s)] = type(s)
-
-      ;Initialize state to union of state from entry blocks.
-      ;Entry blocks are blocks that are predecessors that have already run.
-      val entry-blocks = to-tuple $
-        for p in predecessors(b) filter :
-          index(basic-blocks[p]) < index(b)
-      val num-predecessors = length(entry-blocks)
-      if num-predecessors == 1 :
-        for s in exit-state[entry-blocks[0]] do :
-          type-state[n(s)] = type(s)
-      else if num-predecessors > 1 :
-        for entry in merge-states(seq-cat({exit-state[_]}, entry-blocks)) do :
-          val v = key(entry)
-          val states = value(entry)
-          if length(states) == num-predecessors :
-            val t0 = type(head(states))
-            type-state[v] =
-              if reftype?(t0) : normalize(reduce(EOr, seq(type, states)))
-              else : t0
-      ;Restrict state of entering variables according to their guards
-      for s in enter-state[lbl(b)] do :
-        restrict(n(s), type(s))
-
-      ;Does the given instruction define a value?
-      ;Returns false if it does not.
-      ;Returns its identifier, and whether it is trusted if it does.
-      defn definition? (i:EIns) -> False|[Int, True|False] :
-        defn trusted (x:EVarLoc) : [n(x), true]
-        defn untrusted (x:EVarLoc) : [n(x), false]
-        match(i) :
-          (i:ENew) : trusted(x(i))
-          (i:ETuple) : trusted(x(i))
-          (i:EVoidTuple) : trusted(x(i))
-          (i:ETupleGet) : untrusted(x(i))
-          (i:EObject) : trusted(x(i))
-          (i:EArray) : trusted(x(i))
-          (i:EStruct) : trusted(x(i))
-          (i:EPtr) : trusted(x(i))
-          (i:ELoad) : untrusted(x(i))
-          (i:EInterpret) : untrusted(x(i))
-          (i:EConv) : untrusted(x(i))
-          (i:EPrim) : trusted(x(i))
-          (i:ENewObject) : trusted(x(i))
-          (i:ECall) :
-            match(x(i)) :
-              (x:EVarLoc) :
-                defn check-func (n:Int) :
-                  val arity = length(ys(i))
-                  if function?(vt,n) :
-                    if lostanza?(vt,n) : untrusted(x)
-                    else if tail?(vt,n,arity) : untrusted(x)
-                    else : trusted(x)
-                  else : untrusted(x)
-                match(f(i)) :
-                  (f:EVar) : check-func(n(f))
-                  (f:ECurry) : check-func(n(/x(f)))
-                  (f:EImm) : untrusted(x)
-              (_:False) :
-                false
-          (i) : false
-
-      ;Sweep through instructions of block
-      for instruction in instructions(b) do :
-        ;Analyze local objects and functions
-        match(instruction) :
-          (i:ENew) :
-            analyze-localobj(n(i))
-          (i:EInitClosures) :
-            for x in xs(i) do :
-              type-state[n(x)] = EOf(n(iotable(vt), CORE-FN-ID))
-            do(analyze-localfn{n(_)}, xs(i))
-          (i) : false
-
-        match(definition?(instruction)) :
-          ;Add the variables entry to the type state
-          ;if it is defined.
-          ([n, trusted?]:[Int, True|False]) :
-            type-state[n] = type(vt,n) when trusted?
-                       else erase(type(vt,n))
-            emit(buffer, instruction)
-          ;Otherwise
-          (_:False) :
-            match(instruction) :
-              (i:EDef) :
-                val n = n(x(i))
-                type-state[n] =
-                  if mutable?(vt, n) :
-                    if lostanza?(vt,n) : erase(type(vt,n))
-                    else : type(vt,n)
-                  else : immtype(y(i) as EImm)
-                emit(buffer, i)
-              (i:EMatch|EDispatch) :
-                for b in branches(i) do :
-                  for (y in ys(i), t in types(b)) do :
-                    match(y:EVar) :
-                      add(enter-state, n(b), TypeState(n(y),t))
-                emit(buffer, i)
-              (i:ECheck) :
-                val y = y(i)
-                if not subtype?(ehier, immtype(y), type(i)) :
-                  emit(buffer, i)
-                  match(y:EVar) :
-                    restrict(n(y), type(i))
-              (i) :
-                emit(buffer, i)
-
-      ;Save exiting state of basic block
-      for entry in type-state do :
-        add(exit-state, lbl(b), TypeState(key(entry), value(entry)))
-
-    ;Generate instructions in buffer
-    to-body(buffer, true, false, false)
-
-  ;Analyze package with local var tables and free var analysis
-  within (texp, vt) = map-with-var-table(gvt, epackage) :
-    val empty-table = IntTable<EType>()
-    defn analyze (x:ELBigItem) :
-      match(x) :
-        (x:EFn) : analyze-function(x, empty-table, vt)
-        (x:EBody) : analyze-body(x, [], vt)
-        (x) : map(analyze, x)
-    analyze(analyze-freevars(texp,vt)) as ETExp
-
-val PRINT-FUNCS = if file-exists?("printfuncs.txt") : unwrap-all(reader/read-file("printfuncs.txt"))
-                  else : List()
-println("PRINT-FUNCS = %_" % [PRINT-FUNCS])
-var PRINT : True|False = false
-
-defn merge-states (states:Seqable<TypeState>) :
-  val table = IntListTable<TypeState>()
-  for s in states do : add(table, n(s), s)
-  table
+;  ;Erase type if reference type
+;  ;LoStanza types are trusted.
+;  defn erase (t:EType) :
+;    ETop() when reftype?(t) else t
+;
+;  ;Elide all checks in function.
+;  ;Assumes that free variables have been calculated.
+;  ;parent-type-state is the state of the free variables at the time
+;  ;that the function is declared.
+;  defn analyze-function (e:EFn, parent-type-state:IntTable<EType>, vt:VarTable) -> EFn :
+;    val arg-states = for (a in args(e), t in a1(e)) seq :
+;      if lostanza?(vt,a) : TypeState(a, erase(t))
+;      else : TypeState(a,t)
+;    val free-states = for v in vars(free(e)) seq :
+;                        TypeState(v, parent-type-state[v])
+;    sub-body(e, analyze-body(body(e), cat(arg-states, free-states), vt))
+;
+;  ;Elide checks in body.
+;  defn analyze-body (e:EBody, initial-state:Seqable<TypeState>, vt:VarTable) -> EBody :
+;    ;Generate instructions in buffer
+;    val buffer = BodyBuffer(e)
+;
+;    ;Guard table holds the entering assumptions for different
+;    ;basic blocks.
+;    val enter-state = IntListTable<TypeState>()
+;
+;    ;Guard table holding the exiting type states of each basic block.
+;    val exit-state = IntListTable<TypeState>()
+;
+;    ;Table holding local functions
+;    val localfn-table = to-inttable<ELocalFn> $
+;      for f in localfns(e) seq : n(f) => f
+;    val localobj-table = to-inttable<ELocalObj> $
+;      for o in localobjs(e) seq : n(o) => o
+;
+;    ;Scan through blocks in reverse-post-order, compute
+;    ;types of variables as we go, and elide the checks that
+;    ;are unnecessary.
+;    val basic-blocks = analyze-basic-blocks(ins(e))
+;    for b in basic-blocks do :
+;      ;Current known types of all variables
+;      val type-state = IntTable<EType>()
+;
+;      ;Analyze all EFns declared in item
+;      defn* analyze-inner-fns (x:ELBigItem) :
+;        match(x:EFn) : analyze-function(x, type-state, vt)
+;        else : map(analyze-inner-fns,x)
+;
+;      ;Analyze a local function
+;      defn analyze-localfn (f:Int) :
+;        emit(buffer, analyze-inner-fns(localfn-table[f]) as ELocalFn)
+;      defn analyze-localobj (o:Int) :
+;        emit(buffer, analyze-inner-fns(localobj-table[o]) as ELocalObj)
+;
+;      ;Variable v has now been restricted to
+;      ;be a subtype of the given type. If the variable
+;      ;is not mutable, then it's type is now narrowed.
+;      ;Mutable variable types are not affected because their
+;      ;type can expand again during a reassignment.
+;      defn restrict (v:Int, t:EType) :
+;        if not mutable?(vt,v) :
+;          if reftype?(t) :
+;            type-state[v] = match(get?(type-state,v)) :
+;              (t0:EType) : normalize(EAnd(t,t0))
+;              (_:False) : t
+;
+;      ;Retrieve the current restricted type of the given immediate
+;      defn immtype (e:EImm) :
+;        match(e:EVar) :
+;          if key?(type-state,n(e)) : type-state[n(e)]
+;          else : type(vt, n(e))
+;        else : type(vt,e)
+;
+;      ;Initialize state of entering block
+;      if index(b) == 0 :
+;        for s in initial-state do :
+;          type-state[n(s)] = type(s)
+;
+;      ;Initialize state to union of state from entry blocks.
+;      ;Entry blocks are blocks that are predecessors that have already run.
+;      val entry-blocks = to-tuple $
+;        for p in predecessors(b) filter :
+;          index(basic-blocks[p]) < index(b)
+;      val num-predecessors = length(entry-blocks)
+;      if num-predecessors == 1 :
+;        for s in exit-state[entry-blocks[0]] do :
+;          type-state[n(s)] = type(s)
+;      else if num-predecessors > 1 :
+;        for entry in merge-states(seq-cat({exit-state[_]}, entry-blocks)) do :
+;          val v = key(entry)
+;          val states = value(entry)
+;          if length(states) == num-predecessors :
+;            val t0 = type(head(states))
+;            type-state[v] =
+;              if reftype?(t0) : normalize(reduce(EOr, seq(type, states)))
+;              else : t0
+;      ;Restrict state of entering variables according to their guards
+;      for s in enter-state[lbl(b)] do :
+;        restrict(n(s), type(s))
+;
+;      ;Does the given instruction define a value?
+;      ;Returns false if it does not.
+;      ;Returns its identifier, and whether it is trusted if it does.
+;      defn definition? (i:EIns) -> False|[Int, True|False] :
+;        defn trusted (x:EVarLoc) : [n(x), true]
+;        defn untrusted (x:EVarLoc) : [n(x), false]
+;        match(i) :
+;          (i:ENew) : trusted(x(i))
+;          (i:ETuple) : trusted(x(i))
+;          (i:EVoidTuple) : trusted(x(i))
+;          (i:ETupleGet) : untrusted(x(i))
+;          (i:EObject) : trusted(x(i))
+;          (i:EArray) : trusted(x(i))
+;          (i:EStruct) : trusted(x(i))
+;          (i:EPtr) : trusted(x(i))
+;          (i:ELoad) : untrusted(x(i))
+;          (i:EInterpret) : untrusted(x(i))
+;          (i:EConv) : untrusted(x(i))
+;          (i:EPrim) : trusted(x(i))
+;          (i:ENewObject) : trusted(x(i))
+;          (i:ECall) :
+;            match(x(i)) :
+;              (x:EVarLoc) :
+;                defn check-func (n:Int) :
+;                  val arity = length(ys(i))
+;                  if function?(vt,n) :
+;                    if lostanza?(vt,n) : untrusted(x)
+;                    else if tail?(vt,n,arity) : untrusted(x)
+;                    else : trusted(x)
+;                  else : untrusted(x)
+;                match(f(i)) :
+;                  (f:EVar) : check-func(n(f))
+;                  (f:ECurry) : check-func(n(/x(f)))
+;                  (f:EImm) : untrusted(x)
+;              (_:False) :
+;                false
+;          (i) : false
+;
+;      ;Sweep through instructions of block
+;      for instruction in instructions(b) do :
+;        ;Analyze local objects and functions
+;        match(instruction) :
+;          (i:ENew) :
+;            analyze-localobj(n(i))
+;          (i:EInitClosures) :
+;            for x in xs(i) do :
+;              type-state[n(x)] = EOf(n(iotable(vt), CORE-FN-ID))
+;            do(analyze-localfn{n(_)}, xs(i))
+;          (i) : false
+;
+;        match(definition?(instruction)) :
+;          ;Add the variables entry to the type state
+;          ;if it is defined.
+;          ([n, trusted?]:[Int, True|False]) :
+;            type-state[n] = type(vt,n) when trusted?
+;                       else erase(type(vt,n))
+;            emit(buffer, instruction)
+;          ;Otherwise
+;          (_:False) :
+;            match(instruction) :
+;              (i:EDef) :
+;                val n = n(x(i))
+;                type-state[n] =
+;                  if mutable?(vt, n) :
+;                    if lostanza?(vt,n) : erase(type(vt,n))
+;                    else : type(vt,n)
+;                  else : immtype(y(i) as EImm)
+;                emit(buffer, i)
+;              (i:EMatch|EDispatch) :
+;                for b in branches(i) do :
+;                  for (y in ys(i), t in types(b)) do :
+;                    match(y:EVar) :
+;                      add(enter-state, n(b), TypeState(n(y),t))
+;                emit(buffer, i)
+;              (i:ECheck) :
+;                val y = y(i)
+;                if not subtype?(ehier, immtype(y), type(i)) :
+;                  emit(buffer, i)
+;                  match(y:EVar) :
+;                    restrict(n(y), type(i))
+;              (i) :
+;                emit(buffer, i)
+;
+;      ;Save exiting state of basic block
+;      for entry in type-state do :
+;        add(exit-state, lbl(b), TypeState(key(entry), value(entry)))
+;
+;    ;Generate instructions in buffer
+;    to-body(buffer, true, false, false)
+;
+;  ;Analyze package with local var tables and free var analysis
+;  within (texp, vt) = map-with-var-table(gvt, epackage) :
+;    val empty-table = IntTable<EType>()
+;    defn analyze (x:ELBigItem) :
+;      match(x) :
+;        (x:EFn) : analyze-function(x, empty-table, vt)
+;        (x:EBody) : analyze-body(x, [], vt)
+;        (x) : map(analyze, x)
+;    analyze(analyze-freevars(texp,vt)) as ETExp
+;
+;val PRINT-FUNCS = if file-exists?("printfuncs.txt") : unwrap-all(reader/read-file("printfuncs.txt"))
+;                  else : List()
+;println("PRINT-FUNCS = %_" % [PRINT-FUNCS])
+;var PRINT : True|False = false
+;
+;defn merge-states (states:Seqable<TypeState>) :
+;  val table = IntListTable<TypeState>()
+;  for s in states do : add(table, n(s), s)
+;  table
   
 ;============================================================
 ;=================== Object Lifting =========================
