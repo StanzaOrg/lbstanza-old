@@ -9,6 +9,11 @@ defpackage stz/el :
   import stz/basic-blocks
   import stz/dyn-tree
   import stz/trie
+  import stz/el-infer with :
+    prefix(Input, Block, Ins, Def, Cast,
+           Match, Use, Annotation, Inherit) => I
+    prefix(Branch) => infer-
+    
 
 ;============================================================
 ;==================== Lower All =============================
@@ -71,6 +76,11 @@ public defn lower (epackage:EPackage) -> EPackage :
   within time-ms!("Insert Guards") :
     cur-package = insert-guards(cur-package, global-vt)
     dump(".el.guarded")
+  ensure-unique-identifiers!(cur-package)
+
+  within time-ms!("Annotate Types") :
+    cur-package = add-type-annotations(cur-package, global-vt)
+    dump(".el.annotated")
   ensure-unique-identifiers!(cur-package)
 
   within time-ms!("Elide Checks") :
@@ -1833,6 +1843,257 @@ defn analyze-basic-blocks (ins:Tuple<EIns>) -> BasicBlockTable :
   new BasicBlockTable :
     defmethod to-seq (this) : seq(BBlock, blocks(bs))
     defmethod get (this, lbl:Int) : BBlock(bs[lbl])
+
+;============================================================
+;=================== Type Annotation ========================
+;============================================================
+defn annotate-body-instructions (e:EBody, state0:Table<Int,EType>, vt:VarTable) -> Seqable<EIns> :
+  ;Functions for retrieving the free variables in
+  ;local functions and local objects.
+  val localfn-table = to-inttable(n, localfns(e))
+  val localobj-table = to-inttable(n, localobjs(e))
+  defn all-free (fs:Seqable<EFunction>) :
+    val free-vars = Vector<Int>()
+    defn loop (fs:Seqable<EFunction>) :
+      for f in fs do :
+        match(f) :
+          (f:EMultifn) : loop(funcs(f))
+          (f:EFn) : add-all(free-vars, vars(free(f)))
+    loop(fs)
+    free-vars      
+  defn local-fns-free (ns:Seqable<Int>) :
+    all-free(seq(func{localfn-table[_]}, ns))
+  defn local-obj-free (n:Int) :
+    val ms = methods(localobj-table[n])
+    all-free(seq(func, ms))
+
+  ;Does the given instruction define a value?
+  ;Returns false if it does not.
+  ;Returns its identifier, and whether it is trusted if it does.
+  defn definition? (i:EIns) -> False|[Int, True|False] :
+    defn trusted (x:EVarLoc) : [n(x), true]
+    defn untrusted (x:EVarLoc) : [n(x), false]
+    match(i) :
+      (i:ENew) : trusted(x(i))
+      (i:ETuple) : trusted(x(i))
+      (i:EVoidTuple) : trusted(x(i))
+      (i:ETupleGet) : untrusted(x(i))
+      (i:EObject) : trusted(x(i))
+      (i:EArray) : trusted(x(i))
+      (i:EStruct) : trusted(x(i))
+      (i:EPtr) : trusted(x(i))
+      (i:ELoad) : untrusted(x(i))
+      (i:EInterpret) : untrusted(x(i))
+      (i:EConv) : untrusted(x(i))
+      (i:EPrim) : trusted(x(i))
+      (i:ENewObject) : trusted(x(i))
+      (i:ECall) :
+        match(x(i)) :
+          (x:EVarLoc) :
+            defn check-func (n:Int) :
+              val arity = length(ys(i))
+              if function?(vt,n) :
+                if lostanza?(vt,n) : untrusted(x)
+                else if tail?(vt,n,arity) : untrusted(x)
+                else : trusted(x)
+              else : untrusted(x)
+            match(f(i)) :
+              (f:EVar) : check-func(n(f))
+              (f:ECurry) : check-func(n(/x(f)))
+              (f:EImm) : untrusted(x)
+          (_:False) :
+            false
+      (i) : false
+
+  ;Create the input needed for type inference algorithm
+  defn make-input () :
+    new IInput :
+      defmethod blocks (this) :
+        seq(to-iblock, analyze-basic-blocks(ins(e)))
+      defmethod entry-state (this, n:Int) :
+        if key?(localfn-table, n) : EOf(/n(iotable(vt), CORE-FN-ID))
+        else : state0[n]
+
+  ;Is this variable a local, non-mutable, reftype variable?
+  defn inferred-var? (n:Int) :
+    not global?(vt, n) and
+    not mutable?(vt, n) and
+    reftype?(type(vt,n))
+  defn inferred-var? (v:EImm) :
+    match(v:EVar) : inferred-var?(n(v))
+
+  ;Convert a EBlock into input needed for type inference algorithm
+  defn to-iblock (b:BBlock) :
+    new IBlock :
+      defmethod n (this) :
+        lbl(b)
+      defmethod predecessors (this) :
+        predecessors(b)
+      defmethod instructions (this) :
+        generate<IIns> :
+          for instruction in instructions(b) do :
+            ;Indicate usages
+            match(instruction) :
+              (i:EInitClosures) :
+                for v in local-fns-free(seq(n, xs(i))) do :
+                  yield(IUse(v)) when inferred-var?(v)
+              (i:ENew) :
+                for v in local-obj-free(n(i)) do :
+                  yield(IUse(v)) when inferred-var?(v)
+              (i:ECheck) :
+                yield(IUse(n(y(i) as EVar))) when inferred-var?(y(i))
+              (i) : false
+              
+            ;Add definitions
+            match(definition?(instruction)) :
+              ([n, trusted?]:[Int, True|False]) :
+                if inferred-var?(n) :
+                  val t* = type(vt,n) when trusted? else erase(type(vt,n))
+                  yield(IDef(n, t*, instruction))
+                else :
+                  yield(IWrapped(instruction))
+              (_:False) :
+                match(instruction) :
+                  (i:EDef) :
+                    if inferred-var?(n(x(i))) :
+                      if inferred-var?(y(i) as EImm) :
+                        yield(IInherit(n(x(i)), n(y(i) as EVar), i))
+                      else :
+                        yield(IDef(n(x(i)), type(vt,y(i) as EImm), i))
+                    else :
+                      yield(IWrapped(i))
+                  (i:EMatch|EDispatch) :
+                    yield(IMatch(i, inferred-var?))
+                  (i:ECheck) :
+                    if inferred-var?(y(i)) :
+                      yield(ICast(n(y(i) as EVar), type(i), i))
+                    else :
+                      yield(IWrapped(i))
+                  (i) :
+                    yield(IWrapped(i))
+
+  ;Run inference and produce new block
+  defn run-inference (input:IInput) :
+    for i in infer(input) seq? :
+      match(i) :
+        (i:IAnnotation) :
+          One(EAnnotate(n(i), type(i)))
+        (i) : 
+          match(wrapped(i)) :
+            (w:EIns) : One(w)
+            (w:False) : None()            
+
+  ;Driver
+  run-inference(make-input())    
+
+defn annotate-function (e:EFn, parent-state:Table<Int,EType>, vt:VarTable) -> EFn :
+  val state = IntTable<EType>()
+  for (a in args(e), t in a1(e)) do :
+    state[a] = t
+  for v in vars(free(e)) do :
+    if key?(parent-state,v) :
+      state[v] = parent-state[v]
+  val body* = annotate-body(body(e), state, vt)
+  sub-body(e, body*)
+
+defn annotate-body (b:EBody, state:Table<Int,EType>, vt:VarTable) -> EBody :
+  val buffer = BodyBuffer(b)
+  val localfn-table = to-inttable(n, localfns(b))
+  val localobj-table = to-inttable(n, localobjs(b))
+  defn annotate (f:EFunction) :
+    match(f) :
+      (f:EFn) :
+        annotate-function(f, state, vt)
+      (f:EMultifn) :
+        EMultifn $ for f in funcs(f) map :
+          annotate-function(f, state, vt)
+  defn analyze-function (n:Int) :
+    val f = localfn-table[n]
+    emit(buffer, sub-func(f, annotate(func(f))))
+  defn analyze-obj (n:Int) :
+    val o = localobj-table[n]
+    val methods* = for m in methods(o) map :
+      val func* = annotate-function(func(m), state, vt)
+      sub-func(m, func*)
+    sub-methods(o, methods*)
+    
+  val ins* = annotate-body-instructions(b, state, vt)
+  for i in ins* do :
+    emit(buffer, i)
+    match(i) :
+      (i:EAnnotate) :
+        state[n(i)] = type(i)
+      (i:EInitClosures) :
+        for x in xs(i) do :
+          analyze-function(n(x))
+      (i:ENew) :
+        analyze-obj(n(i))
+      (i) : false
+  to-body(buffer, true, false, false)  
+
+defmulti wrapped (e:IIns) -> EIns|False
+defmethod wrapped (e:IIns) : false
+
+defn ICast (n:Int, type:EType, wrapped:EIns|False) :
+  new ICast :
+    defmethod n (this) : n
+    defmethod type (this) : type
+    defmethod wrapped (this) : wrapped
+
+defn IBranch (b:EBranch, ys:Tuple<EImm>, inferred-var?:EImm -> True|False) :
+  val casts = to-tuple $ for (y in ys, t in types(b)) seq? :
+    if inferred-var?(y) : One(ICast(n(y as EVar), t, false))
+    else : None()    
+  new infer-Branch :
+    defmethod n (this) : n(b)
+    defmethod casts (this) : casts
+
+defn IMatch (i:EMatch|EDispatch, inferred-var?:EImm -> True|False) :
+  val bs* = map(IBranch{_, ys(i), inferred-var?}, branches(i))
+  new IMatch :
+    defmethod branches (this) : bs*
+    defmethod wrapped (this) : i
+
+defn IUse (n:Int) :
+  new IUse :
+    defmethod n (this) : n
+
+defn IDef (n:Int, t:EType, wrapped:EIns|False) :
+  new IDef :
+    defmethod n (this) : n
+    defmethod type (this) : t
+    defmethod wrapped (this) : wrapped
+
+defn IInherit (n:Int, v:Int, wrapped:EIns|False) :
+  new IInherit :
+    defmethod n (this) : n
+    defmethod inherit (this) : v
+    defmethod wrapped (this) : wrapped    
+
+defn IWrapped (i:EIns) :
+  new IIns :
+    defmethod wrapped (this) : i
+
+defstruct EAnnotate <: EIns :
+  n: Int
+  type: EType
+defmethod print (o:OutputStream, e:EAnnotate) :
+  print(o, "annotate V%_ : %_" % [n(e), type(e)])
+
+;Erase type if reference type
+;LoStanza types are trusted.
+defn erase (t:EType) :
+  ETop() when reftype?(t) else t
+
+defn add-type-annotations (epackage:EPackage, gvt:VarTable) -> EPackage :
+  defn infer (f:ETExp, vt:VarTable) :
+    val result = let loop (f:ELBigItem = analyze-freevars(f,vt)) :
+      match(f) :
+        (f:EFn) : annotate-function(f, IntTable<EType>(), vt)
+        (f:EBody) : annotate-body(f, IntTable<EType>(), vt)
+        (f) : map(loop, f)
+    result as ETExp
+  map-with-var-table(infer, gvt, epackage)
 
 ;============================================================
 ;==================== Check Elision =========================
