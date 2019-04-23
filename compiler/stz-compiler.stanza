@@ -55,7 +55,7 @@ public defn compile (filenames:List<String>, output:False|String, pkg-dir:False|
     ;and rename them.
     val ipackages = rename(to-ipackages(expanded, stanza-files(files), input-package-table))
 
-    ;Read in .pkg files and packages.
+    ;Read in .pkg files and packages.    
     val pkgloader = PkgLoader(map(name, ipackages), pkg-files(files), packages(files))
     for entry in file-mapping(pkgloader) do :
       register(input-package-table, key(entry), [value(entry)])
@@ -76,21 +76,26 @@ public defn compile (filenames:List<String>, output:False|String, pkg-dir:False|
         val pkg = FastPkg(packageio(p), exps(p))
         save-package(pkg-dir as String, pkg)
 
-    ;Add loaded EL to src EL if in optimized mode.
-    val el-ir =
-      if flag-defined?(`OPTIMIZE) :
-        val pkgs = pkgs(pkgloader) as Seqable<FastPkg>
-        val epkgs = for pkg in pkgs seq : EPackage(packageio(pkg), exps(pkg))
-        val new-epkgs = to-tuple(cat(src-el-ir, epkgs))
-        init-order(new-epkgs, all-input-files(files), input-package-table)
-      else :
-        src-el-ir
+    ;Determine whether we should continue.
+    ;Continue if we want to emit the assembly code, or emit unoptimized pkgs.
+    val save-unoptimized-pkgs? = pkg-dir is String and
+                                 not flag-defined?(`OPTIMIZE)
+    val continue-to-el? = output is String or save-unoptimized-pkgs?
+    if continue-to-el? :
+      ;Add loaded EL to src EL if in optimized mode.
+      val el-ir =
+        if flag-defined?(`OPTIMIZE) :
+          val pkgs = pkgs(pkgloader) as Seqable<FastPkg>
+          val epkgs = for pkg in pkgs seq : EPackage(packageio(pkg), exps(pkg))
+          val new-epkgs = to-tuple(cat(src-el-ir, epkgs))
+          init-order(new-epkgs, all-input-files(files), input-package-table)
+        else :
+          src-el-ir
 
-    ;Then we compile the EL form into VM form.
-    val vm-ir = to-vm-ir(el-ir)
+      ;Then we compile the EL form into VM form.
+      val vm-ir = to-vm-ir(el-ir)
 
-    ;Finally, we assemble the VM form and emit the assembly code.
-    match(output:String) :
+      ;Finally, we assemble the VM form and emit the assembly code.
       val all-pkgs =
         if flag-defined?(`OPTIMIZE) :
           ;Packages are already collapsed from optimizer
@@ -98,7 +103,7 @@ public defn compile (filenames:List<String>, output:False|String, pkg-dir:False|
         else :
           val pkgs = to-tuple(cat(vm-ir, pkgs(pkgloader) as Seqable<StdPkg>))
           init-order(pkgs, all-input-files(files), input-package-table)
-      assemble(all-pkgs, bindings, output)
+      assemble(all-pkgs, bindings, output)        
 
   defn read+expand (filename:String) -> List :
     val forms = read-file(filename)
@@ -180,7 +185,7 @@ public defn compile (filenames:List<String>, output:False|String, pkg-dir:False|
 
   defn assemble (pkgs:Tuple<VMPackage|StdPkg>,
                  bindings:Collection<Bindings>,
-                 filename:String) :
+                 filename:String|False) :
     ;Normalize all of the vmpackages to prepare for register
     ;allocation.
     val npkgs = for p in pkgs map :
@@ -195,53 +200,81 @@ public defn compile (filenames:List<String>, output:False|String, pkg-dir:False|
     ;Define the assembly stubs for holding the required assembly labels and
     ;code snippets.
     val stubs = AsmStubs(backend)
-    
-    ;Define the stitcher for lowering the abstract assembly instructions.
-    val stitcher = Stitcher(map(collapse,npkgs), bindings, stubs)
+   
 
-    ;Define the file emitter for the output target.
-    val file-emitter = new CodeEmitter :
-      defmethod emit (this, i:Ins) :
-        emit(i, backend)
+    ;If we wish to assemble an assembly file.
+    match(filename:String) :
+      ;Define the file emitter for the output target.
+      val file-emitter = new CodeEmitter :
+        defmethod emit (this, i:Ins) :
+          emit(i, backend)
 
-    ;Write out to file
-    with-output-file(FileOutputStream(filename), fn () :
-      ;Emit code for all packages
+      ;Define the stitcher for lowering the abstract assembly instructions.
+      val stitcher = Stitcher(map(collapse,npkgs), bindings, stubs)
+
+      ;Write out to file
+      with-output-file(FileOutputStream(filename), fn () :
+        ;Emit code for all packages
+        for (pkg in pkgs, npkg in npkgs) do :
+          ;Function for allocating registers for all functions in package.
+          val stitching-emitter = emitter(stitcher, package(packageio(pkg)), file-emitter)
+          defn allocate-registers (emitter:CodeEmitter) :
+            match(npkg) :
+              (npkg:NormVMPackage) :
+                for f in funcs(vmpackage(npkg)) do :
+                  emit(emitter, LinkLabel(id(f)))
+                  /allocate-registers(func(f), emitter, backend, stubs, false)
+              (npkg:StdPkg) :
+                for ins in asm(npkg) do :
+                  emit(emitter, ins)
+
+          ;Allocate registers while also saving instructions to pkg file
+          defn allocate-and-save-pkg (dir:String) :
+            val pkg-maker = PkgMaker(pkg as VMPackage, datas(npkg as NormVMPackage))
+            val emitter = emitter(stitching-emitter, pkg-maker)
+            allocate-registers(emitter)
+            save-package(dir, /pkg(pkg-maker))
+
+          ;Unoptimized packages should be saved if we are compiling in
+          ;unoptimized mode, and a pkg output directory has been specified,
+          ;and pkg is a VMPackage.
+          val save-unoptimized-pkg? = pkg is VMPackage and
+                                      pkg-dir is String and
+                                      not flag-defined?(`OPTIMIZE)
+          if save-unoptimized-pkg? :
+            allocate-and-save-pkg(pkg-dir as String)
+          else :
+            allocate-registers(stitching-emitter)
+            
+        ;Emit stitched tables
+        emit-tables(stitcher, file-emitter)
+        emit-stubs(stitcher, file-emitter)
+        compile-runtime-stubs(file-emitter, stubs))
+
+    ;Otherwise
+    else :
       for (pkg in pkgs, npkg in npkgs) do :
+        ;Empty emitter
+        val empty-emitter = new CodeEmitter :
+          defmethod emit (this, i:Ins) : false
+          
         ;Function for allocating registers for all functions in package.
-        val stitching-emitter = emitter(stitcher, package(packageio(pkg)), file-emitter)
         defn allocate-registers (emitter:CodeEmitter) :
-          match(npkg) :
-            (npkg:NormVMPackage) :
-              for f in funcs(vmpackage(npkg)) do :
-                emit(emitter, LinkLabel(id(f)))
-                /allocate-registers(func(f), emitter, backend, stubs, false)
-            (npkg:StdPkg) :
-              for ins in asm(npkg) do :
-                emit(emitter, ins)
+          val npkg = npkg as NormVMPackage
+          for f in funcs(vmpackage(npkg)) do :
+            emit(emitter, LinkLabel(id(f)))
+            /allocate-registers(func(f), emitter, backend, stubs, false)
 
         ;Allocate registers while also saving instructions to pkg file
         defn allocate-and-save-pkg (dir:String) :
           val pkg-maker = PkgMaker(pkg as VMPackage, datas(npkg as NormVMPackage))
-          val emitter = emitter(stitching-emitter, pkg-maker)
+          val emitter = emitter(empty-emitter, pkg-maker)
           allocate-registers(emitter)
           save-package(dir, /pkg(pkg-maker))
 
-        ;Unoptimized packages should be saved if we are compiling in
-        ;unoptimized mode, and a pkg output directory has been specified,
-        ;and pkg is a VMPackage.
-        val save-unoptimized-pkg? = pkg is VMPackage and
-                                    pkg-dir is String and
-                                    not flag-defined?(`OPTIMIZE)
-        if save-unoptimized-pkg? :
+        ;Allocate registers and save pkg
+        if npkg is NormVMPackage :
           allocate-and-save-pkg(pkg-dir as String)
-        else :
-          allocate-registers(stitching-emitter)
-          
-      ;Emit stitched tables
-      emit-tables(stitcher, file-emitter)
-      emit-stubs(stitcher, file-emitter)
-      compile-runtime-stubs(file-emitter, stubs))
 
   driver()
 
