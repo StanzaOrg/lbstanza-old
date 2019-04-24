@@ -278,10 +278,9 @@
   if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);
 
 #define DECODE_D() \
-  int x = (W1 >> 8) & 0x3FF; \
-  int y = (W1 >> 22) & 0x3FF; \
+  int x = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  if(iprint) printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);
+  if(iprint) printf("          [%d | _ | %d | %ld]\n", opcode, x, value);
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -552,7 +551,7 @@ void vmloop (VMState* vms){
     }
     case SET_OPCODE_WIDE : {
       DECODE_D();
-      SET_LOCAL(y, value);      
+      SET_LOCAL(x, value);      
       continue;
     }
     case SET_REG_OPCODE_LOCAL : {
@@ -604,7 +603,7 @@ void vmloop (VMState* vms){
     }
     case SET_REG_OPCODE_WIDE : {
       DECODE_D();
-      SET_REG(y, value);      
+      SET_REG(x, value);      
       continue;
     }
     case GET_REG_OPCODE : {
