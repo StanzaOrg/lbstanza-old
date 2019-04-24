@@ -260,28 +260,28 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
+  if(iprint) printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
+  if(iprint) printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  /*if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);*/
+  if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  /*if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
+  if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);
 
 #define DECODE_D() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  /*if(iprint) printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);*/
+  if(iprint) printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -290,7 +290,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
+  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -300,7 +300,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
+  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -442,6 +442,7 @@ void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
 int dispatch_branch (VMState* vms, int format);
 char* retrieve_class_name (VMState* vms, long id);
+void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -483,6 +484,9 @@ void vmloop (VMState* vms){
   //for(int i=0; i<255; i++) timings[i] = 0;
   //int last_opcode = -1;
   //uint64_t last_time;
+
+  //Print
+  int iprint = 1;
 
   //Repl Loop
   while(1){
@@ -662,25 +666,23 @@ void vmloop (VMState* vms){
     }
     case CALLC_OPCODE_LOCAL : {
       DECODE_C();
-      uint64_t faddr = LOCAL(value);
-      int format = x;
-      int num_locals = y;
+      void* faddr = LOCAL(value);
+      int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
-      call_c_launcher(vms, format, faddr);
+      c_trampoline((void*)faddr, registers, registers);      
       RESTORE_STATE();
       pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
       continue;
     }
     case CALLC_OPCODE_EXTERN : {
-      DECODE_C();
-      uint64_t faddr = extern_table[value];
-      int format = x;
-      int num_locals = y;
+      DECODE_D();
+      void* faddr = value;
+      int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
-      call_c_launcher(vms, format, faddr);
+      c_trampoline((void*)faddr, registers, registers);      
       RESTORE_STATE();
       pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
