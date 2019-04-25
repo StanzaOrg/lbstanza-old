@@ -10,7 +10,7 @@ defpackage stz/dl :
 
 # Fundamental State #
 
-  package-table:HashTable<Symbol,PackageIO>
+  packages:Vector<PackageIO>
 
 # Retrieving a PackageIO #
 
@@ -21,22 +21,28 @@ typechecking.
 
 # Retrieving all PackageIOs #
 
-  packageios (e:DEnv) -> Seqable<PackageIO>
+  packageios (e:DEnv) -> Collection<PackageIO>
 
 Useful function to be able to calculate the package dependency graph.
+The packages are also ordered according to when they are first added
+to the environment.
 
 # Loading new packages #
 
-  load (e:DEnv, ps:Seqable<PackageIO>) -> LoadResult
+  load (e:DEnv, ps:Collection<PackageIO>, live-recs:Tuple<Rec>) -> LoadResult
 
 Loads the given packages into the environment. The operation succeeds
 and returns LoadSuccess only if the new packages are consistent with
 the definitions of the existing environment. Otherwise, the operation
 returns LoadErrors.
 
+The live-recs argument holds all the records that the currently live
+objects depend upon. This prevents the user from changing the type
+signature of a function that is still in active use.
+
 # Updating existing packages #
 
-  update (e:DEnv, ps:Seqable<PackageIO>) -> LoadResult
+  update (e:DEnv, ps:Collection<PackageIO>, live-recs:Tuple<Rec>) -> LoadResult
   
 Updates the given packages in the environment. This is meant to be
 used to update code definitions in the environment without
@@ -54,11 +60,10 @@ cannot change the type of any global variable.
 
 public :
   deftype DEnv
-  defmulti packageios (e:DEnv) -> Seqable<PackageIO>
+  defmulti packageios (e:DEnv) -> Collection<PackageIO>
   defmulti packageio (e:DEnv, name:Symbol) -> PackageIO|False
-  defmulti check-exports (e:DEnv, ps:Tuple<PackageIO>, live-recs:Tuple<Rec>) -> LoadResult
-  defmulti check-globals (e:DEnv, packages:Tuple<PackageIO>) -> LoadResult
-  defmulti load (e:DEnv, ps:Seqable<PackageIO>) -> False
+  defmulti load (e:DEnv, ps:Seqable<PackageIO>, live-recs:Tuple<Rec>) -> LoadResult
+  defmulti update (e:DEnv, ps:Seqable<PackageIO>, live-recs:Tuple<Rec>) -> LoadResult
 
   deftype LoadResult
   defstruct LoadErrors <: LoadResult : (errors: Tuple<LoadError>)
@@ -90,35 +95,49 @@ public :
 
 public defn DEnv () :
   ;Initialize package table and live set
-  val packages = HashTable<Symbol,PackageIO>()
-  val package-ordering = Vector<Symbol>()
+  val packages = Vector<PackageIO>()
+  val package-indices = HashTable<Symbol,Int>()
 
   ;Packages
   defn add-package (p:PackageIO) :
-    if not key?(packages, package(p)) :
-      add(package-ordering, package(p))
-    packages[package(p)] = p
+    match(get?(package-indices,package(p))) :
+      (i:Int) :
+        packages[i] = p
+      (_:False) :
+        val i = length(packages)
+        add(packages, p)
+        package-indices[package(p)] = i
 
+  ;============================
+  ;==== Ensure Consistency ====
+  ;============================
   ;Sanity consistency check
   defn ensure-consistency () :
     #if-not-defined(OPTIMIZE) :
       ;Ensure that all imported records match the exported records exactly.
       val rec-table = to-hashtable<RecId,Rec> $
-        seq-cat(exported-entries, values(packages))      
-      for import in seq-cat(imports,values(packages)) do :
+        seq-cat(exported-entries, packages)
+      for import in seq-cat(imports,packages) do :
         if not transient?(import) :
           val r = rec(import)
           match(get?(rec-table, id(r))) :
             (r2:Rec) : fatal("Mismatched dependency: %_ != %_" % [r, r2]) when not match?(r, r2)
             (r2:False) : fatal("Missing dependency: %_" % [id(r)])
-    #else :
-      false
+    false
 
-  ;Return true if the given package p may possible by affected the
-  ;given reload set.
-  defn affected? (p:PackageIO, reloaded:Set<Symbol>) :
-    (not reloaded[package(p)]) and
-    any?({reloaded[_]}, imported-packages(p))
+  ;<doc>===========================
+  ;==== Error Checking Utility ====
+  ;================================
+  For anything that may create errors, call it like this:
+
+    within check-for-errors() :
+      my-body()
+      if there-is-error? :
+        error!()
+
+  And the block above will return a LoadResult.
+  ;================================
+  ;===========================<doc>
 
   ;Accumulate any detected errors in buffer
   val error-accum = Vector<LoadError>()
@@ -132,9 +151,22 @@ public defn DEnv () :
       clear(error-accum)
       e
 
+  ;<doc>=============================
+  ;=== Check For Changed Globals ====
+  ;==================================
+  When updating packages, we preserve the state of the existing global
+  variables, and thus we cannot change their type signature. This pass
+  ensures that we do not change the type signatures of any global in
+  the given packages.
+  
+  Since this is used during updating, it is assumed that these
+  packages all have been loaded before.
+  ;==================================
+  ;=============================<doc>
+
   ;Check whether globals have been redefined.
   ;During updating, globals are not allowed to change their types.
-  defn check-globals (packageios:Tuple<PackageIO>) :
+  defn check-for-changed-globals (packageios:Tuple<PackageIO>) :
     ;Retrieve all exported global records in packageio
     defn global-recs (io:PackageIO) :
       for e in exports(io) seq? :
@@ -143,46 +175,44 @@ public defn DEnv () :
           (id) : None()
 
     ;Check against previous definitions
-    val errors = Vector<LoadError>()
-    for io1 in packageios do :
-      ;If this package previously existed
-      val io0 = get?(packages, package(io1))
-      match(io0:PackageIO) :
-        ;Create a table to quickly lookup
-        ;the new definition by id.
-        val new-rec-table = to-hashtable<RecId,Rec> $
-          for r in global-recs(io1) seq :
-            id(r) => r
+    for new-io in packageios do :
+      ;Get old IO
+      val old-io = packages[package(new-io)]
+      
+      ;Create a table to quickly lookup the new definition by id.
+      val new-rec-table = to-hashtable(id, global-recs(new-io))
 
-        ;Compare the old globals to the new globals
-        val src = LoadedPackage(package(io1))
-        for r0 in global-recs(io0) do :
-          match(get?(new-rec-table, id(r0))) :
-            ;Case: The global is no longer defined. That is okay.
-            (_:False) : false
-            ;Case: The global is defined. Ensure that it matches.
-            (r1:Rec) :
-              if not match?(r1, r0) :
-                add(errors, ChangedGlobal(src, r0, r1))
+      ;Compare the old globals to the new globals
+      val src = LoadedPackage(package(io1))
+      for old-r in global-recs(old-io) do :
+        match(get?(new-rec-table, id(old-r))) :
+          ;Case: The global is no longer defined. That is okay.
+          (_:False) : false
+          ;Case: The global is defined. Ensure that it matches.
+          (new-r:Rec) :
+            if not match?(new-r, old-r) :
+              error! $ ChangedGlobal(src, old-r, new-r)
 
-    ;Check against previous definitions
-    if empty?(errors) : LoadSuccess()
-    else : LoadErrors(to-tuple(errors))          
+  ;<doc>=========================================
+  ;=== Check New Exports Against Old Imports ====
+  ;==============================================
+  Check loading packages into the environment.
+  
+  We assume that the packages to load have successfully passed the typechecker.
+  This indicates two things:
+  1. The packages are internally consistent. All imports/exports
+     from/to packages to be reloaded are guaranteed to be consistent by
+     the typechecker.
+  2. The package imports are consistent. The typechecker imports the existing
+     definitions from the environment and ensures that the code is consistent
+     with these definitions.
+  Therefore there is only one thing left to check. Whether the new
+  exports from the reloaded packages are consistent with the imports
+  from the existing context.
+  ;==============================================
+  ;=========================================<doc>
 
-
-  ;Check loading packages into environment. Return an error report
-  ;indicating what will fail, or success otherwise.
-  ;We assume that the packages to load have successfully passed the typechecker.
-  ;This indicates two things:
-  ;1. The packages are internally consistent. All imports/exports
-  ;   from/to packages to be reloaded are guaranteed to be consistent by
-  ;   the typechecker.
-  ;2. The package imports are consistent. The typechecker imports the existing
-  ;   definitions from the environment and ensures that the code is consistent
-  ;   with these definitions.
-  ;Therefore there is only one thing to check. Whether the new exports
-  ;from the reloaded packages are consistent with the context.
-  defn check-exports (ps:Tuple<PackageIO>, live-recs:Tuple<Rec>) :
+  defn check-new-exports-against-old-imports (ps:Tuple<PackageIO>, live-recs:Tuple<Rec>) :
     ;These are the packages to be reloaded
     val reloaded-packages = to-hashset<Symbol>(seq(package, ps))
 
@@ -190,56 +220,64 @@ public defn DEnv () :
     val export-table = to-hashtable<RecId,Rec> $
       seq-cat(exported-entries, ps)
 
-    ;Check whether the imported record, imported, from 'src-package'
+    ;Check whether the imported record, imported, from 'src'
     ;is satisfied by the reloaded-packages.
-    val errors = Vector<LoadError>()
     defn check-dependency (src:DependencySource, imported:Rec) :
       val rid = id(imported)
       if reloaded-packages[package(rid)] :
         match(get?(export-table, rid)) :
           (exported:Rec) :
             if not match?(imported, exported) :
-              add(errors, MismatchedDependency(src, imported, exported))
+              error! $ MismatchedDependency(src, imported, exported)
           (_:False) :
-            add(errors, MissingDependency(src, imported))
+            error! $ MissingDependency(src, imported)
 
-    ;Check all the dependencies from existing packages
-    for p in values(packages) do :
+    ;Return true if the given package p may possibly be affected by the
+    ;given reload set, ie. if it imports a package that is to be reloaded,
+    ;but it is not itself a package to be reloaded.
+    defn affected? (p:PackageIO) :
+      if not reloaded-packages[package(p)] :
+        any?({reloaded-packages[_]}, imported-packages(p))
+
+    ;Check all the (non-transient) dependencies from affected packages
+    for p in filter(affected?, packages) do :
       val src = LoadedPackage(package(p))
-      if affected?(p, reloaded-packages) :
-        for import in imports(p) do :
-          check-dependency(src, rec(import)) when not transient?(import)
+      for import in imports(p) do :
+        check-dependency(src, rec(import)) when not transient?(import)
+        
     ;Check all the dependencies from the live objects
     do(check-dependency{LiveObject(), _}, live-recs)
 
-    ;Return result
-    if empty?(errors) : LoadSuccess()
-    else : LoadErrors(to-tuple(errors))      
-
-  ;Return new environment
+  ;================================
+  ;==== Return new Environment ====
+  ;================================
   new DEnv :
     defmethod packageios (this) :
-      for p in package-ordering seq : packages[p]
+      packages
     defmethod packageio (this, name:Symbol) :
-      get?(packages, name)      
-    defmethod check-exports (this, packages:Tuple<PackageIO>, live-recs:Tuple<Rec>) :
-      check-exports(packages, live-recs)
-    defmethod check-globals (this, packages:Tuple<PackageIO>) :
-      check-globals(packages)
-    defmethod load (this, pkgs:Seqable<PackageIO>) :
-      do(add-package, pkgs)
-      ensure-consistency()
-
-public defn package-exports (denv:DEnv, name:Symbol) :
-  match(packageio(denv, name)) :
-    (io:PackageIO) : PackageExports(package(io), imported-packages(io), exports(io))
-    (_:False) : false
+      val i = get?(package-indices, name)
+      match(i:Int) : packages[i]
+    defmethod load (this, pkgs:Collection<PackageIO>, live-recs:Tuple<Rec>) :
+      val load-result = within check-for-errors() :
+        check-new-exports-against-old-imports(pkgs, live-recs)
+      match(load-result:LoadSuccess) :
+        do(add-package, pkgs)
+        ensure-consistency()
+      load-result
+    defmethod update (this, pkgs:Collection<PackageIO>, live-recs:Tuple<Rec>) :
+      val load-result = within check-for-errors() :
+        check-for-changed-globals(pkgs)
+        check-new-exports-against-old-imports(pkgs, live-recs)
+      match(load-result:LoadSuccess) :
+        do(add-package, pkgs)
+        ensure-consistency()
+      load-result
 
 ;============================================================
 ;======================= Utilities ==========================
 ;============================================================
 
-;Utilities
+;Retrieve all exported entries from packageio
 defn exported-entries (p:PackageIO) :
   for e in exports(p) seq :
     val r = rec(e)
