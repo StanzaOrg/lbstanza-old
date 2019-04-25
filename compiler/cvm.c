@@ -260,28 +260,27 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  if(iprint) printf("          [%d | %d]\n", opcode, value);
+  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  if(iprint) printf("          [%d | %d]\n", opcode, value);
+  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);
+  /*if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);*/
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);
+  /*if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
 
 #define DECODE_D() \
-  int x = (W1 >> 8) & 0x3FF; \
-  int y = (W1 >> 22) & 0x3FF; \
+  int x = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  if(iprint) printf("          [%d | %d | %d | %ld]\n", opcode, x, y, value);
+  /*if(iprint) printf("          [%d | _ | %d | %ld]\n", opcode, x, value);*/
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -290,7 +289,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
+  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -300,7 +299,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
+  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -485,9 +484,6 @@ void vmloop (VMState* vms){
   //int last_opcode = -1;
   //uint64_t last_time;
 
-  //Print
-  int iprint = 1;
-
   //Repl Loop
   while(1){
     //Save pre-decode PC because jump offsets are relative to
@@ -552,7 +548,7 @@ void vmloop (VMState* vms){
     }
     case SET_OPCODE_WIDE : {
       DECODE_D();
-      SET_LOCAL(y, value);      
+      SET_LOCAL(x, value);      
       continue;
     }
     case SET_REG_OPCODE_LOCAL : {
@@ -604,7 +600,7 @@ void vmloop (VMState* vms){
     }
     case SET_REG_OPCODE_WIDE : {
       DECODE_D();
-      SET_REG(y, value);      
+      SET_REG(x, value);      
       continue;
     }
     case GET_REG_OPCODE : {
