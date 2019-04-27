@@ -270,13 +270,15 @@ defn REPL () :
       ensure-no-duplicate-packages!(input-packages)
             
       ;Compile all to EL packages
-      val epackages = compile-to-el(ipackages, pkgloader)
+      val epackages = compile-to-el(ipackages, pkgloader, false)
 
       ;Ensure that packageio definitions for packages are consistent.
       load-into-denv(epackages)
 
-      ;Register file associations with file environment
+      ;Register file associations with file environment.
+      ;Register import lists with the repl environment.
       do(register{file-env, _}, file-assocs)
+      do(register{repl-env, import-list(_)}, ipackages)
 
       ;Compile to vmpackages
       val vmpackages = compile-vmpackages(epackages)
@@ -341,12 +343,27 @@ defn REPL () :
       clear-globals(vm)
       rerun-all-packages()
 
-;  ;Load from repl
-;  defn load-repl (form) :
-;    val typed = type! $ resolve-repl! $ rename! $ to-repl-ipackage! $ macroexpand! $ form
-;    register(repl-env, packageio(packages(typed)[0]))
-;    load-vm!(typed)
-;    run-vm!([name(packages(typed)[0])])
+  ;Load from repl
+  defn load-repl (form) :
+    within intercept-errors() :
+      val ipackage = to-ipackage(form)
+      val pkgloader = PkgLoader()
+      val epackages = compile-to-el([ipackage], pkgloader, true)
+
+      ;Ensure that packageio definitions for packages are consistent.
+      load-into-denv(epackages)
+
+      ;Register successful load
+      register-repl(repl-env, name(ipackage))
+
+      ;Compile to vmpackages
+      val vmpackages = compile-vmpackages(epackages)
+
+      ;Load packages into virtual machine
+      load(vm, vmpackages, false)
+
+      ;Run packages in initialization order
+      run-in-init-order(vmpackages, [name(ipackage)])
 
   ;============================================================
   ;==================== Stages of Loading =====================
@@ -359,7 +376,7 @@ defn REPL () :
       val ipkgs = read-ipackages(filename)
       add-all(ipackages, ipkgs)
       add(file-assocs, FileAssoc(filename, time-modified(filename), map(name,ipkgs)))    
-    val epackages = compile-to-el(ipackages, pkgloader)
+    val epackages = compile-to-el(ipackages, pkgloader, false)
     val result = try-load-into-denv(epackages, update?)
     match(result:LoadErrors) :
       ;Some errors can be recovered from by including their source
@@ -396,18 +413,47 @@ defn REPL () :
                    catch (e:Exception) : throw(ReplErrors([e]))
     to-ipackages(expanded, core-imports())
 
+  defn to-ipackage (form) -> IPackage :
+    val expanded = try : cons(`$begin, parse-syntax[core / #exps!](form))
+                   catch (e:NoMatchException) : throw(ReplErrors(causes(e)))
+                   catch (e:Exception) : throw(ReplErrors([e]))
+    repl-package(repl-env, to-il(expanded))
+
   defn ensure-no-duplicate-packages! (packages:Seqable<Symbol>) :
     val pset = HashSet<Symbol>()
     for p in packages do :
       if not add(pset,p) :
         throw(ReplErrors([DuplicatePackage(p)]))
 
-  defn compile-to-el (ipackages:Collection<IPackage>, pkgloader:PkgLoader) -> Tuple<EPackage|Pkg> :
+  defn compile-to-el (ipackages:Collection<IPackage>, pkgloader:PkgLoader, repl?:True|False) -> Tuple<EPackage|Pkg> :
     ;First rename the binders
     val renamed = match(rename-il(to-tuple(ipackages))) :
       (renamed:Tuple<IPackage>) : renamed
       (e:RenameErrors) : throw(ReplErrors(errors(e)))
+
+    ;Create pkg environment
+    val env = make-pkg-env(pkgloader)
+
+    ;Resolve the binders
+    val priority = package-priority(repl-env, name(renamed[0])) when repl?
+    val resolved = match(resolve-il(renamed, env, priority)) :
+      (e:ResolveErrors) : throw(ReplErrors(errors(e)))
+      (e:Tuple<IPackage>) : e
+
+    ;Retrieve all dependencies and pkgs
+    val already-loaded = cat(seq(name,resolved), seq(package,packageios(denv)))
+    val all-pkgs = all-pkgs-and-dependencies(pkgloader, already-loaded)
+
+    ;Typecheck the program
+    val typed = match(type-program(resolved, env)) :
+      (e:TProg) : e
+      (e:TypeErrors) : throw(ReplErrors(messages(e)))
+
+    ;Compile to EL
+    val epackages = to-el(typed, false)
+    to-tuple(cat(epackages, all-pkgs))    
       
+  defn make-pkg-env (pkgloader:PkgLoader) :
     ;Create the table holding the package exports
     ;The exports have their identifiers renamed so that they do not conflict
     ;with fresh-id().
@@ -433,29 +479,11 @@ defn REPL () :
             false
 
     ;Create the resolution and typing environment
-    val env = new stz/resolver/Env & stz/type/Env :
+    new stz/resolver/Env & stz/type/Env :
       defmethod stz/resolver/exports (this, package:Symbol) :
         package-exports(package)
       defmethod stz/type/exports (this, package:Symbol) :
-        package-exports(package) as PackageExports    
-
-    ;Resolve the binders
-    val resolved = match(resolve-il(renamed, env, false)) :
-      (e:ResolveErrors) : throw(ReplErrors(errors(e)))
-      (e:Tuple<IPackage>) : e
-
-    ;Retrieve all dependencies and pkgs
-    val already-loaded = cat(seq(name,resolved), seq(package,packageios(denv)))
-    val all-pkgs = all-pkgs-and-dependencies(pkgloader, already-loaded)
-
-    ;Typecheck the program
-    val typed = match(type-program(resolved, env)) :
-      (e:TProg) : e
-      (e:TypeErrors) : throw(ReplErrors(messages(e)))
-
-    ;Compile to EL
-    val epackages = to-el(typed, false)
-    to-tuple(cat(epackages, all-pkgs))
+        package-exports(package) as PackageExports        
 
   defn try-load-into-denv (pkgs:Collection<EPackage|Pkg>, update?:True|False) :
     val exclude-roots-from = [] when update? else seq(name,pkgs)
@@ -499,12 +527,12 @@ defn REPL () :
       load-files(inputs)
     defmethod update-files (this) :
       update-files()
-;    defmethod load-repl (this, form) :
-;      load-repl(form)
-;    defmethod clear (this) :
-;      clear-repl()
     defmethod reload (this) :
       reload-files()
+    defmethod load-repl (this, form) :
+      load-repl(form)
+;    defmethod clear (this) :
+;      clear-repl()
 ;    defmethod import (this, import:IImport) :
 ;      if not loaded-package?(package(import)) :
 ;        throw $ ReplErrors $ [PackageNotLoaded(package(import))]
@@ -567,53 +595,120 @@ defn FileEnv () :
 defn core-imports () :
   [IImport(`core), IImport(`collections)]
 
-;============================================================
+;<doc>=======================================================
 ;=================== REPL User Environment ==================
 ;============================================================
 
+# Fundamental State #
+
+  repl-packages: Vector<PackageIO>
+  imports: HashTable<Symbol,IImport>
+  inside-package: Symbol|False
+  import-list-table: HashTable<Symbol,ImportList>
+
+All of the REPL packages, in the order that they were loaded, are
+stored in repl-packages.
+
+The currently active import statements are stored in imports. 
+
+The package that the REPL is currently "inside" is stored in
+inside-package. If the REPL is not currently inside any package, then
+false is stored.
+
+# Creating an IPackage from an Expression entered at the REPL #
+
+Input:
+  env: ReplEnv
+  iexp: IExp
+Output:
+  ipackage: IPackage
+
+The expanded and checked expression entered at the REPL is given in
+iexp. This function creates an IPackage for representing the
+expression, with the appropriate imports for the REPL, registers it
+with the REPL environment, and returns the IPackage.
+
+If the expression contains any expression that is not appropriate for
+the REPL, e.g. defmulti, defmethod, etc. Then a REPLError is thrown.
+
+# Package Priority #
+
+Input:
+  env: ReplEnv
+  package-name: Symbol
+Output:
+  priority: Symbol -> Int
+
+Returns a mapping from package names to their priority level. Higher
+numbers indicate higher priority.
+
+Definitions from the current repl expression have the highest priority
+(INT-MAX), followed by definitions from earlier repl expressions. More
+recent repl definitions have higher priority than older repl
+definitions. Finally, all other packages have equal prioriity. 
+
+# Private Use: Registering the imports of a source package #
+
+  register (env:ReplEnv, importlist:ImportList) -> False
+
+For every source package that is successfully loaded, its importlist
+must be registered with the repl environment. This is used to
+construct the import list for when a user goes inside a package. We
+wish for the repl environment to inherit the import environment of
+that package.
+
+# Private Use: Registering the imports of a source package #
+
+  register-repl (env:ReplEnv, package:Symbol) -> False
+
+Used to register that a REPL package has been successfully loaded
+without errors. This is necessary as future REPL expressions need to
+import the definitions from the previously-loaded REPL expressions.
+
+;============================================================
+;=======================================================<doc>
+
 deftype REPLEnv
 
-;For registering successfully loaded packages
-defmulti register (e:REPLEnv, packageio:PackageIO) -> False
-
-;For import/unimport commands
-defmulti import (e:REPLEnv, import:IImport) -> False
-defmulti unimport (e:REPLEnv, package:Symbol) -> True|False
-
-;For inside command
-defmulti inside (e:REPLEnv, package:Symbol|False) -> False
-defmulti current-inside (e:REPLEnv) -> Symbol|False
-
-;For resolution
-defmulti package-priority (e:REPLEnv, self:Symbol, package:Symbol) -> Int
-
 ;For constructing the IPackage
-defmulti ReplPackage (e:REPLEnv, exp:IExp) -> IPackage
+defmulti repl-package (e:REPLEnv, exp:IExp) -> IPackage
+defmulti package-priority (e:REPLEnv, package:Symbol) -> Symbol -> Int
+defmulti register (env:REPLEnv, importlist:ImportList) -> False
+defmulti register-repl (env:REPLEnv, package:Symbol) -> False
 
-;List names of all repl packages
-defmulti repl-packages (e:REPLEnv) -> Seqable<Symbol>
-defmulti repl-package? (e:REPLEnv, name:Symbol) -> True|False
-
-;Clear repl environment
-defmulti clear (e:REPLEnv) -> False
+;;For import/unimport commands
+;defmulti import (e:REPLEnv, import:IImport) -> False
+;defmulti unimport (e:REPLEnv, package:Symbol) -> True|False
+;
+;;For inside command
+;defmulti inside (e:REPLEnv, package:Symbol|False) -> False
+;defmulti current-inside (e:REPLEnv) -> Symbol|False
+;
+;;For resolution
+;
+;
+;;List names of all repl packages
+;defmulti repl-packages (e:REPLEnv) -> Seqable<Symbol>
+;defmulti repl-package? (e:REPLEnv, name:Symbol) -> True|False
+;
+;;Clear repl environment
+;defmulti clear (e:REPLEnv) -> False
 
 defn REPLEnv () :
-  ;Previous repl packages
-  val previous-packages = Vector<PackageIO>()
-  val package-index = HashTable<Symbol,Int>()
-  ;Current desired imports
-  val imports = HashTable<Symbol, IImport>()
-  ;Currently inside package
+  ;Fundamental State
+  val previous-packages = Vector<Symbol>()
+  val repl-imports = HashTable<Symbol, IImport>()
   var inside-package:Symbol|False = false
+  val import-list-table = HashTable<Symbol,ImportList>()
 
   ;Initialize imports
   defn reset () :
-    clear(previous-packages)
-    clear(package-index)
-    clear(imports)
-    inside-package = false
+  ;  clear(previous-packages)
+  ;  clear(package-index)
+  ;  clear(imports)
+  ;  inside-package = false
     for i in core-imports() do :
-      imports[package(i)] = i
+      repl-imports[package(i)] = i
   reset()
 
   ;Construct IPackage
@@ -621,52 +716,64 @@ defn REPLEnv () :
     ;First ensure legitimacy
     ensure-repl-expression(exp)
 
-    ;Next create import list
-    val package-imports = Vector<IImport>()
-    ;Import all previous repl packages
+    ;Create the appropriate import list
+    val exp-imports = HashTable<Symbol,IImport>()
+    defn add-import (i:IImport) : exp-imports[package(i)] = i
+    
+    ;Previous REPL packages are imported (with visibility into their
+    ;private definitions.)
     for p in previous-packages do :
-      add(package-imports, IImport(package(p), [], false, true))
-    ;Import all current imports
-    for i in values(imports) do :
-      if package(i) != inside-package :
-        add(package-imports, i)
-    ;Import the current 'inside' package
-    match(inside-package:Symbol) :
-      add(package-imports, IImport(inside-package, [], false, true))
+      add-import(IImport(p, [], false, true))
+    ;If we are inside a package, then inherit all of the imports from
+    ;that package.
+    match(inside-package) :
+      (p:Symbol) : do(add-import, imports(import-list-table[p]))
+      (p:False) : false
+    ;If we have custom imports from user interaction, then import those.
+    do(add-import, values(repl-imports))
 
     ;Create IPackage
-    IPackage(gensym(`repl), to-tuple(package-imports), List(exp), info(exp))
-
-  ;Resolution priority of IPackage
-  defn package-priority (self:Symbol, p:Symbol) -> Int :
-    if p == inside-package : 1
-    else if p == self : INT-MAX
-    else if key?(package-index, p) : package-index[p] + 2
-    else : 0
+    IPackage(gensym(`repl),
+             to-tuple(values(exp-imports)),
+             List(exp),
+             info(exp))
 
   ;Construct environment object
   new REPLEnv :
-    defmethod import (this, import:IImport) :
-      imports[package(import)] = import
-    defmethod unimport (this, package:Symbol) -> True|False :
-      remove(imports, package)
-    defmethod inside (this, package:Symbol|False) :
-      inside-package = package
-    defmethod current-inside (this) :
-      inside-package
-    defmethod register (this, packageio:PackageIO) :
-      add(previous-packages, packageio)
-      package-index[package(packageio)] = length(previous-packages) - 1
-    defmethod package-priority (this, self:Symbol, package:Symbol) -> Int :
-      package-priority(self, package)
-    defmethod ReplPackage (this, exp:IExp) :
+    defmethod repl-package (this, exp:IExp) :
       make-repl-package(exp)
-    defmethod repl-packages (this) :
-      seq(package, previous-packages)
-    defmethod repl-package? (this, name:Symbol) :
-      key?(package-index, name)
-    defmethod clear (this) :
-      reset()
+    defmethod package-priority (this, package:Symbol) :
+      val package-index = to-hashtable<Symbol,Int>(previous-packages, 0 to false)
+      fn (name:Symbol) :
+        if name == package : INT-MAX
+        else if key?(package-index, name) : package-index[name] + 1
+        else : 0
+    defmethod register (this, il:ImportList) :
+      import-list-table[package(il)] = il
+    defmethod register-repl (this, package:Symbol) :
+      add(previous-packages, package)
+      
+
+    ;defmethod import (this, import:IImport) :
+    ;  imports[package(import)] = import
+    ;defmethod unimport (this, package:Symbol) -> True|False :
+    ;  remove(imports, package)
+    ;defmethod inside (this, package:Symbol|False) :
+    ;  inside-package = package
+    ;defmethod current-inside (this) :
+    ;  inside-package
+    ;defmethod register (this, packageio:PackageIO) :
+    ;  add(previous-packages, packageio)
+    ;  package-index[package(packageio)] = length(previous-packages) - 1
+    ;defmethod package-priority (this, self:Symbol, package:Symbol) -> Int :
+    ;  package-priority(self, package)
+    ;
+    ;defmethod repl-packages (this) :
+    ;  seq(package, previous-packages)
+    ;defmethod repl-package? (this, name:Symbol) :
+    ;  key?(package-index, name)
+    ;defmethod clear (this) :
+    ;  reset()
 
 defn ensure-repl-expression (expression:IExp) :
   ;Detect illegal expressions
@@ -693,6 +800,13 @@ defn ensure-repl-expression (expression:IExp) :
 
   ;Throw errors if there are any
   throw(ReplErrors(errors)) when not empty?(errors)
+
+defstruct ImportList :
+  package: Symbol
+  imports: Tuple<IImport>
+  
+defn import-list (p:IPackage) :
+  ImportList(name(p), imports(p))
 
 ;============================================================
 ;==================== Categorization ========================
