@@ -1,5 +1,100 @@
 ;See License.txt for details about licensing.
 
+;<doc>=======================================================
+;================== Compilation Steps =======================
+;============================================================
+
+# Categorize the situation #
+
+There are three different situations that require different
+compilation flows:
+
+  1) We are compiling in optimized mode and need to compile to a final
+  assembly file.
+
+  2) We are compiling in unoptimized mode and need to compile to a
+  final assembly file.
+
+  3) We are compiing in unoptimized mode and only need to compile to
+  .pkg files.
+
+# Reorder the given packages by their initialization order #
+
+Input:
+  denv: DEnv
+  packages: Seqable<EPackage|VMPackage|Pkg>
+  input-order: Tuple<Symbol>
+  
+Output:
+  packages: Tuple<EPackage|VMPackage|Pkg>
+
+Reorders the given input by their proper dependency order. 
+
+# Combine multiple EL packages into a single optimized VMPackage #
+
+Input:
+  packages: Tuple<EPackage|FastPkg>
+Output:
+  vmpackage: VMPackage
+
+# Compile a single VMPackage to a File #
+
+Input:
+  vmpackage: VMPackage
+  bindings: Vector<Bindings>
+  filename: String
+
+# Compile VMPackages and StdPkgs to a File #
+
+Input:
+  packages: Tuple<VMPackage|StdPkg>
+  bindings: Vector<Bindings>
+  filename: String
+  save-pkgs?: String|False
+
+Emits the compiled instructions to the given file. If save-pkgs? is a
+String, then we emit the unoptimized .pkg files into the that
+directory.
+
+# Lower and Compile EL Packages to .pkg Files #
+
+Input:
+  epackages: Tuple<EPackage>
+  pkg-dir: String
+
+# Utility: Compile a Normalized VMPackage #
+
+Input:
+  npkg: NormVMPackage
+  stitcher: Stitcher
+  stubs: AsmStubs
+  return-instructions?: True|False
+
+Output:
+  instructions: Tuple<Ins>|False
+
+Emits the compiled instructions to the current output stream, when
+given the normalized package. If return-instructions? is true, then the
+pre-stitched instructions are saved into a tuple and returned.
+Otherwise, the function returns false.
+
+# Utility: Emitters #
+
+  file-emitter: () -> CodeEmitter
+  buffer-emitter: (buffer:Vector<Ins>, e:CodeEmitter) -> CodeEmitter
+  buffer-emitter: (buffer:Vector<Ins>) -> CodeEmitter
+
+# Utility: Emit all system stubs #
+
+Input:
+  stitcher: Stitcher
+  stubs: AsmStubs
+
+Emits all tables and stubs required by the linked assembly file.
+
+;============================================================
+;=======================================================<doc>
+
 defpackage stz/compiler :
   import core
   import collections
@@ -23,6 +118,7 @@ defpackage stz/compiler :
   import stz/el-ir
   import stz/vm-ir
   import stz/dl-ir
+  import stz/dl
   import stz/backend
   import stz/reg-alloc with :
     prefix(Ins) => reg-alloc-
@@ -32,321 +128,260 @@ defpackage stz/compiler :
   import stz/asm-emitter
   import stz/stitcher
   import stz/bindings
+  import stz/bindings-to-vm
   import stz/pkg
+  import stz/ids  
 
 public defn compile (filenames:List<String>, output:False|String, pkg-dir:False|String, backend:Backend) :
   defn driver () :
-    ;First categorize the files
-    val files = categorize(filenames)
+    ;Read in all inputs
+    val input-packages = Vector<Symbol>()
+    val ipackages = Vector<IPackage>()
+    val input-pkgs = Vector<Pkg>()
+    val all-bindings = Vector<Bindings>()
+    val pkgloader = PkgLoader()
+
+    for filename in filenames do :
+      switch(category(filename)) :
+        `package :
+          val pkg = load-pkg(pkgloader, to-symbol(filename))
+          add(input-packages, name(pkg))
+          add(input-pkgs, pkg)
+        `stanza-file :
+          val ipkgs = read-ipackages(filename)
+          add-all(input-packages, seq(name,ipkgs))
+          add-all(ipackages, ipkgs)
+        `pkg-file :
+          val pkg = load-pkg(pkgloader, filename)
+          add(input-packages, name(pkg))
+          add(input-pkgs, pkg)
+        `binding-file :
+          add(all-bindings, read-bindings(filename))
+    ensure-no-duplicate-packages!(input-packages)
+
+    ;Compile all to EL packages
+    val [epackages, all-pkgs] = compile-to-el(ipackages, pkgloader)
+
+    ;Ensure that packageio definitions for packages are consistent.
+    ;Return the DEnv for use later in computing the initialization order.
+    val denv = ensure-consistent-packageios(to-tuple(cat(epackages,all-pkgs)))
+
+    ;Compile binding files to vmpackage
+    val bindings = collapse(all-bindings)
+    val binding-pkg = to-vmpackage(bindings)
+    ensure-consistent-imports(binding-pkg, denv)
     
-    ;Track where all the packages came from
-    val input-package-table = InputPackageTable()
+    ;Save optimized packages if necessary
+    val save-optimized-pkgs? = pkg-dir is String and flag-defined?(`OPTIMIZE)
+    do(save-as-fpkg, epackages) when save-optimized-pkgs?
 
-    ;Read all the binding files
-    val bindings = map(read-bindings, binding-files(files))
-    
-    ;For the stanza files, 
-    ;first read and macro-expand all the files.
-    ;then rename, resolve, and type all the packages.
-    val expanded = map(read+expand, stanza-files(files))
+    ;Depending upon the situation run three different flows
+    val situation =
+      match(flag-defined?(`OPTIMIZE), output) :
+        (opt?:True, output:String) : `optimized-asm
+        (opt?:True, output:False) : `optimized-pkgs
+        (opt?:False, output:String) : `unoptimized-asm
+        (opt?:False, output:False) : `unoptimized-pkgs
+    switch(situation) :
+      `optimized-asm :
+        val ordered = order-by-dependencies(denv, to-tuple(cat(epackages,all-pkgs)), input-packages)
+        val vmpackage = combine-and-lower(ordered as Tuple<EPackage|FastPkg>)
+        compile-vmpackages([vmpackage, binding-pkg], bindings, output as String, false)
+      `optimized-pkgs :
+        ;Already done
+        false
+      `unoptimized-asm :
+        val packages = to-tuple $ cat(
+          seq(compile{lower-unoptimized(_)}, epackages),
+          all-pkgs)
+        val ordered = order-by-dependencies(denv, packages, input-packages) as Tuple<VMPackage|StdPkg>
+        compile-vmpackages(to-tuple(cat(ordered, [binding-pkg])), bindings, output as String, pkg-dir)
+      `unoptimized-pkgs :
+        compile-to-pkgs(epackages, pkg-dir as String)
 
-    ;Then convert the s-expression forms into IPackages.
-    ;and rename them.
-    val ipackages = rename(to-ipackages(expanded, stanza-files(files), input-package-table))
-
-    ;Read in .pkg files and packages.    
-    val pkgloader = PkgLoader(map(name, ipackages), pkg-files(files), packages(files))
-    for entry in file-mapping(pkgloader) do :
-      register(input-package-table, key(entry), [value(entry)])
-
-    ;Then convert the packages into typed form, by
-    ;renaming, resolving, and typechecking.
-    val typed = type(resolve(ipackages, pkgloader), pkgloader)
-
-    ;If the package typechecks, then we can start compilation
-    ;to assembly. The first step is to bring it to EL form.
-    val src-el-ir = to-el-ir(typed)
-
-    ;Optimized packages should be saved if we are compiling in
-    ;optimized mode, and a pkg output directory has been specified.
-    val save-optimized-packages? = pkg-dir is String and flag-defined?(`OPTIMIZE)
-    if save-optimized-packages? :
-      for p in src-el-ir do :
-        val pkg = FastPkg(packageio(p), exps(p))
-        save-package(pkg-dir as String, pkg)
-
-    ;Determine whether we should continue.
-    ;Continue if we want to emit the assembly code, or emit unoptimized pkgs.
-    val save-unoptimized-pkgs? = pkg-dir is String and
-                                 not flag-defined?(`OPTIMIZE)
-    val continue-to-el? = output is String or save-unoptimized-pkgs?
-    if continue-to-el? :
-      ;Add loaded EL to src EL if in optimized mode.
-      val el-ir =
-        if flag-defined?(`OPTIMIZE) :
-          val pkgs = pkgs(pkgloader) as Seqable<FastPkg>
-          val epkgs = for pkg in pkgs seq : EPackage(packageio(pkg), exps(pkg))
-          val new-epkgs = to-tuple(cat(src-el-ir, epkgs))
-          init-order(new-epkgs, all-input-files(files), input-package-table)
-        else :
-          src-el-ir
-
-      ;Then we compile the EL form into VM form.
-      val vm-ir = to-vm-ir(el-ir)
-
-      ;Finally, we assemble the VM form and emit the assembly code.
-      val all-pkgs =
-        if flag-defined?(`OPTIMIZE) :
-          ;Packages are already collapsed from optimizer
-          vm-ir
-        else :
-          val pkgs = to-tuple(cat(vm-ir, pkgs(pkgloader) as Seqable<StdPkg>))
-          init-order(pkgs, all-input-files(files), input-package-table)
-      assemble(all-pkgs, bindings, output)        
-
-  defn read+expand (filename:String) -> List :
+  defn read-ipackages (filename:String) -> Tuple<IPackage> :
+    ;Lex the file into s-expressions
     val forms = read-file(filename)
-    cons(`$begin, parse-syntax[core / #exps!](forms))
+    ;Expand macros
+    val expanded = cons(`$begin, parse-syntax[core / #exps!](forms))
+    ;Convert to IPackage using standard imports
+    val core-imports = [IImport(`core), IImport(`collections)]
+    to-ipackages(expanded, core-imports)
 
-  defn to-ipackages (expanded:Tuple, files:Tuple<String>, ipt:InputPackageTable) :
-    to-tuple $ for (e in expanded, file in files) seq-cat :
-      val core-imports = [IImport(`core), IImport(`collections)]
-      val ipkgs = /to-ipackages(e, core-imports)
-      register(ipt, file, map(name, ipkgs))
-      ipkgs
+  defn ensure-no-duplicate-packages! (packages:Seqable<Symbol>) :
+    val pset = HashSet<Symbol>()
+    for p in packages do :
+      if not add(pset,p) :
+        throw(DuplicatePackage(p))
 
-  defn rename (ipackages:Tuple<IPackage>) :
-    match(rename-il(ipackages)) :
+  defn compile-to-el (ipackages:Collection<IPackage>, pkgloader:PkgLoader) :
+    ;First rename the binders
+    val renamed = match(rename-il(to-tuple(ipackages))) :
       (renamed:Tuple<IPackage>) : renamed
       (e:RenameErrors) : throw(e)
+      
+    ;Create the table holding the package exports
+    ;The exports have their identifiers renamed so that they do not conflict
+    ;with fresh-id().
+    val package-exports-table = HashTable<Symbol,PackageExports|False>()
+    defn package-exports (name:Symbol) :
+      within update?(package-exports-table, name) :
+        try :
+          val pkg = load-pkg(pkgloader, name)
+          val pexs = to-package-exports(packageio(pkg))
+          defn rename-id (e:Export) : sub-n(e, fresh-id())
+          sub-exports(pexs, map(rename-id, exports(pexs)))
+        catch (e:NoPackageException) :
+          false
 
-  defn make-env (pkgloader:PkgLoader) :
-    new stz/resolver/Env & stz/type/Env :
+    ;Create the resolution and typing environment
+    val env = new stz/resolver/Env & stz/type/Env :
       defmethod stz/resolver/exports (this, package:Symbol) :
-        package-exports(pkgloader, package)
+        package-exports(package)
       defmethod stz/type/exports (this, package:Symbol) :
-        package-exports(pkgloader, package) as PackageExports
+        package-exports(package) as PackageExports    
 
-  defn resolve (ipackages:Tuple<IPackage>, pkgloader:PkgLoader) :
-    match(resolve-il(ipackages, make-env(pkgloader), false)) :
+    ;Resolve the binders
+    val resolved = match(resolve-il(renamed, env, false)) :
       (e:ResolveErrors) : throw(e)
       (e:Tuple<IPackage>) : e
 
-  defn type (ipackages:Tuple<IPackage>, pkgloader:PkgLoader) :
-    match(type-program(ipackages, make-env(pkgloader))) :
+    ;Retrieve all dependencies and pkgs
+    val all-pkgs = all-pkgs-and-dependencies(pkgloader, seq(name,resolved))
+
+    ;Typecheck the program
+    val typed = match(type-program(resolved, env)) :
       (e:TProg) : e
       (e:TypeErrors) : throw(e)
 
-  defn to-el-ir (typed:TProg) -> Tuple<EPackage> :
-    to-el(typed, false)
-
-  defn to-vm-ir (epackages:Tuple<EPackage>) :
-    if flag-defined?(`OPTIMIZE) :
-      [compile(lower-optimized(epackages))]
-    else :
-      map(compile{lower-unoptimized(_)}, epackages)
-
-  defn init-order (epkgs:Tuple<EPackage>, files:Tuple<String|Symbol>, ipt:InputPackageTable) -> Tuple<EPackage> :
-    ;Create import graph
-    val import-graph = to-hashtable<Symbol, List<Symbol>> $
-      for p in epkgs seq :
-        val io = packageio(p)
-        package(io) => to-list(imported-packages(io))
-    ;Get package names in input order
-    val package-names = to-tuple $
-      for f in files seq-cat :
-        match(f) :
-          (f:Symbol) : [f]
-          (f:String) : packages(ipt, f)
-    ;Compute initialization order
-    val ordering = initialization-order(import-graph, package-names, {false})
-    ;Compute reordered packages
-    val package-table = to-hashtable(name, epkgs)
-    to-tuple(seq({package-table[_]}, ordering))
-
-  defn init-order (pkgs:Tuple<VMPackage|StdPkg>, files:Tuple<String|Symbol>, ipt:InputPackageTable) -> Tuple<VMPackage|StdPkg> :
-    ;Create import graph
-    val import-graph = to-hashtable<Symbol, List<Symbol>> $
-      for p in pkgs seq :
-        val io = packageio(p)
-        package(io) => to-list(imported-packages(io))
-    ;Get package names in input order
-    val package-names = to-tuple $
-      for f in files seq-cat :
-        match(f) :
-          (f:Symbol) : [f]
-          (f:String) : packages(ipt, f)
-    ;Get proper ordering
-    val ordering = initialization-order(import-graph, package-names, {false})
-    ;Get reordered packages
-    val package-table = to-hashtable(package{packageio(_)}, pkgs)
-    to-tuple(seq({package-table[_]}, ordering))
-
-  defn assemble (pkgs:Tuple<VMPackage|StdPkg>,
-                 bindings:Collection<Bindings>,
-                 filename:String|False) :
-    ;Normalize all of the vmpackages to prepare for register
-    ;allocation.
-    val npkgs = for p in pkgs map :
-      match(p) :
-        (p:VMPackage) : normalize(p, backend)
-        (p:StdPkg) : p
+    ;Compile to EL
+    [to-el(typed, false), all-pkgs]
     
-    ;DEBUG
-    ;for p in npkgs do :
-    ;  dump(p, "logs", "normalize")
+  defn ensure-consistent-packageios (pkgs:Collection<EPackage|Pkg>) -> DEnv :  
+    val denv = DEnv()
+    val result = load(denv, to-collection(seq{packageio,pkgs}), [])
+    match(result:LoadErrors) : throw(result)
+    denv
 
-    ;Define the assembly stubs for holding the required assembly labels and
-    ;code snippets.
+  defn ensure-consistent-imports (pkg:VMPackage, denv:DEnv) :
+    val result = check-imports-defined(denv, packageio(pkg))
+    match(result:LoadErrors) : throw(result)
+
+  defn save-as-fpkg (p:EPackage) :
+    val pkg = FastPkg(packageio(p), exps(p))
+    save-package(pkg-dir as String, pkg)
+
+  defn order-by-dependencies (denv:DEnv, packages:Seqable<EPackage|VMPackage|Pkg>, input-order:Collection<Symbol>) :
+    val init-order = initialization-order(package-dependency-graph(denv), input-order, {false})
+    val package-table = to-hashtable(name, packages)
+    to-tuple(seq({package-table[_]}, init-order))
+
+  defn combine-and-lower (packages:Tuple<EPackage|FastPkg>) :
+    val epackages = for p in packages map :
+      match(p:FastPkg) : EPackage(packageio(p), exps(p))
+      else : p as EPackage
+    compile(lower-optimized(epackages))
+
+  defn compile-vmpackages (packages:Tuple<VMPackage|StdPkg>, bindings:Bindings, filename:String, save-pkgs?:String|False) :
     val stubs = AsmStubs(backend)
-   
+    val npkgs = for p in packages map :
+      match(p:VMPackage) : normalize(p, backend)
+      else : p as StdPkg
+    val stitcher = Stitcher(map(collapse,npkgs), bindings, stubs)
+    defn compile () :
+      for (pkg in packages, npkg in npkgs) do :
+        match(npkg) :
+          (npkg:NormVMPackage) :
+            val ins = compile-normalized-vmpackage(npkg, stitcher, stubs, save-pkgs? is String)
+            match(save-pkgs?:String) :              
+              save-package(save-pkgs?, StdPkg(pkg as VMPackage, ins as Tuple<Ins>, datas(npkg)))            
+          (std-pkg:StdPkg) :
+            compile-stdpkg(std-pkg, stitcher)
+      emit-all-system-stubs(stitcher, stubs)
+    with-output-file(FileOutputStream(filename), compile)      
 
-    ;If we wish to assemble an assembly file.
-    match(filename:String) :
-      ;Define the file emitter for the output target.
-      val file-emitter = new CodeEmitter :
-        defmethod emit (this, i:Ins) :
-          emit(i, backend)
+  defn compile-stdpkg (pkg:StdPkg, stitcher:Stitcher) :
+    val emitter = emitter(stitcher, name(pkg), file-emitter())
+    for ins in asm(pkg) do : emit(emitter, ins)
 
-      ;Define the stitcher for lowering the abstract assembly instructions.
-      val stitcher = Stitcher(map(collapse,npkgs), bindings, stubs)
-
-      ;Write out to file
-      with-output-file(FileOutputStream(filename), fn () :
-        ;Emit code for all packages
-        for (pkg in pkgs, npkg in npkgs) do :
-          ;Function for allocating registers for all functions in package.
-          val stitching-emitter = emitter(stitcher, package(packageio(pkg)), file-emitter)
-          defn allocate-registers (emitter:CodeEmitter) :
-            match(npkg) :
-              (npkg:NormVMPackage) :
-                for f in funcs(vmpackage(npkg)) do :
-                  emit(emitter, LinkLabel(id(f)))
-                  /allocate-registers(func(f), emitter, backend, stubs, false)
-              (npkg:StdPkg) :
-                for ins in asm(npkg) do :
-                  emit(emitter, ins)
-
-          ;Allocate registers while also saving instructions to pkg file
-          defn allocate-and-save-pkg (dir:String) :
-            val pkg-maker = PkgMaker(pkg as VMPackage, datas(npkg as NormVMPackage))
-            val emitter = emitter(stitching-emitter, pkg-maker)
-            allocate-registers(emitter)
-            save-package(dir, /pkg(pkg-maker))
-
-          ;Unoptimized packages should be saved if we are compiling in
-          ;unoptimized mode, and a pkg output directory has been specified,
-          ;and pkg is a VMPackage.
-          val save-unoptimized-pkg? = pkg is VMPackage and
-                                      pkg-dir is String and
-                                      not flag-defined?(`OPTIMIZE)
-          if save-unoptimized-pkg? :
-            allocate-and-save-pkg(pkg-dir as String)
-          else :
-            allocate-registers(stitching-emitter)
-            
-        ;Emit stitched tables
-        emit-tables(stitcher, file-emitter)
-        emit-stubs(stitcher, file-emitter)
-        compile-runtime-stubs(file-emitter, stubs))
-
-    ;Otherwise
+  defn compile-normalized-vmpackage (npkg:NormVMPackage, stitcher:Stitcher, stubs:AsmStubs, return-instructions?:True|False) :
+    if return-instructions? :
+      val buffer = Vector<Ins>()
+      val emitter = buffer-emitter(buffer, emitter(stitcher, name(npkg), file-emitter()))
+      emit-normalized-package(npkg, emitter, stubs)      
+      to-tuple(buffer)
     else :
-      for (pkg in pkgs, npkg in npkgs) do :
-        ;Empty emitter
-        val empty-emitter = new CodeEmitter :
-          defmethod emit (this, i:Ins) : false
-          
-        ;Function for allocating registers for all functions in package.
-        defn allocate-registers (emitter:CodeEmitter) :
-          val npkg = npkg as NormVMPackage
-          for f in funcs(vmpackage(npkg)) do :
-            emit(emitter, LinkLabel(id(f)))
-            /allocate-registers(func(f), emitter, backend, stubs, false)
+      val emitter = emitter(stitcher, name(npkg), file-emitter())
+      emit-normalized-package(npkg, emitter, stubs)
 
-        ;Allocate registers while also saving instructions to pkg file
-        defn allocate-and-save-pkg (dir:String) :
-          val pkg-maker = PkgMaker(pkg as VMPackage, datas(npkg as NormVMPackage))
-          val emitter = emitter(empty-emitter, pkg-maker)
-          allocate-registers(emitter)
-          save-package(dir, /pkg(pkg-maker))
+  defn compile-to-pkgs (epackages:Tuple<EPackage>, dir:String) :
+    val stubs = AsmStubs(backend)
+    for epackage in epackages do :
+      val vmpackage = compile(lower-unoptimized(epackage))
+      val npkg = normalize(vmpackage, backend)
+      val buffer = Vector<Ins>()
+      emit-normalized-package(npkg, buffer-emitter(buffer), stubs)
+      save-package(dir, StdPkg(vmpackage, to-tuple(buffer), datas(npkg))) 
+    
+  defn emit-normalized-package (npkg:NormVMPackage, emitter:CodeEmitter, stubs:AsmStubs) :
+    for f in funcs(vmpackage(npkg)) do :
+      emit(emitter, LinkLabel(id(f)))
+      allocate-registers(func(f), emitter, backend, stubs, false)
 
-        ;Allocate registers and save pkg
-        if npkg is NormVMPackage :
-          allocate-and-save-pkg(pkg-dir as String)
+  defn emit-all-system-stubs (stitcher:Stitcher, stubs:AsmStubs) :
+    val emitter = file-emitter()
+    emit-tables(stitcher, emitter)
+    emit-stubs(stitcher, emitter)
+    compile-runtime-stubs(emitter, stubs)
 
+  ;Buffer Utilities
+  defn file-emitter () :
+    new CodeEmitter :
+      defmethod emit (this, i:Ins) :
+        emit(i, backend)
+
+  defn buffer-emitter (buffer:Vector<Ins>, emitter:CodeEmitter) :
+    new CodeEmitter :
+      defmethod emit (this, i:Ins) :
+        add(buffer, i)
+        emit(emitter, i)
+
+  defn buffer-emitter (buffer:Vector<Ins>) :
+    new CodeEmitter :
+      defmethod emit (this, i:Ins) :
+        add(buffer, i)
+        
+  ;Launch
   driver()
 
-;<doc>=======================================================
+;============================================================
 ;==================== Categorization ========================
 ;============================================================
 
-Classifies the incoming files into four types:
-  myfile.stanza
-  myfile.pkg
-  myfile.vmbindings
-  mypackage
+;Classifies the incoming files into four types:
+;  myfile.stanza
+;  myfile.pkg
+;  myfile.vmbindings
+;  mypackage
+;
+;Returns either:
+;  `package
+;  `stanza-file
+;  `pkg-file
+;  `binding-file
 
-It is assumed that package names have no '.' character in them. This
-will be enforced by the language checker.
-
-The ordering of the files are kept in the field all-input-files. This
-ordering is important when determining the evaluation order of the
-top-level statements in the program.
-
-;============================================================
-;=======================================================<doc>
-
-defstruct CategorizedFiles :
-  stanza-files: Tuple<String>
-  pkg-files: Tuple<String>
-  binding-files: Tuple<String>
-  packages: Tuple<Symbol>
-  all-input-files: Tuple<String|Symbol>
-
-defn categorize (filenames:Seqable<String>) :
-  val stanza-files = Vector<String>()
-  val pkg-files = Vector<String>()
-  val binding-files = Vector<String>()
-  val packages = Vector<Symbol>()
-  val all-input-files = Vector<String|Symbol>()
-  for name in filenames do :
-    if not has-extension?(name) :
-      add(packages, to-symbol(name))
-      add(all-input-files, to-symbol(name))
-    else :
-      switch suffix?{name, _} :
-        ".stanza" :
-          add(stanza-files, name)
-          add(all-input-files, name)
-        ".pkg" :
-          add(pkg-files, name)
-          add(all-input-files, name)
-        ".vmbindings" :
-          add(binding-files, name)
-        else :
-          throw(InvalidExtensionError(name))
-  CategorizedFiles(to-tuple(stanza-files), to-tuple(pkg-files),
-                   to-tuple(binding-files), to-tuple(packages),
-                   to-tuple(all-input-files))
-
-defn has-extension? (s:String) :
-  index-of-char(s, '.') is Int
-
-;============================================================
-;================= File to Package Mapping ==================
-;============================================================
-
-deftype InputPackageTable
-defmulti register (ipt:InputPackageTable, file:String, packages:Tuple<Symbol>) -> False
-defmulti packages (ipt:InputPackageTable, file:String) -> Tuple<Symbol>
-defn InputPackageTable () :
-  val table = HashTable<String,Tuple<Symbol>>()
-  new InputPackageTable :
-    defmethod register (this, file:String, packages:Tuple<Symbol>) :
-      table[file] = packages
-    defmethod packages (this, file:String) :
-      table[file]
+defn category (name:String) -> Symbol :
+  defn has-extension? (s:String) :
+    index-of-char(s, '.') is Int
+  if not has-extension?(name) :
+    `package
+  else :
+    switch suffix?{name, _} :
+      ".stanza" : `stanza-file
+      ".pkg" : `pkg-file
+      ".fpkg" : `pkg-file
+      ".vmbindings" : `binding-file
+      else : throw(InvalidExtensionError(name))
 
 ;============================================================
 ;============= Collapsing a Normalized Package ==============
@@ -369,25 +404,6 @@ defn collapse (p:NormVMPackage|StdPkg) :
     defmethod extern-defns (this) : extern-defns(vmp)
 
 ;============================================================
-;==================== PkgMaker ==============================
-;============================================================
-
-deftype PkgMaker
-defmulti pkg (m:PkgMaker) -> Pkg
-defmulti emitter (emitter:CodeEmitter, m:PkgMaker) -> CodeEmitter
-
-defn PkgMaker (vmp:VMPackage, asm-datas:Tuple<VMData>) :
-  val buffer = Vector<Ins>()
-  new PkgMaker :
-    defmethod pkg (this) :
-      StdPkg(vmp, to-tuple(buffer), asm-datas)
-    defmethod emitter (emitter:CodeEmitter, this) :
-      new CodeEmitter :
-        defmethod emit (this, i:Ins) :
-          add(buffer, i)
-          emit(emitter, i)
-
-;============================================================
 ;===================== Errors ===============================
 ;============================================================
 
@@ -396,3 +412,6 @@ defn InvalidExtensionError (filename:String) :
     defmethod print (o:OutputStream, this) :
       print(o, "File %_ does not have a valid Stanza file extension." % [filename])
 
+defn DuplicatePackage (name:Symbol) :
+  Exception("The package %~ is loaded multiple times." % [name])
+    
