@@ -779,7 +779,7 @@ void vmloop (VMState* vms){
       int xi = (int)xl;        
       float xf = LOCAL_FLOAT(value);
       float xd = LOCAL_DOUBLE(value);
-      printf("DUMP LOCAL %d: (byte = %d, int = %d, long = %lld, ptr = %p, float = %f, double = %f)\n",
+      printf("DUMP LOCAL %d: (byte = %d, int = %d, long = %ld, ptr = %p, float = %f, double = %f)\n",
              value, xb, xi, xl, (void*)xl, xf, xd);
       continue;
     }
