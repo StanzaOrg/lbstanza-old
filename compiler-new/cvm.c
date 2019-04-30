@@ -662,11 +662,11 @@ void vmloop (VMState* vms){
     }
     case CALLC_OPCODE_LOCAL : {
       DECODE_C();
-      void* faddr = LOCAL(value);
+      void* faddr = (void*)LOCAL(value);
       int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
-      c_trampoline((void*)faddr, registers, registers);      
+      c_trampoline(faddr, registers, registers);      
       RESTORE_STATE();
       pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
@@ -674,11 +674,11 @@ void vmloop (VMState* vms){
     }
     case CALLC_OPCODE_EXTERN : {
       DECODE_D();
-      void* faddr = value;
+      void* faddr = (void*)value;
       int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
-      c_trampoline((void*)faddr, registers, registers);      
+      c_trampoline(faddr, registers, registers);      
       RESTORE_STATE();
       pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
