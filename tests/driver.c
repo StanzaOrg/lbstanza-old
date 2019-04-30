@@ -60,6 +60,9 @@ typedef struct{
 #define STACK_TYPE 6
 
 int64_t stanza_entry (VMInit* init);
+//extern int64_t stanza_stack_size;
+//extern int64_t stanza_stack_items_offset;
+//extern char* stanza_stack_pointer;
 
 //     Command line arguments
 //     ======================
@@ -99,6 +102,7 @@ int main (int argc, char* argv[]) {
   int initial_heap_size = 1024 * 1024;
   init.heap = (char*)stz_malloc(initial_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
+  printf("heap = %p, heap_limit = %p\n", init.heap, init.heap_limit);
   init.heap_top = init.heap;
   init.free = (char*)stz_malloc(initial_heap_size);
   init.free_limit = init.free + initial_heap_size;
@@ -108,8 +112,8 @@ int main (int argc, char* argv[]) {
   init.system_stack = alloc_stack(&init);   
 
   //Call Stanza entry
-  stanza_entry(&init);
-  
+  int64_t ret = stanza_entry(&init);
+  printf("ret = %ld\n", ret);
   return 0;
 }
 

@@ -1,0 +1,180 @@
+defpackage stz/bindings-to-vm :
+  import core
+  import collections
+  import stz/bindings
+  import stz/vm-ir
+  import stz/dl-ir
+  import stz/utils
+
+;============================================================
+;======================= Driver =============================
+;============================================================
+
+public defn to-vmpackage (bindings:Bindings) -> VMPackage :
+  val [packageio, ids] = bindings-packageio()
+  val defns = Vector<VMDefn>()
+  val externs = Vector<VMExternDefn>()
+  for (f in extern-defns(bindings), i in 0 to false) do :
+    val vmfunc = to-vmfunc(f, i, ids)
+    add(defns, VMDefn(i + 2, [], vmfunc))
+    add(externs, VMExternDefn(lbl(f), i + 2, a1(f), a2(f)))
+  VMPackage(packageio, false, [], [], [], [], to-tuple(defns), [], [], to-tuple(externs))
+
+;<doc>=======================================================
+;===================== Collapser ============================
+;============================================================
+
+Merges redundant definitions in given bindings into a single bindings
+structure. Checks to ensure that we do not attempt to define multiple
+extern defns with the same label with different type signatures.
+
+Input:
+  bindings:Collection<Bindings>
+Output:
+  bindings:Bindings
+Throws:
+  BindingCollapsingErrors
+
+;============================================================
+;=======================================================<doc>
+
+public defn collapse (bindings:Collection<Bindings>) -> Bindings :
+  ;Group externs by lbl
+  val extern-lbls = to-hashset<Symbol> $
+    for b in bindings seq-cat :
+      seq(lbl, externs(b))
+
+  ;Group extern-defns by lbl
+  val extern-defns = group-by(lbl, seq-cat(extern-defns, bindings))
+
+  ;Check for inconsistent definitions
+  val errors = Vector<RepeatedExternDefnError>()
+  for def in extern-defns do :
+    val lbl = key(def)
+    val sigs = to-tuple(unique(seq(signature, value(def))))
+    add(errors, RepeatedExternDefnError(lbl, sigs)) when length(sigs) > 1
+  throw(BindingCollapsingErrors(to-tuple(errors))) when not empty?(errors)
+
+  ;Return single bindings
+  Bindings(to-tuple(externs), to-tuple(extern-defns)) where :
+    val externs = seq(ExternBinding, extern-lbls) 
+    val extern-defns = seq(head{value(_)}, extern-defns)      
+
+public defstruct ExDefnSignature <: Hashable&Equalable :
+  a1: Tuple<VMType>
+  a2: VMType
+defmethod hash (x:ExDefnSignature) :
+  hash $ [a1(x), a2(x)]
+defmethod equal? (x:ExDefnSignature, y:ExDefnSignature) :
+  a1(x) == a1(y) and a2(x) == a2(y)
+defmethod print (o:OutputStream, t:ExDefnSignature) :
+  print(o, "(%,) -> %_" % [a1(t), a2(t)])
+
+defn signature (e:ExternDefnBinding) :
+  ExDefnSignature(a1(e), a2(e))
+
+public defstruct RepeatedExternDefnError <: Exception :
+  lbl: Symbol
+  signatures: Tuple<ExDefnSignature>
+defmethod print (o:OutputStream, e:RepeatedExternDefnError) :
+  print(o, "The %~ extern function has multiple inconsistent type signatures:")
+  val o2 = IndentedStream(o)
+  do(lnprint{o2, _}, signatures(e))
+
+public defstruct BindingCollapsingErrors <: Exception :
+  errors: Tuple<Exception>
+defmethod print (o:OutputStream, e:BindingCollapsingErrors) :
+  print(o, "%n" % [errors(e)])
+
+;============================================================
+;==================== Bindings IOTable ======================
+;============================================================
+
+defn bindings-packageio () -> [PackageIO, BindingIds] :
+  val call-extern-id = FnId(`stz/vm, `call-extern, 0, 0, [DInt()])
+  val reg-array-id = ValId(`stz/vm, `register-array)
+  val imports = [
+    Import(0, ValRec(reg-array-id, DPtrT(DLong()), true, true), false)
+    Import(1, FnRec(call-extern-id, DInt(), true, false), false)]
+  val packageio = PackageIO(gensym(`bindings), [`stz/vm], imports, [])
+  val ids = BindingIds(GlobalId(0), CodeId(1))
+  [packageio, ids]
+
+defstruct BindingIds :
+  registers-array: GlobalId
+  call-extern: CodeId
+
+;<doc>=======================================================
+;=================== VM Extern Defns ========================
+;============================================================
+
+To convert extern defn bindings into a VMFunc we need the following
+things:
+
+  args: Tuple<Local|VMType>
+  defs: Tuple<VMDef>
+  ins: Tuple<VMIns>
+
+For the arguments, we need the arguments to match against the expected
+types of the C function. So first we need to create temporary locals
+for each of the arguments. The types are already given in binding.
+
+For the defs, we need:
+
+  reg-array: VMLong
+  result: return type
+
+For the instructions, we need to:
+
+  Load the VM registers array into a local.
+  Store false in reg-array[0] to indicate no closure.
+  Store number of arguments in reg-array[1] to indicate the arity.
+  Store each of the following arguments in reg-array[2 ...].
+  Call the stanza function stz/vm/call-extern with the desired extern index.
+  Load the return value into the result local.
+  Return the result local.
+
+;============================================================
+;=======================================================<doc>
+
+defn to-vmfunc (f:ExternDefnBinding, extern-index:Int, ids:BindingIds) :  
+  ;Generate locals for function
+  val local-counter = to-seq(0 to false)
+  val arg-locals = map(Local{next(local-counter)}, a1(f))
+
+  ;Generate defs
+  val reg-array = Local(next(local-counter))
+  val result-local = Local(next(local-counter))
+  val defs = Vector<VMDef>()
+  for (l in arg-locals, t in a1(f)) do :
+    add(defs, VMDef(index(l), t))
+  add(defs, VMDef(index(reg-array), VMLong()))
+  add(defs, VMDef(index(result-local), a2(f)))
+
+  ;Generate instructions
+  val ins = Vector<VMIns>()
+  defn E (i:VMIns) : add(ins,i)
+
+  ;Store arguments into register array with the proper calling
+  ;convention.
+  E $ LoadIns(reg-array, registers-array(ids), 0)
+  E $ StoreIns(reg-array, 0, NumConst(0L))
+  E $ StoreIns(reg-array, 8, NumConst(length(a1(f))))
+  for (l in arg-locals, i in 0 to false) do :
+    val offset = 8 * (i + 2)
+    E $ StoreIns(reg-array, offset, l)
+
+  ;Call the call-extern function with the given index,
+  ;and the proper calling convention.
+  E $ CallIns([], call-extern(ids), [NumConst(0), NumConst(1), NumConst(extern-index)], false)
+
+  ;Move the result into the result local.
+  E $ LoadIns(result-local, reg-array, 0)
+  
+  ;Return result
+  E $ ReturnIns([result-local])
+
+  ;Create and return function
+  VMFunc(arg-locals,
+         to-tuple(defs),
+         to-tuple(ins))
