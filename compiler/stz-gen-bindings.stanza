@@ -1,8 +1,14 @@
 defpackage stz/gen-bindings :
   import core
   import collections
+  import reader
   import stz/vm-ir
   import stz/bindings
+  import stz/il-ir
+  import stz/input
+  import stz/pkg
+  import stz/core-macros
+  import stz/utils
 
 ;<doc>=======================================================
 ;==================== Generating Bindings ===================
@@ -15,10 +21,184 @@ read them in as an IPackage.
 For .stanza files, read the files into IPackage datastructures.
 
 For .pkg files, read the files into Pkg datastructures. Note that we
-do not accept optimized pkgs.
+do not accept optimized pkgs, as the VM itself can only work with
+unoptimized bindings.
 
+# General Strategy #
+
+The files will be processed one-at-a-time. For each type of file, we
+will read in the necessary files, and scan through it for their
+definitions.
+
+# Scanning an IPackage #
+
+Scans through a package and returns the bindings.
+
+Input:
+  return:ExternBinding|ExternDefnBinding -> ?
+  ipackage:IPackage
+
+# Scanning a StdPkg #
+
+Scans through a package and returns the bindings.
+
+Input:
+  return:ExternBinding|ExternDefnBinding -> ?
+  package:StdPkg
 
 ;============================================================
 ;=======================================================<doc>
 
-println("Hello")
+defn generate-bindings (files:Tuple<String>, output:String) :
+  ;For loading unoptimized packages
+  val pkgloader = PkgLoader(false)
+
+  ;For accumulating errors
+  val errors = Vector<BindingException>()
+  defn error! (e:BindingException) : add(errors, e)
+  defn end-if-errors () : throw(BindingErrors(errors)) when not empty?(errors)      
+
+  ;Launcher
+  defn driver () :
+    val externs = Vector<ExternBinding>()
+    val extern-defns = Vector<ExternDefnBinding>()
+    for file in files do :
+      within input = read-input(file) :
+        within binding = scan-input(input) :
+          match(binding) :
+            (binding:ExternBinding) : add(externs, binding)
+            (binding:ExternDefnBinding) : add(extern-defns, binding)
+    scan-for-inconsistent-bindings(extern-defns)
+    end-if-errors()
+    val bindings = create-bindings(externs, extern-defns)
+    spit(output, bindings)
+
+  ;Read in the filename to their respective datastructures.
+  defn read-input (return:StdPkg|IPackage -> ?, filename:String) :
+    switch suffix?{filename, _} :
+      ".pkg" :
+        return(load-pkg(pkgloader, filename) as StdPkg)
+      ".stanza" :
+        val forms = read-file(filename)
+        val expanded = cons(`$begin, parse-syntax[core / #exps!](forms))
+        val core-imports = [IImport(`core), IImport(`collections)]
+        do(return, to-ipackages(expanded, core-imports))
+      else : throw(InvalidExtension(filename))
+
+  ;Scan for all bindings in the given input datastructure.
+  defn scan-input (return:ExternBinding|ExternDefnBinding -> ?, p:IPackage|StdPkg) :
+    match(p) :
+      (p:IPackage) : scan-ipackage(return, p)
+      (p:StdPkg) : scan-pkg(return, p)
+
+  ;<doc>================
+  ;==== Scan inputs ====
+  The expressions to watch for are ILSExtern and ILSExternFn.
+
+    ILSExtern:
+      name: IExp
+      type: IExp
+
+    ILSExternFn :
+      name: IExp
+      a1: List<IExp>
+      a2: IExp
+      args: List<IExp>
+      body: IExp
+      
+  ILExtern/name guaranteed to be IVar.
+  ILSExternFn/name guaranteed to be IVar.
+  
+  The types that we wish to handle are:
+    ILSByteT
+    ILSIntT
+    ILSLongT
+    ILSFloatT
+    ILSDoubleT
+    ILSPtrT
+    ILSRefT    
+  For the other types, indicate that there is an error.
+
+  The following expressions have to be recursed:
+    IBegin
+    IVisibility
+    
+  ;=====================
+  ;================<doc>
+  defn scan-ipackage (return:ExternBinding|ExternDefnBinding -> ?, p:IPackage) :
+    defn scan (e:IExp) :
+      match(e) :
+        (e:ILSExtern) :
+          return(ExternBinding(name!(name(e))))
+        (e:ILSExternFn) :
+          val fname = name!(name(e))
+          attempt :
+            defn to-vmtype! (e:IExp) :
+              match(e) :
+                (e:ILSByteT) : VMByte()
+                (e:ILSIntT) : VMInt()
+                (e:ILSLongT) : VMLong()
+                (e:ILSFloatT) : VMFloat()
+                (e:ILSDoubleT) : VMDouble()
+                (e:ILSPtrT) : VMLong()
+                (e:ILSRefT) : VMRef()
+                (e) : fail()
+            val a1* = to-tuple(seq(to-vmtype!, a1(e)))
+            val a2* = to-vmtype!(a2(e))
+            return(ExternDefnBinding(fname, a1*, a2*))
+          else :
+            error!(BindingTypeError(name(p), fname))
+        (e:IBegin) : do(scan,exps(e))
+        (e:IVisibility) : scan(exp(e))
+        (e) : false
+    do(scan, exps(p))
+
+  ;==== Scan a Pkg ====
+  ;Scan the vmpackage contained in the StdPkg.
+  ;Simply convert the externs and extern-defns into binding definitions.  
+  defn scan-pkg (return:ExternBinding|ExternDefnBinding -> ?, p:StdPkg) :
+    val vmp = vmp(p)
+    for e in externs(vmp) do :
+      return(ExternBinding(name(e)))
+    for e in extern-defns(vmp) do :
+      return(ExternDefnBinding(lbl(e), a1(e), a2(e)))
+            
+  ;Scan a sequence of ExternDefnBindings to check for
+  ;redundant definitions.
+  defn scan-for-inconsistent-bindings (bindings:Seqable<ExternDefnBinding>) :
+    for group in group-by(lbl, bindings) do :
+      val lbl = key(group)
+      val bindings = unique(seq(signature, value(group)))
+      if length(bindings) > 1 :
+        error!(InconsistentDefns(lbl, bindings))
+
+  ;Create bindings from sequence of bindings
+  defn create-bindings (externs:Seqable<ExternBinding>, extern-defns:Seqable<ExternDefnBinding>) :
+    defn remove-duplicates<?T> (key:T -> Symbol, es:Seqable<?T>) : to-tuple(values(to-hashtable(key, es)))
+    Bindings(remove-duplicates(lbl,externs), remove-duplicates(lbl,extern-defns))
+
+  ;===== Launcher =====
+  driver()
+
+public deftype BindingException <: Exception
+public defn BindingException (msg) :
+  val msg-str = to-string(msg)
+  new BindingException :
+    defmethod print (o:OutputStream, this) :
+      print(o, msg-str)
+
+defn BindingErrors (errors:Collection<BindingException>) :
+  BindingException("%n" % [errors])
+
+defn InconsistentDefns (lbl:Symbol, sigs:List<ExDefnSignature>) :
+  new BindingException :
+    defmethod print (o:OutputStream, this) :
+      print(o, "There are multiple conflicting signatures for extern defn %~:" % [lbl])
+      val o2 = IndentedStream(o)
+      for s in sigs do : lnprint(o2, s) 
+
+defn BindingTypeError (package:Symbol, name:Symbol) :
+  BindingException $ "Extern defn %~ in package %~ uses types that are unsupported by Stanza." % [package, name]
+  
+defn InvalidExtension (file:String) :
+  BindingException $ "File %~ does not have a valid Stanza file extension." % [file]
