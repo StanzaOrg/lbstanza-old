@@ -82,6 +82,8 @@ FILES="core/core.stanza \
        compiler/stz-asm-emitter.stanza \
        compiler/stz-pkg.stanza \
        compiler/stz-backend.stanza \
+       compiler/stz-gen-bindings.stanza \
+       compiler/stz-dependencies.stanza \
        compiler/call-records.stanza \
        compiler/stz-main.stanza \
        compiler/stz-driver.stanza"
