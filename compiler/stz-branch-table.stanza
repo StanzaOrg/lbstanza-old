@@ -45,6 +45,11 @@ public defstruct MultiFormat <: BranchFormat :
   num-args: Int
 with: (printer => true)
 
+defstruct ResolvedMultiFormat <: BranchFormat :
+  num-header-args: Int
+  branches: Tuple<LoadedMethod>
+with: (printer => true)
+
 ;============================================================
 ;================= Dispatch Format Creators  ================
 ;============================================================
@@ -94,9 +99,9 @@ public defn BranchTable (ct:ClassTable) :
   val format-table = HashTable<BranchFormat,Int>()
   val methods = Vector<LoadedMethod|False>()
 
-  ;All compiled actions corresponding to each format
-  val actions = Vector<DispatchAction|False>()
-  val stale-actions = Vector<Int>()
+  ;All compiled tables corresponding to each format
+  val trie-tables = PtrBuffer(8)
+  val stale-trie-tables = Vector<Int>()
 
   ;Format dependencies
   val format-class-dependencies = DynBiTable()
@@ -105,30 +110,39 @@ public defn BranchTable (ct:ClassTable) :
   val method-multi-table = DynBiTable() ;Mapping from method to multis
 
   ;==================================================
-  ;================ Action Invalidation =============
+  ;============= Trie Table Invalidation ============
   ;==================================================
-  ;Record an action as invalidated, so that it is updated next cycle
-  defn invalidate-action (i:Int) :
-    if i == length(actions) or actions[i] is-not False :
-      actions[i] = false
-      add(stale-actions, i)
+  ;Record a table as invalidated, so that it is updated next cycle.
+  defn invalidate-table (i:Int) :
+    remove(trie-tables, i)
+    add(stale-trie-tables, i)
       
-  defn invalidate-actions-of-multi (multi:Int) :
-    do(invalidate-action, multi-formats[multi])
+  defn invalidate-tables-of-multi (multi:Int) :
+    do(invalidate-table, multi-formats[multi])
 
-  defn update-actions () :
-    while not empty?(stale-actions) :
-      val i = pop(stale-actions)
-      val f = formats[i]
-      actions[i] = DispatchAction(ct, f, methods-of-multi)
+  defn update-trie-tables () :    
+    while not empty?(stale-trie-tables) :
+      val i = pop(stale-trie-tables)
+      compute-trie-table(i) when not key?(trie-tables, i)
     ensure-no-stale-actions!()
         
-  defn ensure-no-stale-actions! () :
+  defn ensure-no-stale-tables! () :
     #if-not-defined(OPTIMIZE) :
-      for i in 0 to length(actions) do :
-        if actions[i] is False :
-          fatal("Action %_ is stale." % [i])
+      for i in 0 to length(trie-tables) do :
+        if not key?(trie-tables, i) :
+          fatal("Trie table %_ is stale." % [i])
     false
+
+  ;==================================================
+  ;========== Computing the Trie Table ==============
+  ;==================================================
+  defn compute-trie-table (i:Int) :
+    val f* = resolve-format(formats[i])
+    update-trie-table(trie-table, ct, i, f*)
+    
+  defn resolve-format (f:BranchFormat) :
+    match(f:MultiFormat) : ResolvedMultiFormat(num-header-args(f), methods-of-multi(multi(f)))
+    else : f  
 
   ;==================================================
   ;================ Adding new Formats ==============
@@ -140,7 +154,7 @@ public defn BranchTable (ct:ClassTable) :
     format-table[bf] = i
     match(bf:MultiFormat) :
       add(multi-formats, multi(bf), i)
-    invalidate-action(i)
+    invalidate-table(i)
     i
 
   ;==================================================
@@ -150,12 +164,12 @@ public defn BranchTable (ct:ClassTable) :
     add(methods, LoadedMethod(multi(m), types(m), fid(m), package-name, instance?(m)))
     val id = length(methods) - 1
     method-class-dependencies[id] = class-dependencies(m)
-    invalidate-actions-of-multi(multi(m))
+    invalidate-tables-of-multi(multi(m))
     method-multi-table[id] = [multi(m)]
     
   defn remove-method (i:Int) :
     val m = methods[i] as LoadedMethod
-    invalidate-actions-of-multi(multi(m))
+    invalidate-tables-of-multi(multi(m))
     method-class-dependencies[i] = []
     methods[i] = false
     method-multi-table[i] = []
@@ -192,8 +206,8 @@ public defn BranchTable (ct:ClassTable) :
     ;class tree changes.
     new TreeListener :
       defmethod children-changed (this, c:Int) :
-        do(invalidate-action, formats-dependent-on-class(c))
-        do(invalidate-actions-of-multi, multis-dependent-on-class(c))
+        do(invalidate-table, formats-dependent-on-class(c))
+        do(invalidate-tables-of-multi, multis-dependent-on-class(c))
   add(ct, class-change-listener())
 
   ;==================================================
@@ -206,122 +220,136 @@ public defn BranchTable (ct:ClassTable) :
       match(get?(format-table, f)) :
         (i:Int) : i
         (_:False) : add-format(f)
-    defmethod dispatch (this, f:Int, types:Tuple<Int>) :
-      dispatch(actions[f] as DispatchAction, types)
+;    defmethod dispatch (this, f:Int, types:Tuple<Int>) :
+;      dispatch(actions[f] as DispatchAction, types)
     defmethod update (this) :
-      update-actions()
+      update-format-tables()
+    defmethod trie-table (this) :
+      trie-table
     defmethod load-package-methods (this, package:Symbol, ms:Seqable<VMMethod>) :
       load-package-methods(package, ms)
+
+defmulti trie-table (bt:ref<BranchTable>) -> ref<PtrBuffer>
+public lostanza defn trie-table-data (bt:ref<BranchTable>) -> ptr<int> :
+  return trie-table(bt).data
+
+lostanza defn update-trie-table (trie-table:ref<PtrBuffer>,
+                                 class-table:ref<ClassTable>,
+                                 i:ref<Int>,
+                                 f:ref<BranchFormat>) -> ref<False> :
+  val p = to-trie-table(class-table, f)
+  set(trie-table, i.value, p)
+  return false
 
 ;============================================================
 ;==================== Dispatch Actions ======================
 ;============================================================
-
-val DEFAULT-ACTION = fn (xtypes:Tuple<Int>, t:Int) : Default()
-
-defn compile-trie (t:MTrie) -> (Tuple<Int>, Int) -> DispatchResult :
-  match(t) :
-    (t:IfTrie) :
-      ;Compile the actions
-      var default = DEFAULT-ACTION
-      val actions = Vector<KeyValue<Int, ((Tuple<Int>, Int) -> DispatchResult)>>()
-      for entry in branches(t) do :
-        val t = compile-trie(value(entry))
-        match(key(entry)) :
-          (s:IAll) :
-            default = t
-          (s:ISubset) :
-            for x in xs(s) do :
-              add(actions, x => t)
-
-      ;Compile differently depending upon the number of branches.
-      val num-actions = length(actions)
-      if num-actions == 0 :
-        ;Just call the default action
-        fn* (xtypes:Tuple<Int>, i:Int) :
-          default(xtypes, i + 1)
-      else if num-actions == 1 :
-        ;Check and call the default action if no match
-        val x0 = key(actions[0])
-        val a0 = value(actions[0])
-        fn* (xtypes:Tuple<Int>, i:Int) :
-          val x = xtypes[i]
-          if x == x0 : a0(xtypes, i + 1)
-          else : default(xtypes, i + 1)          
-      else if num-actions <= 4 :
-        ;Linear search
-        fn* (xtypes:Tuple<Int>, i:Int) :
-          val x = xtypes[i]
-          let loop (j:Int = 0) :
-            if j < num-actions :
-              if x == key(actions[j]) : value(actions[j])(xtypes, i + 1)
-              else : loop(j + 1)
-            else : default(xtypes, i + 1)
-      else :
-        ;Table lookup
-        val table = IntTable<((Tuple<Int>, Int) -> DispatchResult)>()
-        for entry in actions do :
-          table[key(entry)] = value(entry)
-        ;Cache of last taken
-        var last-x:Int|False = false
-        var last-a:((Tuple<Int>, Int) -> DispatchResult)|False = false
-        ;Return closure
-        fn* (xtypes:Tuple<Int>, i:Int) :
-          ;Retrieve i'th type tag
-          val x = xtypes[i]
-          ;Retrieve either cached action or lookup action
-          val a =
-            if x == last-x :
-              last-a as (Tuple<Int>, Int) -> DispatchResult
-            else :
-              val a = get?(table, xtypes[i], default)
-              last-x = x
-              last-a = a
-              a
-          ;Execute action
-          a(xtypes, i + 1)
-    (t:EndTrie) :
-      ;Return target
-      val tgt = target(t)
-      fn* (xtypes:Tuple<Int>, i:Int) :
-        tgt
-        
-defn compile-action (bs:Seq<IDispatchBranch>) :
-  val f = DEFAULT-ACTION when empty?(bs)
-     else compile-trie(to-trie(bs))
-  new DispatchAction :
-    defmethod dispatch (this, xtypes:Tuple<Int>) :
-      f(xtypes, 0)
-
-defn DispatchAction (ct:ClassTable, f:BranchFormat,
-                     methods:Int -> Tuple<LoadedMethod>) :
-  defn isets-list (ts:Seqable<TypeSet>) :
-    to-list(seq(to-iset{ct, _}, ts))
-  defn isets-tuple (ts:Seqable<TypeSet>) :
-    to-tuple(seq(to-iset{ct, _}, ts))
-    
-  compile-action $ match(f) :
-    (f:MatchFormat) :
-      seq(IBranch{isets-list(_), _}, branches(f), 0 to false)
-    (f:DispatchFormat) :
-      val indexed-branches = to-tuple $ seq(KeyValue, branches(f), 0 to false)
-      val dispatch-branches = dispatch-ordering(ct, indexed-branches, key)
-      for b in dispatch-branches seq :
-        match(b) :
-          (b:KeyValue<Tuple<TypeSet>,Int>) :
-            IBranch(isets-list(key(b)), value(b))
-          (bs:Tuple<KeyValue<Tuple<TypeSet>,Int>>) :
-            val sets = map(isets-tuple{key(_)}, bs)
-            IAmb(sets, Amb())
-    (f:MultiFormat) :
-      val dispatch-methods = dispatch-ordering(ct, methods(multi(f)), types)
-      for m in dispatch-methods seq :
-        match(m) :
-          (m:LoadedMethod) :
-            IBranch(isets-list(types(m)), CodeId(fid(m)))
-          (ms:Tuple<LoadedMethod>) :
-            val sets = map(isets-tuple{types(_)}, ms)
-            IAmb(sets, Amb())
+;
+;val DEFAULT-ACTION = fn (xtypes:Tuple<Int>, t:Int) : Default()
+;
+;defn compile-trie (t:MTrie) -> (Tuple<Int>, Int) -> DispatchResult :
+;  match(t) :
+;    (t:IfTrie) :
+;      ;Compile the actions
+;      var default = DEFAULT-ACTION
+;      val actions = Vector<KeyValue<Int, ((Tuple<Int>, Int) -> DispatchResult)>>()
+;      for entry in branches(t) do :
+;        val t = compile-trie(value(entry))
+;        match(key(entry)) :
+;          (s:IAll) :
+;            default = t
+;          (s:ISubset) :
+;            for x in xs(s) do :
+;              add(actions, x => t)
+;
+;      ;Compile differently depending upon the number of branches.
+;      val num-actions = length(actions)
+;      if num-actions == 0 :
+;        ;Just call the default action
+;        fn* (xtypes:Tuple<Int>, i:Int) :
+;          default(xtypes, i + 1)
+;      else if num-actions == 1 :
+;        ;Check and call the default action if no match
+;        val x0 = key(actions[0])
+;        val a0 = value(actions[0])
+;        fn* (xtypes:Tuple<Int>, i:Int) :
+;          val x = xtypes[i]
+;          if x == x0 : a0(xtypes, i + 1)
+;          else : default(xtypes, i + 1)          
+;      else if num-actions <= 4 :
+;        ;Linear search
+;        fn* (xtypes:Tuple<Int>, i:Int) :
+;          val x = xtypes[i]
+;          let loop (j:Int = 0) :
+;            if j < num-actions :
+;              if x == key(actions[j]) : value(actions[j])(xtypes, i + 1)
+;              else : loop(j + 1)
+;            else : default(xtypes, i + 1)
+;      else :
+;        ;Table lookup
+;        val table = IntTable<((Tuple<Int>, Int) -> DispatchResult)>()
+;        for entry in actions do :
+;          table[key(entry)] = value(entry)
+;        ;Cache of last taken
+;        var last-x:Int|False = false
+;        var last-a:((Tuple<Int>, Int) -> DispatchResult)|False = false
+;        ;Return closure
+;        fn* (xtypes:Tuple<Int>, i:Int) :
+;          ;Retrieve i'th type tag
+;          val x = xtypes[i]
+;          ;Retrieve either cached action or lookup action
+;          val a =
+;            if x == last-x :
+;              last-a as (Tuple<Int>, Int) -> DispatchResult
+;            else :
+;              val a = get?(table, xtypes[i], default)
+;              last-x = x
+;              last-a = a
+;              a
+;          ;Execute action
+;          a(xtypes, i + 1)
+;    (t:EndTrie) :
+;      ;Return target
+;      val tgt = target(t)
+;      fn* (xtypes:Tuple<Int>, i:Int) :
+;        tgt
+;        
+;defn compile-action (bs:Seq<IDispatchBranch>) :
+;  val f = DEFAULT-ACTION when empty?(bs)
+;     else compile-trie(to-trie(bs))
+;  new DispatchAction :
+;    defmethod dispatch (this, xtypes:Tuple<Int>) :
+;      f(xtypes, 0)
+;
+;defn DispatchAction (ct:ClassTable, f:BranchFormat,
+;                     methods:Int -> Tuple<LoadedMethod>) :
+;  defn isets-list (ts:Seqable<TypeSet>) :
+;    to-list(seq(to-iset{ct, _}, ts))
+;  defn isets-tuple (ts:Seqable<TypeSet>) :
+;    to-tuple(seq(to-iset{ct, _}, ts))
+;    
+;  compile-action $ match(f) :
+;    (f:MatchFormat) :
+;      seq(IBranch{isets-list(_), _}, branches(f), 0 to false)
+;    (f:DispatchFormat) :
+;      val indexed-branches = to-tuple $ seq(KeyValue, branches(f), 0 to false)
+;      val dispatch-branches = dispatch-ordering(ct, indexed-branches, key)
+;      for b in dispatch-branches seq :
+;        match(b) :
+;          (b:KeyValue<Tuple<TypeSet>,Int>) :
+;            IBranch(isets-list(key(b)), value(b))
+;          (bs:Tuple<KeyValue<Tuple<TypeSet>,Int>>) :
+;            val sets = map(isets-tuple{key(_)}, bs)
+;            IAmb(sets, Amb())
+;    (f:MultiFormat) :
+;      val dispatch-methods = dispatch-ordering(ct, methods(multi(f)), types)
+;      for m in dispatch-methods seq :
+;        match(m) :
+;          (m:LoadedMethod) :
+;            IBranch(isets-list(types(m)), CodeId(fid(m)))
+;          (ms:Tuple<LoadedMethod>) :
+;            val sets = map(isets-tuple{types(_)}, ms)
+;            IAmb(sets, Amb())
 
 ;============================================================
 ;==================== Utilities =============================
@@ -367,6 +395,154 @@ defn multi-dependencies (f:BranchFormat) :
     (f:MultiFormat) : [multi(f)]
     (f:DispatchFormat|MatchFormat) : []
 
+;<doc>=======================================================
+;================== PtrBuffer Datastructure =================
+;============================================================
+
+# Creation of PtrBuffer #
+
+Input:
+  n:ref<Int>
+Output:
+  buffer:ref<PtrBuffer>
+
+# Store new pointer into PtrBuffer #
+
+Input:
+  b:ref<PtrBuffer>
+  i:int
+  p:ptr<?>
+
+# Retrieve the data pointer of ref<PtrBuffer> #
+
+  p.data
+
+# Check whether key i exists in PtrBuffer #
+
+Input:
+  b:ref<PtrBuffer>
+  i:ref<Int>
+Output:
+  exists?:ref<True|False>
+
+# Remove an entry i from PtrBuffer #
+
+Input:
+  b:ref<PtrBuffer>
+  i:ref<Int>
+Output:
+  removed?:ref<True|False>
+
+;============================================================
+;=======================================================<doc>
+
+public lostanza deftype PtrBuffer :
+  length: int
+  data: ptr<ptr<?>>
+
+lostanza defn PtrBuffer (n:ref<Int>) -> ref<PtrBuffer> :
+  val len = n.value
+  val data:ptr<ptr<?>> = call-c clib/malloc(len * sizeof(ptr<?>))
+  for (var i:int = 0, i < len, i = i + 1) :
+    data[i] = null
+  return new PtrBuffer{len, data}
+
+lostanza defn ensure-capacity (p:ref<PtrBuffer>, c:int) -> int :
+  val l0 = p.length
+  if l0 < c :
+    ;Compute new length
+    var l:int = l0
+    while l < c : l = l * 2
+    ;Allocate new data, and copy old stuff over
+    val data:ptr<ptr<?>> = call-c clib/malloc(l * sizeof(ptr<?>))
+    call-c clib/memcpy(data, p.data, l0 * sizeof(ptr<?>))
+    ;Void out left over slots
+    for (var i:int = l0, i < l, i = i + 1) :
+      data[i] = null
+    ;Free old data, and set new data and length
+    call-c clib/free(p.data)
+    p.data = data
+    p.length = l
+  return 0
+
+lostanza defn set (p:ref<PtrBuffer>, i:int, p*:ptr<?>) -> int :
+  ensure-capacity(p, i + 1)
+  ;Free old ptr
+  val p0 = p.data[i]
+  if p0 != null : call-c clib/free(p0)
+  ;Store new ptr
+  p.data[i] = p*    
+  return 0
+
+lostanza defn key? (p:ref<PtrBuffer>, i:ref<Int>) -> ref<True|False> :
+  if i.value < p.length :
+    val p = p.data[i.value]
+    if p == null : return false
+    else : return true
+  else :
+    return false
+
+lostanza defn remove (p:ref<PtrBuffer>, i:ref<Int>) -> ref<True|False> :
+  if i.value < p.length :
+    val p = p.data[i.value]
+    if p == null :
+      return false
+    else :
+      call-c clib/free(p)
+      p.data[i.value] = null
+      return true
+  else :
+    return false
+
+lostanza defn length (p:ref<PtrBuffer>) -> ref<Int> :
+  return new Int{p.length}
+
+;<doc>=======================================================
+;================ Encoding of Branch Formats ================
+;============================================================
+
+# Conversion of a Typeset into an ISet #
+
+Input:
+  ct:ClassTable
+  t:TypeSet
+Output:
+  set:ISet
+
+# Conversion of a BranchFormat into list of IDispatchBranch #
+
+Input:
+  ct:ClassTable
+  f:BranchFormat
+Output:
+  branches:Tuple<IDispatchBranch>
+
+# Conversion of a BranchFormat into an encoded Vector<Int> #
+
+Input:
+  ct:ClassTable
+  f:BranchFormat
+Output:
+  table:Vector<Int>
+
+# Conversion of a Vector<int> into a ptr<int> #
+
+Input:
+  xs:Vector<Int>
+Output:
+  ys:ptr<int>
+
+# Conversion of a BranchFormat into a ptr<int> #
+
+Input:
+  ct:ref<ClassTable>
+  f:ref<BranchFormat>
+Output:
+  table:ptr<int>
+
+;============================================================
+;=======================================================<doc>
+
 ;Convert a typeset to an iset
 defn to-iset (ct:ClassTable, t:TypeSet) :
   defn union (a:ISet, b:ISet) :
@@ -379,3 +555,45 @@ defn to-iset (ct:ClassTable, t:TypeSet) :
       (t:OrType) : reduce(union, seq(loop, types(t)))
       (t:TopType) : IAll()
       (t:SingleType) : ISubset(children(ct, type(t)))
+
+;Convert a BranchFormat to a tuple of IBranch
+defn to-ibranches (ct:ClassTable, f:BranchFormat) -> Tuple<IDispatchBranch> :
+  match(f) :
+    (f:MatchFormat) :
+      to-tuple $ for (b in branches(f), i in 0 to false) seq :
+        IBranch(to-list(isets(b)), i + 1)
+    (f:DispatchFormat) :
+      val indexed-branches = to-tuple(seq(KeyValue, branches(f), 0 to false))
+      val ordered-branches = dispatch-ordering(ct, indexed-branches, key)
+      to-tuple $ for b in ordered-branches seq :
+        match(b) :
+          (b:KeyValue<Tuple<TypeSet>,Int>) :
+            IBranch(to-list(isets(key(b))), value(b) + 2)
+          (bs:Tuple<KeyValue<Tuple<TypeSet>,Int>>) :
+            val sets = map(to-tuple{isets(key(_))}, bs)
+            IAmb(sets, 1)
+    (f:ResolvedMultiFormat) :
+      val ordered-methods = dispatch-ordering(ct, methods(f), types)
+      to-tuple $ for m in ordered-methods seq :
+        match(m) :
+          (m:LoadedMethod) :
+            IBranch(to-list(isets(types(m))), fid(m) + 2)
+          (ms:Tuple<LoadedMethod>) :
+            val sets = map(to-tuple{isets(types(_))}, ms)
+            IAmb(sets, 1)
+
+;Conversion of a BranchFormat into an encoded Vector<Int>
+defn encode-branch-format (ct:ClassTable, f:BranchFormat) -> Vector<Int> :
+  encode-trie(to-ibranches(ct, f))
+
+;Conversion of a Vector<int> into a ptr<int>
+lostanza defn to-int-ptr (xs:ref<Vector<Int>>) -> ptr<int> :
+  val n = length(xs).value
+  val p:ptr<int> = call-c clib/malloc(n * sizeof(int))
+  for (var i:int = 0, i < n, i = i + 1) :
+    p[i] = get(xs, new Int{i}).value
+  return p
+
+;Conversion of a BranchFormat into a ptr<int>
+lostanza defn to-trie-table (ct:ClassTable, f:BranchFormat) -> ptr<int> :
+  return to-int-ptr(encode-branch-format(ct, f))
