@@ -58,6 +58,8 @@ FILES="core/core.stanza \
        compiler/stz-dyn-tree.stanza \
        compiler/stz-dyn-bi-table.stanza \
        compiler/stz-vm-table.stanza \
+       compiler/stz-trie-table.stanza \
+       compiler/stz-hash.stanza \
        compiler/stz-branch-table.stanza \
        compiler/stz-vm-analyze.stanza \
        compiler/stz-vm-bindings.stanza \
