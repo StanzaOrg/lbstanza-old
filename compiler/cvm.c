@@ -35,8 +35,7 @@
 #define TCALL_OPCODE_CODE 24
 #define TCALL_CLOSURE_OPCODE 26
 #define CALLC_OPCODE_LOCAL 27
-#define CALLC_OPCODE_EXTERN 29
-#define CALLC_OPCODE_EXTERN_DEFN 28
+#define CALLC_OPCODE_WIDE 28
 #define POP_FRAME_OPCODE 30
 #define LIVE_OPCODE 31
 #define YIELD_OPCODE 32
@@ -436,11 +435,9 @@ typedef struct{
 //========================= TRAPS ============================
 //============================================================
 
-void call_c_launcher (VMState* vms, int index, uint64_t faddr);
 int call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
-int dispatch_branch (VMState* vms, int format);
 char* retrieve_class_name (VMState* vms, long id);
 void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
 
@@ -678,26 +675,13 @@ void vmloop (VMState* vms){
       POP_FRAME(num_locals);
       continue;
     }
-    case CALLC_OPCODE_EXTERN : {
+    case CALLC_OPCODE_WIDE : {
       DECODE_D();
       void* faddr = (void*)value;
       int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
       c_trampoline(faddr, registers, registers);      
-      RESTORE_STATE();
-      pc = instructions + stack_pointer->returnpc;      
-      POP_FRAME(num_locals);
-      continue;
-    }
-    case CALLC_OPCODE_EXTERN_DEFN : {
-      DECODE_C();
-      uint64_t faddr = extern_defn_addresses[value];
-      int format = x;
-      int num_locals = y;
-      PUSH_FRAME(num_locals);
-      SAVE_STATE();
-      call_c_launcher(vms, format, faddr);
       RESTORE_STATE();
       pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
