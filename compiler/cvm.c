@@ -35,8 +35,7 @@
 #define TCALL_OPCODE_CODE 24
 #define TCALL_CLOSURE_OPCODE 26
 #define CALLC_OPCODE_LOCAL 27
-#define CALLC_OPCODE_EXTERN 29
-#define CALLC_OPCODE_EXTERN_DEFN 28
+#define CALLC_OPCODE_WIDE 28
 #define POP_FRAME_OPCODE 30
 #define LIVE_OPCODE 31
 #define YIELD_OPCODE 32
@@ -363,7 +362,6 @@
 #define BYTE_TAG_BITS 3
 #define CHAR_TAG_BITS 4
 #define FLOAT_TAG_BITS 5  
-
 #define FALSE_TYPE 0
 #define TRUE_TYPE 1
 #define BYTE_TYPE 2
@@ -410,6 +408,8 @@ typedef struct{
   //System state
   uint64_t system_stack;  
   uint64_t* system_registers;
+  //Trie table
+  void** trie_table;
 } VMState;
 
 typedef struct{
@@ -435,13 +435,16 @@ typedef struct{
 //========================= TRAPS ============================
 //============================================================
 
-void call_c_launcher (VMState* vms, int index, uint64_t faddr);
 int call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
-int dispatch_branch (VMState* vms, int format);
 char* retrieve_class_name (VMState* vms, long id);
 void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
+
+//============================================================
+//=================== Forward Declarations ===================
+//============================================================
+int read_dispatch_table (VMState* vms, int format);
 
 //============================================================
 //===================== MAIN LOOP ============================
@@ -672,26 +675,13 @@ void vmloop (VMState* vms){
       POP_FRAME(num_locals);
       continue;
     }
-    case CALLC_OPCODE_EXTERN : {
+    case CALLC_OPCODE_WIDE : {
       DECODE_D();
       void* faddr = (void*)value;
       int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
       c_trampoline(faddr, registers, registers);      
-      RESTORE_STATE();
-      pc = instructions + stack_pointer->returnpc;      
-      POP_FRAME(num_locals);
-      continue;
-    }
-    case CALLC_OPCODE_EXTERN_DEFN : {
-      DECODE_C();
-      uint64_t faddr = extern_defn_addresses[value];
-      int format = x;
-      int num_locals = y;
-      PUSH_FRAME(num_locals);
-      SAVE_STATE();
-      call_c_launcher(vms, format, faddr);
       RESTORE_STATE();
       pc = instructions + stack_pointer->returnpc;      
       POP_FRAME(num_locals);
@@ -1334,7 +1324,7 @@ void vmloop (VMState* vms){
     case TYPEOF_OPCODE : {
       DECODE_C();
       int format = value;
-      int index = dispatch_branch(vms, format);
+      int index = read_dispatch_table(vms, format);
       SET_LOCAL(x, index);
       continue;
     }
@@ -1813,7 +1803,7 @@ void vmloop (VMState* vms){
       uint32_t* tgts = (uint32_t*)(pc + 4);
       //DECODE_TGTS();
       int format = value;
-      int index = dispatch_branch(vms, format);
+      int index = read_dispatch_table(vms, format);
       int tgt = tgts[index];
       pc = pc0 + (tgt * 4);
       continue;
@@ -1823,7 +1813,7 @@ void vmloop (VMState* vms){
       uint32_t* tgts = (uint32_t*)(pc + 4);
       //DECODE_TGTS();
       int format = value;
-      int index = dispatch_branch(vms, format);
+      int index = read_dispatch_table(vms, format);
       if(index < 2){
         int tgt = tgts[index];
         pc = pc0 + (tgt * 4);
@@ -1884,5 +1874,113 @@ void vmloop (VMState* vms){
     //Done    
     printf("Invalid opcode: %d\n", opcode);
     exit(-1);
+  }
+}
+
+//============================================================
+//================= Dispatch Interpreter =====================
+//============================================================
+
+typedef struct {
+  int index;
+  int n;
+} TrieTable;
+
+typedef struct {
+  int d0;
+  int dtable[];
+} DTable;
+
+typedef struct {
+  int key;
+  int value;
+} DKV;
+
+int PRIM_TYPEIDS[] = {INT_TYPE, 0, 0, BYTE_TYPE, CHAR_TYPE, FLOAT_TYPE};
+
+int argtype (VMState* vms, int i){
+  uint64_t x = vms->registers[i];
+  int tagbits = (int)x & 0x7;
+  if(tagbits == REF_TAG_BITS){
+    int* p = (int*)(x - 1);
+    return *p;
+  }
+  else if(tagbits == MARKER_TAG_BITS){
+    return (int)(x >> 3);
+  }
+  else{
+    return PRIM_TYPEIDS[tagbits];
+  }
+}
+
+DKV* small_etable (TrieTable* trie_table){
+  void* p = trie_table;
+  return p + sizeof(TrieTable);
+}
+
+DKV* big_etable (DTable* dtable, int n){
+  void* p = dtable->dtable + n;
+  return p;
+}
+
+DTable* trie_dtable (TrieTable* trie_table){
+  void* p = trie_table;
+  return p + sizeof(TrieTable);
+}
+
+int default_value (DKV* etable, int n){
+  return etable[n].key;
+}
+
+int lookup_small_etable (DKV* etable, int t, int n){
+  for(int i=0; i<n; i++){
+    DKV e = etable[i];
+    if(e.key == t) return e.value;
+  }
+  return default_value(etable,n);
+}
+
+int lookup_etable (DKV* etable, int slot, int t, int n){
+  DKV e = etable[slot];
+  if(e.key == t) return e.value;
+  return default_value(etable,n);
+}
+
+int dhash (int d, int x, int n){
+  unsigned int a = x;
+  a = (a + 0x7ed55d16 + d) + (a << 12);
+  a = (a ^ 0xc761c23c) ^ (a >> 19);
+  a = (a + 0x165667b1) + (a << 5);
+  a = (a + 0xd3a2646c) ^ (a << 9);
+  a = (a + 0xfd7046c5) + (a << 3);
+  a = (a ^ 0xb55a4f09) ^ (a >> 16);
+  return ((int)a & 0x7FFFFFFF) % n;
+}
+
+int lookup_trie_table (VMState* vms, TrieTable* trie_table){
+  int n = trie_table->n;
+  int type = argtype(vms, trie_table->index);
+  if(n <= 4){
+    return lookup_small_etable(small_etable(trie_table), type, n);
+  }else{
+    DTable* dtable = trie_dtable(trie_table);
+    int dslot = dhash(dtable->d0, type, n);
+    int d = dtable->dtable[dslot];
+    if(d == 0){
+      return default_value(big_etable(dtable,n), n);
+    }else{
+      int slot = d < 0? -d - 1 : dhash(d, type, n);
+      return lookup_etable(big_etable(dtable,n), slot, type, n);
+    }
+  }  
+}
+
+int read_dispatch_table (VMState* vms, int format){
+  int* trie_table = vms->trie_table[format];
+  int table_offset = 0;
+  while(1){
+    int value = lookup_trie_table(vms, (TrieTable*)(trie_table + table_offset));
+    if(value < 0) return -value - 1;
+    table_offset = value;
   }
 }
