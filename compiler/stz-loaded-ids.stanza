@@ -20,10 +20,10 @@ to, may refer to different things.
 
 # Fundamental State #
 
-  fn-recs:Vector<FnId>
-  global-recs:Vector<ValId>
-  class-recs:Vector<TypeId>
-  data-recs:DataPool
+  fn-ids:Vector<FnId>
+  global-ids:Vector<ValId>
+  class-ids:Vector<TypeId>
+  data-pool:DataPool
   const-pool:ConstantPool
 
 For fn-recs, global-recs, class-recs, the array index is the
@@ -46,124 +46,355 @@ are the set of definitions that it depends upon.
 ;============================================================
 
 public deftype LoadedIds
-public defmulti make-package-ids (ids:LoadedIds, vmps:Collection<VMPackage>) -> False
-public defmulti package-ids (ids:LoadedIds, vmpackage:VMPackage) -> PackageIds
-public defmulti function-dependencies (ids:LoadedIds, function:Int) -> Tuple<Rec>
-public defmulti class-dependencies (ids:LoadedIds, class:Int) -> Tuple<Rec>
-public defmulti get (ids:LoadedIds, id:RecId) -> Int
-public defmulti key? (ids:LoadedIds, id:RecId) -> True|False
-
-public deftype PackageIds
-public defmulti get (ids:PackageIds, n:Int) -> Int
-public defmulti set-function-dependencies (ids:PackageIds, n:Int, ds:Tuple<Int>) -> False
-public defmulti set-class-dependencies (ids:PackageIds, n:Int, ds:Tuple<Int>) -> False
-public defmulti consts (ids:PackageIds) -> Vector<VMConst>
 
 public defn LoadedIds () :
-  ;Tables
+  ;Fundamental State
   val id-table = HashTable<RecId,Int>()
-  val function-dependencies = IntTable<Tuple<Rec>>()
-  val class-dependencies = IntTable<Tuple<Rec>>()
-  val constant-pool = HashTable<?,Int>()
+  val fn-ids = Vector<FnId|False>()
+  val global-ids = Vector<ValId|False>()
+  val class-ids = Vector<TypeId|False>()
+  val data-pool = DataPool()
+  val const-pool = ConstantPool()
+  
+  ;Dependency Tracking
+  val function-dependencies = Vector<Tuple<Rec>>()
+  val class-dependencies = Vector<Tuple<Rec>>()
 
-  ;Counters
-  val fn-counter = to-seq(0 to false)
-  val extern-counter = to-seq(0 to false)
-  val global-counter = to-seq(0 to false)
-  val data-counter = to-seq(0 to false)
-  val class-counter = to-seq(NUM-BUILTIN-TYPES to false)
-  defn make-fn-id () : next(fn-counter)
-  defn make-extern-id () : next(extern-counter)
-  defn make-global-id () : next(global-counter)
-  defn make-data-id () : next(data-counter)
-  defn make-class-id () : next(class-counter)
+  ;Make an Id
+  defn make-fn-id () -> Int :
+    add(fn-ids, false)
+    add(function-dependencies, [])
+    length(fn-ids) - 1
+  defn make-class-id () -> Int :
+    add(class-ids, false)
+    add(class-dependencies, [])
+    length(class-ids) - 1
+  defn make-global-id () -> Int :
+    add(global-ids, false)
+    length(global-ids) - 1
 
-  ;Make global id
-  defn make-id (r:Rec) :
-    if not key?(id-table, id(r)) :
-      val f = match(r) :
-        (r:ValRec) : make-global-id
-        (r:FnRec) : make-fn-id
-        (r:MultiRec) : make-fn-id
-        (r:ExternRec) : make-extern-id
-        (r:StructRec) : make-class-id
-        (r:TypeRec) : make-class-id
-        (r:ExternFnRec) : make-fn-id
-      id-table[id(r)] = f()
-    id-table[id(r)]
+  ;Assign a given record a new Id
+  defn assign-id (r:RecId) -> Int :
+    ;Get id and id vector
+    val [ids, i] = match(r) :
+      (r:FnId) : [fn-ids, make-fn-id()]
+      (r:ValId) : [global-ids, make-global-id()]
+      (r:TypeId) : [class-ids, make-class-id()]
+    add(ids, r)
+    id-table[r] = i
+    i
 
-  ;Populate built-in IDs
-  for (name in [`False, `True, `Byte, `Char, `Int,
-                `Float, `Stack, `Fn, `Type, `LivenessTracker],
-       i in [FALSE-TYPE, TRUE-TYPE, BYTE-TYPE, CHAR-TYPE, INT-TYPE,
-             FLOAT-TYPE, STACK-TYPE, FN-TYPE, TYPE-TYPE, LIVENESS-TRACKER-TYPE]) do :
-    id-table[TypeId(`core, name)] = i
+  ;Assign existing ids
+  defn assign-ids (rs0:Seqable<KeyValue<RecId,Int>>) :
+    ;Put into array, and sort by i
+    val rs = to-array<KeyValue<RecId,Int>>(rs0)
+    qsort!(value, rs)
+    ;Assume that the index is dense
+    for e in rs do :
+      val i = assign-id(key(e))
+      fatal("Assigned id (%_) is not the desired id (%_)." % [i, value(e)]) when i != value(e)
+  assign-ids $ [
+    TypeId(`core, `False) => FALSE_TYPE
+    TypeId(`core, `True) => TRUE-TYPE
+    TypeId(`core, `Byte) => BYTE-TYPE
+    TypeId(`core, `Char) => CHAR-TYPE
+    TypeId(`core, `Int) => INT-TYPE
+    TypeId(`core, `Float) => FLOAT-TYPE
+    TypeId(`core, `Stack) => STACK-TYPE
+    TypeId(`core, `Fn) => FN-TYPE
+    TypeId(`core, `Type) => TYPE-TYPE
+    TypeId(`core, `LivenessTracker) => LIVENESS-TRACKER-TYPE]
 
-  ;Create PackageIds
-  defn package-ids (vmp:VMPackage) :
-    ;Populate table with global ids
-    val table = IntTable<Int>()
-    val recs = IntTable<Rec>()
-    for e in cat(imports(packageio(vmp)), exports(packageio(vmp))) do :
-      table[n(e)] = id-table[id(rec(e))]
-      recs[n(e)] = rec(e)
+  ;Form a single LoadUnit from a group of packages
+  defn load-packages (pkgs:Tuple<VMPackage>) -> LoadUnit :
+    ;Driver
+    defn driver () :
+      assign-export-ids()
+      val imports = Vector<Import>()
+      val exports = Vector<Export>()
+      val packages = Vector<LoadPackage>()
+      val classes = Vector<VMClass>()
+      val funcs = Vector<VMData>()
+      for pgk in pkgs do :
+        val [global-ids, callback-indices] = create-global-ids(pkg)
+        add-all(imports, resolved-imports(pkg, global-ids))
+        add-all(exports, resolved-exports(pkg, global-ids))
+        add(packages, make-load-package(pkg, global-ids))
+        add-all(classes, resolved-classes(pkg, global-ids))
+        add-all(funcs, resolved-funcs(pkg, global-ids, callback-indices))
+      val datas = datas(data-pool)[num-old-datas to false]
+      val consts = consts(const-pool)[num-old-classes to false]
+      remove-duplicates!(imports)
+      LoadUnit(
+        to-tuple(imports),
+        to-tuple(exports),
+        to-tuple(packages),
+        datas,
+        consts,
+        to-tuple(classes),
+        to-tuple(funcs))
 
-    ;Populate table with local ids
-    defn make-local-ids<?T> (entries:VMPackage -> Seqable<?T>, n:T -> Int, id:() -> Int) :
-      for e in entries(vmp) do :
-        val n = n(e)
-        if not key?(table, n) :
-          table[n] = id()
-    make-local-ids(globals, id, make-global-id)
-    make-local-ids(datas, id, make-data-id)
-    make-local-ids(classes, id, make-class-id)
-    make-local-ids(funcs, id, make-fn-id)
-    make-local-ids(externs, id, make-extern-id)
+    ;Assign global export ids to all exported definitions in all packages
+    defn assign-export-ids () :
+      for pkg in pkgs do :
+        for e in exports(packageio(pkg)) do :
+          assign-id(id(rec(e)))
 
-    ;Add consts to pool
-    val package-consts = Vector<VMConst>()
-    defn intern-const (v:VMValue) -> VMInternedConst :
-      if key?(constant-pool, v) :
-        VMInternedConst(ConstId(constant-pool[v]))
-      else :
-        val v* = match(v) :
-          (v:List) : map(intern-const, v)
-          (v) : v
-        val i = length(constant-pool)
-        constant-pool[v] = i
-        add(package-consts, VMConst(i, v*))
-        VMInternedConst(ConstId(i))
-    ;Add package constants
-    for c in consts(vmp) do :
-      ;First resolve any type objects or code objects
-      val v* = map-id({table[_]}, value(c))
-      ;Then intern the value
-      val c* = intern-const(v*)
-      ;Record the mapping
-      table[id(c)] = id(id(c*))
+    ;Compute global ids for all definitions in package
+    defn create-global-ids (pkg:VMPackage) -> [IntTable, IntTable] :
+      val global-ids = IntTable()
+      ;First record ids for imported and exported definitions
+      for i in cat(imports(packageio(pkg)), exports(packageio(pkg))) do :
+        val local-id = n(i)
+        val global-id = id-table[id(rec(i))]
+        global-ids[local-id] = global-id
+      ;Then create ids for unexported definitions
+      defn create-ids<?T> (entries: VMPackage -> ?T, local-id: T -> Int, make-id: () -> Int) :
+        for e in entries(pkg) do :
+          if not key?(global-ids, local-id(e)) :
+            global-ids[local-id(e)] = make-id()
+      create-ids(globals, id, make-global-id)
+      create-ids(classes, id, make-class-id)
+      create-ids(funcs, id, make-fn-id)
+      ;Then create ids for datas and consts
+      for d in datas(pkg) do :
+        val local-id = id(d)
+        val global-id = intern(data-pool, data(d))
+        global-ids[local-id] = global-id
+      for c in consts(pkg) do :
+        val local-id = id(c)
+        val value* = map-id({global-ids[_]}, value(c))
+        val global-id = id(intern(const-pool, value*))
+        global-ids[local-id] = global-id
+      ;Then create ids for externs
+      for e in externs(pkg) do :
+        val local-id = id(e)
+        val global-id = extern-id-table[name(e)]
+        global-ids[local-id] = global-id
+      ;Then create callback indices for extern defns
+      val callback-indices = IntTable()
+      for e in extern-defns(pkg) do :
+        val local-id = fid(e)
+        val callback-index = callback-index-table[lbl(e)]
+        callback-indices[local-id] = callback-index
+      ;Return ids
+      [global-ids, callback-indices]
 
-    ;Return Structure
-    new PackageIds :
-      defmethod get (this, n:Int) : table[n]
-      defmethod consts (this) : package-consts
-      defmethod set-function-dependencies (this, n:Int, ds:Tuple<Int>) :
-        function-dependencies[table[n]] = map({recs[_]}, ds)
-      defmethod set-class-dependencies (this, n:Int, ds:Tuple<Int>) :
-        class-dependencies[table[n]] = map({recs[_]}, ds)
+    ;Make a LoadPackage from a VMPackage
+    defn make-load-package (pkg:VMPackage, global-ids:IntTable) -> LoadPackage :
+      defn gid (n:Int) : global-ids[n]
+      defn gid (n:False) : false
+      defn resolve (e:VMGlobal) : map-id(gid, e)
+      defn resolve (e:VMMethod) : map-id(gid, e)
+      LoadPackage(
+        name(pkg),
+        gid(init(pkg)),
+        map(resolve, globals(pkg)),
+        map(resolve, methods(pkg)))
 
-  ;Return LoadedIds datastructure
-  new LoadedIds :
-    defmethod package-ids (this, vmp:VMPackage) :
-      package-ids(vmp)
-    defmethod make-package-ids (this, vmps:Collection<VMPackage>) :
-      for vmp in vmps do :
-        for e in exports(packageio(vmp)) do :
-          make-id(rec(e))
-    defmethod function-dependencies (this, function:Int) :
-      function-dependencies[function]
-    defmethod class-dependencies (this, class:Int) :
-      class-dependencies[class]
-    defmethod get (this, id:RecId) :
-      id-table[id]
-    defmethod key? (this, id:RecId) :
-      key?(id-table, id)
+    ;Resolve all classes in the given package
+    defn resolved-classes (pkg:VMPackage, global-ids:IntTable) :
+      for c in classes(pkg) seq : map-id({global-id[_]}, c)
+
+    ;Resolve a single func
+    defn resolve-func (func:VMDefn, global-ids:IntTable, callback-indices:IntTable) :
+      ;asdflkasdjf
+
+    ;Resolve all funcs from packages
+    defn resolved-funcs (pkg:VMPackage, global-ids:IntTable, callback-indices:IntTable) :
+      for f in funcs(pkg) seq :
+        resolve-func(f, global-ids, callback-indices)
+
+    ;Remove all duplicate imports
+    defn remove-duplicates! (imports:Vector<Import>) :
+      val visited = IntSet()
+      for i in imports remove-when :
+        not add(visited, n(i))
+
+;public deftype LoadedIds
+;public defmulti make-package-ids (ids:LoadedIds, vmps:Collection<VMPackage>) -> False
+;public defmulti package-ids (ids:LoadedIds, vmpackage:VMPackage) -> PackageIds
+;public defmulti function-dependencies (ids:LoadedIds, function:Int) -> Tuple<Rec>
+;public defmulti class-dependencies (ids:LoadedIds, class:Int) -> Tuple<Rec>
+;public defmulti get (ids:LoadedIds, id:RecId) -> Int
+;public defmulti key? (ids:LoadedIds, id:RecId) -> True|False
+;
+;public deftype PackageIds
+;public defmulti get (ids:PackageIds, n:Int) -> Int
+;public defmulti set-function-dependencies (ids:PackageIds, n:Int, ds:Tuple<Int>) -> False
+;public defmulti set-class-dependencies (ids:PackageIds, n:Int, ds:Tuple<Int>) -> False
+;public defmulti consts (ids:PackageIds) -> Vector<VMConst>
+;
+;public defn LoadedIds () :
+;  ;Tables
+;  val id-table = HashTable<RecId,Int>()
+;  val function-dependencies = IntTable<Tuple<Rec>>()
+;  val class-dependencies = IntTable<Tuple<Rec>>()
+;  val constant-pool = HashTable<?,Int>()
+;
+;  ;Counters
+;  val fn-counter = to-seq(0 to false)
+;  val extern-counter = to-seq(0 to false)
+;  val global-counter = to-seq(0 to false)
+;  val data-counter = to-seq(0 to false)
+;  val class-counter = to-seq(NUM-BUILTIN-TYPES to false)
+;  defn make-fn-id () : next(fn-counter)
+;  defn make-extern-id () : next(extern-counter)
+;  defn make-global-id () : next(global-counter)
+;  defn make-data-id () : next(data-counter)
+;  defn make-class-id () : next(class-counter)
+;
+;  ;Make global id
+;  defn make-id (r:Rec) :
+;    if not key?(id-table, id(r)) :
+;      val f = match(r) :
+;        (r:ValRec) : make-global-id
+;        (r:FnRec) : make-fn-id
+;        (r:MultiRec) : make-fn-id
+;        (r:ExternRec) : make-extern-id
+;        (r:StructRec) : make-class-id
+;        (r:TypeRec) : make-class-id
+;        (r:ExternFnRec) : make-fn-id
+;      id-table[id(r)] = f()
+;    id-table[id(r)]
+;
+;  ;Populate built-in IDs
+;  for (name in [`False, `True, `Byte, `Char, `Int,
+;                `Float, `Stack, `Fn, `Type, `LivenessTracker],
+;       i in [FALSE-TYPE, TRUE-TYPE, BYTE-TYPE, CHAR-TYPE, INT-TYPE,
+;             FLOAT-TYPE, STACK-TYPE, FN-TYPE, TYPE-TYPE, LIVENESS-TRACKER-TYPE]) do :
+;    id-table[TypeId(`core, name)] = i
+;
+;  ;Create PackageIds
+;  defn package-ids (vmp:VMPackage) :
+;    ;Populate table with global ids
+;    val table = IntTable<Int>()
+;    val recs = IntTable<Rec>()
+;    for e in cat(imports(packageio(vmp)), exports(packageio(vmp))) do :
+;      table[n(e)] = id-table[id(rec(e))]
+;      recs[n(e)] = rec(e)
+;
+;    ;Populate table with local ids
+;    defn make-local-ids<?T> (entries:VMPackage -> Seqable<?T>, n:T -> Int, id:() -> Int) :
+;      for e in entries(vmp) do :
+;        val n = n(e)
+;        if not key?(table, n) :
+;          table[n] = id()
+;    make-local-ids(globals, id, make-global-id)
+;    make-local-ids(datas, id, make-data-id)
+;    make-local-ids(classes, id, make-class-id)
+;    make-local-ids(funcs, id, make-fn-id)
+;    make-local-ids(externs, id, make-extern-id)
+;
+;    ;Add consts to pool
+;    val package-consts = Vector<VMConst>()
+;    defn intern-const (v:VMValue) -> VMInternedConst :
+;      if key?(constant-pool, v) :
+;        VMInternedConst(ConstId(constant-pool[v]))
+;      else :
+;        val v* = match(v) :
+;          (v:List) : map(intern-const, v)
+;          (v) : v
+;        val i = length(constant-pool)
+;        constant-pool[v] = i
+;        add(package-consts, VMConst(i, v*))
+;        VMInternedConst(ConstId(i))
+;    ;Add package constants
+;    for c in consts(vmp) do :
+;      ;First resolve any type objects or code objects
+;      val v* = map-id({table[_]}, value(c))
+;      ;Then intern the value
+;      val c* = intern-const(v*)
+;      ;Record the mapping
+;      table[id(c)] = id(id(c*))
+;
+;    ;Return Structure
+;    new PackageIds :
+;      defmethod get (this, n:Int) : table[n]
+;      defmethod consts (this) : package-consts
+;      defmethod set-function-dependencies (this, n:Int, ds:Tuple<Int>) :
+;        function-dependencies[table[n]] = map({recs[_]}, ds)
+;      defmethod set-class-dependencies (this, n:Int, ds:Tuple<Int>) :
+;        class-dependencies[table[n]] = map({recs[_]}, ds)
+;
+;  ;Return LoadedIds datastructure
+;  new LoadedIds :
+;    defmethod package-ids (this, vmp:VMPackage) :
+;      package-ids(vmp)
+;    defmethod make-package-ids (this, vmps:Collection<VMPackage>) :
+;      for vmp in vmps do :
+;        for e in exports(packageio(vmp)) do :
+;          make-id(rec(e))
+;    defmethod function-dependencies (this, function:Int) :
+;      function-dependencies[function]
+;    defmethod class-dependencies (this, class:Int) :
+;      class-dependencies[class]
+;    defmethod get (this, id:RecId) :
+;      id-table[id]
+;    defmethod key? (this, id:RecId) :
+;      key?(id-table, id)
+
+;<doc>=======================================================
+;===================== LoadUnit =============================
+;============================================================
+
+Represents a group of packages ready to be loaded into the VM.
+
+# For each package #
+
+  name: Symbol
+  init: Int|False
+  globals: Tuple<VMGlobal>
+  methods: Tuple<VMMethod>
+
+These definitions must be grouped by package because old definitions
+must be removed in order to preserve semantics. Old globals must be
+removed so that they are not considered live. Old methods must be
+removed so that we do not enter them.
+
+# For the unit #
+
+  imports: Tuple<Import>
+  exports: Tuple<Export>
+  packages: Tuple<LoadPackage>
+  datas: Tuple<VMData>
+  consts: Tuple<VMConst>
+  classes: Tuple<VMClass>
+  funcs: Tuple<VMDefn>
+  extern-defns: Tuple<VMExternDefn>
+
+The exports of all packages are consolidated into a single list.
+The imports of all packages are consolidated, with duplicates removed,
+into a single list.
+
+All datas and consts are interned. The new datas and consts necessary
+for this LoadUnit are included here.
+
+All newly defined classes are listed.
+
+All newly defined functions are listed.
+
+All newly defined extern-defn bindings are listed here. They each have
+an additional field called callback-index that refers to the index of
+their callback stub.
+
+;============================================================
+;=======================================================<doc>
+
+public defstruct LoadUnit :
+  imports: Tuple<Import>
+  exports: Tuple<Export>
+  packages: Tuple<LoadPackage>
+  datas: Tuple<VMData>
+  consts: Tuple<VMConst>
+  classes: Tuple<VMClass>
+  funcs: Tuple<VMDefn>
+
+public defstruct LoadPackage :
+  name: Symbol
+  init: Int|False
+  globals: Tuple<VMGlobal>
+  methods: Tuple<VMMethod>
+
+public defmulti extern-index (e:VMDefn) -> Int|False
+  
