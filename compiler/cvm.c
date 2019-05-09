@@ -1340,7 +1340,6 @@ void vmloop (VMState* vms){
     case TYPEOF_OPCODE : {
       DECODE_C();
       int format = value;
-      printf("TYPEOF OPCODE\n");
       int index = read_dispatch_table(vms, format);
       SET_LOCAL(x, index);
       continue;
@@ -1820,7 +1819,6 @@ void vmloop (VMState* vms){
       uint32_t* tgts = (uint32_t*)(pc + 4);
       //DECODE_TGTS();
       int format = value;
-      printf("DISPATCH OPCODE\n");
       int index = read_dispatch_table(vms, format);
       int tgt = tgts[index];
       pc = pc0 + (tgt * 4);
@@ -1831,7 +1829,6 @@ void vmloop (VMState* vms){
       uint32_t* tgts = (uint32_t*)(pc + 4);
       //DECODE_TGTS();
       int format = value;
-      printf("DISPATCH METHOD OPCODE\n");
       int index = read_dispatch_table(vms, format);
       if(index < 2){
         int tgt = tgts[index];
@@ -1919,7 +1916,6 @@ int PRIM_TYPEIDS[] = {INT_TYPE, 0, 0, BYTE_TYPE, CHAR_TYPE, FLOAT_TYPE};
 
 int argtype (VMState* vms, int i){
   uint64_t x = vms->registers[i];
-  printf("compute type of %x\n", x);
   int tagbits = (int)x & 0x7;
   if(tagbits == REF_TAG_BITS){
     int* p = (int*)(x - 1);
@@ -1962,7 +1958,6 @@ int lookup_small_etable (DKV* etable, int t, int n){
 
 int lookup_etable (DKV* etable, int slot, int t, int n){
   DKV e = etable[slot];
-  printf("Looking in etable for key %d: %d => %d\n", t, e.key, e.value);
   if(e.key == t) return e.value;
   return default_value(etable,n);
 }
@@ -1980,46 +1975,28 @@ int dhash (int d, int x, int n){
 
 int lookup_trie_table (VMState* vms, TrieTable* trie_table){
   int n = trie_table->n;
-  printf("index = %d\n", trie_table->index);
   int type = argtype(vms, trie_table->index);
-  printf("arg type = %d\n", type);
-  printf("n = %d\n", n);
   if(n <= 4){
     return lookup_small_etable(small_etable(trie_table), type, n);
   }else{
     DTable* dtable = trie_dtable(trie_table);
-    printf("d0 = %d\n", dtable->d0);
-    int slot = dhash(dtable->d0, type, n);
-    printf("slot = %d\n", slot);
-    int d = dtable->dtable[slot];
-    printf("d = %d\n", d);
+    int dslot = dhash(dtable->d0, type, n);
+    int d = dtable->dtable[dslot];
     if(d == 0){
       return default_value(big_etable(dtable,n), n);
-    }else if(d < 0){
-      int slot2 = -d - 1;
-      printf("second slot = %d\n", slot2);
-      return lookup_etable(big_etable(dtable,n), slot2, type, n);
     }else{
-      int slot2 = dhash(d, type, n);
-      printf("second slot = %d\n", slot2);
-      return lookup_etable(big_etable(dtable,n), slot2, type, n);
+      int slot = d < 0? -d - 1 : dhash(d, type, n);
+      return lookup_etable(big_etable(dtable,n), slot, type, n);
     }
-    printf("Not yet implemented\n");
-    exit(-1);
   }  
 }
 
 int read_dispatch_table (VMState* vms, int format){
-  printf("Read dispatch code for format %d\n", format);
   int* trie_table = vms->trie_table[format];
   int table_offset = 0;
   while(1){
     int value = lookup_trie_table(vms, (TrieTable*)(trie_table + table_offset));
-    printf("value = %d\n", value);
     if(value < 0) return -value - 1;
     table_offset = value;
   }
-  exit(-1);
 }
-
-
