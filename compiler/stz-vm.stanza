@@ -273,8 +273,6 @@ public lostanza deftype VMState :
   extern-addresses: ptr<long>
   extern-defn-addresses: ptr<long>
   code-offsets: ptr<int>
-  extend-heap-id: int
-  extend-stack-id: int
   ;Variable State
   ;Changes in-between each boundary change
   heap: ptr<long>      
@@ -348,10 +346,6 @@ lostanza defn update-vmstate (vm:ref<VirtualMachine>) -> ref<False> :
   vms.data-offsets = vmt.data-positions.data
   vms.data-mem = vmt.data.mem
   vms.code-offsets = vmt.function-addresses.data
-  if key?(vm.loaded-ids, CORE-EXTEND-HEAP-ID) == true :
-    vms.extend-heap-id = get(vm.loaded-ids, CORE-EXTEND-HEAP-ID).value
-  if key?(vm.loaded-ids, CORE-EXTEND-STACK-ID) == true :
-    vms.extend-stack-id = get(vm.loaded-ids, CORE-EXTEND-STACK-ID).value
   return false
 
 ;============================================================
@@ -1107,59 +1101,10 @@ lostanza defn function-addresses (vmt:ref<VMTable>) -> ref<StableIntArray> :
   return vmt.function-addresses
 
 ;============================================================
-;===================== Resolving ============================
-;============================================================
-
-defn resolve (pkgids:PackageIds, vmp:VMPackage) :
-  defn resolve (n:Int) : pkgids[n]
-  defn resolve (x:False) : false
-  defn resolve<?T> (x:?T&(VMGlobal|VMData|VMClass|VMDefn|VMMethod|VMExtern|VMExternDefn)) :
-    defn resolve-ids (x:VMItem) :
-      match(x) :
-        (x:VMDefn) : sub-id(x, resolve(id(x)))
-        (x:VMArrayClass) : sub-parents(sub-id(x, resolve(id(x))), map(resolve,parents(x)))
-        (x:VMLeafClass) : sub-parents(sub-id(x, resolve(id(x))), map(resolve,parents(x)))
-        (x) : map-id(resolve, vm-map(resolve-ids, x))
-    resolve-ids(x) as T&VMItem
-  defn resolve (packageio:PackageIO) :
-    val imports* = for i in imports(packageio) map : sub-n(i, pkgids[n(i)])
-    val exports* = for e in exports(packageio) map : sub-n(e, pkgids[n(e)])
-    PackageIO(package(packageio), imported-packages(packageio), imports*, exports*)
-  VMPackage(
-    resolve(packageio(vmp))
-    resolve(init(vmp))
-    map(resolve,globals(vmp))
-    map(resolve,datas(vmp))
-    to-tuple(consts(pkgids))
-    map(resolve,classes(vmp))
-    map(resolve,funcs(vmp))
-    map(resolve,methods(vmp))
-    map(resolve,externs(vmp))
-    map(resolve,extern-defns(vmp)))
-
-;============================================================
 ;================= Instruction Encoding =====================
 ;============================================================
 
-defn EncodingResolver (pkg:VMPackage, extern-address-table:HashTable<Symbol,Long>, branch-table:BranchTable, live-map-table:LiveMapTable) :
-  ;Build the extern table
-  val extern-table = IntTable<Symbol>()  
-  for e in externs(pkg) do :
-    extern-table[id(e)] = name(e)
-  for i in imports(packageio(pkg)) do :
-    val r = rec(i)
-    match(r:ExternRec) :
-      extern-table[n(i)] = lbl(r)
-      
-  ;Build the extern defn table
-  val extern-defn-table = IntTable<Symbol>()
-  for e in extern-defns(pkg) do :
-    extern-defn-table[fid(e)] = lbl(e)
-  for i in imports(packageio(pkg)) do :
-    val r = rec(i)
-    match(r:ExternFnRec) :
-      extern-defn-table[n(i)] = lbl(r)
-  
+defn EncodingResolver (branch-table:BranchTable, live-map-table:LiveMapTable) :
   new EncodingResolver :
     defmethod liveness-map (this, live:Tuple<Int>, num-locals:Int) :
       map-index(live-map-table, LivenessMap(live, num-locals))
@@ -1178,82 +1123,56 @@ defn EncodingResolver (pkg:VMPackage, extern-address-table:HashTable<Symbol,Long
     defmethod marker (this, type:Int) : marker-int(type)
     defmethod void-marker (this) : void-marker-int()
     defmethod ref-offset (this) : REF-TAG-INT
-    defmethod extern-address (this, eid:ExternId|ExternDefnId) :
-      val lbl = match(eid) :
-        (eid:ExternId) : extern-table[id(eid)]
-        (eid:ExternDefnId) : extern-defn-table[id(eid)]
-      extern-address-table[lbl]
+
+;============================================================
+;==================== Class Names ===========================
+;============================================================
+
+defn class-name (c:VMClass, ids:LoadedIds) -> String :
+  match(type-id(ids, id(c))) :
+    (id:TypeId) :
+      to-string(name(id))
+    (_:False) :
+      defn name! (n:Int) : name(type-id(ids,n) as TypeId)
+      string-join(seq(name!, parents(c)), "&")
+
+defn class-names (cs:Seqable<VMClass>, ids:LoadedIds) -> Seqable<KeyValue<Int,String>> :
+  for c in cs seq :
+    id(c) => class-name(c,ids)
 
 ;============================================================
 ;====================== Loading =============================
 ;============================================================
 
-public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>,
-                  keep-existing-globals?:True|False) :
-  val new-consts = Vector<VMConst>()
-  val new-classes = Vector<VMClass>()
+public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>, keep-existing-globals?:True|False) :
   val vmt = vmtable(vm)
-
-  ;Make global ids
-  make-package-ids(loaded-ids(vm), vmps)
-
-  ;Get extern table
-  val extern-address-table = make-extern-table()
-
-  for vmp0 in vmps do :
-    ;Get package ids
-    val pkgids = package-ids(loaded-ids(vm), vmp0)
-
-    ;Register dependencies
-    for f in funcs(vmp0) do :
-      set-function-dependencies(pkgids, id(f), dependencies(f))
-    for c in filter-by<VMLeafClass|VMArrayClass>(classes(vmp0)) do :
-      set-class-dependencies(pkgids, id(c), dependencies(c))
-
-    ;Resolution
-    ;dump(vmp0, "logs", false)
-    val vmp = resolve(pkgids, vmp0)
-    ;dump(vmp, "logs", "resolved")
-
-    ;Link functions
-    val encoding-resolver = EncodingResolver(vmp, extern-address-table, branch-table(vm), live-map-table(linker(vm)))
-    for f in funcs(vmp) do :
-      ;val linked = link(linker(vm), f, pkgids)
-      ;load-function(vmt, id(f), linked)
-      val ef = encode(func(f), pkgids, encoding-resolver, backend(vm))
-      load-function(vmt, id(f), ef)
-
-    ;Stage constants and classes to be loaded together
-    add-all(new-consts, consts(vmp))
-    add-all(new-classes, classes(vmp))
-
-    ;Load definitions
-    load-globals(vmt, globals(vmp), package(vmp), keep-existing-globals?)
-    load-datas(vmt, datas(vmp))
-    ;load-externs(vmt, externs(vmp))
-    load-extern-defns(vmt, extern-defns(vmp))
-    load-package-methods(branch-table(vm), package(vmp), methods(vmp))
-    load-class-names(vmt, packageio(vmp), classes(vmp))
-
-    ;Register initialization function
-    set-init(vmt, package(vmp), init(vmp))
-
-  ;Load constants and classes
-  load-consts(vmt, to-tuple(new-consts))
-  load-classes(vmt, new-classes)
-
-  ;Update the branch table
-  update-branch-table(vm)
-
+  val loaded-ids = loaded-ids(vm)
+  val load-unit = load-packages(loaded-ids, vmps)
+  
+  ;Load all packages
+  for p in packages(load-unit) do :
+    load-globals(vmt, globals(p), name(p), keep-existing-globals?)
+    load-package-methods(branch-table(vm), name(p), methods(p))
+  ;Load functions
+  val encoding-resolver = EncodingResolver(branch-table(vm), live-map-table(linker(vm)))
+  for f in funcs(load-unit) do :
+    val ef = encode(func(f), encoding-resolver, backend(vm))
+    load-function(vmt, id(f), ef)
+  ;Load all classes into table  
+  load-classes(vmt, classes(load-unit))
+  load-class-names(vmt, class-names(classes(load-unit), loaded-ids))
+  ;Load datas and consts
+  load-datas(vmt, datas(load-unit))
+  load-consts(vmt, consts(load-unit))
+  ;Load callbacks
+  for c in callbacks(load-unit) do :
+    load-callback(vmt, index(c), function-id(c))
   ;Update the virtual machine state
   update-vmstate(vm)
-
+  
   ;Initialize constants
-  if any?({package(_) == `core}, vmps) :
-    mark-core-as-loaded(vm)
-  else :
-    val init-consts-id = loaded-ids(vm)[CORE-INIT-CONSTS-ID]
-    run-bytecode(vm, init-consts-id)
+  if any?({package(_) == `core}, vmps) : mark-core-as-loaded(vm)
+  else : run-bytecode(vm, INIT-CONSTS-FN)
 
 lostanza defn update-branch-table (vm:ref<VirtualMachine>) -> ref<False> :
   update(branch-table(vm))
@@ -1272,7 +1191,7 @@ lostanza defn mark-core-as-loaded (vm:ref<VirtualMachine>) -> ref<False> :
   return false
 
 public defn init-package (vm:VirtualMachine, package:Symbol) :
-  val f = init(vmtable(vm), package)
+  val f = package-init(loaded-ids(vm), package)
   match(f:Int) :
     val trace? = false
     val use-launcher? = package != `core
@@ -1291,8 +1210,7 @@ lostanza defn launch-init (vm:ref<VirtualMachine>, fid:ref<Int>, trace?:ref<True
   vms.registers[0] = false-marker()
   vms.registers[1] = 1L
   vms.registers[2] = tag(closure - 8L)
-  val launcher-id = get(loaded-ids(vm), CORE-EXECUTE-TOPLEVEL-COMMAND-ID)
-  run-bytecode(vm, launcher-id)
+  run-bytecode(vm, EXECUTE-TOPLEVEL-COMMAND-FN)
   ;Return
   return false
 

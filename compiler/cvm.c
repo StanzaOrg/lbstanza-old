@@ -259,27 +259,27 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
+  if(iprint) printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
+  if(iprint) printf("          [%d | %d]\n", opcode, value);
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  /*if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);*/
+  if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  /*if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
+  if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);
 
 #define DECODE_D() \
   int x = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  /*if(iprint) printf("          [%d | _ | %d | %ld]\n", opcode, x, value);*/
+  if(iprint) printf("          [%d | _ | %d | %ld]\n", opcode, x, value);
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -288,7 +288,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
+  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -298,7 +298,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
+  if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -361,7 +361,8 @@
 #define MARKER_TAG_BITS 2
 #define BYTE_TAG_BITS 3
 #define CHAR_TAG_BITS 4
-#define FLOAT_TAG_BITS 5  
+#define FLOAT_TAG_BITS 5
+
 #define FALSE_TYPE 0
 #define TRUE_TYPE 1
 #define BYTE_TYPE 2
@@ -372,6 +373,11 @@
 #define FN_TYPE 7
 #define TYPE_TYPE 8
 #define LIVENESS_TRACKER_TYPE 9
+
+#define EXTEND_HEAP_FN 0
+#define EXTEND_STACK_FN 1
+#define INIT_CONSTS_FN 2
+#define EXECUTE_TOPLEVEL_COMMAND_FN 3
 
 #define BOOLREF(x) (((x) << 3) + MARKER_TAG_BITS)
 
@@ -395,8 +401,6 @@ typedef struct{
   uint64_t* extern_table;
   uint64_t* extern_defn_addresses;
   uint32_t* code_offsets;
-  int extend_heap_id;
-  int extend_stack_id;
   //Variable State
   //Changes in_between each boundary change
   char* heap;
@@ -486,6 +490,9 @@ void vmloop (VMState* vms){
   //for(int i=0; i<255; i++) timings[i] = 0;
   //int last_opcode = -1;
   //uint64_t last_time;
+
+  //Debug
+  int iprint = 1;
 
   //Repl Loop
   while(1){
@@ -1545,7 +1552,7 @@ void vmloop (VMState* vms){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1L);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_heap_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1563,7 +1570,7 @@ void vmloop (VMState* vms){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1L);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_heap_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1863,7 +1870,7 @@ void vmloop (VMState* vms){
         stack_pointer = stk->frames;
         stack_pointer->returnpc = SYSTEM_RETURN_STUB;
         //Jump to stack extender          
-        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_stack_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_STACK_FN]) * 4;
         pc = instructions + fpos;
         continue;        
       }
