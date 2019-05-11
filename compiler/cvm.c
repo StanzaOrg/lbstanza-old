@@ -11,8 +11,6 @@
 #define SET_OPCODE_UNSIGNED 1
 #define SET_OPCODE_SIGNED 2
 #define SET_OPCODE_CODE 3
-#define SET_OPCODE_EXTERN 4
-#define SET_OPCODE_EXTERN_DEFN 21
 #define SET_OPCODE_GLOBAL 5
 #define SET_OPCODE_DATA 6
 #define SET_OPCODE_CONST 7
@@ -21,8 +19,6 @@
 #define SET_REG_OPCODE_UNSIGNED 10
 #define SET_REG_OPCODE_SIGNED 11
 #define SET_REG_OPCODE_CODE 12
-#define SET_REG_OPCODE_EXTERN 13
-#define SET_REG_OPCODE_EXTERN_DEFN 25
 #define SET_REG_OPCODE_GLOBAL 14
 #define SET_REG_OPCODE_DATA 15
 #define SET_REG_OPCODE_CONST 16
@@ -361,7 +357,8 @@
 #define MARKER_TAG_BITS 2
 #define BYTE_TAG_BITS 3
 #define CHAR_TAG_BITS 4
-#define FLOAT_TAG_BITS 5  
+#define FLOAT_TAG_BITS 5
+
 #define FALSE_TYPE 0
 #define TRUE_TYPE 1
 #define BYTE_TYPE 2
@@ -372,6 +369,11 @@
 #define FN_TYPE 7
 #define TYPE_TYPE 8
 #define LIVENESS_TRACKER_TYPE 9
+
+#define EXTEND_HEAP_FN 0
+#define EXTEND_STACK_FN 1
+#define INIT_CONSTS_FN 2
+#define EXECUTE_TOPLEVEL_COMMAND_FN 3
 
 #define BOOLREF(x) (((x) << 3) + MARKER_TAG_BITS)
 
@@ -392,11 +394,7 @@ typedef struct{
   char* const_mem;
   uint32_t* data_offsets;
   char* data_mem;
-  uint64_t* extern_table;
-  uint64_t* extern_defn_addresses;
   uint32_t* code_offsets;
-  int extend_heap_id;
-  int extend_stack_id;
   //Variable State
   //Changes in_between each boundary change
   char* heap;
@@ -468,8 +466,6 @@ void vmloop (VMState* vms){
   char* const_mem = vms->const_mem;
   uint32_t* data_offsets = vms->data_offsets;
   char* data_mem = vms->data_mem;
-  uint64_t* extern_table = vms->extern_table;
-  uint64_t* extern_defn_addresses = vms->extern_defn_addresses;
   uint32_t* code_offsets = vms->code_offsets;
   //Variable State
   //Changes in_between each boundary change
@@ -486,6 +482,9 @@ void vmloop (VMState* vms){
   //for(int i=0; i<255; i++) timings[i] = 0;
   //int last_opcode = -1;
   //uint64_t last_time;
+
+  //Debug
+  //int iprint = 1;
 
   //Repl Loop
   while(1){
@@ -520,16 +519,6 @@ void vmloop (VMState* vms){
     case SET_OPCODE_CODE : {
       DECODE_C();
       SET_LOCAL(y, value);
-      continue;
-    }
-    case SET_OPCODE_EXTERN : {
-      DECODE_C();
-      SET_LOCAL(y, extern_table[value]);
-      continue;
-    }
-    case SET_OPCODE_EXTERN_DEFN : {
-      DECODE_C();
-      SET_LOCAL(y, extern_defn_addresses[value]);
       continue;
     }
     case SET_OPCODE_GLOBAL : {
@@ -572,16 +561,6 @@ void vmloop (VMState* vms){
     case SET_REG_OPCODE_CODE : {
       DECODE_C();
       SET_REG(y, value);
-      continue;
-    }
-    case SET_REG_OPCODE_EXTERN : {
-      DECODE_C();
-      SET_REG(y, extern_table[value]);
-      continue;
-    }
-    case SET_REG_OPCODE_EXTERN_DEFN : {
-      DECODE_C();
-      SET_REG(y, extern_defn_addresses[value]);
       continue;
     }
     case SET_REG_OPCODE_GLOBAL : {
@@ -1545,7 +1524,7 @@ void vmloop (VMState* vms){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1L);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_heap_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1563,7 +1542,7 @@ void vmloop (VMState* vms){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1L);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_heap_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1863,7 +1842,7 @@ void vmloop (VMState* vms){
         stack_pointer = stk->frames;
         stack_pointer->returnpc = SYSTEM_RETURN_STUB;
         //Jump to stack extender          
-        uint64_t fpos = (uint64_t)(code_offsets[vms->extend_stack_id]) * 4;
+        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_STACK_FN]) * 4;
         pc = instructions + fpos;
         continue;        
       }
