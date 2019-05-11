@@ -55,11 +55,11 @@ FILES="core/core.stanza \
        compiler/stz-bindings-to-vm.stanza \
        compiler/stz-vm-encoder.stanza \
        compiler/stz-trie.stanza \
+       compiler/stz-trie-table.stanza \
+       compiler/stz-hash.stanza \
        compiler/stz-dyn-tree.stanza \
        compiler/stz-dyn-bi-table.stanza \
        compiler/stz-vm-table.stanza \
-       compiler/stz-trie-table.stanza \
-       compiler/stz-hash.stanza \
        compiler/stz-branch-table.stanza \
        compiler/stz-vm-analyze.stanza \
        compiler/stz-vm-bindings.stanza \
@@ -76,6 +76,7 @@ FILES="core/core.stanza \
        compiler/stz-reg-alloc2.stanza \
        compiler/stz-stitcher2.stanza \
        compiler/stz-const-pool.stanza \
+       compiler/stz-data-pool.stanza \
        compiler/stz-padder.stanza \
        compiler/stz-build.stanza \
        compiler/stz-repl.stanza \

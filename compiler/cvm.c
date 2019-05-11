@@ -11,8 +11,6 @@
 #define SET_OPCODE_UNSIGNED 1
 #define SET_OPCODE_SIGNED 2
 #define SET_OPCODE_CODE 3
-#define SET_OPCODE_EXTERN 4
-#define SET_OPCODE_EXTERN_DEFN 21
 #define SET_OPCODE_GLOBAL 5
 #define SET_OPCODE_DATA 6
 #define SET_OPCODE_CONST 7
@@ -21,8 +19,6 @@
 #define SET_REG_OPCODE_UNSIGNED 10
 #define SET_REG_OPCODE_SIGNED 11
 #define SET_REG_OPCODE_CODE 12
-#define SET_REG_OPCODE_EXTERN 13
-#define SET_REG_OPCODE_EXTERN_DEFN 25
 #define SET_REG_OPCODE_GLOBAL 14
 #define SET_REG_OPCODE_DATA 15
 #define SET_REG_OPCODE_CONST 16
@@ -398,8 +394,6 @@ typedef struct{
   char* const_mem;
   uint32_t* data_offsets;
   char* data_mem;
-  uint64_t* extern_table;
-  uint64_t* extern_defn_addresses;
   uint32_t* code_offsets;
   //Variable State
   //Changes in_between each boundary change
@@ -472,8 +466,6 @@ void vmloop (VMState* vms){
   char* const_mem = vms->const_mem;
   uint32_t* data_offsets = vms->data_offsets;
   char* data_mem = vms->data_mem;
-  uint64_t* extern_table = vms->extern_table;
-  uint64_t* extern_defn_addresses = vms->extern_defn_addresses;
   uint32_t* code_offsets = vms->code_offsets;
   //Variable State
   //Changes in_between each boundary change
@@ -529,16 +521,6 @@ void vmloop (VMState* vms){
       SET_LOCAL(y, value);
       continue;
     }
-    case SET_OPCODE_EXTERN : {
-      DECODE_C();
-      SET_LOCAL(y, extern_table[value]);
-      continue;
-    }
-    case SET_OPCODE_EXTERN_DEFN : {
-      DECODE_C();
-      SET_LOCAL(y, extern_defn_addresses[value]);
-      continue;
-    }
     case SET_OPCODE_GLOBAL : {
       DECODE_C();
       char* address = global_mem + global_offsets[value];
@@ -579,16 +561,6 @@ void vmloop (VMState* vms){
     case SET_REG_OPCODE_CODE : {
       DECODE_C();
       SET_REG(y, value);
-      continue;
-    }
-    case SET_REG_OPCODE_EXTERN : {
-      DECODE_C();
-      SET_REG(y, extern_table[value]);
-      continue;
-    }
-    case SET_REG_OPCODE_EXTERN_DEFN : {
-      DECODE_C();
-      SET_REG(y, extern_defn_addresses[value]);
       continue;
     }
     case SET_REG_OPCODE_GLOBAL : {
