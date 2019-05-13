@@ -3,10 +3,12 @@ defpackage stz/vm-encoder :
   import collections
   import stz/vm-ir
   import stz/typeset
-  import stz/loaded-ids
+  import stz/vm-ids
   import stz/basic-ops
   import stz/call-records
   import stz/backend
+  import stz/utils
+  import stz/trie
 
 public deftype EncodingResolver
 public defmulti liveness-map (r:EncodingResolver, live:Tuple<Int>, num-locals:Int) -> Int
@@ -19,6 +21,9 @@ public defmulti method-format (r:EncodingResolver, multi:Int, num-header-args:In
 public defmulti marker (r:EncodingResolver, type:Int) -> Int
 public defmulti void-marker (r:EncodingResolver) -> Int
 public defmulti ref-offset (r:EncodingResolver) -> Int
+public defmulti type-is-final? (r:EncodingResolver, n:Int) -> True|False
+public defmulti marker? (r:EncodingResolver, n:Int) -> True|False
+public defmulti tagbits (r:EncodingResolver, typeid:Int) -> Int
 
 public defstruct EncodedFunction :
   buffer: ByteBuffer
@@ -35,7 +40,15 @@ public defn encode (func:VMFunction,
   val buffer = ByteBuffer()
   defn buffer-pos () : write-position(buffer) / 4
 
-  ;Delay the generation of this instruction
+  ;Accumulate file information entries for implementing
+  ;stack traces.
+  val fileinfo-table = Vector<FileInfoEntry>()
+  defn record-info (info:FileInfo|False) :
+    match(info:FileInfo) :
+      add(fileinfo-table, FileInfoEntry(buffer-pos(), info))
+
+  ;Delay the generation of this instruction,
+  ;Instruction takes up the given number of 'instruction-words'.
   defn delayed-ins (f:() -> ?, instruction-words:Int) :
     val h = write-position(buffer)
     for i in 0 to instruction-words do :
@@ -48,13 +61,6 @@ public defn encode (func:VMFunction,
       val expected = instruction-words * 4
       fatal("Incorrect size.") when written != expected
       set-write-position(buffer, h0)
-
-  ;Accumulate file information entries for implementing
-  ;stack traces.
-  val fileinfo-table = Vector<FileInfoEntry>()
-  defn record-info (info:FileInfo|False) :
-    match(info:FileInfo) :
-      add(fileinfo-table, FileInfoEntry(buffer-pos(), info))
 
   ;Instruction formats:
   ;A: [OPCODE | VALUE]
@@ -111,6 +117,27 @@ public defn encode (func:VMFunction,
     val targets = map(n, bs)
     [types, targets]
 
+  ;Check whether type is final.
+  ;If the function returns true, it means that the type cannot be redefined.
+  defn type-is-final? (t:TypeSet) :
+    match(t) :
+      (t:SingleType) : /type-is-final?(resolver, type(t))
+      (t:OrType) : all?(type-is-final?, types(t))
+      (t:AndType) : any?(type-is-final?, types(t))
+      (t:TopType) : true
+
+  ;Convert a TypeSet to an ISet assuming that the TypeSet represents a final type.
+  defn final-iset (t:TypeSet) :
+    match(t) :
+      (t:SingleType) : ISubset([type(t)])
+      (t:OrType) : reduce(union, seq(final-iset, types(t)))
+      (t:AndType) : final-iset(find!(type-is-final?, types(t)))
+      (t:TopType) : IAll()
+
+  ;Check whether all types in branch are final.
+  defn branch-is-final? (b:VMBranch) :
+    all?(type-is-final?, types(b))
+
   ;Encode multivarity functions
   defn encode (multi:VMMultifn) :
     ;Declare function positions
@@ -129,103 +156,199 @@ public defn encode (func:VMFunction,
       encode(value(entry))
       fpos
 
+  ;<doc>===================================
+  ;========= Encoding a Function ==========
+  # Fundamental State #
+  
+  max-local: Int
+
+    The index of the highest local in this function frame.
+
+  num-locals: Int
+
+    The total number of locals in this function frame, including
+    temporary locals needed to satisfy shuffling.
+    
+  deftable: IntTable<VMDef>
+
+    The mapping from Local identifiers to their definitions.
+
+  label-table: IntTable<Int>
+
+    The mapping from LabelIns identifiers to their buffer position.
+    This table is filled during the first pass of the compilation, and
+    can only be used after that.
+ 
+  used-labels: IntSet
+
+    The set of all labels used by the given input function. Used
+    during generation of new unique labels.
+
+  label-counter: Seq<Int>
+
+    The counter used to generate new unique labels.
+
+  # Immediate Utilities #
+
+  imm-type (x:VMImm) -> VMType
+  imm-type (x:VMType) -> VMType
+  
+    Returns the VMType corresponding to an immediate. Works trivially
+    on VMType as well for convenience when dealing with missing
+    arguments.
+
+  slot (x:Local) -> Int
+
+    Returns the frame slot in which the given Local is stored.
+
+  # Label Utilities #
+
+  jump-offset (n:Int) -> Int
+  
+    Returns the offset, relative to the current buffer position, of
+    the given label.
+
+  jump-offsets (xs:Seqable<Int>) -> Tuple<Int>
+  jump-offsets (xs:Seqable<Int>, ys:Seqable<Int>) -> Tuple<Int>
+
+    Returns all offsets, as a tuple, of the given labels relative to
+    the current buffer position.
+
+  gen-label () -> Int
+  
+    Returns a new unique label.
+
+  ;========================================
+  ;===================================<doc>
+
   ;Encode function instructions
   defn encode (func:VMFunc) :
-    ;Compute num locals
+    ;==================================================
+    ;============== Fundamental State =================
+    ;==================================================
     ;Reserve extra 3 locals for temporary moving
     val max-local = maximum(-1, seq(local, defs(func)))
     val num-locals = max-local + 1 + 3
 
-    ;Create mapping from local ID to slot
-    val deftable = to-inttable<VMDef> $
-      for def in defs(func) seq :
-        id(def) => def
-
-    ;Use deftable to retrieve the type of an immediate
-    defn imm-type (x:VMImm) :
-      match(x:Local) : type(deftable[index(x)])
-      else : type(x)
-    defn imm-type (x:VMType) :
-      x
-
-    ;Use deftable to retrieve the slot of a local
-    defn slot (x:Local) :
-      local(deftable[index(x)])
-
-    ;Retrieve the corresponding bits for the given immediate
-    defn to-bits (y:VMImm) -> Int|Long :
-      match(y) :
-        (y:Local) : slot(y)
-        (y:NumConst) :
-          match(value(y)) :
-            (v:Char) : to-int(v)
-            (v:Byte) : to-int(v)
-            (v:Int) : v
-            (v:Long) : v
-            (v:Float) : bits(v)
-            (v:Double) : bits(v)
-        (y:Marker) : marker(resolver, typeid(y))
-        (y:Tag) : typeid(y)
-        (y:VoidMarker) : void-marker(resolver)
-        (y:CodeId) : id(y)
-        (y:ExternId) : extern-address(id(y))
-        (y:GlobalId) : id(y)
-        (y:DataId) : id(y)
-        (y:ConstId) : id(y)
-
-    ;Set register
-    defn set-reg (i:Int, y:VMImm) :
-      match(to-bits(y)) :
-        (v:Int) : emit-ins-c(set-reg-opcode(y), i, v)
-        (v:Long) : emit-ins-d(set-reg-opcode(y), i, v)    
-    defn set-regs (ys:Seqable<VMImm>) :
-      do(set-reg, 0 to false, ys)
-    defn get-reg (x:Local|VMType, i:Int) :
-      match(x:Local) :
-        emit-ins-b(GET-REG-OPCODE, slot(x), i)
-    defn get-regs (xs:Seqable<Local|VMType>) :
-      do(get-reg, xs, 0 to false)
-
-    ;Set local
-    defn set-local (x:Int, y:VMImm) :
-      match(to-bits(y)) :
-        (v:Int) : emit-ins-c(set-opcode(y), x, v)
-        (v:Long) : emit-ins-d(set-opcode(y), x, v)
-
-    ;Put immediate in temporary local if not a local
-    defn to-local (x:VMImm, num:Int) :
-      match(x:Local) :
-        slot(x)
-      else :
-        val index = max-local + num + 1
-        set-local(index, x)
-        index
-
-    ;Put immediate in register if not a function immediate
-    defn to-function (f:VMImm) :
-      match(f) :
-        (f:Local) : slot(f)
-        (f:CodeId) : id(f)
-        (f:ExternId) : id(f)
-        (f) : to-local(f, 0)
-
-    ;Create mapping from label ID to position
-    val label-table = IntTable<Int>()
-    defn jump-offset (n:Int) :
-      label-table[n] - buffer-pos()
-    defn jump-offsets (xs:Seqable<Int>) :
-      to-tuple(seq(jump-offset, xs))
-    defn jump-offsets (xs:Seqable<Int>, ys:Seqable<Int>) :
-      jump-offsets(cat(xs,ys))
-
-    ;Enter function
-    emit-ins-a(FNENTRY-OPCODE, num-locals)
-
-    ;Retrieve arguments
-    get-regs(args(func))
+    ;Definitions
+    val deftable = to-inttable(id, defs(func))
     
-    ;Encode each instruction 
-    for ins in ins(func) do :
+    ;Labels
+    val label-table = IntTable<Int>()
+    val used-labels = to-intset(seq(n, filter-by<LabelIns>(ins(func))))
+    val label-counter = to-seq(0 to false)
+
+    ;==================================================
+    ;============== Overall Algorithm =================
+    ;==================================================
+    defn driver () :
+      emit-prelude()
+      do(emit-ins, ins(func))
+
+    ;Enter a function
+    defn emit-prelude () :
+      ;Enter function
+      emit-ins-a(FNENTRY-OPCODE, num-locals)
+      ;Retrieve arguments
+      get-regs(args(func))
+
+    ;Encode a match statement that can be redefined later.
+    defn emit-non-final-match (ys:Tuple<VMImm>, bs:Tuple<VMBranch>, default:Int) :
+      ;Retrieve the format index of this match statement.
+      val [types, dests] = split-types-and-dests(bs)
+      val format = match-format(resolver, types)
+      
+      ;Push arguments onto registers
+      set-regs(ys)
+
+      ;One target for default and then each branch for dispatch.
+      val num-targets = 1 + length(bs)
+      within delayed-ins(1 + 1 + num-targets) :
+        val targets = jump-offsets([default], dests)
+        emit-ins-a(DISPATCH-OPCODE, format)            
+        emit-ins-targets(targets)    
+
+    ;Encode a match statement that cannot be redefined later.
+    defn emit-final-match (ys:Tuple<VMImm>, bs:Tuple<VMBranch>, default:Int) :
+      ;Overall algorithm
+      defn driver () :
+        if empty?(bs) : emit-ins(GotoIns(default))
+        else : emit-tries(to-trie(seq(ibranch,bs), default))          
+      ;Convert a VMBranch into an IBranch
+      defn ibranch (v:VMBranch) :
+        IBranch(to-list(seq(final-iset,types(v))), n(v))
+      ;Compile branches to flattened tries
+      defn to-trie (bs:Seqable<IBranch>, default:Int) :
+        flatten(/to-trie(bs), default)
+      ;Compile a flattened trie
+      defn emit-tries (ftries:LabeledTries) -> False :
+        ;Create labels for all tries
+        val labels = to-tuple(seq(gen-label{}, 0 to num-labeled-tries(ftries)))
+        ;Convert a TrieTarget into a label
+        defn to-n (t:TrieTarget) :
+          match(t) :
+            (t:EndTrie) : target(t) as Int
+            (t:TrieId) : labels[id(t)]
+        ;Compile each trie
+        for trie in tries(ftries) do :
+          ;Emit trie label
+          if id(trie) is Int :
+            val l = labels[id(trie) as Int]
+            emit-ins(LabelIns(l))
+          ;Emit empty trie if required
+          if empty?(entries(trie)) :
+            emit-ins(GotoIns(to-n(/default(trie))))
+          ;Emit each branch
+          else :
+            val num-e = length(entries(trie))
+            for (e in entries(trie), i in 0 to false) do :
+              val n1 = to-n(value(e))
+              val n2 = gen-label() when i < num-e - 1 else to-n(/default(trie))
+              emit-ins(Branch1Ins(n1, n2, InstanceofOp(SingleType(key(e))), ys[index(trie)]))
+              emit-ins(LabelIns(n2)) when i < num-e - 1
+      ;Launch
+      driver()
+
+    ;Emit instanceof operation
+    defn emit-instanceof (n1:Int, n2:Int, x:VMImm, type:TypeSet) :
+      if (type is SingleType) and type-is-final?(type) :
+        defn driver () :
+          val tag = /type(type as SingleType)
+          switch(tag) :
+            BYTE-TYPE : compare-tag-bits(BYTE-TYPE)
+            CHAR-TYPE : compare-tag-bits(CHAR-TYPE)
+            INT-TYPE : compare-tag-bits(INT-TYPE)
+            FLOAT-TYPE :  compare-tag-bits(FLOAT-TYPE)
+            else :
+              if marker?(resolver, tag) : compare-marker(tag)
+              else : compare-tag-word(tag)
+        defn compare-tag-bits (typeid:Int) :
+          within delayed-ins(2) :
+            val bits = tagbits(resolver,typeid)
+            emit-ins-f(JUMP-TAGBITS-OPCODE, to-local(x,0), bits, jump-offset(n1), jump-offset(n2))
+        defn compare-marker (typeid:Int) :
+          emit-ins(Branch2Ins(n1, n2, EqOp(), x, Marker(typeid)))
+        defn compare-tag-word (typeid:Int) :
+          val tmp = max-local + 1
+          set-local(tmp, NumConst(typeid))
+          within delayed-ins(2) :            
+            emit-ins-f(JUMP-TAGWORD-OPCODE, to-local(x,0), tmp, jump-offset(n1), jump-offset(n2))          
+        driver()
+      else :
+        ;Retrieve format
+        val format = match-format(resolver, [[type]])          
+        ;Push argument into register
+        set-reg(0, x)
+        ;Emit dispatch instruction
+        ;Two targets, match success and default
+        val num-targets = 2
+        within delayed-ins(1 + 1 + num-targets) :
+          val targets = jump-offsets([n2, n1])
+          emit-ins-a(DISPATCH-OPCODE, format)
+          emit-ins-targets(targets)
+    
+    ;Encode each instruction
+    defn emit-ins (ins:VMIns) :
       match(ins) :
         (ins:LabelIns) :
           label-table[n(ins)] = buffer-pos()
@@ -233,13 +356,13 @@ public defn encode (func:VMFunction,
           false
         (ins:TCallIns) :
           set-regs(ys(ins))
-          emit-ins-c(tcall-opcode(f(ins)), 0, to-function(f(ins)))
+          emit-ins-c(tcall-opcode(f(ins)), 0, to-function-local(f(ins)))
         (ins:TCallClosureIns) :
           set-regs(ys(ins))
           emit-ins-a(TCALL-CLOSURE-OPCODE, to-local(f(ins), 0))
         (ins:CallIns) : 
           set-regs(ys(ins))
-          emit-ins-c(call-opcode(f(ins)), num-locals, to-function(f(ins)))
+          emit-ins-c(call-opcode(f(ins)), num-locals, to-function-local(f(ins)))
           record-info(info(ins))
           emit-ins-a(POP-FRAME-OPCODE, num-locals)
           get-regs(xs(ins))
@@ -342,7 +465,6 @@ public defn encode (func:VMFunction,
             (op:InstanceofOp) :
               ;Push argument into register
               set-reg(0, y(ins))
-              ;Retrieve format
               val format = match-format(resolver, [[type(op)]])
               ;Emit typeof instruction
               emit-ins-c(TYPEOF-OPCODE, slot(x(ins)), format)
@@ -366,17 +488,7 @@ public defn encode (func:VMFunction,
         (ins:Branch1Ins) :
           match(op(ins)) :
             (op:InstanceofOp) :
-              ;Push argument into register
-              set-reg(0, x(ins))
-              ;Retrieve format
-              val format = match-format(resolver, [[type(op)]])
-              ;Emit dispatch instruction
-              ;Two targets, match success and default
-              val num-targets = 2
-              within delayed-ins(1 + 1 + num-targets) :
-                val targets = jump-offsets([n2(ins), n1(ins)])
-                emit-ins-a(DISPATCH-OPCODE, format)
-                emit-ins-targets(targets)
+              emit-instanceof(n1(ins), n2(ins), x(ins), type(op))
             (op:False) :
               val x* = to-local(x(ins), 0)
               within delayed-ins(2) :
@@ -411,7 +523,7 @@ public defn encode (func:VMFunction,
           ;Push arguments onto registers
           set-regs(ys(ins))
           val [types, dests] = split-types-and-dests(branches(ins))
-          val format = dispatch-format(resolver, types)          
+          val format = dispatch-format(resolver, types)            
           ;Two targets for default and amb and then each branch for dispatch.
           val num-targets = 2 + length(branches(ins))
           within delayed-ins(1 + 1 + num-targets) :
@@ -419,17 +531,10 @@ public defn encode (func:VMFunction,
             emit-ins-a(DISPATCH-OPCODE, format)            
             emit-ins-targets(targets)
         (ins:MatchIns) :
-          ;Push arguments onto registers
-          set-regs(ys(ins))
-          val [types, dests] = split-types-and-dests(branches(ins))
-          val format = match-format(resolver, types)
-          ;One target for default and then each branch for dispatch.
-          val num-targets = 1 + length(branches(ins))
-          within delayed-ins(1 + 1 + num-targets) :
-
-            val targets = jump-offsets([default(ins)], dests)
-            emit-ins-a(DISPATCH-OPCODE, format)            
-            emit-ins-targets(targets)
+          if all?(branch-is-final?, branches(ins)) :
+            emit-final-match(ys(ins), branches(ins), default(ins))
+          else :
+            emit-non-final-match(ys(ins), branches(ins), default(ins))
         (ins:MethodDispatchIns) :
           ;Push arguments onto registers
           set-regs(cat(ys(ins), zs(ins)))
@@ -443,6 +548,99 @@ public defn encode (func:VMFunction,
             emit-ins-targets(targets)
         (ins:SetIns) :
           set-local(slot(x(ins)), y(ins))
+
+    ;==================================================
+    ;============= Immediate Utilities ================
+    ;==================================================
+    ;Retrieve type of immediate
+    defn imm-type (x:VMImm) :
+      match(x:Local) : type(deftable[index(x)])
+      else : type(x)
+    defn imm-type (x:VMType) :
+      x
+
+    ;Use deftable to retrieve the slot of a local
+    defn slot (x:Local) :
+      local(deftable[index(x)])
+
+    ;==================================================
+    ;============= Label Utilities ====================
+    ;==================================================
+    ;Create mapping from label ID to position
+    defn jump-offset (n:Int) :
+      label-table[n] - buffer-pos()
+    defn jump-offsets (xs:Seqable<Int>) :
+      to-tuple(seq(jump-offset, xs))
+    defn jump-offsets (xs:Seqable<Int>, ys:Seqable<Int>) :
+      jump-offsets(cat(xs,ys))
+
+    ;Generate new unique label
+    defn* gen-label () :
+      val l = next(label-counter)
+      gen-label() when used-labels[l] else l
+
+    ;==================================================
+    ;============= Compilation Utilities ==============
+    ;==================================================
+    ;Retrieve the corresponding bits for the given immediate
+    defn to-bits (y:VMImm) -> Int|Long :
+      match(y) :
+        (y:Local) : slot(y)
+        (y:NumConst) :
+          match(value(y)) :
+            (v:Char) : to-int(v)
+            (v:Byte) : to-int(v)
+            (v:Int) : v
+            (v:Long) : v
+            (v:Float) : bits(v)
+            (v:Double) : bits(v)
+        (y:Marker) : marker(resolver, typeid(y))
+        (y:Tag) : typeid(y)
+        (y:VoidMarker) : void-marker(resolver)
+        (y:CodeId) : id(y)
+        (y:ExternId) : extern-address(id(y))
+        (y:GlobalId) : id(y)
+        (y:DataId) : id(y)
+        (y:ConstId) : id(y)
+
+    ;Set register
+    defn set-reg (i:Int, y:VMImm) :
+      match(to-bits(y)) :
+        (v:Int) : emit-ins-c(set-reg-opcode(y), i, v)
+        (v:Long) : emit-ins-d(set-reg-opcode(y), i, v)    
+    defn set-regs (ys:Seqable<VMImm>) :
+      do(set-reg, 0 to false, ys)
+    defn get-reg (x:Local|VMType, i:Int) :
+      match(x:Local) :
+        emit-ins-b(GET-REG-OPCODE, slot(x), i)
+    defn get-regs (xs:Seqable<Local|VMType>) :
+      do(get-reg, xs, 0 to false)
+
+    ;Set local
+    defn set-local (x:Int, y:VMImm) :
+      match(to-bits(y)) :
+        (v:Int) : emit-ins-c(set-opcode(y), x, v)
+        (v:Long) : emit-ins-d(set-opcode(y), x, v)
+
+    ;Put immediate in temporary local if not a local
+    defn to-local (x:VMImm, num:Int) :
+      match(x:Local) :
+        slot(x)
+      else :
+        val index = max-local + num + 1
+        set-local(index, x)
+        index
+
+    ;Put immediate in register if not a function immediate
+    defn to-function-local (f:VMImm) :
+      match(f) :
+        (f:CodeId) : id(f)
+        (f) : to-local(f, 0)
+
+    ;==================================================
+    ;===================== Launch =====================
+    ;==================================================
+    driver()
 
   ;Use delayed actions and encode instructions
   within delay-actions() :
@@ -595,6 +793,8 @@ val DEREF-OPCODE = 142
 val TYPEOF-OPCODE = 143
 ;branch operation
 val JUMP-SET-OPCODE = 144
+val JUMP-TAGBITS-OPCODE = 240
+val JUMP-TAGWORD-OPCODE = 242
 val GOTO-OPCODE = 145
 ;conversion operations
 val CONV-OPCODE-BYTE-FLOAT = 146

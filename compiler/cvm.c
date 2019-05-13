@@ -146,6 +146,8 @@
 #define DEREF_OPCODE 142
 #define TYPEOF_OPCODE 143
 #define JUMP_SET_OPCODE 144
+#define JUMP_TAGBITS_OPCODE 240
+#define JUMP_TAGWORD_OPCODE 242
 #define GOTO_OPCODE 145
 #define CONV_OPCODE_BYTE_FLOAT 146
 #define CONV_OPCODE_BYTE_DOUBLE 147
@@ -1309,11 +1311,23 @@ void vmloop (VMState* vms){
     }
     case JUMP_SET_OPCODE : {
       DECODE_F();
-      if(LOCAL(x)){
-        pc = pc0 + (n1 * 4);
-        continue;
-      }
-      else{
+      F_JUMP(LOCAL(x));
+    }
+    case JUMP_TAGBITS_OPCODE : {
+      DECODE_F();
+      int tagbits = (int)(LOCAL(x)) & 0x7;
+      int bits = y;
+      F_JUMP(tagbits == bits);
+    }
+    case JUMP_TAGWORD_OPCODE : {
+      DECODE_F();
+      uint64_t obj = LOCAL(x);
+      int tagbits = (int)obj & 0x7;
+      int tag = LOCAL(y);
+      if(tagbits == 1){
+        int* p = (int*)(obj - 1);
+        F_JUMP(*p == tag);
+      }else{
         pc = pc0 + (n2 * 4);
         continue;
       }
