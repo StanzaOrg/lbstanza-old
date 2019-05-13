@@ -8,6 +8,7 @@ defpackage stz/vm-encoder :
   import stz/call-records
   import stz/backend
   import stz/utils
+  import stz/trie
 
 public deftype EncodingResolver
 public defmulti liveness-map (r:EncodingResolver, live:Tuple<Int>, num-locals:Int) -> Int
@@ -123,6 +124,10 @@ public defn encode (func:VMFunction,
       (t:AndType) : any?(type-is-final?, types(t))
       (t:TopType) : true
 
+  ;Check whether all types in branch are final.
+  defn branch-is-final? (b:VMBranch) :
+    all?(type-is-final?, types(b))
+
   ;Encode multivarity functions
   defn encode (multi:VMMultifn) :
     ;Declare function positions
@@ -236,6 +241,70 @@ public defn encode (func:VMFunction,
       emit-ins-a(FNENTRY-OPCODE, num-locals)
       ;Retrieve arguments
       get-regs(args(func))
+
+    ;Encode a match statement that can be redefined later.
+    defn emit-non-final-match (ys:Tuple<VMImm>, bs:Tuple<VMBranch>, default:Int) :
+      ;Retrieve the format index of this match statement.
+      val [types, dests] = split-types-and-dests(bs)
+      val format = match-format(resolver, types)
+      
+      ;Push arguments onto registers
+      set-regs(ys)
+
+      ;One target for default and then each branch for dispatch.
+      val num-targets = 1 + length(bs)
+      within delayed-ins(1 + 1 + num-targets) :
+        val targets = jump-offsets([default], dests)
+        emit-ins-a(DISPATCH-OPCODE, format)            
+        emit-ins-targets(targets)    
+
+    ;Encode a match statement that cannot be redefined later.
+    defn emit-final-match (ys:Tuple<VMImm>, bs:Tuple<VMBranch>, default:Int) :
+      ;Overall algorithm
+      defn driver () :
+        if empty?(bs) : emit-ins(GotoIns(default))
+        else : emit-tries(to-trie(seq(ibranch,bs), default))          
+      ;Convert a TypeSet to an ISet assuming that the TypeSet represents a final type.
+      defn final-iset (t:TypeSet) :
+        match(t) :
+          (t:SingleType) : ISubset([type(t)])
+          (t:OrType) : reduce(union, seq(final-iset, types(t)))
+          (t:AndType) : final-iset(find!(type-is-final?, types(t)))
+          (t:TopType) : IAll()
+      ;Convert a VMBranch into an IBranch
+      defn ibranch (v:VMBranch) :
+        IBranch(to-list(seq(final-iset,types(v))), n(v))
+      ;Compile branches to flattened tries
+      defn to-trie (bs:Seqable<IBranch>, default:Int) :
+        flatten(/to-trie(bs), default)
+      ;Compile a flattened trie
+      defn emit-tries (ftries:LabeledTries) -> False :
+        ;Create labels for all tries
+        val labels = to-tuple(seq(gen-label{}, 0 to num-labeled-tries(ftries)))
+        ;Convert a TrieTarget into a label
+        defn to-n (t:TrieTarget) :
+          match(t) :
+            (t:EndTrie) : target(t) as Int
+            (t:TrieId) : labels[id(t)]
+        ;Compile each trie
+        for trie in tries(ftries) do :
+          ;Emit trie label
+          if id(trie) is Int :
+            val l = labels[id(trie) as Int]
+            emit-ins(LabelIns(l))
+          ;Emit empty trie if required
+          if empty?(entries(trie)) :
+            emit-ins(GotoIns(to-n(/default(trie))))
+          ;Emit each branch
+          else :
+            val num-e = length(entries(trie))
+            for (e in entries(trie), i in 0 to false) do :
+              val n1 = to-n(value(e))
+              val n2 = gen-label() when i < num-e - 1 else to-n(/default(trie))
+              emit-ins(Branch1Ins(n1, n2, InstanceofOp(SingleType(key(e))), ys[index(trie)]))
+              emit-ins(LabelIns(n2)) when i < num-e - 1
+      ;Launch
+      driver()
     
     ;Encode each instruction
     defn emit-ins (ins:VMIns) :
@@ -431,16 +500,10 @@ public defn encode (func:VMFunction,
             emit-ins-a(DISPATCH-OPCODE, format)            
             emit-ins-targets(targets)
         (ins:MatchIns) :
-          ;Push arguments onto registers
-          set-regs(ys(ins))
-          val [types, dests] = split-types-and-dests(branches(ins))
-          val format = match-format(resolver, types)
-          ;One target for default and then each branch for dispatch.
-          val num-targets = 1 + length(branches(ins))
-          within delayed-ins(1 + 1 + num-targets) :
-            val targets = jump-offsets([default(ins)], dests)
-            emit-ins-a(DISPATCH-OPCODE, format)            
-            emit-ins-targets(targets)
+          if all?(branch-is-final?, branches(ins)) :
+            emit-final-match(ys(ins), branches(ins), default(ins))
+          else :
+            emit-non-final-match(ys(ins), branches(ins), default(ins))
         (ins:MethodDispatchIns) :
           ;Push arguments onto registers
           set-regs(cat(ys(ins), zs(ins)))
