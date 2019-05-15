@@ -63,7 +63,7 @@ FILES="core/core.stanza \
        compiler/stz-branch-table.stanza \
        compiler/stz-vm-analyze.stanza \
        compiler/stz-vm-bindings.stanza \
-       compiler/stz-loaded-ids.stanza \
+       compiler/stz-vm-ids.stanza \
        compiler/stz-el-to-vm.stanza \
        compiler/stz-vm-normalize.stanza \
        compiler/stz-compiler.stanza \
