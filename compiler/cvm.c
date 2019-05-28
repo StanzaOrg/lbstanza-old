@@ -647,7 +647,7 @@ void vmloop (VMState* vms){
     case CALLC_OPCODE_LOCAL : {
       DECODE_C();
       void* faddr = (void*)LOCAL(value);
-      int num_locals = x;
+      int num_locals = y;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
       c_trampoline(faddr, registers, registers);      

@@ -89,7 +89,9 @@ uint64_t alloc_stack (VMInit* init){
 }
 
 int main (int argc, char* argv[]) {
-  init_fmalloc();
+  #if defined(FMALLOC)
+    init_fmalloc();
+  #endif
   
   input_argc = argc;
   input_argv = argv;
