@@ -437,7 +437,6 @@ typedef struct{
 //============================================================
 
 int call_garbage_collector (VMState* vms, uint64_t total_size);
-void call_stack_extender (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
 char* retrieve_class_name (VMState* vms, long id);
 void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
