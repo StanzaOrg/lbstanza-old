@@ -193,6 +193,7 @@
 #define CLASS_NAME_OPCODE 241
 #define PRINT_STACK_TRACE_OPCODE 186
 #define FLUSH_VM_OPCODE 188
+#define C_RSP_OPCODE 243
 #define JUMP_INT_LT_OPCODE 192
 #define JUMP_INT_GT_OPCODE 193
 #define JUMP_INT_LE_OPCODE 194
@@ -458,7 +459,7 @@ uint64_t ptr_to_ref (void* p){
   return (uint64_t)p + REF_TAG_BITS;
 }
 
-void vmloop (VMState* vms){
+void vmloop (VMState* vms, uint64_t stanza_crsp){
   //Pull out local cache
   char* instructions = vms->instructions;
   uint64_t* registers = vms->registers;
@@ -1613,6 +1614,11 @@ void vmloop (VMState* vms){
       DECODE_A_UNSIGNED();
       SAVE_STATE();
       SET_LOCAL(value, (uint64_t)vms);
+      continue;
+    }
+    case C_RSP_OPCODE : {
+      DECODE_A_UNSIGNED();
+      SET_LOCAL(value, stanza_crsp);
       continue;
     }
     case JUMP_INT_LT_OPCODE : {
