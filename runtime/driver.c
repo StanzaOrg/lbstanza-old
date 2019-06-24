@@ -65,6 +65,7 @@ int64_t stanza_entry (VMInit* init);
 //     ======================
 int input_argc;
 char** input_argv;
+int input_argv_needs_free;
 
 //     Main Driver
 //     ===========
@@ -95,6 +96,7 @@ int main (int argc, char* argv[]) {
   
   input_argc = argc;
   input_argv = argv;
+  input_argv_needs_free = 0;
   VMInit init;
 
   //Allocate heap and free
