@@ -57,6 +57,8 @@ FILES="core/core.stanza \
        compiler/stz-trie.stanza \
        compiler/stz-trie-table.stanza \
        compiler/stz-hash.stanza \
+       compiler/stz-keyed-set.stanza \
+       compiler/stz-dyn-graph.stanza \
        compiler/stz-dyn-tree.stanza \
        compiler/stz-dyn-bi-table.stanza \
        compiler/stz-vm-table.stanza \
