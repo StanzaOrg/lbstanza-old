@@ -57,10 +57,10 @@ FILES="core/core.stanza \
        compiler/stz-trie-table.stanza \
        compiler/stz-hash.stanza \
        compiler/stz-keyed-set.stanza \
-       compiler/set-utils.stanza \
+       compiler/stz-set-utils.stanza \
        compiler/stz-conversion-utils.stanza \
        compiler/stz-dyn-graph.stanza \
-       compiler/dispatch-dag.stanza \
+       compiler/stz-dispatch-dag.stanza \
        compiler/stz-dyn-tree.stanza \
        compiler/stz-dyn-bi-table.stanza \
        compiler/stz-vm-table.stanza \
@@ -91,7 +91,7 @@ FILES="core/core.stanza \
        compiler/stz-backend.stanza \
        compiler/stz-gen-bindings.stanza \
        compiler/stz-dependencies.stanza \
-       compiler/call-records.stanza \
+       compiler/stz-call-records.stanza \
        compiler/stz-main.stanza \
        compiler/stz-driver.stanza"
 
