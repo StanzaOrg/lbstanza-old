@@ -54,11 +54,13 @@ FILES="core/core.stanza \
        compiler/stz-bindings.stanza \
        compiler/stz-bindings-to-vm.stanza \
        compiler/stz-vm-encoder.stanza \
-       compiler/stz-trie.stanza \
        compiler/stz-trie-table.stanza \
        compiler/stz-hash.stanza \
        compiler/stz-keyed-set.stanza \
+       compiler/set-utils.stanza \
+       compiler/stz-conversion-utils.stanza \
        compiler/stz-dyn-graph.stanza \
+       compiler/dispatch-dag.stanza \
        compiler/stz-dyn-tree.stanza \
        compiler/stz-dyn-bi-table.stanza \
        compiler/stz-vm-table.stanza \
