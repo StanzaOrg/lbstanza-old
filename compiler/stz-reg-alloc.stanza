@@ -1,83 +1,264 @@
 ;See License.txt for details about licensing.
 
+;<doc>=======================================================
+;=================== Documentation ==========================
+;============================================================
+
+INPUT:
+  One single normalized VMFunction.
+  An emitter for outputting the generated assembly instructions.
+  The backend upon which to perform the allocation.
+  The assembly stubs which contain all of the labels needed to generate the
+  assembly instructions.
+OUTPUT:
+  The allocated abstract instructions. 
+
+Constructs that must be handled, and their variants:
+  
+  Args - (StanzaContext / CContext)
+  Return - (StanzaContext / CContext)
+  Call - (StanzaCall / StanzaTCall / CCall / YieldCall / CollectGarbage / ExtendStack)
+  Op - (AddOp / SubOp / MulOp / AndOp / OrOp / XorOp / NotOp / ShlOp / ShrOp /
+        AshrOp / NegOp / EqOp / NeOp / LtOp / GtOp / LeOp / GeOp / UleOp / UltOp /
+        UgtOp / UgeOp / FlushVMOp / CRSPOp / DivModOp / NoOp / RecordLiveOp / LoadOp /
+        StoreOp / StoreArgOp / StoreCArgOp / LoadArgOp / AllocOp / InstanceofOp)
+  Branch - (EqOp / NeOp / LtOp / GtOp / LeOp / GeOp / UleOp / UltOp /
+            UgtOp / UgeOp / HasHeapOp / HasStackOp / ArgEqOp)
+  Set
+  Match
+  MethodDispatch
+  Save
+  Load
+
+Implementations:
+
+  Args - StanzaContext:
+    The arguments are assumed to be located in their preassigned registers.
+  Args - CContext:
+    ???
+  Return - StanzaContext:
+    Return values are stored in their preassigned registers.
+  Return - CContext:
+    ???
+  Call - StanzaCall:
+    Arguments are already stored.
+    Push stack frame
+    Call function
+    Pop stack frame
+    
+    RSP += frame-size + 8
+    call F
+    RSP -= frame-size + 8    
+  Call - StanzaTCall :  
+    Arguments are already stored.
+    Jump to function
+    
+    goto F
+  Call - CCall :
+    Push stack frame.
+    Save RSP in stack-pointer temporary
+    Restore C Context: C preserved registers, CRSP
+    Push CRSP down
+    Set number of floating point arguments
+    Call function
+    Restore RSP.
+    Pop stack frame.
+    
+    RSP += frame-size + 8
+    [saved-stack-pointer] = RSP
+    
+    R2 = [saved-CR2]
+    ...
+    Rn = [saved-CRn]
+    
+    RSP = [saved-CRsp]
+    
+    RSP -= c-frame-size
+    
+    R0 = num floating-point arguments
+    
+    call F
+    
+    RSP = [saved-stack-pointer]
+    RSP -= frame-size + 8
+  Call - YieldCall :
+    Save current stack progress
+    Load given stack
+    Goto saved PC
+
+    TMP = [current-stack]
+    [TMP.pc] = &lbl
+      (TMP2 = &lbl
+       [TMP.pc] = TMP2)
+    [TMP.sp] = RSP
+    
+    [current-stack] = F
+    RSP = F.sp or F.frames (depending on enter?)
+    [stack-limit] = F.frames + F.size
+      (TMP = F.frames
+       TMP2 = F.size
+       TMP += TMP2
+       [stack-limit] = TMP)
+    
+    goto F.pc
+      (TMP = F.pc
+       goto TMP)
+    label lbl:
+  Call - CollectGarbage :
+    Assume size is in first argument
+    Set return address
+    
+    R0 = &lbl
+    goto collect-garbage
+    label lbl:
+  Call - ExtendStack :
+    Set return address
+    R0 = &lbl
+    goto extend-stack
+    label lbl:
+  Op - FlushVMOp :
+    save stack-pointer into current stack
+
+    x = [current-stack]
+    [x.sp] = RSP
+    x = &vmstate
+
+  Op - AllocOp :
+    Load heap-top
+    Return pointer tagged with tag-bits
+    Add size to pointer and save back into heap-top
+
+    TMP = [heap-top]
+    TMP2 = size
+    x = TMP + ref-tag-bits(1)
+    [heap-top] = TMP + TMP2
+
+  Op - InstanceofOp :
+    Ensure two scratch registers for compilation.
+
+  Branch - HasHeapOp :
+    Load heap-top
+    Add requested size to heap-top.
+    Compare against heap-limit
+
+    TMP = [heap-top]
+    TMP += size
+    TMP2 = [heap-limit]
+    compare TMP TMP2
+
+  Branch - HasStackOp :
+    Add RSP to frame-size + 8
+    Load stack-limit
+
+    TMP = RSP + frame-size + 8
+    TMP2 = [stack-limit]
+    compare TMP TMP2
+
+    HasStackOp is guaranteed for TMP/TMP2 in R0/R1 to be free because
+    it is used during the function prelude, and registers still
+    obey the calling convention.    
+    
+  Match :
+    Ensure two scratch registers for trie compilation
+
+  MethodDispatch :
+    Ensure two scratch registers for trie compilation.
+    
+    MethodDispatch is guaranteed for TMP/TMP2 in R0/R1 to be free because
+    it is used during the function prelude, and registers still
+    obey the calling convention.    
+
+Allocation of Classes:
+  This pass handles spilling, saving, and loading of registers so that every
+  instruction has the necessary number of register available to it during
+  register assignment. 
+
+  Thus, for each construct, we need to know how many extra registers we need
+  for its stub.
+
+  
+
+;============================================================
+;=======================================================<doc>
+
 defpackage stz/reg-alloc :
   import core
   import collections with :
     prefix(Set) => collections-
   import stz/algorithms
-  import stz/tgt-ir
-  import stz/kl-ir
-  import stz/ids
   import stz/backend
   import stz/padder
+  import stz/vm-ir
+  import stz/basic-ops
+  import stz/typeset
   import stz/asm-ir with :
     prefix => asm-
-  import stz/codegen
-  import stz/params
+  import stz/vm-normalize with :
+    prefix(CallType, StanzaCall, StanzaTCall, CCall, YieldCall) => vm-
   import stz/utils
+  import stz/codegen
+  import stz/basic-blocks with :
+    prefix(Block) => Basic
 
 ;============================================================
 ;===================== Driver ===============================
 ;============================================================
 
-public defn allocate-registers (ins:Collection<TGIns>, backend:Backend) -> False :
-  if flag-defined?(`PRINT-REG-ALLOC) :
-    println("==== Input ====")
-    do(println, ins)
+public defn allocate-registers (ins:VMFunction, emitter:CodeEmitter, backend:Backend, stubs:AsmStubs, print?:True|False) -> False :
+  take-ids(ins)
+  
+  ;if flag-defined?(`PRINT-REG-ALLOC) :
+  ;  println("==== Input ====")
+  ;  do(println, ins)
 
-  load-instructions(ins)
-  if flag-defined?(`PRINT-REG-ALLOC) :
+  load-instructions(ins as VMFunc, backend)
+  if print? :
     println("==== Load Instructions ====")
     print-prog()
-
-  normalize(backend)
-  if flag-defined?(`PRINT-REG-ALLOC):
-    println("==== Normalize ====")
-    print-prog()
-
+  ;
+  ;normalize(backend)
+  ;if flag-defined?(`PRINT-REG-ALLOC):
+  ;  println("==== Normalize ====")
+  ;  print-prog()
+  ;
   remove-critical-edges()
-  if flag-defined?(`PRINT-REG-ALLOC) :
-    println("==== Remove Critical Edges ====")
-    print-prog() 
-
+  ;if print? :
+  ;  println("==== Remove Critical Edges ====")
+  ;  print-prog() 
+  
   reverse-post-order()
-  if flag-defined?(`PRINT-REG-ALLOC) :
-    println("==== Reverse Post Order ====")
-    print-prog()
-
+  ;if print? :
+  ;  println("==== Reverse Post Order ====")
+  ;  print-prog()
+  
   compute-predecessors()
   liveness-analysis()
   add-annotations()
-  if flag-defined?(`PRINT-REG-ALLOC) :
+  if print? :
     println("==== Added Annotations ====")
     print-prog()
-
+  
   allocate-classes(backend)
-  if flag-defined?(`PRINT-REG-ALLOC) :
+  if print? :
     println("==== Allocated Classes ====")
     print-prog()
 
   register-assignment(backend)
-  if flag-defined?(`PRINT-REG-ALLOC) :
+  if print? :
     println("==== Assigned Registers ====")
     print-prog()
-
+  
   val smap = stack-map()
-  if flag-defined?(`PRINT-REG-ALLOC) :
-    println("==== Stack Map ====")
-    println(smap)
-
-  enforce-clearing(smap)
-  if flag-defined?(`PRINT-REG-ALLOC) :
-    println("==== Enforce Clearing ====")
-    print-prog()
-
+  ;if print? :
+  ;  println("==== Stack Map ====")
+  ;  println(smap)
+  
   collapse-blocks()
-  if flag-defined?(`PRINT-REG-ALLOC) :
+  if print? :
     println("==== Collapse Blocks ====")
     print-prog()
 
-  assemble(smap, backend)
+  assemble(emitter, smap, stubs)
   clear-working-set()
 
 ;============================================================
@@ -88,26 +269,24 @@ public defn allocate-registers (ins:Collection<TGIns>, backend:Backend) -> False
 ;==== Variable Definitions ====
 ;==============================
 
-deftype Imm
-defstruct Var <: Imm :
+public deftype Imm
+public defstruct Var <: Imm :
   n: Int
-  reg? : False|Reg|FReg
-defstruct Val <: Imm :
-  value: TGImm
+  reg? : False|Reg|FReg with: (default => false)
+public defstruct Val <: Imm :
+  value: VMImm
 
-deftype Loc
-defstruct Reg <: Loc&Equalable :
+public deftype Loc
+public defstruct Reg <: Loc&Equalable :
   n: Int
-defstruct FReg <: Loc&Equalable :
+public defstruct FReg <: Loc&Equalable :
   n: Int
 
 ;======================
 ;==== Constructors ====
 ;======================
-defn Var (n:Int) : Var(n, false)
-
-defn XReg (t:TGType, n:Int) :
-  match(t:TGIntegerT) : Reg(n)
+defn XReg (t:VMType, n:Int) :
+  match(t:VMType&IntegerT) : Reg(n)
   else : FReg(n)
 
 ;==================
@@ -119,100 +298,152 @@ defmethod equal? (a:Reg, b:Reg) :
 
 defmethod equal? (a:FReg, b:FReg) :
   n(a) == n(b)
-
+  
 ;=================================
 ;==== Instruction Definitions ====
 ;=================================
-deftype Ins
+public deftype Ins
 defmulti killed? (i:Ins) -> False|List<Int>
 
-defstruct Def <: Ins :
+public defstruct Def <: Ins :
   x: Var
-  killed?: False|List<Int> with: (as-method => true)
+  killed?: False|List<Int> with: (default => false, as-method => true)
 
-defstruct Set <: Ins :
+public defstruct Set <: Ins :
   x: Var
   y: Imm
-  killed?: False|List<Int> with: (as-method => true)
+  killed?: False|List<Int> with: (default => false, as-method => true)
 
-defstruct Args <: Ins :
+public defstruct Args <: Ins :
   xs: List<Var>
   ctxt: FnContext
-  killed?: False|List<Int> with: (as-method => true)
+  killed?: False|List<Int> with: (default => false, as-method => true)
 
-defstruct Return <: Ins :
+public defstruct Return <: Ins :
   xs: List<Imm>
   ctxt: FnContext
-  killed?: False|List<Int> with: (as-method => true)
+  killed?: False|List<Int> with: (default => false, as-method => true)
 
-defstruct Call <: Ins :
+public defstruct Call <: Ins :
   xs: List<Var> with: (updater => sub-xs)
   f: Imm with: (updater => sub-f)
   ys: List<Imm> with: (updater => sub-ys)
   type: CallType with: (updater => sub-type)
-  killed?: False|List<Int> with: (as-method => true)
+  killed?: False|List<Int> with: (default => false, as-method => true)
 
-defstruct Op <: Ins :
-  op: TGOp with: (updater => sub-op)
+public defstruct Op <: Ins :
+  op: VMOp with: (updater => sub-op)
   xs: List<Var> with: (updater => sub-xs)
   ys: List<Imm> with: (updater => sub-ys)
-  killed?: False|List<Int> with: (as-method => true) 
+  killed?: False|List<Int> with: (default => false, as-method => true) 
 
-defstruct Branch <: Ins :
-  op: TGOp
+public defstruct Branch <: Ins :
+  op: VMOp
   xs: List<Imm>
-  killed?: False|List<Int> with: (as-method => true)
+  killed?: False|List<Int> with: (default => false, as-method => true)
 
-defstruct Match <: Ins :
+public defstruct Match <: Ins :
   dispatch?: True|False
-  tag-lists: List<List<KType>>
+  type-lists: List<List<TypeSet>>
   xs: List<Imm>
-  killed?: False|List<Int> with: (as-method => true)
-  ns?: False|List<Int>
+  killed?: False|List<Int> with: (default => false, as-method => true)
+  ns?: False|List<Int> with: (default => false)
 
-defstruct Save <: Ins :
+public defstruct MethodDispatch <: Ins :
+  multi: Int
+  num-header-args: Int
+  default?: Int|False with: (default => false)
+  amb?: Int|False with: (default => false)
+  killed?: False|List<Int> with: (default => false, as-method => true)
+
+public defstruct Save <: Ins :
   x: Var
 
-defstruct Load <: Ins :
+public defstruct Load <: Ins :
   x: Var
 
-defstruct Unload <: Ins :
+public defstruct Unload <: Ins :
   n: Int
 
-defstruct NextUsed <: Ins :
+public defstruct NextUsed <: Ins :
   n: Int
   pos: Int
 
-defstruct Xchg <: Ins :
+public defstruct Xchg <: Ins :
   x: Var
   y: Var
   swap: False|Reg|FReg
-
-defstruct Clear <: Ins :
-  n: Int
-
-defstruct ShuffleReg <: Ins :
+  
+public defstruct ShuffleReg <: Ins :
   xs: List<Int>
   ys: List<Int>
 
-defstruct ShuffleFReg <: Ins :
+public defstruct ShuffleFReg <: Ins :
   xs: List<Int>
   ys: List<Int>
 
-defstruct Label <: Ins :
+public defstruct Label <: Ins :
   n: Int
 
-defstruct Goto <: Ins :
+public defstruct Goto <: Ins :
   n: Int
 
-defstruct Break <: Ins :
+public defstruct Break <: Ins :
   n: Int
-  op: TGOp
+  op: VMOp
   xs: List<Imm>
 
-defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg|Clear|
+defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg|
                      ShuffleReg|ShuffleFReg|Label|Goto|Break) :
   false
+
+;==========================
+;==== Function Context ====
+;==========================
+
+public deftype FnContext
+public defmulti regs (c:FnContext) -> List<Loc>
+public defstruct StanzaContext <: FnContext :
+  regs: List<Loc> with: (as-method => true)
+public defstruct CContext <: FnContext :
+  regs: List<Loc> with: (as-method => true)
+
+;===================
+;==== Call Type ====
+;===================
+
+public deftype CallType
+
+public defstruct StanzaCall <: CallType :
+  info: False|FileInfo
+  func-reg: False|Loc 
+  arg-regs: List<Loc>
+  ret-regs: List<Loc>
+  
+public defstruct StanzaTCall <: CallType :
+  func-reg: False|Loc
+  arg-regs: List<Loc>
+
+public defstruct CCall <: CallType :
+  num-mem-args: Int
+  func-reg: False|Loc
+  arg-regs: List<Loc>
+  ret-regs: List<Loc>
+  
+public defstruct YieldCall <: CallType :
+  enter?: True|False
+  info: False|FileInfo
+  func-reg: Loc
+  arg-regs: List<Loc>
+  ret-regs: List<Loc>
+  scratch-regs: List<Loc>
+
+public defstruct CollectGarbage <: CallType :
+  info: False|FileInfo
+  arg-regs: List<Loc>
+  ret-regs: List<Loc>
+  
+public defstruct ExtendStack <: CallType
 
 ;==========================
 ;==== Block Definition ====
@@ -225,24 +456,11 @@ public defstruct Block :
 ;=== Port Definition ====
 ;========================
 defstruct Port :
-   n: Int
-   saved?: True|False
-   loaded?: True|False
-   reg: False|Reg|FReg
-   dist: Int
-
-;==================================
-;==== Convenience Constructors ====
-;==================================
-
-public defn Def (x:Var) : Def(x, false)
-public defn Set (x:Var, y:Imm) : Set(x, y, false)
-public defn Args (xs:List<Var>, ctxt:FnContext) : Args(xs, ctxt, false)
-public defn Return (xs:List<Imm>, ctxt:FnContext) : Return(xs, ctxt, false)
-public defn Call (xs:List<Var>, f:Imm, ys:List<Imm>, type:CallType) : Call(xs, f, ys, type, false)
-public defn Op (op:TGOp, xs:List<Var>, ys:List<Imm>) : Op(op, xs, ys, false)
-public defn Branch (op:TGOp, xs:List<Imm>) : Branch(op, xs, false)
-public defn Match (d?:True|False, ts:List<List<KType>>, xs:List<Imm>) : Match(d?, ts, xs, false, false)
+  n: Int
+  saved?: True|False
+  loaded?: True|False
+  reg: False|Reg|FReg
+  dist: Int
 
 ;=============================
 ;==== Convenience Getters ====
@@ -250,120 +468,86 @@ public defn Match (d?:True|False, ts:List<List<KType>>, xs:List<Imm>) : Match(d?
 defn killed (i:Ins) : killed?(i) as List<Int>
 defn ns (m:Match) : ns?(m) as List<Int>
 defn reg (v:Var) : reg?(v) as Reg|FReg
-
-;==========================
-;==== Function Context ====
-;==========================
-
-public deftype FnContext
-public defstruct StanzaContext <: FnContext :
-  regs?: False|List<Loc>
-public defstruct CContext <: FnContext :
-  regs?: False|List<Loc>
-
-public defn StanzaContext () : StanzaContext(false)
-public defn CContext () : CContext(false)
-
-public defn regs (s:FnContext) :
-  regs?(s as StanzaContext|CContext) as List<Loc>
-
-;===================
-;==== Call Type ====
-;===================
-
-public deftype CallType
-public defstruct StanzaCall <: CallType :
-  arity: Int
-  info: False|FileInfo
-  func-reg?: False|Loc
-  arg-regs?: False|List<Loc>
-  ret-regs?: False|List<Loc>
-public defstruct StanzaTCall <: CallType :
-  arity: Int
-  func-reg?: False|Loc
-  arg-regs?: False|List<Loc>
-  ret-regs?: False|List<Loc>
-public defstruct CCall <: CallType :
-  arity: Int
-  num-mem-args: Int
-  func-reg?: False|Loc
-  arg-regs?: False|List<Loc>
-  ret-reg?: False|Loc
-public defstruct StackSwitch <: CallType :
-  func-reg?: False|Loc
-  reg?: False|Loc
-
-public defn StanzaCall (arity:Int, i:False|FileInfo) :
-  StanzaCall(arity, i, false, false, false)
-public defn StanzaTCall (arity:Int) : StanzaTCall(arity, false, false, false)
-public defn CCall (arity:Int) : CCall(arity, 0, false, false, false)
-public defn StackSwitch () : StackSwitch(false, false)
-
-public defn arg-regs (t:CallType) :
-  match(t) :
-    (t:StanzaCall) : arg-regs?(t) as List<Loc>
-    (t:StanzaTCall) : arg-regs?(t) as List<Loc>
-    (t:CCall) : arg-regs?(t) as List<Loc>
-    (t:StackSwitch) : List(reg?(t) as Loc)
-
-public defn ret-regs (t:CallType) :
-  match(t) :
-    (t:StanzaCall) : ret-regs?(t) as List<Loc>
-    (t:StanzaTCall) : ret-regs?(t) as List<Loc>
-    (t:CCall) : List(ret-reg?(t) as Loc)
-    (t:StackSwitch) : List(reg?(t) as Loc)
-
-public defn func-reg (t:CallType) :
-  match(t) :
-    (t:StanzaCall) : func-reg?(t) as Loc
-    (t:StanzaTCall) : func-reg?(t) as Loc
-    (t:CCall) : func-reg?(t) as Loc
-    (t:StackSwitch) : func-reg?(t) as Loc
+defn default (m:MethodDispatch) : default?(m) as Int
+defn amb (m:MethodDispatch) : amb?(m) as Int
 
 ;=====================
 ;==== Special Ops ====
 ;=====================
-
-public defstruct DivModOp <: TGOp
-defmethod print (o:OutputStream, op:DivModOp) :
-  print(o, "divmod")
-
-public defstruct NoOp <: TGOp
+public defstruct NoOp <: VMOp
 defmethod print (o:OutputStream, op:NoOp) :
   print(o, "nop")
 
-public defstruct ConvOp <: TGOp
-defmethod print (o:OutputStream, op:ConvOp) :
-  print(o, "conv")
-
-public defstruct InterpretOp <: TGOp
-defmethod print (o:OutputStream, op:InterpretOp) :
-  print(o, "interpret")
-
-public defstruct NewStackOp <: TGOp
-defmethod print (o:OutputStream, op:NewStackOp) :
-  print(o, "newstk")
-
-public defstruct SaveCContextOp <: TGOp
+public defstruct SaveCContextOp <: VMOp
 defmethod print (o:OutputStream, op:SaveCContextOp) :
   print(o, "save-c-ctxt")
 
-public defstruct ArityErrorOp <: TGOp :
-  info: False|FileInfo
-defmethod print (o:OutputStream, op:ArityErrorOp) :
-  print(o, "arity-error")
+public defstruct RecordLiveOp <: VMOp :
+  live-vars: Tuple<Var>
+defmethod print (o:OutputStream, op:RecordLiveOp) :
+  print(o, "live(%,)" % [live-vars(op)])
 
-public defstruct LoadOp <: TGOp : (offset:Int)
+public defstruct LoadOp <: VMOp : (offset:Int)
 defmethod print (o:OutputStream, op:LoadOp) :
   print(o, "load/%_" % [offset(op)])
 
-public defstruct StoreOp <: TGOp : (offset:Int)
+public defstruct StoreOp <: VMOp : (offset:Int) ;[4]
 defmethod print (o:OutputStream, op:StoreOp) :
   print(o, "store/%_" % [offset(op)])
 
-public defstruct FlipOp <: TGOp : (op:TGOp)
+public defstruct StoreArgOp <: VMOp : (index:Int)
+defmethod print (o:OutputStream, op:StoreArgOp) :
+  print(o, "storearg/%_" % [index(op)])
+
+public defstruct LoadCArgOp <: VMOp : (index:Int, num-mem-args:Int)
+defmethod print (o:OutputStream, op:LoadCArgOp) :
+  print(o, "loadcarg/%_ (num-mem-args = %_)" % [index(op), num-mem-args(op)])
+
+public defstruct StoreCArgOp <: VMOp : (index:Int, num-mem-args:Int)
+defmethod print (o:OutputStream, op:StoreCArgOp) :
+  print(o, "storecarg/%_ (num-mem-args = %_)" % [index(op), num-mem-args(op)])
+  
+public defstruct LoadArgOp <: VMOp : (index:Int)
+defmethod print (o:OutputStream, op:LoadArgOp) :
+  print(o, "loadarg/%_" % [index(op)])
+
+public defstruct AllocOp <: VMOp
+defmethod print (o:OutputStream, op:AllocOp) :
+  print(o, "alloc")  
+
+public defstruct StoreCRSPOp <: VMOp
+with: (printer => true)
+
+public defstruct FlipOp <: VMOp : (op:VMOp)
 defmethod print (o:OutputStream, x:FlipOp) :
   print(o, "flip(%_)" % [op(x)])
+
+;============================================================
+;===================== Working Set ==========================
+;============================================================
+
+val BLOCKS = Vector<Block>()
+val VAR-TYPES = Vector<VMType>()
+val IN-PORTS = Vector<List<Port>>()
+val OUT-PORTS = Vector<List<Port>>()
+val PREDECESSORS = Vector<List<Int>>()
+
+defn nblocks () : length(BLOCKS)
+defn nvars () : length(VAR-TYPES)
+
+defn clear-working-set () :
+  clear(BLOCKS)
+  clear(VAR-TYPES)
+
+defn type (i:Imm) :
+  match(i) :
+    (i:Var) : VAR-TYPES[n(i)]
+    (i:Val) : type(value(i))
+
+defn make-var (t:VMType) :
+  val n = length(VAR-TYPES)
+  add(VAR-TYPES, t)
+  Var(n)
 
 ;============================================================
 ;====================== Printing ============================
@@ -424,8 +608,9 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:Xchg) : "xchg %_ with %_ through %_" % [x(i), y(i), swap(i)]
     (i:Match) :
       val op = "dispatch" when dispatch?(i) else "match"
-      "%_(%,)[%,]%_" % [op, xs(i), tag-lists(i), ks]
-    (i:Clear) : "clear %_" % [n(i)]
+      "%_(%,)[%,]%_" % [op, xs(i), type-lists(i), ks]
+    (i:MethodDispatch) :
+      "method-dispatch(%_)%_" % [multi(i), ks]
     (i:ShuffleReg) : "shuffle (%,) = (%,)" % [xs(i), ys(i)]
     (i:ShuffleFReg) : "fshuffle (%,) = (%,)" % [xs(i), ys(i)]
     (i:Label) : "label %_" % [n(i)]
@@ -434,15 +619,17 @@ defmethod print (o:OutputStream, i:Ins) :
 
 defmethod print (o:OutputStream, c:FnContext) :
   print{o, _} $ match(c) :
-    (c:StanzaContext) : "ST(%_)" % [regs?(c)]
-    (c:CContext) : "C(%_)" % [regs?(c)]
+    (c:StanzaContext) : "ST(%_)" % [regs(c)]
+    (c:CContext) : "C(%_)" % [regs(c)]
 
 defmethod print (o:OutputStream, c:CallType) :
   print{o, _} $ match(c) :
-    (c:StanzaCall) : "S(%_, %_, %_)" % [arity(c), arg-regs?(c), ret-regs?(c)]
-    (c:StanzaTCall) : "ST(%_, %_, %_)" % [arity(c), arg-regs?(c), ret-regs?(c)]
-    (c:CCall) : "C(%_, %_, %_)" % [arity(c), num-mem-args(c), arg-regs?(c)]
-    (c:StackSwitch) : "STK(%_)" % [reg?(c)]
+    (c:StanzaCall) : "S(%_, %_, %_)" % [func-reg(c), arg-regs(c), ret-regs(c)]
+    (c:StanzaTCall) : "ST(%_, %_)" % [func-reg(c), arg-regs(c)]
+    (c:CCall) : "C(%_, %_, %_, %_)" % [num-mem-args(c), func-reg(c), arg-regs(c), ret-regs(c)]
+    (c:YieldCall) : "Y(%_, %_, %_, %_, %_)" % [enter?(c), func-reg(c), arg-regs(c), ret-regs(c), scratch-regs(c)]
+    (c:CollectGarbage) : "CollectGarbage"
+    (c:ExtendStack) : "ExtendStack"
 
 defmethod print (o:OutputStream, b:Block) :
   do(println{o, _}, ins(b))
@@ -450,63 +637,6 @@ defmethod print (o:OutputStream, b:Block) :
 
 defmethod print (o:OutputStream, p:Port) :
    print(o, "%~ (s:%~, l:%~, at:%~, dist:%~)" % [n(p), saved?(p), loaded?(p), reg(p), dist(p)])
-
-;============================================================
-;================== Operator Classification =================
-;============================================================
-
-deftype Commutative :
-  TGAddOp <: Commutative
-  TGAndOp <: Commutative
-  TGOrOp <: Commutative
-  TGXorOp <: Commutative
-
-deftype NonCommutative :
-  TGSubOp <: NonCommutative
-  TGDivOp <: NonCommutative
-  TGModOp <: NonCommutative
-  TGShlOp <: NonCommutative
-  TGShrOp <: NonCommutative
-  TGAshrOp <: NonCommutative
-
-deftype Comparison :
-  TGEqOp <: Comparison
-  TGNeOp <: Comparison
-  TGLtOp <: Comparison
-  TGGtOp <: Comparison
-  TGLeOp <: Comparison
-  TGGeOp <: Comparison
-  TGUleOp <: Comparison
-  TGUltOp <: Comparison
-  TGUgtOp <: Comparison
-  TGUgeOp <: Comparison
-
-deftype Binary :
-   TGAddOp <: Binary
-   TGSubOp <: Binary
-   TGMulOp <: Binary
-   TGDivOp <: Binary
-   TGModOp <: Binary
-   TGAndOp <: Binary
-   TGOrOp <: Binary
-   TGXorOp <: Binary
-   TGShlOp <: Binary
-   TGShrOp <: Binary
-   TGAshrOp <: Binary
-   TGEqOp <: Binary
-   TGNeOp <: Binary
-   TGLtOp <: Binary
-   TGGtOp <: Binary
-   TGLeOp <: Binary
-   TGGeOp <: Binary
-   TGUleOp <: Binary
-   TGUltOp <: Binary
-   TGUgtOp <: Binary
-   TGUgeOp <: Binary
-
-deftype Unary :
-   TGNotOp <: Unary
-   TGNegOp <: Unary
 
 ;============================================================
 ;=================== Working Functions ======================
@@ -524,6 +654,7 @@ defn do-defined (f: Var -> ?, e:Ins) :
     (e:Save) : false
     (e:Load) : f(x(e))
     (e:Match) : false
+    (e:MethodDispatch) : false
   false
 
 defn do-used (gv: Var -> ?, e:Ins) :
@@ -539,6 +670,7 @@ defn do-used (gv: Var -> ?, e:Ins) :
     (e:Save) : g(x(e))
     (e:Load) : false
     (e:Match) : do(g, xs(e))
+    (e:MethodDispatch) : false
   false
 
 defn used-vars (e:Ins) :
@@ -551,8 +683,8 @@ defn do-vars (f: Var -> ?, e:Ins) :
 
 defn reverse-sweep (e:Ins, define:Var -> ?, emit:Ins -> ?, use-var:Var -> ?) :
   defn use (x:Imm) :
-   match(x:Var) :
-     use-var(x)
+    match(x:Var) :
+      use-var(x)
   match(e) :
     (e:Def) :
       define(x(e))
@@ -582,6 +714,8 @@ defn reverse-sweep (e:Ins, define:Var -> ?, emit:Ins -> ?, use-var:Var -> ?) :
     (e:Match) :
       emit(e)
       do(use, xs(e))
+    (e:MethodDispatch) :
+      emit(e)
 
 defn attach-killed (e:Ins, ks:List<Int>) :
   match(e) :
@@ -592,677 +726,246 @@ defn attach-killed (e:Ins, ks:List<Int>) :
     (e:Call) : Call(xs(e), f(e), ys(e), type(e), ks)
     (e:Op) : Op(op(e), xs(e), ys(e), ks)
     (e:Branch) : Branch(op(e), xs(e), ks)
-    (e:Match) : Match(dispatch?(e), tag-lists(e), xs(e), ks, ns?(e))
+    (e:Match) : Match(dispatch?(e), type-lists(e), xs(e), ks, ns?(e))
+    (e:MethodDispatch) : MethodDispatch(multi(e), num-header-args(e), default?(e), amb?(e), ks)
 
 ;============================================================
-;===================== Working Set ==========================
+;=================== Unique Labels ==========================
 ;============================================================
+val TAKEN-IDS = IntSet()
+var ID-COUNTER:Seq<Int>
 
-val CONSTANTS = Vector<TGDefData>()
-val BLOCKS = Vector<Block>()
-val VAR-TYPES = Vector<TGType>()
-val IN-PORTS = Vector<List<Port>>()
-val OUT-PORTS = Vector<List<Port>>()
-val PREDECESSORS = Vector<List<Int>>()
+defn take-ids (f:VMFunction) :
+  clear(TAKEN-IDS)
+  ID-COUNTER = to-seq(0 to false)
+  
+  defn take-ids (f:VMFunc) :
+    add-all(TAKEN-IDS, seq(id, defs(f)))
+    add-all(TAKEN-IDS, seq(n,filter-by<LabelIns>(ins(f))))
+    
+  match(f) :
+    (f:VMFunc) :
+      take-ids(f)
+    (f:VMMultifn) :
+      do(take-ids{value(_)}, funcs(f))
+      take-ids(default(f))
 
-defn nblocks () : length(BLOCKS)
-defn nvars () : length(VAR-TYPES)
-
-defn clear-working-set () :
-  clear(CONSTANTS)
-  clear(BLOCKS)
-  clear(VAR-TYPES)
-
-defn type (i:Imm) :
-  match(i) :
-    (i:Var) : VAR-TYPES[n(i)]
-    (i:Val) : type(value(i))
-
-defn make-var (t:TGType) :
-  val n = length(VAR-TYPES)
-  add(VAR-TYPES, t)
-  Var(n)
+defn unique-id () :
+  let loop () :
+    val i = next(ID-COUNTER)
+    if TAKEN-IDS[i] : loop()
+    else : i
 
 ;============================================================
 ;================= Load into Working Set ====================
 ;============================================================
-
-defn load-instructions (instructions:Collection<TGIns>) :
+  
+defn load-instructions (function:VMFunc, backend:Backend) :
   ;========================
   ;==== Variable Table ====
   ;========================
   val var-table = IntTable<Int>()
-  defn make-var (n:Int, t:TGType) :
+  defn make-var (n:Int, t:VMType) :
     fatal("Variable %_ already exists." % [n]) when key?(var-table,n)
     var-table[n] = length(VAR-TYPES)
     add(VAR-TYPES, t)
-    if flag-defined?(`PRINT-REG-ALLOC) :
-      println("V%_ = $v%_" % [var-table[n], n])
-  defn get-var (v:TGVar) :
-    val n = var-table[n(v)]
-    Var(n, false)
-  defn get-imm (v:TGImm) :
-    match(v) :
-      (v:TGVar) : get-var(v)
-      (v) : Val(v)
-  defn get-vars (vs:List<TGVar>) :
-    map(get-var, vs)
-  defn get-imms (vs:List<TGImm>) :
-    map(get-imm, vs)
+;    if flag-defined?(`PRINT-REG-ALLOC) :
+;      println("V%_ = $v%_" % [var-table[n], n])
+  defn make-var (t:VMType) :
+    val n = length(VAR-TYPES)
+    add(VAR-TYPES, t)
+    Var(n)
+  defn get-var (v:Int) :
+    Var(var-table[v])
+  defn get-var (v:Local) :
+    get-var(index(v))
+  defn get-imm (v:VMImm) :
+    match(v:Local) : get-var(v)
+    else : Val(v)
+  defn get-vars (vs:Seqable<Local>) :
+    to-list(seq(get-var, vs))
+  defn get-imms (vs:Seqable<VMImm>) :
+    to-list(seq(get-imm, vs))
 
-  ;=====================
-  ;==== Block Table ====
-  ;=====================
-  val block-table = IntTable<Int>()
-  var active-block : False|Block = false
-  var active-block-index : False|Int = false
+  ;=========================
+  ;====== Convenience ======
+  ;=========================
+  defn locals (r:RetRecords) :
+    seq(x, records(r))
+  defn to-reg (r:CallReg|CallFReg) :
+    match(r) :
+      (r:CallReg) : Reg(index(r))
+      (r:CallFReg) : FReg(index(r))          
+  defn regs (r:RetRecords) :
+    to-list $ for r in records(r) seq :
+      to-reg(loc(r) as CallReg|CallFReg)
+  defn imms (r:CallRecords) :
+    for r in records(r) seq :
+      arg(r) as VMImm
+  defn regs (r:CallRecords) :
+    to-list $ for r in records(r) seq :
+      to-reg(loc(r) as CallReg|CallFReg)
 
-  defn open-block (lbl:Int) -> Int :
-    val i = set?{block-table, lbl, _} $ fn () :
-      add(BLOCKS, Block(Vector<Ins>(), List()))
-      length(BLOCKS) - 1
-    if flag-defined?(`PRINT-REG-ALLOC) :
-      println("Label %_ = Block %_" % [lbl, i])
-    active-block-index = i
-    active-block = BLOCKS[i]
-    i
+  ;================================
+  ;===== Basic Block Analysis =====
+  ;================================
 
-  defn close-block (next-lbls:List<Int>) :
-    val b = active-block
-    match(b:Block) :
-      val i = active-block-index as Int
-      BLOCKS[i] = Block(ins(b), map(open-block, next-lbls))
-      active-block = false
-      active-block-index = false
+  val blocks = analyze-basic-blocks $
+    new Instructions :
+      defmethod length (this) : length(ins(function))
+      defmethod unique-label (this) : unique-id()
+      defmethod classify (this, i:Int) :
+        match(ins(function)[i]) :
+          (ins:CallRecordIns) :
+            if type(ins) is vm-StanzaTCall : JumpInstruction([])
+            else : StandardInstruction()
+          (ins:ReturnRecordIns) :
+            JumpInstruction([])
+          (ins:MatchRecordIns) :
+            val branch-ns = seq(n, branches(ins))
+            JumpInstruction{to-tuple(_)} $ match(amb(ins)) :
+              (amb:Int) : cat([default(ins), amb], branch-ns)
+              (amb:False) : cat([default(ins)], branch-ns)
+          (ins:Branch0Ins) : JumpInstruction([n1(ins), n2(ins)])
+          (ins:Branch1Ins) : JumpInstruction([n1(ins), n2(ins)])
+          (ins:Branch2Ins) : JumpInstruction([n1(ins), n2(ins)])
+          (ins:MethodDispatchIns) : JumpInstruction([default(ins), amb(ins)])
+          (ins:UnreachableIns) : JumpInstruction([])          
+          (ins:LabelIns) : LabelInstruction(n(ins))
+          (ins:GotoIns) : GotoInstruction(n(ins))
+          (ins) : StandardInstruction()
 
-  defn push (e:Ins) :
-    match(active-block:False) :
-      open-block(fresh-id())
-    val b = active-block as Block
-    add(ins(b), e)
+  ;Convert basic block into RegAlloc IR
+  defn to-block (b:BasicBlock) :
+    defn R (n:Int) : renamed-label(blocks, n)
+    val ins-buffer = Vector<Ins>()
+    defn push (i:Ins) : add(ins-buffer, i)
+    if index(b) == 0 :
+      for d in defs(function) do :
+        make-var(id(d), type(d))
+        push(Def(get-var(id(d))))
+    for i in start(b) to start(b) + length(b) do :
+      match(ins(function)[i]) :
+        (e:ArgIns) :
+          val r = ret(e)
+          val xs = get-vars(locals(r))
+          val ctxt = match(type(e)) :
+            (t:StanzaArg) : StanzaContext(regs(r))
+            (t:CArg) : CContext(regs(r))
+          push(Args(xs, ctxt))
+        (e:CallRecordIns) :
+          ;Retrieve a func register if necessary
+          defn func-reg? (f:VMImm, used:Seqable<Loc>) :
+            match(f:Local) : unused-regs(used, 1, backend)[0]            
 
-  ;=================
-  ;==== Loading ====
-  ;=================
-  open-block(fresh-id())
-  for e in instructions do :
-    match(e) :
-      (e:TGDef) :
-        make-var(n(e), type(e))
-        push(Def(get-var(TGVar(n(e)))))
-      (e:TGDefData) :
-        add(CONSTANTS, e)
-      (e:TGArgs) :
-        push(Args(get-vars(xs(e)), StanzaContext()))
-      (e:TGReturn) :
-        push(Return(get-imms(xs(e)), StanzaContext()))
-        close-block(List())
-      (e:TGSet) :
-        push(Set(get-var(x(e)), get-imm(y(e))))
-      (e:TGConv) :
-        push(Op(ConvOp(), List(get-var(x(e))), List(get-imm(y(e)))))
-      (e:TGInterpret) :
-        push(Op(InterpretOp(), List(get-var(x(e))), List(get-imm(y(e)))))
-      (e:TGBinOp) :
-        push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)), get-imm(z(e)))))
-      (e:TGUnaOp) :
-        push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)))))
-      (e:TGLoad) :
-        push(Op(LoadOp(offset(e)), List(get-var(x(e))), List(get-imm(y(e)))))
-      (e:TGStore) :
-        push(Op(StoreOp(offset(e)), List(), List(get-imm(x(e)), get-imm(y(e)))))
-      (e:TGCall) :
-        val type = StanzaCall(arity(e), info(e))
-        push(Call(get-vars(xs(e)), get-imm(f(e)), get-imms(ys(e)), type))
-      (e:TGTCall) :
-        val type = StanzaTCall(arity(e))
-        push(Call(List(), get-imm(f(e)), get-imms(ys(e)), type))
-        close-block(List())
-      (e:TGSwitchStack) :
-        val type = StackSwitch()
-        push(Call(List(get-var(x(e))), get-imm(s(e)), List(get-imm(y(e))), type))
-      (e:TGLabel) :
-        close-block(List(n(e)))
-        open-block(n(e))
-      (e:TGGoto) :
-        close-block(List(n(e)))
-      (e:TGEnd) :
-        close-block(List())
-      (e:TGBinCmp) :
-        push(Branch(op(e), List(get-imm(x(e)), get-imm(y(e)))))
-        val alt = fresh-id()
-        close-block(List(n(e), alt))
-        open-block(alt)
-      (e:TGUnaCmp) :
-        push(Branch(op(e), List(get-imm(x(e)))))
-        val alt = fresh-id()
-        close-block(List(n(e), alt))
-        open-block(alt)
-      (e:TGNullCmp) :
-        push(Branch(op(e), List()))
-        val alt = fresh-id()
-        close-block(List(n(e), alt))
-        open-block(alt)
-      (e:TGMatch) :
-        val ts = map(tags, branches(e))
-        val ns = map(n, branches(e))
-        push(Match(false, ts, get-imms(xs(e))))
-        close-block(cons(no-branch(e), ns))
-      (e:TGDispatch) :
-        val ts = map(tags, branches(e))
-        val ns = map(n, branches(e))
-        push(Match(true, ts, get-imms(xs(e))))        
-        close-block(cons(no-branch(e), amb-branch(e), ns))
-      (e:TGCallC) :
-        val type = CCall(length(ys(e)))
-        val args = append(get-imms(ys(e)), get-imms(vs(e)))
-        push(Call(get-vars(xs(e)), get-imm(f(e)), args, type))
-      (e:TGArgsC) :
-        push(Args(get-vars(xs(e)), CContext()))
-      (e:TGReturnC) :
-        push(Return(get-imms(xs(e)), CContext()))
-        close-block(List())
-      (e:TGNewStack) :
-        push(Op(NewStackOp(), List(), List()))
-      (e:TGSaveCContext) :
-        push(Op(SaveCContextOp(), List(), List()))
-      (e:TGArityError) :
-        push(Op(ArityErrorOp(info(e)), List(), List()))
-        close-block(List())
+          val r = ret(e)
+          val a = args(e)
+          val a-regs = regs(a)
+          val calltype = match(type(e)) :
+            (t:vm-StanzaCall) :
+              StanzaCall(info(e), func-reg?(f(e), a-regs), a-regs, regs(r))
+            (t:vm-StanzaTCall) :
+              StanzaTCall(func-reg?(f(e), a-regs), a-regs)
+            (t:vm-CCall) :
+              val freg = func-reg?(f(e), cat-all $ [a-regs, seq(Reg,c-preserved-regs(backend)), [Reg(0)]])
+              CCall(num-mem-args(t), freg, a-regs, regs(r))              
+            (t:vm-YieldCall) :
+              val rs = unused-regs(a-regs, 3, backend)
+              YieldCall(enter?(t), info(e), rs[0], a-regs, regs(r), List(rs[1], rs[2]))
+          push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
+        (e:ReturnRecordIns) :
+          val r = args(e)
+          val xs = get-imms(imms(r))
+          val ctxt = match(type(e)) :
+            (t:vm-StanzaCall) : StanzaContext(regs(r))
+            (t:vm-CCall) : CContext(regs(r))
+          push(Return(xs, ctxt))
+        (e:MatchRecordIns) :
+          val type-lists = to-list(seq(to-list{types(_)}, branches(e)))
+          val r = args(e)
+          push(Match(dispatch?(e), type-lists, get-imms(imms(r))))
+        (e:ExtendStackIns) :
+          push(Call(List(), Val(VoidMarker()), List(), ExtendStack()))
+        (e:AllocOnHeap) :
+          val size = get-imm(size(e))
+          push(Op(AllocOp(), List(get-var(x(e))), List(size)))
+        (e:SetIns) :
+          push(Set(get-var(x(e)), get-imm(y(e))))
+        (e:Op0Ins) :
+          push(Op(op(e), List(get-var(x(e))), List()))
+        (e:Op1Ins) :
+          match(op(e)) :
+            (op:GCOp) :
+              val x = get-var(x(e))
+              val size = get-imm(y(e))
+              val a-regs = List(Reg(head(call-regs(backend))))
+              val r-regs = List(Reg(head(call-regs(backend))))
+              push(Call(List(x), Val(VoidMarker()), List(size), CollectGarbage(false, a-regs, r-regs)))              
+            (op) :
+              push(Op(op, List(get-var(x(e))), List(get-imm(y(e)))))
+        (e:Op2Ins) :
+          push(Op(op(e), List(get-var(x(e))), List(get-imm(y(e)), get-imm(z(e)))))
+        (e:DualOp2Ins) :
+          push(Op(op(e), List(get-var(x(e)), get-var(y(e))), List(get-imm(z(e)), get-imm(w(e)))))
+        (e:LoadArgIns) :
+          push(Op(LoadArgOp(index(e)), List(get-var(x(e))), List()))      
+        (e:StoreArgIns) :
+          push(Op(StoreArgOp(index(e)), List(), List(get-imm(y(e)))))
+        (e:StoreCArgIns) :
+          push(Op(StoreCArgOp(index(e), num-mem-args(e)), List(), List(get-imm(crsp(e)), get-imm(y(e)))))
+        (e:LoadCArgIns) :
+          push(Op(LoadCArgOp(index(e), num-mem-args(e)), List(get-var(x(e))), List(get-imm(crsp(e)))))
+        (e:CRSPIns) :
+          push(Op(CRSPOp(), List(get-var(x(e))), List()))
+        (e:StoreCRSPIns) :
+          push(Op(StoreCRSPOp(), List(), List(get-imm(y(e)))))
+        (e:Branch0Ins) :
+          push(Branch(op(e), List()))
+        (e:Branch1Ins) :
+          val op* = op(e) as VMOp
+          push(Branch(op*, List(get-imm(x(e)))))
+        (e:Branch2Ins) :
+          push(Branch(op(e), List(get-imm(x(e)), get-imm(y(e)))))
+        (e:MethodDispatchIns) :
+          push(MethodDispatch(multi(e), length(ys(e))))
+        (e:StoreIns) :      
+          push(Op(StoreOp(offset(e)), List(), List(get-imm(x(e)), get-imm(z(e)))))
+        (e:LoadIns) :
+          push(Op(LoadOp(offset(e)), List(get-var(x(e))), List(get-imm(y(e)))))
+        (e:DumpIns) :
+          false
+        (e:LiveIns) :
+          push(Op(NoOp(), List(), get-imms(xs(e))))
+        (e:RecordLiveIns) :
+          false
+        (e:SaveCContextIns) :
+          push(Op(SaveCContextOp(), List(), List()))
+        (e:CommentIns) :
+          false
+        (e:UnreachableIns) :
+          false
+    val next = to-list $
+      for s in succs(b) seq :
+        index(blocks[s])
+    Block(ins-buffer, next)
 
-;============================================================
-;================== Backend Properties ======================
-;============================================================
+  ;Add blocks to working set
+  add-all(BLOCKS, seq(to-block, /blocks(blocks)))
 
-defn frame-size (t:CCall, backend:Backend) :
-  match(backend) :
-    (backend:W64Backend) :
-      val num-ctxt = length(c-preserved-regs(backend))
-      8 * ((num-ctxt + num-mem-args(t) + 4) | 1)
-    (backend) :
-      val num-ctxt = length(c-preserved-regs(backend))
-      8 * ((num-ctxt + num-mem-args(t)) | 1)
-
-defn mem-arg-offsets (t:CCall, backend:Backend) :
-  match(backend) :
-    (backend:W64Backend) :
-      val offset = (- frame-size(t, backend))
-      seq({offset + _}, 32 to false by 8)
-    (backend) :
-      val offset = (- frame-size(t, backend))
-      seq({offset + _}, 0 to false by 8)
-
-;============================================================
-;=================== Normalization ==========================
-;============================================================
-
-defn normalize (backend:Backend) :
-  ;===============================================
-  ;==== If a value is needed for saving C Rsp ====
-  ;===============================================
-  val cached-var-table = HashTable-init<Symbol,Var>(make-var{TGLongT()})
-  defn cached-var (name:Symbol) : cached-var-table[name]
-    
-  ;Normalize each block
-  for (blk in BLOCKS, b in 0 to false) do :
-    normalize(blk, b, cached-var, backend)
-
-defn normalize (blk:Block, b:Int, cached-var: Symbol -> Var, backend:Backend) :
-  ;============================
-  ;==== Instruction Buffer ====
-  ;============================
-  val instructions = Vector<Ins>()
-  defn emit (e:Ins) : add(instructions, e)
-
-  ;======================
-  ;==== Instructions ====
-  ;======================
-  val #argspace = Val(TGMem(ARG-LBL))
-  val #c-rsp = Val(TGMem(C-RSP-LBL))
-  val #rsp = Val(TGMem(STACK-PTR-LBL))
-  defn #load (x:Var, y:Imm, offset:Int) :
-    emit(Op(LoadOp(offset), List(x), List(y)))
-  defn #store (x:Imm, y:Imm, offset:Int) :
-    emit(Op(StoreOp(offset), List(), List(x, y)))
-  defn #conv (x:Var, y:Imm) :
-    emit(Op(ConvOp(), List(x), List(y)))
-
-  ;=============================
-  ;==== Variable Operations ====
-  ;=============================
-  defn force-new-var (x:Imm) :
-    val x* = make-var(type(x))
-    emit(Set(x*, x))
-    x*
-
-  defn force-var (x:Imm) :
-    match(x:Var) : x
-    else : force-new-var(x)
-
-  defn force-operand (x:Imm) :
-    val max = 1 << 16
-    val min = -1 << 16
-    defn large? (v:Int) : (v < min) or (v > max)
-    defn large? (v:Long) : (v < to-long(min)) or (v > to-long(max))
-    match(x) :
-      (x:Var) :
-        x
-      (x:Val) :
-        match(value(x)) :
-         (v:TGInt|TGLong) :
-           if large?(value(v)) : force-var(x)
-           else : x
-         (v:TGMem|TGExMem) : force-var(x)
-         (v) : x
- 
-  ;===============================
-  ;==== Position Independence ====
-  ;===============================
-  
-  ;Does i refer to an external memory location?
-  defn exmem? (i:Imm) :
-    match(i:Val) : 
-      value(i) is TGExMem
-      
-  ;Does i refer to an external memory location with non-zero offset?    
-  defn exmem-non-zero-offset? (i:Imm) :
-    match(i:Val) :
-      val v = value(i)
-      match(v:TGExMem) :
-        offset(v) != 0      
-
-  ;Remove the external memory location from necessary instructions, if
-  ;backend requires a global offset table.
-  defn remove-exmem (i:Ins) :
-    if use-global-offset-table?(backend) :
-      match(i) :
-        (i:Op) :
-          match(op(i)) :
-            (op:LoadOp) :
-              val y = head(ys(i))
-              if exmem?(y) : sub-ys(i, List(force-var(y)))
-              else : i
-            (op:StoreOp) :
-              val x = head(ys(i))
-              if exmem?(x) :
-                val ys* = List(force-var(x), ys(i)[1])
-                sub-ys(i, ys*)
-              else : i
-            (op) : i
-        (i:Call) :
-          if exmem-non-zero-offset?(f(i)) :
-            sub-f(i, force-var(f(i)))
-          else : i
-        (i) : i
-    else : i
-
-  ;============================
-  ;==== Call Normalization ====
-  ;============================
-  defn norm-stanza-call (e:Call) :
-    val ys* = split-call-locs(map(force-new-var,ys(e)),
-                call-regs(backend), call-fregs(backend))
-    val xs* = split-call-locs(xs(e), call-regs(backend), call-fregs(backend))
-    for (y in mems(ys*), o in 0 to false by 8) do :
-      #store(#argspace, y, o)
-    val type* = match(type(e)) :
-      (t:StanzaCall) : StanzaCall(arity(t), info(t),
-                         Reg(1), locs(ys*), locs(xs*))
-      (t:StanzaTCall) : StanzaTCall(arity(t), Reg(1), locs(ys*), locs(xs*))
-    emit(Call(regs(xs*) as List<Var>, f(e), regs(ys*), type*))
-    for (x in mems(xs*), o in 0 to false by 8) do :
-      #load(x as Var, #argspace, o)
-
-  defn norm-c-call (e:Call) :
-    val t = type(e) as CCall
-    ;Split up arguments
-    val ys* = match(backend) :
-      (backend:W64Backend) :
-        defn shadow (x:Imm) :
-          val x* = make-var(TGIntegerT(type(x)))
-          emit(Op(InterpretOp(), List(x*), List(force-var(x))))
-          x*
-        split-call-locs-shadow(map(force-new-var,ys(e)),
-                               arity(t),
-                               callc-regs(backend),
-                               callc-fregs(backend), shadow)
-      (backend:Backend) :
-        split-call-locs(map(force-new-var,ys(e)),
-          callc-regs(backend), callc-fregs(backend))
-    ;Return register
-    val ret-reg =
-      if empty?(xs(e)) : Reg(0)
-      else if type(head(xs(e))) is TGIntegerT : Reg(0)
-      else : FReg(0)
-    ;Annotated call type
-    val type* = CCall(arity(t), length(mems(ys*)), Reg(1), locs(ys*), ret-reg)
-    ;Store arguments
-    if not empty?(mems(ys*)) :
-      val csp = make-var(TGLongT())
-      #load(csp, #c-rsp, 0)
-      for (y in mems(ys*), o in mem-arg-offsets(type*,backend)) do :
-        #store(csp, y, o)
-    ;Emit call    
-    emit(Call(xs(e), f(e), regs(ys*), type*))
-
-  defn norm-stack-call (e:Call) :
-    val reg = Reg(head(call-regs(backend)))
-    val type* = StackSwitch(Reg(1), reg)
-    emit(Call(xs(e), force-var(f(e)), ys(e), type*))
-
-  ;==============================
-  ;==== Return Normalization ====
-  ;==============================
-  defn norm-stanza-return (e:Return) :
-    val xs* = split-call-locs(map(force-new-var,xs(e)), call-regs(backend), call-fregs(backend))
-    val argspace = TGMem(ARG-LBL)
-    for (x in mems(xs*), o in 0 to false by 8) do :
-      #store(#argspace, x, o)
-    val ctxt* = StanzaContext(locs(xs*))
-    emit(Return(regs(xs*), ctxt*))
-
-  defn norm-c-return (e:Return) :
-    ;Load C pointer, and restore old one
-    val c-rsp = make-var(TGLongT())
-    #load(c-rsp, #c-rsp, 0)
-    #store(#c-rsp, cached-var(`saved-c-rsp), 0)
-    #store(#rsp, cached-var(`saved-rsp), 0)
-    ;Emit instruction
-    val xs* = cons(c-rsp, map(force-new-var,xs(e)))
-    val ret-reg =
-      if empty?(xs(e)) :
-        Reg(0)
-      else :
-        match(type(head(xs(e)))) :
-          (t:TGIntegerT) : Reg(0)
-          (t:TGRealT) : FReg(0)
-    val ctxt* = CContext(List(Reg(6), ret-reg))
-    emit(Return(xs*, ctxt*))
-
-  ;===========================
-  ;==== Arg Normalization ====
-  ;===========================
-  defn norm-stanza-args (e:Args) :
-    val xs* = split-call-locs(xs(e), call-regs(backend), call-fregs(backend))
-    val argspace = TGMem(ARG-LBL)
-    val ctxt* = StanzaContext(locs(xs*))
-    emit(Args(regs(xs*) as List<Var>, ctxt*))
-    for (x in mems(xs*), o in 0 to false by 8) do :
-      #load(x as Var, #argspace, o)
-
-  defn norm-c-args (e:Args) :
-    ;Split up arguments
-    val arity = length(xs(e))
-    val xs* = match(backend) :
-      (backend:W64Backend) :
-        split-call-locs-shadow(xs(e), arity, callc-regs(backend),
-                               callc-fregs(backend), fatal{"No Shadow"})
-      (backend:Backend) :
-        split-call-locs(xs(e), callc-regs(backend), callc-fregs(backend))
-    ;Emit instruction
-    val c-rsp = make-var(TGLongT())
-    val ctxt* = CContext(cons(Reg(6), locs(xs*)))
-    emit(Args(cons(c-rsp, regs(xs*) as List<Var>), ctxt*))
-    ;Load arguments
-    for (x in mems(xs*), i in 0 to false) do :
-      #load(x as Var, c-rsp, 8 * (i + 1))
-    ;Save old C pointer and Set c-rsp as new C pointer
-    #load(cached-var(`saved-rsp), #rsp, 0)
-    #load(cached-var(`saved-c-rsp), #c-rsp, 0)
-    #store(#c-rsp, c-rsp, 0)
-
-  ;=============================
-  ;==== Match Normalization ====
-  ;=============================
-  defn norm-match (e:Match) :
-    val [xs, mxs] = split-match-locs(xvars, nregs) where :
-      val xvars = map(force-new-var, xs(e))
-      val nregs = num-regs(backend)
-    ;Store arguments
-    val argspace = TGMem(ARG-LBL)
-    for (x in mxs, o in 0 to false by 8) do :
-      #store(#argspace, x, o)
-    ;Emit instruction
-    emit(Match(dispatch?(e), tag-lists(e), xs))
-
-  ;==============================
-  ;==== Branch Normalization ====
-  ;==============================
-  defn norm-branch (e:Branch) :
-    defn x1 () : force-operand(xs(e)[0])
-    defn x2 () : force-operand(xs(e)[1])
-    match(op(e)) :
-      (op:TGOp&Comparison) :
-        match(x1(), x2()) :
-          (x1:Val, x2:Val) : emit(Branch(op, List(force-var(x1), x2)))
-          (x1, x2) : emit(Branch(op, List(x1, x2)))
-      (op:TGArityNeOp) :
-        emit(Branch(op, List(x1())))
-      (op) : emit(e)
-
-  ;===============================
-  ;==== Operand Normalization ====
-  ;===============================
-  defn cast-to-int (x:Imm) :
-    val ix = make-var(TGIntT())
-    #conv(ix, force-var(x))
-    ix
-      
-  defn cast-to-int (x:Var, y1:Imm, y2:Imm,
-                    f: (TGType, Var, Var, Var) -> False) :
-    val ix = make-var(TGIntT())
-    f(TGIntT(), ix, cast-to-int(y1), cast-to-int(y2))
-    #conv(x, ix)
-    
-  defn cast-to-int (x:Var, y:Imm, 
-                    f: (TGType, Var, Var) -> False) :
-    val ix = make-var(TGIntT())
-    f(TGIntT(), ix, cast-to-int(y))
-    #conv(x, ix)
-
-  defn norm-div-op (x:Var, y1:Imm, y2:Imm) :
-    match(type(y1)) :    
-      (t:TGByteT) :
-        cast-to-int{x, y1, y2, _} $ fn (t, x, y1, y2) :
-          emit(Op(DivModOp(), List(x, make-var(t)), List(y1, y2)))
-          emit(Op(NoOp(), List(), List(y2)))
-      (t:TGIntegerT) :
-        val x2 = make-var(type(y1))
-        val y1 = force-var(y1)
-        val y2 = force-var(y2)
-        emit(Op(DivModOp(), List(x,x2), List(y1, y2)))
-        emit(Op(NoOp(), List(), List(y2)))
-      (t:TGRealT) :
-        emit(Op(TGDivOp(), List(x), List(y1, y2)))
-        emit(Op(NoOp(), List(), List(y2)))        
-
-  defn norm-mod-op (x:Var, y1:Imm, y2:Imm) :
-    match(type(y1)) :
-      (t:TGByteT) :
-        cast-to-int{x, y1, y2, _} $ fn (t, x, y1, y2) :
-          emit(Op(DivModOp(), List(make-var(t), x), List(y1, y2)))
-          emit(Op(NoOp(), List(), List(y2)))
-      (t:TGIntegerT) :
-        val y1 = force-var(y1)
-        val y2 = force-var(y2)
-        emit(Op(DivModOp(), List(make-var(t), x), List(y1, y2)))
-        emit(Op(NoOp(), List(), List(y2)))
-
-  defn norm-mul-op (x:Var, y1:Imm, y2:Imm) :
-    match(type(y1)) :
-      (t:TGByteT) :
-        cast-to-int{x, y1, y2, _} $ fn (t, x, y1, y2) :
-          emit(Op(TGMulOp(), List(x), List(y1, y2)))
-      (t) : emit(Op(TGMulOp(), List(x), List(y1, y2)))
-
-  defn norm-noncomm-op (op:TGOp, x:Var, y1:Imm, y2:Imm) :
-    emit(Op(op, List(x), List(y1, y2)))
-    emit(Op(NoOp(), List(), List(y2)))
-
-  defn norm-cmp-op (op:TGOp, x:Var, y1:Imm, y2:Imm) :
-    match(y1, y2) :
-      (y1:Val, y2:Val) : emit(Op(op, List(x), List(force-var(y1), y2)))
-      (y1, y2) : emit(Op(op, List(x), List(y1, y2)))
-
-  defn norm-neg-op (op:TGOp, x:Var, y:Imm) :
-    match(type(x)) :
-      (t:TGIntegerT) :
-        norm-unary-op(op, x, y)
-      (t:TGRealT) :
-        val zero = make-var(t)
-        #conv(zero, force-var(Val(TGInt(0))))
-        emit(Op(TGSubOp(), List(x), List(zero, y)))
-
-  defn norm-unary-op (op:TGOp, x:Var, y:Imm) :
-    match(type(x)) :
-      (t:TGByteT) :
-        cast-to-int{x, y, _} $ fn (t, x, y) :
-          emit(Op(op, List(x), List(y)))
-      (t:TGIntegerT) :
-        emit(Op(op, List(x), List(y)))
-
-  defn norm-conv-op (x:Var, #y:Imm) :
-    val y = force-var(#y)
-    match(type(x), type(y)) :
-      (xt:TGIntegerT, yt:TGIntegerT) :
-        #conv(x, y)
-      (xt:TGRealT, yt:TGRealT) :
-        #conv(x, y)
-      (xt:TGByteT, yt:TGRealT) :
-        #conv(x, cast-to-int(y))
-      (xt:TGIntegerT, yt:TGRealT) :
-        #conv(x, y)
-      (xt:TGRealT, yt:TGByteT) :        
-        val iy = make-var(TGIntT())
-        #conv(iy, y)
-        #conv(x, iy)
-      (xt:TGRealT, yt:TGIntegerT) :
-        #conv(x, y)
-
-  defn norm-interpret-op (x:Var, y:Imm) :
-    emit(Op(InterpretOp(), List(x), List(force-var(y))))
-
-  defn norm-store-op (op:TGOp, y1:Imm, y2:Imm) :
-    emit(Op(op, List(), List(y1, y2)))
-
-  ;===================
-  ;==== Algorithm ====
-  ;===================
-  ;Sweep through instructions
-  for e0 in ins(blk) do :
-    match(remove-exmem(e0)) :
-      (e:Call) :
-        match(type(e)) :
-          (type:StanzaCall|StanzaTCall) : norm-stanza-call(e)
-          (type:CCall) : norm-c-call(e)
-          (type:StackSwitch) : norm-stack-call(e)
-      (e:Return) :
-        match(ctxt(e)) :
-          (type:StanzaContext) : norm-stanza-return(e)
-          (type:CContext) : norm-c-return(e)
-      (e:Args) :
-        match(ctxt(e)) :
-          (type:StanzaContext) : norm-stanza-args(e)
-          (type:CContext) : norm-c-args(e)
-      (e:Match) :
-        norm-match(e)
-      (e:Op) :
-        defn x () : head(xs(e))
-        defn m1 () : ys(e)[0]
-        defn y1 () : force-operand(ys(e)[0])
-        defn y2 () : force-operand(ys(e)[1])
-        match(op(e)) :
-          (op:TGDivOp) : norm-div-op(x(), y1(), y2())
-          (op:TGModOp) : norm-mod-op(x(), y1(), y2())
-          (op:TGMulOp) : norm-mul-op(x(), y1(), y2())
-          (op:TGOp&Commutative) : emit(Op(op, xs(e), map(force-operand,ys(e))))
-          (op:TGOp&NonCommutative) : norm-noncomm-op(op, x(), y1(), y2())
-          (op:TGOp&Comparison) : norm-cmp-op(op, x(), y1(), y2())
-          (op:TGNegOp) : norm-neg-op(op, x(), y1())
-          (op:TGNotOp) : norm-unary-op(op, x(), y1())
-          (op:InterpretOp) : norm-interpret-op(x(), y1())
-          (op:ConvOp) : norm-conv-op(x(), y1())
-          (op:StoreOp) : norm-store-op(op, m1(), y2())
-          (op:LoadOp|NewStackOp|SaveCContextOp|ArityErrorOp) : emit(e)
-          (op) : fatal("Not supported: %_" % [op])
-      (e:Branch) :
-        norm-branch(e)
-      (e) :
-        emit(e)
-
-  ;Replace block
-  BLOCKS[b] = Block(instructions, next(blk))
-
-;===================================
-;==== Determining Mem Arguments ====
-;===================================
-defstruct SplitLocs :
-  regs: List<Imm>
-  mems: List<Imm>
-  locs: List<Loc>
-
-defn split-call-locs (xs:List<Imm>, reg-ns:List<Int>, freg-ns:List<Int>) :
-  val regs = seq(Reg, reg-ns)
-  val fregs = seq(FReg, freg-ns)
-  val reg-xs = Vector<Imm>()
-  val mem-xs = Vector<Imm>()
-  val xs-locs = Vector<Loc>()
-  for x in xs do :
-    add{_, x} $ match(type(x)) :
-      (t:TGIntegerT) :
-        if empty?(regs) : mem-xs
-        else : (add(xs-locs,next(regs)), reg-xs)
-      (t:TGRealT) :
-        if empty?(fregs) : mem-xs
-        else : (add(xs-locs,next(fregs)), reg-xs)
-  SplitLocs(to-list(reg-xs), to-list(mem-xs), to-list(xs-locs))
-
-defn split-call-locs-shadow (xs:List<Imm>, arity:Int, reg-ns:List<Int>, freg-ns:List<Int>,
-                             shadow: Imm -> Var) :
-  val regs = seq(Reg, reg-ns)
-  val fregs = seq(FReg, freg-ns)
-  val argcount = to-seq(0 to arity)
-  val reg-xs = Vector<Imm>()
-  val mem-xs = Vector<Imm>()
-  val xs-locs = Vector<Loc>()
-  for x in xs do :
-    val vararg? = if empty?(argcount) : true
-                  else : (next(argcount), false)
-    match(type(x)) :
-      (t:TGIntegerT) :
-        if empty?(regs) :                          ;If no more integer registers
-          add(mem-xs, x)                           ;  then mem argument
-        else :                                     ;Otherwise
-          add(xs-locs, next(regs))                 ;  place in integer register
-          add(reg-xs, x)                           ;
-          next(fregs)                              ;  eat real register
-      (t:TGRealT) :                                ;
-        if empty?(fregs) :                         ;If no more real registers
-          add(mem-xs, x)                           ;  then mem argument
-        else :                                     ;Otherwise
-          add(xs-locs, next(fregs))                ;  place in real register
-          add(reg-xs, x)                           ;
-          if vararg? :                             ;  If vararg
-            add(xs-locs, next(regs))               ;    place shadow in integer register
-            add(reg-xs, shadow(x))                 ;
-          else :                                   ;  Otherwise
-            next(regs)                             ;    eat integer register
-  SplitLocs(to-list(reg-xs), to-list(mem-xs), to-list(xs-locs))
-
-defn split-match-locs (xs:List<Imm>, num-regs:Int) :
-  val regs = to-seq(0 to num-regs - 2) ;R0,R1 are scratch
-  val imm-xs = Vector<Imm>()
-  val mem-xs = Vector<Imm>()
-  for x in xs do :
-    match(x:Var) :
-      if empty?(regs) :
-        add(mem-xs, x)
-      else :
-        add(imm-xs, x)
-        next(regs)
-    else :
-      add(imm-xs, x)
-  [to-list(imm-xs), to-list(mem-xs)]
+;Take num 'number' of unused registers
+defn unused-regs (used:Seqable<Loc>, num:Int, backend:Backend) :
+  val used-set = IntSet()
+  for x in used do :
+    match(x:Reg) : add(used-set, n(x))
+  defn find-unused () :
+    for i in 0 to num-regs(backend) find! :
+      not used-set[i]
+  val unused = Vector<Reg>()
+  for i in 0 to num do :
+    val n = find-unused()
+    add(unused, Reg(n))
+    add(used-set, n)
+  unused
 
 ;============================================================
 ;================= Critical Edge Removal ====================
@@ -1303,9 +1006,9 @@ defn reverse-post-order () :
       mapping[n] = length(blocks)
       add(blocks, blk)
 
-  if flag-defined?(`PRINT-REG-ALLOC) :
-    println("Reverse post order mapping:")
-    do(println, mapping)
+  ;if flag-defined?(`PRINT-REG-ALLOC) :
+  ;  println("Reverse post order mapping:")
+  ;  do(println, mapping)
 
   ;New mapping
   val num-blocks = length(blocks)
@@ -1363,6 +1066,10 @@ lostanza defn cat-ints (a:ref<Int>, b:ref<Int>) -> ref<Long> :
 defstruct VarUse :
   block: Int
   dist: Int
+
+defn crosses-boundary? (i:Ins) :
+  match(i:Call) :
+    type(i) is-not ExtendStack
 
 defn liveness-analysis () :
   ;Clear state
@@ -1566,10 +1273,14 @@ defn add-annotations (blk:Block, b:Int) :
           val killed = to-list(filter({not live?(_)}, used-vars(e)))
           emit(attach-killed(e, to-list(killed)))
           ;Cross call boundary
-          match(e:Call) :
+          if crosses-boundary?(e) :
+            val live-set = IntSet()
             do-live $ fn (x) :
+              add(live-set, x)
               requires-save[x] = true
               prefers-load[x] = false
+            val live-vars = to-tuple(seq(Var,live-set))
+            emit(Op(RecordLiveOp(live-vars), List(), List(), List()))
         ;Used
         fn (x:Var) :
           mark-used(n(x), i)
@@ -1584,6 +1295,29 @@ defn add-annotations (blk:Block, b:Int) :
 ;===================== Allocate Classes =====================
 ;============================================================
 
+;Note over-provisioning of AllocOp/InstanceofOp/HasHeapOp/Match
+;due to bug in register assignment.
+;Occurs when registers are completedly used (max register pressure)
+;and the argument to match is killed during the match statement.
+defn num-scratch-registers (i:Ins) :
+  match(i) :
+    (i:Call) :
+      match(type(i)) :
+        (t:YieldCall) : 2
+        (t) : 0
+    (i:Op) :
+      match(op(i)) :
+        (op:AllocOp) : 4
+        (op:InstanceofOp) : 4
+        (op) : 0
+    (i:Branch) :
+      match(op(i)) :
+        (op:HasHeapOp) : 4
+        (op) : 0
+    (i:Match) : 4
+    (i:MethodDispatch) : 0
+    (i) : 0
+
 defn allocate-classes (backend:Backend) :
   for (blk in BLOCKS, b in 0 to false) do :
     allocate-classes(blk, b, backend)
@@ -1597,8 +1331,8 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
   var num-free-freg = num-fregs(backend)
   defn inc-reg (n:Int, delta:Int) :
     match(VAR-TYPES[n]) :
-      (t:TGIntegerT) : num-free-reg = num-free-reg + delta
-      (t:TGRealT) : num-free-freg = num-free-freg + delta
+      (t:VMType&IntegerT) : num-free-reg = num-free-reg + delta
+      (t:VMType&RealT) : num-free-freg = num-free-freg + delta
   defn num-free (integer?:True|False) :
     if integer? : num-free-reg
     else : num-free-freg
@@ -1665,8 +1399,8 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
   ;Find next variable to spill
   defn next-spill-var (integer?:True|False) :
     defn right-type? (n:Int) :
-      if integer? : VAR-TYPES[n] is TGIntegerT
-      else : VAR-TYPES[n] is TGRealT
+      if integer? : VAR-TYPES[n] is VMType&IntegerT
+      else : VAR-TYPES[n] is VMType&RealT
     argmax(next-use, filter(right-type?, loaded-vars()))
   ;Spill one register
   defn spill-reg (integer?:True|False, buffer:False|Vector<Ins>) :
@@ -1676,7 +1410,7 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
   ;Ensure free register for var
   defn ensure-reg-for-var (n:Int, buffer:False|Vector<Ins>) :
     if not loaded[n] :
-      val int? = VAR-TYPES[n] is TGIntegerT
+      val int? = VAR-TYPES[n] is VMType&IntegerT
       if num-free(int?) < 1 :
         spill-reg(int?, buffer)
 
@@ -1713,16 +1447,6 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
         ensure-unloaded(n(e), instructions)
       (e:Save) :
         ensure-saved(n(x(e)), instructions)
-      (e:Match) :
-        ;Load arguments
-        for x in e do-used :
-          ensure-reg-for-var(n(x), instructions)
-          ensure-loaded(n(x), instructions)
-        ;Reserve scratch registers
-        while num-free-reg < 2 :
-          spill-reg(true, instructions)
-        ;Emit instruction
-        add(instructions, e)        
       (e) :
         ;Load arguments
         for x in e do-used :
@@ -1731,12 +1455,16 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
         ;Emit instruction
         add(buffer, e)
         ;Unload registers
-        match(e:Call) : mark-all-unloaded()
+        if crosses-boundary?(e) : mark-all-unloaded()
         else : do(mark-unloaded, killed(e))
         ;Define new variables
         for x in e do-defined :
           ensure-reg-for-var(n(x), instructions)
           mark-defined(n(x))
+        ;Reserve scratch registers
+        val num-scratch = num-scratch-registers(e)
+        while num-free-reg < num-scratch :
+          spill-reg(true, instructions)
         ;Flush buffer instructions
         add-all(instructions, buffer)
         clear(buffer)
@@ -1784,7 +1512,7 @@ defn PrefReg (x:Imm) :
 
 defmethod print (o:OutputStream, r:FreeReg) :
   print(o, "FreeReg(%,)" % [prefer(r)])
-
+  
 ;===================
 ;==== Algorithm ====
 ;===================
@@ -1825,8 +1553,8 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
       (r:FReg) : freg-slots[n(r)]
 
   ;Retrieve register listing
-  defn all-regs (t:TGType) :
-    match(t:TGIntegerT) : seq(Reg, cat(free(reg-list), reg-list))
+  defn all-regs (t:VMType) :
+    match(t:VMType&IntegerT) : seq(Reg, cat(free(reg-list), reg-list))
     else : seq(FReg, cat(free(freg-list), freg-list))
 
   ;Free the variable x from its register, if it is in one
@@ -1861,20 +1589,20 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
     clear(freg-list)
 
   ;Find an available register (assumes that one is available).
-  defn free-reg? (t:TGType) :
+  defn free-reg? (t:VMType) :
     match(t) :
-      (t:TGIntegerT) :
+      (t:VMType&IntegerT) :
         val rs = free(reg-list)
         Reg(next(rs)) when not empty?(rs)
-      (t:TGRealT) :
+      (t:VMType&RealT) :
         val rs = free(freg-list)
         FReg(next(rs)) when not empty?(rs)    
-  defn available-reg? (t:TGType, pref:List<Int>) :
+  defn available-reg? (t:VMType, pref:List<Int>) :
     val pref-regs = seq(XReg{t, _}, pref)
     val r = find({slot(_) is False}, pref-regs)
     match(r:Reg|FReg) : r
     else : free-reg?(t)
-  defn available-reg (t:TGType, pref:List<Int>) :
+  defn available-reg (t:VMType, pref:List<Int>) :
     available-reg?(t,pref) as Reg|FReg
 
   ;Assign a variable to a location
@@ -1928,7 +1656,7 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
         match(src:Reg) :
           emit(Xchg(Var(x,src), Var(y,dst), false))
         else :        
-          val swap = available-reg?(TGFloatT(), List())
+          val swap = available-reg?(VMFloat(), List())
           emit(Xchg(Var(x,src), Var(y,dst), swap))        
         free-var(x)
         free-var(y)
@@ -1947,8 +1675,8 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
       available?(r) and not contains?(regs, r)
 
     ;Compute swap registers
-    val swaps = lazy(filter{safe-swap?, all-regs(TGIntT())})
-    val fswaps = lazy(filter{safe-swap?, all-regs(TGFloatT())})
+    val swaps = lazy(filter{safe-swap?, all-regs(VMInt())})
+    val fswaps = lazy(filter{safe-swap?, all-regs(VMFloat())})
       
     ;Swap out registers
     for r in regs do :
@@ -2016,6 +1744,9 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
         assign(x(e), PrefReg(y*))
         emit(Set(annotate(x(e)), y*, killed?(e)))
       (e:Branch) :
+        match(op(e)) :
+          (op:HasHeapOp) : ensure-available(list-r0-r1, List())
+          (op) : false        
         emit(Branch(op(e), map(annotate, xs(e)), killed?(e)))
         do(free-var, killed(e))
       (e:Return) :
@@ -2030,17 +1761,34 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
       (e:Call) :
         val f* = annotate(f(e))
         val ys* = map(annotate,ys(e)) as List<Var>
+
+        ;Retrieve special registers
+        defn func-reg! (t:CallType) :
+          func-reg(t as StanzaCall|CCall|YieldCall|StanzaTCall) as Reg
+        defn arg-regs! (t:CallType) :
+          match(t) :
+            (t:StanzaCall|CCall|YieldCall|StanzaTCall|CollectGarbage) : arg-regs(t)
+            (t) : List()
+        defn ret-regs! (t:CallType) :
+          match(t) :
+            (t:StanzaCall|CCall|YieldCall|CollectGarbage) : ret-regs(t)
+            (t) : List()            
+
         ;Move arguments into place
         match(f*) :
-          (f*:Var) : par-mov(cons(func-reg(type(e)), arg-regs(type(e))), cons(f*,ys*))
-          (f*:Val) : par-mov(arg-regs(type(e)), ys*)
+          (f*:Var) :
+            val freg = func-reg!(type(e))
+            par-mov(cons(freg, arg-regs!(type(e))), cons(f*,ys*))
+          (f*:Val) :
+            par-mov(arg-regs!(type(e)), ys*)
+            
         ;New shuffled arguments
         val f** = annotate(f(e))
         val ys** = map(annotate, ys(e))
         ;Free all registers
         free-all-regs()
         ;Move return values into place
-        assign(xs(e), ret-regs(type(e)))
+        assign(xs(e), ret-regs!(type(e)))
         ;Emit
         emit(Call(map(annotate,xs(e)), f**, ys**, type(e), killed?(e)))
       (e:Save) :
@@ -2053,8 +1801,10 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
       (e:Match) :
         ensure-available(list-r0-r1, List())
         val xs* = map(annotate, xs(e))
-        do(free-var, killed(e))
-        emit(Match(dispatch?(e), tag-lists(e), xs*, killed?(e), ns?(e)))
+        emit(Match(dispatch?(e), type-lists(e), xs*, killed?(e), ns?(e)))
+        do(free-var, killed(e))        
+      (e:MethodDispatch) :
+        emit(e)
       (e:Op) :
         defn assign-prefs (pref:List<Imm> -> Loc|List<Loc>) :
           val ys* = map(annotate, ys(e))
@@ -2067,14 +1817,14 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
 
         match(op(e)) :
           ;Prefers first argument
-          (op:TGSubOp|TGDivOp|TGModOp) :
+          (op:SubOp|DivOp|ModOp) :
             assign-prefs(PrefReg{head(_)})
           ;Prefers any argument
-          (op:LoadOp|TGAddOp|TGMulOp|TGAndOp|TGOrOp|TGXorOp|
-              TGNotOp|TGNegOp|ConvOp|InterpretOp) :
+          (op:LoadOp|AddOp|MulOp|AndOp|OrOp|XorOp|
+              NotOp|NegOp|ConvOp|InterpretOp) :
             assign-prefs(PrefReg)
           ;Second argument in R2, prefer first argument
-          (op:TGShlOp|TGShrOp|TGAshrOp) :
+          (op:ShlOp|ShrOp|AshrOp) :
             val y = ys(e)[1]
             match(y:Var) : ensure-location(n(y), Reg(2))
             assign-prefs(PrefReg{head(_)})
@@ -2083,20 +1833,20 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
             val rs = List(Reg(0), Reg(3))
             ensure-available(rs, killed(e))
             assign-prefs(rs)
-          ;Any register will do
-          (op:StoreOp|SaveCContextOp|NewStackOp|ArityErrorOp) :
+          ;AllocOp
+          (op:AllocOp|InstanceofOp) :
+            ensure-available(List(Reg(0), Reg(1)), List())
+            assign-slot(Reg(0), -1)
+            assign-slot(Reg(1), -1)
             assign-prefs(FreeReg())
-          ;Any register will do
-          (op:TGEqOp|TGNeOp|TGLtOp|TGGtOp|TGLeOp|TGGeOp|
-              TGUleOp|TGUltOp|TGUgtOp|TGUgeOp|
-              TGArityNeOp|TGHasStackSpace) :
-            assign-prefs(FreeReg())
-          ;Nop
+            free-slot(Reg(0))
+            free-slot(Reg(1))
+          ;Noop
           (op:NoOp) :
             do(free-var, killed(e))
-          ;Otherwise
+          ;Any register will do
           (op) :
-            fatal("Not supported: %_" % [op])
+            assign-prefs(FreeReg())
       (e) :
         fatal("%_ not supported." % [e])
 
@@ -2186,6 +1936,10 @@ defn stack-intervals () -> Seq<Interval> :
       match(e) :
         (e:Save) : note-usage(n(x(e)), pos)
         (e:Load) : note-usage(n(x(e)), pos)
+        (e:Op) :
+          match(op(e)) :
+            (op:RecordLiveOp) : do(note-usage{n(_), pos}, live-vars(op))
+            (op) : false
         (e) : false
 
     ;Out port usages
@@ -2202,21 +1956,27 @@ defn stack-intervals () -> Seq<Interval> :
 deftype StackMap
 defmulti location (m:StackMap, n:Int) -> False|Int
 defmulti offset (m:StackMap, n:Int) -> Int
-defmulti locations (m:StackMap) -> Vector<TGType>
+defmulti locations (m:StackMap) -> Vector<VMType>
 defmulti offsets (m:StackMap) -> Vector<Int>
 defmulti size (m:StackMap) -> Int
+
+defn int-type-matching-size (t:VMType) :
+  match(t) :
+    (t:VMFloat) : VMInt()
+    (t:VMDouble) : VMLong()
+    (t:VMType&IntegerT) : t
 
 defn stack-map () :
   ;===========================
   ;==== Location Tracking ====
   ;===========================
   val occupied-locs = Vector<True|False>()
-  val loc-types = Vector<TGType>()
+  val loc-types = Vector<VMType>()
   val var-locs = Array<False|Int>(nvars(), false)
 
   ;Get next available location
-  defn available-loc (t:TGType) :
-    val t* = TGIntegerT(t)
+  defn available-loc (t:VMType) :
+    val t* = int-type-matching-size(t)
     val n = length(occupied-locs)
     val i = for i in 0 to n find :
       (not occupied-locs[i]) and
@@ -2260,7 +2020,7 @@ defn stack-map () :
     for x in padded do :
       match(x) :
         (x:Padding) : next(offset-counter, size(x))
-        (x:TGType) : add(offsets, next(offset-counter, size(x)))
+        (x:VMType) : add(offsets, next(offset-counter, size(x)))
     value(offset-counter)
 
   ;Return Map
@@ -2290,65 +2050,14 @@ defn num-locations (s:StackMap) :
 defn refmask (s:StackMap) :
   val mask = Array<True|False>(size(s) / 8, false)
   for (t in locations(s), offset in offsets(s)) do :
-    match(t:TGRefT) : mask[offset / 8] = true
+    match(t:VMRef) : mask[offset / 8] = true
   [length(mask), to-bitmask(mask)]
 
 defn ref-offsets (s:StackMap) :
   for (offset in offsets(s), t in locations(s)) filter :
-    t is TGRefT
+    t is VMRef
+    
 
-;============================================================
-;================== Enforced Clearing =======================
-;============================================================
-
-defn enforce-clearing (smap:StackMap) :
-  for (blk in BLOCKS, b in 0 to false) do :
-    enforce-clearing(blk, b, smap)
-
-defn enforce-clearing (blk:Block, b:Int, smap:StackMap) :
-  ;============================
-  ;==== Instruction Buffer ====
-  ;============================
-  val instructions = Vector<Ins>()
-  defn emit (e:Ins) : add(instructions, e)
-
-  ;========================
-  ;==== Track Liveness ====
-  ;========================
-  val loc-live = Array<True|False>(num-locations(smap), false)
-  defn loc (n:Int) : location(smap,n) as Int
-  defn mark-live (n:Int) : loc-live[loc(n)] = true
-  defn mark-dead (n:Int) : loc-live[loc(n)] = false
-  defn live? (v:Var) : loc-live[loc(n(v))]
-
-  ;===================
-  ;==== Algorithm ====
-  ;===================
-  ;Is n a reference type?
-  defn ref? (v:Var) : VAR-TYPES[n(v)] is TGRefT
-  defn ref? (p:Port) : VAR-TYPES[n(p)] is TGRefT
-
-  ;Initialization liveness
-  for p in OUT-PORTS[b] do :
-    mark-live(n(p)) when saved?(p)
-
-  ;Sweep through instructions in reverse
-  for e in in-reverse(ins(blk)) do :
-    match(e) :
-      (e:Load) :
-        if ref?(x(e)) and not live?(x(e)) :
-          emit(Clear(n(x(e))))
-        emit(e)
-        mark-live(n(x(e)))
-      (e:Save) :
-        emit(e)
-        mark-dead(n(x(e)))
-      (e) :
-        emit(e)
-
-  ;Update block instructions
-  reverse!(instructions)
-  BLOCKS[b] = Block(instructions, next(blk))
 
 ;============================================================
 ;==================== Shuffling Engine ======================
@@ -2472,20 +2181,20 @@ defn shuffle (nreg:Int, xs:List<Int>, ys:List<Int>
 ;=============== Flipped Comparison Operators ===============
 ;============================================================
 
-defn flip (o:TGOp) :
+defn flip (o:VMOp) -> VMOp :
   match(o) :
-    (o:TGEqOp) : TGNeOp()
-    (o:TGNeOp) : TGEqOp()
-    (o:TGLtOp) : TGGeOp()
-    (o:TGGtOp) : TGLeOp()
-    (o:TGLeOp) : TGGtOp()
-    (o:TGGeOp) : TGLtOp()
-    (o:TGUleOp) : TGUgtOp()
-    (o:TGUltOp) : TGUgeOp()
-    (o:TGUgtOp) : TGUleOp()
-    (o:TGUgeOp) : TGUltOp()
-    (o:TGArityNeOp|TGHasStackSpace) : FlipOp(o)
+    (o:EqOp) : NeOp()
+    (o:NeOp) : EqOp()
+    (o:LtOp) : GeOp()
+    (o:GtOp) : LeOp()
+    (o:LeOp) : GtOp()
+    (o:GeOp) : LtOp()
+    (o:UleOp) : UgtOp()
+    (o:UltOp) : UgeOp()
+    (o:UgtOp) : UleOp()
+    (o:UgeOp) : UltOp()
     (o:FlipOp) : op(o)
+    (o) : FlipOp(o)
 
 ;============================================================
 ;=================== Block Collapsing =======================
@@ -2507,12 +2216,8 @@ defn collapse-blocks () :
     ;Instructions buffers
     val saves = Vector<Ins>()
     val loads = Vector<Ins>()
-    val clears = Vector<Ins>()
     val shuffles = Vector<KeyValue<Int,Int>>()
     val fshuffles = Vector<KeyValue<Int,Int>>()
-
-    ;Is n a reference variable?
-    defn ref? (n:Int) : VAR-TYPES[n] is TGRefT
 
     ;Populate port table
     val port-table = Array<Port>(nvars())
@@ -2524,10 +2229,9 @@ defn collapse-blocks () :
       val y = port-table[n(x)]
       val vx = Var(n(x), reg(x))
       val vy = Var(n(y), reg(y))
-      ;Saves and Clears
+      ;Saves
       match(saved?(x), saved?(y)) :
         (sx:True, sy:False) : add(saves, Save(vy))
-        (sx:False, sy:True) : add(clears, Clear(n(x))) when ref?(n(x))
         (sx, sy) : false
       ;Loads
       match(loaded?(x), loaded?(y)) :
@@ -2544,7 +2248,6 @@ defn collapse-blocks () :
     emit(ShuffleReg(values(shuffles), keys(shuffles)))
     emit(ShuffleFReg(values(fshuffles), keys(fshuffles)))
     emit(loads)
-    emit(clears)
 
   ;=======================
   ;==== Glue Location ====
@@ -2564,18 +2267,20 @@ defn collapse-blocks () :
   ;==== Goto Block ====
   ;====================
   defn ends-with-goto? (blk:Block) :
+    ;A block ends with a goto if it has exactly 1 successor,
+    ;and its last instruction is not a jumping instruction (Branch|Match|MethodDispatch).
     if length(next(blk)) == 1 :
       if empty?(ins(blk)) :
         true
       else :
         val e = ins(blk)[length(ins(blk)) - 1]
-        e is-not Branch|Match
+        e is-not Branch|Match|MethodDispatch
 
   ;======================
   ;==== Block Labels ====
   ;======================
   val lbls = Array<Int>(nblocks())
-  lbls[0 to false] = repeatedly(fresh-id{})
+  lbls[0 to false] = repeatedly(unique-id{})
 
   ;===================
   ;==== Algorithm ====
@@ -2608,7 +2313,11 @@ defn collapse-blocks () :
               emit(Goto(lbls[alt]))
         (e:Match) :
           val ns = map({lbls[_]}, next(blk))
-          emit(Match(dispatch?(e), tag-lists(e), xs(e), false, ns))
+          emit(Match(dispatch?(e), type-lists(e), xs(e), false, ns))
+        (e:MethodDispatch) :
+          val default = lbls[next(blk)[0]]
+          val amb = lbls[next(blk)[1]]
+          emit(MethodDispatch(multi(e), num-header-args(e), default, amb))
         (e:Def) :
           false
         (e) :
@@ -2628,297 +2337,424 @@ defn collapse-blocks () :
   clear(BLOCKS)
   add(BLOCKS, Block(instructions, List()))
 
-defn keys<?T> (xs:Vector<KeyValue<?T,?>>) : to-list(seq(key,xs))
-defn values<?T> (xs:Vector<KeyValue<?,?T>>) : to-list(seq(value,xs))
+;============================================================
+;================== Backend Properties ======================
+;============================================================
+defn frame-size (num-mem-args:Int, backend:Backend) :
+  match(backend) :
+    (backend:W64Backend) :
+      val num-ctxt = length(c-preserved-regs(backend))
+      8 * ((num-ctxt + num-mem-args + 4) | 1)
+    (backend) :
+      val num-ctxt = length(c-preserved-regs(backend))
+      8 * ((num-ctxt + num-mem-args) | 1)
+
+defn mem-arg-offset (num-mem-args:Int, index:Int, backend:Backend) :
+  match(backend) :
+    (backend:W64Backend) :
+      val frame-size = frame-size(num-mem-args, backend)
+      (- frame-size) + (8 * index) + 32
+    (backend) :
+      val frame-size = frame-size(num-mem-args, backend)
+      (- frame-size) + (8 * index)  
+
+defn mem-arg-offset (op:StoreCArgOp|LoadCArgOp, backend:Backend) :
+  mem-arg-offset(num-mem-args(op), index(op), backend)  
 
 ;============================================================
 ;====================== Assemble ============================
 ;============================================================
 
-defn assemble (stackmap:StackMap, backend:Backend) :
+defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
   ;============================
   ;==== Assembly Utilities ====
   ;============================
+  defn E (i:asm-Ins) : emit(emitter, i)  
   defn T (x:Imm) : asm-type(x)
   defn I (x:Imm) : to-asm-imm(x)
-  defn V (x:Var) : to-asm-imm(x) as asm-Loc
-  defn OP (op:TGOp) : to-asm-op(op)
-  val #stack-sp = STACK-SP-OFFSET - REF-TAG-BITS
-  val #stack-size = STACK-SIZE - REF-TAG-BITS
+  defn V (x:Var) : to-asm-loc(x)
 
-  ;==============
-  ;==== Data ====
-  ;==============
-  #data()
-  for entry in CONSTANTS do :
-    #label(n(entry))
-    match(value(entry)) :
-      (v:String) : #defstring(v)
-      (v:Double) : #defdouble(v)
-  #text()      
+  ;====================
+  ;==== Label Pool ====
+  ;====================
+  val label-table = IntTable-init<asm-LocalMem>(asm-LocalMem{unique-id(stubs)})
 
-  ;===================
-  ;==== Stack Map ====
-  ;===================
-  val stack-map-lbl = fresh-id()
-  let :
-    val [n, bits] = refmask(stackmap)
-    #data()
-    #label(stack-map-lbl)
-    #deflong(to-long(n))
-    do(#deflong, bits)
-    #text()
+  ;=========================
+  ;==== Special Offsets ====
+  ;=========================
+  val stack-offset-counter = Counter(-1 + 8)
+  val size-offset = next(stack-offset-counter, 8)
+  val frames-offset = next(stack-offset-counter, 8)
+  val sp-offset = next(stack-offset-counter, 8)
+  val pc-offset = next(stack-offset-counter, 8)
 
   ;==============
   ;==== Body ====
   ;==============
   for e in ins(BLOCKS[0]) do :
+    ;println("//Assembling: %_" % [e])
     match(e) :
       (e:Set) :
-        val t = T(x(e))
-        val x = V(x(e))
-        val y = I(y(e))
-        #mov(t, x, y) when x != y
+        match(y(e)) :
+          (v:Val) :
+            match(value(v)) :
+              (v:ConstId) : load-const(id(v))
+              (v) : set-value(y(e))
+          (v) : set-value(v)
+        where :
+          defn load-const (id:Int) :
+            val x = V(x(e))
+            E $ LoadL(x, asm-LinkId(id))
+          defn set-value (v:Imm) :
+            val t = T(x(e))
+            val x = V(x(e))
+            val y = I(v)
+            E(asm-SetIns(t, x, y)) when x != y            
       (e:Return) :
         match(ctxt(e)) :
           (c:StanzaContext) :
-            #return()
+            E $ asm-Return()
           (c:CContext) :
-            val ns = c-preserved-regs(backend)
-            #movl(RSP, R6)
-            for (n in ns, o in -8 to false by -8) do :
-              #loadl(R(n), RSP, o)
-            #return()
+            ;Save current context
+            E $ StoreL(M(stack-pointer(stubs)), RSP)
+
+            ;Restore C context
+            E $ SetL(RSP, R(c-rsp-arg(backend(stubs))))
+            for (reg in c-preserved-regs(backend(stubs)), i in 0 to false) do :
+              val o = -8 - (8 * i)
+              E $ LoadL(R(reg), RSP, o)
+            E $ asm-Return()
       (e:Args) :
-        ;Write stack map
-        #movl(R1, M(stack-map-lbl))
-        #storel(RSP, R1, 8)
-        ;Null out stack
-        for off in ref-offsets(stackmap) do :
-          #storel(RSP, INT(VOID-TAG), off)
+        match(ctxt(e)) :
+          (ctxt:StanzaContext) :
+            ;Everything is set up already
+            false
+          (ctxt:CContext) :
+            false
       (e:Call) :
         match(type(e)) :
-          (t:StanzaTCall) :
-            #movl(R0, INT(arity(t)))
-            #goto(I(f(e)))
+          (t:ExtendStack) :
+            val return-lbl = unique-id(stubs)
+            E $ SetL(R0, LM(return-lbl))
+            E $ SetL(R1, INT(size(stackmap) + 8))
+            E $ asm-Goto(M(extend-stack(stubs)))
+            E $ asm-Label(return-lbl)
+          (t:CollectGarbage) :
+            val return-lbl = unique-id(stubs)
+            E $ SetL(R0, LM(return-lbl))
+            E $ asm-Goto(M(collect-garbage(stubs)))
+            E $ asm-Label(return-lbl)
           (t:StanzaCall) :
-            #movl(R0, INT(arity(t)))
-            #addl(RSP, RSP, INT(size(stackmap) + 8))
-            #call(I(f(e)), info(t))
-            #subl(RSP, RSP, INT(size(stackmap) + 8))
-          (t:CCall) :            
-            ;Set number of floating point registers
-            defn ref? (i:Imm) : type(i) is TGRealT
-            #movl(R0, INT(count(ref?, ys(e))))
-            ;Call in C stack frame
-            #addl(RSP, RSP, INT(size(stackmap)))
-            #storel(M(STACK-PTR-LBL), RSP)
-            #loadl(RSP, M(C-RSP-LBL))
-            #subl(RSP, RSP, INT(frame-size(t,backend)))
-            #call(I(f(e)), false)
-            #loadl(RSP, M(STACK-PTR-LBL))
-            #subl(RSP, RSP, INT(size(stackmap)))
-          (t:StackSwitch) :
-            ;==================
-            ;R0 is temporary
-            ;R1 is target stack
-            ;==================
+            val frame-size = INT(size(stackmap) + 8)
+            E $ AddL(RSP, RSP, frame-size)
+            E $ asm-Call(I(f(e)))
+            match(info(t):FileInfo) :
+              E $ asm-Label(unique-id(stubs), info(t))
+            E $ SubL(RSP, RSP, frame-size)
+          (t:StanzaTCall) :
+            E $ asm-Goto(I(f(e)))
+          (t:CCall) :
+            ;Push frame:
+            E $ AddL(RSP, RSP, INT(size(stackmap)))
 
-            ;RSP = RSP + stack-size
-            ;[stack].sp = RSP
-            val ret-lbl = fresh-id()
-            #addl(RSP, RSP, INT(size(stackmap)))
-            #loadl(R0, M(STACK-LBL))
-            #storel(R0, RSP, #stack-sp)
-            ;[RSP] = addr(ret-lbl)
-            #movl(R0, M(ret-lbl))
-            #storel(RSP, R0)
-            ;[stack-limit] = current stack + stack-size
-            ;[stack] = R1
-            #addl(R0, R1, INT(#stack-size))
-            #storel(M(STACK-LIM-LBL), R0)
-            #storel(M(STACK-LBL), R1)
-            ;RSP = stack.sp
-            #loadl(RSP, R1, #stack-sp)
-            ;Return
-            #return()
-            ;Return address
-            #label(ret-lbl)
-            ;Resume
-            #subl(RSP, RSP, INT(size(stackmap) + 8))
-      (e:Op) :
+            ;Save RSP
+            E $ StoreL(M(stack-pointer(stubs)), RSP)
+            
+            ;Restore the C context:
+            E $ LoadL(RSP, M(saved-c-rsp(stubs)))
+              
+            ;Call C function with right convention
+            val num-float-args = for y in ys(e) count : reg?(y as Var) is FReg
+            E $ SubL(RSP, RSP, INT(frame-size(num-mem-args(t), backend(stubs))))
+            E $ SetL(R0, INT(num-float-args))
+            E $ asm-Call(I(f(e)))
+
+            ;Load RSP
+            E $ LoadL(RSP, M(stack-pointer(stubs)))
+
+            ;Pop frame:
+            E $ SubL(RSP, RSP, INT(size(stackmap)))
+          (t:YieldCall) :            
+            val lbl = unique-id(stubs)
+            val TMP = to-asm-loc(scratch-regs(t)[0])
+            val TMP2 = to-asm-loc(scratch-regs(t)[1])
+            val F = I(f(e))
+
+            ;Save current stack progress
+            val size-offset = -1 + 8 
+            val frames-offset = -1 + 8 + 8
+            val sp-offset = -1 + 8 + 8 + 8
+            val pc-offset = -1 + 8 + 8 + 8 + 8
+            E $ LoadL(TMP, M(current-stack(stubs)))
+            E $ SetL(TMP2, LM(lbl))
+            E $ StoreL(TMP, TMP2, pc-offset)
+            E $ StoreL(TMP, RSP, sp-offset)
+
+            ;Load given stack
+            E $ StoreL(M(current-stack(stubs)), F)
+            if enter?(t) : E $ LoadL(RSP, F, frames-offset)
+            else : E $ LoadL(RSP, F, sp-offset)
+            E $ LoadL(TMP, F, frames-offset)            
+            E $ LoadL(TMP2, F, size-offset)
+            E $ AddL(TMP, TMP, TMP2)
+            E $ StoreL(M(stack-limit(stubs)), TMP)
+            
+            E $ LoadL(TMP, F, pc-offset)
+            E $ asm-Goto(TMP)            
+            E $ asm-Label(lbl, info(t))
+      (e:Op) : ;[2]
         match(op(e)) :
-          (op:NewStackOp) :
-            val ret-lbl = fresh-id()
-            #movl(R0, M(ret-lbl))
-            #goto(M(EXTEND-STACK-LBL))
-            #label(ret-lbl)
           (op:SaveCContextOp) :
-            val ns = c-preserved-regs(backend)
-            for (n in ns, o in -8 to false by -8) do :
-              #storel(RSP, R(n), o)
-            #movl(R6, RSP)
-            #loadl(RSP, M(STACK-PTR-LBL))
-          (op:ArityErrorOp) :
-            val arg0 = head(call-regs(backend))
-            #movl(R(arg0), R0)
-            #movl(R0, INT(1))
-            #addl(RSP, RSP, INT(size(stackmap) + 8))
-            #call(M(ARITY-ERROR-ID), info(op))
-            #subl(RSP, RSP, INT(size(stackmap) + 8))
+            ;Save C preserved registers
+            for (reg in c-preserved-regs(backend(stubs)), i in 0 to false) do :
+              val o = -8 - (8 * i)
+              E $ StoreL(RSP, R(reg), o)
+            ;Move RSP to special register for holding CRSP
+            E $ SetL(R(c-rsp-arg(backend(stubs))), RSP)
+            ;Load Stanza RSP
+            E $ LoadL(RSP, M(stack-pointer(stubs)))
+          (op:RecordLiveOp) :
+            val indices = qsort $
+              for v in live-vars(op) seq? :
+                if type(v) is VMRef :
+                  val o = offset(stackmap, n(v)) - 16
+                  fatal("Wrong alignment for ref on stack.") when o % 8 != 0
+                  One(o / 8)
+                else : None()
+            E $ StoreL(RSP, asm-StackMap(size(stackmap), indices), 8)
+          (op:AllocOp) :
+            val x = V(xs(e)[0])
+            val size = I(ys(e)[0])
+            val TMP = R0
+            val TMP2 = R1
+            E $ LoadL(TMP, M(heap-top(stubs)))
+            E $ SetL(TMP2, size)
+            E $ AddL(x, TMP, INT(1))
+            E $ AddL(TMP, TMP, TMP2)
+            E $ StoreL(M(heap-top(stubs)), TMP)
+          (op:NoOp) :
+            false
           (op:ConvOp) :
             val [x, y] = [head(xs(e)), head(ys(e))]
-            #conv(T(x), V(x), T(y), I(y))
+            E $ asm-ConvertIns(T(x), V(x), T(y), I(y))
           (op:InterpretOp) :
             val [x, y] = [head(xs(e)), head(ys(e))]
-            #interpret(T(x), V(x), T(y), I(y))
+            E $ asm-InterpretIns(T(x), V(x), T(y), I(y))
           (op:LoadOp) :
             val [x, y, o] = [head(xs(e)), head(ys(e)), offset(op)]
-            #load(T(x), V(x), I(y), o)
+            E $ asm-Load(T(x), V(x), I(y), o)
           (op:StoreOp) :
             val [x, y, o] = [ys(e)[0], ys(e)[1], offset(op)]
-            #store(T(y), I(x), I(y), o)
-          (op:TGOp&Binary) :
+            E $ asm-Store(T(y), I(x), I(y), o)
+          (op:LoadArgOp) :
+            val x = xs(e)[0]
+            E $ LoadL(V(x), M(registers(stubs)), 8 * index(op))
+          (op:StoreArgOp) :
+            val y = ys(e)[0]
+            E $ StoreL(M(registers(stubs)), I(y), 8 * index(op))
+          (op:StoreCArgOp) :
+            val crsp = ys(e)[0]
+            val y = ys(e)[1]
+            E $ StoreL(I(crsp), I(y), mem-arg-offset(op,backend(stubs)))
+          (op:LoadCArgOp) :
+            val crsp = ys(e)[0]
+            val x = xs(e)[0]
+            E $ LoadL(V(x), I(crsp), mem-arg-offset(op,backend(stubs)))
+          (op:CRSPOp) :
+            val x = xs(e)[0]
+            E $ LoadL(V(x), M(saved-c-rsp(stubs)))
+          (op:StoreCRSPOp) :
+            val y = ys(e)[0]
+            E $ StoreL(M(saved-c-rsp(stubs)), I(y))
+          (op:VMOp&Binary) :
             val [x, y, z] = [head(xs(e)), ys(e)[0], ys(e)[1]]
-            #bin(T(y), V(x), OP(op), I(y), I(z))
-          (op:TGOp&Unary) :
+            E $ asm-BinOp(T(y), V(x), to-asm-op(op), I(y), I(z))
+          (op:VMOp&Unary) :
             val [x, y] = [head(xs(e)), head(ys(e))]
-            #una(T(x), V(x), OP(op), I(y))
+            E $ asm-UnaOp(T(x), V(x), to-asm-op(op), I(y))
           (op:DivModOp) :
             val [x1, x2, y, z] = [xs(e)[0], xs(e)[1], ys(e)[0], ys(e)[1]]
-            #dual(T(x1), V(x1), V(x2), OP(op), I(y), I(z))    
+            E $ asm-DualOp(T(x1), V(x1), V(x2), to-asm-op(op), I(y), I(z))
+          (op:InstanceofOp) :
+            val [x, y] = [head(xs(e)), head(ys(e))]
+            E $ asm-UnaOp(T(x), V(x), to-asm-op(op), I(y))
+          (op:FlushVMOp) :
+            val x = V(head(xs(e)))
+            val stack-pointer-offset = -1 + 8 + 16
+            E $ LoadL(x, M(current-stack(stubs)))
+            E $ StoreL(x, RSP, stack-pointer-offset)
+            E $ SetL(x, M(vmstate(stubs)))
+          (op) :
+            fatal("Not yet implemented")
+
       (e:Save) :
         val x = x(e)
         val offset = offset(stackmap, n(x))
-        #store(T(x), RSP, I(x), offset)
+        E $ asm-Store(T(x), RSP, I(x), offset)
       (e:Load) :
         val x = x(e)
         val offset = offset(stackmap, n(x))
-        #load(T(x), V(x), RSP, offset)
+        E $ asm-Load(T(x), V(x), RSP, offset)
       (e:Xchg) :
         val [x, y] = [x(e), y(e)]
         match(swap(e)) :
           (s:FReg) :
-            #movd(F(n(s)), I(x))
-            #movd(V(x), I(y))
-            #movd(V(y), F(n(s)))
+            E $ SetD(F(n(s)), I(x))
+            E $ SetD(V(x), I(y))
+            E $ SetD(V(y), F(n(s)))
           (s:False) :
-            #xchg(V(x), V(y))
-      (e:Clear) :
-        val offset = offset(stackmap, n(e))
-        #storel(RSP, INT(VOID-TAG), offset)        
+            E $ asm-XchgIns(V(x), V(y))
       (e:ShuffleReg) :
         if xs(e) != ys(e) :
-          shuffle(num-regs(backend), xs(e), ys(e),
+          shuffle(num-regs(backend(stubs)), xs(e), ys(e),
             fn (src:Int, dst:Int) :
               E $ asm-SetIns(LT, R(dst), R(src))
             fn (src:Int, dst:Int) :
               E $ asm-XchgIns(R(dst), R(src)))
       (e:ShuffleFReg) :
         if xs(e) != ys(e) :
-          shuffle(num-fregs(backend), xs(e), ys(e),
+          shuffle(num-fregs(backend(stubs)), xs(e), ys(e),
             fn (src:Int, dst:Int) :
               E $ asm-SetIns(DT, F(dst), F(src))
             fn (n:Int) :
-              E $ asm-Store(DT, M(SWAP-LBL), F(n), 0)
+              E $ asm-Store(DT, M(swap-lbl(stubs)), F(n), 0)
             fn (n:Int) :
-              E $ asm-Load(DT, F(n), M(SWAP-LBL), 0))
+              E $ asm-Load(DT, F(n), M(swap-lbl(stubs)), 0))
       (e:Label) :
-        #label(n(e))
+        val l = label-table[n(e)]
+        E $ asm-Label(asm-n(l))
       (e:Goto) :
-        #goto(M(n(e)))
-      (e:Break) :
-        defn cmp-stack-limit (op:asm-Op) :
-          #addl(R0, RSP, INT(size(stackmap) + 8))
-          #loadl(R1, M(STACK-LIM-LBL))
-          #breakl(M(n(e)), op, R0, R1)
-        defn cmp-arity (op:asm-Op) :
-          val arity = xs(e)[0]
-          #breakl(M(n(e)), op, R0, I(arity))
+        E $ asm-Goto(label-table[n(e)])
+      (e:Break) : ;[1]
+        defn cmp-stack-limit (le-op:asm-Op) :
+          val TMP = R0
+          val TMP2 = R1
+          E $ AddL(TMP, RSP, INT(size(stackmap) + 8))
+          E $ LoadL(TMP2, M(stack-limit(stubs)))
+          E $ BreakL(label-table[n(e)], le-op, TMP, TMP2)
+        defn cmp-heap-limit (le-op:asm-Op) :
+          val TMP = R0
+          val TMP2 = R1
+          val size = I(xs(e)[0])
+          E $ LoadL(TMP, M(heap-top(stubs)))
+          E $ AddL(TMP, TMP, size)
+          E $ LoadL(TMP2, M(heap-limit(stubs)))
+          E $ BreakL(label-table[n(e)], le-op, TMP, TMP2)
+        defn cmp-arity (arg:Int, value:Int, eq-op:asm-Op) :
+          val arg-reg = R(call-regs(backend(stubs))[arg])
+          E $ BreakL(label-table[n(e)], eq-op, arg-reg, INT(value))
+
         match(op(e)) :
-          (op:TGHasStackSpace) :
-            cmp-stack-limit(OP(TGUleOp()))
-          (op:TGArityNeOp) :
-            cmp-arity(OP(TGNeOp()))
+          (op:HasStackOp) :
+            cmp-stack-limit(asm-UleOp())
+          (op:HasHeapOp) :
+            cmp-heap-limit(asm-UleOp())
+          (op:ArgEqOp) :
+            cmp-arity(arg(op), value(op), asm-EqOp())
           (fop:FlipOp) :
             match(op(fop)) :
-              (op:TGHasStackSpace) :
-                cmp-stack-limit(OP(flip(TGUleOp())))
-              (op:TGArityNeOp) :
-                cmp-arity(OP(flip(TGNeOp())))
+              (op:HasStackOp) :
+                cmp-stack-limit(asm-flip(asm-UleOp()))
+              (op:HasHeapOp) :
+                cmp-heap-limit(asm-flip(asm-UleOp()))
+              (op:ArgEqOp) :
+                cmp-arity(arg(op), value(op), asm-flip(asm-EqOp()))
           (op) :
             val [x, y] = [xs(e)[0], xs(e)[1]]
-            #break(T(x), M(n(e)), OP(op), I(x), I(y))
+            E $ asm-Break(T(x), label-table[n(e)], to-asm-op(op), I(x), I(y))
       (e:Match) :
         if dispatch?(e) :
-          val no-branch = ns(e)[0]
-          val amb-branch = ns(e)[1]
+          val no-branch = label-table[ns(e)[0]]
+          val amb-branch = label-table[ns(e)[1]]
           val branch-ns = tailn(ns(e), 2)          
-          val bs = map(asm-Branch, tag-lists(e), branch-ns)
+          val bs = map(asm-Branch{_, label-table[_]}, type-lists(e), branch-ns)          
           val xs = map(I, xs(e))
-          #dispatch(xs, bs, no-branch, amb-branch)          
+          E $ asm-Dispatch(xs, bs, no-branch, amb-branch)
         else :
-          val no-branch = head(ns(e))
+          val no-branch = label-table[head(ns(e))]
           val branch-ns = tail(ns(e))          
-          val bs = map(asm-Branch, tag-lists(e), branch-ns)
+          val bs = map(asm-Branch{_, label-table[_]}, type-lists(e), branch-ns)          
           val xs = map(I, xs(e))
-          #match(xs, bs, no-branch)
+          E $ asm-Match(xs, bs, no-branch)
+      (e:MethodDispatch) :
+        val no-branch = label-table[default(e)]
+        val amb-branch = label-table[amb(e)]
+        E $ asm-MethodDispatch(multi(e), num-header-args(e), no-branch, amb-branch)        
+      (e) : fatal("Not yet implemented: %_" % [e])
 
 defn asm-type (x:Imm) :
   to-asm-type(type(x))
 
-defn to-asm-type (t:TGType) -> asm-ASMType :
+defn to-asm-type (t:VMType) -> asm-ASMType :
   match(t) :
-    (t:TGByteT) : asm-ByteT()
-    (t:TGIntT) : asm-IntT()
-    (t:TGLongT) : asm-LongT()
-    (t:TGRefT) : asm-LongT()
-    (t:TGFloatT) : asm-FloatT()
-    (t:TGDoubleT) : asm-DoubleT()
+    (t:VMByte) : asm-ByteT()
+    (t:VMInt) : asm-IntT()
+    (t:VMLong) : asm-LongT()
+    (t:VMRef) : asm-LongT()
+    (t:VMFloat) : asm-FloatT()
+    (t:VMDouble) : asm-DoubleT()
+
+defn to-asm-loc (x:Imm) :
+  to-asm-imm(x) as asm-Loc
 
 defn to-asm-imm (x:Imm) -> asm-Imm :
   match(x) :
-    (x:Var) :
-      match(reg(x)) :
-        (r:Reg) : asm-Reg(n(r))
-        (r:FReg) : asm-FReg(n(r))
-    (x:Val) :
-      to-asm-imm(value(x))
+    (x:Var) : to-asm-loc(reg(x))
+    (x:Val) : to-asm-imm(value(x))
 
-defn to-asm-imm (i:TGImm) -> asm-Imm :
+defn to-asm-loc (x:Loc) -> asm-Loc :
+  match(x) :
+    (x:Reg) : asm-Reg(n(x))
+    (x:FReg) : asm-FReg(n(x))
+
+defn to-asm-imm (i:VMImm) -> asm-Imm :
   match(i) :
-    (i:TGRegSP) : asm-RegSP()
-    (i:TGTag) : asm-TagImm(n(i), marker?(i))
-    (i:TGByte) : asm-IntImm(value(i))
-    (i:TGInt) : asm-IntImm(value(i))
-    (i:TGLong) : asm-IntImm(value(i))
-    (i:TGMem) : asm-Mem(n(i), offset(i))
-    (i:TGExMem) : asm-ExMem(lbl(i), offset(i))
+    (i:NumConst) :
+      match(value(i)) :
+        (v:Byte|Int|Long) : asm-IntImm(v)
+        (v:Char) : asm-IntImm(to-byte(v))
+        (v:Float|Double) : fatal("Not yet implemented: Need interpret instruction")
+    (i:Marker) : asm-TagImm(typeid(i), true)
+    (i:Tag) : asm-TagImm(typeid(i), false)
+    (i:CodeId) : asm-LinkId(id(i))
+    (i:ExternId) : asm-LinkId(id(i))
+    (i:ExternDefnId) : asm-LinkId(id(i))
+    (i:GlobalId) : asm-LinkId(id(i))
+    (i:DataId) : asm-LinkId(id(i))
+    (i:VoidMarker) : asm-IntImm(-8 + 2)
+    (i:ConstId) : fatal("Constants must be loaded")
 
-defn to-asm-op (op:TGOp) -> asm-Op :
+defn to-asm-op (op:VMOp) -> asm-Op :
   match(op) :
-    (op:TGAddOp) : asm-AddOp()
-    (op:TGSubOp) : asm-SubOp()
-    (op:TGMulOp) : asm-MulOp()
-    (op:TGDivOp) : asm-DivOp()
-    (op:TGModOp) : asm-ModOp()
-    (op:TGAndOp) : asm-AndOp()
-    (op:TGOrOp) : asm-OrOp()
-    (op:TGXorOp) : asm-XorOp()
-    (op:TGShlOp) : asm-ShlOp()
-    (op:TGShrOp) : asm-ShrOp()
-    (op:TGAshrOp) : asm-AshrOp()
-    (op:TGEqOp) : asm-EqOp()
-    (op:TGNeOp) : asm-NeOp()
-    (op:TGLtOp) : asm-LtOp()
-    (op:TGGtOp) : asm-GtOp()
-    (op:TGLeOp) : asm-LeOp()
-    (op:TGGeOp) : asm-GeOp()
-    (op:TGUleOp) : asm-UleOp()
-    (op:TGUltOp) : asm-UltOp()
-    (op:TGUgtOp) : asm-UgtOp()
-    (op:TGUgeOp) : asm-UgeOp()
-    (op:TGNotOp) : asm-NotOp()
-    (op:TGNegOp) : asm-NegOp()
+    (op:AddOp) : asm-AddOp()
+    (op:SubOp) : asm-SubOp()
+    (op:MulOp) : asm-MulOp()
+    (op:DivOp) : asm-DivOp()
+    (op:ModOp) : asm-ModOp()
+    (op:AndOp) : asm-AndOp()
+    (op:OrOp) : asm-OrOp()
+    (op:XorOp) : asm-XorOp()
+    (op:ShlOp) : asm-ShlOp()
+    (op:ShrOp) : asm-ShrOp()
+    (op:AshrOp) : asm-AshrOp()
+    (op:EqOp) : asm-EqOp()
+    (op:NeOp) : asm-NeOp()
+    (op:LtOp) : asm-LtOp()
+    (op:GtOp) : asm-GtOp()
+    (op:LeOp) : asm-LeOp()
+    (op:GeOp) : asm-GeOp()
+    (op:UleOp) : asm-UleOp()
+    (op:UltOp) : asm-UltOp()
+    (op:UgtOp) : asm-UgtOp()
+    (op:UgeOp) : asm-UgeOp()
+    (op:NotOp) : asm-NotOp()
+    (op:NegOp) : asm-NegOp()
     (op:DivModOp) : asm-DivModOp()
-    
+    (op:InstanceofOp) : asm-TypeofOp(type(op))
+
+;============================================================
+;===================== Utilities ============================
+;============================================================
+
+defn keys<?T> (xs:Vector<KeyValue<?T,?>>) : to-list(seq(key,xs))
+defn values<?T> (xs:Vector<KeyValue<?,?T>>) : to-list(seq(value,xs))

@@ -8,7 +8,9 @@ defpackage stz/vm-encoder :
   import stz/call-records
   import stz/backend
   import stz/utils
-  import stz/trie
+  import stz/set-utils
+  import stz/conversion-utils
+  import stz/dispatch-dag
 
 public deftype EncodingResolver
 public defmulti liveness-map (r:EncodingResolver, live:Tuple<Int>, num-locals:Int) -> Int
@@ -139,12 +141,12 @@ public defn encode (func:VMFunction,
       (t:TopType) : true
 
   ;Convert a TypeSet to an ISet assuming that the TypeSet represents a final type.
-  defn final-iset (t:TypeSet) :
-    match(t) :
-      (t:SingleType) : ISubset([type(t)])
-      (t:OrType) : reduce(union, seq(final-iset, types(t)))
-      (t:AndType) : final-iset(find!(type-is-final?, types(t)))
-      (t:TopType) : IAll()
+  ;defn final-iset (t:TypeSet) :
+  ;  match(t) :
+  ;    (t:SingleType) : ISubset([type(t)])
+  ;    (t:OrType) : reduce(union, seq(final-iset, types(t)))
+  ;    (t:AndType) : final-iset(find!(type-is-final?, types(t)))
+  ;    (t:TopType) : IAll()
 
   ;Check whether all types in branch are final.
   defn branch-is-final? (b:VMBranch) :
@@ -250,6 +252,9 @@ public defn encode (func:VMFunction,
     val used-labels = to-intset(seq(n, filter-by<LabelIns>(ins(func))))
     val label-counter = to-seq(0 to false)
 
+    ;Acceleration
+    val sf = SetFlattener()
+
     ;==================================================
     ;============== Overall Algorithm =================
     ;==================================================
@@ -281,45 +286,47 @@ public defn encode (func:VMFunction,
         emit-ins-targets(targets)    
 
     ;Encode a match statement that cannot be redefined later.
-    defn emit-final-match (ys:Tuple<VMImm>, bs:Tuple<VMBranch>, default:Int) :
-      ;Overall algorithm
-      defn driver () :
-        if empty?(bs) : emit-ins(GotoIns(default))
-        else : emit-tries(to-trie(seq(ibranch,bs), default))          
-      ;Convert a VMBranch into an IBranch
-      defn ibranch (v:VMBranch) :
-        IBranch(to-list(seq(final-iset,types(v))), n(v))
-      ;Compile branches to flattened tries
-      defn to-trie (bs:Seqable<IBranch>, default:Int) :
-        flatten(/to-trie(bs), default)
-      ;Compile a flattened trie
-      defn emit-tries (ftries:LabeledTries) -> False :
-        ;Create labels for all tries
-        val labels = to-tuple(seq(gen-label{}, 0 to num-labeled-tries(ftries)))
-        ;Convert a TrieTarget into a label
-        defn to-n (t:TrieTarget) :
-          match(t) :
-            (t:EndTrie) : target(t) as Int
-            (t:TrieId) : labels[id(t)]
-        ;Compile each trie
-        for trie in tries(ftries) do :
-          ;Emit trie label
-          if id(trie) is Int :
-            val l = labels[id(trie) as Int]
-            emit-ins(LabelIns(l))
-          ;Emit empty trie if required
-          if empty?(entries(trie)) :
-            emit-ins(GotoIns(to-n(/default(trie))))
-          ;Emit each branch
+    defn emit-final-match (ys:Tuple<VMImm>, bs:Tuple<VMBranch>, default-label:Int) :      
+      defn compute-dag () :
+        val branch-table = BranchTable(to-branches(seq(types,bs), {[_]}, sf))
+        compute-dispatch-dag(branch-table, false)
+        
+      defn emit-dag (dag:Dag) :
+        ;Create labels for all entries
+        val labels = map(gen-label{}, entries(dag))
+        ;Convert a value into a label
+        defn to-label (x:Int|Soln) :
+          match(x) :
+            (x:Int) : labels[x]
+            (x:UniqueSoln) : n(bs[index(x)])
+            (x:NoSoln) : default-label
+        ;Compile a given entry
+        defn emit-entry (e:DagEntry) :
+          if empty?(entries(e)) :
+            emit-ins(GotoIns(to-label(default(e))))
           else :
-            val num-e = length(entries(trie))
-            for (e in entries(trie), i in 0 to false) do :
-              val n1 = to-n(value(e))
-              val n2 = gen-label() when i < num-e - 1 else to-n(/default(trie))
-              emit-ins(Branch1Ins(n1, n2, InstanceofOp(SingleType(key(e))), ys[index(trie)]))
-              emit-ins(LabelIns(n2)) when i < num-e - 1
+            within (entry, last?) = expanded-entries(e) :
+              val n1 = to-label(value(entry))
+              val n2 = to-label(default(e)) when last? else gen-label()
+              emit-ins(Branch1Ins(n1, n2, InstanceofOp(SingleType(key(entry))), ys[depth(e)]))
+              emit-ins(LabelIns(n2)) when not last?
+        ;Compile all entries
+        for (e in entries(dag), l in labels) do :
+          emit-ins(LabelIns(l))
+          emit-entry(e)
+
+      ;Expand the given entries and compute whether it is the last entry
+      defn expanded-entries (f:(KeyValue<Int,Int|Soln>, True|False) -> ?, e:DagEntry) :
+        val es = for e in entries(e) seq-cat :
+          for v in values(key(e)) seq :
+            v => value(e)
+        let loop () :
+          val e = next(es)          
+          f(e, empty?(es))
+          loop() when not empty?(es)
+
       ;Launch
-      driver()
+      emit-dag(compute-dag())
 
     ;Emit instanceof operation
     defn emit-instanceof (n1:Int, n2:Int, x:VMImm, type:TypeSet) :

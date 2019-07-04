@@ -54,9 +54,13 @@ FILES="core/core.stanza \
        compiler/stz-bindings.stanza \
        compiler/stz-bindings-to-vm.stanza \
        compiler/stz-vm-encoder.stanza \
-       compiler/stz-trie.stanza \
        compiler/stz-trie-table.stanza \
        compiler/stz-hash.stanza \
+       compiler/stz-keyed-set.stanza \
+       compiler/stz-set-utils.stanza \
+       compiler/stz-conversion-utils.stanza \
+       compiler/stz-dyn-graph.stanza \
+       compiler/stz-dispatch-dag.stanza \
        compiler/stz-dyn-tree.stanza \
        compiler/stz-dyn-bi-table.stanza \
        compiler/stz-vm-table.stanza \
@@ -72,22 +76,22 @@ FILES="core/core.stanza \
        compiler/lang-renamer.stanza \
        compiler/lang-resolver.stanza \
        compiler/lang-serializer.stanza \
-       compiler/stz-codegen2.stanza \
-       compiler/stz-reg-alloc2.stanza \
-       compiler/stz-stitcher2.stanza \
+       compiler/stz-codegen.stanza \
+       compiler/stz-reg-alloc.stanza \
+       compiler/stz-stitcher.stanza \
        compiler/stz-const-pool.stanza \
        compiler/stz-data-pool.stanza \
        compiler/stz-padder.stanza \
        compiler/stz-build.stanza \
        compiler/stz-repl.stanza \
        compiler/stz-config.stanza \
-       compiler/stz-asm-ir2.stanza \
+       compiler/stz-asm-ir.stanza \
        compiler/stz-asm-emitter.stanza \
        compiler/stz-pkg.stanza \
        compiler/stz-backend.stanza \
        compiler/stz-gen-bindings.stanza \
        compiler/stz-dependencies.stanza \
-       compiler/call-records.stanza \
+       compiler/stz-call-records.stanza \
        compiler/stz-main.stanza \
        compiler/stz-driver.stanza"
 

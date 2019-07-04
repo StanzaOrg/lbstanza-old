@@ -6,9 +6,12 @@ defpackage stz/branch-table :
   import stz/dyn-bi-table
   import stz/utils
   import stz/vm-table
-  import stz/trie
   import stz/typeset
   import stz/trie-table
+  import stz/dispatch-dag with:
+    prefix(BranchTable) => Dag
+  import stz/set-utils
+  import stz/conversion-utils
 
 ;============================================================
 ;=================== Public Interface =======================
@@ -103,6 +106,9 @@ public defn BranchTable (ct:ClassTable) :
   val multi-formats = IntListTable<Int>()
   val method-multi-table = DynBiTable() ;Mapping from method to multis
 
+  ;Accelerated set flattening
+  val set-flattener = SetFlattener()
+
   ;==================================================
   ;============= Trie Table Invalidation ============
   ;==================================================
@@ -132,7 +138,7 @@ public defn BranchTable (ct:ClassTable) :
   ;==================================================
   defn compute-trie-table (i:Int) :
     val f* = resolve-format(formats[i])
-    compute-trie-table-entry(trie-table, ct, i, f*)
+    compute-trie-table-entry(trie-table, ct, set-flattener, i, f*)
     
   defn resolve-format (f:BranchFormat) :
     match(f:MultiFormat) : ResolvedMultiFormat(num-header-args(f), methods-of-multi(multi(f)))
@@ -199,7 +205,7 @@ public defn BranchTable (ct:ClassTable) :
     ;Return listener that invalidates formats when
     ;class tree changes.
     new TreeListener :
-      defmethod children-changed (this, c:Int) :
+      defmethod node-changed (this, c:Int) :
         do(invalidate-table, formats-dependent-on-class(c))
         do(invalidate-tables-of-multi, multis-dependent-on-class(c))
   add(ct, class-change-listener())
@@ -233,9 +239,10 @@ public lostanza defn trie-table-data (bt:ref<BranchTable>) -> ptr<ptr<int>> :
 ;==================================================
 lostanza defn compute-trie-table-entry (trie-table:ref<PtrBuffer>,
                                         class-table:ref<ClassTable>,
+                                        sf:ref<SetFlattener>,
                                         i:ref<Int>,
                                         f:ref<BranchFormat>) -> ref<False> :
-  val p = to-trie-table(class-table, f)
+  val p = to-trie-table(class-table, sf, f)
   set(trie-table, i.value, p)
   return false
 
@@ -383,18 +390,20 @@ lostanza defn remove (b:ref<PtrBuffer>, i:ref<Int>) -> ref<True|False> :
 ;================ Encoding of Branch Formats ================
 ;============================================================
 
-# Conversion of a Typeset into an ISet #
+# Conversion of a Typeset into an Arg #
 
 Input:
   ct:ClassTable
+  sf:SetFlattener
   t:TypeSet
 Output:
-  set:ISet
+  arg:Arg
 
 # Conversion of a BranchFormat into an encoded Vector<Int> #
 
 Input:
   ct:ClassTable
+  sf:SetFlattener
   f:BranchFormat
 Output:
   table:Vector<Int>
@@ -410,6 +419,7 @@ Output:
 
 Input:
   ct:ref<ClassTable>
+  sf:ref<SetFlattener>
   f:ref<BranchFormat>
 Output:
   table:ptr<int>
@@ -417,49 +427,41 @@ Output:
 ;============================================================
 ;=======================================================<doc>
 
-;Convert a typeset to an iset
-defn to-iset (ct:ClassTable, t:TypeSet) :
-  defn union (a:ISet, b:ISet) :
-    a-or-b(compare(a,b))
-  defn intersection (a:ISet, b:ISet) :
-    a-and-b(compare(a,b))
-  let loop (t:TypeSet = t) :
-    match(t) :
-      (t:AndType) : reduce(intersection, seq(loop, types(t)))
-      (t:OrType) : reduce(union, seq(loop, types(t)))
-      (t:TopType) : IAll()
-      (t:SingleType) : ISubset(children(ct, type(t)))
+;Encoding a sequence of TypeSets into a dispatch branch
+defn make-branch-table (ct:ClassTable, sf:SetFlattener, branches:Seqable<Seqable<TypeSet>>) :
+  DagBranchTable(
+    to-branches(branches, set-representation{ct, _}, sf),
+    abstract-classes(ct))
 
 ;Convert a BranchFormat to a tuple of IBranch
-defn encode-branch-format (ct:ClassTable, f:BranchFormat) -> Vector<Int> :
-  defn isets (ts:Seqable<TypeSet>) :
-    seq(to-iset{ct, _}, ts)
+defn encode-branch-format (ct:ClassTable, sf:SetFlattener, f:BranchFormat) -> Vector<Int> :
   match(f) :
-    (f:MatchFormat) :
-      val ibs = to-tuple $ for (b in branches(f), i in 0 to false) seq :
-        IBranch(to-list(isets(b)), i + 1)
-      encode-trie(ibs, 0)
+    (f:MatchFormat) :    
+      val branch-table = make-branch-table(ct,sf,branches(f))
+      val dag = compute-dispatch-dag(branch-table, false)
+      defn soln-id (s:Soln) :
+        match(s) :
+          (s:NoSoln) : 0
+          (s:UniqueSoln) : index(s) + 1
+      encode-dag(dag, 0, soln-id)
     (f:DispatchFormat) :
-      val indexed-branches = to-tuple(seq(KeyValue, branches(f), 0 to false))
-      val ordered-branches = dispatch-ordering(ct, indexed-branches, key)
-      val ibs = to-tuple $ for b in ordered-branches seq :
-        match(b) :
-          (b:KeyValue<Tuple<TypeSet>,Int>) :
-            IBranch(to-list(isets(key(b))), value(b) + 2)
-          (bs:Tuple<KeyValue<Tuple<TypeSet>,Int>>) :
-            val sets = map(to-tuple{isets(key(_))}, bs)
-            IAmb(sets, 1)
-      encode-trie(ibs, 0)
+      val branch-table = make-branch-table(ct,sf,branches(f))
+      val dag = compute-dispatch-dag(branch-table, true)
+      defn soln-id (s:Soln) :
+        match(s) :
+          (s:NoSoln) : 0
+          (s:AmbSoln) : 1
+          (s:UniqueSoln) : index(s) + 2
+      encode-dag(dag, 0, soln-id)
     (f:ResolvedMultiFormat) :
-      val ordered-methods = dispatch-ordering(ct, methods(f), types)
-      val ibs = to-tuple $ for m in ordered-methods seq :
-        match(m) :
-          (m:LoadedMethod) :
-            IBranch(to-list(isets(types(m))), fid(m) + 2)
-          (ms:Tuple<LoadedMethod>) :
-            val sets = map(to-tuple{isets(types(_))}, ms)
-            IAmb(sets, 1)
-      encode-trie(ibs, num-header-args(f))
+      val branch-table = make-branch-table(ct,sf,seq(types,methods(f)))
+      val dag = compute-dispatch-dag(branch-table, true)
+      defn soln-id (s:Soln) :
+        match(s) :
+          (s:NoSoln) : 0
+          (s:AmbSoln) : 1
+          (s:UniqueSoln) : fid(methods(f)[index(s)]) + 2
+      encode-dag(dag, num-header-args(f), soln-id)
 
 ;Conversion of a Vector<int> into a ptr<int>
 lostanza defn to-int-ptr (xs:ref<Vector<Int>>) -> ptr<int> :
@@ -470,6 +472,6 @@ lostanza defn to-int-ptr (xs:ref<Vector<Int>>) -> ptr<int> :
   return p
 
 ;Conversion of a BranchFormat into a ptr<int>
-lostanza defn to-trie-table (ct:ref<ClassTable>, f:ref<BranchFormat>) -> ptr<int> :
-  val ints = encode-branch-format(ct, f)
+lostanza defn to-trie-table (ct:ref<ClassTable>, sf:ref<SetFlattener>, f:ref<BranchFormat>) -> ptr<int> :
+  val ints = encode-branch-format(ct, sf, f)
   return to-int-ptr(ints)

@@ -65,7 +65,11 @@ $STANZA \
   compiler/stz-trie.stanza \
   compiler/stz-trie-table.stanza \
   compiler/stz-hash.stanza \
+  compiler/stz-keyed-set.stanza \
   compiler/stz-dyn-tree.stanza \
+  compiler/set-utils.stanza \
+  compiler/stz-dyn-graph.stanza \
+  compiler/dispatch-dag.stanza \
   compiler/stz-dyn-bi-table.stanza \
   compiler/stz-vm-table.stanza \
   compiler/stz-branch-table.stanza \

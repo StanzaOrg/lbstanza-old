@@ -1,12 +1,41 @@
 ;See License.txt for details about licensing.
 
-defpackage stz/asm-ir :
-   import core
-   import collections
-   import stz/kl-ir
-
 ;Use utilities for defining ASTs quickly
 #use-added-syntax(stz-ast-lang)
+
+defpackage stz/asm-ir :
+  import core
+  import collections
+  import stz/typeset
+
+;<doc>=======================================================
+;====================== Link Utilities ======================
+;============================================================
+
+# Local Labels and References #
+
+Label: creates a package-local label. This label is only visible
+within the package assembly code. 
+  
+LocalMem: refers to a label defined in the current package. 
+
+# Linked Labels and References #
+
+LinkLabel: creates the label for an item exported in the PackageIO
+header.
+
+LinkId: refers to a label imported in the PackageIO header.
+
+# Absolute References #
+
+Mem: refers to an absolute label. Note that the only absolute labels
+that are known to a package are the system labels, such as
+current_stack, registers, heap_pointer, etc.
+
+There is no way for a package to define an absolute label. 
+
+;============================================================
+;=======================================================<doc>
 
 ;============================================================
 ;=================== Immediates =============================
@@ -14,9 +43,12 @@ defpackage stz/asm-ir :
 
 public deftype Imm <: Equalable
 public defstruct IntImm <: Imm : (value: Byte|Int|Long)
-public defstruct TagImm <: Imm : (n:Int, marker?:True|False)
 public defstruct Mem <: Imm : (n:Int, offset:Int)
 public defstruct ExMem <: Imm : (lbl:Symbol, offset:Int)
+public defstruct LocalMem <: Imm : (n:Int)
+public defstruct TagImm <: Imm : (n:Int, marker?:True|False)
+public defstruct LinkId <: Imm : (id:Int)
+public defstruct StackMap <: Imm : (size:Int, indices:Tuple<Int> with: (ensure => unique!))
 
 public deftype Loc <: Imm
 public defstruct RegSP <: Loc
@@ -31,6 +63,16 @@ public defstruct FloatT <: ASMType
 public defstruct DoubleT <: ASMType
 
 ;============================================================
+;==================== Conditions ============================
+;============================================================
+
+defn unique! (description:String, xs:Tuple<Int>) :
+  val xs-set = IntSet()
+  for x in xs do :
+    if not add(xs-set, x) :
+      fatal("Value %_ given to %_ is not unique!" % [xs, description])
+
+;============================================================
 ;====================== Equality ============================
 ;============================================================
 
@@ -43,6 +85,9 @@ defmethod equal? (a:Imm, b:Imm) :
     (a:RegSP, b:RegSP) : true
     (a:Reg, b:Reg) : n(a) == n(b)
     (a:FReg, b:FReg) : n(a) == n(b)
+    (a:StackMap, b:StackMap) : size(a) == size(b) and indices(a) == indices(b)
+    (a:LinkId, b:LinkId) : id(a) == id(b)
+    (a:LocalMem, b:LocalMem) : n(a) == n(b)
     (a, b) : false
 
 defmethod equal? (a:ASMType, b:ASMType) :
@@ -118,21 +163,28 @@ public defast :
       x: Imm
       op: Op
       y: Imm
-      z: Imm   
+      z: Imm
+    LinkLabel :
+      id: Int
     Label :
       n: Int
-      info: False|FileInfo
+      info: False|FileInfo with: (default => false)
     ExLabel :
       name: Symbol
     Match :
       xs: List<Imm>
       branches: List<Branch>
-      no-branch: Int
+      no-branch: Imm
     Dispatch :
       xs: List<Imm>
       branches: List<Branch>
-      no-branch: Int
-      amb-branch: Int
+      no-branch: Imm
+      amb-branch: Imm
+    MethodDispatch :
+      multi: Int
+      num-header-args: Int
+      no-branch: Imm
+      amb-branch: Imm
 
     ;==== Data Instructions ====
     DefData
@@ -143,6 +195,7 @@ public defast :
     DefFloat : (value:Float)
     DefDouble : (value:Double)
     DefString : (value:String)
+    DefBytes : (value:ByteArray)
     DefSpace : (size:Int)
     DefLabel : (n:Int)
 
@@ -151,14 +204,15 @@ public defast :
     (x:Loc) : f(x) as Loc
     (x:Imm) : f(x)
     (x:List<Imm>) : map(f,x)
+    (x:List<Branch>) : for b in x map : Branch(tags(b), f(dst(b)))
   defdoer (f:Imm -> ?) :
     (x:Loc) : f(x)
     (x:Imm) : f(x)
     (x:List<Imm>) : do(f,x)
+    (x:List<Branch>) : do(f{dst(_)}, x)
 
   ;Other
   ignore :
-    List<Branch>
     ASMType
     Op
     Byte
@@ -167,6 +221,7 @@ public defast :
     Float
     Double
     String
+    ByteArray
     Symbol
     False|FileInfo
 
@@ -175,8 +230,8 @@ public defast :
   make-doer(f:Imm -> ?, e:Ins)
 
 public defstruct Branch :
-  tags: List<KType>
-  n: Int
+  tags: List<TypeSet>
+  dst: Imm
 
 ;============================================================
 ;====================== Operations ==========================
@@ -208,6 +263,7 @@ public defstruct NegOp <: Op
 public defstruct DivModOp <: Op
 public defstruct BitSetOp <: Op
 public defstruct BitNotSetOp <: Op
+public defstruct TypeofOp <: Op : (tag:TypeSet)
 
 ;============================================================
 ;================ Operation Flipping ========================
@@ -260,9 +316,11 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:Goto) : "   goto %~" % [x(i)]
     (i:Break) : "   %~: break %~ when %~ %~ %~" % [type(i), x(i), y(i), op(i), z(i)]
     (i:Label) : "L<%~> : %_" % [n(i), info(i)]
+    (i:LinkLabel) : "linked %_" % [id(i)]
     (i:ExLabel) : "L<%~>" % [name(i)]
-    (i:Match) : "   match(%,) %_ no: %_" % [xs(i), branches(i), no-branch(i)]
+    (i:Match) : "   match(%,) %_ no: %_" % [xs(i), branches(i), no-branch(i)]    
     (i:Dispatch) : "   dispatch(%,) %_ no: %_ amb: %_" % [xs(i), branches(i), no-branch(i), amb-branch(i)]
+    (i:MethodDispatch) : "  method-dispatch(%_) no: %_ amb: %_" % [multi(i), no-branch(i), amb-branch(i)]
     (i:DefData) : "   .data"
     (i:DefText) : "   .text"
     (i:DefByte) : "   .byte %~" % [value(i)]
@@ -271,11 +329,12 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:DefFloat) : "   .float %~" % [value(i)]
     (i:DefDouble) : "   .double %~" % [value(i)]
     (i:DefString) : "   .string %~" % [value(i)]
+    (i:DefBytes) : "   .bytes %~" % [value(i)]
     (i:DefSpace) : "   .space %~" % [size(i)]
     (i:DefLabel) : "   .label L<%~>" % [n(i)]
 
 defmethod print (o:OutputStream, b:Branch) :
-  print(o, "(%,) => L%_" % [tags(b), n(b)])
+  print(o, "(%,) => L%_" % [tags(b), dst(b)])
 
 defmethod print (o:OutputStream, i:Imm) :
   print{o, _} $ match(i) :
@@ -290,6 +349,9 @@ defmethod print (o:OutputStream, i:Imm) :
     (i:RegSP) : "rsp"
     (i:Reg) : "R%_" % [n(i)]
     (i:FReg) : "F%_" % [n(i)]
+    (i:StackMap) : "stackmap(size = %_, indices = %_)" % [size(i), indices(i)]
+    (i:LocalMem) : "LM%_" % [n(i)]
+    (i:LinkId) : "linkid(%_)" % [id(i)]
 
 defmethod print (o:OutputStream, t:ASMType) :
   print{o, _} $ match(t) :
@@ -327,3 +389,4 @@ defmethod print (o:OutputStream, op:Op) :
     (op:DivModOp) : "divmod"
     (op:BitSetOp) : "bitset"
     (op:BitNotSetOp) : "bitnotset"
+    (op:TypeofOp) : "typeof(%_)" % [tag(op)]
