@@ -76,16 +76,16 @@ FILES="core/core.stanza \
        compiler/lang-renamer.stanza \
        compiler/lang-resolver.stanza \
        compiler/lang-serializer.stanza \
-       compiler/stz-codegen2.stanza \
-       compiler/stz-reg-alloc2.stanza \
-       compiler/stz-stitcher2.stanza \
+       compiler/stz-codegen.stanza \
+       compiler/stz-reg-alloc.stanza \
+       compiler/stz-stitcher.stanza \
        compiler/stz-const-pool.stanza \
        compiler/stz-data-pool.stanza \
        compiler/stz-padder.stanza \
        compiler/stz-build.stanza \
        compiler/stz-repl.stanza \
        compiler/stz-config.stanza \
-       compiler/stz-asm-ir2.stanza \
+       compiler/stz-asm-ir.stanza \
        compiler/stz-asm-emitter.stanza \
        compiler/stz-pkg.stanza \
        compiler/stz-backend.stanza \
