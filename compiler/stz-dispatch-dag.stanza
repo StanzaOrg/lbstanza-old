@@ -6,8 +6,8 @@ defpackage stz/dispatch-dag :
 ;==================== Input Datastructure ===================
 ;============================================================
 
-public deftype Arg
-public defstruct Top <: Arg & Hashable & Equalable
+public deftype Arg <: Hashable & Equalable
+public defstruct Top <: Arg
 public defstruct Nums <: Arg :
   values: Tuple<Int>
 
@@ -44,8 +44,16 @@ defn different! (a:Int) :
 ;=================== Hash and Equality ======================
 ;============================================================
 
-defmethod hash (t:Top) : 0
-defmethod equal? (a:Top, b:Top) : true
+defmethod hash (a:Arg) :
+  match(a) :
+    (a:Top) : 0
+    (a:Nums) : hash(values(a))
+
+defmethod equal? (a:Arg, b:Arg) :
+  match(a, b) :
+    (a:Top, b:Top) : true
+    (a:Nums, b:Nums) : values(a) == values(b)
+    (a,b) : false
 
 defmethod hash (a:Soln) -> Int:
   match(a):
@@ -150,7 +158,7 @@ public defn check (s:Soln, case:Tuple<Int>, table:BranchTable) -> True|False :
       no-other-satisfying-subbranch?(index2(s))
 
 ;============================================================
-;====================== Ancestor Table ===================
+;====================== Ancestor Table ======================
 ;============================================================
 
 ;Returns a strict ancestor table.
@@ -210,6 +218,35 @@ defmethod compare (a:IntervalEvent, b:IntervalEvent) :
   else : c
 
 ;============================================================
+;================= Topological Solution =====================
+;============================================================
+
+defn topo-order (btable:BranchTable) -> Tuple<Int> :
+  val bs = branches(btable)
+  defn compare-branch (i:Int, j:Int) :
+    match(subbranch?(bs[i], bs[j]), subbranch?(bs[j], bs[i])) :
+      (a:True, b:False) : -1
+      (a:False, b:True) : 1
+      (a, b) : compare(i,j)
+  qsort(0 to length(bs), compare-branch)
+
+defn topo-soln (solns:Tuple<Soln>, ancestors:Table<Int,List<Int>>, btable:BranchTable) -> Soln :
+  ;Retrieve the first branch index
+  val branch0 = index(solns[0] as UniqueSoln)
+  
+  ;If the number of applicable branches is equal to the number of
+  ;ancestors, then the solution is unique.
+  if length(solns) == length(ancestors[branch0]) + 1 :
+    UniqueSoln(branch0)
+  else:
+    ;Otherwise it is ambiguous, ie. one of the branches
+    ;is not a strict subbranch of branch0.
+    val amb-id = for i in 1 to length(solns) find! :
+      val b = index(solns[i] as UniqueSoln)
+      not strict-subbranch?(branches(btable)[branch0], branches(btable)[b])
+    AmbSoln(branch0, amb-id)
+
+;============================================================
 ;================== Argument Collapsing =====================
 ;============================================================
 
@@ -249,6 +286,28 @@ defn collapse-args (args:Tuple<Arg>, abstract:IntSet) -> [Tuple<Tuple<Int|Top>>,
         
   ;Return new mapped arguments and values for each group
   [args*, group-values]
+
+defn form-trie<T> (branches:Tuple<Branch>,
+                   targets:Tuple<Soln>,
+                   abstract-nums:IntSet,
+                   Node: (Int, Tuple<KeyValue<Int|Top,T>>, Vector<List<Int>>) -> T,
+                   Leaf: Tuple<Soln> -> T) :
+  defn form (depth:Int, branches:Tuple<List<Arg>>, targets:Tuple<Soln>) -> T :
+    if empty?(branches[0]) :
+      Leaf(targets)
+    else :
+      val [groups, group-values] = collapse-args(map(head,branches), abstract-nums)
+      val table = ListTable<Int|Top, KeyValue<List<Arg>,Soln>>()
+      for (group in in-reverse(groups), branch in in-reverse(branches), target in in-reverse(targets)) do :
+        for v in group do :
+          add(table, v, tail(branch) => target)      
+      val trie-entries = to-tuple $
+        for [v, entries-list] in pairs(table) seq :
+          val entries = to-tuple(entries-list)          
+          v => form(depth + 1, map(key,entries), map(value,entries))
+      Node(depth, trie-entries, group-values)
+  form(0, branch-lists, targets) where :
+    val branch-lists = map(to-list{args(_)}, branches)
 
 defn collapse-branches (btable:BranchTable) -> [Tuple<Tuple<Tuple<Int|Top>>>, Vector<Vector<List<Int>>>] :
   val arity = length(args(branches(btable)[0]))
@@ -309,32 +368,46 @@ defn compute-ordered-soln (b-table:BranchTable) -> [
   [to-seq(entries), group-values]
 
 ;============================================================
-;========== Compute Topologically Sorted Solution ===========
+;============== Compute Dag from Branch Table ===============
 ;============================================================
 
-defn compute-topo-soln (b-table:BranchTable) -> [
-                        Seq<KeyValue<Tuple<Int|Top>, Soln>>,
-                        Vector<Vector<List<Int>>>] :
-  ;Compute ancestor table of branches
-  val ancestor-table = ancestor-table(branches(b-table))
-  
-  ;Collapse branches into groups
-  val [branch-groups, group-values] = collapse-branches(b-table)
+defn compute-dag (b-table:BranchTable, branch-order:Collection<Int>, collapse-solns:Tuple<Soln> -> Soln) :
+  ;Form DAG entries
+  val dag-table = HashTable<DagEntry,Int>(dag-hash, dag-equal?)
+  val dag-entries = Vector<DagEntry|False>()
+  defn dag-index (e:DagEntry) :
+    if not key?(dag-table,e) :
+      add(dag-entries, e)
+      dag-table[e] = length(dag-entries) - 1
+    dag-table[e]
 
-  ;Compute the topological ordering on branches
-  val topo-order = compute-topo-order(branch-groups)
+  ;Form a dag entry
+  defn make-dag-entry (depth:Int, entries:Tuple<KeyValue<Int|Top, Int|Soln>>, group-values:Vector<List<Int>>) -> Int|Soln :
+    val merged-entries = within keys = merge-keys(entries) :
+      if any?({_ is Top}, keys) : Top()
+      else : Nums $ to-tuple $ seq-cat({group-values[_ as Int]}, keys)
+    val [dag-entries, default] = fork-on-seq(merged-entries,
+      fn (es) :
+        val r = to-tuple(filter({key(_) is Nums}, es))
+        r as Tuple<KeyValue<Nums,Int|Soln>>
+      fn (es) :
+        val v = for e in es first :
+          if key(e) is Top : One(value(e))
+          else : None()
+        value?(v, NoSoln()))
+    if empty?(dag-entries) : default
+    else : dag-index(DagEntry(depth, dag-entries, default))
 
-  ;Compute all applicable branches for each input argument list
-  val applicable-branches = construct-cartesian-table(branch-groups, topo-order)
+  ;Create all dag entries
+  val branches* = to-tuple(seq({branches(b-table)[_]}, branch-order))
+  val targets* = to-tuple(seq(UniqueSoln, branch-order))
+  add(dag-entries, false)
+  form-trie<Int|Soln>(branches*, targets*, abstract-nums(b-table), make-dag-entry, collapse-solns)
+  dag-entries[0] = pop(dag-entries)
 
-  ;Compute all solutions for each input argument list
-  defn strict-subbranch? (a:Int, b:Int) :
-    /strict-subbranch?(branches(b-table)[a], branches(b-table)[b])
-  val solns = for [input-args, branches] in pairs(applicable-branches) seq :    
-    input-args => arg-soln(branches, ancestor-table, strict-subbranch?)
-
-  ;Return soln sequence and values corresponding to each group
-  [solns, group-values]
+  ;Return Dag datastructure
+  val depth = length(args(branches(b-table)[0]))
+  Dag(depth, to-tuple(dag-entries) as Tuple<DagEntry>)
 
 defn arg-soln (applicable-branches:List<Int>,
                ancestors:Table<Int,List<Int>>,
@@ -430,6 +503,14 @@ public defstruct Dag :
   depth: Int
   entries: Tuple<DagEntry>
 
+defn dag-equal? (a:DagEntry, b:DagEntry) :
+  if depth(a) == depth(b) and default(a) == default(b) and length(entries(a)) == length(entries(b)) :
+    val b-set = to-hashset<KeyValue<Nums,Int|Soln>>(entries(b))
+    all?({b-set[_]}, entries(a))
+  
+defn dag-hash (e:DagEntry) :
+  hash $ [depth(e), sum(seq(hash, entries(e))), default(e)]
+
 defn dagify-trie (trie:Trie, group-values:Vector<Vector<List<Int>>>, depth:Int) -> Dag:
   val dag-entries = Vector<DagEntry>()
   
@@ -494,19 +575,28 @@ defmethod print (o:OutputStream, e:DagEntry) :
 ;================== Computing the Dispatch Dag ==============
 ;============================================================
 
-public defn compute-dispatch-dag (btable:BranchTable, topological?:True|False) -> Dag :
-  defn empty-dag () :
-    val e = DagEntry(0, [], NoSoln())
-    Dag(0, [e])    
-  
-  if empty?(branches(btable)) :
-    empty-dag()
-  else :
-    val [solns, group-values] =
-      if topological? : compute-topo-soln(btable)
-      else : compute-ordered-soln(btable)
-    if empty?(solns) : empty-dag()
-    else : dagify-trie(create-trie(solns), group-values, length(args(branches(btable)[0])))
+val DAG-TIMER = MillisecondTimer("Dag")
+public defn compute-dispatch-dag (btable:BranchTable, topological?:True|False) -> ? :
+  defn run () :
+    ;Empty branch table
+    if empty?(branches(btable)) :
+      val e = DagEntry(0, [], NoSoln())
+      Dag(0, [e])
+    ;Topological branch table
+    else if topological? :
+      val topo-order = topo-order(btable)
+      val ancestors = ancestor-table(branches(btable))
+      compute-dag(btable, topo-order, topo-soln{_, ancestors, btable})
+    ;Ordered branch table
+    else :
+      defn first-soln (solns:Tuple<Soln>) : solns[0]
+      compute-dag(btable, 0 to length(branches(btable)), first-soln)
+
+  start(DAG-TIMER)
+  val result = run()
+  stop(DAG-TIMER)
+  println(DAG-TIMER)
+  result
 
 ;============================================================
 ;=================== Resolving a Dag ========================
