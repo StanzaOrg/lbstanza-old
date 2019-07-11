@@ -259,27 +259,27 @@
 
 #define DECODE_A_UNSIGNED() \
   int value = W1 >> 8; \
-  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
+  /*if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);/*
 
 #define DECODE_A_SIGNED() \
   int value = (int)W1 >> 8; \
-  /*if(iprint) printf("          [%d | %d]\n", opcode, value);*/
+  /*if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);/*
 
 #define DECODE_B_UNSIGNED() \
   int x = (W1 >> 8) & 0x3FF; \
   int value = W1 >> 18; \
-  /*if(iprint) printf("          [%d | %d | %d]\n", opcode, x, value);*/
+  /*if(iprint) printf("          %ld) [%d | %d | %d]\n", icounter, opcode, x, value);/*
 
 #define DECODE_C() \
   int x = (W1 >> 8) & 0x3FF; \
   int y = (W1 >> 22) & 0x3FF; \
   int value = PC_INT(); \
-  /*if(iprint) printf("          [%d | %d | %d | %d]\n", opcode, x, y, value);*/
+  /*if(iprint) printf("          %ld) [%d | %d | %d | %d]\n", icounter, opcode, x, y, value);/*
 
 #define DECODE_D() \
   int x = (W1 >> 22) & 0x3FF; \
   long value = PC_LONG(); \
-  /*if(iprint) printf("          [%d | _ | %d | %ld]\n", opcode, x, value);*/
+  /*if(iprint) printf("          %ld) [%d | _ | %d | %ld]\n", icounter, opcode, x, value);/*
 
 #define DECODE_E() \
   unsigned int W2 = PC_INT(); \
@@ -288,7 +288,7 @@
   int y = (int)(W12 >> 18) & 0x3FF; \
   int z = (int)(W12 >> 28) & 0x3FF; \
   int value = (int)((int64_t)W12 >> 38); \
-  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, z, value);*/
+  /*if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, z, value);/*
 
 #define DECODE_F() \
   unsigned int W2 = PC_INT(); \
@@ -298,7 +298,7 @@
   int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
   int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
-  /*if(iprint) printf("          [%d | %d | %d | %d | %d]\n", opcode, x, y, n1, n2);*/
+  /*if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, n1, n2);/*
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -459,6 +459,24 @@ uint64_t ptr_to_ref (void* p){
   return (uint64_t)p + REF_TAG_BITS;
 }
 
+//long iprint_start;
+//long iprint_end;
+//long iprint_step;
+//long icounter;
+//int iprint_init = 0;
+//void init_iprint () {
+//  if(!iprint_init){
+//    iprint_init = 1;
+//    icounter = 0;
+//    FILE* file = fopen("iprint.txt", "r");
+//    int n = fscanf(file, "%ld %ld %ld", &iprint_start, &iprint_end, &iprint_step);
+//    if(n != 3){
+//      printf("Couldn't read iprint.txt.");
+//      exit(-1);
+//    }
+//  }
+//}
+
 void vmloop (VMState* vms, uint64_t stanza_crsp){
   //Pull out local cache
   char* instructions = vms->instructions;
@@ -487,10 +505,13 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
   //uint64_t last_time;
 
   //Debug
-  //int iprint = 1;
+  //init_iprint();
 
   //Repl Loop
   while(1){
+    //icounter++;
+    //int iprint = icounter >= iprint_start && icounter <= iprint_end && icounter % iprint_step == 0;
+    
     //Save pre-decode PC because jump offsets are relative to
     //pre-decode PC.
     char* pc0 = pc;
@@ -548,7 +569,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case SET_REG_OPCODE_LOCAL : {
       DECODE_C();
-      SET_REG(y, LOCAL(value));      
+      SET_REG(y, LOCAL(value));
       continue;
     }
     case SET_REG_OPCODE_UNSIGNED : {
