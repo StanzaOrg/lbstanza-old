@@ -68,6 +68,7 @@ FILES="core/core.stanza \
        compiler/stz-set-utils.stanza \
        compiler/stz-conversion-utils.stanza \
        compiler/stz-dyn-graph.stanza \
+       compiler/stz-binary-tree.stanza \
        compiler/stz-dispatch-dag.stanza \
        compiler/stz-dyn-tree.stanza \
        compiler/stz-dyn-bi-table.stanza \
