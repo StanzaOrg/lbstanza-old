@@ -282,24 +282,38 @@ defn escape-char (s:ParseStream, c:Char) -> Char :
 ;Has form |asdf \t \n asdfkj |.
 ;The first character is assumed to be the bracketing character.
 defn eat-escaped-chars (s:ParseStream, buf:StringBuffer) -> String|False :
+  ;Clear the buffer and retrieve the bracketing character
   clear(buf)
   val end-char = get-char!(s)
-  let loop () :
+
+  ;Process the next character in the stream
+  defn* process-next-char () :
     match(get-char(s)) :
       (c1:Char) :
         if c1 == end-char :
           to-string(buf)
         else if c1 == '\\' :
           match(get-char(s)) :
-            (c2:Char) : add(buf, escape-char(s,c2))
-            (c2:False) : throw(NoEscapeSpecifier(line-info(s)))
-          loop()
+            (c2:Char) :
+              if c2 == '\n' : eat-whitespace()
+              else : add(buf, escape-char(s,c2))
+            (c2:False) :
+              throw(NoEscapeSpecifier(line-info(s)))
+          process-next-char()
         else :
           add(buf, c1)
-          loop()
+          process-next-char()
       ;End of stream. Read failure.
       (c1:False) :
         false
+
+  ;Eat all the leading whitespace
+  defn* eat-whitespace () :
+    while peek?(s) == ' ' :
+      get-char!(s)
+
+  ;Launch
+  process-next-char()
 
 ;============================================================
 ;==================== Tokenizer =============================
@@ -596,9 +610,10 @@ deftype StackCtxt :
   OpenToken <: StackCtxt
   Indentation <: StackCtxt
 
-defstruct LEColon <: StackCtxt :
-  prev:Int
-  next:Int
+defstruct IndentedBlock <: StackCtxt :
+  indent: Int
+with:
+  printer => true
 
 defstruct StackBottom <: StackCtxt
 
@@ -607,6 +622,7 @@ defn convert-indentations-to-structural-tokens (tokens:Seq<Token>) -> Seq<Token>
     ;Initialize stack
     val stack = Vector<Token>()
     add(stack, Token(StackBottom(), FileInfo("NoFile", 0, 0)))
+    add(stack, Token(IndentedBlock(0), FileInfo("NoFile", 0, 0)))
 
     ;Test whether the given token is a line-ending colon.
     ;If it is, then we pop the next indentation from the token stream and pass
@@ -619,101 +635,106 @@ defn convert-indentations-to-structural-tokens (tokens:Seq<Token>) -> Seq<Token>
           (item) : no()
       else : no()
 
-    ;Retrieve the most recent indent stored in the stack
-    defn prev-indent () :
+    ;Retrieve the current base indent.
+    defn base-indent () :
       for t in in-reverse(stack) first! :
         val item = item(t)
-        match(item) :
-          (item:LEColon) : One(next(item))
-          (item:StackBottom) : One(0)
-          (item) : None()
+        match(item:IndentedBlock) : One(indent(item))
+        else : None()
 
-    ;Pop items from the stack using the given token
-    defn* pop-stack (t:Token) :
-      match(item(t), item(peek(stack))) :
-        (item:Indentation, top:LEColon) :
-          ;Case: Deindent past colon
-          if indent(item) < next(top) :
-            if indent(item) > prev(top) :
-              throw(InvalidDeindent(info(t), indent(item), prev(top)))
+    ;The next token is an deindentation token
+    defn deindent (t:Token) :
+      val item-t = item(t) as Indentation
+      match(item(peek(stack))) :
+        (top:Indentation) :          
+          if indent(item-t) > indent(top) :
+            throw(InvalidDeindent(info(t), indent(item-t), indent(top)))
+          else if indent(item-t) == indent(top) :
+            set-top(stack,t)
+          else :
+            pop(stack)
+            deindent(t)
+        (top:OpenToken) :
+          add(stack,t)
+        (top:IndentedBlock) :
+          if indent(item-t) > indent(top) :
+            throw(InvalidDeindent(info(t), indent(item-t), indent(top)))
+          else if indent(item-t) == indent(top) :
+            false
+          else :
             yield(Token(CloseToken(')'), info(t)))
             pop(stack)
-            pop-stack(t)            
-          ;Case: Indent inwards
-          else :
-            add(stack, t)
-        (item:Indentation, top:OpenToken) :
-          ;Record indentation on stack
+            deindent(t)
+            
+    ;Update the stack with the given token
+    defn update-stack (t:Token) :
+      match(item(t)) :
+        (item:Indentation) :
+          match(/item(peek(stack))) :
+            (top:Indentation) :
+              if indent(item) > indent(top) :
+                add(stack,t)
+              else if indent(item) == indent(top) :
+                set-top(stack, t)
+              else :
+                pop(stack)
+                update-stack(t)
+            (top:OpenToken) :
+              add(stack, t)
+            (top:IndentedBlock) :
+              if indent(item) > indent(top) : add(stack, t)
+              else : deindent(t)
+        (item:CloseToken) :
+          match(/item(peek(stack))) :
+            (top:Indentation) :
+              pop(stack)
+              update-stack(t)
+            (top:OpenToken) :
+              yield(t)
+              pop(stack)
+              false
+            (top:IndentedBlock) :
+              yield(Token(CloseToken(')'), info(t)))
+              pop(stack)
+              update-stack(t)
+        (item:StreamEnd) :
+          match(/item(peek(stack))) :
+            (top:Indentation) :
+              pop(stack)
+              update-stack(t)
+            (top:OpenToken) :
+              throw(NoClosingToken(info(peek(stack)), char(top)))
+            (top:IndentedBlock) :
+              yield(Token(CloseToken(')'), info(t)))
+              pop(stack)
+              update-stack(t)
+            (top:StackBottom) :
+              ;Done
+              false
+        (item:OpenToken) :
           add(stack, t)
-        (item:Indentation, top:Indentation) :
-          ;Pop off indentations that are greater.
-          if indent(item) <= indent(top) :
-            pop(stack)
-            pop-stack(t)
-          else :
-            add(stack, t)
-        (item:Indentation, top:StackBottom) :
-          ;Record indentation on stack
+        (item:IndentedBlock) :
+          val prev-base = base-indent()
+          if indent(item) <= prev-base :
+            throw(InvalidBlock(info(t), indent(item), prev-base))
           add(stack, t)
-          false        
-        (item:CloseToken, top:LEColon) :
-          ;Close off indentation block
-          yield(Token(CloseToken(')'), info(t)))
-          pop(stack)
-          pop-stack(t)
-        (item:CloseToken, top:Indentation) :
-          pop(stack)
-          pop-stack(t)
-        (item:CloseToken, top:StackBottom) :
-          ;Tokenizer guarantees that token is matched
-          fatal("Unreachable")
-        (item:CloseToken, top:OpenToken) :
-          ;Tokenizer guarantees that token is matched.
-          pop(stack)
-          yield(t)
-        (item:StreamEnd, top:OpenToken) :
-          throw(NoClosingToken(info(peek(stack)), char(top)))
-        (item:StreamEnd, top:LEColon) :
-          ;Close off indentation block
-          yield(Token(CloseToken(')'), info(t)))
-          pop(stack)
-          pop-stack(t)
-        (item:StreamEnd, top:Indentation) :
-          ;Ignore left over indentations
-          pop(stack)
-          pop-stack(t)
-        (item:StreamEnd, top:StackBottom) :
-          ;Done
-          false
 
     ;Process a given token
     defn* process (t:Token) :
       match(item(t)) :
         (item:Indentation|CloseToken|StreamEnd) :
-          pop-stack(t)
+          update-stack(t)
         (item:OpenToken) :
           yield(t)
-          add(stack, t)
+          update-stack(t)
         (item:Operator) :
           line-ending-colon?(item,
             fn* (next-indent, indent-info) :
-              val prev-indent = prev-indent()
-              ;Case 1: We are indenting forward
-              if next-indent > prev-indent :
-                ;Yield : (
-                yield(t)
-                yield(Token(OpenToken('(', false), indent-info))
-                ;Push new context onto stack
-                add(stack, Token(LEColon(prev-indent, next-indent), info(t)))
-                add(stack, Token(Indentation(next-indent), indent-info))
-              ;Case 2: Empty body, with deindent
-              else :
-                ;Yield : ( )
-                yield(t)
-                yield(Token(OpenToken('(', false), info(t)))
-                yield(Token(CloseToken(')'), info(t)))
-                ;Process pop using deindent
-                pop-stack(Token(Indentation(next-indent), info(t)))
+              ;Yield : (
+              yield(t)
+              yield(Token(OpenToken('(', false), indent-info))
+              ;Push new context onto stack
+              update-stack(Token(IndentedBlock(next-indent), indent-info))
             fn* () :
               yield(t))
         (item) :
@@ -804,6 +825,10 @@ defn Parser (s:Seq<Token>) -> Parser :
 defn but-last (str:String) :
   str[0 to (length(str) - 1)]
 
+defn set-top<?T> (v:Vector<?T>, x:T) :
+  val n = length(v)
+  v[n - 1] = x
+
 ;============================================================
 ;=================== Lexer Errors ===========================
 ;============================================================
@@ -869,7 +894,11 @@ defn NoEndTagFound (info:FileInfo, description:String) :
 
 defn InvalidDeindent (info:FileInfo, actual:Int, expected:Int) :
   LexerException $ to-string $
-  "%_: Invalid deindentation to %_ spaces does not match previous indentation of %_ spaces." % [info, actual, expected]
+  "%_: Cannot de-indent to %_ spaces. It does not line up with the previous indentation level which is at %_ spaces." % [info, actual, expected]
+
+defn InvalidBlock (info:FileInfo, indent:Int, base:Int) :
+  LexerException $ to-string $
+  "%_: Cannot start indented block with an indentation level of %_ spaces. The previous indentation level is at %_ spaces." % [info, indent, base]
 
 defn NoForm (info:FileInfo) :
   LexerException $ string-join $
