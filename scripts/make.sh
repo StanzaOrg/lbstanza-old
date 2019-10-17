@@ -116,7 +116,7 @@ echo "Compiling OSX Pkgs"
 $STANZA $FILES -pkg pkgs
 $STANZA $PKGFILES -pkg pkgs
 echo "Compiling OSX Executable"
-$STANZA $FILES -pkg pkgs -optimize -s stanza.s
+$STANZA $FILES -pkg pkgs -s stanza.s -optimize
 $STANZA $PKGFILES -pkg pkgs -optimize
 
 #Compile Linux Pkgs and Executable
@@ -124,7 +124,7 @@ echo "Compiling Linux Pkgs"
 $STANZA $FILES -pkg lpkgs -platform linux
 $STANZA $PKGFILES -pkg lpkgs -platform linux
 echo "Compiling Linux Executable"
-$STANZA $FILES -pkg lpkgs -optimize -s lstanza.s -platform linux
+$STANZA $FILES -pkg lpkgs -s lstanza.s -platform linux -optimize
 $STANZA $PKGFILES -pkg lpkgs -platform linux -optimize
 
 #Compile Windows Pkgs and Executable
