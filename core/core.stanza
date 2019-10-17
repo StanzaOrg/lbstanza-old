@@ -10,6 +10,7 @@ defpackage clib
 
 protected extern memcpy: (ptr<?>, ptr<?>, long) -> int
 protected extern remove: (ptr<byte>) -> int
+protected extern rename: (ptr<byte>, ptr<byte>) -> int
 protected extern ftell: (ptr<?>) -> long
 protected extern fclose: (ptr<?>) -> int
 protected extern fflush: (ptr<?>) -> int
@@ -253,7 +254,7 @@ defn cast-message (t:Type, x, ctxt:Int) :
 
 public lostanza defn fatal! (msg:ptr<byte>) -> ref<Void> :
   call-c clib/fflush(stdout)
-  call-c clib/fprintf(stderr, "FATAL ERROR: %s\n", msg)
+  call-c clib/fprintf(current-err, "FATAL ERROR: %s\n", msg)
   print-stack-trace()
   call-c clib/exit(-1)
   ;Unreachable
@@ -261,14 +262,14 @@ public lostanza defn fatal! (msg:ptr<byte>) -> ref<Void> :
 
 public lostanza defn fatal (msg:ptr<byte>) -> ref<Void> :
   call-c clib/fflush(stdout)
-  call-c clib/fprintf(stderr, "FATAL ERROR: %s\n", msg)
+  call-c clib/fprintf(current-err, "FATAL ERROR: %s\n", msg)
   print-stack-trace()
   return halt()
 
 public defn fatal (msg) -> Void :
   flush(STANDARD-OUTPUT-STREAM as FileOutputStream)
-  print(STANDARD-ERROR-STREAM, "FATAL ERROR: ")
-  println(STANDARD-ERROR-STREAM, msg)
+  print(CURRENT-ERROR-STREAM, "FATAL ERROR: ")
+  println(CURRENT-ERROR-STREAM, msg)
   print-stack-trace()
   halt()
 
@@ -340,7 +341,7 @@ lostanza defn print-stack-trace (stack:ref<Stack>) -> ref<False> :
   for (var i:long = buffer.length - 1, i >= 0, i = i - 1) :
     val entry = file-info-entry(buffer.items[i], vms.info-table)
     if entry != null :
-      call-c clib/fprintf(stderr, "  at %s:%d.%d\n", entry.file, entry.line, entry.column)
+      call-c clib/fprintf(current-err, "  at %s:%d.%d\n", entry.file, entry.line, entry.column)
 
   ;Free the buffer
   free(buffer)
@@ -2935,14 +2936,42 @@ public lostanza val STANDARD-INPUT-STREAM : ref<InputStream> =
 var CURRENT-OUTPUT-STREAM : OutputStream = STANDARD-OUTPUT-STREAM
 
 public defn with-output-stream<?T> (o:OutputStream, f: () -> ?T) -> T :
-   let-var CURRENT-OUTPUT-STREAM = o :
-      f()
+  let-var CURRENT-OUTPUT-STREAM = o :
+    f()
 
 public defn current-output-stream () :
-   CURRENT-OUTPUT-STREAM
+  CURRENT-OUTPUT-STREAM
 
 public defn set-current-output-stream (o:OutputStream) :
   CURRENT-OUTPUT-STREAM = o
+
+;                 Current Error Stream
+;                 ====================
+
+var CURRENT-ERROR-STREAM : OutputStream = STANDARD-ERROR-STREAM
+lostanza var current-err:ptr<?> = stderr
+
+public defn with-error-stream<?T> (o:OutputStream, body: () -> ?T) -> T :
+  val oldv = CURRENT-ERROR-STREAM
+  dynamic-wind(
+    fn () : set-current-error-stream(o)
+    body
+    fn (f) : set-current-error-stream(oldv))
+
+public defn current-error-stream () :
+  CURRENT-ERROR-STREAM
+
+public defn set-current-error-stream (o:OutputStream) :
+  CURRENT-ERROR-STREAM = o
+  match(o:FileOutputStream) :
+    set-current-err(o)
+
+lostanza defn set-current-err (o:ref<FileOutputStream>) -> ref<False> :
+  current-err = o.file
+  return false
+
+;              Print to Current Output Stream
+;              ==============================
 
 public defn print (x) :
    print(CURRENT-OUTPUT-STREAM, x)
@@ -3231,6 +3260,14 @@ public lostanza defn RandomAccessFile (filename:ref<String>, writable:ref<True|F
     val file = call-c clib/fopen(addr!(filename.chars), "rb")
     if file == null : throw(FileOpenException(filename, linux-error-msg()))
     return new RandomAccessFile{file, writable}
+
+public lostanza defn output-stream (file:ref<RandomAccessFile>) -> ref<FileOutputStream> :
+  if file.writable == false :
+    throw(FileNotWritableException())
+  return new FileOutputStream{file.file, 0}
+
+public lostanza defn input-stream (file:ref<RandomAccessFile>) -> ref<FileInputStream> :
+  return new FileInputStream{file.file, 0}
 
 public lostanza defn close (f:ref<RandomAccessFile>) -> ref<False> :
   val err = call-c clib/fclose(f.file)
@@ -3634,6 +3671,22 @@ public defn FileDeletionError (path:String, msg:String) :
          "Error when attempting to delete %_. %_." % [path, msg]
 
 ;============================================================
+;====================== Rename a File =======================
+;============================================================
+
+public lostanza defn rename-file (path:ref<String>, new-path:ref<String>) -> ref<False> :
+  val r = call-c clib/rename(addr!(path.chars), addr!(new-path.chars))
+  if r == -1 : throw(FileRenameError(path, linux-error-msg()))
+  return false
+
+public deftype FileRenameError <: Exception
+public defn FileRenameError (path:String, msg:String) :
+   new FileRenameError :
+      defmethod print (o:OutputStream, this) :
+         print{o, _} $
+         "Error when attempting to rename %_. %_." % [path, msg]
+
+;============================================================
 ;===================== FilePaths ============================
 ;============================================================
 
@@ -3651,6 +3704,135 @@ public defn norm-path (path) -> String :
       replace(to-string(path), '/', '\\')
    #else :
       to-string(path)
+
+;============================================================
+;================= Get the File Type ========================
+;============================================================
+
+public deftype FileType
+public defstruct RegularFileType <: FileType
+public defstruct DirectoryType <: FileType
+public defstruct OtherType <: FileType
+
+defmethod print (o:OutputStream, t:FileType) :
+  print{o, _} $ match(t) :
+    (t:RegularFileType) : "Regular File"
+    (t:DirectoryType) : "Directory"
+    (t:OtherType) : "Other"
+
+extern get_file_type: ptr<byte> -> int
+public lostanza defn file-type (filename:ref<String>) -> ref<FileType> :
+  val r = call-c get_file_type(addr!(filename.chars))
+  if r == -1 : throw(FileTypeException(filename, linux-error-msg()))
+  if r == 0 : return RegularFileType()
+  else if r == 1 : return DirectoryType()
+  else if r == 2 : return OtherType()
+  else : return throw(FileTypeException(filename))
+
+public defstruct FileTypeException <: IOException :
+  filename: String
+  cause: String|False with: (default => false)
+defmethod print (o:OutputStream, e:FileTypeException) :
+  val cause-str = match(cause(e)) :
+    (c:String) : ": %_" % [c]
+    (c:False) : ""
+  print(o, "Error occurred when determining type of file %_%_." % [filename(e), cause-str])
+
+;============================================================
+;================ List Contents of Directory ================
+;============================================================
+
+extern free_stringlist : ptr<StringList> -> int
+lostanza deftype StringList :
+  n: int
+  capacity: int
+  strings: ptr<ptr<byte>>
+  
+extern list_dir: ptr<byte> -> ptr<StringList>
+public lostanza defn dir-files (dirname:ref<String>, include-parents?:ref<True|False>) -> ref<Tuple<String>> :
+  ;Call list dir
+  val list = call-c list_dir(addr!(dirname.chars))
+  val null = 0L as ptr<?>
+  if list == null: throw(DirException(dirname, linux-error-msg()))
+  ;Convert to vector
+  val strings = Vector<String>()
+  for (var i:int = 0, i < list.n, i = i + 1) :
+    add(strings, String(list.strings[i]))
+  ;Free stringlist
+  call-c free_stringlist(list)
+  ;Apply filter
+  if include-parents? == true : return to-tuple(strings)
+  else : return to-tuple(filter(fn(without-parents), strings))
+
+defn without-parents (name:String) : name != "." and name != ".."
+
+public defn dir-files (dirname:String) : dir-files(dirname, false)
+
+public defstruct DirException <: IOException :
+  filename: String
+  cause: String
+defmethod print (o:OutputStream, e:DirException) :
+  print(o, "Error occurred when listing contents of directory %_: %_." % 
+    [filename(e), cause(e)])
+
+;============================================================
+;================== Split a Filepath ========================
+;============================================================
+
+public defn split-filepath (path:String) -> [String, String] :
+  val n = length(path)
+  match(last-index-of-char(path, '/')) :
+    (i:Int) :
+      throw(PathEndsWithSlash(path)) when i == n - 1        
+      [path[0 through i], path[(i + 1) to false]]
+    (i:False) :
+      throw(EmptyPath()) when n == 0
+      ["./", path]
+
+public deftype PathException <: Exception
+
+public defstruct PathEndsWithSlash <: PathException :
+  path: String
+defmethod print (o:OutputStream, e:PathEndsWithSlash) :
+  print(o, PEWS-MSG % [path(e)])
+val PEWS-MSG = "Could not determine project name. Path %~ ends with a slash."
+
+public defstruct EmptyPath <: PathException
+defmethod print (o:OutputStream, e:EmptyPath) :
+  print(o, EP-MSG)
+val EP-MSG = "Could not determine project name. The given path is empty."
+
+;============================================================
+;================== Recursively Delete ======================
+;============================================================
+
+public defn delete-recursive (path:String) :
+  if file-type(path) is DirectoryType :
+    for file in dir-files(path) do :
+      delete-recursive(norm-path("%_/%_" % [path, file]))
+  delete-file(path)
+
+;============================================================
+;================ Create a New Directory ====================
+;============================================================
+
+extern mkdir: (ptr<byte>, long) -> int
+
+public lostanza defn create-dir (dirname:ref<String>, 
+                                 permissions:ref<Int>) -> ref<False> :
+  val result = call-c mkdir(addr!(dirname.chars), permissions.value)
+  if result == -1 : throw(CreateDirException(dirname, linux-error-msg()))  
+  return false
+
+public defn create-dir (dirname:String) :
+  create-dir(dirname, 0o777)
+
+public defstruct CreateDirException <: IOException :
+  filename: String
+  cause: String
+defmethod print (o:OutputStream, e:CreateDirException) :
+  print(o, "Error occurred when attempting to create directory %_: %_." % 
+    [filename(e), cause(e)])
 
 ;============================================================
 ;================ Environment Variables =====================
@@ -3760,6 +3942,10 @@ defmethod print (o:OutputStream, e:FileOpenException) :
 
 public defstruct FileCloseException <: IOException :
    cause: String
+
+public defstruct FileNotWritableException <: IOException
+defmethod print (o:OutputStream, e:FileNotWritableException) :
+  print(o, "The given random access file is not allowed to be written to.")
 
 defmethod print (o:OutputStream, e:FileCloseException) :
    print(o, "Error occurred when attempting to close file. %_." % [cause(e)])
@@ -4065,8 +4251,17 @@ public defn index-of-chars (a:String, r:Range, b:String) -> False|Int :
       for i in s through (e - bn) find :
          matches?(a, i, b)
 
+;Returns the index at which b occurs within a.
 public defn index-of-chars (a:String, b:String) -> False|Int :
    index-of-chars(a, 0 to false, b)
+
+;Returns true if b is a substring of a.
+public defn substring? (a:String, b:String) -> True|False :
+  index-of-chars(a, b) is Int
+
+;Returns true if b is a substring of the given range within a.
+public defn substring? (a:String, r:Range, b:String) -> True|False :
+  index-of-chars(a, r, b) is Int
 
 public defn last-index-of-char (s:String, r:Range, c:Char) -> False|Int :
    ensure-index-range(s, r)

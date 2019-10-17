@@ -85,6 +85,7 @@ FILES="core/core.stanza \
        compiler/lang-renamer.stanza \
        compiler/lang-resolver.stanza \
        compiler/lang-serializer.stanza \
+       compiler/stz-test-lang.stanza \
        compiler/stz-codegen.stanza \
        compiler/stz-reg-alloc.stanza \
        compiler/stz-stitcher.stanza \
@@ -104,5 +105,5 @@ FILES="core/core.stanza \
        compiler/stz-main.stanza \
        compiler/stz-driver.stanza"
 
-$STANZA $FILES -ccfiles runtime/linenoise.c compiler/cvm.c -s $OUT.s -o $OUT -optimize
-
+$STANZA $FILES -s $OUT.s -optimize
+gcc -std=gnu99 $OUT.s runtime/driver.c runtime/linenoise.c compiler/cvm.c -o $OUT -DPLATFORM_OS_X

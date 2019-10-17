@@ -77,6 +77,7 @@ FILES="core/core.stanza \
        compiler/lang-renamer.stanza \
        compiler/lang-resolver.stanza \
        compiler/lang-serializer.stanza \
+       compiler/stz-test-lang.stanza \
        compiler/stz-codegen.stanza \
        compiler/stz-reg-alloc.stanza \
        compiler/stz-stitcher.stanza \
@@ -96,6 +97,10 @@ FILES="core/core.stanza \
        compiler/stz-main.stanza \
        compiler/stz-driver.stanza"
 
+#Pkg source files
+PKGFILES="compiler/stz-test-framework.stanza \
+          compiler/stz-test-driver.stanza"
+
 #Delete pkg files
 rm -rf pkgs
 rm -rf lpkgs
@@ -109,14 +114,18 @@ mkdir -p lpkgs
 #Compile OSX Pkgs and Executable
 echo "Compiling OSX Pkgs"
 $STANZA $FILES -pkg pkgs
+$STANZA $PKGFILES -pkg pkgs
 echo "Compiling OSX Executable"
-$STANZA $FILES -pkg pkgs -optimize -s stanza.s
+$STANZA $FILES -pkg pkgs -s stanza.s -optimize
+$STANZA $PKGFILES -pkg pkgs -optimize
 
 #Compile Linux Pkgs and Executable
 echo "Compiling Linux Pkgs"
 $STANZA $FILES -pkg lpkgs -platform linux
+$STANZA $PKGFILES -pkg lpkgs -platform linux
 echo "Compiling Linux Executable"
-$STANZA $FILES -pkg lpkgs -optimize -s lstanza.s -platform linux
+$STANZA $FILES -pkg lpkgs -s lstanza.s -platform linux -optimize
+$STANZA $PKGFILES -pkg lpkgs -platform linux -optimize
 
 #Compile Windows Pkgs and Executable
 #echo "Compiling Windows Pkgs"
