@@ -16,6 +16,7 @@
 #include<sys/types.h>
 #include<sys/mman.h>
 #include<dirent.h>
+#include<pthread.h>
 
 //       Forward Declarations
 //       ====================
