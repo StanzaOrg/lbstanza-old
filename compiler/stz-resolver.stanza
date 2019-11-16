@@ -8,21 +8,39 @@ defpackage stz/resolver :
    import stz/primitives
    import stz/utils
    import stz/algorithms
-   import stz/renamer
    import stz/params
    import stz/dl-ir
    import stz/ids
    import stz/visibility
 
+;<doc>=======================================================
+;====================== Environment =========================
+;============================================================
+When the resolver imports a package that is not yet loaded, it
+requests the environment to retrieve the package.
+
+If the environment cannot find the package, then it returns false.
+
+If the environment can find the package, then it returns either:
+
+  a. an IPackage: which means that the package is represented by a
+  source file, or
+
+  b. a PackageExports: which means that the package is represented by
+  a .pkg file.
+
+In the case of a, it is assumed the IPackage is already correctly
+renamed.
+
+;============================================================
+;=======================================================<doc>
+
+public deftype Env
+public defmulti imported-package (e:Env, package:Symbol) -> IPackage|PackageExports|False
+
 ;============================================================
 ;====================== Driver ==============================
 ;============================================================
-
-;Exports from the environment must have unique identifiers
-;(rename the identifiers if this is not the case).
-public deftype Env
-public defmulti exports (e:Env, package:Symbol) -> PackageExports|False
-
 public defn resolve-il (ipackages:Tuple<IPackage>, env:Env, priority:False|(Symbol -> Int)) -> Tuple<IPackage>|ResolveErrors :
   ;Track all detected errors
   val error-accum = Vector<ResolveError>()
@@ -31,19 +49,34 @@ public defn resolve-il (ipackages:Tuple<IPackage>, env:Env, priority:False|(Symb
   val symtables = SymbolTables(ipackages, env, error-accum)
 
   ;Resolve individual packages
-  val ipackages* = for ipackage in ipackages map :
-    val symtable = symtables[name(ipackage)] as SymbolTable
-    val eng = Engine(symtable, symtables, priority, error-accum)
-    val exps* = map(resolve-exp{_, eng}, exps(ipackage))
-    val ipackage* = sub-exps(ipackage, exps*)
-    add-qualified-imports(ipackage*, qualified-imports(eng))
+  val ipackages* = Vector<IPackage>()
+  let resolve-ipackages (ps:Tuple<IPackage> = ipackages) :
+    if not empty?(ps) :
+      for p in ps do :
+        add(ipackages*, resolve-package(p, symtables, priority, error-accum))
+      resolve-ipackages(new-ipackages(symtables))
 
   ;Resolve type dependencies from pkgs
   check-exported-types(symtables, ipackages, package-exports(symtables), error-accum)
 
   ;Return result
-  if empty?(error-accum) : ipackages*
+  if empty?(error-accum) : to-tuple(ipackages*)
   else : ResolveErrors(error-accum)  
+
+;============================================================
+;=================== Resolve a Single Package ===============
+;============================================================
+
+defn resolve-package (ipackage:IPackage,
+                      symtables:SymbolTables,
+                      priority:False|(Symbol -> Int),
+                      error-accum:Vector<ResolveError>) :
+  ;Retrieve symbol table for the package to resolven
+  val symtable = symtables[name(ipackage)] as SymbolTable
+  val eng = Engine(symtable, symtables, priority, error-accum)
+  val exps* = map(resolve-exp{_, eng}, exps(ipackage))
+  val ipackage* = sub-exps(ipackage, exps*)
+  add-qualified-imports(ipackage*, qualified-imports(eng))  
 
 ;============================================================
 ;=================== Check Type Dependencies ================
@@ -479,52 +512,77 @@ defn add-qualified-imports (ipackage:IPackage, imps:Tuple<Symbol>) :
 deftype SymbolTables
 defmulti get (st:SymbolTables, package:Symbol) -> SymbolTable|False
 defmulti package-exports (st:SymbolTables) -> Tuple<PackageExports>
+defmulti new-ipackages (st:SymbolTables) -> Tuple<IPackage>
 
 defn SymbolTables (ipackages:Tuple<IPackage>, env:Env, errors:Vector<ResolveError>) :
-  ;Table mapping package names to source packages
-  val pkg-table = to-hashtable<Symbol, IPackage> $
-    for p in ipackages seq :
-      name(p) => p
+  ;Table holding packages
+  val pkg-table = HashTable<Symbol,IPackage|PackageExports|False>()
+  
+  ;Accumulator holding new ipackages loaded during the resolution process
+  val new-ipackages = Vector<IPackage>()
 
-  ;Keep track of all PackageExports required by program
-  val package-exports = HashTable-init<Symbol,PackageExports|False>(exports{env, _})      
+  ;Initialize with source packages
+  for p in ipackages do :
+    pkg-table[name(p)] = p
 
-  ;Construct symbol tables
-  defn make-symtable (package:Symbol) :
-    if key?(pkg-table, package) :
-      ;Package corresponds to a source package
-      val ipackage = pkg-table[package]
-      ;Create and initialize symboltable with base mappings
-      val symtable = SymbolTable(name(ipackage), namemap(ipackage))
-      ;Evaluate all imports for the symbol table
-      for imp in imports(ipackage) do :
-        defn visible? (e:VEntry|Export) :
-          if import-private?(imp) : true
-          else : visibility(e) is Public
-        val package-name = /package(imp)
-        if key?(pkg-table, package-name) :
-          val namemap = namemap(pkg-table[package-name])
-          import(symtable, filter(visible?, toplevel(namemap)), prefix(imp))
-        else :
-          match(package-exports[package-name]) :
-            (pexs:PackageExports) : import(symtable, filter(visible?, exports(pexs)), prefix(imp))
-            (_:False) : add(errors, NoPackage(package-name, name(ipackage), info(imp)))        
-      symtable
-    else :      
-      match(package-exports[package]) :
-        ;Package corresponds to an environment package
-        (pexs:PackageExports) : SymbolTable(package, exports(pexs))
-        (_:False) : false
-        
-  ;Cached symbol tables
-  val symtables = HashTable-init<Symbol, SymbolTable|False>(make-symtable)
+  ;Load a new package
+  defn environment-package (name:Symbol) -> IPackage|PackageExports|False :
+    set?(pkg-table, name, fn () :
+      val p = imported-package(env,name)
+      pkg-table[name] = p
+      match(p) :
+        (p:IPackage) :
+          ;Record as a newly loaded IPackage
+          add(new-ipackages, p)
+        (p:PackageExports) :
+          ;Load package dependencies
+          do(environment-package, imported-packages(p))
+        (p:False) : false
+      p)
+
+  ;Construct a symbol table from a source package.
+  defn make-symtable (p:IPackage) -> SymbolTable :
+    ;Create and initialize symboltable with base mappings
+    val symtable = SymbolTable(name(p), namemap(p))
+    ;Evaluate all imports for the symbol table
+    for imp in imports(p) do :
+      defn visible? (e:VEntry|Export) :
+        if import-private?(imp) : true
+        else : visibility(e) is Public
+      val package-name = package(imp)
+      match(environment-package(package-name)) :
+        ;Imported a source file
+        (p:IPackage) :
+          import(symtable, filter(visible?, toplevel(namemap(p))), prefix(imp))
+        ;Imported a .pkg file.
+        (p:PackageExports) :
+          import(symtable, filter(visible?, exports(p)), prefix(imp))
+        ;Could not resolve the imported package.
+        (f:False) :
+          add(errors, NoPackage(package-name, name(p), info(imp)))
+    ;Return new symbol table      
+    symtable
+    
+  ;Construct a symbol table from a .pkg file.        
+  defn make-symtable (p:PackageExports) -> SymbolTable :
+    SymbolTable(package(p), exports(p))
+
+  ;Create cached symbol tables
+  val symtables = within package-name = HashTable-init<Symbol,SymbolTable|False>() :
+    match(environment-package(package-name)) :
+      (p:IPackage|PackageExports) : make-symtable(p)
+      (p:False) : false
 
   ;Return symbol tables structure
   new SymbolTables :
     defmethod get (this, package:Symbol) :
       symtables[package]
     defmethod package-exports (this) :
-      to-tuple $ filter-by<PackageExports>(values(package-exports))
+      to-tuple $ filter-by<PackageExports>(values(pkg-table))
+    defmethod new-ipackages (this) :
+      val ps = to-tuple(new-ipackages)
+      clear(new-ipackages)
+      ps
 
 deftype SymbolTable
 defmulti package (t:SymbolTable) -> Symbol
