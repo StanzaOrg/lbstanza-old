@@ -15,6 +15,7 @@ defpackage stz/front-end :
   import stz/ids
   import stz/type
   import stz/tl-to-el
+  import stz/dl
 
 ;<doc>=======================================================
 ;======================== Algorithm =========================
@@ -58,37 +59,14 @@ package when given its name.
 5. Next, we compile the resolved packages to EL, which requires
 running the type inferencer and the EL compiler.
 
-6. The last 
+6. The last step is to check for type consistency. Whether the types
+in the source packages are consistent with their expected types in the
+precompiled .pkg packages.
 
-
-3. Using the process outlined above, load all input source files.
-Dependencies arrive in one of two ways:
-  - While resolving a source file, an import statement attempts to
-    bring in a new dependency.
-  - A loaded .pkg file comes with a set of dependencies that need to
-    be satisfied.
-
-By the end of this step, we should have a collection of IPackage
-packages, each representing a source file package, and a collection of
-Pkg packages, each representing a loaded .pkg file.
-
-4. Now run the type inferencer on the IPackage packages, constructing
-the environment from the given .pkg files. This step should not
-involve pulling in any more dependencies. If successful, the IPackage
-packages will now be represented as a TProg program.
-
-5. A typed TProg program can be compiled into a collection of EPackage
-packages.
-
-6. Given the collection of EPackage packages, we now have to check
-their type consistency. Inconsistencies will be caused by out-of-date
-packages loaded from .pkg files. If any inconsistency is found, we can
-attempt to reload the offending packages from their source files (into
-IPackage form), and then restart the type inferencer from step 4.
-
-7. If we reach the end of the algorithm, we will have a series of
-EPackage packages ready to be compiled by the backend, or loaded into
-the REPL.
+Inconsistencies will be caused by out-of-date packages loaded from
+.pkg files. Inconsistencies are classified into either unrecoverable
+errors, or errors potentially recoverable by reloading the original
+source file corresponding to the .pkg file. 
 
 ;============================================================
 ;=======================================================<doc>
@@ -96,13 +74,30 @@ the REPL.
 public deftype FrontEndInputs
 public defmulti inputs (e:FrontEndInputs) -> Tuple<String|Symbol>
 public defmulti find-package (inputs:FrontEndInputs, name:Symbol) -> String|False
+public defmulti source-file? (inputs:FrontEndInputs, name:Symbol) -> String|False
 
-public defn compile-to-el (sys:FrontEndInputs) :
+public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
   ;----------------------------------------------------------
   ;--------------------- State ------------------------------
   ;----------------------------------------------------------
   val package-table = HashTable<Symbol,IPackage|Pkg|False>()
   val package-exports-table = HashTable<Symbol,PackageExports>()
+  val file-assocs = Vector<FileAssoc>()
+
+  ;----------------------------------------------------------
+  ;------------------ Main Algorithm ------------------------
+  ;----------------------------------------------------------
+  defn main () :
+    load-package-table $ read-inputs(inputs(sys))
+    let loop () :
+      val resolved = resolve-packages()
+      val epackages = compile-to-el(resolved)
+      match(check-type-consistency!(epackages)) :
+        (f:False) :
+          form-output(epackages)
+        (ss:Tuple<PackageSource>) :
+          load-package-table $ read-inputs(ss)
+          loop()
 
   ;----------------------------------------------------------
   ;-------------------- Utilities ---------------------------
@@ -110,9 +105,25 @@ public defn compile-to-el (sys:FrontEndInputs) :
   defn put-in-package-table (p:IPackage|Pkg) :
     package-table[name(p)] = p
 
-  ;------------------------------------------------------------
-  ;------------------- Reading Inputs -------------------------
-  ;------------------------------------------------------------
+  defn record-file-assoc (package:Symbol, filename:String) :
+    val timestamp = time-modified(filename)
+    val filename* = resolve-path(filename) as String
+    add(file-assocs, FileAssoc(package, filename*, timestamp))
+
+  defn record-file-assocs (packages:Seqable<Symbol>, filename:String) :
+    val timestamp = time-modified(filename)
+    val filename* = resolve-path(filename) as String
+    for p in packages do :
+      add(file-assocs, FileAssoc(p, filename*, timestamp))
+
+  defn most-recent-file-assocs () :
+    val exists = HashSet<Symbol>()    
+    to-tuple $ for assoc in in-reverse(file-assocs) filter :
+      add(exists, package(assoc))
+
+  ;----------------------------------------------------------
+  ;------------------- Reading Inputs -----------------------
+  ;----------------------------------------------------------
   defn read-inputs (inputs:Seqable<Symbol|String|PackageSource>) -> Vector<IPackage|Pkg|Bindings> :
     val objects = Vector<IPackage|Pkg|Bindings>()
     defn read-file (filename:String, expected-package:Symbol|False) :
@@ -122,9 +133,16 @@ public defn compile-to-el (sys:FrontEndInputs) :
           match(expected-package:Symbol) :
             ensure-contains-package!(ps, filename, expected-package)
           add-all(objects, ps)
-        ".pkg" : add(objects, load-package(filename, expected-package, false))
-        ".fpkg" : add(objects, load-package(filename, expected-package, true))
-        ".vmbindings" : read-bindings(filename)
+        ".pkg" :
+          val pkg = load-package(filename, expected-package, false)
+          record-file-assoc(name(pkg), filename)
+          add(objects, pkg)
+        ".fpkg" :
+          val pkg = load-package(filename, expected-package, true)
+          record-file-assoc(name(pkg), filename)
+          add(objects, pkg)
+        ".vmbindings" :
+          read-bindings(filename)
         else : throw(InvalidExtensionError(filename))
     for input in inputs do :
       match(input) :
@@ -139,10 +157,12 @@ public defn compile-to-el (sys:FrontEndInputs) :
     objects
 
   defn read-ipackages (filename:String) -> Tuple<IPackage> :
-    val forms = read-file(filename)
+    val forms = read-file(filename)    
     val expanded = parse-syntax[core / #exp!](List(forms))
     val core-imports = [IImport(`core), IImport(`collections)]
-    to-ipackages(expanded, core-imports)
+    val packages = to-ipackages(expanded, core-imports)
+    record-file-assocs(seq(name,packages), filename)
+    packages
 
   ;----------------------------------------------------------
   ;-------------- Initialize Package Table ------------------
@@ -184,9 +204,9 @@ public defn compile-to-el (sys:FrontEndInputs) :
     val ipackages = to-tuple $ filter-by<IPackage>(values(package-table))
     resolve-il!(ipackages, resolver-environment())
 
-  ;------------------------------------------------------------
-  ;------------------- Compile to EL --------------------------
-  ;------------------------------------------------------------
+  ;----------------------------------------------------------
+  ;------------------- Compile to EL ------------------------
+  ;----------------------------------------------------------
   defn compile-to-el (resolved:Tuple<IPackage>) -> Tuple<EPackage> :
     val env = new stz/type/Env :
       defmethod stz/type/exports (this, package:Symbol) :
@@ -194,36 +214,40 @@ public defn compile-to-el (sys:FrontEndInputs) :
     val typed = type-program!(resolved, env)
     to-el(typed, false)
 
-  ;------------------------------------------------------------
-  ;------------------ Check Consistency -----------------------
-  ;------------------------------------------------------------
+  ;----------------------------------------------------------
+  ;------------------ Check Consistency ---------------------
+  ;----------------------------------------------------------
 
-;  ;Check type consistency
-;  defn check-type-consistency! () -> Tuple<PackageSource>|False :
-;    val packageios = Vector<PackageIO>()
-;    for p in elpkgs do : add(packageios, packageio(p))
-;    for p in filter-by<Pkg>(values(package-table)) do : add(packageios, packageio(p))
-;    val denv = DEnv()
-;    val result = load(denv, packageios)
-;    match(result:LoadErrors) :
-;      ;Some errors can be recovered from by including their source
-;      ;files during the recompilation. Other errors are unrecoverable.
-;      ;Classify these errors now.
-;      val more-source-files = Vector<String>()
-;      val unrecoverable-errors = Vector<LoadError>()
-;      for e in errors(result) do :
-;        match(source(e)) :
-;          (src:LoadedPackage) :
-;            match(source-file?(sys, package(src))) :
-;              (file:String) : add(more-source-files, file)
-;              (file:False) : add(unrecoverable-errors, e)
-;          (src:LiveObject) :
-;            add(unrecoverable-errors, e)
-;      ;If there are no unrecoverable errors, then try again with the added source files
-;      if empty?(unrecoverable-errors) :
-;        to-tuple(more-source-files)
-;      else :
-;        throw(ReplErrors(unrecoverable-errors))    
+  ;Check type consistency
+  defn check-type-consistency! (epkgs:Tuple<EPackage>) -> Tuple<PackageSource>|False :
+    val packageios = to-tuple{seq(packageio, _)} $
+      cat(epkgs, filter-by<Pkg>(values(package-table)))
+    val denv = DEnv()
+    val result = load(denv, packageios, [])
+    match(result:LoadErrors) :
+      val package-sources = Vector<PackageSource>()
+      val unrecoverable-errors = Vector<LoadError>()
+      for e in errors(result) do :
+        match(source(e)) :
+          (src:LoadedPackage) :
+            match(source-file?(sys, package(src))) :
+              (file:String) : add(package-sources, PackageSource(package(src), file))
+              (file:False) : add(unrecoverable-errors, e)
+          (src:LiveObject) :
+            add(unrecoverable-errors, e)
+      if not empty?(unrecoverable-errors) :
+        throw(LoadErrors(to-tuple(unrecoverable-errors)))
+      ;Return package sources
+      to-tuple(package-sources)
+
+  ;----------------------------------------------------------
+  ;------------------- Make Output --------------------------
+  ;----------------------------------------------------------
+  defn form-output (epackages:Tuple<EPackage>) :
+    FrontEndResult(
+      epackages,
+      to-tuple(filter-by<Pkg>(values(package-table))),
+      most-recent-file-assocs())
 
   ;----------------------------------------------------------
   ;------------------ Error Handling ------------------------
@@ -265,7 +289,10 @@ public defn compile-to-el (sys:FrontEndInputs) :
     if not exists? :
       throw(MissingPackageInFile(filename, expected-package))
 
-  false
+  ;----------------------------------------------------------
+  ;-------------------- Launch! -----------------------------
+  ;----------------------------------------------------------
+  main()
 
 ;============================================================
 ;================ Utility Datastructures ====================
@@ -274,6 +301,16 @@ public defn compile-to-el (sys:FrontEndInputs) :
 defstruct PackageSource :
   name: Symbol
   filename: String
+
+public defstruct FileAssoc :
+  package: Symbol
+  filename: String
+  timestamp: Long
+
+public defstruct FrontEndResult :
+  epackages: Tuple<EPackage>
+  pkgs: Tuple<Pkg>
+  assocs: Tuple<FileAssoc>
 
 ;============================================================
 ;===================== Errors ===============================
