@@ -1,24 +1,65 @@
 defpackage stz/front-end :
   import core
+  import reader
   import collections
+  import stz/pkg
+  import stz/il-ir
+  import stz/dl-ir
+  import stz/el-ir
+  import stz/tl-ir
+  import stz/input
+  import stz/core-macros
+  import stz/bindings
+  import stz/renamer
+  import stz/resolver
+  import stz/ids
+  import stz/type
+  import stz/tl-to-el
 
 ;<doc>=======================================================
 ;======================== Algorithm =========================
 ;============================================================
 
-1. Categorize all of the given inputs into their respective types.
-There are the following categories:
-  - LoadStanzaFile
-  - LoadPkgFile
-  - LoadPkg
-  - LoadBindingsFile
+1. The following state tables are updated through the algorithm steps:
 
-2. The following is the process to follow for loading any source file:
-  - The source file needs to be read in.
-  - The source file needs to be macroexpanded.
-  - The source file needs to be converted into IPackage form.
-  - The source file needs to be renamed.
-  - The source file needs to be resolved.
+  package-table: HashTable<Symbol,IPackage|Pkg|False>
+  package-exports-table: HashTable<Symbol,PackageExports>
+
+  The package-table associates each successfully loaded and renamed
+  package during the algorithm. An IPackage indicates it is a source
+  package, a Pkg indicates it is a .pkg file, and False indicates that
+  the package could not be found.
+
+  The package-exports-table stores the computed PackageExports
+  datastructure for each .pkg file.
+
+2. The first step is to read in all the given inputs. The following
+  file types are supported:
+
+  *.stanza - Read, macroexpand, and convert to IL-IR.
+  *.pkg - Read in.
+  *.fpkg - Read in.
+  *.vmbindings - Read in to Bindings file.
+
+  If the input is a Symbol, then we first locate the filename for that
+  package, and then read as normal.
+
+  The output is Vector<IPackage|Pkg|Bindings> for representing each
+  object.
+
+3. The next step is to rename all of the input packages, and load them
+into the package-table. Error is thrown if we detect duplicate
+packages, or if something fails during renaming.
+
+4. Next we need to resolve the packages. In order to do that, we need
+to implement a resolver environment which is responsible for loading a
+package when given its name.
+
+5. Next, we compile the resolved packages to EL, which requires
+running the type inferencer and the EL compiler.
+
+6. The last 
+
 
 3. Using the process outlined above, load all input source files.
 Dependencies arrive in one of two ways:
@@ -53,55 +94,212 @@ the REPL.
 ;=======================================================<doc>
 
 public deftype FrontEndInputs
-inputs -> Tuple<String|Symbol>
-
-public defstruct FrontEndResult :
-  ???
+public defmulti inputs (e:FrontEndInputs) -> Tuple<String|Symbol>
+public defmulti find-package (inputs:FrontEndInputs, name:Symbol) -> String|False
 
 public defn compile-to-el (sys:FrontEndInputs) :
-  val s = CompileState()
-  load-inputs(s, inputs(sys))
-  
+  ;----------------------------------------------------------
+  ;--------------------- State ------------------------------
+  ;----------------------------------------------------------
+  val package-table = HashTable<Symbol,IPackage|Pkg|False>()
+  val package-exports-table = HashTable<Symbol,PackageExports>()
+
+  ;----------------------------------------------------------
+  ;-------------------- Utilities ---------------------------
+  ;----------------------------------------------------------
+  defn put-in-package-table (p:IPackage|Pkg) :
+    package-table[name(p)] = p
+
+  ;------------------------------------------------------------
+  ;------------------- Reading Inputs -------------------------
+  ;------------------------------------------------------------
+  defn read-inputs (inputs:Seqable<Symbol|String|PackageSource>) -> Vector<IPackage|Pkg|Bindings> :
+    val objects = Vector<IPackage|Pkg|Bindings>()
+    defn read-file (filename:String, expected-package:Symbol|False) :
+      switch suffix?{filename, _} :
+        ".stanza" :
+          val ps = read-ipackages(filename)
+          match(expected-package:Symbol) :
+            ensure-contains-package!(ps, filename, expected-package)
+          add-all(objects, ps)
+        ".pkg" : add(objects, load-package(filename, expected-package, false))
+        ".fpkg" : add(objects, load-package(filename, expected-package, true))
+        ".vmbindings" : read-bindings(filename)
+        else : throw(InvalidExtensionError(filename))
+    for input in inputs do :
+      match(input) :
+        (input:String) :
+          read-file(input, false)
+        (input:PackageSource) :
+          read-file(filename(input), name(input))
+        (input:Symbol) :
+          read-file(find-package!(sys, input), input)
+            
+    ;Return objects
+    objects
+
+  defn read-ipackages (filename:String) -> Tuple<IPackage> :
+    val forms = read-file(filename)
+    val expanded = parse-syntax[core / #exp!](List(forms))
+    val core-imports = [IImport(`core), IImport(`collections)]
+    to-ipackages(expanded, core-imports)
+
+  ;----------------------------------------------------------
+  ;-------------- Initialize Package Table ------------------
+  ;----------------------------------------------------------
+  defn load-package-table (objects:Collection<IPackage|Pkg|Bindings>) :
+    ensure-no-duplicate-packages!(filter-by<IPackage|Pkg>(objects))
+    ensure-not-already-loaded!(filter-by<IPackage|Pkg>(objects))
+    val ipackages = to-tuple(filter-by<IPackage>(objects))
+    do(put-in-package-table, rename-il!(ipackages))
+    do(put-in-package-table, filter-by<Pkg>(objects))
+
+  ;----------------------------------------------------------
+  ;--------------- Resolving Package ------------------------
+  ;----------------------------------------------------------
+
+  defn package-exports (pkg:Pkg) :
+    set?(package-exports-table, name(pkg), fn () :
+      val pexs = to-package-exports(packageio(pkg))
+      defn rename-id (e:Export) : sub-n(e, fresh-id())
+      sub-exports(pexs, map(rename-id, exports(pexs))))
+
+  defn resolver-environment () :
+    defn imported-package (package:Symbol) :
+      ;If there is no entry in the package table, then locate the package
+      ;and load it.
+      if not key?(package-table, package) :
+        match(find-package(sys, package)) :
+          (filename:String) : load-package-table $ read-inputs $ [PackageSource(package, filename)]
+          (filename:False) : false
+      match(package-table[package]) :
+        (pkg:IPackage|False) : pkg
+        (pkg:Pkg) : package-exports(pkg)
+    ;Make environment
+    new stz/resolver/Env :
+      defmethod imported-package (this, package:Symbol) :
+        imported-package(package)
+
+  defn resolve-packages () -> Tuple<IPackage> :
+    val ipackages = to-tuple $ filter-by<IPackage>(values(package-table))
+    resolve-il!(ipackages, resolver-environment())
+
+  ;------------------------------------------------------------
+  ;------------------- Compile to EL --------------------------
+  ;------------------------------------------------------------
+  defn compile-to-el (resolved:Tuple<IPackage>) -> Tuple<EPackage> :
+    val env = new stz/type/Env :
+      defmethod stz/type/exports (this, package:Symbol) :
+        package-exports-table[package]
+    val typed = type-program!(resolved, env)
+    to-el(typed, false)
+
+  ;------------------------------------------------------------
+  ;------------------ Check Consistency -----------------------
+  ;------------------------------------------------------------
+
+;  ;Check type consistency
+;  defn check-type-consistency! () -> Tuple<PackageSource>|False :
+;    val packageios = Vector<PackageIO>()
+;    for p in elpkgs do : add(packageios, packageio(p))
+;    for p in filter-by<Pkg>(values(package-table)) do : add(packageios, packageio(p))
+;    val denv = DEnv()
+;    val result = load(denv, packageios)
+;    match(result:LoadErrors) :
+;      ;Some errors can be recovered from by including their source
+;      ;files during the recompilation. Other errors are unrecoverable.
+;      ;Classify these errors now.
+;      val more-source-files = Vector<String>()
+;      val unrecoverable-errors = Vector<LoadError>()
+;      for e in errors(result) do :
+;        match(source(e)) :
+;          (src:LoadedPackage) :
+;            match(source-file?(sys, package(src))) :
+;              (file:String) : add(more-source-files, file)
+;              (file:False) : add(unrecoverable-errors, e)
+;          (src:LiveObject) :
+;            add(unrecoverable-errors, e)
+;      ;If there are no unrecoverable errors, then try again with the added source files
+;      if empty?(unrecoverable-errors) :
+;        to-tuple(more-source-files)
+;      else :
+;        throw(ReplErrors(unrecoverable-errors))    
+
+  ;----------------------------------------------------------
+  ;------------------ Error Handling ------------------------
+  ;----------------------------------------------------------
+  defn find-package! (sys:FrontEndInputs, package:Symbol) -> String :
+    match(find-package(sys, package)) :
+      (file:String) : file
+      (file:False) : throw(CannotLocatePackage(package))
+ 
+  defn rename-il! (ps:Tuple<IPackage>) -> Tuple<IPackage> :
+    match(rename-il(ps)) :
+      (e:RenameErrors) : throw(e)
+      (ps:Tuple<IPackage>) : ps
+
+  defn resolve-il! (ps:Tuple<IPackage>, env:stz/resolver/Env) -> Tuple<IPackage> :
+    match(resolve-il(ps, env, false)) :
+      (e:ResolveErrors) : throw(e)
+      (ps:Tuple<IPackage>) : ps
+
+  defn type-program! (ipackages:Tuple<IPackage>, env:stz/type/Env) :
+    match(type-program(ipackages,env)) :
+      (p:TProg) : p
+      (e:TypeErrors) : throw(e)
+
+  defn ensure-no-duplicate-packages! (ps:Seqable<IPackage|Pkg>) :
+    val added-set = HashSet<Symbol>()
+    val duplicates = unique $ for name in seq(name,ps) filter :
+      not add(added-set, name)
+    if not empty?(duplicates) :
+      throw(DuplicatePackages(to-tuple(duplicates)))
+
+  defn ensure-not-already-loaded! (ps:Seqable<IPackage|Pkg>) :
+    for p in ps do :
+      if key?(package-table, name(p)) :
+        throw(PackageAlreadyLoaded(name(p)))    
+
+  defn ensure-contains-package! (ps:Seqable<IPackage>, filename:String, expected-package:Symbol) :
+    val exists? = any?({name(_) == expected-package}, ps)
+    if not exists? :
+      throw(MissingPackageInFile(filename, expected-package))
+
+  false
+
 ;============================================================
-;====================== State ===============================
+;================ Utility Datastructures ====================
 ;============================================================
 
-defstruct CompileState :
-  records: Vector<CRecord>
-
-deftype CRecord
-
-;------------------------------------------------------------
-;----------------------- Loading ----------------------------
-;------------------------------------------------------------
-
-defstruct LoadStanzaFile <: CRecord :
-  filename: String
-
-defstruct LoadPkgFile <: CRecord :
-  filename: String
-
-defstruct LoadPkg <: CRecord :
+defstruct PackageSource :
   name: Symbol
-
-defstruct LoadBindingsFile <: CRecord :
   filename: String
 
-defstruct LoadProjFile <: CRecord :
-  filename: String
+;============================================================
+;===================== Errors ===============================
+;============================================================
 
-defn load-inputs (s:CompileState, inputs:Seqable<Symbol|String>) :
-  for input in inputs do :
-    val rec = match(input) :
-      (input:Symbol) :
-        LoadPkg(input)
-      (input:String) :
-        switch suffix?{input, _} :
-          ".stanza" : LoadStanzaFile(input)
-          ".pkg" : LoadPkgFile(input)
-          ".fpkg" : LoadPkgFile(input)
-          ".vmbindings" : LoadBindingsFile(input)
-          ".proj" : LoadProjFile(input)
-          else : throw(InvalidExtensionError(input))
-    add(records(s), rec)
-  
+defn InvalidExtensionError (filename:String) :
+  new Exception :
+    defmethod print (o:OutputStream, this) :
+      print(o, "File %_ does not have a valid Stanza file extension." % [filename])
+
+defn CannotLocatePackage (name:Symbol) :
+  new Exception :
+    defmethod print (o:OutputStream, this) :
+      print(o, "Cannot locate .pkg file for package %~." % [filename])
+
+defn DuplicatePackages (names:Tuple<Symbol>) :
+  new Exception :
+    defmethod print (o:OutputStream, this) :
+      print(o, "The following packages, %,, has been loaded more than once." % [names])
+
+defn MissingPackageInFile (filename:String, package-name:Symbol) :
+  new Exception :
+    defmethod print (o:OutputStream, this) :
+      print(o, "The file %~ was expected to contain the package %~, but does not." % [filename, package-name])
+
+defn PackageAlreadyLoaded (package-name:Symbol) :
+  new Exception :
+    defmethod print (o:OutputStream, this) :
+      print(o, "The package %~ has already been loaded." % [package-name])
