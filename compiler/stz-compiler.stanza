@@ -132,13 +132,41 @@ defpackage stz/compiler :
   import stz/pkg
   import stz/ids
   import stz/front-end
+  import stz/proj-manager
+  import stz/proj
 
 public defn compile (filenames:List<String>,
                      output:False|String,
                      pkg-dir:False|String,
                      backend:Backend,
                      optimize?:True|False) :
+  ;State
+  var proj-manager:ProjManager
+  
   defn driver () :
+    ;Categorize input files
+    val projfiles = Vector<String>()
+    add(projfiles, "stanza.proj") when file-exists?("stanza.proj")
+
+    val inputs = Vector<Symbol|String>()
+    for filename in filenames do :
+      if not has-extension?(filename) :
+        add(inputs, to-symbol(filename))
+      else if suffix?(filename, ".proj") :
+        add(projfiles, filename)
+      else :
+        add(inputs, filename)
+
+    ;Create project manager
+    proj-manager = ProjManager(proj, auxfile, params) where :
+      val proj = read-proj-files(projfiles, OUTPUT-PLATFORM)
+      val auxfile = read-aux-file?("stanza.aux2")
+      val params = BuildParams(
+                     compiler-flags(),
+                     optimize?,
+                     pkg-dir)
+
+
     ;;Read in all inputs
     ;val input-packages = Vector<Symbol>()
     ;val ipackages = Vector<IPackage>()
@@ -185,9 +213,9 @@ public defn compile (filenames:List<String>,
     ;    add(all-packages, binding-pkg)
 
     val result = compile-to-el $ new FrontEndInputs :
-      defmethod inputs (this) : to-tuple(filenames)
-      defmethod find-package (this, name:Symbol) : find-pkg(name, optimize?)
-      defmethod source-file? (this, name:Symbol) : find-pkg(name, optimize?)
+      defmethod inputs (this) : to-tuple(inputs)
+      defmethod find-package (this, name:Symbol) : find-package(proj-manager, name)
+      defmethod source-file? (this, name:Symbol) : source-file?(proj-manager, name)
     val epackages = epackages(result)
     val input-packages = input-ordering(result)
     val all-pkgs = pkgs(result)
@@ -195,8 +223,9 @@ public defn compile (filenames:List<String>,
     val binding-pkg:VMPackage|False = false
     
     ;Save optimized packages if necessary
-    val save-optimized-pkgs? = pkg-dir is String and optimize?
-    do(save-as-fpkg, epackages) when save-optimized-pkgs?
+    if pkg-dir is String and optimize? :
+      for p in epackages do :
+        save-as-fpkg(p, assocs(result))
 
     ;Depending upon the situation run three different flows
     val situation =
@@ -207,11 +236,11 @@ public defn compile (filenames:List<String>,
         (opt?:False, output:False) : `unoptimized-pkgs
     switch(situation) :
       `optimized-asm :
-        val ordered = order-by-dependencies(to-tuple(cat(epackages,all-pkgs)), input-packages)
+        val ordered = order-by-dependencies(to-tuple(cat(epackages,all-pkgs)), input-ordering(result))
         val vmpackage = combine-and-lower(ordered as Tuple<EPackage|FastPkg>)
         val packages = match(binding-pkg:VMPackage) : [vmpackage, binding-pkg]
                        else : [vmpackage]
-        compile-vmpackages(packages, bindings, output as String, false)
+        compile-vmpackages(packages, bindings, output as String, false, assocs(result))
       `optimized-pkgs :
         ;Already done
         false
@@ -219,12 +248,16 @@ public defn compile (filenames:List<String>,
         val packages = to-tuple $ cat(
           seq(compile{lower-unoptimized(_)}, epackages),
           all-pkgs)
-        val ordered = order-by-dependencies(packages, input-packages) as Tuple<VMPackage|StdPkg>
+        val ordered = order-by-dependencies(packages, input-ordering(result)) as Tuple<VMPackage|StdPkg>
         val packages* = match(binding-pkg:VMPackage) : to-tuple(cat(ordered, [binding-pkg]))
                         else : ordered
-        compile-vmpackages(packages*, bindings, output as String, pkg-dir)
+        compile-vmpackages(packages*, bindings, output as String, pkg-dir is String, assocs(result))
       `unoptimized-pkgs :
-        compile-to-pkgs(epackages, pkg-dir as String)
+        compile-to-pkgs(epackages, assocs(result))
+
+    ;Update the auxiliary file
+    if pkg-dir is String :
+      write-aux-file("stanza.aux2", updated-aux-file(proj-manager))
 
   defn read-ipackages (filename:String) -> Tuple<IPackage> :
     ;Lex the file into s-expressions
@@ -294,9 +327,10 @@ public defn compile (filenames:List<String>,
     val result = check-imports-defined(denv, packageio(pkg))
     match(result:LoadErrors) : throw(result)
 
-  defn save-as-fpkg (p:EPackage) :
+  defn save-as-fpkg (p:EPackage, assocs:Tuple<FileAssoc>) :
     val pkg = FastPkg(packageio(p), exps(p))
-    save-package(pkg-dir as String, pkg)
+    val assoc = find!({package(_) == name(p)}, assocs)
+    save-package(proj-manager, pkg, filename(assoc), timestamp(assoc))
 
   defn package-dependency-graph (pkgs:Seqable<EPackage|VMPackage|Pkg>) :
     to-hashtable<Symbol,List<Symbol>> $ for p in pkgs seq :
@@ -316,7 +350,7 @@ public defn compile (filenames:List<String>,
       else : p as EPackage
     compile(lower-optimized(epackages))
 
-  defn compile-vmpackages (packages:Tuple<VMPackage|StdPkg>, bindings:Bindings, filename:String, save-pkgs?:String|False) :
+  defn compile-vmpackages (packages:Tuple<VMPackage|StdPkg>, bindings:Bindings, filename:String, save-pkgs?:True|False, assocs:Tuple<FileAssoc>) :
     val stubs = AsmStubs(backend)
     val npkgs = for p in packages map :
       match(p:VMPackage) : normalize(p, backend)
@@ -326,9 +360,11 @@ public defn compile (filenames:List<String>,
       for (pkg in packages, npkg in npkgs) do :
         match(npkg) :
           (npkg:NormVMPackage) :
-            val ins = compile-normalized-vmpackage(npkg, stitcher, stubs, save-pkgs? is String)
-            match(save-pkgs?:String) :              
-              save-package(save-pkgs?, StdPkg(pkg as VMPackage, ins as Tuple<Ins>, datas(npkg)))            
+            val ins = compile-normalized-vmpackage(npkg, stitcher, stubs, save-pkgs?)
+            if save-pkgs? :
+              val pkg = StdPkg(pkg as VMPackage, ins as Tuple<Ins>, datas(npkg))
+              val assoc = find!({package(_) == name(pkg)}, assocs)
+              save-package(proj-manager, pkg, /filename(assoc), timestamp(assoc))
           (std-pkg:StdPkg) :
             compile-stdpkg(std-pkg, stitcher)
       emit-all-system-stubs(stitcher, stubs)
@@ -348,14 +384,16 @@ public defn compile (filenames:List<String>,
       val emitter = emitter(stitcher, name(npkg), file-emitter())
       emit-normalized-package(npkg, emitter, stubs)
 
-  defn compile-to-pkgs (epackages:Tuple<EPackage>, dir:String) :
+  defn compile-to-pkgs (epackages:Tuple<EPackage>, assocs:Tuple<FileAssoc>) :
     val stubs = AsmStubs(backend)
     for epackage in epackages do :
       val vmpackage = compile(lower-unoptimized(epackage))
       val npkg = normalize(vmpackage, backend)
       val buffer = Vector<Ins>()
       emit-normalized-package(npkg, buffer-emitter(buffer), stubs)
-      save-package(dir, StdPkg(vmpackage, to-tuple(buffer), datas(npkg))) 
+      val pkg = StdPkg(vmpackage, to-tuple(buffer), datas(npkg))
+      val assoc = find!({package(_) == name(epackage)}, assocs)      
+      save-package(proj-manager, pkg, filename(assoc), timestamp(assoc)) 
     
   defn emit-normalized-package (npkg:NormVMPackage, emitter:CodeEmitter, stubs:AsmStubs) :
     for f in funcs(vmpackage(npkg)) do :
@@ -403,6 +441,9 @@ public defn compile (filenames:List<String>,
 ;  `stanza-file
 ;  `pkg-file
 ;  `binding-file
+
+defn has-extension? (s:String) :
+  index-of-char(s, '.') is Int
 
 defn category (name:String) -> Symbol :
   defn has-extension? (s:String) :
