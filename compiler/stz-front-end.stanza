@@ -17,6 +17,7 @@ defpackage stz/front-end :
   import stz/tl-to-el
   import stz/dl
   import stz/utils
+  import stz/proj-manager
 
 ;<doc>=======================================================
 ;======================== Algorithm =========================
@@ -74,8 +75,7 @@ source file corresponding to the .pkg file.
 
 public deftype FrontEndInputs
 public defmulti inputs (e:FrontEndInputs) -> Tuple<String|Symbol|IPackage>
-public defmulti find-package (inputs:FrontEndInputs, name:Symbol) -> String|False
-public defmulti source-file? (inputs:FrontEndInputs, name:Symbol) -> String|False
+public defmulti find-package (inputs:FrontEndInputs, name:Symbol) -> PkgLocation|False
 public defmulti environment-package? (inputs:FrontEndInputs, name:Symbol) -> PackageIO|False
 public defmulti load-into-denv (inputs:FrontEndInputs, ios:Tuple<PackageIO>) -> LoadResult
 
@@ -98,12 +98,15 @@ defmethod conditional-dependencies (inputs:FrontEndInputs, packages:Seqable<Symb
 public defstruct FrontEndResult :
   import-lists: Tuple<ImportList>
   packages: Tuple<EPackage|Pkg>
-  assocs: Tuple<FileAssoc>
+  timestamps: Tuple<PackageStamp>
 
-public defstruct FileAssoc :
-  package: Symbol
-  filename: String
-  timestamp: Long
+public defstruct PackageStamp :
+  location: PkgLocation
+  source-timestamp: Long|False
+  pkg-timestamp: Long|False
+
+public defn package (stamp:PackageStamp) :
+  package(location(stamp))
 
 ;============================================================
 ;================ Main Compilation Algorithm ================
@@ -114,7 +117,8 @@ public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
   ;----------------------------------------------------------
   val package-table = HashTable<Symbol,IPackage|Pkg|False>()
   val package-exports-table = HashTable<Symbol,PackageExports>()
-  val file-assocs = Vector<FileAssoc>()
+  val package-locations = HashTable<Symbol,PkgLocation|False>()
+  val package-stamps = HashTable<Symbol,PackageStamp>()
 
   ;----------------------------------------------------------
   ;------------------ Main Algorithm ------------------------
@@ -129,9 +133,10 @@ public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
                                     init-order(resolved))
       match(load-into-denv!(all-pkgs)) :
         (f:False) :
+          val timestamps = to-tuple(values(package-stamps))
           FrontEndResult(import-lists(resolved),
                          all-pkgs,
-                         to-tuple(file-assocs))
+                         timestamps)
         (ss:Tuple<PackageSource>) :
           load-package-table $ read-inputs(ss)
           loop()
@@ -139,56 +144,73 @@ public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
   ;----------------------------------------------------------
   ;-------------------- Utilities ---------------------------
   ;----------------------------------------------------------
+  defn package-location (name:Symbol) :
+    set?(package-locations, name, fn () :
+      find-package(sys, name))
+
+  defn source-file? (name:Symbol) :
+    match(package-location(name)) :
+      (l:PkgLocation) : source-file(l)
+      (f:False) : false
+      
   defn put-in-package-table (p:IPackage|Pkg) :
     package-table[name(p)] = p
 
-  defn record-file-assoc (package:Symbol, filename:String) :
-    val timestamp = time-modified(filename)
-    val filename* = resolve-path(filename) as String
-    add(file-assocs, FileAssoc(package, filename*, timestamp))
-
-  defn record-file-assocs (packages:Seqable<Symbol>, filename:String) :
-    val timestamp = time-modified(filename)
-    val filename* = resolve-path(filename) as String
-    for p in packages do :
-      add(file-assocs, FileAssoc(p, filename*, timestamp))
-
-  defn most-recent-file-assocs () :
-    val exists = HashSet<Symbol>()    
-    to-tuple $ for assoc in in-reverse(file-assocs) filter :
-      add(exists, package(assoc))
-
+  defn record-timestamp (l:PkgLocation) :
+    defn timestamp? (file:String|False) -> Long|False :
+      match(file:String) :
+        time-modified(file) when file-exists?(file)
+    val stamp = PackageStamp(l, timestamp?(source-file(l)), timestamp?(pkg-file(l)))
+    package-stamps[package(l)] = stamp
+    
   ;----------------------------------------------------------
   ;------------------- Reading Inputs -----------------------
   ;----------------------------------------------------------
   defn read-inputs (inputs:Seqable<Symbol|String|PackageSource|IPackage>) -> Vector<IPackage|Pkg|Bindings> :
-    val objects = Vector<IPackage|Pkg|Bindings>()
-    defn read-file (filename:String, expected-package:Symbol|False) :
+    ;Read in a package from the given file, containing the given expected package.
+    defn read-file (return: IPackage|Pkg|Bindings -> ?, filename:String, expected-package:Symbol|False) :
       switch suffix?{filename, _} :
         ".stanza" :
           val ps = read-ipackages(filename)
           match(expected-package:Symbol) :
             ensure-contains-package!(ps, filename, expected-package)
-          add-all(objects, ps)
+          do(return, ps)
         ".pkg" :
-          val pkg = load-package(filename, expected-package, false)
-          record-file-assoc(name(pkg), filename)
-          add(objects, pkg)
+          return(load-package(filename, expected-package, false))
         ".fpkg" :
-          val pkg = load-package(filename, expected-package, true)
-          record-file-assoc(name(pkg), filename)
-          add(objects, pkg)
+          return(load-package(filename, expected-package, true))
         ".vmbindings" :
-          read-bindings(filename)
-        else : throw(InvalidExtensionError(filename))
+          return(read-bindings(filename))
+        else :
+          throw(InvalidExtensionError(filename))
+
+    ;Read all objects to the objects vector.
+    val objects = Vector<IPackage|Pkg|Bindings>()
     for input in inputs do :
       match(input) :
         (input:String) :
-          read-file(input, false)
+          within pkg = read-file(input, false) :
+            add(objects, pkg)
+            match(pkg) :
+              (pkg:IPackage) :
+                record-timestamp $ PkgLocation(name(pkg), input, false, false)
+              (pkg:Pkg) :
+                record-timestamp $ PkgLocation(name(pkg), false, input, false)
+              (pkg) : false              
         (input:PackageSource) :
-          read-file(filename(input), name(input))
+          within pkg = read-file(filename(input), name(input)) :
+            add(objects, pkg)
+            match(pkg) :
+              (pkg:IPackage) :
+                record-timestamp $ PkgLocation(name(pkg), filename(input), false, false)
+              (pkg:Pkg) :
+                record-timestamp $ PkgLocation(name(pkg), false, filename(input), false)
+              (pkg) : false
         (input:Symbol) :
-          read-file(find-package!(sys, input), input)
+          val loc = package-location!(input)
+          within pkg = read-file(filename(loc), input) :
+            add(objects, pkg)
+            record-timestamp $ loc
         (input:IPackage) :
           add(objects, input)
             
@@ -199,9 +221,7 @@ public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
     val forms = read-file(filename)    
     val expanded = parse-syntax[core / #exp!](List(forms))
     val core-imports = [IImport(`core), IImport(`collections)]
-    val packages = to-ipackages(expanded, core-imports)
-    record-file-assocs(seq(name,packages), filename)
-    packages
+    to-ipackages(expanded, core-imports)
 
   ;----------------------------------------------------------
   ;-------------- Initialize Package Table ------------------
@@ -238,9 +258,9 @@ public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
           ;If there is no entry in the package table, then locate the package
           ;and load it.
           if not key?(package-table, package) :
-            match(find-package(sys, package)) :
-              (filename:String) : load-package-table $ read-inputs $ [PackageSource(package, filename)]
-              (filename:False) : package-table[package] = false
+            match(package-location(package)) :
+              (l:PkgLocation) : load-package-table $ read-inputs $ [PackageSource(package, filename(l))]
+              (f:False) : package-table[package] = false
           to-resolver-input(package-table[package])
     ;Make environment
     new stz/resolver/Env :
@@ -301,7 +321,7 @@ public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
       for e in errors(result) do :
         match(source(e)) :
           (src:LoadedPackage) :
-            match(source-file?(sys, package(src))) :
+            match(source-file?(package(src))) :
               (file:String) : add(package-sources, PackageSource(package(src), file))
               (file:False) : add(unrecoverable-errors, e)
           (src:LiveObject) :
@@ -314,11 +334,12 @@ public defn compile-to-el (sys:FrontEndInputs) -> FrontEndResult :
   ;----------------------------------------------------------
   ;------------------ Error Handling ------------------------
   ;----------------------------------------------------------
-  defn find-package! (sys:FrontEndInputs, package:Symbol) -> String :
-    match(find-package(sys, package)) :
-      (file:String) : file
-      (file:False) : throw(CannotLocatePackage(package))
- 
+  defn package-location! (name:Symbol) :
+    val loc = package-location(name)
+    if loc is False :
+      throw(CannotLocatePackage(name))
+    loc as PkgLocation
+    
   defn rename-il! (ps:Tuple<IPackage>) -> Tuple<IPackage> :
     match(rename-il(ps)) :
       (e:RenameErrors) : throw(e)

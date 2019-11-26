@@ -157,20 +157,13 @@ public defn compile (filenames:List<String>,
 
   ;Create project manager                   
   val proj = read-proj-files(projfiles, OUTPUT-PLATFORM)
-  val auxfile = read-aux-file?("stanza.aux2")
   val params = ProjParams(
                  compiler-flags(),
-                 optimize?,
-                 pkg-dir)
-  val proj-manager = ProjManager(proj, auxfile, params)
+                 optimize?)
+  val proj-manager = ProjManager(proj, params)
 
   ;Compile with project manager
   val compiled-packages = compile(proj-manager, inputs, output, pkg-dir, backend, optimize?)
-
-  ;Update the auxiliary file
-  if pkg-dir is String :
-    val aux-file* = updated-aux-file(proj-manager)
-    write-aux-file("stanza.aux2", aux-file*)
 
   ;Return the project dependencies
   dependencies(proj-manager, compiled-packages)
@@ -193,16 +186,19 @@ defn compile (proj-manager:ProjManager,
     val result = compile-to-el $ new FrontEndInputs :
       defmethod inputs (this) : to-tuple(inputs)
       defmethod find-package (this, name:Symbol) : find-package(proj-manager, name)
-      defmethod source-file? (this, name:Symbol) : source-file?(proj-manager, name)
       defmethod environment-package? (this, name:Symbol) : packageio(denv, name)
       defmethod load-into-denv (this, ios:Tuple<PackageIO>) : load(denv, ios, [])
       defmethod conditional-dependencies (this, pkgs:Seqable<Symbol>) : conditional-imports(proj-manager, pkgs)
     val bindings = collapse([])
+
+    ;Build timestamp table
+    val timestamp-table = to-hashtable(package, timestamps(result))
     
     ;Save optimized packages if necessary
     if pkg-dir is String and optimize? :
-      for p in filter-by<EPackage>(packages(result)) do :
-        save-as-fpkg(p, assocs(result))
+      within save = save-pkgs(timestamp-table) :
+        for p in filter-by<EPackage>(packages(result)) do :
+          save(FastPkg(packageio(p), exps(p)))
 
     ;Depending upon the situation run three different flows
     val situation =
@@ -216,7 +212,7 @@ defn compile (proj-manager:ProjManager,
         val vmpackage = combine-and-lower(packages(result) as Tuple<EPackage|FastPkg>)
         ;val packages = match(binding-pkg:VMPackage) : [vmpackage, binding-pkg]
         ;               else : [vmpackage]
-        compile-vmpackages([vmpackage], bindings, output as String, false, assocs(result))
+        compile-vmpackages({false}, [vmpackage], bindings, output as String, false)
       `optimized-pkgs :
         ;Already done
         false
@@ -227,18 +223,32 @@ defn compile (proj-manager:ProjManager,
             (p:StdPkg)  : p          
         ;val packages* = match(binding-pkg:VMPackage) : to-tuple(cat(ordered, [binding-pkg]))
         ;                else : ordered
-        compile-vmpackages(packages, bindings, output as String, pkg-dir is String, assocs(result))
+        within save = save-pkgs(timestamp-table) :
+          compile-vmpackages(save, packages, bindings, output as String, pkg-dir is String)
       `unoptimized-pkgs :
         val epackages = to-tuple $ filter-by<EPackage>(packages(result))
-        compile-to-pkgs(epackages, assocs(result))
+        within save = save-pkgs(timestamp-table) :
+          compile-to-pkgs(save, epackages)
 
     ;Return the compiled packages
     map(name, packages(result))
 
-  defn save-as-fpkg (p:EPackage, assocs:Tuple<FileAssoc>) :
-    val pkg = FastPkg(packageio(p), exps(p))
-    val assoc = find!({package(_) == name(p)}, assocs)
-    save-package(proj-manager, pkg, filename(assoc), timestamp(assoc))
+  defn save-pkgs (body:(Pkg -> False) -> ?,  
+                  timestamp-table:HashTable<Symbol,PackageStamp>) :
+    match(pkg-dir:String) :
+      val saved-pkgs = Vector<SavedPkg>()
+      defn save-pkg (pkg:Pkg) :
+        val filename = save-package(pkg-dir as String, pkg)
+        val stamp = timestamp-table[name(pkg)]      
+        val filestamp = filestamp(filename)
+        val sourcestamp = FileStamp(source-file(location(stamp)) as String,
+                                    source-timestamp(stamp) as Long)
+        add(saved-pkgs, SavedPkg(name(pkg), filestamp, sourcestamp))
+      body(save-pkg)
+      update-aux-file(proj-manager, saved-pkgs)
+    else :
+      defn save-pkg (pkg:Pkg) : false
+      body(save-pkg)
 
   defn combine-and-lower (packages:Tuple<EPackage|FastPkg>) :
     val epackages = for p in packages map :
@@ -246,7 +256,7 @@ defn compile (proj-manager:ProjManager,
       else : p as EPackage
     compile(lower-optimized(epackages))
 
-  defn compile-vmpackages (packages:Tuple<VMPackage|StdPkg>, bindings:Bindings, filename:String, save-pkgs?:True|False, assocs:Tuple<FileAssoc>) :
+  defn compile-vmpackages (save-pkg:Pkg -> ?, packages:Tuple<VMPackage|StdPkg>, bindings:Bindings, filename:String, save-pkgs?:True|False) :
     val stubs = AsmStubs(backend)
     val npkgs = for p in packages map :
       match(p:VMPackage) : normalize(p, backend)
@@ -258,9 +268,7 @@ defn compile (proj-manager:ProjManager,
           (npkg:NormVMPackage) :
             val ins = compile-normalized-vmpackage(npkg, stitcher, stubs, save-pkgs?)
             if save-pkgs? :
-              val pkg = StdPkg(pkg as VMPackage, ins as Tuple<Ins>, datas(npkg))
-              val assoc = find!({package(_) == name(pkg)}, assocs)
-              save-package(proj-manager, pkg, /filename(assoc), timestamp(assoc))
+              save-pkg(StdPkg(pkg as VMPackage, ins as Tuple<Ins>, datas(npkg)))
           (std-pkg:StdPkg) :
             compile-stdpkg(std-pkg, stitcher)
       emit-all-system-stubs(stitcher, stubs)
@@ -280,16 +288,14 @@ defn compile (proj-manager:ProjManager,
       val emitter = emitter(stitcher, name(npkg), file-emitter())
       emit-normalized-package(npkg, emitter, stubs)
 
-  defn compile-to-pkgs (epackages:Tuple<EPackage>, assocs:Tuple<FileAssoc>) :
+  defn compile-to-pkgs (save-pkg:Pkg -> ?, epackages:Tuple<EPackage>) :
     val stubs = AsmStubs(backend)
     for epackage in epackages do :
       val vmpackage = compile(lower-unoptimized(epackage))
       val npkg = normalize(vmpackage, backend)
       val buffer = Vector<Ins>()
       emit-normalized-package(npkg, buffer-emitter(buffer), stubs)
-      val pkg = StdPkg(vmpackage, to-tuple(buffer), datas(npkg))
-      val assoc = find!({package(_) == name(epackage)}, assocs)      
-      save-package(proj-manager, pkg, filename(assoc), timestamp(assoc)) 
+      save-pkg(StdPkg(vmpackage, to-tuple(buffer), datas(npkg)))
     
   defn emit-normalized-package (npkg:NormVMPackage, emitter:CodeEmitter, stubs:AsmStubs) :
     for f in funcs(vmpackage(npkg)) do :
