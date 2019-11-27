@@ -34,6 +34,7 @@ public defstruct BuildTarget <: BuildInputs :
 
 public defstruct BuildSettings :
   inputs: BuildInputs
+  vm-packages: BuildInputs with: (ensure => not-target!)
   platform: Symbol|False
   assembly: String|False
   output: String|False
@@ -43,6 +44,10 @@ public defstruct BuildSettings :
   ccflags: Tuple<String>
   flags: Tuple<Symbol>
 
+defn not-target! (description:String, input:BuildInputs) :
+  match(input:BuildTarget) :
+    fatal("Cannot assign target to %_." % [description])
+
 ;============================================================
 ;============= Compile Given Files EntryPoint ===============
 ;============================================================
@@ -51,57 +56,62 @@ public defn compile (settings:BuildSettings, system:System) :
   defn main () :
     read-config-file()
     val build-platform = compute-build-platform()
-    val [proj, build-manager, inputs] = classify-inputs(build-platform)
+    val [proj, build-manager, inputs, vm-packages] = classify-inputs(build-platform)
     val [build-flags, build-optimization, build-asm, temporary-asm?, build-out, build-pkg-dir] = compute-build-settings(build-manager)
     setup-system-flags(build-platform, build-flags, build-optimization, build-pkg-dir)
     val proj-manager = ProjManager(proj, ProjParams(compiler-flags(), build-optimization))
-    val compiled-packages = compile(proj-manager, inputs, build-asm, build-pkg-dir,
-                                    backend(build-platform),
-                                    build-optimization)
-    link-output-file(build-platform, build-asm, temporary-asm?, build-out, build-manager, compiled-packages)
+    val [compiled-packages, binding-packages] = compile(proj-manager, inputs, vm-packages, build-asm, build-pkg-dir,
+                                                        backend(build-platform), build-optimization)
+    link-output-file(build-platform, build-asm, temporary-asm?, build-out, build-manager, compiled-packages, binding-packages)
 
   defn compute-build-platform () :
     match(platform(settings)) :
       (p:Symbol) : p
       (f:False) : OUTPUT-PLATFORM
     
-  defn classify-inputs (platform:Symbol) -> [ProjFile, BuildManager, Collection<Symbol|String>] :
+  defn classify-inputs (platform:Symbol) -> [ProjFile, BuildManager, Collection<Symbol|String>, Tuple<Symbol|String>] :
+    defn classify-names (inputs:BuildInputs,
+                         return-proj:String -> ?,
+                         return-file:String -> ?,
+                         return-package:Symbol -> ?) :
+      match(inputs) :
+        (inputs:BuildStringArgs) :
+          for name in names(inputs) do :
+            if not has-extension?(name) : return-package(to-symbol(name))
+            else if suffix?(name, ".proj") : return-proj(name)
+            else : return-file(name)            
+        (inputs:BuildPackages) :
+          for p in packages(inputs) do :
+            match(p) :
+              (p:String) : return-file(p)
+              (p:Symbol) : return-package(p)
     match(inputs(settings)) :
-      (build-inputs:BuildStringArgs) :
+      (build-inputs:BuildStringArgs|BuildPackages) :
         ;Categorize filenames
         val projfiles = to-vector<String> $ ["stanza.proj"]
-        val inputs = Vector<String|Symbol>()
-        for name in names(build-inputs) do :
-          if not has-extension?(name) :
-            add(inputs, to-symbol(name))
-          else if suffix?(name, ".proj") :
-            add(projfiles, name)
-          else :
-            add(inputs, name)
+        val inputs = Vector<String|Symbol>()        
+        classify-names(build-inputs, add-to(projfiles), add-to(inputs), add-to(inputs))
+
+        ;Categorize vmpackage files
+        val vmpackages = Vector<String|Symbol>()
+        classify-names(/vm-packages(settings), fatal{"Illegal .proj file."}, add-to(vmpackages), add-to(vmpackages))
+
         ;Read proj file
         val proj = read-proj-files(projfiles, platform)
+        
         ;Return proj and inputs
-        [proj, BuildManager(proj), inputs]
-      (build-inputs:BuildPackages) :
-        ;Categorize filenames
-        val projfiles = to-vector<String> $ ["stanza.proj"]
-        val inputs = Vector<String|Symbol>()
-        for name in packages(build-inputs) do :
-          match(name) :
-            (name:Symbol) :
-              add(inputs, name)
-            (name:String) :
-              if suffix?(name, ".proj") : add(projfiles, name)
-              else : add(inputs, name)
-        ;Read proj file
-        val proj = read-proj-files(projfiles, platform)
-        ;Return proj and inputs
-        [proj, BuildManager(proj), inputs]
+        [proj, BuildManager(proj), inputs, to-tuple(vmpackages)]
       (inputs:BuildTarget) :
         val proj = read-proj-files(["stanza.proj"], platform)
         val bm = BuildManager(proj)
         val s = target(bm, target(inputs))
-        [proj, bm, /inputs(s)]
+
+        ;Categorize vmpackage files
+        val vmpackages = to-vector<String|Symbol>(supported-vm-packages(s))
+        classify-names(/vm-packages(settings), fatal{"Illegal. proj file"}, add-to(vmpackages), add-to(vmpackages))        
+
+        ;Return proj and inputs
+        [proj, bm, /inputs(s), to-tuple(vmpackages)]
 
   defn compute-build-settings (bm:BuildManager) :
     if inputs(settings) is BuildTarget :
@@ -180,12 +190,12 @@ public defn compile (settings:BuildSettings, system:System) :
       `windows : W64Backend()
 
   defn link-output-file (build-platform:Symbol, build-asm:String|False, temporary-asm?:True|False, build-out:String|False,
-                         build-manager:BuildManager, compiled-packages:Tuple<Symbol>) :
+                         build-manager:BuildManager, compiled-packages:Tuple<Symbol>, binding-packages:Tuple<Symbol>) :
     match(build-out:String) :
       ;Compute the project external dependencies
       val [ccfiles*, ccflags*] = [unique-join(ccfiles(settings), ccfiles(ds)),
                                   unique-join(ccflags(settings), ccflags(ds))] where :
-        val ds = dependencies(build-manager, compiled-packages)
+        val ds = dependencies(build-manager, unique-join(compiled-packages, binding-packages))
       ;Create the output file
       call-cc(system, build-platform, build-asm as String, ccfiles*, ccflags*, build-out as String)
       ;Delete the temporary asm file if necessary
@@ -193,9 +203,15 @@ public defn compile (settings:BuildSettings, system:System) :
 
   ;Launch!
   main()
+
+;============================================================
+;====================== Utilities ===========================
+;============================================================
     
 defn unique-join<?T> (xs:Seqable<?T&Equalable>, ys:Seqable<?T&Equalable>) :
   to-tuple $ unique $ cat(xs, ys)
 
 defn has-extension? (s:String) :
   index-of-char(s, '.') is Int
+
+defn add-to<?T> (v:Vector<?T>) : (fn (x:T) : add(v, x))
