@@ -63,6 +63,7 @@ with: (printer => true)
 ;============================================================
 defstruct ProjFileS0 :
   path: String
+  full-path: String
   stmts: Tuple<ProjStmt>
 with:
   printer => true
@@ -77,6 +78,7 @@ with: (printer => true)
 defstruct IncludedStmtsS0 <: ProjStmt :
   info: FileInfo|False with: (as-method => true)
   path: String
+  full-path: String
   stmts: Tuple<ProjStmt>
 with: (printer => true)
 
@@ -145,7 +147,8 @@ with: (printer => true)
 defn read-raw-proj-file (filename:String) :
   val forms = read-file(filename)
   val stmts = parse-syntax[stanza-projfile / #projstmt! ...](forms)
-  ProjFileS0(filename, to-tuple(stmts))
+  val full-path = resolve-path(filename) as String
+  ProjFileS0(filename, full-path, to-tuple(stmts))
 
 ;============================================================
 ;================= Project File Syntax ======================
@@ -332,19 +335,20 @@ defn traverse-includes (f:ProjFileS0) :
       else if included?(parent-paths, full-path) :
         fatal("Cyclic include of %_." % [/full-path(full-path)])
       else :
-        val parent-paths* = cons(full-path, parent-paths)
-        process(read-raw-proj-file(path(full-path)), parent-paths*, info(s))
+        included-stmts(cons(full-path, parent-paths), info(s))
     else :
       s
-  defn process (f:ProjFileS0, parent-paths:List<IncludePath>, info:FileInfo|False) :
-    val stmts* = map(process{_, parent-paths}, stmts(f))
-    IncludedStmtsS0(info, path(f), stmts*)
+  defn included-stmts (parent-paths:List<IncludePath>, info:FileInfo|False) :
+    val ipath = head(parent-paths)
+    val file = read-raw-proj-file(path(ipath))
+    val stmts* = map(process{_, parent-paths}, stmts(file))
+    IncludedStmtsS0(info, path(ipath), full-path(ipath) as String, stmts*)
 
   ;Launch!
   val path* = include-path(path(f))
   fatal("Could not resolve path.") when not exists?(path*)
   val stmts* = map(process{_, List(path*)}, stmts(f))
-  ProjFileS0(path(f), stmts*)
+  ProjFileS0(path(f), full-path(f), stmts*)
 
 defstruct IncludePath :
   path: String
@@ -371,6 +375,11 @@ defn replace-path-head (path:String, head:String) :
   match(i:Int) : string-join $ [path[0 through i], head]
   else : head
 
+defn remove-path-head (path:String) :
+  val i = last-index-of-char(path, '/')
+  match(i:Int) : path[0 through i]
+  else : "."
+
 ;============================================================
 ;============ Normalize Statements Under Platform ===========
 ;============================================================
@@ -380,7 +389,7 @@ defn normalize (f:ProjFileS0, current-platform:Symbol) :
     match(s) :
       (s:IncludedStmtsS0) :
         val stmts* = map(norm, stmts(s))
-        IncludedStmtsS0(info(s), path(s), stmts*)
+        IncludedStmtsS0(info(s), path(s), full-path(s), stmts*)
       (s:DefinedInStmtS0) :
         DefinedInStmt(package(s), filename(s))
       (s:RequiresStmtS0) :
@@ -447,23 +456,44 @@ defn normalize (f:ProjFileS0, current-platform:Symbol) :
     value(v as AtomValue) as Symbol
     
   ;Launch!
-  ProjFileS0(path(f), map(norm,stmts(f)))
+  ProjFileS0(path(f), full-path(f), map(norm,stmts(f)))
 
 ;============================================================
 ;=============== Flatten Relative Paths =====================
 ;============================================================
 defn flatten-relative-paths (f:ProjFileS0) :
+  ;Compute working directory
+  val workdir = resolve-path(".") as String
+  
+  ;Accumulate flattened statements
   val accum = Vector<ProjStmt>()
   defn emit (s:ProjStmt) : add(accum,s)
-  defn process (s:ProjStmt, parent-path:String) :
-    defn flatten-path (s:String) :
+
+  ;Accumulate errors
+  val errors = Vector<Exception>()
+
+  ;Replace environment variables in string
+  defn sub-env-vars (s:String, proj-file:String, proj-dir:String) :
+    attempt :
+      defn no-var (name:String) :
+        val msg = "Could not resolve environment variable %_ in %~." % [name, proj-file]
+        add(errors, ProjFileError(false, to-string(msg)))
+        fail()
+      substitute-environment-variables(s, workdir, proj-dir, no-var)
+    else : s
+
+  ;Process statement and sub-statements and push into accumulator.
+  defn process (s:ProjStmt, parent-path:String, parent-full-path:String) :
+    val parent-dir = remove-path-head(parent-full-path)
+    defn flatten-path (s0:String) :
+      val s = sub-env-vars(s0, parent-path, parent-dir)
       if absolute-path?(s) : s
       else : replace-path-head(parent-path, s)
     defn flatten-path (s:Symbol) :
       s
     match(s) :
       (s:IncludedStmtsS0) :
-        do(process{_, path(s)}, stmts(s))
+        do(process{_, path(s), full-path(s)}, stmts(s))
       (s:DefinedInStmt) :
         emit $ DefinedInStmt(package(s), flatten-path(filename(s)))
       (s:RequiresStmt) :
@@ -487,8 +517,49 @@ defn flatten-relative-paths (f:ProjFileS0) :
           ccflags(s)
           flags(s)
           optimize(s))
-  do(process{_, path(f)}, stmts(f))
+
+  ;Launch!
+  do(process{_, path(f), full-path(f)}, stmts(f))
+  
+  ;Throw errors
+  throw(ProjFileErrors(errors)) when not empty?(errors)    
+
+  ;Return new project file
   ProjFile(to-tuple(accum))
+
+defn replace-curly (f:String -> String, s:String) :
+  if index-of-char(s, '{') is False :
+    s
+  else :
+    val buffer = StringBuffer()
+    let loop (start:Int = 0) :
+      val [i, j] = let :
+        val i = index-of-char(s, start to false, '{')
+        match(i:Int) :
+          [i, index-of-char(s, (i + 1) to false, '}')]
+        else : [i, false]
+      match(i:Int, j:Int) :
+        add-all(buffer, s[start to i])
+        add-all(buffer, f(s[(i + 1) through (j - 1)]))
+        loop(j + 1)
+      else :
+        add-all(buffer, s[start to false])        
+    to-string(buffer)
+
+defn substitute-environment-variables (s:String,
+                                       work-dir:String,
+                                       proj-dir:String,
+                                       no-var:String -> Void) :
+  within name = replace-curly(s) :
+    switch(name) :
+      "WORKDIR" :
+        work-dir
+      "." :
+        proj-dir
+      else : 
+        val v = get-env(name)
+        match(v:String) : v
+        else : no-var(name)
 
 ;============================================================
 ;=================== Combine Files ==========================
@@ -507,6 +578,11 @@ defmethod print (o:OutputStream, e:ProjFileError) :
   val info-str = "" when info(e) is False
             else "%_: " % [info(e)]
   print(o, "%_%_" % [info-str, msg(e)])
+
+public defstruct ProjFileErrors <: Exception :
+  exceptions: Collection<Exception>
+defmethod print (o:OutputStream, e:ProjFileErrors) :
+  print(o, "%n" % [exceptions(e)])
 
 defn add-proj-file-info<?T> (f:() -> ?T, info:FileInfo|False) :
   try :
