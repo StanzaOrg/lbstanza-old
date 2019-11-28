@@ -27,16 +27,14 @@ public defmulti delete-temporary-file (s:System, file:String) -> False
 ;============================================================
 
 public deftype BuildInputs
-public defstruct BuildStringArgs <: BuildInputs :
-  names: Tuple<String>
 public defstruct BuildPackages <: BuildInputs :
-  packages: Tuple<String|Symbol>
+  names: Tuple<String|Symbol>
 public defstruct BuildTarget <: BuildInputs :
   target: Symbol
 
 public defstruct BuildSettings :
-  inputs: BuildInputs
-  vm-packages: BuildInputs with: (ensure => not-target!)
+  inputs: BuildInputs with: (updater => sub-inputs)
+  vm-packages: BuildPackages with: (updater => sub-vm-packages)
   platform: Symbol|False
   assembly: String|False
   output: String|False
@@ -46,10 +44,6 @@ public defstruct BuildSettings :
   ccflags: Tuple<String>
   flags: Tuple<Symbol>
 
-defn not-target! (description:String, input:BuildInputs) :
-  match(input:BuildTarget) :
-    fatal("Cannot assign target to %_." % [description])
-
 ;============================================================
 ;============= Compile Given Files EntryPoint ===============
 ;============================================================
@@ -58,140 +52,117 @@ public defn compile (settings:BuildSettings, system:System) :
   defn main () :
     read-config-file()
     val build-platform = compute-build-platform()
-    val [proj, build-manager, inputs, vm-packages] = classify-inputs(build-platform)
-    if already-built?(/inputs(settings), build-manager) :
+    val [proj, build-manager, settings*] = compute-build-settings(build-platform)
+    if already-built?(build-manager) :
       val target = target(/inputs(settings) as BuildTarget)
       println("Build target %~ is already up-to-date." % [target])
     else :
-      val [build-flags, build-optimization, build-asm, temporary-asm?, build-out, build-pkg-dir] = compute-build-settings(build-manager)
-      setup-system-flags(build-platform, build-flags, build-optimization, build-pkg-dir)
-      val proj-manager = ProjManager(proj, ProjParams(compiler-flags(), build-optimization))
-      val comp-result = compile(proj-manager, inputs, vm-packages, build-asm, build-pkg-dir,
-                                backend(build-platform), build-optimization)
-      link-output-file(build-platform, build-asm, temporary-asm?, build-out, build-manager, comp-result)
+      setup-system-flags(settings*)
+      val proj-manager = ProjManager(proj, ProjParams(compiler-flags(), optimize?(settings*)))
+      defn names! (inputs:BuildInputs) : names(inputs as BuildPackages)
+      val [build-asm, temporary-asm?] = make-asm-file?(settings*)
+      val comp-result = compile(proj-manager, names!(inputs(settings*)), names!(vm-packages(settings*)), build-asm, pkg-dir(settings*),
+                                backend(platform(settings*) as Symbol), optimize?(settings*))
+      link-output-file(settings*, build-asm, temporary-asm?, build-manager, comp-result, target?(inputs(settings)))
 
   defn compute-build-platform () :
     match(platform(settings)) :
       (p:Symbol) : p
       (f:False) : OUTPUT-PLATFORM
-    
-  defn classify-inputs (platform:Symbol) -> [ProjFile, BuildManager, Collection<Symbol|String>, Tuple<Symbol|String>] :
-    defn classify-names (inputs:BuildInputs,
-                         return-proj:String -> ?,
-                         return-file:String -> ?,
-                         return-package:Symbol -> ?) :
-      match(inputs) :
-        (inputs:BuildStringArgs) :
-          for name in names(inputs) do :
-            if not has-extension?(name) : return-package(to-symbol(name))
-            else if suffix?(name, ".proj") : return-proj(name)
-            else : return-file(name)            
-        (inputs:BuildPackages) :
-          for p in packages(inputs) do :
-            match(p) :
-              (p:String) : return-file(p)
-              (p:Symbol) : return-package(p)
-    match(inputs(settings)) :
-      (build-inputs:BuildStringArgs|BuildPackages) :
-        ;Categorize filenames
-        val projfiles = to-vector<String> $ ["stanza.proj"]
-        val inputs = Vector<String|Symbol>()        
-        classify-names(build-inputs, add-to(projfiles), add-to(inputs), add-to(inputs))
 
-        ;Categorize vmpackage files
-        val vmpackages = Vector<String|Symbol>()
-        classify-names(/vm-packages(settings), fatal{"Illegal .proj file."}, add-to(vmpackages), add-to(vmpackages))
 
-        ;Read proj file
-        val proj = read-proj-files(projfiles, platform)
-        
-        ;Return proj and inputs
-        [proj, BuildManager(proj), inputs, to-tuple(vmpackages)]
-      (inputs:BuildTarget) :
-        val proj = read-proj-files(["stanza.proj"], platform)
-        val bm = BuildManager(proj)
-        val s = target(bm, target(inputs))
 
-        ;Categorize vmpackage files
-        val vmpackages = to-vector<String|Symbol>(supported-vm-packages(s))
-        classify-names(/vm-packages(settings), fatal{"Illegal. proj file"}, add-to(vmpackages), add-to(vmpackages))        
+  defn target? (inputs:BuildInputs) :
+    match(inputs:BuildTarget) : target(inputs)
 
-        ;Return proj and inputs
-        [proj, bm, /inputs(s), to-tuple(vmpackages)]
-
-  defn already-built? (inputs:BuildInputs, bm:BuildManager) :
+  defn already-built? (bm:BuildManager) :
+    val inputs = inputs(settings)
     match(inputs:BuildTarget) :
       target-up-to-date?(bm, target(inputs))
 
-  defn compute-build-settings (bm:BuildManager) :
-    if inputs(settings) is BuildTarget :
-      val s = target(bm, target(inputs(settings) as BuildTarget))
+  defn compute-build-settings (platform:Symbol) -> [ProjFile, BuildManager, BuildSettings] :
+    ;Utilities
+    defn proj-file? (s:String|Symbol) : 
+      match(s:String) : suffix?(s, ".proj")
       
-      ;Compute build flags
-      val build-flags = unique-join(flags(s), flags(settings))
-
-      ;Compute build optimization level
-      val build-optimization = optimize?(settings) or optimize(s)
-
-      ;Compute assembly and output
-      defn string-or? (a:String|False, b:String|False) :
-        match(a:False) : b
-        else : a
-      val assembly* = string-or?(assembly(settings), value?(assembly(s)))
-      val output* = string-or?(output(settings), value?(output(s)))
-
-      ;Compute build assembly file
-      val [build-asm, temporary-asm?] =
-        match(assembly*, output*) :
-          (asm:String, out) : [asm, false]
-          (asm:False, out:String) : [make-temporary-file(system), true]
-          (asm:False, out:False) : [false, false]
-
-      ;Compute build pkg directory
-      val build-pkg-dir = string-or?(pkg-dir(settings), value?(pkg(s)))
+    defn proj-files (ss:Tuple<String|Symbol>) :
+      filter(proj-file?, ss) as Seq<String>
       
-      ;Return settings
-      [build-flags, build-optimization, build-asm, temporary-asm?, output*, build-pkg-dir]
+    defn non-proj-files (ss:Tuple<String|Symbol>) :
+      filter({not proj-file?(_)}, ss)
       
-    else :
-      ;Compute build flags
-      val build-flags = flags(settings)
+    defn non-files-to-symbols (ss:Seqable<String|Symbol>) :
+      for s in ss seq :
+        match(s) :
+          (s:String) : s when has-extension?(s) else to-symbol(s)
+          (s:Symbol) : s
 
-      ;Compute build optimization level
-      val build-optimization = optimize?(settings)
+    ;Categorize depending on whether using build target or not.
+    match(inputs(settings)) :
+      (inputs:BuildTarget) :
+        val proj = read-proj-files(["stanza.proj"], platform)
+        val bm = BuildManager(proj)
+        ;Retrieve build target statement
+        val s = target(bm, target(inputs))
+        ;Compute build flags
+        val build-flags = unique-join(flags(s), flags(settings))
+        ;Compute build optimization level
+        val build-optimization = optimize?(settings) or optimize(s)
+        ;Compute assembly
+        val build-asm = string-or?(assembly(settings), value?(assembly(s)))        
+        ;Compute output
+        val build-out = string-or?(output(settings), value?(output(s)))
+        ;Compute build pkg directory
+        val build-pkg-dir = string-or?(pkg-dir(settings), value?(pkg(s)))
+        ;Compute new settings
+        val inputs* = BuildPackages $ /inputs(s)
+        val vm-packages* = BuildPackages $ supported-vm-packages(s)
+        val settings* = BuildSettings(
+          inputs*,
+          vm-packages*,
+          platform,
+          build-asm,
+          build-out,
+          build-pkg-dir,
+          build-optimization,
+          ccfiles(settings),
+          ccflags(settings),
+          build-flags)
+        ;Return
+        [proj, bm, settings*]
+        
+      (inputs:BuildPackages) :
+        val proj-files = cat(["stanza.proj"], proj-files(names(inputs)))
+        val proj = read-proj-files(proj-files, platform)
+        val bm = BuildManager(proj)
+        val inputs* = BuildPackages $ to-tuple $ non-files-to-symbols $ non-proj-files $ names $ inputs
+        val vm-packages* = BuildPackages $ to-tuple $ non-files-to-symbols $ names $ vm-packages $ settings
+        val settings* = sub-vm-packages(sub-inputs(settings, inputs*), vm-packages*)
+        [proj, bm, settings*]
 
-      ;Compute build assembly file
-      val [build-asm, temporary-asm?] =
-        match(assembly(settings), output(settings)) :
-          (asm:String, out) : [asm, false]
-          (asm:False, out:String) : [make-temporary-file(system), true]
-          (asm:False, out:False) : [false, false]
+  defn make-asm-file? (settings:BuildSettings) -> [String|False, True|False] :
+    match(assembly(settings), output(settings)) :
+      (asm:String, out) : [asm, false]
+      (asm:False, out:String) : [make-temporary-file(system), true]
+      (asm:False, out:False) : [false, false]
 
-      ;Compute build output file
-      val build-out = output(settings)
-
-      ;Compute build pkg directory
-      val build-pkg-dir = pkg-dir(settings)
-      
-      ;Return settings
-      [build-flags, build-optimization, build-asm, temporary-asm?, build-out, build-pkg-dir]
-
-  defn setup-system-flags (build-platform:Symbol, build-flags:Tuple<Symbol>, build-optimization:True|False, build-pkg-dir:String|False) :
+  defn setup-system-flags (settings:BuildSettings) :
     ;Platform setting
-    OUTPUT-PLATFORM = build-platform
+    OUTPUT-PLATFORM = platform(settings) as Symbol
 
     ;Platform flag
-    add-flag $ platform-flag(build-platform)
+    add-flag $ platform-flag(platform(settings) as Symbol)
 
     ;Optimization flag
-    add-flag(`OPTIMIZE) when build-optimization
+    add-flag(`OPTIMIZE) when optimize?(settings)
 
     ;Add custom build flags
-    do(add-flag, build-flags)
+    do(add-flag, flags(settings))
 
     ;Update pkg path
-    match(build-pkg-dir:String) :
-      STANZA-PKG-DIRS = cons(build-pkg-dir, STANZA-PKG-DIRS)
+    val pkg-dir = pkg-dir(settings)
+    match(pkg-dir:String) :
+      STANZA-PKG-DIRS = cons(pkg-dir, STANZA-PKG-DIRS)
 
   defn backend (platform:Symbol) :
     switch(platform) :
@@ -199,8 +170,8 @@ public defn compile (settings:BuildSettings, system:System) :
       `linux : L64Backend()
       `windows : W64Backend()
 
-  defn link-output-file (build-platform:Symbol, build-asm:String|False, temporary-asm?:True|False, build-out:String|False,
-                         build-manager:BuildManager, comp-result:CompilationResult) :
+  defn link-output-file (settings:BuildSettings, build-asm:String|False, temporary-asm?:True|False,
+                         build-manager:BuildManager, comp-result:CompilationResult, target:Symbol|False) :
     ;Accumulate filestamps
     val filestamps = Vector<FileStamp>()
 
@@ -209,7 +180,7 @@ public defn compile (settings:BuildSettings, system:System) :
       ;Add package stamps from front end compilation result
       add-all(filestamps, output-pkgs(comp-result))
       ;Categorize cases
-      match(build-out, build-asm) :
+      match(output(settings), build-asm) :
         (build-out:String, build-asm) : compile-exe(build-asm as String, build-out)
         (build-out:False, build-asm:String) : compile-asm(build-asm)
         (build-out:False, build-asm:False) : compile-pkgs()
@@ -222,11 +193,12 @@ public defn compile (settings:BuildSettings, system:System) :
       val cs = build-commands(build-manager, ds)
       do(add-filestamp, cs)
       ;Run any compilation commands
+      val platform = platform(settings) as Symbol
       val commands = seq-cat(commands, filter-by<CompileStmt>(seq(compile, cs)))
       for command in commands do :
-        call-shell(system, build-platform, command)
+        call-shell(system, platform, command)
       ;Create the output file
-      call-cc(system, build-platform, build-asm, ccfiles(ds), ccflags(ds), build-out)
+      call-cc(system, platform, build-asm, ccfiles(ds), ccflags(ds), build-out)
       ;Delete the temporary asm file if necessary
       delete-temporary-file(system, build-asm) when temporary-asm?
       ;Update the auxiliary file
@@ -266,8 +238,7 @@ public defn compile (settings:BuildSettings, system:System) :
         (f:False, file?:False) : false
       
     defn write-aux-file () :
-      if inputs(settings) is BuildTarget :
-        val target = target(inputs(settings) as BuildTarget)
+      match(target:Symbol) :
         update-aux-file(build-manager, target, package-stamps(comp-result), to-tuple(filestamps))
         
     ;Launch!
@@ -286,4 +257,6 @@ defn unique-join<?T> (xs:Seqable<?T&Equalable>, ys:Seqable<?T&Equalable>) :
 defn has-extension? (s:String) :
   index-of-char(s, '.') is Int
 
-defn add-to<?T> (v:Vector<?T>) : (fn (x:T) : add(v, x))
+defn string-or? (a:String|False, b:String|False) :
+  match(a:False) : b
+  else : a
