@@ -12,7 +12,8 @@ public defn read-proj-files (filenames:Seqable<String>, platform:Symbol) :
   combine $ for filename in filenames seq :
     flatten-relative-paths $
     normalize{_, platform} $
-    traverse-includes $
+    traverse-includes{_, platform} $
+    ensure-wellformed{_, platform} $
     read-raw-proj-file(filename)
 
 public defn default-proj-files () -> Vector<String> :
@@ -333,13 +334,124 @@ defn entry!<?T> (es:Seqable<KeyValue<Symbol,?T>>, name:Symbol) :
 ;============ Check Statements Under Platform ===============
 ;============================================================
 
-;[TODO]
+defn ensure-wellformed (f:ProjFileS0, platform:Symbol) :
+  val errors = Vector<ProjFileError>()
+  defn emit-error (e:ProjFileError) : add(errors, e)
+
+  defn check-for-errors (body:() -> ?) :
+    val num-errors = length(errors)
+    body()
+    length(errors) > num-errors
+
+  defn ensure-suffix! (info:FileInfo|False, path:String, suffix:String) :
+    if not suffix?(path, suffix) :
+      val msg = "Expected a %_ file here, but found %~." % [suffix path]
+      emit-error $ ProjFileError(info, to-string(msg))
+
+  defn ensure-wellformed (type:Symbol, v:Maybe<ProjValue>) :
+    ensure-wellformed(type,value!(v)) when not empty?(v)
+    
+  defn ensure-wellformed (type:Symbol, v:ProjValue) :
+    ;Check whether platforms are supported in value
+    defn check-platforms (v:ProjValue) :
+      match(v) :      
+        (v:AtomValue) :
+          false
+        (v:ProjValues) :
+          do(check-platforms, values(v))
+        (v:CondPlatform) :
+          ;First check keys are supported platforms or 'else'. 
+          val n = length(values(v))
+          for (entry in values(v), i in 0 to false) do :
+            if key(entry) == `else :
+              if i != n - 1 :
+                emit-error $ ProjFileError(info(v), "The 'else' keyword can only be used as last entry in list.")
+            else :
+              if not supported-platform?(key(entry)) :
+                emit-error $ ProjFileError(info(v), to-string("'%~' does not refer to a supported platform." % [key(entry)]))
+          ;Check whether given platform is supported.
+          val platform-supported? = 
+            for entry in values(v) any? :
+              key(entry) == `else or key(entry) == platform
+          if not platform-supported? :
+            emit-error $ ProjFileError(info(v), to-string("There is no available option for the current platform %~." % [platform]))
+          ;Then recurse
+          do(check-platforms{value(_)}, values(v))
+
+    ;Flatten values into a single vector of atoms
+    defn flatten (v:ProjValue) :
+      val buffer = Vector<AtomValue>()
+      let loop (v:ProjValue = v) :
+        match(v) :
+          (v:AtomValue) :
+            add(buffer, v)
+          (v:ProjValues) :
+            do(loop, values(v))
+          (v:CondPlatform) :
+            val v0 = for entry in values(v) first! :
+              if key(entry) == `else or key(entry) == platform : One(value(entry))
+              else : None()
+            loop(v0)
+      buffer
+
+    ;Launch!
+    val platform-errors? = check-for-errors(check-platforms{v})
+    if not platform-errors? :
+      val atoms = flatten(v)
+      switch(type) :
+        `strings :
+          for v in atoms do :
+            if value(v) is-not String :
+              emit-error $ ProjFileError(info(v), to-string("Expected a string here, but received symbol %~." % [value(v)]))
+        `symbols :
+          for v in atoms do :
+            if value(v) is-not Symbol :
+              emit-error $ ProjFileError(info(v), to-string("Expected a symbol here, but received string %~." % [value(v)]))
+        `atoms :
+          false
+        `string :
+          if length(atoms) != 1 :
+            emit-error $ ProjFileError(info(v), to-string("Expected a single string here, but received %_ values." % [length(atoms)]))
+          else :
+            val v = atoms[0]
+            if value(v) is-not String :
+              emit-error $ ProjFileError(info(v), to-string("Expected a string here, but received symbol %~." % [value(v)]))
+
+  ;Scan through all statements
+  for s in stmts(f) do :
+    match(s) :
+      (s:IncludeStmtS0) :
+        ensure-suffix!(info(s), path(s), ".proj")
+      (s:DefinedInStmtS0) :
+        ensure-suffix!(info(s), filename(s) ".stanza")
+      (s:RequiresStmtS0) :
+        ensure-wellformed(`strings, ccfiles(s))
+        ensure-wellformed(`strings, ccflags(s))
+      (s:ImportWhenStmtS0) :
+        false
+      (s:CompileStmtS0) :
+        ensure-wellformed(`strings, dependencies(s))
+        ensure-wellformed(`strings, commands(s))
+      (s:BuildStmtS0) :
+        ensure-wellformed(`atoms, inputs(s))
+        ensure-wellformed(`atoms, supported-vm-packages(s))
+        ensure-wellformed(`string, pkg(s))
+        ensure-wellformed(`string, output(s))
+        ensure-wellformed(`string, assembly(s))
+        ensure-wellformed(`strings, ccfiles(s))
+        ensure-wellformed(`strings, ccflags(s))
+        ensure-wellformed(`symbols, flags(s))
+
+  ;Throw exception if any errors  
+  throw(ProjFileErrors(errors)) when not empty?(errors)
+  ;Return file unchanged
+  f
 
 ;============================================================
 ;================== Traverse Includes =======================
 ;============================================================
 
-defn traverse-includes (f:ProjFileS0) :
+defn traverse-includes (f:ProjFileS0, platform:Symbol) :
   defn process (s:ProjStmt, parent-paths:List<IncludePath>) :
     match(s:IncludeStmtS0) :
       val parent-path = head(parent-paths)
@@ -347,22 +459,22 @@ defn traverse-includes (f:ProjFileS0) :
         if relative-path?(path(s)) : replace-path-head(path(parent-path), path(s))
         else : path(s)
       if not exists?(full-path) :
-        fatal("File %_ doesn't exist." % [path(full-path)])
+        throw(CannotFindIncludeProj(info(s), path(parent-path), path(full-path)))
       else if included?(parent-paths, full-path) :
-        fatal("Cyclic include of %_." % [/full-path(full-path)])
+        throw(IncludeCycle(info(s), path(full-path), map(path,parent-paths)))
       else :
         included-stmts(cons(full-path, parent-paths), info(s))
     else :
       s
   defn included-stmts (parent-paths:List<IncludePath>, info:FileInfo|False) :
     val ipath = head(parent-paths)
-    val file = read-raw-proj-file(path(ipath))
+    val file = ensure-wellformed(read-raw-proj-file(path(ipath)), platform)
     val stmts* = map(process{_, parent-paths}, stmts(file))
     IncludedStmtsS0(info, path(ipath), full-path(ipath) as String, stmts*)
 
   ;Launch!
   val path* = include-path(path(f))
-  fatal("Could not resolve path.") when not exists?(path*)
+  fatal("Project file no longer resolvable.") when not exists?(path*)
   val stmts* = map(process{_, List(path*)}, stmts(f))
   ProjFileS0(path(f), full-path(f), stmts*)
 
@@ -608,6 +720,15 @@ public defstruct ProjFileErrors <: Exception :
   exceptions: Collection<Exception>
 defmethod print (o:OutputStream, e:ProjFileErrors) :
   print(o, "%n" % [exceptions(e)])
+
+public defn CannotFindIncludeProj (info:FileInfo|False, src-proj:String, load-proj:String) :
+  val msg = to-string("The project file %~ cannot load non-existent project file %~." % [src-proj, load-proj])
+  ProjFileError(info, msg)
+
+public defn IncludeCycle (info:FileInfo|False, path:String, parent-paths:List<String>) :
+  val msg = to-string("Cyclic include error when attempting to re-include project file %~. Already included through paths: %@." % [
+    path, parent-paths])
+  ProjFileError(info, msg)
 
 defn add-proj-file-info<?T> (f:() -> ?T, info:FileInfo|False) :
   try :
