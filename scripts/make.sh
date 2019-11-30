@@ -24,6 +24,9 @@ mkdir -p pkgs
 mkdir -p lpkgs
 #mkdir -p wpkgs
 
+#Clean
+$STANZA clean
+
 #Compile OSX Pkgs and Executable
 echo "Compiling OSX Pkgs"
 $STANZA build-stanza.proj stz/driver $PKGFILES -pkg pkgs
