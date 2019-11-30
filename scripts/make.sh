@@ -11,95 +11,8 @@ fi
 
 STANZA=$1
 
-#All input source files
-FILES="core/core.stanza \
-       core/collections.stanza \
-       core/reader.stanza \
-       core/parser.stanza \
-       core/macro-utils.stanza \
-       compiler/line-noise-prompter.stanza \
-       compiler/stz-algorithms.stanza \
-       compiler/stz-utils.stanza \
-       compiler/stz-stable-arrays.stanza \
-       compiler/stz-serializer.stanza \
-       compiler/stz-params.stanza \
-       compiler/stz-core-macros.stanza \
-       compiler/stz-ids.stanza \
-       compiler/lang-read.stanza \
-       compiler/lang-check.stanza \
-       compiler/stz-primitives.stanza \
-       compiler/stz-il-ir.stanza \
-       compiler/stz-tl-ir.stanza \
-       compiler/stz-input.stanza \
-       compiler/stz-visibility.stanza \
-       compiler/stz-basic-ops.stanza \
-       compiler/stz-namemap.stanza \
-       compiler/stz-renamer.stanza \
-       compiler/stz-resolver.stanza \
-       compiler/stz-infer.stanza \
-       compiler/stz-type-calculus.stanza \
-       compiler/stz-type.stanza \
-       compiler/stz-tl-to-el.stanza \
-       compiler/stz-tl-to-dl.stanza \
-       compiler/stz-el-ir.stanza \
-       compiler/stz-dl-ir.stanza \
-       compiler/stz-vm-ir.stanza \
-       compiler/stz-typeset.stanza \
-       compiler/stz-dl.stanza \
-       compiler/stz-el.stanza \
-       compiler/stz-el-infer.stanza \
-       compiler/stz-basic-blocks.stanza \
-       compiler/stz-ehier.stanza \
-       compiler/stz-vm.stanza \
-       compiler/stz-bindings.stanza \
-       compiler/stz-bindings-to-vm.stanza \
-       compiler/stz-vm-encoder.stanza \
-       compiler/stz-trie-table.stanza \
-       compiler/stz-hash.stanza \
-       compiler/stz-keyed-set.stanza \
-       compiler/stz-set-utils.stanza \
-       compiler/stz-conversion-utils.stanza \
-       compiler/stz-dyn-graph.stanza \
-       compiler/stz-binary-tree.stanza \
-       compiler/stz-dispatch-dag.stanza \
-       compiler/stz-dyn-tree.stanza \
-       compiler/stz-dyn-bi-table.stanza \
-       compiler/stz-vm-table.stanza \
-       compiler/stz-branch-table.stanza \
-       compiler/stz-vm-analyze.stanza \
-       compiler/stz-vm-bindings.stanza \
-       compiler/stz-vm-ids.stanza \
-       compiler/stz-el-to-vm.stanza \
-       compiler/stz-vm-normalize.stanza \
-       compiler/stz-compiler.stanza \
-       compiler/stz-arg-parser.stanza \
-       compiler/stz-langs.stanza \
-       compiler/lang-renamer.stanza \
-       compiler/lang-resolver.stanza \
-       compiler/lang-serializer.stanza \
-       compiler/stz-test-lang.stanza \
-       compiler/stz-codegen.stanza \
-       compiler/stz-reg-alloc.stanza \
-       compiler/stz-stitcher.stanza \
-       compiler/stz-const-pool.stanza \
-       compiler/stz-data-pool.stanza \
-       compiler/stz-padder.stanza \
-       compiler/stz-build.stanza \
-       compiler/stz-repl.stanza \
-       compiler/stz-config.stanza \
-       compiler/stz-asm-ir.stanza \
-       compiler/stz-asm-emitter.stanza \
-       compiler/stz-pkg.stanza \
-       compiler/stz-backend.stanza \
-       compiler/stz-gen-bindings.stanza \
-       compiler/stz-dependencies.stanza \
-       compiler/stz-call-records.stanza \
-       compiler/stz-main.stanza \
-       compiler/stz-driver.stanza"
-
-#Pkg source files
-PKGFILES="compiler/stz-test-framework.stanza \
-          compiler/stz-test-driver.stanza"
+#Pkg packages
+PKGFILES="stz/test-driver"
 
 #Delete pkg files
 rm -rf pkgs
@@ -113,25 +26,14 @@ mkdir -p lpkgs
 
 #Compile OSX Pkgs and Executable
 echo "Compiling OSX Pkgs"
-$STANZA $FILES -pkg pkgs
-$STANZA $PKGFILES -pkg pkgs
-echo "Compiling OSX Executable"
-$STANZA $FILES -pkg pkgs -s stanza.s -optimize
-$STANZA $PKGFILES -pkg pkgs -optimize
+$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg pkgs
+$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg pkgs -optimize
+$STANZA compiler/stanza.proj stz/driver -pkg pkgs -s stanza.s -optimize
 
 #Compile Linux Pkgs and Executable
-echo "Compiling Linux Pkgs"
-$STANZA $FILES -pkg lpkgs -platform linux
-$STANZA $PKGFILES -pkg lpkgs -platform linux
-echo "Compiling Linux Executable"
-$STANZA $FILES -pkg lpkgs -s lstanza.s -platform linux -optimize
-$STANZA $PKGFILES -pkg lpkgs -platform linux -optimize
-
-#Compile Windows Pkgs and Executable
-#echo "Compiling Windows Pkgs"
-#$STANZA $FILES -pkg wpkgs -platform windows
-#echo "Compiling Windows Executable"
-#$STANZA $FILES -pkg wfast-pkgs -optimize -s wstanza.s -platform windows
+$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg lpkgs -platform linux
+$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg lpkgs -optimize -platform linux
+$STANZA compiler/stanza.proj stz/driver -pkg lpkgs -s lstanza.s -optimize -platform linux
 
 #Finish on osx
 #gcc -std=gnu99 -c compiler/cvm.c -O3 -o cvm.o
