@@ -26,14 +26,17 @@ mkdir -p lpkgs
 
 #Compile OSX Pkgs and Executable
 echo "Compiling OSX Pkgs"
-$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg pkgs
-$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg pkgs -optimize
-$STANZA compiler/stanza.proj stz/driver -pkg pkgs -s stanza.s -optimize
+$STANZA build-stanza.proj stz/driver $PKGFILES -pkg pkgs
+$STANZA build-stanza.proj stz/driver $PKGFILES -pkg pkgs -optimize
+echo "Compiling OSX Executable"
+$STANZA build-stanza.proj stz/driver -pkg pkgs -s stanza.s -optimize
 
 #Compile Linux Pkgs and Executable
-$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg lpkgs -platform linux
-$STANZA compiler/stanza.proj stz/driver $PKGFILES -pkg lpkgs -optimize -platform linux
-$STANZA compiler/stanza.proj stz/driver -pkg lpkgs -s lstanza.s -optimize -platform linux
+echo "Compiling Linux Pkgs"
+$STANZA build-stanza.proj stz/driver $PKGFILES -pkg lpkgs -platform linux
+$STANZA build-stanza.proj stz/driver $PKGFILES -pkg lpkgs -optimize -platform linux
+echo "Compiling Linux Executable"
+$STANZA build-stanza.proj stz/driver -pkg lpkgs -s lstanza.s -optimize -platform linux
 
 #Finish on osx
 #gcc -std=gnu99 -c compiler/cvm.c -O3 -o cvm.o
