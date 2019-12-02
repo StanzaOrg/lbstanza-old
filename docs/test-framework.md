@@ -64,7 +64,7 @@ deftest mytest :
 
 `deftest` is never included unless the source file is compiled as a test.
 
-# Running Tests
+# Compiling and Running Tests
 
 ## Compiling a test executable
 
@@ -94,5 +94,31 @@ stanza compile-test mytests.stanza -o mytests
 
 ```
 ./mytests -not-tagged flaky
+```
+
+### Run the test and save the output to a log directory
+
+```
+./mytests -log logs
+```
+
+# Running Tests in the Virtual Machine
+
+### Running the tests
+
+```
+stanza run-test mytests.stanza
+```
+
+### Running the tests with the given name
+
+```
+stanza run-test mytests.stanza -named mytest1 mytest2
+```
+
+### Running the tests tagged with a given tag
+
+```
+stanza run-test mytests.stanza -tagged short
 ```
 
