@@ -144,40 +144,28 @@ defn ensure-unique-identifiers! (epackage:EPackage) :
 ;======================= Pruning ============================
 ;============================================================
 
-val trace? = false
+val trace? = true
 
 ;; roots that need to be traced
 ;; globals are there because their values might have side effects
+;;
+;; the roots and their traceable fields are
+;; EInit          -> body:EBody
+;; EDefStruct     -> parent:False|EType, base:Tuple<EType>, items:EType|False
+;; EEXternFn      -> func|EFn
+;; EDefType       -> parent:False|EType
+;; EDefTypeObject -> type:EType
+;; EDefGlobal     -> type:EType
 defn roots (epackage:EPackage) -> Seqable<ETExp> :
   for e in exps(epackage) filter :
     match(e) :
-      (e:EInit|EDefGlobal|EDefStruct|EExternFn|EDefType|EDefObject|EDefTypeObject) : true ;; EExtern|
+      (e:EInit|EDefStruct|EExternFn|EDefType|EDefTypeObject|EDefGlobal) : true ;; EExtern|EDefObject
       (e) : false
 
 ;; definitions that need to be in runtime and aren't traceable from roots
 defn predefines (epackage:EPackage) -> Seqable<EDefn> :
   val iotable = IOTable(packageio(epackage))
-  val predefines-ids = [
-    CORE-LIVENESS-TRACKER-ID
-    CORE-ARITY-ERROR-ID
-    CORE-NO-METHOD-ERROR-ID
-    CORE-AMB-METHOD-ERROR-ID
-    CORE-TUPLE-LENGTH-ERROR-ID
-    CORE-NO-BRANCH-ERROR-ID
-    CORE-AMB-BRANCH-ERROR-ID
-    CORE-CAST-ERROR-ID
-    CORE-VARIABLE-UNINITIALIZED-ERROR-ID
-    CORE-INVALID-RETURN-ID
-    CORE-VOID-TUPLE-ID
-    CORE-INIT-CONSTS-ID
-    CORE-EXTEND-HEAP-ID
-    CORE-EXTEND-STACK-ID
-    CORE-PRINT-STACK-TRACE-ID
-    CORE-COLLECT-GARBAGE-ID
-    CORE-CLASS-NAME-ID
-    CORE-MAKE-STRING-ID
-    CORE-EXECUTE-TOPLEVEL-COMMAND-ID]
-  val predefines = to-intset $ for i in predefines-ids seq : n(iotable, i)
+  val predefines = to-intset $ for i in core-ids() seq : n(iotable, i)
   generate<EDefn> :
     for e in exps(epackage) do :
       match(e) :
@@ -203,8 +191,40 @@ defn methods (epackage:EPackage) -> IntTable<List<Int>> :
       (e) : false
   tab
 
-;; main function for tracing produces set of reachables and defined-objects
-defn walk-reachable-defs (e:ETExp, q:Queue<ETExp>, defs:IntTable<ETExp>, methods:IntTable<List<Int>>, visited?:IntSet, reachables:IntSet, defined-objects:IntSet, parents:IntTable<Int>) :
+;; find global vars with that are not read but may be initialized
+defn unused-global-vars (epackage:EPackage) -> IntSet :
+  val iotable = IOTable(packageio(epackage))
+  val num-reads = IntTable<Int>(0)
+  val num-writes = IntTable<Int>(0)
+  val globals = IntSet()
+  for e in exps(epackage) do :
+    match(e) :
+      (e:EDefGlobal) : add(globals, n(e))
+      (e) : false
+  defn* walk (e:ELItem) :
+    match(e) :
+      (e:EStore) :
+        match(loc(e)) :
+          (l:EVarLoc) : if globals[n(l)] : num-writes[n(l)] = num-writes[n(l)] + 1
+          (l)         : false
+        walk(y(e))
+      (e:EVar|EVarLoc) : if globals[n(e)] : num-reads[n(e)] = num-reads[n(e)] + 1
+      (e) :              do(walk, e)
+  for e in exps(epackage) do : walk(e)
+  val unused-globals = IntSet()
+  for gv in to-list $ globals do :
+    if num-reads[gv] == 0 and num-writes[gv] <= 1 :
+      ;; println("%_ %_: %_ READS %_ WRITES" % [gv, iotable[gv], num-reads[gv], num-writes[gv]]) when trace?
+      add(unused-globals, gv) 
+  unused-globals
+
+;; main function for tracing produces set of reachables and parents for tracing where
+;; reachables are traced from program/data roots and
+;; parents are ids of parents in trace useful for determining why something is reachable
+;; walks
+;; o methods when ref to multi is traversed
+;; o multi when defmethod is traversed
+defn walk-reachable-defs (e:ETExp, q:Queue<ETExp>, defs:IntTable<ETExp>, methods:IntTable<List<Int>>, visited?:IntSet, reachables:IntSet, parents:IntTable<Int>) :
   match(e) :
     (e:EDefGlobal|EDefStruct|EExternFn|EExtern|EDefType|EDefObject|EDefTypeObject) : add(reachables, n(e))
     (e) : false
@@ -213,49 +233,29 @@ defn walk-reachable-defs (e:ETExp, q:Queue<ETExp>, defs:IntTable<ETExp>, methods
     (e) : -1
   let walk (e:ELItem = e) :
     defn maybe-walk (id:Int) :
-      if add(visited?, id) :
-        if key?(defs, id) :
-          add(reachables, id)
-          parents[id] = pid
-          add(q, defs[id])
+      if add(visited?, id) and key?(defs, id) :
+        add(reachables, id)
+        parents[id] = pid
+        add(q, defs[id])
     match(e) :
       (e:EVar|EVarLoc) :
         maybe-walk(n(e))
         if key?(methods, n(e)) :  ;; is a multi?
           for m in methods[n(e)] do : maybe-walk(m)
-      (e:EDefObject|ELocalObj) :
-        add(defined-objects, n(e))
-        do(walk, e)
       (e:EDefmethod) :
         maybe-walk(multi(e)) ;; compiler needs multi to be there if method is reachable
         do(walk, e)
       (e:ELItem) :
         do(walk, e)
 
-;; find all defined-objects inside package
-defn find-defined-objects (epackage:EPackage) -> IntSet :
-  val defined-objects = IntSet()
-  defn* walk (e:ELItem) :
-    match(e) :
-      (e:EDefObject|ELocalObj) :
-        add(defined-objects, n(e))
-        do(walk, e)
-      (e) :
-        do(walk, e)
-  for exp in exps(epackage) do :
-    walk(exp)
-  defined-objects
-
-;; find all reachable defs and defined-objects and also returns complete set of defined-objects
-defn walk-reachable-defs (epackage:EPackage) -> [IntSet, IntSet, IntSet, IntTable<Int>] :
+;; find all reachable defs and parents
+defn walk-reachable-defs (epackage:EPackage) -> [IntSet, IntTable<Int>] :
   val defs = defs(epackage)
   val methods = methods(epackage)
   val q = Queue<ETExp>()
   val visited? = IntSet()
   val reachables = IntSet()
   val parents = IntTable<Int>(-1)
-  val defined-objects = IntSet()
-  val orig-defined-objects = find-defined-objects(epackage)
   for root in roots(epackage) do :
     add(q, root)
   for predef in predefines(epackage) do :
@@ -263,10 +263,9 @@ defn walk-reachable-defs (epackage:EPackage) -> [IntSet, IntSet, IntSet, IntTabl
     add(q, predef)
   while not empty?(q) :
     val def = pop(q)
-    walk-reachable-defs(def, q, defs, methods, visited?, reachables, defined-objects, parents)
+    walk-reachable-defs(def, q, defs, methods, visited?, reachables, parents)
   println("FOUND %_ REACHABLE OUT OF %_ DEFINED" % [length(reachables), length(defs)]) when trace?
-  println("FOUND %_ DEFINED-OBJECTS OUT OF %_ ORIG-DEFINED-OBJECTS" % [length(defined-objects), length(orig-defined-objects)]) when trace?
-  [reachables, orig-defined-objects, defined-objects, parents]
+  [reachables, parents]
 
 ;; walk all top level forms and check that all vars are defined
 defn check-vars-defined (epackage:EPackage, odefs:IntTable<ETExp>) :
@@ -285,38 +284,29 @@ defn check-vars-defined (epackage:EPackage, odefs:IntTable<ETExp>) :
     check(e, odefs, defs, undefines)
   println("UNDEFINES %_" % [to-tuple $ qsort $ undefines]) when not empty?(undefines)
 
-defn prune-package (epackage:EPackage, gvt:VarTable) -> EPackage :
+defn prune-package (epackage:EPackage) -> EPackage :
   val iotable = IOTable(packageio(epackage))
-  val [reachables, orig-defined-objects, defined-objects, parents] = walk-reachable-defs(epackage)
+  val [reachables, parents] = walk-reachable-defs(epackage)
 
-  defn undefined-objects? (e:EType) :
-    var undefined? = false
-    let walk (e:ELItem = e) :
-      match(e) :
-        (e:EVar) :
-          if orig-defined-objects[n(e)] and not defined-objects[n(e)] :
-            undefined? = true
-        (e) :
-          do(walk, e)
-    undefined?
+  val unused-vars = unused-global-vars(epackage)
+
+  if trace? :
+    val defs = defs(epackage)
+    for v in unused-vars do :
+      println("UNUSED %_ / %_" % [defs[v] iotable[v]])
 
   defn defined? (e:ETExp) :
     match(e) :
-      (e:EDefn|EDefClosure|EDefmulti) :
+      (e:EDefn|EDefClosure|EDefmulti|EDefmethod) :
         reachables[n(e)]
-      (e:EDefmethod) :
-        val res = reachables[n(e)] and not any?(undefined-objects?, targs(e))
-        println("REMOVING %_ -> %_ %_" % [n(e), iotable[multi(e)], targs(e)]) when (trace? and not res)
-        res
-        ;; reachables[n(e)]
-      (e:EDefGlobal|EDefStruct|EExternFn|EExtern|EDefType|EDefObject|EDefTypeObject) :
+      (e:EDefGlobal) :
+        not unused-vars[n(e)]
+      (e:EDefStruct|EExternFn|EExtern|EDefType|EDefObject|EDefTypeObject) :
         true
       (e) :
         true
 
-  println(qsort $ reachables) when trace?
-
-  ;; remove all unreachable defs from package
+  ;; remove all methods on unreachable multis from package
   defn prune (e:ETExp, reachables:IntSet) -> ETExp :
     defn* walk (e:ELItem) -> ELItem :
       match(e) :
@@ -327,22 +317,42 @@ defn prune-package (epackage:EPackage, gvt:VarTable) -> EPackage :
           map(walk, e)
     walk(e) as ETExp
 
+  ;; remove unreachable imports/exports 
   defn prune-packageio (packageio:PackageIO, defined?:IntSet) -> PackageIO :
     PackageIO(package(packageio), imported-packages(packageio),
               to-tuple $ for i in imports(packageio) filter : defined?[n(i)],
               to-tuple $ for e in exports(packageio) filter : defined?[n(e)])
 
+  ;; remove inits corresponding to unused global vars
+  defn prune-inits (exps:Seqable<ETExp>) -> Seq<ETExp> :
+    defn remove-unused-stores (ins:Tuple<EIns>) -> Seq<EIns> :
+      defn unused-store? (i:EIns) -> True|False :
+        match(i) :
+          (i:EStore) :
+            match(loc(i)) :
+              (l:EVarLoc) : unused-vars[n(l)]
+              (l)         : false
+          (e) : false
+      for i in ins filter : not unused-store?(i)
+    for e in exps seq :
+      match(e) :
+        (e:EInit) : sub-body(e, sub-ins(body(e), to-tuple $ remove-unused-stores $ ins(body(e))))
+        (e) :       e
+
   val etexps = for exp in exps(epackage) filter : defined?(exp)
   val new-packageio = prune-packageio(packageio(epackage), reachables)
-  val res = EPackage(new-packageio, to-tuple $ for e in etexps seq : prune(e, reachables))
-  val defs = defs(epackage)
-  val tree = to-list $ for kv in parents seq : List(key(kv), value(kv))
-  val symbol-table = to-list $ for ie in cat(imports(new-packageio), exports(new-packageio)) seq :
-    val n = n(ie)
-    val rec = rec(ie)
-    List(n, List(package(id(rec)), name(id(rec))))
-  spit("parents.txt", List(symbol-table, tree))
-  check-vars-defined(res, defs)
+  val new-exps = for e in etexps seq : prune(e, reachables)
+  val res = EPackage(new-packageio, to-tuple $ prune-inits $ new-exps)
+
+  if trace? :
+    val defs = defs(epackage)
+    val tree = to-list $ for kv in parents seq : List(key(kv), value(kv))
+    val symbol-table = to-list $ for ie in cat(imports(new-packageio), exports(new-packageio)) seq :
+      val n = n(ie)
+      val rec = rec(ie)
+      List(n, List(package(id(rec)), name(id(rec))))
+    spit("parents.txt", List(symbol-table, tree))
+    check-vars-defined(res, defs)
   res
 
 ;============================================================
