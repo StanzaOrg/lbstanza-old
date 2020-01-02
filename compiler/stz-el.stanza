@@ -144,7 +144,7 @@ defn ensure-unique-identifiers! (epackage:EPackage) :
 ;======================= Pruning ============================
 ;============================================================
 
-val trace? = true
+val trace? = false
 
 ;; roots that need to be traced
 ;; globals are there because their values might have side effects
@@ -191,32 +191,24 @@ defn methods (epackage:EPackage) -> IntTable<List<Int>> :
       (e) : false
   tab
 
-;; find global vars with that are not read but may be initialized
+;; find global vars with that are not read but are written such as in initialization code
 defn unused-global-vars (epackage:EPackage) -> IntSet :
   val iotable = IOTable(packageio(epackage))
   val num-reads = IntTable<Int>(0)
-  val num-writes = IntTable<Int>(0)
   val globals = IntSet()
   for e in exps(epackage) do :
-    match(e) :
-      (e:EDefGlobal) : add(globals, n(e))
-      (e) : false
+    match(e:EDefGlobal) : add(globals, n(e))
   defn* walk (e:ELItem) :
     match(e) :
       (e:EStore) :
         match(loc(e)) :
-          (l:EVarLoc) : if globals[n(l)] : num-writes[n(l)] = num-writes[n(l)] + 1
-          (l)         : false
+          (l:EVarLoc) : if not globals[n(l)] : walk(loc(e)) ;; avoid counting reads in a write
+          (l) :         walk(loc(e))
         walk(y(e))
       (e:EVar|EVarLoc) : if globals[n(e)] : num-reads[n(e)] = num-reads[n(e)] + 1
       (e) :              do(walk, e)
   for e in exps(epackage) do : walk(e)
-  val unused-globals = IntSet()
-  for gv in to-list $ globals do :
-    if num-reads[gv] == 0 and num-writes[gv] <= 1 :
-      ;; println("%_ %_: %_ READS %_ WRITES" % [gv, iotable[gv], num-reads[gv], num-writes[gv]]) when trace?
-      add(unused-globals, gv) 
-  unused-globals
+  to-intset $ for gv in globals filter : num-reads[gv] == 0
 
 ;; main function for tracing produces set of reachables and parents for tracing where
 ;; reachables are traced from program/data roots and
@@ -238,6 +230,9 @@ defn walk-reachable-defs (e:ETExp, q:Queue<ETExp>, defs:IntTable<ETExp>, methods
         parents[id] = pid
         add(q, defs[id])
     match(e) :
+      (e:EStore) :
+        if loc(e) is-not EVarLoc : walk(loc(e))
+        walk(y(e))
       (e:EVar|EVarLoc) :
         maybe-walk(n(e))
         if key?(methods, n(e)) :  ;; is a multi?
@@ -323,28 +318,36 @@ defn prune-package (epackage:EPackage) -> EPackage :
               to-tuple $ for i in imports(packageio) filter : defined?[n(i)],
               to-tuple $ for e in exports(packageio) filter : defined?[n(e)])
 
-  ;; remove inits corresponding to unused global vars
-  defn prune-inits (exps:Seqable<ETExp>) -> Seq<ETExp> :
-    defn remove-unused-stores (ins:Tuple<EIns>) -> Seq<EIns> :
-      defn unused-store? (i:EIns) -> True|False :
-        match(i) :
-          (i:EStore) :
-            match(loc(i)) :
-              (l:EVarLoc) : unused-vars[n(l)]
-              (l)         : false
-          (e) : false
-      for i in ins filter : not unused-store?(i)
-    for e in exps seq :
+  ;; remove store instructions that are on vars that are only written to not read from
+  defn remove-unused-var-stores (exps:Seqable<ETExp>) -> Seq<ETExp> :
+    defn* walk (e:ELItem) -> ELItem :
+      defn remove-unused-stores (ins:Tuple<EIns>) -> Seq<EIns> :
+        for i in ins filter : 
+          match(i) :
+            (i:EStore) :
+              match(loc(i)) :
+                (l:EVarLoc) : not unused-vars[n(l)]
+                (l)         : true
+            (e) : true
       match(e) :
-        (e:EInit) : sub-body(e, sub-ins(body(e), to-tuple $ remove-unused-stores $ ins(body(e))))
-        (e) :       e
+        (e:EType|EDefGlobal|EDefmulti|EDefStruct|EExtern|EDefType|EDefObject|EDefTypeObject) :
+          e
+        (e:EBody) :
+          EBody(map(walk, locals(e)) as Tuple<ELocal>, map(walk, localtypes(e)) as Tuple<ELocalType>,
+                map(walk, localfns(e)) as Tuple<ELocalFn>, map(walk, localobjs(e)) as Tuple<ELocalObj>,
+                (to-tuple $ seq(walk, remove-unused-stores(ins(e)))) as Tuple<EIns>)
+        (e) :
+          map(walk, e)
+    val res = for e in exps seq : walk(e)
+    res as Seq<ETExp>
 
   val etexps = for exp in exps(epackage) filter : defined?(exp)
   val new-packageio = prune-packageio(packageio(epackage), reachables)
   val new-exps = for e in etexps seq : prune(e, reachables)
-  val res = EPackage(new-packageio, to-tuple $ prune-inits $ new-exps)
+  val res = EPackage(new-packageio, to-tuple $ remove-unused-var-stores $ new-exps)
 
   if trace? :
+    ;; write out file that can be used to find trace path to variable to understand why it's held onto
     val defs = defs(epackage)
     val tree = to-list $ for kv in parents seq : List(key(kv), value(kv))
     val symbol-table = to-list $ for ie in cat(imports(new-packageio), exports(new-packageio)) seq :
