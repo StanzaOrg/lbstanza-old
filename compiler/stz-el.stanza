@@ -85,6 +85,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   run-pass("Lift Objects", lift-objects, "objlifted", true)
   if optimize? :
     run-pass("Resolve Methods", resolve-methods, "resolved-methods", false)
+    run-pass("Fold Ifs", fold-ifs, "fold-ifs", false)
   run-pass("Lift Closures", lift-closures, "closurelifted", false)
   run-pass("Lift Type Objects", lift-type-objects, "typelifted", false)
 
@@ -2368,6 +2369,130 @@ defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
 defstruct MethodDag :
   dag: Dag
   targets: Tuple<Int>
+
+;============================================================
+;====================== FOLD IFS ============================
+;============================================================
+
+defstruct IfRewrite :
+  old-if : EIf
+  new-if : EIf
+with:
+  printer => true
+
+defn match-if (return:() -> Void, inz:Seq<EIns>) -> EIf :
+  return() when empty?(inz)
+  match(peek(inz)) :
+    (ins:EIf) : next(inz) as EIf
+    (ins) :     return()
+
+defn match-label (return:() -> Void, inz:Seq<EIns>, target:Int) :
+  return() when empty?(inz)
+  match(peek(inz)) :
+    (ins:ELabel) :
+      if n(ins) == target: next(inz)
+      else : return()
+    (ins) :  return()
+
+defn maybe-match-live (inz:Seq<EIns>) :
+  if not empty?(inz) :
+    match(peek(inz)) :
+      (ins:ELive) : next(inz)
+      (ins) :       false
+
+defn match-def (return:() -> Void, inz:Seq<EIns>, var-loc:False|EVarLoc, target:ELSLiteral) -> EVarLoc :
+  return() when empty?(inz)
+  match(peek(inz)) :
+    (ins:EDef) :
+      match(y(ins)) :
+        (t:ELSLiteral) :
+          if value(target) == value(t) :
+            match(var-loc) :
+              (var-loc:EVarLoc) :
+                if n(x(ins)) == n(var-loc) : (next(inz), x(ins))
+                else : return()
+              (var-loc) :
+                (next(inz), x(ins))
+          else : return()
+        (t) : return()
+    (ins) : return()
+
+defn match-goto (return:() -> Void, inz:Seq<EIns>, target:False|Int) -> Int :
+  return() when empty?(inz)
+  match(peek(inz)) :
+    (ins:EGoto) :
+      match(target) :
+        (target:Int) :
+          if n(ins) == target : (next(inz), n(ins))
+          else : return()
+        (target) : (next(inz), n(ins))
+    (ins) :  return()
+
+defn match-match (return:() -> Void, vt:VarTable, inz:Seq<EIns>, arg:Int) -> EMatch :
+  return() when empty?(inz)
+  match(peek(inz)) :
+    (ins:EMatch) :
+      if length(ys(ins)) == 1 and length(branches(ins)) == 2 :
+        match(ys(ins)[0], types(branches(ins)[0])[0], types(branches(ins)[1])[0]) :
+          (v:EVar, bt0:EOf, bt1:EOf) :
+            if n(v) == arg and n(bt0) == n(iotable(vt), CORE-TRUE-ID) and n(bt1) == n(iotable(vt), CORE-FALSE-ID) :
+              next(inz) as EMatch
+            else : return()
+          (y, bt0, bt1) : return()
+      else : return()
+    (ins) : return()
+
+defn match-if-match (inz:Seq<EIns>, vt:VarTable) -> Maybe<IfRewrite> :
+  label<Maybe<IfRewrite>> top-return:
+    defn return () : top-return(None())
+    val if-ins = match-if(return, inz)
+    match-label(return, inz, n2(if-ins))
+    maybe-match-live(inz)
+    val merge-var = match-def(return, inz, false, ELSLiteral(false))
+    val merge-label = match-goto(return, inz, false)
+    match-label(return, inz, n1(if-ins))
+    maybe-match-live(inz)
+    match-def(return, inz, merge-var, ELSLiteral(true))
+    match-goto(return, inz, merge-label)
+    match-label(return, inz, merge-label)
+    val match-ins = match-match(return, vt, inz, n(merge-var))
+    One(IfRewrite(if-ins, EIf(n(branches(match-ins)[0]), n(branches(match-ins)[1]), false, ys(if-ins))))
+
+defn fold-ifs (epackage:EPackage, gvt:VarTable) -> EPackage :
+  defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
+    val inz = to-seq $ ins(e)
+    val rewrites = Queue<IfRewrite>()
+    let loop () :
+      match(match-if-match(inz, vt)) :
+        (ir:One<IfRewrite>) :
+          add(rewrites, value(ir))
+        (none) : false
+      if not empty?(inz) :
+        next(inz)
+        loop()
+    if empty?(rewrites) :
+      e
+    else :
+      defn eq-if? (a:EIf, b:EIf) -> True|False :
+        if n1(a) == n1(b) and n2(a) == n2(b) and length(ys(a)) == length(ys(b)) :
+          match(op(a), op(b), ys(a)[0], ys(b)[0]) :
+            (oa:False, ob:False, av:EVar, bv:EVar) : n(av) == n(bv)
+            (oa, ob, ai, bi) :                       false
+      val new-ins = for ins in ins(e) map :
+        if empty?(rewrites) :
+          ins
+        else :
+          match(ins, peek(rewrites)) :
+            (ins:EIf, rewrite:IfRewrite) : (pop(rewrites), new-if(rewrite) when eq-if?(ins, old-if(rewrite)) else ins)
+            (ins, rewrite) :               ins
+      sub-ins(e, new-ins)
+  defn resolve-texp (x:ETExp, vt:VarTable) :
+    val result = let loop (x:ELBigItem = x) :
+      match(map(loop, x)) :
+        (e:EBody) : fold-in-body(e,vt)
+        (e) : e
+    result as ETExp
+  map-with-var-table(resolve-texp, gvt, epackage)
 
 ;============================================================
 ;=================== Closure Lifting ========================
