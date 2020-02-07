@@ -1,6 +1,7 @@
 defpackage stz/el :
   import core
   import collections
+  import stz/params
   import stz/dl-ir
   import stz/el-ir
   import stz/utils
@@ -65,6 +66,8 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
 
   ;Dump input
   ;dump(cur-package, "logs", "input")
+  if optimize? :
+    run-pass("Prune Package 1", prune-package, "prune1", true) when DEAD-STRIPPING?
   run-pass("Map Methods", map-methods, "mapped-methods", false)
   run-pass("Create Closures", create-closures, "closures", false)
   run-pass("Convert Mixes", convert-mixes, "mixes", false)
@@ -85,6 +88,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   run-pass("Lift Objects", lift-objects, "objlifted", true)
   if optimize? :
     run-pass("Resolve Methods", resolve-methods, "resolved-methods", false)
+    run-pass("Prune Package 2", prune-package, "prune2", true) when DEAD-STRIPPING?
   run-pass("Lift Closures", lift-closures, "closurelifted", false)
   run-pass("Lift Type Objects", lift-type-objects, "typelifted", false)
 
@@ -129,6 +133,175 @@ defn ensure-unique-identifiers! (epackage:EPackage) :
       defmethod print (o:OutputStream, this) :
         print(o, "The following identifiers are declared more than once: %," % [non-unique])
         print(o, "\nThe program is as follows:\n%_" % [epackage])
+
+;============================================================
+;======================= Pruning ============================
+;============================================================
+
+;Retrieve identifier of top-level declaration if it has one.
+defn identifier? (e:ETExp) -> Int|False :
+  match(e:EDefGlobal|EDefn|EDefClosure|EDefmulti|EDefmethod|EDefStruct|
+          EExternFn|EExtern|EDefType|EDefObject|EDefTypeObject) :
+    n(e)
+
+;Definitions that need to be in runtime and aren't traceable from roots.
+defn predefines (epackage:EPackage) -> Seqable<ETExp> :
+  val iotable = IOTable(packageio(epackage))
+  val predefines = to-intset $ for id in core-ids() seq : n(iotable, id)
+  for e in exps(epackage) filter :
+    val n = identifier?(e)
+    match(n:Int) : predefines[n]
+
+;Ids to definitions table.
+defn defs (epackage:EPackage) -> IntTable<ETExp> :
+  to-inttable<ETExp> $
+    for e in exps(epackage) seq? :
+      val n = identifier?(e)
+      match(n:Int) : One(n => e)
+      else : None()
+
+;Find all reachable defs from program/data roots of package and parents.
+;Returns:
+;  - Set of reachable ids traced from roots of package.
+;  - Id to ETExp table.
+;  - Parent of each reachable id. (Used for determining why something was reached.)
+;
+;Algorithm for reachability:
+;  - All EVar and EVarLoc objects are reachable if they are contained within a
+;    reachable definition.
+;  - All methods are reachable when its multi is reachable.
+;  - A multi is reachable when any of its methods is reachable. (Necessary for after
+;    resolve-methods pass, as methods can be referred to directly).
+;The following top-level declarations are considered roots, and their associated
+;tracable fields are:
+;  EInit          -> body:EBody  (This is always evaluated.)
+;  EExternFn      -> func|EFn
+
+defn walk-reachable-defs (epackage:EPackage) -> [IntSet, IntTable<ETExp>, IntTable<Int>] :
+  val defs = defs(epackage)                    ;id to ETExp's
+  val method-ids = IntTable<List<Int>>(List()) ;multi ids to list of their method ids
+  for e in exps(epackage) do :
+    match(e:EDefmethod) : method-ids[multi(e)] = cons(n(e), method-ids[multi(e)])
+  val q = Queue<ETExp>()          ;for walking todo list
+  val visited? = IntSet()         ;for not walking things twice
+  val reachables = IntSet()       ;set of traceable etexps
+  val parents = IntTable<Int>(-1) ;parents ids in trace
+  defn walk-top (e:ETExp) :
+    val pid = match(identifier?(e)) :
+      (n:Int)   : (add(reachables, n), n)
+      (f:False) : -1
+    let walk (e:ELItem = e) :
+      defn maybe-walk (id:Int) :
+        if add(visited?, id) and key?(defs, id) :
+          parents[id] = pid
+          add(q, defs[id])
+      match(e) :
+        (e:EStore) :
+          if loc(e) is-not EVarLoc : walk(loc(e))
+          walk(y(e))
+        (e:EVar|EVarLoc) :
+          maybe-walk(n(e))
+        (e:EStructT|EOf|EField) :
+          maybe-walk(n(e))
+        (e:ENew|EObject|EObject|EArray|EStruct|ETypeObject|ENewObject|EObjectGet|EObjectTGet|
+           EConstClosure|EClosureGet|EClosureTGet|EClosure) :
+          maybe-walk(n(e))
+          do(walk, e)
+        (e:EDefClosure) :
+          maybe-walk(closure(e))
+          do(walk, e)
+        (e:EDefmulti) :
+          do(maybe-walk, method-ids[n(e)])
+          do(walk, e)
+        (e:ELItem) :
+          do(walk, e)
+
+  do(walk-top, filter-by<EInit|EExternFn>(exps(epackage)))
+  do(walk-top, predefines(epackage))
+  while not empty?(q) : walk-top(pop(q))
+  [reachables, defs, parents]
+
+;Top level for tree shaking package removing all unreachable vars and all unread global vars.
+defn prune-package (epackage:EPackage) -> EPackage :
+  val iotable = IOTable(packageio(epackage))
+  val [reachables, defs, parents] = walk-reachable-defs(epackage)
+
+  defn keep? (e:ETExp) :
+    match(identifier?(e)) :
+      (n:Int) :   reachables[n]
+      (f:False) : true
+
+  ;Remove all methods on unreachable multis from package.
+  defn prune-methods (e:ETExp, reachables:IntSet) -> ETExp :
+    defn* walk (e:ELItem) -> ELItem :
+      match(map(walk,e)) :
+        (e:ELocalObj) :
+          val methods = for m in methods(e) filter : reachables[multi(m)]
+          sub-methods(e, to-tuple $ methods)
+        (e) :
+          e
+    walk(e) as ETExp
+
+  ;Remove unreachable imports/exports.
+  defn prune-packageio (packageio:PackageIO, defined?:IntSet) -> PackageIO :
+    PackageIO(package(packageio), imported-packages(packageio),
+              to-tuple $ for i in imports(packageio) filter : defined?[n(i)],
+              to-tuple $ for e in exports(packageio) filter : defined?[n(e)])
+
+  val globals = to-intset $ for e in exps(epackage) seq? :
+    match(e:EDefGlobal) : One(n(e))
+    else : None()
+
+  ;Remove store instructions that are on vars that are only written to not read from.
+  defn remove-unused-var-stores (exps:Seqable<ETExp>) -> Seq<ETExp> :
+    defn* walk (e:ELItem) -> ELItem :
+      defn remove-unused-stores (ins:Tuple<EIns>) -> Seq<EIns> :
+        for i in ins filter : 
+          match(i:EStore) :
+            match(loc(i)) :
+              (l:EVarLoc) : not globals[n(l)] or reachables[n(l)]
+              (l)         : true
+          else: true
+      match(e) :
+        (e:EType|EDefGlobal|EDefmulti|EDefStruct|EExtern|EDefType|EDefObject|EDefTypeObject) :
+          e
+        (e:EBody) :
+          val e* = map(walk, e)
+          val ins* = to-tuple $ remove-unused-stores(ins(e*))
+          sub-ins(e*, ins*)
+        (e) :
+          map(walk, e)
+    val res = for e in exps seq :
+      walk(e)
+    res as Seq<ETExp>
+
+  val multis = to-intset $ for id in reachables seq? :
+    val e = defs[id]
+    match(e:EDefmulti) : One(n(e))
+    else : None()
+
+  ;Change all methods without multis to defns.
+  defn promote-methods (exps:Seqable<ETExp>) -> Seq<ETExp> :
+    for e in exps seq :
+      match(e:EDefmethod) : e when multis[multi(e)] else EDefn(n(e), func(e), lostanza?(e))
+      else : e
+
+  ;Top-level work.
+  val new-packageio = prune-packageio(packageio(epackage), reachables)
+  val kept-exps = for e in filter(keep?, exps(epackage)) seq : prune-methods(e, reachables)
+  val new-exps = remove-unused-var-stores $ promote-methods $ kept-exps
+  val res = EPackage(new-packageio, to-tuple $ new-exps)
+
+  if DEAD-STRIPPING-DEBUG? :
+    ;Write out file that can be used to find trace path to variable to understand why it's held onto.
+    val tree = to-list $ for kv in parents seq : List(key(kv), value(kv))
+    val symbol-table = to-list $ for ie in cat(imports(new-packageio), exports(new-packageio)) seq :
+      val n = n(ie)
+      val rec = rec(ie)
+      List(n, List(package(id(rec)), name(id(rec))))
+    spit("parents.txt", List(symbol-table, tree))
+
+  res
 
 ;============================================================
 ;===================== Collapsing ===========================
