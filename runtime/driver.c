@@ -697,8 +697,8 @@ void get_process_state (long pid, ProcessState* s, int is_wait){
 //------------------------------------------------------------
 
 #define LAUNCH_COMMAND 0
-#define STATE_COMMAND 1
-#define STATE_WAIT_COMMAND 2
+#define STATE_NO_HANG_COMMAND 1
+#define STATE_HANG_COMMAND 2
 
 void write_error_and_exit (int fd){
   int code = errno;
@@ -782,12 +782,12 @@ void launcher_main (FILE* lin, FILE* lout){
       }
     }
     //Interpret state retrieval command
-    else if(comm == STATE_COMMAND || comm == STATE_WAIT_COMMAND){
+    else if(comm == STATE_NO_HANG_COMMAND || comm == STATE_HANG_COMMAND){
       //Read in process id
       long pid = read_long(lin);
 
       //Retrieve state
-      ProcessState s; get_process_state(pid, &s, comm == STATE_WAIT_COMMAND);
+      ProcessState s; get_process_state(pid, &s, comm == STATE_HANG_COMMAND);
       write_process_state(lout, &s);
       fflush(lout);
     }
@@ -915,7 +915,7 @@ int launch_process (char* file, char** argvs,
   return 0;
 }
 
-void retrieve_process_state (long pid, ProcessState* s, char is_wait){
+void retrieve_process_state (long pid, ProcessState* s, char is_hang){
   //Check whether launcher has been initialized
   if(launcher_pid < 0){
     fprintf(stderr, "Launcher not initialized.\n");
@@ -923,7 +923,7 @@ void retrieve_process_state (long pid, ProcessState* s, char is_wait){
   }
     
   //Send command
-  int r = fputc(is_wait ? STATE_WAIT_COMMAND : STATE_COMMAND, launcher_in);
+  int r = fputc(is_hang ? STATE_HANG_COMMAND : STATE_NO_HANG_COMMAND, launcher_in);
   if(r == EOF) exit_with_error();
   write_long(launcher_in, pid);
   fflush(launcher_in);
