@@ -78,14 +78,15 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   run-pass("Box Mutables", box-mutables, "boxed", false)
   run-pass("Detect Loops", detect-loops, "looped", false)
   run-pass("Simple Inline", simple-inline, "inlined", false)
-  run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined", false)
+  run-pass("Within Package Inline", within-package-inline{_, { true }, IntSet()}, "wp-inlined", false)
   if optimize? :
     run-pass("Remove Reified Types", force-remove-types, "removed-types", true)
   run-pass("Lambda Lift", lambda-lift, "lambda", true)
   run-pass("Lift Objects", lift-objects, "objlifted", true)
   if optimize? :
-    run-pass("Resolve Methods", resolve-methods, "resolved-methods", false)
-    run-pass("Within Package Inline Methods", within-package-inline{_, true}, "wp-inlined-methods", false)
+    val methods-resolved? = IntSet()
+    run-pass("Resolve Methods", resolve-methods{_, _, { true }, methods-resolved?}, "resolved-methods", false)
+    run-pass("Within Package Inline Methods", within-package-inline{_, { methods-resolved?[_] }, IntSet()}, "wp-inlined-methods", false)
   run-pass("Lift Closures", lift-closures, "closurelifted", false)
   run-pass("Lift Type Objects", lift-type-objects, "typelifted", false)
 
@@ -179,6 +180,7 @@ defn collapse (epackages:Tuple<EPackage>) :
         (e:ETVar) : ETVar(new-id(n(e)))
         ;ETExps
         (e:EDefGlobal) : sub-n(e, new-id(n(e)))
+        (e:EInit) : sub-n(e, new-id(n(e)))
         (e:EDefn) : sub-n(e, new-id(n(e)))
         (e:EDefmulti) : sub-targs(sub-n(e, new-id(n(e))), new-id(targs(e)))
         (e:EDefmethod) : sub-multi(sub-n(e, new-id(n(e))), new-id(multi(e)))
@@ -888,7 +890,7 @@ public defn insert-guards (epackage:EPackage, gvt:VarTable) :
       emit(buffer, guard-localobj(o,vt))
     guard-body(body(e), buffer, vt, lostanza?(e), false, false)
     val body* = to-body(buffer, true, false, false)
-    EInit(body*, lostanza?(e))
+    EInit(n(e), body*, lostanza?(e))
 
   ;Overall driver
   defn analyze (e:ELBigItem, vt:VarTable) -> ELBigItem :
@@ -1477,29 +1479,48 @@ defn simple-inline (epackage:EPackage) :
 ;================== within-package-inline ===================
 ;============================================================
 
-defn within-package-inline (epackage:EPackage, methods?:True|False) :
+defn inc (t:IntTable<Int>, k:Int) -> Int :
+  update(t, { _ + 1 }, k)
+
+defn num-reads (epackage:EPackage, enabled?:Int -> True|False) -> IntTable<Int> :
+  val num-reads = IntTable<Int>(0)
+  defn walk (e:ELItem) :
+    match(e) :
+      (e:EInit) :
+        do(walk, e)
+      (e:EDefn|EDefmethod|EExternFn|EInit) :
+        do(walk, e) when enabled?(n(e))
+      (e:EVar) :
+        inc(num-reads, n(e))
+      (e) :
+        do(walk, e)
+  do(walk, exps(epackage))
+  num-reads
+
+defn within-package-inline (epackage:EPackage, enabled?:Int -> True|False, changed?:IntSet) :
   ;Table for holding inlined functions
   val inlined-functions = IntTable<ELocalFn|EDefn|EDefmethod>()
   defn add-to-inline-table (l:ELocalFn|EDefn|EDefmethod) :
     inlined-functions[n(l)] = l
       
+  val num-reads = num-reads(epackage, enabled?)
+
   ;Determine whether a function should be inlined
-  defn inline? (f:EFunction) :
+  defn leaf? (body:EBody) -> True|False :
+    not (for i in ins(body) any? : i is ECall|ETCall)
+  defn inline? (n:Int, f:EFunction, top?:True|False) :
     match(f) :
       (f:EMultifn) :
-        all?(inline?, funcs(f))
+        all?(inline?{n, _, top?}, funcs(f))
       (f:EFn) :
+        val len = length(ins(body(f)))
         empty?(localfns(body(f))) and
-        empty?(localobjs(body(f))) and
-        length(ins(body(f))) < 11 ;set to allow basic compare methods to inline
+          empty?(localobjs(body(f))) and
+          ((not top? and num-reads[n] == 1) or (len < 8 or (leaf?(body(f)) and len < 11)))
 
   for exp in exps(epackage) do :
-    if methods? :
-      match(exp:EDefmethod) :
-        add-to-inline-table(exp) when inline?(func(exp))
-    else :
-      match(exp:EDefn) :
-        add-to-inline-table(exp) when inline?(func(exp))
+    match(exp:EDefmethod|EDefn) :
+      add-to-inline-table(exp) when (inline?(n(exp), func(exp), true))
 
   defn inline-texp (e:ETExp) :
     ;Inlining a single function
@@ -1509,42 +1530,52 @@ defn within-package-inline (epackage:EPackage, methods?:True|False) :
         for f in efns find :
           arity == length(args(f))
 
-    defn inline (e:ELBigItem) :
-      match(e:EBody) :
-        if not methods? :
+    defn inline (e:ELBigItem, tops:List<Int>) :
+      match(e) :
+        (e:EBody) :
           ;Add to inline table if appropriate
           for l in localfns(e) do :
-            add-to-inline-table(l) when inline?(func(l))
-        ;Create buffer
-        val buffer = BodyBuffer(e)
-        for l in localfns(e) do :
-          emit(buffer, inline(l) as ELocalFn)
-        for o in localobjs(e) do :
-          emit(buffer, inline(o) as ELocalObj)
-        for i in ins(e) do :
-          match(i:ECall|ETCall) :
-            val f* = deconstruct-function(f(i))
-            if empty?(f*) :
-              emit(buffer, i)
-            else :
-              val [fid, targs] = value!(f*)
-              match(get-inlined-function(fid, length(ys(i)))) :
-                (func:EFn) :
-                  val [ret, tail?] = match(i) :
-                    (i:ECall) : [x(i), false]
-                    (i:ETCall) : [false, true]
-                  inline-call(buffer, ret, rename-fn(func), targs, ys(i), tail?)
-                (_:False) :
-                  emit(buffer, i)          
+            add-to-inline-table(l) when inline?(n(l), func(l), false)
+          ;Create buffer
+          val buffer = BodyBuffer(e)
+          for l in localfns(e) do :
+            emit(buffer, inline(l, cons(n(l), tops)) as ELocalFn)
+          for o in localobjs(e) do :
+            emit(buffer, inline(o, tops) as ELocalObj)
+          for i in ins(e) do :
+            match(i) :
+              (i:ECall|ETCall) :
+                val f* = deconstruct-function(f(i))
+                if empty?(f*) :
+                  emit(buffer, i)
+                else :
+                  val [fid, targs] = value!(f*)
+                  if contains?(tops, fid) :
+                    emit(buffer, i)          
+                  else:
+                    match(get-inlined-function(fid, length(ys(i)))) :
+                      (func:EFn) :
+                        val [ret, tail?] = match(i) :
+                          (i:ECall) : [x(i), false]
+                          (i:ETCall) : [false, true]
+                        for top in tops do : add(changed?, top)
+                        inline-call(buffer, ret, rename-fn(func), targs, ys(i), tail?)
+                      (_:False) :
+                        emit(buffer, i)          
+              (i) :
+                emit(buffer, i)
+          ;Return the body
+          to-body(buffer, true, false, false)
+        (e:EDefmethod|EDefn|EExternFn|EInit) :
+          if enabled?(n(e)) :
+            map(inline{_, cons(n(e), tops)}, e)
           else :
-            emit(buffer, i)
-        ;Return the body
-        to-body(buffer, true, false, false)
-      else :
-        map(inline, e)        
+            e
+        (e) :
+          map(inline{_, tops}, e)        
 
     ;Inline the top level
-    inline(e) as ETExp
+    inline(e, List()) as ETExp
 
   ;Inline all top-level expressions
   sub-exps(epackage, map(inline-texp, exps(epackage)))  
@@ -2343,9 +2374,9 @@ defn MethodTable (epackage:EPackage) :
   ;Launch
   driver()
 
-defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
+defn resolve-methods (epackage:EPackage, gvt:VarTable, enabled?: Int -> True|False, changed?:IntSet) -> EPackage :
   val method-table = MethodTable(epackage)
-  defn resolve-in-body (e:EBody, vt:VarTable) -> EBody :
+  defn resolve-in-body (e:EBody, vt:VarTable, top:False|Int) -> EBody :
     val ins* = for i in ins(e) map :
       ;Resolve target of call
       defn resolve-call (f:EImm, ys:Tuple<EImm>) -> EImm|False :
@@ -2360,7 +2391,9 @@ defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
         match(fid:Int) :
           val ys-types = map(type{vt, _}, ys)
           match(resolve-target(method-table, fid, ys-types)) :
-            (n:Int) : sub-fid(n)
+            (n:Int) :
+              match(top:Int) : (add(changed?, top))
+              sub-fid(n)
             (n:False) : false
             
       ;Resolve calls and tcalls
@@ -2372,12 +2405,16 @@ defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
         (i) : i
     sub-ins(e, ins*)
   defn resolve-texp (x:ETExp, vt:VarTable) :
-    val result = let loop (x:ELBigItem = x) :
-      match(map(loop, x)) :
-        (e:EBody) : resolve-in-body(e,vt)
-        (e) : e
+    val result = let loop (x:ELBigItem = x, top:False|Int = false) :
+      match(x) :
+        (e:EDefmethod|EDefn|EExternFn|EInit) :
+          map(loop{_, n(e)}, e)
+        (e:EBody) :
+          resolve-in-body(e,vt,top)
+        (e) :
+          map(loop{_, top}, e)
     result as ETExp
-  map-with-var-table(resolve-texp, gvt, epackage)
+  map-with-var-table(resolve-texp, gvt, epackage, enabled?)
 
 defstruct MethodDag :
   dag: Dag
@@ -2926,6 +2963,16 @@ defn join-free (fs:Seqable<Free>) :
 defn map-with-var-table (f:(ETExp, VarTable) -> ETExp, gvt:VarTable, epackage:EPackage) :
   val exps* = for e in exps(epackage) map :
     f(e, LocalVarTable(gvt, e))
+  sub-exps(epackage, exps*)
+
+;Compute a local var table for each enabled top level definition 
+defn map-with-var-table (f:(ETExp, VarTable) -> ETExp, gvt:VarTable, epackage:EPackage, enabled?:Int -> True|False) :
+  val exps* = for e in exps(epackage) map :
+    match(e) :
+      (e:EDefn|EDefmethod|EExternFn|EInit) :
+        f(e, LocalVarTable(gvt, e)) when enabled?(n(e)) else e
+      (e) :
+        f(e, LocalVarTable(gvt, e))
   sub-exps(epackage, exps*)
 
 ;Rename all variables and type variables
