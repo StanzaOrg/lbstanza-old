@@ -2373,8 +2373,14 @@ defstruct MethodDag :
   targets: Tuple<Int>
 
 ;============================================================
-;====================== FOLD IFS ============================
+;=================== FOLD MATCH/IFS =========================
 ;============================================================
+
+;The standard compiler generates a long series of instructions
+;for performing boolean comparisons and branches
+;This code pattern matches against these instruction sequences
+;and collapses them into much smaller sequences.
+;It requires dead code elimination to remove garbage afterwards.
 
 defstruct InsRewrite :
   off : Int
@@ -2383,6 +2389,7 @@ with:
   printer => true
 
 ;x is a small immediate if it can fit as an x86 immediate operand.
+;Same is in stz-vm-normalize
 defn small-immediate? (x:EImm) :
   val max = 1 << 16
   val min = -1 << 16
@@ -2440,27 +2447,28 @@ defn match-goto (return:() -> Void, inz:Seq<[Int,EIns]>, target:False|Int) -> [I
         (target) :     ins
   match-x(return, inz, check)
 
-defn match-match (return:() -> Void, vt:VarTable, inz:Seq<[Int,EIns]>, arg:Int) -> [Int,EMatch] :
+defn match-match (return:() -> Void, inz:Seq<[Int,EIns]>, arg:Int, true-id:Int, false-id:Int) -> [Int,EMatch] :
   defn check (ins:EIns) :
     match(ins:EMatch) :
       if length(ys(ins)) == 1 and length(branches(ins)) == 2 :
         match(ys(ins)[0], types(branches(ins)[0])[0], types(branches(ins)[1])[0]) :
-          (v:EVar, bt0:EOf, bt1:EOf) : ins when (n(v) == arg and n(bt0) == n(iotable(vt), CORE-TRUE-ID) and n(bt1) == n(iotable(vt), CORE-FALSE-ID))
+          (v:EVar, bt0:EOf, bt1:EOf) :
+            ins when (n(v) == arg and n(bt0) == true-id and n(bt1) == false-id)
           (y, bt0, bt1) : false
   match-x(return, inz, check)
 
-defn match-if-match (inz:Seq<[Int,EIns]>, vt:VarTable) -> Maybe<InsRewrite> :
+defn match-if-match (inz:Seq<[Int,EIns]>, true-id:Int, false-id:Int) -> Maybe<InsRewrite> :
   label<Maybe<InsRewrite>> top-return:
     defn return () : top-return(None())
     val [cmp-off, cmp-ins] = match-cmp-op(return, inz)
     defn maybe-match-int-if () :
       if op(cmp-ins) is EqOp|NeOp|IntLtOp|IntGtOp|IntLeOp|IntGeOp :
         maybe-match-live(inz)
-        val [match-off, match-ins] = match-match(return, vt, inz, n(x(cmp-ins)))
+        val [match-off, match-ins] = match-match(return, inz, n(x(cmp-ins)), true-id, false-id)
         val op =
           match(op(cmp-ins)) :
-            (op:EqOp) : EqOp()
-            (op:NeOp) : NeOp()
+            (op:EqOp) :    EqOp()
+            (op:NeOp) :    NeOp()
             (op:IntLtOp) : LtOp()
             (op:IntLtOp) : LtOp()
             (op:IntGtOp) : GtOp()
@@ -2486,18 +2494,20 @@ defn match-if-match (inz:Seq<[Int,EIns]>, vt:VarTable) -> Maybe<InsRewrite> :
     match-def(return, inz, merge-var, ELSLiteral(true))
     match-goto(return, inz, merge-label)
     match-label(return, inz, merge-label)
-    val [match-off, match-ins] = match-match(return, vt, inz, n(merge-var))
+    val [match-off, match-ins] = match-match(return, inz, n(merge-var), true-id, false-id)
     if all?(small-immediate?, ys(cmp-ins)) :
       One(InsRewrite(if-off, EIf(n(branches(match-ins)[0]), n(branches(match-ins)[1]), op(cmp-ins), ys(cmp-ins))))
     else :
       One(InsRewrite(if-off, EIf(n(branches(match-ins)[0]), n(branches(match-ins)[1]), false, ys(if-ins))))
 
 defn shrink-ifs (epackage:EPackage, gvt:VarTable, enabled?: Int -> True|False, changed?:IntSet) -> EPackage :
-  defn fold-in-body (e:EBody, top:False|Int, vt:VarTable) -> EBody :
+  defn fold-in-body (e:EBody, top:False|Int) -> EBody :
+    ;Walk through instructions with pattern matcher that steps seq and returns rewrites.
+    val [true-id, false-id] = [n(iotable(gvt), CORE-TRUE-ID), n(iotable(gvt), CORE-FALSE-ID)]
     val inz = zip(0 to false, ins(e))
     val rewrites = Queue<InsRewrite>()
     let loop (prev-idx:Int = 0) :
-      match(match-if-match(inz, vt)) :
+      match(match-if-match(inz, true-id, false-id)) :
         (ir:One<InsRewrite>) : add(rewrites, value(ir))
         (none) : false
       if not empty?(inz) :
@@ -2509,6 +2519,9 @@ defn shrink-ifs (epackage:EPackage, gvt:VarTable, enabled?: Int -> True|False, c
       e
     else :
       ;; if not empty?(rewrites): for ins in ins(e) do : println(ins)
+      println("DEFN %_" % [top])
+      println("--- BEFORE ---")
+      for (ins in ins(e), i in 0 to false) do: println("%_: %_" % [i, ins])
       val new-ins = to-tuple $ for (ins in ins(e), j in 0 to false) seq :
         if empty?(rewrites) :
           ins
@@ -2516,21 +2529,23 @@ defn shrink-ifs (epackage:EPackage, gvt:VarTable, enabled?: Int -> True|False, c
           val rewrite = peek(rewrites)
           if j == off(rewrite) :
             add(changed?, top as Int) when top is Int
-            (pop(rewrites), new-ins(rewrite))
+            (println("--- REWRITING %_: %_" % [j, new-ins(rewrite)]), pop(rewrites), new-ins(rewrite))
           else :
             ins
       sub-ins(e, new-ins)
-  defn resolve-texp (x:ETExp, vt:VarTable) :
+
+  defn resolve-texp (x:ETExp) :
     val result = let loop (x:ELBigItem = x, top:Int|False = false) :
       match(x) :
         (x:EDefn|EDefmethod|EExternFn) :
-          analyze-freevars(map(loop{_, n(x)}, x), vt) 
+          map(loop{_, n(x)}, x) when enabled?(n(x)) else x
         (e:EBody) :
-          fold-in-body(e,top,vt)
+          fold-in-body(e,top)
         (e) :
           map(loop{_, top}, e)
     result as ETExp
-  map-with-var-table(resolve-texp, gvt, epackage, enabled?)
+
+  sub-exps(epackage, map(resolve-texp, exps(epackage)))
 
 ;============================================================
 ;============== RESOLVE MATCHES-COVERAGE ====================
