@@ -1479,6 +1479,8 @@ defn simple-inline (epackage:EPackage) :
 ;================== ELIMINATE-DEAD-CODE =====================
 ;============================================================
 
+;Remove code that is unreachable by simulated execution
+;Also remove any gotos to immediately following singly referenced label.
 defn remove-unreachable-code (body:EBody) -> EBody :
   val labels = IntTable<Int>()
   for (i in ins(body), j in 0 to false) do :
@@ -1535,9 +1537,7 @@ defn remove-unreachable-code (e:ETExp) -> ETExp :
       (e) : e
   remove-unreachable-code-in-bodies(e) as ETExp
 
-defn maybe-side-effecting? (e:EIns) -> True|False :
-  e is ETCall|ECall|EGoto|EBoxSet|ECheckFail
-
+;No potential for side-effect and can be safely removed if unnecessary
 defn pure? (ins:EIns) :
   match(ins) :
     (ins:EPrim) : op(ins) is BasicOp and op(ins) is-not GCOp|PrintStackTraceOp|FlushVMOp|CRSPOp
@@ -1550,18 +1550,19 @@ defn inc (t:IntTable<Int>, k:Int) -> Int :
 defn cons!<?T> (t:IntTable<List<?T>>, k:Int, e:?T) -> List<T> :
   update(t, { cons(e, _) }, k)
 
+;Remove unecessary vars
 defn eliminate-dead-code (epackage:EPackage, gvt:VarTable, enabled?:Int -> True|False) -> EPackage :
   val unreachable-timer = MillisecondTimer("UNREACHABLE")
   val analyze-timer = MillisecondTimer("ANALYZE")
   val transitive-timer = MillisecondTimer("TRANSITIVE")
   val rename-timer = MillisecondTimer("RENAME")
-  val unused-vars = IntSet()
   val num-reads = IntTable<Int>(0)
-  val num-writes = IntTable<Int>(0)
-  val writers = IntTable<List<EIns>>(List())
-  val mut? = IntSet()
-  val var-side-effecting? = IntSet()
-  val aliases = IntTable<Int>()
+  val num-writes = IntTable<Int>(0)           
+  val unused-vars = IntSet()                  ;num-reads = 0
+  val writers = IntTable<List<EIns>>(List())  ;writers of var
+  val mut? = IntSet()                         ;num-writes > 1
+  val var-side-effecting? = IntSet()          ;cached set of impure writers
+  val aliases = IntTable<Int>()               ;rewrites
   val work = Queue<Int>()
 
   ;Collect statistics including num-reads/writes on vars
@@ -1595,6 +1596,9 @@ defn eliminate-dead-code (epackage:EPackage, gvt:VarTable, enabled?:Int -> True|
 
     for ins in ins(body) do : walk(ins, false)
 
+  ;remove all pure writers of unused variables
+  ;while also decrementing num-reads on pure writer args
+  ;potentially triggering more removals
   defn transitively-remove-unused-vars () :
     for kv in num-reads do :
       add(unused-vars, key(kv)) when value(kv) == 0
@@ -1630,19 +1634,18 @@ defn eliminate-dead-code (epackage:EPackage, gvt:VarTable, enabled?:Int -> True|
           (e:EDef) :
             match(y(e)) :
               (y:EVar) :
+                ;single write var on rhs?
                 if immutable?(vt, n(y)) and immutable?(vt, n(x(e))) :
                   aliases[n(x(e))] = get?(aliases, n(y), n(y))
-                  add(unused-vars, n(x(e)))
+                  add(unused-vars, n(x(e))) ;no longer needed
                 sub-y(e, walk(y) as EVar)
               (y) :
                 e
           (e:EVar|EVarLoc) :
             if key?(aliases, n(e)) :
-              sub-n(e, aliases[n(e)])
+              sub-n(e, aliases[n(e)]) ;rewrite in terms of alias
             else :
               e
-          (e:ELive) :
-            ELive(to-tuple $ for e in xs(e) filter : not match(e:EVar) : key?(aliases, n(e)))
           (e) :
             map(walk, e)
       walk(e) as EIns
@@ -1654,8 +1657,6 @@ defn eliminate-dead-code (epackage:EPackage, gvt:VarTable, enabled?:Int -> True|
     val new-ins = Vector<EIns>()
     for (i in renamed-ins, j in 0 to false) do :
       match(i) :
-        (i:EDef|EPrim|ELoad|EPtr|ENew|ETuple|EVoidTuple|ETupleGet|EObject|EStruct|ENewObject|EObjectGet|EClosureGet|EBox|EBoxGet|EInterpret|EConv) :
-          add(new-ins, i) when not unused?(n(x(i)))
         (i:EInitClosures) :
           val xs* = for x in xs(i) filter : not unused-localfn?(n(x))
           if not empty?(xs*) :
@@ -1663,6 +1664,8 @@ defn eliminate-dead-code (epackage:EPackage, gvt:VarTable, enabled?:Int -> True|
         (i:ELive) :
           val vars = to-tuple $ for e in xs(i) filter : not match(e:EVar) : unused?(n(e))
           add(new-ins, ELive(vars)) when not empty?(vars)
+        (i:EDef|EPrim|ELoad|EPtr|ENew|ETuple|EVoidTuple|ETupleGet|EObject|EStruct|ENewObject|EObjectGet|EClosureGet|EBox|EBoxGet|EInterpret|EConv) :
+          add(new-ins, i) when not (pure?(i) and unused?(n(x(i))))
         (i) :
           add(new-ins, i)
 
@@ -1680,10 +1683,10 @@ defn eliminate-dead-code (epackage:EPackage, gvt:VarTable, enabled?:Int -> True|
           analyze-body(e, vt)
           do(analyze, localfns(e))
         (e:EDefn|EDefmethod|EInit|EExternFn) :
+          clear(num-reads)
           clear(mut?)
           clear(aliases)
           clear(unused-vars)
-          clear(num-reads)
           clear(num-writes)
           clear(writers)
           clear(var-side-effecting?)
@@ -1694,20 +1697,20 @@ defn eliminate-dead-code (epackage:EPackage, gvt:VarTable, enabled?:Int -> True|
     defn loop (e:ELItem) -> ELItem :
       match(e) :
         (e:EBody) :
-          val body = rename-body(e, vt)
+          val body = rename-body(e, vt)       ; alias single use defs
           sub-localfns(body, map(loop, localfns(e)) as Tuple<ELocalFn>)
         (e:EDefn|EDefmethod|EInit) :
           ; println("\n--- WALKING DEFN %_---\n" % [n(e)])
           start(unreachable-timer)
-          val pe = remove-unreachable-code(e)
+          val pe = remove-unreachable-code(e) ; first remove unreachable instructions
           stop(unreachable-timer)
 
           start(analyze-timer)
-          analyze(pe)
+          analyze(pe)                         ; collect usage stats
           stop(analyze-timer)
 
           start(transitive-timer)
-          transitively-remove-unused-vars()
+          transitively-remove-unused-vars()   ; gc vars and their writers
           stop(transitive-timer)
 
           start(rename-timer)
