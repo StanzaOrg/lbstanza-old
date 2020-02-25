@@ -450,15 +450,11 @@ StringList* list_dir (char* filename){
 //===================== Sleeping =============================
 //============================================================
 
-void sleep_us (long us){
+int sleep_us (long us){
   struct timespec t1, t2;
   t1.tv_sec = 0;
   t1.tv_nsec = us * 1000L;
-  int ret = nanosleep(&t1, &t2);
-  if(ret < 0){
-    fprintf(stderr, "Sleep system call failed.\n");
-    exit(-1);
-  }
+  return nanosleep(&t1, &t2);
 }
 
 //============================================================
@@ -676,9 +672,9 @@ void free_earg (EvalArg* arg){
 //-------------------- Process Queries -----------------------
 //------------------------------------------------------------
 
-void get_process_state (long pid, ProcessState* s){
+void get_process_state (long pid, ProcessState* s, int wait_for_termination){
   int status;
-  int ret = waitpid(pid, &status, WNOHANG);  
+  int ret = waitpid(pid, &status, wait_for_termination? 0 : WNOHANG);  
   
   if(ret == 0)
     *s = (ProcessState){PROCESS_RUNNING, 0};
@@ -698,6 +694,7 @@ void get_process_state (long pid, ProcessState* s){
 
 #define LAUNCH_COMMAND 0
 #define STATE_COMMAND 1
+#define WAIT_COMMAND 2
 
 void write_error_and_exit (int fd){
   int code = errno;
@@ -781,12 +778,12 @@ void launcher_main (FILE* lin, FILE* lout){
       }
     }
     //Interpret state retrieval command
-    else if(comm == STATE_COMMAND){
+    else if(comm == STATE_COMMAND || comm == WAIT_COMMAND){
       //Read in process id
       long pid = read_long(lin);
 
       //Retrieve state
-      ProcessState s; get_process_state(pid, &s);
+      ProcessState s; get_process_state(pid, &s, comm == WAIT_COMMAND);
       write_process_state(lout, &s);
       fflush(lout);
     }
@@ -914,7 +911,7 @@ int launch_process (char* file, char** argvs,
   return 0;
 }
 
-void retrieve_process_state (long pid, ProcessState* s){
+void retrieve_process_state (long pid, ProcessState* s, int wait_for_termination){
   //Check whether launcher has been initialized
   if(launcher_pid < 0){
     fprintf(stderr, "Launcher not initialized.\n");
@@ -922,7 +919,7 @@ void retrieve_process_state (long pid, ProcessState* s){
   }
     
   //Send command
-  int r = fputc(STATE_COMMAND, launcher_in);
+  int r = fputc(wait_for_termination? WAIT_COMMAND : STATE_COMMAND, launcher_in);
   if(r == EOF) exit_with_error();
   write_long(launcher_in, pid);
   fflush(launcher_in);
