@@ -201,6 +201,13 @@ defpackage stz/reg-alloc :
     prefix(Block) => Basic
 
 ;============================================================
+;=================== Parameters =============================
+;============================================================
+
+;Size of smap which can be called without checking stack-size.
+val SMALL-SMAP-SIZE = 16 
+
+;============================================================
 ;===================== Driver ===============================
 ;============================================================
 
@@ -249,10 +256,10 @@ public defn allocate-registers (ins:VMFunction, emitter:CodeEmitter, backend:Bac
     print-prog()
   
   val smap = stack-map()
-  ;if print? :
-  ;  println("==== Stack Map ====")
-  ;  println(smap)
-  
+  ;; if print? :
+  ;;   println("==== Stack Map ====")
+  ;;   println(smap)
+
   collapse-blocks()
   if print? :
     println("==== Collapse Blocks ====")
@@ -354,6 +361,10 @@ public defstruct MethodDispatch <: Ins :
   num-header-args: Int
   default?: Int|False with: (default => false)
   amb?: Int|False with: (default => false)
+  killed?: False|List<Int> with: (default => false, as-method => true)
+
+public defstruct SectionMarker <: Ins :
+  marker: Symbol
   killed?: False|List<Int> with: (default => false, as-method => true)
 
 public defstruct Save <: Ins :
@@ -616,6 +627,7 @@ defmethod print (o:OutputStream, i:Ins) :
     (i:Label) : "label %_" % [n(i)]
     (i:Goto) : "goto %_" % [n(i)]
     (i:Break) : "break %_ when %_(%,)" % [n(i), op(i), xs(i)]
+    (i:SectionMarker) : "section: %~" % [marker(i)]
 
 defmethod print (o:OutputStream, c:FnContext) :
   print{o, _} $ match(c) :
@@ -655,6 +667,7 @@ defn do-defined (f: Var -> ?, e:Ins) :
     (e:Load) : f(x(e))
     (e:Match) : false
     (e:MethodDispatch) : false
+    (e:SectionMarker) : false
   false
 
 defn do-used (gv: Var -> ?, e:Ins) :
@@ -671,6 +684,7 @@ defn do-used (gv: Var -> ?, e:Ins) :
     (e:Load) : false
     (e:Match) : do(g, xs(e))
     (e:MethodDispatch) : false
+    (e:SectionMarker) : false
   false
 
 defn used-vars (e:Ins) :
@@ -716,6 +730,8 @@ defn reverse-sweep (e:Ins, define:Var -> ?, emit:Ins -> ?, use-var:Var -> ?) :
       do(use, xs(e))
     (e:MethodDispatch) :
       emit(e)
+    (e:SectionMarker) :
+      emit(e)
 
 defn attach-killed (e:Ins, ks:List<Int>) :
   match(e) :
@@ -728,6 +744,7 @@ defn attach-killed (e:Ins, ks:List<Int>) :
     (e:Branch) : Branch(op(e), xs(e), ks)
     (e:Match) : Match(dispatch?(e), type-lists(e), xs(e), ks, ns?(e))
     (e:MethodDispatch) : MethodDispatch(multi(e), num-header-args(e), default?(e), amb?(e), ks)
+    (e:SectionMarker) : SectionMarker(marker(e), ks)
 
 ;============================================================
 ;=================== Unique Labels ==========================
@@ -942,6 +959,8 @@ defn load-instructions (function:VMFunc, backend:Backend) :
           push(Op(SaveCContextOp(), List(), List()))
         (e:CommentIns) :
           false
+        (e:SectionMarkerIns) :
+          push(SectionMarker(marker(e)))
         (e:UnreachableIns) :
           false
     val next = to-list $
@@ -1805,6 +1824,8 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
         do(free-var, killed(e))        
       (e:MethodDispatch) :
         emit(e)
+      (e:SectionMarker) :
+        emit(e)
       (e:Op) :
         defn assign-prefs (pref:List<Imm> -> Loc|List<Loc>) :
           val ys* = map(annotate, ys(e))
@@ -2391,8 +2412,8 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
   ;==============
   ;==== Body ====
   ;==============
-  for e in ins(BLOCKS[0]) do :
-    ;println("//Assembling: %_" % [e])
+
+  defn emit (e:Ins) :
     match(e) :
       (e:Set) :
         match(y(e)) :
@@ -2436,7 +2457,7 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
           (t:ExtendStack) :
             val return-lbl = unique-id(stubs)
             E $ SetL(R0, LM(return-lbl))
-            E $ SetL(R1, INT(size(stackmap) + 8))
+            E $ SetL(R1, INT(size(stackmap) + (8 + SMALL-SMAP-SIZE)))
             E $ asm-Goto(M(extend-stack(stubs)))
             E $ asm-Label(return-lbl)
           (t:CollectGarbage) :
@@ -2459,10 +2480,10 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
 
             ;Save RSP
             E $ StoreL(M(stack-pointer(stubs)), RSP)
-            
+
             ;Restore the C context:
             E $ LoadL(RSP, M(saved-c-rsp(stubs)))
-              
+
             ;Call C function with right convention
             val num-float-args = for y in ys(e) count : reg?(y as Var) is FReg
             E $ SubL(RSP, RSP, INT(frame-size(num-mem-args(t), backend(stubs))))
@@ -2498,7 +2519,7 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
             E $ LoadL(TMP2, F, size-offset)
             E $ AddL(TMP, TMP, TMP2)
             E $ StoreL(M(stack-limit(stubs)), TMP)
-            
+
             E $ LoadL(TMP, F, pc-offset)
             E $ asm-Goto(TMP)            
             E $ asm-Label(lbl, info(t))
@@ -2629,7 +2650,7 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
         defn cmp-stack-limit (le-op:asm-Op) :
           val TMP = R0
           val TMP2 = R1
-          E $ AddL(TMP, RSP, INT(size(stackmap) + 8))
+          E $ AddL(TMP, RSP, INT(size(stackmap) + (8 + SMALL-SMAP-SIZE)))
           E $ LoadL(TMP2, M(stack-limit(stubs)))
           E $ BreakL(label-table[n(e)], le-op, TMP, TMP2)
         defn cmp-heap-limit (le-op:asm-Op) :
@@ -2681,6 +2702,22 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap, stubs:AsmStubs) :
         val amb-branch = label-table[amb(e)]
         E $ asm-MethodDispatch(multi(e), num-header-args(e), no-branch, amb-branch)        
       (e) : fatal("Not yet implemented: %_" % [e])
+    
+  ;When size(stackmap) <= SMALL-SMAP-SIZE and no non-tail-calls in body:
+  val stripping-preamble?:True|False = if size(stackmap) <= SMALL-SMAP-SIZE and STRIP-STACK-CHECKS? :
+    for e in ins(BLOCKS[0]) any? :
+      match(e:Call) : type(e) is-not StanzaTCall
+  ;Strip ins between preamble SectionMarkerIns'.
+  var stripping?:True|False = false
+  for e in ins(BLOCKS[0]) do :
+    if stripping? :
+      match(e:SectionMarker) :
+        if marker(e) == `preamble: stripping? = false
+    else :
+      match(e:SectionMarker) :
+        stripping? = stripping-preamble? and (marker(e) == `preamble)
+      else :
+        emit(e)
 
 defn asm-type (x:Imm) :
   to-asm-type(type(x))
