@@ -6,6 +6,120 @@ defpackage stz/config :
   import reader
   import parser
   import stz/params
+  import stz/utils
+  import stz/parsed-path
+
+;============================================================
+;============= Stanza Configuration File ====================
+;============================================================
+defstruct ConfigFile :
+  path: String
+  stmts: Tuple<ConfigStmt>
+
+deftype ConfigStmt
+defmulti info (s:ConfigStmt) -> FileInfo|False
+
+defstruct PlatformStmt <: ConfigStmt :
+  info: FileInfo|False with: (as-method => true)
+  platform: Symbol
+defstruct InstallDirStmt <: ConfigStmt :
+  info: FileInfo|False with: (as-method => true)
+  path: String with: (updater => sub-path)
+defstruct PkgDirsStmt <: ConfigStmt :
+  info: FileInfo|False with: (as-method => true)
+  paths: Tuple<String> with: (updater => sub-paths)
+defstruct ProjFilesStmt <: ConfigStmt :
+  info: FileInfo|False with: (as-method => true)
+  paths: Tuple<String> with: (updater => sub-paths)
+defstruct MaxHeapSizeStmt <: ConfigStmt :
+  info: FileInfo|False with: (as-method => true)
+  size: Long
+defstruct ExperimentalStmt <: ConfigStmt :
+  info: FileInfo|False with: (as-method => true)
+  value: True|False
+
+;============================================================
+;====================== Checker =============================
+;============================================================
+
+defn check! (f:ConfigFile) :
+  ensure-no-duplicate-stmts!(f)
+  for stmt in stmts(f) do :
+    match(stmt) :
+      (stmt:PlatformStmt) :
+        if not supported-platform?(platform(stmt)) :
+          throw(UnsupportedPlatform(info(stmt), platform(stmt)))
+      (stmt:MaxHeapSizeStmt) :
+        val default-size = current-heap-size()
+        if size(stmt) < default-size :
+          throw(InvalidMaxHeap(info(stmt), default-size))
+      (stmt) : false
+
+defn name (s:ConfigStmt) :
+  match(s) :
+    (s:PlatformStmt) : "platform"
+    (s:InstallDirStmt) : "install-dir"
+    (s:PkgDirsStmt) : "pkg-dirs"
+    (s:ProjFilesStmt) : "proj-files"
+    (s:MaxHeapSizeStmt) : "compiler-max-heap-size"
+    (s:ExperimentalStmt) : "experimental"
+
+defn ensure-no-duplicate-stmts! (f:ConfigFile) :
+  for entry in group-by(name, stmts(f)) do :
+    if length(value(entry)) > 1 :
+      val s1 = value(entry)[1]
+      val s2 = value(entry)[0]
+      throw(DuplicateStmtError(info(s2), info(s1), name(s2)))
+
+;============================================================
+;============= Substitute Environment Variables =============
+;============================================================
+
+defn substitute-environment-variables (file:ConfigFile) -> ConfigFile :
+  val stmts* = for s in stmts(file) map :
+    defn sub (str:String) : substitute-env-vars(info(s), str)
+    match(s) :
+      (s:InstallDirStmt) : sub-path(s, sub(path(s)))
+      (s:PkgDirsStmt) : sub-paths(s, map(sub, paths(s)))
+      (s:ProjFilesStmt) : sub-paths(s, map(sub, paths(s)))
+      (s) : s
+  ConfigFile(path(file), stmts*)
+
+;============================================================
+;================ Resolve Relative Paths ====================
+;============================================================
+
+defn resolve-relative-paths (file:ConfigFile) -> ConfigFile :
+  val config-dir = enclosing-dir(parse-path(path(file)))
+  defn resolve (path:String) :
+    to-string(relative-to-dir(config-dir, parse-path(path)))
+  val stmts* = for s in stmts(file) map :
+    match(s) :
+      (s:InstallDirStmt) : sub-path(s, resolve(path(s)))
+      (s:PkgDirsStmt) : sub-paths(s, map(resolve, paths(s)))
+      (s:ProjFilesStmt) : sub-paths(s, map(resolve, paths(s)))
+      (s) : s
+  ConfigFile(path(file), stmts*)
+
+;============================================================
+;====================== Execute =============================
+;============================================================
+
+defn execute (file:ConfigFile) :
+  for s in stmts(file) do :
+    match(s) :
+      (s:PlatformStmt) :
+        OUTPUT-PLATFORM = platform(s)
+      (s:InstallDirStmt) :
+        STANZA-INSTALL-DIR = path(s)
+      (s:PkgDirsStmt) :
+        STANZA-PKG-DIRS = append(paths(s), STANZA-PKG-DIRS)
+      (s:ProjFilesStmt) :
+        add-all(STANZA-PROJ-FILES, paths(s))
+      (s:MaxHeapSizeStmt) :
+        STANZA-MAX-COMPILER-HEAP-SIZE = size(s)
+      (s:ExperimentalStmt) :
+        EXPERIMENTAL = value(s)
 
 ;============================================================
 ;================ Configuration Syntax ======================
@@ -36,41 +150,35 @@ defsyntax stanza-config :
   defrule long! = (?s:#long) : s
   fail-if long! = () : PE(closest-info(), "Expected a long here.")
 
+  defproduction sym!: Symbol
+  defrule sym! = (?s:#sym) : s
+  fail-if sym! = () : PE(closest-info(), "Expected a symbol here.")
+
   defproduction bool! : True|False
   defrule bool! = (?v) when unwrap-token(v) is True|False : unwrap-token(v)
   fail-if bool! = () : PE(closest-info(), "Expected a bool here.")
 
-  defproduction platform!: Symbol
-  defrule platform! = (?x:#sym) :
-    try :
-      ensure-supported-platform(x),
-      x
-    catch (e:Exception) :
-      throw(PE(closest-info(), e))
-  fail-if platform! = () :
-    PE(closest-info(), "Expected a platform here.")
+  public defproduction stmt!: ConfigStmt
+  defrule stmt! = (platform = ?p:#sym!) : PlatformStmt(closest-info(), p)
+  defrule stmt! = (install-dir = ?path:#string!) : InstallDirStmt(closest-info(), path)
+  defrule stmt! = (pkg-dirs = (?paths:#string! ...)) : PkgDirsStmt(closest-info(), to-tuple(paths))
+  defrule stmt! = (proj-files = (?paths:#string! ...)) : ProjFilesStmt(closest-info(), to-tuple(paths))
+  defrule stmt! = (compiler-max-heap-size = ?size:#long!) : MaxHeapSizeStmt(closest-info(), size)
+  defrule stmt! = (experimental = ?b:#bool!) : ExperimentalStmt(closest-info(), b)
+  fail-if stmt! = () : PE(closest-info(), "Invalid configuration rule.")
 
-  public defproduction entry: False
-  defrule entry = (install-dir = ?path:#string!) :
-    STANZA-INSTALL-DIR = substitute-env-vars(closest-info(), path)
-  defrule entry = (platform = ?p:#platform!) :
-    OUTPUT-PLATFORM = p
-  defrule entry = (pkg-dirs = (?paths:#string ...)) :
-    val paths* = for p in paths map : substitute-env-vars(closest-info(), p)
-    STANZA-PKG-DIRS = append(paths*, STANZA-PKG-DIRS)
-  defrule entry = (proj-files = (?paths:#string ...)) :
-    val paths* = for p in paths map : substitute-env-vars(closest-info(), p)
-    add-all(STANZA-PROJ-FILES, paths*)
-  defrule entry = (compiler-max-heap-size = ?sz:#long!) :
-    val cur-heap = current-heap-size()
-    if sz < current-heap-size() :
-      val msg = "Cannot set maximum heap size to be smaller than default heap size (%_)."
-      throw(PE(closest-info(), msg % [cur-heap]))
-    STANZA-MAX-COMPILER-HEAP-SIZE = sz
-  defrule entry = (experimental = ?b:#bool!) :
-    EXPERIMENTAL = b
-  fail-if entry = () :
-    PE(closest-info(), "Invalid configuration rule.")
+;============================================================
+;=============== Read and Execute Config File ===============
+;============================================================
+
+defn read-and-execute-config-file (filename:String) :
+  val stmts = parse-syntax[stanza-config / #stmt! ...](read-file(filename))
+  val file = ConfigFile(filename, to-tuple(stmts))
+  check!(file)
+  execute $
+  resolve-relative-paths $
+  substitute-environment-variables $
+  file
 
 ;============================================================
 ;================ Read Configuration File ===================
@@ -80,12 +188,11 @@ var STANZA-CONFIGURED? = false
 public defn read-config-file () :
   if not STANZA-CONFIGURED? :
     ;Extract parameters from config file
-    label<False> break :
+    label break :
       defn extract-from-file (filename:String) :
         if file-exists?(filename) :
-          val forms = read-file(filename)
-          parse-syntax[stanza-config / #entry ...](forms)
-          break(false)
+          read-and-execute-config-file(filename)
+          break()
 
       defn extract-from-env (name:String) :
         match(get-env(name)) :
@@ -159,6 +266,33 @@ defstruct EnvSubstitutionError <: Exception :
 defmethod print (o:OutputStream, e:EnvSubstitutionError) :
   val msg = "%_Could not determine value of environment variable %_."
   print(o, msg % [info-str(info(e)), name(e)])
+
+defstruct DuplicateStmtError <: Exception :
+  info:FileInfo|False
+  prev-info:FileInfo|False
+  name:String
+
+defmethod print (o:OutputStream, e:DuplicateStmtError) :
+  val prev-info-str = "" when prev-info(e) is False
+                 else " Previous statement declared at %_." % [prev-info(e)]
+  val msg = "%_Duplicate %_ statement in configuration file.%_"
+  print(o, msg % [info-str(info(e)), name(e), prev-info-str])
+
+defstruct UnsupportedPlatform <: Exception :
+  info:FileInfo|False
+  platform: Symbol
+
+defmethod print (o:OutputStream, e:UnsupportedPlatform) :
+  val msg = "%_%_ is not a supported platform."
+  print(o, msg % [info-str(info(e)), platform(e)])
+
+defstruct InvalidMaxHeap <: Exception :
+  info:FileInfo|False
+  default-size:Long
+
+defmethod print (o:OutputStream, e:InvalidMaxHeap) :
+  val msg = "%_Cannot set maximum heap size to be smaller than default heap size (%_)."
+  print(o, msg % [info-str(info(e)), default-size(e)])
 
 defn info-str (info:FileInfo|False) :
   "" when info is False else "%_: " % [info]
