@@ -28,6 +28,8 @@ defstruct EItem :
   rule:Int
   num-parsed:Int
   parent:Int
+  null-advanced:True|False with: (default => false)
+  completion-cache:EItem|False with: (default => false, updater => sub-completion-cache)
 
 defstruct ESet :
   index:Int
@@ -86,6 +88,34 @@ defmethod print (o:OutputStream, r:GRule) :
 
 defn length (r:ParsedRange) : end(r) - start(r)
 
+defn inc-num-parsed (x:EItem) :
+  inc-num-parsed(x, false)
+
+defn inc-num-parsed (x:EItem, null-advanced:True|False) :
+  EItem(rule(x), num-parsed(x) + 1, parent(x), null-advanced, false)
+
+;============================================================
+;====================== Nullable Set ========================
+;============================================================
+
+defn compute-nullable-set (grammar:Tuple<GRule>) :
+  val null-table = HashTable<Symbol,True|False>()
+  val rule-table = group-by(name, grammar)
+  defn nullable? (t:GToken) :
+    match(t) :
+      (t:GTerminal) : false
+      (t:GProduction) : nullable?(name(t))
+  defn nullable? (name:Symbol) :
+    if key?(null-table, name) :
+      null-table[name]
+    else :
+      null-table[name] = false
+      null-table[name] = for rule in rule-table[name] any? :
+        all?(nullable?, tokens(rule))        
+      null-table[name]
+  do(nullable?{name(_)}, grammar)
+  to-hashset<Symbol>(seq(key, filter(value, null-table)))
+
 ;============================================================
 ;====================== Algorithm ===========================
 ;============================================================
@@ -93,6 +123,7 @@ defn length (r:ParsedRange) : end(r) - start(r)
 defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
   val sets = Vector<ESet>()
   val parents = Vector<EParent>()
+  val nullable-set = compute-nullable-set(grammar)
   
   defn make-initial-set () :
     val set0 = ESet(0, Vector<EItem>())
@@ -113,7 +144,10 @@ defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
             print(o, t)
         if num-parsed(e) == length(tokens(r)) :
           print(o, " •")
-        print(o, ", S%_]" % [parent(e)])
+        val null-str = ", null-advanced" when null-advanced(e) else ""
+        val comp-str = "" when completion-cache(e) is False
+                  else " (completed to %_)" % [format(completion-cache(e) as EItem)]
+        print(o, ", S%_%_]%_" % [parent(e), null-str, comp-str])
 
   defn format (r:ParsedRange) :
     new Printable :
@@ -123,6 +157,9 @@ defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
 
   defn format (e:ParseEdge) :
     "%_ index %_ => %_" % [format(parent(e)), index(e), format(child(e))]
+    
+  defn format (p:EParent) :
+    "%_ from %_ (index %_) => %_" % [grammar[rule(p)], start(p), index(p), format(child(p))]
 
   defn print-sets () :
     for (s in sets, i in 0 to false) do :
@@ -136,11 +173,15 @@ defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
     if num-parsed(item) < length(tokens(r)) :
       tokens(r)[num-parsed(item)]
 
+  defn production-items (eset:ESet, name:Symbol) :
+    for item in items(eset) filter :
+      upcoming(item) == GProduction(name)
+
   defn process-set (set-index:Int) :
     val eset = sets[set-index]
     val item-index = to-seq(0 to false)
     val prediction-set = HashSet<Symbol>()
-    val advance-set = HashSet<[Int,Int,Int]>()
+    val advance-set = HashSet<[Int,Int]>()
     while peek(item-index) < length(items(eset)) :
       val item = items(eset)[next(item-index)]
       defn dispatch () :
@@ -155,28 +196,61 @@ defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
               upcoming-terminal(item)
             else : nonmatched-terminal()            
       defn upcoming-terminal (item:EItem) :
-        val item* = EItem(rule(item), num-parsed(item) + 1, parent(item))
-        add(items(sets[set-index + 1]), item*)
+        add(items(sets[set-index + 1]), inc-num-parsed(item))
       defn nonmatched-terminal () :
         false
       defn upcoming-production (item:EItem, t:GProduction) :
+        if nullable-set[name(t)] :
+          val item* = inc-num-parsed(item,true)
+          add(items(eset), item*)
         if add(prediction-set, name(t)) :
           for (rule in grammar, i in 0 to false) do :
             if name(rule) == name(t) :
               val item* = EItem(i, 0, set-index)
               add(items(eset), item*)
       defn end-of-rule (completed-item:EItem) :
-        val grule = grammar[rule(completed-item)]
-        val pset = sets[parent(completed-item)]
-        val range = ParsedRange(rule(completed-item), index(pset), index(eset))
-        for item in items(pset) do :
-          if upcoming(item) == GProduction(name(grule)) :
-            val parent-start = index(sets[parent(item)])
-            val item* = EItem(rule(item), num-parsed(item) + 1, parent(item))
-            add(parents, EParent(rule(item), parent-start, num-parsed(item), range))
-            if add(advance-set, [rule(item), num-parsed(item), parent(item)]) :
-              add(items(eset), item*)
+        if parent(completed-item) < index(eset) :
+          val grule = grammar[rule(completed-item)]
+          val pset = sets[parent(completed-item)]
+          val range = ParsedRange(rule(completed-item), index(pset), index(eset))
+          for item in production-items(pset, name(grule)) do :
+            if not null-advanced(item) :
+              val parent-start = index(sets[parent(item)])
+              val item* = match(completion-cache(item)) :
+                            (item*:EItem) : item*
+                            (f:False) : inc-num-parsed(item)
+              add(parents, EParent(rule(item), parent-start, num-parsed(item), range))
+              if add(advance-set, [rule(item*), parent(item*)]) :
+                add(items(eset), item*)
       dispatch()
+    defn compute-completion-cache () :
+      ;Compute count table
+      val counts = HashTable<Symbol,Int>(0)
+      for item in items(eset) do :
+        match(upcoming(item)) :
+          (t:GProduction) : update(counts, {_ + 1}, name(t))
+          (t) : false
+      ;Determine whether deterministic reduction
+      defn deterministic-reduction? (item:EItem) :
+        val num-tokens = length(tokens(grammar[rule(item)]))
+        if num-parsed(item) == num-tokens - 1 :
+          match(upcoming(item)) :
+            (t:GProduction) : counts[name(t)] == 1              
+            (t) : false            
+      ;Compute completion
+      defn complete (item:EItem) :
+        if deterministic-reduction?(item) :
+          val pset = sets[parent(item)]
+          val items = production-items(pset, name(upcoming(item) as GProduction))
+          val cached-completion = completion-cache(next(items)) when not empty?(items)
+          val completion = if cached-completion is False : inc-num-parsed(item)
+                           else : cached-completion
+          sub-completion-cache(item, completion)
+        else :
+          item
+      ;Compute all completions
+      map!(complete, items(eset))
+    compute-completion-cache()
 
   defn* process-until-finished () :
     val set-index = length(sets) - 1
@@ -187,6 +261,10 @@ defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
       process-until-finished()
  
   defn* determine-reachable-graph () :
+    println("PARENTS:")
+    within indented() :
+      for p in parents do :
+        println(format(p))
     val used-ranges = HashSet<ParsedRange>()
     val edges = Vector<ParseEdge>()
     val children-table = group-by(key, parents) where :
@@ -215,6 +293,10 @@ defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
     to-tuple(edges)
 
   defn* disambiguate (edges:Tuple<ParseEdge>) :
+    println("PARSE EDGES:")
+    within indented() :
+      for e in edges do :
+        println(format(e))
     val candidate-table = group-by(key, edges) where :
       defn key (e:ParseEdge) : [parent(e), index(e)]
     defn candidates (r:ParsedRange, index:Int, position:Int) :
@@ -261,9 +343,9 @@ defn parse (grammar:Tuple<GRule>, input:Tuple<Symbol>) :
     make-initial-set()
     process-until-finished()
     print-sets()
-    val edges = disambiguate(determine-reachable-graph())
-    println("Disambiguated:")
-    do(println{format(_)}, edges)
+    ;val edges = disambiguate(determine-reachable-graph())
+    ;println("Disambiguated:")
+    ;do(println{format(_)}, edges)
 
 
   main()
@@ -351,7 +433,7 @@ defn example-grammar-5 () :
         x in [+, x, L, R, N, =, let, in, if, :, else, switch]) :
     val X = GTerminal(`x)
   [GRule(`Start, [ES])
-   GRule(`ES, [E ES])
+   GRule(`ES, [ES E])
    GRule(`ES, [])
    GRule(`E, [E PLUS E], 200, LeftAssociative)
    GRule(`E, [E TIMES E], 210, LeftAssociative)
@@ -364,7 +446,7 @@ defn example-grammar-5 () :
    GRule(`IF-E, [IF E COLON E ELSE COLON E])
    GRule(`E, [SWITCH LPAREN SCLAUSES ECLAUSE RPAREN])
    GRule(`E, [SWITCH LPAREN SCLAUSES RPAREN])
-   GRule(`SCLAUSES, [SCLAUSE SCLAUSES])
+   GRule(`SCLAUSES, [SCLAUSES SCLAUSE])
    GRule(`SCLAUSES, [])
    GRule(`SCLAUSE, [E COLON E])
    GRule(`ECLAUSE, [ELSE COLON E])]
@@ -382,3 +464,38 @@ deftest parse-5 :
 deftest parse-6 :
   val g = example-grammar-5()
   parse(g, to-tuple $ unwrap-all $ reader/read-file("test.txt"))
+
+defn example-grammar-6 () :
+  #for E in [ES, E] :
+    val E = GProduction(`E)
+  #for (X in [A B C],
+        x in [a b c]) :
+    val X = GTerminal(`x)
+  [GRule(`Start, [ES])
+   GRule(`ES, [E, ES])
+   GRule(`ES, [])
+   GRule(`E, [A])
+   GRule(`E, [B C])]  
+
+deftest parse-7 :
+  val g = example-grammar-6()
+  parse(g, to-tuple $ `(a a b c a a b c b c a a a a a a a a a a a a a a a a))
+
+defn example-null-grammar () :
+  #for X in [S Ap E] :
+    val X = GProduction(`X)
+  #for (X in [A],
+        x in [a]) :
+    val X = GTerminal(`x)
+  [GRule(`Start, [S])
+   GRule(`S, [Ap Ap Ap Ap])
+   GRule(`Ap, [A])
+   GRule(`Ap, [E])
+   GRule(`E, [])]  
+
+deftest calc-null-set :
+  println("Null set = %," % [compute-nullable-set(example-grammar-5())])
+
+deftest parse-null :
+  val g = example-null-grammar()
+  parse(g, to-tuple $ `(a))
