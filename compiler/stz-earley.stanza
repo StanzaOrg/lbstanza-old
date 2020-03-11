@@ -56,6 +56,27 @@ defenum ControlToken :
   InsertedInput
   EndOfInput
 
+defstruct MissingInput :
+  input
+  info: FileInfo|False
+  items: Tuple<EItem>
+
+defstruct DroppedInput :
+  input
+  info: FileInfo|False
+  items: Tuple<EItem>
+
+defstruct MissingProductions <: Exception :
+  info: FileInfo|False
+  names: Tuple<Symbol>
+
+defstruct MissingTerminals <: Exception :
+  info: FileInfo|False
+  terminals: Tuple<Symbol>
+
+defstruct ParsingErrors <: Exception :
+  errors: Tuple<Exception>
+
 ;============================================================
 ;======================== Equalable =========================
 ;============================================================
@@ -79,12 +100,34 @@ defmethod print (o:OutputStream, t:GProduction) :
 defmethod print (o:OutputStream, r:GRule) :
   print(o, "%_ = %s" % [name(r), tokens(r)])
 
+defmethod print (o:OutputStream, e:MissingProductions) :
+  val info-str = "" when info(e) is False else "%_: " % [info(e)]
+  if length(names(e)) == 1 :
+    print(o, "%_Expected the production '%_' here." % [info-str, names(e)[0]])
+  else :
+    print(o, "%_Expected one of the following productions here:%,." % [info-str, names(e)])
+
+defmethod print (o:OutputStream, e:MissingTerminals) :
+  val info-str = "" when info(e) is False else "%_: " % [info(e)]
+  if length(terminals(e)) == 1 :
+    print(o, "%_Expected the '%_' terminal here." % [info-str, terminals(e)[0]])
+  else :
+    val term-str = for t in terminals(e) seq : "'%_'" % [t]
+    print(o, "%_Expected one of the following terminals here:%,." % [info-str, term-str])
+
+defmethod print (o:OutputStream, e:ParsingErrors) :
+  print-all(o, join(errors(e), '\n'))
+
 ;============================================================
 ;======================== Utilities =========================
 ;============================================================
 
 defn length (r:ParsedRange) :
   end(r) - start(r)
+
+defn wrap (token, info:FileInfo|False) :
+  match(info:FileInfo) : Token(token, info)
+  else : token
 
 defn inc-num-parsed (x:EItem) :
   EItem(rule(x), num-parsed(x) + 1, parent(x))
@@ -420,23 +463,30 @@ deftype AbstractInputStream
 defmulti peek? (stream:AbstractInputStream) -> ?
 defmulti advance (stream:AbstractInputStream) -> False
 defmulti insert (stream:AbstractInputStream) -> False
+defmulti info (stream:AbstractInputStream) -> FileInfo|False
 
 defn AbstractInputStream (input:Seqable) :
   val input-seq = to-seq(input)
   var inserted:True|False = false
-  new AbstractInputStream :
+  var file-info:FileInfo|False = false
+  defn update-file-info (t) :
+    match(t:Token) : file-info = info(t)
+  val stream = new AbstractInputStream :
+    defmethod info (this) :
+      file-info
     defmethod peek? (this) :
-      if inserted : InsertedInput
+      if inserted : wrap(InsertedInput, file-info)
       else if empty?(input-seq) : EndOfInput
       else : peek(input-seq)
-    defmethod advance (this) :
-      if inserted :
-        inserted = false
-      else :
-        next(input-seq)
-        false
+    defmethod advance (this) :        
+      ;Update stream
+      if inserted : inserted = false
+      else : next(input-seq)
+      update-file-info(peek?(this))
     defmethod insert (this) :
       inserted = true
+  update-file-info(peek?(stream))
+  stream
 
 ;============================================================
 ;====================== Algorithm ===========================
@@ -449,6 +499,9 @@ defn parse (grammar:Grammar, input:Seqable) :
   val production-count = ProductionTable<Int>(0)
   val parents = Vector<EParent>()
   val ranges = Vector<ParsedRange>()
+  val inputlist = Vector<?>()
+  val missing = Vector<MissingInput>()
+  val dropped = Vector<DroppedInput>()
 
   ;Returns true if the starting rule has been completed
   defn process-set (set-index:Int,
@@ -560,11 +613,11 @@ defn parse (grammar:Grammar, input:Seqable) :
       ;Case: Not yet finished parsing
       if not empty?(next-set) :        
         compute-completion-cache(set-index, current-set)
-        print-current-set(set-index, current-set)
+        ;print-current-set(set-index, current-set)
         add-to-setlist(current-set)
+        add(inputlist, next-input)
         record-completions(set-index, current-set)        
         clear(current-set)
-        println("SCANNED %_" % [next-input])
         advance(input-stream)
         loop(set-index + 1, next-set, current-set)
       ;Case: Finished parsing successfully
@@ -573,16 +626,17 @@ defn parse (grammar:Grammar, input:Seqable) :
         record-completions(set-index, current-set)        
       ;Case: Unexpected end of input
       else if next-input is EndOfInput and not start-completed :
-        false
+        add(missing, MissingInput(EndOfInput, info(input-stream), to-tuple(current-set)))
       ;Case: Unexpected extra input
       else if start-completed :
-        println("DROP NEXT TOKEN %_" % [next-input])
-        shorten(current-set, set-length)
+        add(dropped, DroppedInput(next-input, info(input-stream), to-tuple(current-set)))
         advance(input-stream)
+        shorten(current-set, set-length)
         loop(set-index, current-set, next-set)
       ;Case: Unexpected input
       else :
-        println("INSERT MAGIC TOKEN before %_" % [next-input])
+        println("Generate missing input for %_ at info %_" % [next-input, info(input-stream)])
+        add(missing, MissingInput(next-input, info(input-stream), to-tuple(current-set)))
         insert(input-stream)
         loop(set-index, current-set, next-set)
 
@@ -651,17 +705,39 @@ defn parse (grammar:Grammar, input:Seqable) :
     ;Launch  
     select(id)
 
+  ;Make a missing input exception
+  defn missing-input-exception (e:MissingInput) :
+    val production-set = HashSet<Symbol>()
+    val terminal-set = HashSet<Symbol>()
+    for item in items(e) do :
+      val tokens = tokens(grammar[rule(item)])
+      if num-parsed(item) < length(tokens) :
+        if num-parsed(item) == 0 :
+          add(production-set, production(grammar,item))
+        else :
+          match(upcoming(grammar,item)) :
+            (t:GTerminal) : add(terminal-set, /item(t))
+            (t:GProduction) : add(production-set, name(t))
+    if empty?(production-set) :
+      MissingTerminals(info(e), to-tuple(terminal-set))
+    else :
+      MissingProductions(info(e), to-tuple(production-set))
+
   defn main () :
     val start-id = process-all-sets()
+
+    for e in missing do :
+      println(missing-input-exception(e))
+
     ;println("start-id = %_" % [start-id])
     ;println(format(grammar, setlist))
     ;println("Ranges:")
     ;do(println, ranges)
     ;println("Parents:")
     ;do(println, parents)
-    match(start-id:Int) :
+    match(start-id:Int) :      
       val tree = select-tree(start-id)
-      println(format(grammar,tree))
+      println(format(grammar,tree))      
 
   main()
 
@@ -768,7 +844,7 @@ defn example-grammar-5 () :
 deftest grammar-calc :
   Grammar(example-grammar-5())
 
-let :;deftest parse-5 :
+deftest parse-5 :
   val g = example-grammar-5()
   parse(Grammar(g), to-tuple $ `(
     switch L
@@ -780,7 +856,7 @@ let :;deftest parse-5 :
 
 deftest parse-6 :
   val g = example-grammar-5()
-  parse(Grammar(g), to-tuple $ unwrap-all $ reader/read-file("test.txt"))
+  parse(Grammar(g), to-tuple $ reader/read-file("test.txt"))
 
 defn example-grammar-6 () :
   #for E in [ES, E] :
