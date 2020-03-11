@@ -18,7 +18,7 @@ defenum Associativity :
   LeftAssociative
   RightAssociative
 
-deftype GToken <: Equalable
+deftype GToken <: Equalable & Hashable
 defstruct GTerminal <: GToken :
   item: Symbol
 defstruct GProduction <: GToken :
@@ -56,27 +56,6 @@ defenum ControlToken :
   InsertedInput
   EndOfInput
 
-defstruct MissingInput :
-  input
-  info: FileInfo|False
-  items: Tuple<EItem>
-
-defstruct DroppedInput :
-  input
-  info: FileInfo|False
-  items: Tuple<EItem>
-
-defstruct MissingProductions <: Exception :
-  info: FileInfo|False
-  names: Tuple<Symbol>
-
-defstruct MissingTerminals <: Exception :
-  info: FileInfo|False
-  terminals: Tuple<Symbol>
-
-defstruct ParsingErrors <: Exception :
-  errors: Tuple<Exception>
-
 ;============================================================
 ;======================== Equalable =========================
 ;============================================================
@@ -86,6 +65,11 @@ defmethod equal? (a:GToken, b:GToken) :
     (a:GTerminal, b:GTerminal) : item(a) == item(b)
     (a:GProduction, b:GProduction) : name(a) == name(b)
     (a, b) : false
+
+defmethod hash (t:GToken) :
+  match(t) :
+    (t:GTerminal) : 1 + hash(item(t))
+    (t:GProduction) : 2 + hash(name(t))
 
 ;============================================================
 ;======================= Printers ===========================
@@ -99,24 +83,6 @@ defmethod print (o:OutputStream, t:GProduction) :
 
 defmethod print (o:OutputStream, r:GRule) :
   print(o, "%_ = %s" % [name(r), tokens(r)])
-
-defmethod print (o:OutputStream, e:MissingProductions) :
-  val info-str = "" when info(e) is False else "%_: " % [info(e)]
-  if length(names(e)) == 1 :
-    print(o, "%_Expected the production '%_' here." % [info-str, names(e)[0]])
-  else :
-    print(o, "%_Expected one of the following productions here:%,." % [info-str, names(e)])
-
-defmethod print (o:OutputStream, e:MissingTerminals) :
-  val info-str = "" when info(e) is False else "%_: " % [info(e)]
-  if length(terminals(e)) == 1 :
-    print(o, "%_Expected the '%_' terminal here." % [info-str, terminals(e)[0]])
-  else :
-    val term-str = for t in terminals(e) seq : "'%_'" % [t]
-    print(o, "%_Expected one of the following terminals here:%,." % [info-str, term-str])
-
-defmethod print (o:OutputStream, e:ParsingErrors) :
-  print-all(o, join(errors(e), '\n'))
 
 ;============================================================
 ;======================== Utilities =========================
@@ -362,6 +328,95 @@ defn bsearch<?T> (xs:Vector<?T>, compare:T -> Int) -> Int|False :
   bsearch(xs, 0, length(xs), compare)
 
 ;============================================================
+;==================== Error Handling ========================
+;============================================================
+
+defstruct MissingInput :
+  input
+  set-index: Int
+  info: FileInfo|False
+  items: Tuple<EItem>
+
+defstruct MissingInputError <: Exception :
+  input
+  info: FileInfo|False
+  upcoming: Tuple<UpcomingTokens>
+
+defstruct UpcomingTokens :
+  production: Symbol
+  tokens: Tuple<GToken>
+
+defstruct ParsingErrors <: Exception :
+  errors: Tuple<Exception>
+
+defn to-exception (g:Grammar, m:MissingInput) :
+  ;Compute earliest completed productions
+  defn completed? (item:EItem) :
+    val tokens = tokens(g[rule(item)])
+    num-parsed(item) == length(tokens)
+  val completed-productions = HashTable<Symbol,Int>(INT-MAX)
+  for item in filter(completed?,items(m)) do :
+    update(completed-productions, min{_, parent(item)}, production(g,item))
+
+  ;Compute table of upcoming tokens
+  val upcoming-tokens = group-by{key, value, _} $
+    for item in items(m) seq? :
+      val skip? = completed?(item) or
+                  completed-productions[production(g,item)] <= parent(item) or
+                  num-parsed(item) == 0
+      if skip? : None()
+      else : One(production(g,item) => upcoming(g, item) as GToken)
+
+  ;Sort tokens by terminals first, and then productions
+  defn sort-tokens (ts:Collection<GToken>) :
+    to-tuple $ unique $ cat(
+      lazy-qsort(item, filter-by<GTerminal>(ts))
+      lazy-qsort(name, filter-by<GProduction>(ts)))
+
+  ;Make structs
+  val upcoming = to-tuple $ for entry in upcoming-tokens seq :    
+    UpcomingTokens(key(entry), sort-tokens(value(entry)))
+
+  ;Return error
+  MissingInputError(input(m), info(m), upcoming)
+
+defn to-exception (g:Grammar, input-ms:Seqable<MissingInput>) :
+  val ms = to-tuple(input-ms)
+  defn first-in-chain? (i:Int) : i == 0 or set-index(ms[i - 1]) < set-index(ms[i]) - 1
+  val es = seq(to-exception{g, ms[_]}, filter(first-in-chain?, 0 to length(ms)))
+  ParsingErrors $ to-tuple $ es
+
+defmethod print (o:OutputStream, e:MissingInputError) :
+  val info-str = "" when info(e) is False else "%_: " % [info(e)]
+  val input-str = "end of input" when input(e) is EndOfInput else "input '%~'" % [input(e)]
+  defn token-str (t:GToken) :
+    match(t) :
+      (t:GTerminal) : "'%~'" % [item(t)]
+      (t:GProduction) : "a '%~' production" % [name(t)]
+  defn tokens-str (ts:Tuple<GToken>) :
+    if length(ts) == 1 :
+      token-str(ts[0])
+    else :
+      val but-last-t = ts[0 to length(ts) - 1]
+      val last-t = ts[length(ts) - 1]      
+      "either %,, or %_" % [seq(token-str,but-last-t), token-str(last-t)]
+  defn single-clause (c:UpcomingTokens) :
+    "Currently parsing %_, and %_ is expected next." % [
+      token-str(GProduction(production(c)))
+      tokens-str(tokens(c))]
+  defn cond-clause (c:UpcomingTokens) :
+    "If this is %_, then a %_ is expected next." % [
+      token-str(GProduction(production(c))),
+      tokens-str(tokens(c))]
+  defn clauses (cs:Tuple<UpcomingTokens>) :
+    if length(cs) == 1 : single-clause(cs[0])
+    else : "%s" % [seq(cond-clause,cs)]
+  print(o, "%_Unexpected %_. %_" % [info-str, input-str, clauses(upcoming(e))])
+
+defmethod print (o:OutputStream, e:ParsingErrors) :
+  print-all(o, join(errors(e), '\n'))
+
+;============================================================
 ;============== ProductionTable/ProductionSet ===============
 ;============================================================
 
@@ -492,7 +547,7 @@ defn AbstractInputStream (input:Seqable) :
 ;====================== Algorithm ===========================
 ;============================================================
 
-defn parse (grammar:Grammar, input:Seqable) :
+defn parse (grammar:Grammar, input:Seqable) -> ParseNode|ParsingErrors :
   val setlist = ESetList(grammar)
   val prediction-set = ProductionSet()
   val completion-set = CompletionSet()
@@ -501,7 +556,6 @@ defn parse (grammar:Grammar, input:Seqable) :
   val ranges = Vector<ParsedRange>()
   val inputlist = Vector<?>()
   val missing = Vector<MissingInput>()
-  val dropped = Vector<DroppedInput>()
 
   ;Returns true if the starting rule has been completed
   defn process-set (set-index:Int,
@@ -596,6 +650,9 @@ defn parse (grammar:Grammar, input:Seqable) :
         add(parents, EParent(rule(pitem), parent(pitem), num-parsed(pitem), id))
     start-id
 
+  defn record-missing-input (next-input, index:Int, info:FileInfo|False, eset:Vector<EItem>) :
+    add(missing, MissingInput(next-input, index, info, to-tuple(eset)))
+
   defn process-all-sets () -> Int|False :
     ;Initialize current-set and next-set.
     val current-set = Vector<EItem>()
@@ -626,17 +683,16 @@ defn parse (grammar:Grammar, input:Seqable) :
         record-completions(set-index, current-set)        
       ;Case: Unexpected end of input
       else if next-input is EndOfInput and not start-completed :
-        add(missing, MissingInput(EndOfInput, info(input-stream), to-tuple(current-set)))
+        record-missing-input(next-input, set-index, info(input-stream), current-set)
       ;Case: Unexpected extra input
       else if start-completed :
-        add(dropped, DroppedInput(next-input, info(input-stream), to-tuple(current-set)))
+        record-missing-input(next-input, set-index, info(input-stream), current-set)
         advance(input-stream)
         shorten(current-set, set-length)
         loop(set-index, current-set, next-set)
       ;Case: Unexpected input
       else :
-        println("Generate missing input for %_ at info %_" % [next-input, info(input-stream)])
-        add(missing, MissingInput(next-input, info(input-stream), to-tuple(current-set)))
+        record-missing-input(next-input, set-index, info(input-stream), current-set)
         insert(input-stream)
         loop(set-index, current-set, next-set)
 
@@ -705,50 +761,23 @@ defn parse (grammar:Grammar, input:Seqable) :
     ;Launch  
     select(id)
 
-  ;Make a missing input exception
-  defn missing-input-exception (e:MissingInput) :
-    val production-set = HashSet<Symbol>()
-    val terminal-set = HashSet<Symbol>()
-    for item in items(e) do :
-      val tokens = tokens(grammar[rule(item)])
-      if num-parsed(item) < length(tokens) :
-        if num-parsed(item) == 0 :
-          val prod = production(grammar,item)
-          if not nullable?(grammar,prod) :
-            add(production-set, prod)
-        else :
-          match(upcoming(grammar,item)) :
-            (t:GTerminal) :
-              add(terminal-set, /item(t))
-            (t:GProduction) :
-              if not nullable?(grammar,name(t)) :
-                add(production-set, name(t))
-    if empty?(production-set) :
-      MissingTerminals(info(e), to-tuple(terminal-set))
-    else :
-      MissingProductions(info(e), to-tuple(production-set))
-
+  ;Launch!
   defn main () :
     val start-id = process-all-sets()
-
-    for e in missing do :
-      println(missing-input-exception(e))
-
-    ;println("start-id = %_" % [start-id])
-    ;println(format(grammar, setlist))
-    ;println("Ranges:")
-    ;do(println, ranges)
-    ;println("Parents:")
-    ;do(println, parents)
-    match(start-id:Int) :      
-      val tree = select-tree(start-id)
-      println(format(grammar,tree))      
+    if empty?(missing) : select-tree(start-id as Int)
+    else : to-exception(grammar, missing)
 
   main()
 
 ;============================================================
 ;======================= Test Case ==========================
 ;============================================================
+
+defn test-parse (rules:Tuple<GRule>, input:Seqable) :
+  val g = Grammar(rules)
+  match(parse(g, input)) :
+    (n:ParseNode) : println(format(g,n))
+    (e:ParsingErrors) : println(e)
 
 defn example-grammar () :
   val E = GProduction(`E)
@@ -768,8 +797,7 @@ deftest print-grammar :
   do(println, g)
 
 deftest parse :
-  val g = example-grammar()
-  parse(Grammar(g), to-tuple $ `(N x N x L N + N R x N x N + N x N x N))
+  test-parse(example-grammar(), `(N x N x L N + N R x N x N + N x N x N))
 
 defn example-grammar-2 () :
   val S = GProduction(`S)
@@ -860,8 +888,7 @@ deftest parse-5 :
     R))
 
 deftest parse-6 :
-  val g = example-grammar-5()
-  parse(Grammar(g), to-tuple $ reader/read-file("test.txt"))
+  test-parse(example-grammar-5(), reader/read-file("test.txt"))
 
 defn example-grammar-6 () :
   #for E in [ES, E] :
