@@ -11,7 +11,7 @@ defpackage stz/earley :
 defstruct GRule :
   name: Symbol
   tokens: Tuple<GToken>
-  precedence: Int with: (default => 100)
+  priority: Int with: (default => 100)
   associativity: Associativity with: (default => RightAssociative)
 
 defenum Associativity :
@@ -35,6 +35,15 @@ defstruct EParent :
   start: Int
   index: Int
   id: Int
+  direct?: True|False
+with:
+  printer => true
+
+defstruct ECondParent :
+  rule: Int
+  start: Int
+  child-start: Int
+  production: Symbol
 with:
   printer => true
 
@@ -87,9 +96,6 @@ defmethod print (o:OutputStream, r:GRule) :
 ;============================================================
 ;======================== Utilities =========================
 ;============================================================
-
-defn length (r:ParsedRange) :
-  end(r) - start(r)
 
 defn wrap (token, info:FileInfo|False) :
   match(info:FileInfo) : Token(token, info)
@@ -244,6 +250,38 @@ defn nullable-productions (grammar:Tuple<GRule>) :
   to-hashset<Symbol> $ seq(key, filter(value, null-table))
 
 ;============================================================
+;===================== Specificity ==========================
+;============================================================
+
+defstruct SpecificityKey <: Comparable<SpecificityKey> :
+  parent-associativity: Associativity
+  length: Int
+  priority: Int
+  rule: Int  
+with:
+  printer => true
+
+;Return -1 if a should take priority over b during
+;a right-to-left disambiguation sweep of the parse forest.
+defmethod compare (a:SpecificityKey, b:SpecificityKey) :
+  fatal("Incomparable keys!") when parent-associativity(a) != parent-associativity(b)
+  ;Retrieve fields
+  defn compare-associativity () :
+    switch(parent-associativity(a)) :
+      RightAssociative : compare(length(b), length(a))
+      LeftAssociative : compare(length(a), length(b))
+  defn compare-priority () :
+    compare(priority(b), priority(a))
+  defn compare-order () :
+    compare(rule(a), rule(b))
+  val c1 = compare-associativity()
+  if c1 == 0 :
+    val c2 = compare-priority()
+    if c2 == 0 : compare-order()
+    else : c2
+  else : c1
+
+;============================================================
 ;======================== ESetList ==========================
 ;============================================================
 
@@ -337,11 +375,8 @@ defstruct MissingInput :
 defstruct MissingInputError <: Exception :
   input
   info: FileInfo|False
-  upcoming: Tuple<UpcomingTokens>
-
-defstruct UpcomingTokens :
-  production: Symbol
-  tokens: Tuple<GToken>
+  productions: Tuple<Symbol>
+  upcoming: Tuple<GToken>
 
 defstruct ParsingErrors <: Exception :
   errors: Tuple<Exception>
@@ -355,27 +390,31 @@ defn to-exception (g:Grammar, m:MissingInput) :
   for item in filter(completed?,items(m)) do :
     update(completed-productions, min{_, parent(item)}, production(g,item))
 
-  ;Compute table of upcoming tokens
-  val upcoming-tokens = group-by{key, value, _} $
-    for item in items(m) seq? :
-      val skip? = completed?(item) or
-                  completed-productions[production(g,item)] <= parent(item) or
-                  num-parsed(item) == 0
-      if skip? : None()
-      else : One(production(g,item) => upcoming(g, item) as GToken)
+  ;Compute productions and upcoming
+  val productions = HashSet<Symbol>()
+  val upcoming-tokens = HashSet<GToken>()
+  for item in items(m) do :
+    val production = production(g,item)
+    val skip? = match(upcoming(g, item)) :
+      (t:GProduction) :
+        num-parsed(item) == 0
+      (t:GTerminal) :
+        num-parsed(item) == 0 or
+        completed-productions[production] <= parent(item)
+      (t:False) :
+        true
+    if not skip? :
+      add(productions, production)
+      add(upcoming-tokens, upcoming(g, item) as GToken)
 
   ;Sort tokens by terminals first, and then productions
   defn sort-tokens (ts:Collection<GToken>) :
-    to-tuple $ unique $ cat(
+    to-tuple $ cat(
       lazy-qsort(item, filter-by<GTerminal>(ts))
       lazy-qsort(name, filter-by<GProduction>(ts)))
 
-  ;Make structs
-  val upcoming = to-tuple $ for entry in upcoming-tokens seq :    
-    UpcomingTokens(key(entry), sort-tokens(value(entry)))
-
   ;Return error
-  MissingInputError(input(m), info(m), upcoming)
+  MissingInputError(input(m), info(m), to-tuple(productions), to-tuple(upcoming-tokens))
 
 defn to-exception (g:Grammar, input-ms:Seqable<MissingInput>) :
   val ms = to-tuple(input-ms)
@@ -397,18 +436,12 @@ defmethod print (o:OutputStream, e:MissingInputError) :
       val but-last-t = ts[0 to length(ts) - 1]
       val last-t = ts[length(ts) - 1]      
       "either %,, or %_" % [seq(token-str,but-last-t), token-str(last-t)]
-  defn single-clause (c:UpcomingTokens) :
-    "Currently parsing %_, and %_ is expected next." % [
-      token-str(GProduction(production(c)))
-      tokens-str(tokens(c))]
-  defn cond-clause (c:UpcomingTokens) :
-    "If this is %_, then a %_ is expected next." % [
-      token-str(GProduction(production(c))),
-      tokens-str(tokens(c))]
-  defn clauses (cs:Tuple<UpcomingTokens>) :
-    if length(cs) == 1 : single-clause(cs[0])
-    else : "%s" % [seq(cond-clause,cs)]
-  print(o, "%_Unexpected %_. %_" % [info-str, input-str, clauses(upcoming(e))])
+  defn productions-str (names:Tuple<Symbol>) :
+    tokens-str(map(GProduction,names))    
+  print(o, "%_Unexpected %_." % [info-str, input-str])
+  if not empty?(productions(e)) :
+    print(o, " Current parsing %_ and %_ is expected next." % [
+      productions-str(productions(e)), tokens-str(upcoming(e))])
 
 defmethod print (o:OutputStream, e:ParsingErrors) :
   print-all(o, join(errors(e), '\n'))
@@ -493,6 +526,9 @@ defn format (grammar:Grammar, eset:Vector<EItem>) :
     print(o, "ESet :")
     do(lnprint{o2, format(grammar,_)}, eset)
 
+defn format (grammar:Grammar, r:ParsedRange) :
+  "(range %_) [%_ to %_] %_" % [id(r), start(r), end(r), grammar[rule(r)]]
+
 defn format (grammar:Grammar, node:ParseNode) :
   within o = printable-stream() :
     val rule = grammar[rule(node)]
@@ -504,8 +540,9 @@ defn format (grammar:Grammar, ranges:Vector<ParsedRange>, p:EParent) :
   val parent-rule = grammar[rule(p)]
   val child = ranges[id(p)]
   val child-rule = grammar[rule(child)]
-  "[%_ onwards] %_ (index %_) => [%_ to %_] %_" % [
-    start(p), parent-rule, index(p), start(child), end(child), child-rule]
+  val direct-str = " (direct)" when direct?(p) else ""
+  "[%_ onwards] %_ (index %_) => [%_ to %_] %_%_" % [
+    start(p), parent-rule, index(p), start(child), end(child), child-rule, direct-str]
 
 ;============================================================
 ;================== Abstract Input Stream ===================
@@ -549,7 +586,7 @@ defn parse (grammar:Grammar, input:Seqable) -> ParseNode|ParsingErrors :
   val prediction-set = ProductionSet()
   val completion-set = CompletionSet()
   val production-count = ProductionTable<Int>(0)
-  val parents = Vector<EParent>()
+  val parents = Vector<EParent|ECondParent>()
   val ranges = Vector<ParsedRange>()
   val inputlist = Vector<?>()
   val missing = Vector<MissingInput>()
@@ -639,12 +676,20 @@ defn parse (grammar:Grammar, input:Seqable) -> ParseNode|ParsingErrors :
   defn record-completions (set-index:Int, current-set:Vector<EItem>) -> Int|False :
     defn complete? (item:EItem) : upcoming(grammar,item) is False
     var start-id:Int|False = false
-    for item in filter(complete?, current-set) do :
-      val id = length(ranges)
-      (start-id = id) when rule(item) == 0
-      add(ranges, ParsedRange(id, rule(item), parent(item), set-index))
-      within pitem = items(setlist, parent(item), production(grammar, item), false) :
-        add(parents, EParent(rule(pitem), parent(pitem), num-parsed(pitem), id))
+    for item in current-set do :
+      if complete?(item) :
+        val id = length(ranges)      
+        (start-id = id) when rule(item) == 0
+        add(ranges, ParsedRange(id, rule(item), parent(item), set-index))
+        within pitem = items(setlist, parent(item), production(grammar, item), false) :
+          add(parents, EParent(rule(pitem), parent(pitem), num-parsed(pitem), id, true))
+          if completion-cache(pitem) is-not False :
+            val pitem = completion-cache(pitem) as EItem
+            add(parents, EParent(rule(pitem), parent(pitem), num-parsed(pitem) - 1, id, false))
+      else if completion-cache(item) is-not False :
+        val production = name(upcoming(grammar,item) as GProduction)
+        add(parents, ECondParent(rule(item), parent(item), set-index, production))
+        
     start-id
 
   defn record-missing-input (next-input, index:Int, info:FileInfo|False, eset:Vector<EItem>) :
@@ -677,6 +722,7 @@ defn parse (grammar:Grammar, input:Seqable) -> ParseNode|ParsingErrors :
       ;Case: Finished parsing successfully
       else if next-input is EndOfInput and start-completed :
         compute-completion-cache(set-index, current-set)
+        ;print-current-set(set-index, current-set)
         add-to-setlist(current-set)
         record-completions(set-index, current-set)        
       ;Case: Unexpected end of input
@@ -694,70 +740,104 @@ defn parse (grammar:Grammar, input:Seqable) -> ParseNode|ParsingErrors :
         insert(input-stream)
         loop(set-index, current-set, next-set)
 
-  ;Return -1 if a should take precedence over b during
-  ;a right-to-left disambiguation sweep of the parse forest.
-  defn compare-specificity (a:EParent, b:EParent) -> Int :
-    ;Retrieve fields
-    val parent-rule = grammar[rule(a)]
-    val range-a = ranges[id(a)]
-    val range-b = ranges[id(b)]
-    val rule-a = grammar[rule(range-a)]
-    val rule-b = grammar[rule(range-b)]
-    defn compare-associativity () :
-      switch(associativity(parent-rule)) :
-        RightAssociative : compare(length(range-b), length(range-a))
-        LeftAssociative : compare(length(range-a), length(range-b))
-    defn compare-precedence () :
-      compare(precedence(rule-a), precedence(rule-b))
-    defn compare-order () :
-      compare(rule(range-a), rule(range-b))      
-    val c1 = compare-associativity()
-    if c1 == 0 :
-      val c2 = compare-precedence()
-      if c2 == 0 : compare-order()
-      else : c2
-    else : c1
-
   ;Retrieve a child property
   defn child<?T> (field:ParsedRange -> ?T, p:EParent) :
     field(ranges[id(p)])
 
-  ;Sorting key for use in binary search when looking up parents vector.  
+  ;Lookup key for use in child table.
   defn lookup-key (p:EParent) :
     [rule(p), start(p), index(p), child(end,p)]
 
-  ;Sorting key for use in binary search when lookup up child of parent.
-  defn lookup-key (id:Int, index:Int, end:Int) :
-    val parent = ranges[id]
-    [rule(parent), start(parent), index, end]
+  defn parent-key (p:EParent) :
+    [child(rule, p), child(start,p), child(end,p)]
+
+  defn lookup-key (rule:Int, start:Int, index:Int, end:Int) :
+    [rule, start, index, end]
 
   ;Select a single tree after disambiguation.
-  defn select-tree (id:Int) -> ParseNode :
-    ;Create children table
-    val children-table = group-by(lookup-key, parents)
-    defn lookup-child (id:Int, index:Int, end:Int) :
-      val cs = children-table[lookup-key(id, index, end)]
-      minimum(cs, {compare-specificity(_, _) < 0})
+  defn select-tree (start-id:Int) -> ParseNode :
+    ;Create children/parent table
+    val children-table = group-by(lookup-key, filter-by<EParent>(parents))
+    val parent-table = to-hashtable(parent-key, filter-by<ECondParent>(parents)) where :
+      defn parent-key (p:ECondParent) : [child-start(p), production(p)]
     
-    defn select (id:Int) -> ParseNode :
-      val range = ranges[id]
-      val rule = grammar[rule(range)]
-      val num-tokens = length(tokens(rule))
+    defn lookup-child (rule:Int, start:Int, index:Int, end:Int) :
+      val cs = children-table[lookup-key(rule, start, index, end)]
+      if empty?(tail(cs)) : head(cs)
+      else : minimum(specificity-key, cs)
+
+    defn specificity-key (p:EParent) :
+      defn make-key (parent-rule:Int, start:Int, end:Int, child-rule:Int) :
+        SpecificityKey(associativity(grammar[parent-rule]),
+                       end - start,
+                       priority(grammar[child-rule]),
+                       child-rule)
+      val r = ranges[id(p)]
+      if direct?(p) :
+        make-key(rule(p), start(r), end(r), rule(r))
+      else :
+        let loop (c-rule:Int = rule(r), c-start:Int = start(r)) :
+          val c-production = name(grammar[c-rule])
+          val parent = parent-table[[c-start, c-production]]
+          if rule(parent) == rule(p) and start(parent) == start(p) :
+            make-key(rule(p), c-start, end(r), c-rule)
+          else :
+            loop(rule(parent), start(parent))
+
+    defn select-tokens (rule:Int,
+                        start-position:Int,
+                        end-position:Int,
+                        rightmost-child:ParseNode|False) -> Tuple<ParseNode>|EParent :
+      val grule = grammar[rule]
       val children = Vector<ParseNode>()
-      let loop (index:Int = num-tokens - 1, end-position:Int = end(range)) :
+      match(rightmost-child:ParseNode) : add(children, rightmost-child)
+      val last-index = length(tokens(grule)) - 1
+      val start-index = last-index - length(children)
+      let loop (index:Int = start-index, end-position:Int = end-position) :
         if index >= 0 :
-          match(tokens(rule)[index]) :
+          match(tokens(grule)[index]) :
             (t:GTerminal) :
               loop(index - 1, end-position - 1)
             (t:GProduction) :
-              val child-edge = lookup-child(id, index, end-position)
-              add(children, select(/id(child-edge)))
-              loop(index - 1, child(start, child-edge))
-      reverse!(children)
-      ParseNode(/rule(range), start(range), end(range), to-tuple(children))
-      
+              val child-edge = lookup-child(rule, start-position, index, end-position)
+              if direct?(child-edge) :
+                add(children, select(id(child-edge)))
+                loop(index - 1, child(start, child-edge))
+              else :
+                fatal("Indirect child only allowed on right-most production.") when index < last-index
+                child-edge
+        else :
+          reverse!(children)
+          to-tuple(children)
+    
+    defn select (range-id:Int) -> ParseNode :
+      val range = ranges[range-id]
+      match(select-tokens(rule(range), start(range), end(range), false)) :
+        (children:Tuple<ParseNode>) : 
+          ParseNode(rule(range), start(range), end(range), children)
+        (indirect-child:EParent) :
+          val node = right-recursive-chain(indirect-child)
+          if rule(node) != rule(range) or
+             start(node) != start(range) or
+             end(node) != end(range) :
+            fatal("Inconsistent right recursive chain!")
+          node
+
+    defn right-recursive-chain (p:EParent) :
+      val seed-id = id(p)
+      val seed-range = ranges[seed-id]
+      let loop (seed-rule:Int = rule(seed-range),
+                seed-start:Int = start(seed-range),
+                seed:ParseNode = select(seed-id)) :
+        val seed-production = name(grammar[seed-rule])
+        val parent = parent-table[[seed-start, seed-production]]
+        val children = select-tokens(rule(parent), start(parent), seed-start, seed) as Tuple<ParseNode>
+        val seed* = ParseNode(rule(parent), start(parent), end(seed-range), children)
+        if rule(parent) == rule(p) and start(parent) == start(p) : seed*
+        else : loop(rule(parent), start(parent), seed*)
+
     ;Launch  
-    select(id)
+    select(start-id)
 
   ;Launch!
   defn main () :
@@ -785,8 +865,8 @@ defn example-grammar () :
   val LPAREN = GTerminal(`L)
   val RPAREN = GTerminal(`R)
   [GRule(`S, [E])
-   GRule(`E, [E PLUS E], 100, LeftAssociative)
-   GRule(`E, [E TIMES E], 200, LeftAssociative)
+   GRule(`E, [E PLUS E], 90, LeftAssociative)
+   GRule(`E, [E TIMES E], 80, LeftAssociative)
    GRule(`E, [LPAREN E RPAREN])
    GRule(`E, [N])]
 
@@ -813,7 +893,7 @@ defn example-grammar-2 () :
 
 deftest parse-2 :
   val g = example-grammar-2()
-  parse(Grammar(g), to-tuple $ `(A A B A A B Y))
+  test-parse(g, `(A A B A A B Y))
 
 defn example-grammar-3 () :
   val S = GProduction(`S)
@@ -831,7 +911,7 @@ defn example-grammar-3 () :
 
 deftest parse-3 :
   val g = example-grammar-3()
-  parse(Grammar(g), to-tuple $ `(A A A X))
+  test-parse(g, `(A A A X))
 
 defn example-grammar-4 () :
   val S = GProduction(`S)
@@ -845,7 +925,7 @@ defn example-grammar-4 () :
 
 deftest parse-4 :
   val g = example-grammar-4()
-  parse(Grammar(g), to-tuple $ `(A A A A X))
+  test-parse(g, `(A A A A X))
 
 defn example-grammar-5 () :
   #for E in [ES, E, IF-E, SCLAUSES, SCLAUSE, ECLAUSE] :
@@ -854,10 +934,10 @@ defn example-grammar-5 () :
         x in [+, x, L, R, N, =, let, in, if, :, else, switch]) :
     val X = GTerminal(`x)
   [GRule(`Start, [ES])
-   GRule(`ES, [ES E])
+   GRule(`ES, [E ES])
    GRule(`ES, [])
-   GRule(`E, [E PLUS E], 200, LeftAssociative)
-   GRule(`E, [E TIMES E], 210, LeftAssociative)
+   GRule(`E, [E PLUS E], 90, LeftAssociative)
+   GRule(`E, [E TIMES E], 80, LeftAssociative)
    GRule(`E, [LPAREN E RPAREN])
    GRule(`E, [N])
    GRule(`E, [E EQ E])
@@ -867,7 +947,7 @@ defn example-grammar-5 () :
    GRule(`IF-E, [IF E COLON E ELSE COLON E])
    GRule(`E, [SWITCH LPAREN SCLAUSES ECLAUSE RPAREN])
    GRule(`E, [SWITCH LPAREN SCLAUSES RPAREN])
-   GRule(`SCLAUSES, [SCLAUSES SCLAUSE])
+   GRule(`SCLAUSES, [SCLAUSE SCLAUSES])
    GRule(`SCLAUSES, [])
    GRule(`SCLAUSE, [E COLON E])
    GRule(`ECLAUSE, [ELSE COLON E])]
@@ -877,7 +957,7 @@ deftest grammar-calc :
 
 deftest parse-5 :
   val g = example-grammar-5()
-  parse(Grammar(g), to-tuple $ `(
+  test-parse(g, `(
     switch L
       N : N x N else
       N x N : N
@@ -902,7 +982,40 @@ defn example-grammar-6 () :
 
 deftest parse-7 :
   val g = example-grammar-6()
-  parse(Grammar(g), to-tuple $ `(a a b c a a b c b c a a a a a a a a a a a a a a a a))
+  test-parse(g, `(a a b c a a b c b c a a a a a a a a a a a a a a a a))
+
+deftest parse-mutually-right-recursive :
+  #for E in [AS BS CS A B C X] :
+    val E = GProduction(`E)
+  #for (X in [x a b c],
+        x in [x a b c]) :
+    val X = GTerminal(`x)  
+  val rules = [
+    GRule(`Start, [X X X AS])
+    GRule(`AS, [A, X, BS])
+    GRule(`BS, [B, X, CS])
+    GRule(`CS, [X])
+    GRule(`CS, [C, X, AS])
+    GRule(`X, [x])
+    GRule(`A, [a])
+    GRule(`B, [b])
+    GRule(`C, [c])]
+  test-parse(rules, `(x x x a x b x c x a x b x c x a x b x x))
+
+deftest right-recursive-priority :
+  #for E in [E A BS] :
+    val E = GProduction(`E)
+  #for (X in [a],
+        x in [a]) :
+    val X = GTerminal(`x)  
+  val rules = [
+    GRule(`Start, [E])
+    GRule(`E, [A BS])
+    GRule(`E, [A A A A], 200)    
+    GRule(`BS, [A BS])
+    GRule(`BS, [])    
+    GRule(`A, [a])]
+  test-parse(rules, `(a a a a))
 
 defn example-null-grammar () :
   #for X in [S Ap E] :
@@ -918,7 +1031,7 @@ defn example-null-grammar () :
 
 deftest parse-null :
   val g = example-null-grammar()
-  parse(Grammar(g), to-tuple $ `(a a a))
+  test-parse(g, `(a a a))
 
 defn example-tricky-null-grammar () :
   #for E in [S, A, B] :
@@ -936,7 +1049,7 @@ defn example-tricky-null-grammar () :
 
 deftest parse-tricky-null :
   val g = example-tricky-null-grammar()
-  parse(Grammar(g), to-tuple $ `(w x x d))
+  test-parse(g, `(w x x d))
 
 defn example-tricky-null-grammar-2 () :
   #for E in [B S A] :
@@ -947,10 +1060,10 @@ defn example-tricky-null-grammar-2 () :
   [GRule(`Start, [B])
    GRule(`B, [S])
    GRule(`B, [A])
-   GRule(`S, [w x A A A A d])
+   GRule(`S, [w x A A A A d], 100, LeftAssociative)
    GRule(`A, [w x])
    GRule(`A, [])]
 
 deftest parse-tricky-null-2 :
   val g = example-tricky-null-grammar-2()
-  parse(Grammar(g), to-tuple $ `(w x w x d))
+  test-parse(g, `(w x w x d))
