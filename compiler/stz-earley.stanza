@@ -392,46 +392,6 @@ defn convert-negation-rules (rules:Tuple<GRule>) -> Tuple<GRule> :
      remaining-rules]
 
 ;============================================================
-;===================== Specificity ==========================
-;============================================================
-
-defstruct SpecificityKey <: Comparable<SpecificityKey> :
-  parent-associativity: Associativity
-  length: Int
-  priority: Int
-  rule: Int
-  direct?: True|False
-with:
-  printer => true
-
-;Return -1 if a should take priority over b during
-;a right-to-left disambiguation sweep of the parse forest.
-defmethod compare (a:SpecificityKey, b:SpecificityKey) :
-  fatal("Incomparable keys!") when parent-associativity(a) != parent-associativity(b)
-  ;Retrieve fields
-  defn compare-associativity () :
-    switch(parent-associativity(a)) :
-      RightAssociative : compare(length(b), length(a))
-      LeftAssociative : compare(length(a), length(b))
-  defn compare-priority () :
-    compare(priority(b), priority(a))
-  defn compare-order () :
-    compare(rule(a), rule(b))
-  defn compare-direct () :
-    val da = 0 when direct?(a) else 1
-    val db = 0 when direct?(b) else 1
-    compare(da, db)
-  val c1 = compare-associativity()
-  if c1 == 0 :
-    val c2 = compare-priority()
-    if c2 == 0 :
-      val c3 = compare-order()
-      if c3 == 0 : compare-direct()
-      else : c3
-    else : c2
-  else : c1
-
-;============================================================
 ;======================== ESetList ==========================
 ;============================================================
 
@@ -903,6 +863,7 @@ deftype RangeTable
 defmulti add (t:RangeTable, p:EParent) -> False
 defmulti add (t:RangeTable, p:ECondParent) -> False
 defmulti children (t:RangeTable, rule:Int, start:Int, index:Int, end:Int) -> List<EParent>
+defmulti indirect-children (t:RangeTable, rule:Int, start:Int, index:Int, end:Int) -> List<EParent>
 defmulti parent? (t:RangeTable, start:Int, production:Symbol) -> ECondParent|False
 defmulti parents (t:RangeTable) -> Collection<EParent>
 defmulti condparents (t:RangeTable) -> Collection<ECondParent>
@@ -933,11 +894,13 @@ with:
 
 defn RangeTable () :
   val children-table = HashTable<[Int, Int, Int, Int],List<EParent>>(List())
+  val indirect-children-table = HashTable<[Int, Int, Int, Int],List<EParent>>(List())
   val parent-table = HashTable<[Int,Symbol],ECondParent>()
   new RangeTable :
     defmethod add (this, p:EParent) :
       val key = [rule(p), start(p), index(p), end(child(p))]
-      update(children-table, cons{p, _}, key)
+      val table = children-table when direct?(p) else indirect-children-table
+      update(table, cons{p, _}, key)
       false
     defmethod add (this, p:ECondParent) :
       val key = [child-start(p), production(p)]
@@ -945,6 +908,8 @@ defn RangeTable () :
       parent-table[key] = p
     defmethod children (this, rule:Int, start:Int, index:Int, end:Int) :
       children-table[[rule, start, index, end]]
+    defmethod indirect-children (this, rule:Int, start:Int, index:Int, end:Int) :
+      indirect-children-table[[rule, start, index, end]]
     defmethod parent? (this, start:Int, production:Symbol) :
       get?(parent-table, [start, production])
     defmethod parents (this) :
@@ -961,6 +926,34 @@ defmethod equal? (a:ParsedRange, b:ParsedRange) :
 
 defmethod hash (a:ParsedRange) :
   hash $ [rule(a), start(a), end(a)]
+
+defn length (r:ParsedRange) :
+  end(r) - start(r)
+
+;============================================================
+;===================== Specificity ==========================
+;============================================================
+
+;Return -1 if a should take priority over b during
+;a right-to-left disambiguation sweep of the parse forest.
+defn compare-specificity (grammar:Grammar, a:EParent, b:EParent) :
+  val parent-rule = grammar[rule(a)] as GMatcherRule|GTokenRule
+  val rule-a = grammar[rule(child(a))] as GMatcherRule|GTokenRule
+  val rule-b = grammar[rule(child(b))] as GMatcherRule|GTokenRule
+  defn compare-associativity () :
+    switch(associativity(parent-rule)) :
+      RightAssociative : compare(length(child(b)), length(child(a)))
+      LeftAssociative : compare(length(child(a)), length(child(b)))
+  defn compare-priority () :
+    compare(priority(rule-b), priority(rule-a))
+  defn compare-order () :
+    compare(rule(child(a)), rule(child(b)))
+  val c1 = compare-associativity()
+  if c1 == 0 :
+    val c2 = compare-priority()
+    if c2 == 0 : compare-order()
+    else : c2
+  else : c1  
 
 ;============================================================
 ;====================== Algorithm ===========================
@@ -1115,7 +1108,7 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
       defn* accept-input (t:SExpToken) :
         add(inputlist, t)
         compute-completion-root(set-index, current-set)
-        print-current-set(grammar, set-index, current-set)
+        ;print-current-set(grammar, set-index, current-set)
         add-to-setlist(current-set)
         record-completions(set-index, current-set)
       defn* scan-next-set () :
@@ -1174,13 +1167,7 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
 
   ;Select a single tree after disambiguation.
   defn select-tree () -> ParseNode :
-    println("PARENTS:")
-    for p in parents(ranges) do :
-      println(format(grammar, p))
-    println("COND PARENTS:")
-    for p in condparents(ranges) do :
-      println(p)
-
+    ;Complete right recursive chains 
     val completed-right-recursive-chains = HashSet<ParsedRange>()
     defn complete-right-recursive-chain (r:ParsedRange) :
       if add(completed-right-recursive-chains, r) :
@@ -1188,61 +1175,18 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
         val parent = parent?(ranges, start(r), production)
         match(parent:ECondParent) :
           val last-index = length(tokens!(grammar[rule(parent)])) - 1
-          println("ADDED RIGHT RECURSIVE CHAIN: %_" % [format(grammar,
-            EParent(rule(parent), start(parent), last-index, r, true))])
           add(ranges, EParent(rule(parent), start(parent), last-index, r, true))
           complete-right-recursive-chain(ParsedRange(rule(parent), start(parent), end(r)))
 
-    defn complete-right-recursive-chains (rule:Int, start:Int, index:Int, end:Int) :
-      val cs = children(ranges, rule, start, index, end)
-      for c in cs do :
-        if not direct?(c) :
-          complete-right-recursive-chain(child(c))
-
     defn lookup-child (rule:Int, start:Int, index:Int, end:Int, rightmost-child?:True|False) :
-      println("Lookup child for rule %_ start %_ index %_ end %_" % [
-        rule, start, index, end])
+      ;Complete any outstanding right recursive chains
       if rightmost-child? :
-        val cs = children(ranges, rule, start, index, end)
-        for c in cs do :
-          if not direct?(c) :
-            complete-right-recursive-chain(child(c))
-        val cs* = to-list $ filter(direct?, children(ranges, rule, start, index, end))
-        println("Children:")
-        for c in cs* do :
-          println(format(grammar, c))
-          println("Specificity = %_" % [specificity-key(c)])
-        if empty?(tail(cs*)) : head(cs*)
-        else : minimum(specificity-key, cs*)
-        
-      else :
-        val cs = children(ranges, rule, start, index, end)
-        fatal("Indirect child in non-rightmost-child.") when not all?(direct?,cs)
-        println("Children:")
-        for c in cs do :
-          println(format(grammar, c))
-          println("Specificity = %_" % [specificity-key(c)])
-        if empty?(tail(cs)) : head(cs)
-        else : minimum(specificity-key, cs)
-
-    defn specificity-key (p:EParent) :
-      defn make-key (parent-rule:Int, start:Int, end:Int, child-rule:Int, direct?:True|False) :
-        SpecificityKey(associativity(grammar[parent-rule] as GMatcherRule|GTokenRule),
-                       end - start,
-                       priority(grammar[child-rule] as GMatcherRule|GTokenRule),
-                       child-rule,
-                       direct?)
-      val r = child(p)
-;      if direct?(p) :
-      make-key(rule(p), start(r), end(r), rule(r), true)
-;      else :
-;        let loop (c-rule:Int = rule(r), c-start:Int = start(r)) :
-;          val c-production = name(grammar[c-rule])
-;          val parent = parent(ranges, c-start, c-production)
-;          if rule(parent) == rule(p) and start(parent) == start(p) :
-;            make-key(rule(p), c-start, end(r), c-rule, false)
-;          else :
-;            loop(rule(parent), start(parent))
+        for c in indirect-children(ranges, rule, start, index, end) do :
+          complete-right-recursive-chain(child(c))
+      ;Find most specific child
+      val cs = children(ranges, rule, start, index, end)
+      if empty?(tail(cs)) : head(cs)
+      else : minimum(cs, {compare-specificity(grammar, _, _) < 0})
 
     defn select-tokens (rule:Int,
                         start-position:Int,
@@ -1264,22 +1208,7 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
 
     defn select (range:ParsedRange) -> ParseNode :
       val children = select-tokens(rule(range), start(range), end(range))
-      ParseNode(rule(range), start(range), end(range), children)
-
-;    defn right-recursive-chain (p:EParent) :
-;      val seed-id = id(p)
-;      val seed-range = ranges[seed-id]
-;      println("RIGHT RECURSIVE CHAIN %_" % [format(grammar, seed-range)])
-;      let loop (seed-rule:Int = rule(seed-range),
-;                seed-start:Int = start(seed-range),
-;                seed:ParseNode = select(seed-id)) :
-;        val seed-production = name(grammar[seed-rule])
-;        val parent = parent(ranges, seed-start, seed-production)
-;        val children = select-tokens(rule(parent), start(parent), seed-start, seed) as Tuple<ParseNode>
-;        val seed* = ParseNode(rule(parent), start(parent), end(seed-range), children)
-;        if rule(parent) == rule(p) and start(parent) == start(p) : seed*
-;        else : loop(rule(parent), start(parent), seed*)
-      
+      ParseNode(rule(range), start(range), end(range), children)      
 
     ;Launch
     select(ParsedRange(0, 0, length(setlist) - 1))
@@ -1656,7 +1585,7 @@ defn amb-grammar-2 () :
    GTokenRule(`E, [red])
    GTokenRule(`E, [dog dog])]    
 
-deftest parse-amb-grammar-2 :
+let :;deftest parse-amb-grammar-2 :
   val g = amb-grammar-2()
   test-parse(g, `(red dog dog red dog dog red dog dog red dog dog red dog dog))
 
