@@ -14,6 +14,7 @@ defstruct GRule :
   priority: Int with: (default => 100)
   associativity: Associativity with: (default => RightAssociative)
   reluctant?: True|False with: (default => false)
+  guard: Maybe<(ScannedTokens -> True|False)> with: (default => None())
 
 defenum Associativity :
   LeftAssociative
@@ -33,6 +34,7 @@ defstruct EItem :
   rule:Int
   num-parsed:Int
   parent:Int
+  indices: List<Int>
   completion-root:EItem|False with: (init => false, updater => sub-completion-root)
 
 defstruct ParseNode :
@@ -40,6 +42,9 @@ defstruct ParseNode :
   start: Int
   end: Int
   children: Tuple<ParseNode>
+
+deftype ScannedTokens
+defmulti token (t:ScannedTokens, i:Int) -> SExpToken
 
 ;============================================================
 ;======================== Equalable =========================
@@ -106,8 +111,8 @@ defn wrap (token, info:FileInfo|False) :
   match(info:FileInfo) : Token(token, info)
   else : token
 
-defn inc-num-parsed (x:EItem) :
-  EItem(rule(x), num-parsed(x) + 1, parent(x))
+defn inc-num-parsed (x:EItem, index:Int) :
+  EItem(rule(x), num-parsed(x) + 1, parent(x), cons(index, indices(x)))
 
 defn upcoming (grammar:Grammar, item:EItem) -> GToken|False :
   val r = grammar[rule(item)]
@@ -615,7 +620,7 @@ defn printable-stream (return:OutputStream -> ?) :
       return(o)
 
 defn print-current-set (grammar:Grammar, set-index:Int, current-set:ESet) :
-  println("Completed set %_" % [set-index])
+  println("Set %_" % [set-index])
   within indented() :
     do(println{format(grammar,_)}, current-set)
 
@@ -628,7 +633,7 @@ defn format (grammar:Grammar, e:EItem) :
       print-all(o, [prefix, t])
     if num-parsed(e) == length(tokens(r)) :
       print(o, " •")
-    print(o, ", S%_]" % [parent(e)])
+    print(o, ", S%_] (indices: %,)" % [parent(e), indices(e)])
     if completion-root(e) is EItem :
       val msg = format(grammar, completion-root(e) as EItem)
       print(o, " (complete as %_)" % [msg])
@@ -657,7 +662,7 @@ defn format (grammar:Grammar, node:ParseNode) :
     val o2 = IndentedStream(o)
     do(lnprint{o2, format(grammar,_)}, children(node))
 
-defn format (grammar:Grammar, ranges:Vector<ParsedRange>, p:EParent) :
+defn format (grammar:Grammar, ranges:RangeTable, p:EParent) :
   val parent-rule = grammar[rule(p)]
   val child = ranges[id(p)]
   val child-rule = grammar[rule(child)]
@@ -755,6 +760,8 @@ defmulti length (t:RangeTable) -> Int
 defmulti get (t:RangeTable, id:Int) -> ParsedRange
 defmulti children (t:RangeTable, rule:Int, start:Int, index:Int, end:Int) -> List<EParent>
 defmulti parent (t:RangeTable, start:Int, production:Symbol) -> ECondParent
+defmulti ranges (t:RangeTable) -> Collection<ParsedRange>
+defmulti parents (t:RangeTable) -> Collection<EParent>
 
 defstruct EParent :
   rule: Int
@@ -805,7 +812,12 @@ defn RangeTable () :
     defmethod children (this, rule:Int, start:Int, index:Int, end:Int) :
       children-table[[rule, start, index, end]]
     defmethod parent (this, start:Int, production:Symbol) :
-      parent-table[[start, production]]    
+      parent-table[[start, production]]
+    defmethod ranges (this) :
+      ranges
+    defmethod parents (this) :
+      within to-collection() :
+        cat-all(values(children-table))
 
 ;============================================================
 ;====================== Algorithm ===========================
@@ -838,7 +850,7 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
   defn process-set (set-index:Int,
                     current-set:ESet,
                     next-set:ESet,
-                    next-input) -> True|False :
+                    next-input:SExpToken) -> True|False :
     ;Clear state
     clear-markers(setlist)
     clear(prediction-set)
@@ -859,12 +871,12 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
           add(current-set, item) when add(completion-set, item)
         defn upcoming-terminal (item:EItem, t:GKeyword|GListStart|GListEnd|GAny|GListRest) :
           if matches-input?(t, next-input) :
-            add(next-set, inc-num-parsed(item))
+            add(next-set, inc-num-parsed(item, set-index))
         defn upcoming-production (item:EItem, t:GProduction) :
-          add-completion(inc-num-parsed(item)) when nullable?(grammar, name(t))
+          add-completion(inc-num-parsed(item, set-index)) when nullable?(grammar, name(t))
           if add(prediction-set, name(t)) :
             for rule in rules(grammar, name(t), next-input) do :
-              add(current-set, EItem(rule, 0, set-index))
+              add(current-set, EItem(rule, 0, set-index, List()))
         defn end-of-rule (completed-item:EItem) :
           if rule(completed-item) == 0 : start-completed = true
           val prod = production(grammar,completed-item)
@@ -873,17 +885,10 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
               val root = match(completion-root(item)) :
                 (root:EItem) : root
                 (f:False) : item
-              add-completion(inc-num-parsed(root))
+              add-completion(inc-num-parsed(root, parent(completed-item)))
 
     ;Return whether the starting production has been completed.
     start-completed
-
-  ;Scan any passing
-  defn scan-upcoming (f:GToken|False -> True|False, current-set:ESet, next-set:ESet) :
-    clear(next-set, 0)
-    for item in current-set do :
-      if f(upcoming(grammar,item)) :
-        add(next-set, inc-num-parsed(item))
 
   defn compute-completion-root (set-index:Int, current-set:ESet) :
     ;Compute count table
@@ -940,7 +945,7 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
     ;Initialize current-set and next-set.
     val current-set = ESet(grammar)
     val next-set = ESet(grammar)
-    add(current-set, EItem(0, 0, 0))
+    add(current-set, EItem(0, 0, 0, List()))
     ;Initialize input stream
     val input-stream = SExpStream(input)
     ;Process sets until finished.
@@ -955,6 +960,7 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
       defn* accept-input (t:SExpToken) :
         add(inputlist, t)
         compute-completion-root(set-index, current-set)
+        print-current-set(grammar, set-index, current-set)
         add-to-setlist(current-set)
         record-completions(set-index, current-set)
       defn* scan-next-set () :
@@ -963,6 +969,13 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
       defn* scan-current-set-again () :
         clear(current-set, num-scanned)
         loop(set-index, current-set, next-set)
+      defn* inc-num-parsed-when (f:GToken|False -> True|False) :
+        clear(next-set, 0)
+        for item in current-set do :        
+          if f(upcoming(grammar,item)) :
+            add(next-set, inc-num-parsed(item, set-index))
+      defn scanned-list-start? (item:EItem) :
+        previous(grammar,item) is GListStart
 
       ;Dispatch to different cases
       defn* dispatch () :
@@ -973,11 +986,11 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
           else : unexpected-input()
         else : advance-standard-terminals()
       defn* advance-rest-terminals () :
-        scan-upcoming({_ is GListRest}, current-set, next-set)
+        inc-num-parsed-when({_ is GListRest})
         accept-input(advance-rest(input-stream))
         scan-next-set()
       defn* advance-any-terminals () :
-        scan-upcoming({_ is GAny}, current-set, next-set)          
+        inc-num-parsed-when({_ is GAny})          
         accept-input(next-input)
         advance(input-stream, false)
         scan-next-set()
@@ -1452,6 +1465,6 @@ defn if-grammar () :
    GRule(`E, [IF E THEN E ELSE E], 100, LeftAssociative)
    GRule(`E, [N])]    
 
-deftest parse-if-grammar :
+let :;deftest parse-if-grammar :
   val g = if-grammar()
   test-parse(g, `(if N then (if N then N) else N))
