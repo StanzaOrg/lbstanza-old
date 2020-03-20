@@ -21,12 +21,16 @@ defstruct GMatcherRule <: GRule :
   tokens: Tuple<GToken>
   matcher: ? -> True|False
   priority: Int with: (default => 100)
+  lazy-action?: True|False with: (default => false)
+  action: ParsedResult -> ? with: (default => default-action)
 
 defstruct GTokenRule <: GRule :
   name: Symbol with: (as-method => true, updater => sub-name)
   tokens: Tuple<GToken>
   priority: Int with: (default => 100)
   associativity: Associativity with: (default => RightAssociative)
+  lazy-action?: True|False with: (default => false)
+  action: ParsedResult -> ? with: (default => default-action)
 
 defenum Associativity :
   LeftAssociative
@@ -60,7 +64,13 @@ defstruct ParseNode :
   rule: Int
   start: Int
   end: Int
-  children: Tuple<ParseNode>
+  children: Tuple<ParseNode|False>
+
+deftype ParsedResult
+defmulti get (r:ParsedResult, i:Int) -> ?
+defmulti info (r:ParsedResult) -> FileInfo|False
+defmulti form (r:ParsedResult) -> List
+defn default-action (r:ParsedResult) : false
 
 ;============================================================
 ;======================== Equalable =========================
@@ -663,7 +673,7 @@ defn format (grammar:Grammar, node:ParseNode) :
     val rule = grammar[rule(node)]
     print(o, "[%_ to %_] %_" % [start(node), end(node), rule])
     val o2 = IndentedStream(o)
-    do(lnprint{o2, format(grammar,_)}, children(node))
+    do(lnprint{o2, format(grammar,_)}, filter-by<ParseNode>(children(node)))
 
 defn format (grammar:Grammar, p:EParent) :
   val parent-rule = grammar[rule(p)]
@@ -692,6 +702,9 @@ with:
 defstruct SExpWildcard <: SExpToken
 defstruct SExpListEnd <: SExpToken
 defstruct EndOfInput <: SExpToken
+
+defn list (t:SExpListEnd) :
+  List()
 
 defn SExpStream (input:List) :
   val stack = Vector<List>()
@@ -938,7 +951,13 @@ defn empty? (s:ESet) :
 ;====================== Algorithm ===========================
 ;============================================================
 
-defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
+defstruct ParseResult :
+  node: ParseNode
+  grammar: Grammar
+  inputlist: Vector<SExpToken>
+  infolist: Vector<FileInfo|False>
+
+defn parse-result (grammar:Grammar, input:List) -> ParseResult|ParsingErrors :
   val setlist = ESetList(grammar)
   val prediction-set = ProductionSet()
   val completion-set = CompletionSet()
@@ -1174,8 +1193,11 @@ defn parse (grammar:Grammar, input:List) -> ParseNode|ParsingErrors :
   ;Launch!
   defn main () :
     process-all-sets()
-    if empty?(missing) : select-tree(grammar, ranges, length(setlist) - 1)
-    else : to-exception(grammar, missing)
+    if empty?(missing) :
+      val node = select-tree(grammar, ranges, length(setlist) - 1)
+      ParseResult(node, grammar, inputlist, infolist)
+    else :
+      to-exception(grammar, missing)
 
   main()  
 
@@ -1207,15 +1229,16 @@ defn select-tree (grammar:Grammar, ranges:RangeTable, ending-set:Int) -> ParseNo
 
   defn select-tokens (rule:Int,
                       start-position:Int,
-                      end-position:Int) -> Tuple<ParseNode> :
+                      end-position:Int) -> Tuple<ParseNode|False> :
     val grule = grammar[rule] as GMatcherRule|GTokenRule
-    val children = Vector<ParseNode>()
+    val children = Vector<ParseNode|False>()
     val last-index = length(tokens(grule)) - 1
     let loop (index:Int = last-index, end-position:Int = end-position) :
       if index >= 0 :
         match(tokens(grule)[index]) :
           (t:GKeyword|GListStart|GListEnd|GAny|GListRest) :
             loop(index - 1, end-position - 1)
+            add(children, false)
           (t:GProduction) :              
             val child-edge = lookup-child(rule, start-position, index, end-position, index == last-index)
             add(children, select(child(child-edge)))
@@ -1252,13 +1275,85 @@ defn compare-specificity (grammar:Grammar, a:EParent, b:EParent) :
   else : c1  
 
 ;============================================================
+;================= Evaluate the Parse Tree ==================
+;============================================================
+
+defn evaluate-parse-tree (parse-result:ParseResult) :
+  ;Pull out fields
+  val grammar = grammar(parse-result)
+  val inputlist = inputlist(parse-result)
+  val infolist = infolist(parse-result)
+  
+  ;Accumulated errors                        
+  val errors = Vector<Exception>()
+
+  ;Attempt evaluation of a given ParseNode
+  defn evaluate (tree:ParseNode) -> Maybe :
+    ;Retrieve rule
+    val rule = grammar[rule(tree)] as GMatcherRule|GTokenRule
+    defn evaluate-child (i:Int) -> Maybe :
+      match(children(tree)[i]) :
+        (child:ParseNode) :
+          evaluate(child)
+        (f:False) :
+          val token = tokens(rule)[i]
+          val input = inputlist[start(tree) + i]
+          match(token, input) :
+            (token:GListRest, input:SExpForm|SExpListEnd) : One(list(input))
+            (token, input:SExpForm) : One(form(input))
+            
+    ;Lazy evaluation
+    defn lazy-evaluation () :
+      val result = new ParsedResult :
+        defmethod get (this, i:Int) :
+          val v = evaluate-child(i)
+          throw(ChildNotEvaluated()) when empty?(v)
+          value!(v)
+        defmethod info (this) : infolist[start(tree)]
+        defmethod form (this) : list(inputlist[start(tree)] as SExpForm|SExpListEnd)
+      try :
+        One(action(rule)(result))
+      catch (e:ChildNotEvaluated) :
+        None()
+      catch (e:Exception) :
+        add(errors, e)
+        None()
+        
+    ;Eager evaluation
+    defn eager-evaluation () :
+      val results = to-tuple $ seq(evaluate-child, 0 to length(tokens(rule)))
+      if none?(empty?, results) :
+        val result = new ParsedResult :
+          defmethod get (this, i:Int) : value!(results[i])
+          defmethod info (this) : infolist[start(tree)]
+          defmethod form (this) : list(inputlist[start(tree)] as SExpForm|SExpListEnd)
+        try :
+          One(action(rule)(result))
+        catch (e:Exception) :
+          add(errors, e)
+          None()
+      else :
+        None()
+
+    ;Launch!
+    if lazy-action?(rule) : lazy-evaluation()
+    else : eager-evaluation()
+
+  ;Launch!
+  val v = evaluate(node(parse-result))
+  if empty?(v) : value!(v)
+  else : throw(ParsingErrors(to-tuple(errors)))
+
+defstruct ChildNotEvaluated <: Exception
+
+;============================================================
 ;======================= Test Case ==========================
 ;============================================================
 
 defn test-parse (rules:Tuple<GRule>, input:List) :
   val g = Grammar(rules)
-  match(parse(g, input)) :
-    (n:ParseNode) : println(format(g,n))
+  match(parse-result(g, input)) :
+    (n:ParseResult) : println(format(g,node(n)))
     (e:ParsingErrors) : println(e)
 
 defn example-grammar () :
