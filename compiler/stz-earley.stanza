@@ -20,7 +20,7 @@ defstruct GMatcherRule <: GRule :
   name: Symbol with: (as-method => true, updater => sub-name)
   tokens: Tuple<GToken>
   matcher: ? -> True|False
-  category: Int with: (default => 0)
+  failure: True|False with: (default => false)
   priority: Int with: (default => 100)
   action: ParsedResult -> ? with: (default => default-action)
   lazy-action?: True|False with: (default => false)
@@ -28,7 +28,7 @@ defstruct GMatcherRule <: GRule :
 defstruct GTokenRule <: GRule :
   name: Symbol with: (as-method => true, updater => sub-name)
   tokens: Tuple<GToken>
-  category: Int with: (default => 0)
+  failure: True|False with: (default => false)
   priority: Int with: (default => 100)
   associativity: Associativity with: (default => RightAssociative)
   action: ParsedResult -> ? with: (default => default-action)
@@ -36,7 +36,7 @@ defstruct GTokenRule <: GRule :
 
 defn GMatcherRule (name:Symbol, tokens:Tuple<GToken>, matcher:? -> True|False,
                    action:ParsedResult -> ?, lazy-action?:True|False) :
-  GMatcherRule(name, tokens, matcher, 0, 100, action, lazy-action?)
+  GMatcherRule(name, tokens, matcher, false, 100, action, lazy-action?)
 
 defn GMatcherRule (name:Symbol, tokens:Tuple<GToken>, matcher:? -> True|False,
                    action:ParsedResult -> ?) :
@@ -46,7 +46,7 @@ defn GTokenRule (name:Symbol,
                  tokens:Tuple<GToken>,
                  action:ParsedResult -> ?,
                  lazy-action?:True|False) :
-  GTokenRule(name, tokens, 0, 100, RightAssociative, action, lazy-action?)
+  GTokenRule(name, tokens, false, 100, RightAssociative, action, lazy-action?)
 
 defn GTokenRule (name:Symbol,
                  tokens:Tuple<GToken>,
@@ -94,9 +94,8 @@ defstruct EItem :
   completion-root:EItem|False with: (init => false, updater => sub-completion-root)  
 
 defstruct ParseNode :
-  rule: Int
-  start: Int
-  end: Int
+  range: ParsedRange
+  max-failure: Int
   children: Tuple<ParseNode|False>
 
 deftype ParsedResult
@@ -853,8 +852,7 @@ defn format (grammar:Grammar, r:ParsedRange) :
 
 defn format (grammar:Grammar, node:ParseNode) :
   within o = printable-stream() :
-    val rule = grammar[rule(node)]
-    print(o, "[%_ to %_] %_" % [start(node), end(node), rule])
+    print(o, format(grammar, range(node)))
     val o2 = IndentedStream(o)
     do(lnprint{o2, format(grammar,_)}, filter-by<ParseNode>(children(node)))
 
@@ -1440,19 +1438,10 @@ defn parse-result (grammar:Grammar, input:List) -> ParseResult|ParsingErrors :
 
   ;Launch!
   defn main () :
-    val process-set-timer = MillisecondTimer("Process Set")
-    start(process-set-timer)
     process-all-sets()
-    stop(process-set-timer)
-    println(process-set-timer)
-    
     if empty?(missing) :
-      val tree-timer = MillisecondTimer("Tree")
-      start(tree-timer)
       val pruned-ranges = prune-tree(grammar, ranges, length(setlist) - 1)
       val node = select-tree(grammar, pruned-ranges)
-      stop(tree-timer)
-      println(tree-timer)
       ParseResult(node, grammar, inputlist, infolist)
     else :
       to-exception(grammar, missing)
@@ -1513,46 +1502,48 @@ defn prune-tree (grammar:Grammar, ranges:RangeTable, ending-set:Int) :
 ;============================================================
 
 defn select-tree (grammar:Grammar, children-table:ChildrenTable) -> ParseNode :
-  defn lookup-child (range:ParsedRange, index:Int, child-start:Int) :
-    val cs = children-table[range, index, child-start]
-    if empty?(tail(cs)) : head(cs)
-    else : minimum(cs, {compare-specificity(grammar, rule(range), _, _) < 0})
+  val node-table = HashTable<ParsedRange,ParseNode>()
 
   defn select (range:ParsedRange) -> ParseNode :
-    val grule = grammar[rule(range)] as GMatcherRule|GTokenRule
-    val children = Vector<ParseNode|False>()
-    val num-tokens = length(tokens(grule))
-    let loop (index:Int = 0, position:Int = start(range)) :
-      if index < num-tokens :
-        match(tokens(grule)[index]) :
-          (t:GTerminal) :
-            add(children, false)
-            loop(index + 1, position + 1)
-          (t:GProduction) :
-            val child = lookup-child(range, index, position)
-            add(children, select(child))
-            loop(index + 1, end(child))
-    ParseNode(rule(range), start(range), end(range), to-tuple(children))
+    set?(node-table, range, fn () :
+      val grule = grammar[rule(range)] as GMatcherRule|GTokenRule
+      var max-failure:Int = length(range) when failure(grule) else 0
+      val children = Vector<ParseNode|False>()
+      val num-tokens = length(tokens(grule))
+      let loop (index:Int = 0, position:Int = start(range)) :
+        if index < num-tokens :
+          match(tokens(grule)[index]) :
+            (t:GTerminal) :
+              add(children, false)
+              loop(index + 1, position + 1)
+            (t:GProduction) :
+              val child-ranges = children-table[range, index, position]
+              val candidate-children = map(select, child-ranges)
+              val child = minimum(candidate-children, {compare-specificity(grammar, rule(range), _, _) < 0})
+              max-failure = max(max-failure, /max-failure(child))
+              add(children, child)
+              loop(index + 1, end(/range(child)))
+      ParseNode(range, max-failure, to-tuple(children)))
 
   ;Launch!
   select(start(children-table))
 
 ;Return -1 if a should take priority over b during a left-to-right disambiguation sweep of the parse forest.
-defn compare-specificity (grammar:Grammar, parent-rule-index:Int, a:ParsedRange, b:ParsedRange) :
+defn compare-specificity (grammar:Grammar, parent-rule-index:Int, a:ParseNode, b:ParseNode) :
   val parent-rule = grammar[parent-rule-index] as GMatcherRule|GTokenRule
-  val rule-a = grammar[rule(a)] as GMatcherRule|GTokenRule
-  val rule-b = grammar[rule(b)] as GMatcherRule|GTokenRule
-  defn compare-category () :
-    compare(category(rule-b), category(rule-a))
+  val rule-a = grammar[rule(range(a))] as GMatcherRule|GTokenRule
+  val rule-b = grammar[rule(range(b))] as GMatcherRule|GTokenRule
+  defn compare-failure () :
+    compare(max-failure(a), max-failure(b))
   defn compare-associativity () :
     switch(associativity(parent-rule)) :
-      LeftAssociative : compare(length(b), length(a))
-      RightAssociative : compare(length(a), length(b))
+      LeftAssociative : compare(length(range(b)), length(range(a)))
+      RightAssociative : compare(length(range(a)), length(range(b)))
   defn compare-priority () :
     compare(priority(rule-b), priority(rule-a))
   defn compare-order () :
-    compare(rule(a), rule(b))
-  val c0 = compare-category()
+    compare(rule(range(a)), rule(range(b)))
+  val c0 = compare-failure()
   if c0 == 0 :
     val c1 = compare-associativity()
     if c1 == 0 :
@@ -1578,14 +1569,14 @@ defn evaluate-parse-tree (parse-result:ParseResult) :
   ;Attempt evaluation of a given ParseNode
   defn evaluate (tree:ParseNode) -> Maybe :
     ;Retrieve rule
-    val rule = grammar[rule(tree)] as GMatcherRule|GTokenRule
+    val rule = grammar[rule(range(tree))] as GMatcherRule|GTokenRule
     defn evaluate-child (i:Int) -> Maybe :
       match(children(tree)[i]) :
         (child:ParseNode) :
           evaluate(child)
         (f:False) :
           val token = tokens(rule)[i]
-          val input = inputlist[start(tree) + i]
+          val input = inputlist[start(range(tree)) + i]
           match(token, input) :
             (token:GListRest, input:SExpForm|SExpListEnd) : One(list(input))
             (token:GListEnd, input:SExpListEnd) : One(false)
@@ -1598,8 +1589,8 @@ defn evaluate-parse-tree (parse-result:ParseResult) :
           val v = evaluate-child(i)
           throw(ChildNotEvaluated()) when empty?(v)
           value!(v)
-        defmethod info (this) : infolist[start(tree)]
-        defmethod form (this) : list(inputlist[start(tree)] as SExpForm|SExpListEnd)
+        defmethod info (this) : infolist[start(range(tree))]
+        defmethod form (this) : list(inputlist[start(range(tree))] as SExpForm|SExpListEnd)
       try :
         One(action(rule)(result))
       catch (e:ChildNotEvaluated) :
@@ -1615,8 +1606,8 @@ defn evaluate-parse-tree (parse-result:ParseResult) :
       if none?(empty?, results) :
         val result = new ParsedResult :
           defmethod get (this, i:Int) : value!(results[i])
-          defmethod info (this) : infolist[start(tree)]
-          defmethod form (this) : list(inputlist[start(tree)] as SExpForm|SExpListEnd)
+          defmethod info (this) : infolist[start(range(tree))]
+          defmethod form (this) : list(inputlist[start(range(tree))] as SExpForm|SExpListEnd)
         try :
           One(action(rule)(result))
         catch (e:Exception) :
@@ -1630,11 +1621,7 @@ defn evaluate-parse-tree (parse-result:ParseResult) :
     else : eager-evaluation()
 
   ;Launch!
-  val evaluate-timer = MillisecondTimer("Evaluation Timer")
-  start(evaluate-timer)
   val v = evaluate(node(parse-result))
-  stop(evaluate-timer)
-  println(evaluate-timer)
   if empty?(v) : throw(ParsingErrors(to-tuple(errors)))
   else : value!(v)
 
@@ -1670,8 +1657,8 @@ defn example-grammar () :
   val LPAREN = GKeyword(`L)
   val RPAREN = GKeyword(`R)
   [GTokenRule(`S, [E])
-   GTokenRule(`E, [E PLUS E], 0, 90, LeftAssociative)
-   GTokenRule(`E, [E TIMES E], 0, 80, LeftAssociative)
+   GTokenRule(`E, [E PLUS E], false, 90, LeftAssociative)
+   GTokenRule(`E, [E TIMES E], false, 80, LeftAssociative)
    GTokenRule(`E, [LPAREN E RPAREN])
    GTokenRule(`E, [N])]
 
@@ -1741,8 +1728,8 @@ defn example-grammar-5 () :
   [GTokenRule(`Start, [ES GListEnd()])
    GTokenRule(`ES, [E ES])
    GTokenRule(`ES, [])
-   GTokenRule(`E, [E PLUS E], 0, 90, LeftAssociative)
-   GTokenRule(`E, [E TIMES E], 0, 80, LeftAssociative)
+   GTokenRule(`E, [E PLUS E], false, 90, LeftAssociative)
+   GTokenRule(`E, [E TIMES E], false, 80, LeftAssociative)
    GTokenRule(`E, [LPAREN E RPAREN])
    GTokenRule(`E, [N])
    GTokenRule(`E, [E EQ E])
@@ -1816,7 +1803,7 @@ deftest right-recursive-priority :
   val rules = [
     GTokenRule(`Start, [E])
     GTokenRule(`E, [A BS])
-    GTokenRule(`E, [A A A A], 200)
+    GTokenRule(`E, [A A A A], false, 200)
     GTokenRule(`BS, [A BS])
     GTokenRule(`BS, [])
     GTokenRule(`A, [a])]
@@ -1865,7 +1852,7 @@ defn example-tricky-null-grammar-2 () :
   [GTokenRule(`Start, [B])
    GTokenRule(`B, [S])
    GTokenRule(`B, [A])
-   GTokenRule(`S, [w x A A A A d], 0, 100, LeftAssociative)
+   GTokenRule(`S, [w x A A A A d], false, 100, LeftAssociative)
    GTokenRule(`A, [w x])
    GTokenRule(`A, [])]
 
@@ -2015,7 +2002,7 @@ defn amb-grammar () :
   val RP = GListEnd()
   [GTokenRule(`Start, [S GListEnd()])
    GTokenRule(`S, [ES])
-   GTokenRule(`ES, [E ES], 0, 100, LeftAssociative)
+   GTokenRule(`ES, [E ES], false, 100, LeftAssociative)
    GTokenRule(`ES, [])
    GTokenRule(`E, [dog])
    GTokenRule(`E, [red])
@@ -2036,7 +2023,7 @@ defn amb-grammar-2 () :
   [GTokenRule(`Start, [S GListEnd()])
    GTokenRule(`S, [ES])
    GTokenRule(`ES, [E])
-   GTokenRule(`ES, [E ES], 0, 100, LeftAssociative)
+   GTokenRule(`ES, [E ES], false, 100, LeftAssociative)
    GTokenRule(`E, [dog])
    GTokenRule(`E, [red])
    GTokenRule(`E, [dog dog])]    
@@ -2055,11 +2042,11 @@ defn if-grammar () :
   val RP = GListEnd()
   [GTokenRule(`Start, [S GListEnd()])
    GTokenRule(`S, [ES])
-   GTokenRule(`ES, [E ES], 0, 100, LeftAssociative)
+   GTokenRule(`ES, [E ES], false, 100, LeftAssociative)
    GTokenRule(`ES, [])
    GTokenRule(`E, [LP E RP])   
-   GTokenRule(`E, [IF E THEN E], 0, 100, LeftAssociative)      
-   GTokenRule(`E, [IF E THEN E ELSE E], 0, 100, LeftAssociative)
+   GTokenRule(`E, [IF E THEN E], false, 100, LeftAssociative)      
+   GTokenRule(`E, [IF E THEN E ELSE E], false, 100, LeftAssociative)
    GTokenRule(`E, [N])]    
 
 deftest parse-if-grammar :
@@ -2173,9 +2160,9 @@ defn exp-grammar () :
        qquote($for ~(result[1]) ~(result[3]) ~(result[5])))
    GTokenRule(`E, [LET ID EQ E COLON E], fn (result) :
      qquote($let ~(result[1]) ~(result[3]) ~(result[5])))
-   GTokenRule(`E, [LET ID EQ E R], -1, 100, RightAssociative, fn (result) :
+   GTokenRule(`E, [LET ID EQ E R], true, 100, RightAssociative, fn (result) :
      throw(Exception("%_: Expected a colon after let binding" % [info(result)])))
-   GTokenRule(`E, [E LP DO ES RP], 0, 70, LeftAssociative, fn (result) :
+   GTokenRule(`E, [E LP DO ES RP], false, 70, LeftAssociative, fn (result) :
      qquote($call ~(result[0]) ~@(result[3])))
    GTokenRule(`E, [LP E RP], fn (result) :
      result[1])
@@ -2185,10 +2172,10 @@ defn exp-grammar () :
      result[0])
    GTokenRule(`E, [GIntToken()], fn (result) :
      result[0])
-   GTokenRule(`E, [E PLUS E], 0, 90, LeftAssociative, fn (result) :
+   GTokenRule(`E, [E PLUS E], false, 90, LeftAssociative, fn (result) :
      qquote($plus ~(result[0]), ~(result[2])))
-   GTokenRule(`E, [E TIMES E], 0, 80, LeftAssociative, fn (result) :
-     qquote($times ~(result[0]), ~(result[2])))]  
+   GTokenRule(`E, [E TIMES E], false, 80, LeftAssociative, fn (result) :
+     qquote($times ~(result[0]), ~(result[2])))]
 
 deftest parse-exp-grammar :
   test-parse(exp-grammar(), reader/read-file("exp-test.txt"))
@@ -2196,31 +2183,31 @@ deftest parse-exp-grammar :
 deftest action-exp-grammar :
   test-parse-action(exp-grammar(), reader/read-file("exp-test.txt"))
 
-;defn rest-priority-grammar () :
-;  #for E in [ES E F A R] :
-;    val E = GProduction(`E)
-;  #for (X in [PLUS N],
-;        x in [+ N]) :
-;    val X = GKeyword(`x)
-;  val LP = GListStart()
-;  val LP* = GListStart(true)
-;  val RP = GListEnd()
-;      
-;  [GTokenRule(`Start, [F GListEnd()])
-;
-;   GTokenRule(`F, [E E], 0, 100, LeftAssociative)
-;   
-;   GTokenRule(`E, [E PLUS E], 0, 90, LeftAssociative)
-;   GTokenRule(`E, [E R], -1)
-;   GTokenRule(`E, [N])
-;
-;   GTokenRule(`A, [GAny()])
-;   GTokenRule(`A, [LP* R RP])
-;   GTokenRule(`R, [GAny(Reluctant) R])
-;   GTokenRule(`R, [LP* R RP R])
-;   GTokenRule(`R, [GListRest()])
-;   GTokenRule(`R, [])]
-;
-;deftest parse-rest-priority-grammar :
-;  val g = rest-priority-grammar()
-;  test-parse(g, `(N + N + N N + N))
+defn rest-priority-grammar () :
+  #for E in [ES E F A R] :
+    val E = GProduction(`E)
+  #for (X in [PLUS N],
+        x in [+ N]) :
+    val X = GKeyword(`x)
+  val LP = GListStart()
+  val LP* = GListStart(true)
+  val RP = GListEnd()
+      
+  [GTokenRule(`Start, [F GListEnd()])
+
+   GTokenRule(`F, [E E], false, 100, LeftAssociative)
+   
+   GTokenRule(`E, [E PLUS E], false, 90, LeftAssociative)
+   GTokenRule(`E, [N R], true)
+   GTokenRule(`E, [N])
+
+   GTokenRule(`A, [GAny()])
+   GTokenRule(`A, [LP* R RP])
+   GTokenRule(`R, [GAny(Reluctant) R])
+   GTokenRule(`R, [LP* R RP R])
+   GTokenRule(`R, [GListRest()])
+   GTokenRule(`R, [])]
+
+deftest parse-rest-priority-grammar :
+  val g = rest-priority-grammar()
+  test-parse(g, `(N + N + N N + N))
