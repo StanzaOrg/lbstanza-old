@@ -1,0 +1,380 @@
+defpackage stz/auto-doc :
+  import core
+  import collections
+  import stz/namemap
+  import stz/compiler
+  import stz/front-end
+  import stz/visibility
+  import stz/il-ir
+  import stz/pkg
+  import stz/dl-ir
+  import stz/algorithms
+  import stz/proj-manager
+
+;produces mdbook documentation for given ipackages
+;auto-doc refers to generating api information from actual definitions
+;also includes doc strings which can have markdown (and html) strings
+;example usage:
+;  stanza doc infinity-mirror-3dp -o md-docs
+;doc string examples:
+;  DOC: "makes figures"
+;  DOC: \<s>makes figures<s>
+;where
+;  \<tag>...<tag> is stanza long comment syntax
+;a doc strings can also contain a FIG:(app, code) within
+;where app is an app that is called with a url as first arg and code as second arg
+;app is responsible for running code and producing figure at given url
+;FIG example is:
+;  <img src=FIG:("gen-pkg-app", view(URL, two-pin-package(0.35, 0.10, 0.14, 0.35, 0.14))).svg height="50">
+;where
+;  gen-pkg-app is passed the url to write to minus the svg suffix and
+;  FIG returns the same url, and 
+;  gen-pkg-app binds the variable URL to the passed in URL
+;
+;TODO:
+;
+; o Move pretty-printer out to general mechanism.
+;     There some tricky nuances involving precedence and operator associativity.
+;     Look at the type printer in stz-type to see how precedence is handled.
+;     Hopefully, can be refactored together with the pretty-printer into the same mechanism.
+; o parse-iterms is fine for now. Has some bad performance characteristics that we can revisit later.
+; o the FIG processing currently runs as part of running stanza doc,
+;     this will need to be revisited so that text can be updated without rerunning all the generation programs.
+
+
+;mangle package name so that it can be used as a filename
+defn mangle (name:Symbol) -> Symbol :
+  to-symbol(replace(to-string(name), '/', '$'))
+
+;find all public definitions in ipackage
+defn public-definitions (ipackage:IPackage) -> Seq<IExp> :
+  generate<IExp> :
+    defn loop (e:IExp) :
+      defn* loop-public (e:IExp, public?:True|False) :
+        match(e) :
+          (e:IBegin) :
+            do(loop-public{_, public?}, exps(e))
+          (e:IDefn|IDef|IDefChild|IDefType|IDefVar|IDefmulti|IDefmethod|ILSDefn|ILSDefType|ILSDefmethod|IDoc) :
+            yield(e)
+          (e:IVisibility) :
+            loop-public(exp(e), visibility(e) is Public)
+          (e) :
+            false
+      match(e) :
+        (e:IBegin) :
+          do(loop, exps(e))
+        (e:IDoc) :
+          yield(e)
+        (e:IDefmethod|ILSDefmethod) :
+          yield(e)
+        (e:IVisibility) :
+          loop-public(exp(e), visibility(e) is Public)
+        (e) :
+          false
+    for e in exps(ipackage) do :
+      loop(e)
+
+;lookup names in namemap
+defn lookup (nm:NameMap, e:IExp) :
+  match(e) :
+    (e:VarN) : name(nm[n(e)])
+    (e) : e
+
+;print anchor for index jumping
+defn print-anchor (o:OutputStream, e:IExp) :
+  match(e:VarN) :
+    println(o, "<a name=\"V%_\"></a>\n" % [n(e)])
+
+defn pretty-targs (nm:NameMap, targs:List<IExp>) :
+  "" when empty?(targs) else ("<%,>" % [pretties(nm, targs)])
+
+;produce a version of exp like surface syntax
+defn pretty (nm:NameMap, e:IExp) :
+  match(e) :
+    (e:IOf) : "%_%_" % [pretty(nm, class(e)), pretty-targs(nm, args(e))]
+    (e:IAnd) : "%_&%_" % [pretty(nm, a(e)), pretty(nm, b(e))]
+    (e:IOr) : "%_|%_" % [pretty(nm, a(e)), pretty(nm, b(e))]
+    (e:IArrow) : "%_ -> %_" % [pretties(nm, a1(e)), pretty(nm, a2(e))]
+    (e:IGradual) : "?"
+    (e:IVoid) : "void"
+    (e:INone) : "none"
+    (e:ITuple) : "[%,]" % [pretties(nm, exps(e))]
+    (e:IVar) : name(e)
+    (e:ICap) : "?%_" % [pretty(nm, name(e))]
+    (e:ILSOfT) : "%_%_" % [pretty(nm, class(e)), pretty-targs(nm, args(e))]
+    (e:ILSRefT) : "ref<%_>" % [pretty(nm, type(e))]
+    (e:VarN) : lookup(nm, e)
+    (e:Raw) : pretty(nm, class(e))
+    (e) : e
+
+defn pretties (nm:NameMap, e:List<IExp>) :
+  map(pretty{nm, _}, e)
+
+defn pretty-arg-type (nm:NameMap, a:IExp, t:IExp) :
+  "%_:%_" % [lookup(nm, a), pretty(nm, t)]
+
+defn pretty-return-type (nm:NameMap, t:IExp) :
+  "" when t is INone else (" -> %_" % [pretty(nm, t)])
+
+defn pretty-parent (nm:NameMap, t:IExp) :
+  "" when t is INone else (" <: %_" % [pretty(nm, t)])
+
+defn pretty-type (nm:NameMap, t:IExp) :
+  "" when t is INone else (" : %_" % [pretty(nm, t)])
+
+defn pretty-args (nm:NameMap, targs:List<IExp>, args:List<IExp>, a1:List<IExp>, a2:IExp) :
+  "%_ (%,)%_" % [pretty-targs(nm, targs), map(pretty-arg-type{nm, _, _}, args, a1), pretty-return-type(nm, a2)]
+
+defn pretty-args (nm:NameMap, targs:List<IExp>, a1:List<IExp>, a2:IExp) :
+  "%_ (%,)%_" % [pretty-targs(nm, targs), pretties(nm, a1), pretty-return-type(nm, a2)]
+
+;records definition index information
+defstruct DefRef :
+  id:          Int
+  pkg:         Symbol
+  name:        Symbol
+  description: String
+
+;create defref from expression
+defn maybe-define (pkg:Symbol, nm:NameMap, tbl:IntTable<DefRef>, e:IExp, descriptions:IntTable<String>) :
+  match(e:VarN) :
+    val name = name(nm[n(e)])
+    tbl[n(e)] = DefRef(n(e), pkg, name, get?(descriptions, n(e), to-string $ name))
+
+;record defref definitions in appropriate indices
+defn collect-definition (pkg:Symbol, nm:NameMap, e:IExp, types:IntTable<DefRef>, vars:IntTable<DefRef>, functions:IntTable<DefRef>, descriptions:IntTable<String>) :
+  match(e) :
+    (e:ILSDefType) : maybe-define(pkg, nm, types, name(e), descriptions)
+    (e:ILSDefn) :    maybe-define(pkg, nm, functions, name(e), descriptions)
+    (e:IDefType) :   maybe-define(pkg, nm, types, class(e), descriptions)
+    (e:IDef) :       maybe-define(pkg, nm, vars, name(e), descriptions)
+    (e:IDefVar) :    maybe-define(pkg, nm, vars, name(e), descriptions)
+    (e:IDefn) :      maybe-define(pkg, nm, functions, name(e), descriptions)
+    (e:IDefmulti) :  maybe-define(pkg, nm, functions, name(e), descriptions)
+    (e) :            false
+
+;split up string into at most max length chunks splitting at char c
+defn split (s:String, c:Char, max:Int) -> Tuple<String> :
+  defn return (lc:False|Int) :
+    if length(s) > 80 :
+      match(lc:Int) :
+        [s[0 to (lc + 1)], s[(lc + 1) to false]]
+      else :
+        [s]
+    else :
+      [s]
+  let inner (start:Int = 0, lc:False|Int = false) :
+    match(index-of-char(s, start to false, c)) :
+      (j:Int) :
+        if j > 80 : return(lc)
+        else : inner(j + 1, j)
+      (j:False) :
+        return(lc)
+
+;pprint signature splitting before args if greater than 80 and
+;then splitting into at most 80 columns chunks
+defn print-code (o:OutputStream, s:String) :
+  val ss =
+    if length(s) > 80 :
+      match(index-of-char(s, '(')) :
+        (i:Int) :
+          val name = s[0 to i]
+          val sig = string-join $ ["  " s[i to false]]
+          if length(sig) > 80 :
+            val res = Vector<String>()
+            let loop (s:String = sig, i:Int = 0) :
+              defn add-res (s:String) :
+                add(res, s when (i == 0) else (string-join $ ["  ", s]))
+              val ss = split(s, ',', 80)
+              add-res(ss[0])
+              loop(ss[1], i + 1) when length(ss) == 2
+            cat-all $ [[name], res]
+          else :
+            [name, sig]
+        (i:False) :
+          [s]
+    else :
+      [s]
+  println(o, "```stanza")
+  for s in ss do : println(o, s)
+  println(o, "```")
+
+;do generate and record descriptions
+defn put-description (id:IExp, gen:IExp -> Printable, descriptions:IntTable<String>) :
+  match(id:VarN) :
+    val d = to-string $ gen(id)
+    descriptions[n(id)] = d
+    d
+  else :
+    ""
+
+;generate and record descriptions using namemap
+defn gen-description (nm:NameMap, e:IExp, descriptions:IntTable<String>) -> String:
+  match(e) :
+    (e:ILSDefType) :
+      put-description(name(e), { "lostanza deftype %_%_%_" % [lookup(nm, _) pretty-targs(nm, args(e)) pretty-parent(nm, parent(e))] }, descriptions)
+    (e:IDefType) :
+      put-description(class(e), { "deftype %_%_%_" % [lookup(nm, _) pretty-targs(nm, args(e)) pretty-parent(nm, parent(e))] }, descriptions)
+    (e:IDef) :
+      put-description(name(e), { "val %_%_" % [lookup(nm, _) pretty-type(nm, type(e))] }, descriptions)
+    (e:IDefVar) :
+      put-description(name(e), { "var %_%_" % [lookup(nm, _) pretty-type(nm, type(e))] }, descriptions)
+    (e:ILSDefn) :
+      put-description(name(e), { "lostanza defn %_%_" % [lookup(nm, _) pretty-args(nm, targs(e), args(e), a1(e) a2(e))] }, descriptions)
+    (e:IDefn) :
+      put-description(name(e), { "defn %_%_" % [lookup(nm, _) pretty-args(nm, targs(e), args(e), a1(e) a2(e))] }, descriptions)
+    (e:IDefmulti) :
+      put-description(name(e), { "defmulti %_%_" % [lookup(nm, _) pretty-args(nm, targs(e), a1(e) a2(e))] }, descriptions)
+    (e) :
+      ""
+
+;Extract the form in the given string at the given index.
+;Returns the lexed form and the index of the character after it. 
+defn extract-form (string:String, start:Int) -> [?, Int] :
+  val input-stream = StringInputStream(string[start to false], "UNTITLED")
+  val form = reader/read(input-stream)
+  val end = length(string) - length(input-stream)
+  [form, end]
+
+deftype ParsedItem
+defstruct ParsedText <: ParsedItem : (string:String)
+defstruct ParsedForm <: ParsedItem : (form)
+
+;Extract all the "CODE:(...)" forms from the given string.
+defn parse-items (string:String, tag:String) -> Vector<ParsedItem> :
+  val items = Vector<ParsedItem>()
+  val prefix = string-join $ [tag ":("]
+  let loop (start:Int = 0) :
+    match(index-of-chars(string, start to false, prefix)) :
+      (i:Int) :
+        val [form, end] = extract-form(string, i + length(tag) + 1)
+        add(items, ParsedText(string[start to i]))
+        add(items, ParsedForm(form))
+        loop(end)
+      (f:False) :
+        add(items, ParsedText(string[start to false]))
+  items
+
+;print definition into package file, printing anchors, and recording descriptions for later
+defn print-definition (o:OutputStream, nm:NameMap, e:IExp, descriptions:IntTable<String>, pkg:IPackage, figs-dir:String) :
+  match(e) :
+    (e:ILSDefType) :
+      print-anchor(o, name(e))   
+      print-code(o, gen-description(nm, e, descriptions))
+    (e:IDefType) :
+      print-anchor(o, class(e))   
+      print-code(o, gen-description(nm, e, descriptions))
+    (e:IDef) :
+      print-anchor(o, name(e))   
+      print-code(o, gen-description(nm, e, descriptions))
+    (e:IDefVar) :
+      print-anchor(o, name(e))   
+      print-code(o, gen-description(nm, e, descriptions))
+    (e:ILSDefn) :
+      print-anchor(o, name(e))   
+      print-code(o, gen-description(nm, e, descriptions))
+    (e:IDefn) :
+      print-anchor(o, name(e))   
+      print-code(o, gen-description(nm, e, descriptions))
+    (e:IDefmulti) :
+      print-anchor(o, name(e))   
+      print-code(o, gen-description(nm, e, descriptions))
+    ; (e:ILSDefmethod) :
+    ;   println(o, "`lostanza defmethod `%_`%_`" % [lookup-and-link(nm, multi(e)) pretty-args(nm, targs(e), args(e), a1(e) a2(e))])
+    ; (e:IDefmethod) :
+    ;   println(o, "`defmethod `%_`%_`" % [lookup-and-link(nm, multi(e)) pretty-args(nm, targs(e), args(e), a1(e) a2(e))])
+    (e:IDoc) :
+      val str = value(string(e) as ILiteral)
+      val script-counter = to-seq(0 to false)
+      for item in parse-items(str, "FIG") do :
+        match(item) :
+          (item:ParsedText) :
+            print(o, string(item))
+          (item:ParsedForm) :
+            val id = next(script-counter)
+            val script-name = to-string("script%_.stanza" % [id])
+            val filename = to-string("%_/fig-%_" % [name(pkg), id])
+            val pathname = to-string("%_/%_" % [figs-dir, filename])
+            val forms = unwrap-all(form(item))
+            val app   = head(forms)
+            val code  = tail(forms)
+            val output = to-string("call-system(\"%_\", [\"%_\", \"%_\", \\<s>%_<s>])" % [app, app, pathname, code])
+            spit(script-name, output)
+            val url = to-string("figs/%_" % [filename])
+            call-system("stanza", ["stanza", "run", script-name])
+            print(o, "\"%_\"" % [url])
+    (e) :
+      false
+
+;print description of package
+defn print-defpackage (o:OutputStream, nm:NameMap, ipackage:IPackage) :
+  println(o, "```stanza") 
+  println(o, "defpackage %_" % [name(ipackage)])
+  for imp in imports(ipackage) do :
+    println(o, "  import %_" % [package(imp)])
+  println(o, "```") 
+
+;produce index of particular kind for each defref
+defn gen-index (so:FileOutputStream, dir:String, kind:String, elts:IntTable<DefRef>) :
+  println(so, "- [%_](./%_/README.md)" % [kind, kind])
+  val kind-dir = string-join $ [dir "/" kind]
+  create-dir(kind-dir) when not file-exists?(kind-dir)
+  val ts = FileOutputStream(string-join $ [kind-dir "/README.md"])
+  println(ts, "# %_\n" % [kind])
+  val refs = qsort(name, values(elts))
+  for ref in refs do :
+    val url = string-join $ ["../packages/" mangle(pkg(ref)) ".html#V" id(ref)]
+    println(ts, "[`%_`](%_)\n" % [description(ref), url])
+  close(ts)
+
+;copy existing figs for given master-figs-dir and package to mdbook destination dir
+defn copy-figs (master-figs-dir:String, package-name:Symbol, info:False|FileInfo) :
+  match(info:FileInfo) :
+    val figs-dir = string-join $ [split-filepath(filename(info))[0], "figs/" package-name]
+    if file-exists?(figs-dir) :
+      val dst-figs-dir = string-join $ [master-figs-dir "/" package-name]
+      call-system("sh", ["sh", "-c", string-join $ ["mkdir -p " dst-figs-dir]])
+      call-system("sh", ["sh", "-c", string-join $ ["cp " figs-dir "/* " dst-figs-dir]])
+
+;produce mdbook doc for dir directory using namemap on all given ipackages
+;outputs summary, package files, and index files
+public defn gen-doc (md-docs-dir:String, nm:NameMap, i-all-ipackages:Seqable<IPackage>) :
+  val all-ipackages = to-tuple $ i-all-ipackages
+  val dir = string-join $ [md-docs-dir "/src"]
+  call-system("sh", ["sh", "-c", string-join $ ["mkdir -p " dir]])
+  create-dir(dir) when not file-exists?(dir)
+  val pkg-dir = string-join $ [dir "/packages"]
+  val so = FileOutputStream $ string-join $ [dir "/SUMMARY.md"]
+  println(so, "# Summary\n")
+  println(so, "- [Packages](./packages/README.md)")
+  create-dir(pkg-dir) when not file-exists?(pkg-dir)
+  val vars = IntTable<DefRef>()
+  val types = IntTable<DefRef>()
+  val functions = IntTable<DefRef>()
+  val dt = IntTable<String>()
+  val figs-dir = string-join $ [pkg-dir "/figs"]
+  for ipackage in qsort(name, all-ipackages) do :
+    copy-figs(figs-dir, name(ipackage), info(ipackage))
+    println(so, "    - [%_](./packages/%_.md)" % [name(ipackage), mangle(name(ipackage))])
+    val definitions = to-tuple $ public-definitions(ipackage)
+    val pn = string-join $ [pkg-dir "/" mangle(name(ipackage)) ".md"]
+    val po = FileOutputStream(pn)
+    println(po, "# %_\n" % [name(ipackage)])
+    print-defpackage(po, nm, ipackage)
+    for d in definitions do :
+      print-definition(po, nm, d, dt, ipackage, figs-dir)
+      collect-definition(name(ipackage), nm, d, types, vars, functions, dt)
+      println(po, "")
+    println(po, "")
+    close(po)
+  gen-index(so, dir, "Types", types)
+  gen-index(so, dir, "Vars", vars)
+  gen-index(so, dir, "Functions", functions)
+  close(so)
+
+;produce mdbook auto-doc in given output directory
+public defn auto-doc (settings:BuildSettings, output:String) :
+  val dep-result = dependencies(settings, true)
+  val dir = match(output:String): output else: "docs"
+  gen-doc(dir, namemap(dep-result), filter-by<IPackage>(packages(dep-result)))
+
