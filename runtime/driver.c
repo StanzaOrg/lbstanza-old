@@ -488,6 +488,7 @@ void stz_free (void* ptr){
 
 typedef struct {
   long pid;
+  int pipeid;
   FILE* in;
   FILE* out;
   FILE* err;
@@ -835,15 +836,22 @@ void initialize_launcher_process (){
   }
 }
 
+int delete_process_pipes (FILE* input, FILE* output, FILE* err) {
+  fclose(input);
+  fclose(output);
+  fclose(err);
+  return 0;
+}
+
 int launch_process (char* file, char** argvs,
-                    int input, int output, int error,
+                    int input, int output, int error, int pipeid,
                     Process* process){
   //Initialize launcher if necessary
   initialize_launcher_process();
   
   //Figure out unique pipe name
   char pipe_name[80];
-  sprintf(pipe_name, "/tmp/stanza_exec_pipe%ld", (long)getpid());
+  sprintf(pipe_name, "/tmp/stanza_exec_pipe_%ld_%ld", (long)getpid(), (long)pipeid);
 
   //Compute pipe sources
   int pipe_sources[NUM_STREAM_SPECS];
