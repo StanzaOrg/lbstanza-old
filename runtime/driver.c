@@ -841,12 +841,14 @@ void make_pipe_name (char* pipe_name, int pipeid) {
 }
 
 int delete_process_pipe (FILE* fd, char* pipe_name, char* suffix) {
-  int close_res = fclose(fd);
-  if (close_res == EOF) return -1;
-  char my_pipe_name[80];
-  sprintf(my_pipe_name, "%s%s", pipe_name, suffix);
-  int rm_res = remove(my_pipe_name);
-  if (rm_res < 0) return -1;
+  if (fd != NULL) {
+    int close_res = fclose(fd);
+    if (close_res == EOF) return -1;
+    char my_pipe_name[80];
+    sprintf(my_pipe_name, "%s%s", pipe_name, suffix);
+    int rm_res = remove(my_pipe_name);
+    if (rm_res < 0) return -1;
+  }
   return 0;
 }
 
