@@ -837,9 +837,18 @@ void initialize_launcher_process (){
 }
 
 int delete_process_pipes (FILE* input, FILE* output, FILE* err) {
-  fclose(input);
-  fclose(output);
-  fclose(err);
+  if (input != NULL) {
+    int res_i = fclose(input);
+    if(res_i == EOF) return -1;
+  }
+  if (output != NULL) {
+    int res_o = fclose(output);
+    if(res_o == EOF) return -2;
+  }
+  if (error != NULL) {
+    int res_e = fclose(err);
+    if(res_e == EOF) return -3;
+  }
   return 0;
 }
 
