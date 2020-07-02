@@ -112,6 +112,7 @@ public defstruct DependencyResult :
   packages: Tuple<IPackage|Pkg>
   pkgstamps: Tuple<PackageStamp>
   namemap: NameMap
+  errors: Tuple<Exception>
 
 public defstruct FrontEndResult :
   import-lists: Tuple<ImportList>
@@ -129,6 +130,10 @@ with:
 
 public defn package (stamp:PackageStamp) :
   package(location(stamp))
+
+public defn throw-errors (r:DependencyResult) :
+  if not empty?(errors(r)) :
+    throw(FrontEndErrors(errors(r)))
 
 ;============================================================
 ;==================== Entry Points ==========================
@@ -173,7 +178,7 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
       load-package-table!(read-inputs!(map(InputSource,binding-package-dependencies())))
     ;Begin the resolver loop.
     let loop () :
-      val resolved = resolve-packages(input-package-names)
+      val resolved = resolve-packages!(input-package-names)
       if verbose?(sys) :
         println("Computed package initialization order: %," % [init-order(resolved)])
       val epackages = compile-to-el(ipackages(resolved))
@@ -211,7 +216,7 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
             (p:Symbol) : not key?(package-table, p)
             (p:String) : true
       load-package-table!(read-inputs!(map(InputSource,remaining-packages)))
-      resolve-packages(to-tuple(seq(name,package-table)))
+      resolve-packages!(to-tuple(seq(name,package-table)))
 
       ;Compute bindings for all packages not already included
       val binding-packages = to-tuple $
@@ -228,17 +233,20 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
   ;------------------- Resolved Packages --------------------
   ;----------------------------------------------------------
   defn dependencies () :
+    ;Accumulate errors
+    val errorlist = Vector<Exception>()
     ;Read all of the given inputs to compiler, and load them into the
     ;compiled package table.
-    val input-objs = read-inputs!(map(InputSource,inputs(sys)))
+    val input-objs = read-inputs(map(InputSource,inputs(sys)), errorlist)
     val input-package-names = to-tuple $ seq(name, input-objs)
-    load-package-table!(input-objs)
+    load-package-table(input-objs, errorlist)
     ;If we require bindings, then add their required dependencies
     ;to the compiler as well.
     if not empty?(supported-vm-packages(sys)) :
-      load-package-table!(read-inputs!(map(InputSource,binding-package-dependencies())))
+      val pkgs = read-inputs(map(InputSource,binding-package-dependencies()), errorlist)
+      load-package-table(pkgs, errorlist)
     ;Resolve packages.
-    val resolved = resolve-packages(input-package-names)
+    val resolved = resolve-packages(input-package-names, errorlist)
     val all-pkgs = order-packages(packages, init-order(resolved)) where :
       val packages = cat(ipackages(resolved), pkgs(package-table))
     ;Make consolidated namemap.
@@ -251,7 +259,8 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
       import-lists(resolved),
       all-pkgs,
       pkgstamps,
-      namemap)
+      namemap,
+      to-tuple(errorlist))
 
   ;----------------------------------------------------------
   ;-------------------- Utilities ---------------------------
@@ -335,7 +344,7 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
             add(objects, pkg)          
           (input:IPackage) :
             add(objects, input)
-      catch (e:FrontEndError|IOException|CheckError|CheckErrors|PkgException) :
+      catch (e:FrontEndError|IOException|CheckError|CheckErrors|PkgException|LexerException) :
         add(errors, e)
 
     ;Return objects
@@ -346,7 +355,13 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
   defn read-inputs! (inputs:Seqable<InputSource>) -> Tuple<IPackage|Pkg> :
     val result = read-inputs(inputs)
     throw(FrontEndErrors(errors(result))) when not empty?(errors(result))
-    packages(result)      
+    packages(result)
+
+  ;Read the given inputs, and add any errors to the given error list.
+  defn read-inputs (inputs:Seqable<InputSource>, errorlist:Vector<Exception>) -> Tuple<IPackage|Pkg> :
+    val result = read-inputs(inputs)
+    add-all(errorlist, errors(result))
+    packages(result)
 
   ;Returns all IPackages in the given file.
   ;Throws:
@@ -372,30 +387,34 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
   ;-------------- Initialize Package Table ------------------
   ;----------------------------------------------------------
   ;Renames and loads the given packages into the package-table.
-  ;defn load-package-table! (input-objects:Collection<IPackage|Pkg>) -> Tuple<Exception> :
-  ;  val objects:Tuple<IPackage|Pkg> = to-tuple(input-objects)
-  ;  val errors = Vector<Exception>()
-  ;  objects = check-duplicate-packages(add{errors, _}, objects)
-  ;  objects = check-already-loaded(add{errors, _}, objects)      
-  ;  
-  ;  val objects* = map-ipackages(rename-il!, objects)
-  ;  do(add{package-table, _}, filter-by<IPackage|Pkg>(objects*))
+  ;Adds any errors to the given error list.
+  defn load-package-table (input-objects:Collection<IPackage|Pkg>, errors:Vector<Exception>) :
+    var objects:Tuple<IPackage|Pkg> = to-tuple(input-objects)
+    objects = check-duplicate-packages(objects, errors)
+    objects = check-already-loaded(objects, errors)
+    val renamed = rename-il(to-tuple(filter-by<IPackage>(objects)))
+    if /errors(renamed) is-not False :
+      add(errors, /errors(renamed) as RenameErrors)
+    objects = sub-ipackages(objects, packages(renamed))
+    do(add{package-table, _}, objects)
     
   defn load-package-table! (objects:Collection<IPackage|Pkg>) :
-    ensure-no-duplicate-packages!(filter-by<IPackage|Pkg>(objects))
-    ensure-not-already-loaded!(filter-by<IPackage|Pkg>(objects))
-    val objects* = map-ipackages(rename-il!, objects)
-    do(add{package-table, _}, filter-by<IPackage|Pkg>(objects*))
+    val errors = Vector<Exception>()
+    load-package-table(objects, errors)
+    throw(FrontEndErrors(errors)) when not empty?(errors)
 
-  defn map-ipackages (f:Tuple<IPackage> -> Tuple<IPackage>, objs:Collection<IPackage|Pkg>) :
-    val ipackages = to-tuple(filter-by<IPackage>(objs))
-    val ipackages* = f(ipackages)
-    fatal("Invalid parallel map.") when length(ipackages) != length(ipackages*)
-    val ipackage-seq = to-seq(ipackages*)
-    to-tuple $ for obj in objs seq :
+  defn sub-ipackages (objs:Seqable<IPackage|Pkg>, new-ipackages:Seqable<IPackage>) -> Tuple<IPackage|Pkg> :
+    val pkg-seq = to-seq(new-ipackages)
+    val result = to-tuple $ for obj in objs seq? :
       match(obj) :
-        (obj:IPackage) : next(ipackage-seq)
-        (obj) : obj
+        (obj:IPackage) :
+          if empty?(pkg-seq) : None()
+          else if name(obj) == name(peek(pkg-seq)) : One(next(pkg-seq))
+          else : None()
+        (obj:Pkg) :
+          One(obj)
+    fatal("Mismatched packages.") when not empty?(pkg-seq)
+    result
 
   ;----------------------------------------------------------
   ;--------------- Resolving Package ------------------------
@@ -420,8 +439,8 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
     match(p:IPackage|PackageExports) : p
     else : fatal("Package %_ not in package table." % [package-name])
 
-  defn resolver-environment () :
-    defn imported-package (package:Symbol) :
+  defn resolver-environment (errorlist:Vector<Exception>) :
+    defn imported-package (package:Symbol) -> IPackage|PackageExports|False :
       ;If it is in the package table then use that for the resolver
       if key?(package-table, package) :
         to-resolver-input?(package)
@@ -433,8 +452,11 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
         ;Otherwise try loading from the file system
         else :
           match(package-location(package)) :
-            (l:PkgLocation) : load-package-table! $ read-inputs! $ [l]
-            (f:False) : set-missing(package-table, package)          
+            (l:PkgLocation) :
+              val pkgs = read-inputs([l], errorlist)
+              load-package-table(pkgs, errorlist)
+            (f:False) :
+              set-missing(package-table, package)
           to-resolver-input?(package)
     ;Make environment
     new stz/resolver/Env :
@@ -445,7 +467,7 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
       defmethod package-priority (this) :
         package-priority(sys)
 
-  defn resolve-packages (package-names:Tuple<Symbol>) -> ResolverResult :
+  defn resolve-packages (package-names:Tuple<Symbol>, errorlist:Vector<Exception>) -> ResolverResult :
     ;The given package names are the package names loaded from the input.
     ;These must have their order preserved.
     ;Include as a resolver input, all the IPackages in the package table.
@@ -454,7 +476,16 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
         not contains?(ys, x)
     val package-names* = to-tuple(cat(existing-packages, package-names)) where :
       val existing-packages = seq(name, ipackages(package-table)) - package-names
-    resolve-il!(map(to-resolver-input,package-names*), resolver-environment())
+    val resolved = resolve-il(map(to-resolver-input,package-names*), resolver-environment(errorlist))
+    if errors(resolved) is-not False :
+      add(errorlist, errors(resolved) as ResolveErrors)
+    resolved
+
+  defn resolve-packages! (package-names:Tuple<Symbol>) -> ResolverResult :
+    val errorlist = Vector<Exception>()
+    val resolved = resolve-packages(package-names, errorlist)
+    throw(FrontEndErrors(errorlist)) when not empty?(errorlist)
+    resolved
 
   ;----------------------------------------------------------
   ;------------------- Compile to EL ------------------------
@@ -511,12 +542,6 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
     if loc is False :
       throw(CannotLocatePackage(name))
     loc as PkgLocation
-    
-  defn rename-il! (ps:Tuple<IPackage>) -> Tuple<IPackage> :
-    val result = rename-il(ps)
-    if errors(result) is-not False :
-      throw(errors(result) as RenameErrors)
-    packages(result)
 
   defn resolve-il! (ps:Tuple<IPackage|PackageExports>, env:stz/resolver/Env) :
     val r = resolve-il(ps,env)
@@ -529,24 +554,27 @@ defn FrontEnd (sys:FrontEndInputs) -> FrontEnd :
       (p:TProg) : p
       (e:TypeErrors) : throw(e)
 
-  defn ensure-no-duplicate-packages! (ps:Seqable<IPackage|Pkg>) :
+  defn check-duplicate-packages (ps:Seqable<IPackage|Pkg>, errors:Vector<Exception>) -> Tuple<IPackage|Pkg> :
     val added-set = HashSet<Symbol>()
-    val duplicates = unique $ for name in seq(name,ps) filter :
-      not add(added-set, name)
+    val duplicates = HashSet<Symbol>()
+    val ps* = to-tuple $ for p in ps filter :
+      if add(added-set, name(p)) : true
+      else : add(duplicates, name(p))
     if not empty?(duplicates) :
       throw(DuplicatePackages(to-tuple(duplicates)))
+    ps*
 
-  defn ensure-not-already-loaded! (ps:Seqable<IPackage|Pkg>) :
+  defn check-already-loaded (ps:Seqable<IPackage|Pkg>, errors:Vector<Exception>) -> Tuple<IPackage|Pkg> :
     defn rank (p:IPackage|Pkg|False) :
       match(p) :
         (p:False) : 0
         (p:Pkg) : 1
         (p:IPackage) : 2
-    for p in ps do :
-      if key?(package-table, name(p)) :
-        val old-p = package-table[name(p)]
-        if rank(old-p) >= rank(p) :
-          throw(PackageAlreadyLoaded(name(p)))    
+    to-tuple $ for p in ps filter :
+      val loaded? = key?(package-table, name(p)) and
+                    rank(package-table[name(p)]) >= rank(p)
+      add(errors, PackageAlreadyLoaded(name(p))) when loaded?
+      not loaded?
 
   defn ensure-contains-package! (ps:Seqable<IPackage>, filename:String, expected-package:Symbol) :
     val exists? = any?({name(_) == expected-package}, ps)
@@ -655,10 +683,13 @@ defn PackageTable () :
 
 public deftype FrontEndError <: Exception
 
-defn FrontEndErrors (es:Collection<Exception>) :
-  new FrontEndError :
-    defmethod print (o:OutputStream, this) :
-      print(o, "%n" % [es])
+defn FrontEndErrors (es:Collection<Exception>&Lengthable) :
+  if length(es) == 1 :
+    next(to-seq(es))
+  else :
+    new FrontEndError :
+      defmethod print (o:OutputStream, this) :
+        print(o, "%n" % [es])
 
 defn MacroexpansionError (e:Exception) :
   new FrontEndError :
