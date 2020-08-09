@@ -240,3 +240,25 @@ Completing the item: If the item has a completion root (and it is not the first 
 #### Utilities ####
 ensure-added: This adds the given item to the current set if it has not already been added. Tracked using `completion-set`. 
 
+### Computing the Completion Root ###
+
+```
+Function `compute-completion-root`
+Input:
+  set-index: Int
+  current-set: ESet
+Uses:
+   production-count: ProductionTable<Int>
+```
+
+Compute the completion-root for each deterministic-reduction in the set.
+
+A deterministic reduction looks like this:
+```
+(rule 0) [Start = X X X • AS, S0]
+```
+It has one remaining production to parse, and this item is the only item with that upcoming production. 
+
+The completion of a deterministic reduction is calculated like so:
+First search for a completion-root in the parent. Let `pitem` be the first item for production `Start` started at position 0. If `pitem` has a completion-root, then this is the completion root for the item.
+If no completion-root is found in the parent, then the item is its own completion-root. 
