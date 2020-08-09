@@ -64,9 +64,56 @@ An atomic `GAny` matches against any form, but if matched, then the input stream
 
 ## Reluctant Matching ##
 
-Terminals are classified into either reluctant or non-reluctant terminals, where the standard terminals are all classified as non-reluctant terminals. 
+The reluctant matching system is used to prevent input s-expressions from being expanded when unnecessary, and to allow list rest matching to work.
 
-For a given position in the input stream, reluctant terminals are only allowed to match if the input stream matches against some expected non-reluctant terminal.
+### Special Terminals ###
+
+The reluctance matching system concerns the following terminals:
+- Standard GListStart
+- Reluctant GListStart
+- Atomic GAny
+- Standard GAny
+- Reluctant GAny
+- GListRest
+
+### Reluctant Terminals ###
+
+The following terminals are classified as reluctant, all others are non-reluctant terminals:
+- Reluctant GListStart
+- Reluctant GAny
+- GListRest
+
+We say that a "non-reluctant terminal has been scanned", if a terminal has been scanned, and that terminal is not classified as reluctant.
+
+### Algorithm ###
+
+The reluctant matching system is implemented via a pruning procedure to eliminate reluctant matches from the Earley set. 
+
+This function removes items from the next set to satisfy the reluctant matching rules. It returns true if the matches require the input stream to expand the upcoming list.
+
+```
+Function `prune-reluctant-matches`
+Input:
+  eset:ESet
+Output:
+  expand?:True|False
+```
+
+There are three initial conditions to calculate:
+- scanned-non-reluctant: true if a non-reluctant terminal has been scanned.
+- scanned-standard-list-start: true if a Standard GListStart has been scanned.
+- scanned-atomic-any: true if an Atomic GAny has been scanned.
+
+From these initial conditions, we can compute whether or not we should expand the upcoming list.
+- expand: true if scanned-standard-list-start and not scanned-atomic-any
+
+Now, iterate and test each item in the Earley set. For each
+- Standard GListStart: Keep if expand.
+- Reluctant GListStart: Keep if expand.
+- Standard GAny: Keep if not expand.
+- Reluctant GAny: Keep if not expand and scanned-non-reluctant.
+- GListRest: Keep if not scanned-non-reluctant.
+- otherwise: Keep.
 
 ## Explanation of Parsing Tables ##
 
@@ -192,3 +239,4 @@ Completing the item: If the item has a completion root (and it is not the first 
 
 #### Utilities ####
 ensure-added: This adds the given item to the current set if it has not already been added. Tracked using `completion-set`. 
+
