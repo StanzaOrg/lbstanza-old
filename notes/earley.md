@@ -1,5 +1,94 @@
 # Earley Parser #
 
+## SExpTokens ##
+
+### Standard SExp Forms ###
+```
+SExpForm :
+  form
+  list:List
+```
+
+This represents a single s-expression form. For implementing matching against list rest, we also provide all subsequent forms in the `list` field. 
+
+### End of List ###
+```
+SExpListEnd
+```
+
+This represents the end of a list in the input. 
+
+### End of Input ###
+```
+EndOfInput
+```
+
+This represents the end of the input.
+
+### Wildcards ###
+```
+SExpWildcard
+```
+
+This is a special token that can be inserted into the input stream in order to force a match against an upcoming terminal.
+
+## SExpStream ##
+
+A `SExpStream` represents the input list of tokens. It is constructed from a single s-expression list.
+
+### Retrieving the Next Token ###
+
+The `peek` and `info` functions return the upcoming token and its file information. 
+
+```
+defmulti peek (s:SExpStream) -> SExpToken
+```
+
+```
+defmulti info (s:SExpStream) -> FileInfo|False
+```
+
+Remember that all `SExpStream` objects end with a `SExpListEnd` followed by a `EndOfInput` token.
+
+### Advancing the Stream ###
+
+The `advance` function steps the stream past the next upcoming token. If `expand-list?` is passed true, then the stream recursively enters the next upcoming list (if it is a list). 
+
+```
+defmulti advance (s:SExpStream, expand-list?:True|False) -> False
+```
+
+The `advance-rest` function steps past all tokens at the current list-level, ending just before `SExpListEnd`. Thus `peek` should return `SExpListEnd` after calling `advance-rest`. 
+
+```
+defmulti advance-rest (s:SExpStream) -> False
+```
+
+It is an error to advance the stream when the upcoming token is `EndOfInput`. 
+
+### Error Recovery Using Wildcards ###
+
+Wildcards match against any terminal except for ListStart, so the stream allows us to insert a wildcard token to the beginning of the stream.
+
+```
+defmulti insert-wildcard (s:SExpStream) -> False
+```
+
+The stream allows us to also insert an empty list to the beginning of the stream, to recover from if the parser is stuck awaiting a ListStart.
+
+```
+defmulti insert-list (s:SExpStream) -> False
+```
+
+It is an error to insert any tokens into the stream if the upcoming token in `EndOfInput`. 
+
+
+
+
+
+
+
+
 ## Types of Terminals ##
 
 ### Keyword Terminal ###
