@@ -1,0 +1,352 @@
+defpackage stz/earley-grammar-analysis :
+  import core
+  import collections
+  import stz/earley-grammar
+  import stz/earley-sexp-stream
+  import stz/utils
+  import stz/earley-eval-result
+
+;============================================================
+;===================== Grammar Creation =====================
+;============================================================
+
+public defn analyze (input-rules:Tuple<GRule>) -> Grammar :
+  val rules = convert-negation-rules(input-rules)
+  val grammar-properties = analyze-grammar-properties(rules)
+  val null-prods = nullable-productions(grammar-properties)
+  val dispatch-sets = analyze-dispatch-sets(rules, grammar-properties)
+  new Grammar :
+    defmethod get (this, i:Int) :
+      rules[i]
+    defmethod nullable? (this, production:Symbol) :
+      null-prods[production]
+    defmethod rules (this, production:Symbol) :
+      all-rules(dispatch-sets)[production]
+    defmethod rules (this, production:Symbol, next-input:SExpToken) :
+      match(next-input) :
+        (input:SExpWildcard) :
+          all-rules(dispatch-sets)[production]
+        (input:SExpForm) :
+          val x = unwrap-token(form(input))
+          val obj-rules = match(x) :
+            (x:Symbol) : keyword-rules(dispatch-sets)[[production, x]]
+            (x) : List()
+          val type-rules = match(x) :
+            (x:Char) : char-rules(dispatch-sets)[production]
+            (x:Byte) : byte-rules(dispatch-sets)[production]
+            (x:Int) : int-rules(dispatch-sets)[production]
+            (x:Long) : long-rules(dispatch-sets)[production]
+            (x:Float) : float-rules(dispatch-sets)[production]
+            (x:Double) : double-rules(dispatch-sets)[production]
+            (x:String) : string-rules(dispatch-sets)[production]
+            (x:True) : true-rules(dispatch-sets)[production]
+            (x:False) : false-rules(dispatch-sets)[production]
+            (x:Symbol) : symbol-rules(dispatch-sets)[production]
+            (x:List) : list-rules(dispatch-sets)[production]
+            (x) : List()
+          cat-all $ [
+            obj-rules,
+            type-rules,
+            any-rules(dispatch-sets)[production]
+            null-rules(dispatch-sets)[production]]              
+        (input:SExpListEnd) :
+          cat(
+            list-end-rules(dispatch-sets)[production]
+            null-rules(dispatch-sets)[production])
+
+;============================================================
+;================== Grammar Properties ======================
+;============================================================
+
+defstruct GrammarProperties:
+  nullable-productions: HashSet<Symbol>
+  nullable-rules: IntSet
+  first-sets: Tuple<Tuple<GTerminal>>
+
+defn analyze-grammar-properties (grammar:Tuple<GMatcherRule|GTokenRule>) :
+  ;Compute parent rules that contain each production.
+  val parent-table:HashTable<Symbol,List<Int>> = group-by{key, value, _} $
+    for (rule in grammar, rule-index in 0 to false) seq-cat :
+      for prod in filter-by<GProduction>(tokens(rule)) seq :
+        name(prod) => rule-index
+
+  ;Production worklist algorithm
+  defn worklist (f:(Int, GMatcherRule|GTokenRule, () -> False) -> ?) :
+    val queue = Queue<Int>()
+    add-all(queue, 0 to length(grammar))
+    while not empty?(queue) :
+      val rule-index = pop(queue)
+      val rule = grammar[rule-index]
+      var progress?:True|False = false
+      defn progress () : progress? = true
+      f(rule-index, rule, progress)
+      if progress? :
+        add-all(queue, parent-table[name(rule)])
+
+  ;Compute nullable productions and rules
+  val null-prods = HashSet<Symbol>()
+  val null-rules = IntSet()
+  defn nullable? (t:GToken) :
+    match(t:GProduction) :
+      null-prods[name(t)]
+  defn nullable? (rule:GMatcherRule|GTokenRule) :
+    all?(nullable?, tokens(rule))
+  within (rule-index, rule, progress) = worklist() :
+    if nullable?(rule) :
+      add(null-rules, rule-index)
+      progress() when add(null-prods, name(rule))
+
+  ;Compute firstsets
+  val first-set-entries = HashSet<KeyValue<Symbol,GTerminal>>()
+  val first-set-table = HashTable<Symbol,List<GTerminal>>(List())  
+  defn first-set (t:GToken) :
+    match(t) :
+      (t:GTerminal) : [t]
+      (t:GProduction) : first-set-table[name(t)]
+  defn first-set (rule:GMatcherRule|GTokenRule) :
+    generate<GTerminal> :
+      let loop (i:Int = 0) :
+        if i < length(tokens(rule)) :
+          val t = tokens(rule)[i]
+          do(yield, first-set(t))
+          loop(i + 1) when nullable?(t)
+  within (rule-index, rule, progress) = worklist() :
+    for t in first-set(rule) do :
+      if add(first-set-entries, name(rule) => t) :
+        add(first-set-table, name(rule), t)
+        progress()
+  val first-sets = for rule in grammar map :
+    to-tuple $ unique $ first-set(rule)
+
+  ;Return all properties
+  GrammarProperties(
+    null-prods,
+    null-rules,
+    first-sets)
+
+;============================================================
+;================== Dispatch Sets ==========================-
+;============================================================
+
+defstruct DispatchSet :
+  all-rules:HashTable<Symbol,List<Int>>
+  null-rules:HashTable<Symbol,List<Int>>
+  any-rules:HashTable<Symbol,List<Int>>
+  list-end-rules:HashTable<Symbol,List<Int>>
+  char-rules:HashTable<Symbol,List<Int>>
+  byte-rules:HashTable<Symbol,List<Int>>
+  int-rules:HashTable<Symbol,List<Int>>
+  long-rules:HashTable<Symbol,List<Int>>
+  float-rules:HashTable<Symbol,List<Int>>
+  double-rules:HashTable<Symbol,List<Int>>
+  string-rules:HashTable<Symbol,List<Int>>
+  true-rules:HashTable<Symbol,List<Int>>
+  false-rules:HashTable<Symbol,List<Int>>
+  symbol-rules:HashTable<Symbol,List<Int>>
+  list-rules:HashTable<Symbol,List<Int>>
+  keyword-rules:HashTable<[Symbol,Symbol],List<Int>>
+
+defn analyze-dispatch-sets (grammar:Tuple<GRule>, props:GrammarProperties) :
+  ;Create rule sets
+  val all-rules = HashTable<Symbol,List<Int>>(List())
+  val null-rules = HashTable<Symbol,List<Int>>(List())
+  val any-rules = HashTable<Symbol,List<Int>>(List())
+  val list-end-rules = HashTable<Symbol,List<Int>>(List())
+  val char-rules = HashTable<Symbol,List<Int>>(List())
+  val byte-rules = HashTable<Symbol,List<Int>>(List())
+  val int-rules = HashTable<Symbol,List<Int>>(List())
+  val long-rules = HashTable<Symbol,List<Int>>(List())
+  val float-rules = HashTable<Symbol,List<Int>>(List())
+  val double-rules = HashTable<Symbol,List<Int>>(List())
+  val string-rules = HashTable<Symbol,List<Int>>(List())
+  val true-rules = HashTable<Symbol,List<Int>>(List())
+  val false-rules = HashTable<Symbol,List<Int>>(List())
+  val symbol-rules = HashTable<Symbol,List<Int>>(List())
+  val list-rules = HashTable<Symbol,List<Int>>(List())
+  val keyword-rules = HashTable<[Symbol,Symbol],List<Int>>(List())
+
+  ;Add to rule sets
+  for (rule in grammar, rule-index in 0 to false, fset in first-sets(props)) do :
+    defn add-to-set (table:HashTable<Symbol,List<Int>>) :
+      add(table, name(rule), rule-index)
+    add-to-set(all-rules)
+    if nullable-rules(props)[rule-index] :
+      add-to-set(null-rules)
+    for token in fset do :
+      match(token) :
+        (token:GAny|GListRest) : add-to-set(any-rules)
+        (token:GListEnd) : add-to-set(list-end-rules)
+        (token:GCharToken) : add-to-set(char-rules)
+        (token:GByteToken) : add-to-set(byte-rules)
+        (token:GIntToken) : add-to-set(int-rules)
+        (token:GLongToken) : add-to-set(long-rules)
+        (token:GFloatToken) : add-to-set(float-rules)
+        (token:GDoubleToken) : add-to-set(double-rules)
+        (token:GStringToken) : add-to-set(string-rules)
+        (token:GTrueToken) : add-to-set(true-rules)
+        (token:GFalseToken) : add-to-set(false-rules)
+        (token:GSymbolToken) : add-to-set(symbol-rules)
+        (token:GListStart) : add-to-set(list-rules)
+        (token:GKeyword) : add(keyword-rules, [name(rule), item(token)], rule-index)
+
+  ;Ensure subtraction relationships of sets
+  val set-buffer = IntSet()
+  defn minus (a:Seqable<Int>, b:Seqable<Int>) :
+    add-all(set-buffer, b)
+    val result = to-list $ filter({not set-buffer[_]}, a)
+    clear(set-buffer)
+    result
+  defn subtract-map! (atable:HashTable<Symbol,List<Int>>,
+                      btables:Collection<HashTable<Symbol,List<Int>>>) :
+    for entry in atable map! :
+      val prod = key(entry)
+      val bset = seq-cat({_[prod]}, btables)
+      value(entry) - bset
+  defn subtract-map! (atable:HashTable<[Symbol,Symbol],List<Int>>,
+                      btables:Collection<HashTable<Symbol,List<Int>>>) :
+    for entry in atable map! :
+      val [prod, _] = key(entry)
+      val bset = seq-cat({_[prod]}, btables)
+      value(entry) - bset  
+  subtract-map!(keyword-rules, [symbol-rules, any-rules, null-rules])
+  subtract-map!(char-rules, [any-rules, null-rules])
+  subtract-map!(byte-rules, [any-rules, null-rules])
+  subtract-map!(int-rules, [any-rules, null-rules])
+  subtract-map!(long-rules, [any-rules, null-rules])
+  subtract-map!(float-rules, [any-rules, null-rules])
+  subtract-map!(double-rules, [any-rules, null-rules])
+  subtract-map!(string-rules, [any-rules, null-rules])
+  subtract-map!(true-rules, [any-rules, null-rules])
+  subtract-map!(false-rules, [any-rules, null-rules])
+  subtract-map!(symbol-rules, [any-rules, null-rules])
+  subtract-map!(list-rules, [any-rules, null-rules])
+  subtract-map!(list-end-rules, [null-rules])
+  subtract-map!(any-rules, [null-rules])
+  
+  ;Return computed dispatch sets
+  DispatchSet(
+    all-rules
+    null-rules
+    any-rules
+    list-end-rules
+    char-rules
+    byte-rules
+    int-rules
+    long-rules
+    float-rules
+    double-rules
+    string-rules
+    true-rules
+    false-rules
+    symbol-rules
+    list-rules
+    keyword-rules)
+
+;============================================================
+;================- Negation Set Analysis ====================
+;============================================================
+
+deftype KSet
+defstruct KeywordSet <: KSet :
+  keywords: Tuple<Symbol>
+with:
+  printer => true
+  
+defstruct ProdSet <: KSet :
+  name: Symbol
+with:
+  printer => true
+  
+defstruct UnionSet <: KSet :
+  sets: Tuple<KSet>
+with:
+  printer => true
+  
+defstruct MinusSet <: KSet :
+  a: KSet
+  b: KSet
+with:
+  printer => true
+
+defn convert-negation-rules (rules:Tuple<GRule>) -> Tuple<GMatcherRule|GTokenRule> :
+  ;Gather positive and negative tokens
+  val negative-table = HashTable<Symbol,List<GToken>>(List())
+  val positive-table = HashTable<Symbol,List<GToken>>(List())
+  for rule in rules do :
+    match(rule) :
+      (rule:GNegationRule) :
+        add(negative-table, name(rule), token(rule))
+      (rule:GTokenRule) :
+        if length(tokens(rule)) == 1 :
+          val t = tokens(rule)[0]
+          add(positive-table, name(rule), t)
+      (rule:GMatcherRule) :
+        false
+        
+  ;Create initial kset table
+  val kset-table = HashTable<Symbol,KSet>()
+  defn to-kset (name:Symbol) :
+    set?(kset-table, name, fn () :
+      val psets = to-tuple $ seq(to-kset, positive-table[name])
+      val nsets = to-tuple $ seq(to-kset, negative-table[name])
+      MinusSet(UnionSet(psets), UnionSet(nsets)))
+  defn to-kset (t:GToken) :
+    match(t) :
+      (t:GProduction) : to-kset(name(t))
+      (t:GKeyword) : KeywordSet([item(t)])
+      
+  ;Simplify kset
+  val simplified-kset-table = HashTable<Symbol,KeywordSet>()
+  defn simplify (name:Symbol) :
+    set?(simplified-kset-table, name, fn () :
+      simplify(to-kset(name)))
+  defn simplify (kset:KSet) -> KeywordSet :
+    match(kset) :
+      (kset:UnionSet) :
+        val keywords = seq-cat(keywords{simplify(_)}, sets(kset))
+        KeywordSet $ to-tuple $ to-hashset<Symbol>(keywords)
+      (kset:MinusSet) :
+        val symbols = to-hashset<Symbol>(keywords(simplify(a(kset))))
+        do(remove{symbols, _}, keywords(simplify(b(kset))))
+        KeywordSet $ to-tuple $ symbols
+      (kset:KeywordSet) :
+        kset
+      (kset:ProdSet) :
+        simplify(name(kset))
+
+  ;Create matcher rule
+  defn to-matcher-rules (prod:Symbol) :
+    val neg-tokens = negative-table[prod]
+    val keywords = seq-cat(keywords{simplify(to-kset(_))}, neg-tokens)
+    val keyword-set = to-hashset<Symbol>(keywords)
+    defn match? (form) :
+      match(unwrap-token(form)) :
+        (s:Symbol) : not keyword-set[s]
+        (s) : true
+    val new-rules = Vector<GRule>()
+    val old-prod = gensym(prod)
+    add(new-rules, GMatcherRule(prod, [GProduction(old-prod)], match?, fn (result) : result[0]))
+    for r in rules do :
+      if name(r) == prod and r is-not GNegationRule :
+        add(new-rules, sub-name(r, old-prod))
+    new-rules
+
+  ;Create matcher rules  
+  val matcher-rules = seq-cat(to-matcher-rules, keys(negative-table))
+  defn standard-rule? (r:GRule) : not key?(negative-table, name(r))
+  val remaining-rules = filter(standard-rule?, rules[1 to false])
+  val new-rules = to-tuple $ cat-all $ [
+    [rules[0]]
+     matcher-rules
+     remaining-rules]
+  new-rules as Tuple<GMatcherRule|GTokenRule>
+
+;============================================================
+;======================== Utilities =========================
+;============================================================
+
+defn add-all<?T> (q:Queue<?T>, xs:Seqable<T>) :
+  do(add{q, _}, xs)
+
+defn add<?K,?V> (table:Table<?K,List<?V>>, k:K, v:V) :
+  update(table, cons{v, _,}, k)
