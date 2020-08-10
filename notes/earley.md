@@ -18,17 +18,17 @@ SExpListEnd
 
 This represents the end of a list in the input. 
 
+### Wildcards ###
+```
+SExpWildcard
+```
+
 ### End of Input ###
 ```
 EndOfInput
 ```
 
 This represents the end of the input.
-
-### Wildcards ###
-```
-SExpWildcard
-```
 
 This is a special token that can be inserted into the input stream in order to force a match against an upcoming terminal.
 
@@ -82,11 +82,36 @@ defmulti insert-list (s:SExpStream) -> False
 
 It is an error to insert any tokens into the stream if the upcoming token in `EndOfInput`. 
 
+## Matching Algorithm ##
 
+The general matching algorithm is handled by:
+```
+Function matches-input?
+Input:
+  terminal:GTerminal
+  input:SExpToken
+Output:
+  result:True|False
+```
 
+It is assumed that the input is never `EndOfInput`. 
 
+### Wildcards ###
+The wildcard token matches against all terminals except for `GListStart` and `GListEnd`.
 
+### SExpForm ###
+The SExpForm token matches against all
 
+- keyword
+- primitive
+- list start
+- any
+- list rest
+
+terminals, if their contents are appropriate.
+
+### SExpListEnd ###
+The SExpListEnd token matches only against `GListEnd`. 
 
 
 ## Types of Terminals ##
