@@ -82,38 +82,6 @@ defmulti insert-list (s:SExpStream) -> False
 
 It is an error to insert any tokens into the stream if the upcoming token in `EndOfInput`. 
 
-## Matching Algorithm ##
-
-The general matching algorithm is handled by:
-```
-Function matches-input?
-Input:
-  terminal:GTerminal
-  input:SExpToken
-Output:
-  result:True|False
-```
-
-It is assumed that the input is never `EndOfInput`. 
-
-### Wildcards ###
-The wildcard token matches against all terminals except for `GListStart` and `GListEnd`.
-
-### SExpForm ###
-The SExpForm token matches against all
-
-- keyword
-- primitive
-- list start
-- any
-- list rest
-
-terminals, if their contents are appropriate.
-
-### SExpListEnd ###
-The SExpListEnd token matches only against `GListEnd`. 
-
-
 ## Types of Terminals ##
 
 ### Keyword Terminal ###
@@ -175,6 +143,37 @@ A standard `GAny` matches against any form.
 A reluctant `GAny` matches against any form if a reluctant match is allowed.
 
 An atomic `GAny` matches against any form, but if matched, then the input stream is not allowed to expand and parse within the next upcoming s-expression (in the case where the upcoming s-expression is a list). 
+
+## Matching Algorithm ##
+
+The general matching algorithm is handled by:
+```
+Function matches-input?
+Input:
+  terminal:GTerminal
+  input:SExpToken
+Output:
+  result:True|False
+```
+
+It is assumed that the input is never `EndOfInput`. 
+
+### Wildcards ###
+The wildcard token matches against all terminals except for `GListStart` and `GListEnd`.
+
+### SExpForm ###
+The SExpForm token matches against all
+
+- keyword
+- primitive
+- list start
+- any
+- list rest
+
+terminals, if their contents are appropriate.
+
+### SExpListEnd ###
+The SExpListEnd token matches only against `GListEnd`. 
 
 ## Reluctant Matching ##
 
@@ -376,3 +375,49 @@ It has one remaining production to parse, and this item is the only item with th
 The completion of a deterministic reduction is calculated like so:
 First search for a completion-root in the parent. Let `pitem` be the first item for production `Start` started at position 0. If `pitem` has a completion-root, then this is the completion root for the item.
 If no completion-root is found in the parent, then the item is its own completion-root. 
+
+### Main Algorithm ###
+
+Each iteration manages
+```
+current-set:ESet
+next-set:ESet
+```
+
+We first process the `current-set` and add advanced items to `next-set`. Then we prune the reluctant matches from `next-set`.
+
+At this point, there are a few scenarios:
+
+```
+Case: Next set is empty.
+  Case A: The current set contains the completed start production.
+  Case B: The current set does not contain the completed start production.
+Case C: Next set is not empty.
+```
+
+#### Case A: Finished Parse ####
+This case occurs when we have finished parsing.
+
+#### Case B: Error Recovery ####
+This case occurs when the parser is stuck and is awaiting a terminal that does not match the input stream. 
+
+First, we want to save the context that caused this error. So compute the first list of Earley items (without using predictive look-ahead), and save this information.
+
+Here is the full list of terminals awaiting, and the action to take to force the parser to continue:
+- Keyword: Insert wildcard.
+- Primitive terminals: Insert wildcard.
+- List start: Insert list.
+- List end: Drop input.
+- Any: Insert wildcard.
+
+In terms of priority, we want to take actions with the following priority:
+1. Insert wildcard
+2. Insert list
+3. Drop input
+
+#### Case C: Standard Iteration ####
+This case occurs when a normal iteration is completed.
+We need to advance the input stream, and then go to the next iteration.
+To advance the input stream we either advance to the end of the list if the rest terminal was scanned, or by a single form otherwise. 
+
+
