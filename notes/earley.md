@@ -420,4 +420,71 @@ This case occurs when a normal iteration is completed.
 We need to advance the input stream, and then go to the next iteration.
 To advance the input stream we either advance to the end of the list if the rest terminal was scanned, or by a single form otherwise. 
 
+## Creation of Parse Forest ##
 
+The input to the parse forest algorithm is the set list from the backward parse. 
+
+The most important interface to the parse forest is the `get` function:
+```
+defmulti get (f:ParseForest, r:ParsedRange, index:Int, starting-position:Int) -> Seqable<ParsedRange>
+```
+
+where `ParsedRange` is defined as followed:
+```
+defstruct ParsedRange :
+  rule: Int
+  start: Int
+  end: Int
+```
+
+The input `ParsedRange` represents a range of input tokens, between `start` (inclusive) and `end` (exclusive), that can be parsed according to the given rule. As an example, the root range for a successful parse is `ParsedRange(start-rule, 0, total-num-tokens)`, where `start-rule` is the identifier of the starting rule, and `total-num-tokens` is the total number of tokens in the input. 
+
+The `ParseForest` allows us to query the individual subtrees that make up a `ParsedRange`. Suppose the input parsed range is
+```
+(rule 4) [F = A c d A B] from 10 to 35
+```
+. Then the question we are interested in is:
+
+"What can the subproductions `A` (first occurrence), `A` (second occurrence), and `B` be parsed as?"
+ 
+To answer this question for the first occurrence of `A`, we ask the parse forest:
+
+"Given `ParsedRange(4, 10, 35)`, what are the parsed ranges for token 0, starting from 10?"
+
+And suppose that the parse forest returns two ranges:
+```
+ParsedRange(22, 10, 15)
+ParsedRange(23, 10, 18)
+```
+This means that tokens 10 to 15 can be parsed as the first occurrence of `A` using rule 22, and that tokens 10 to 18 can also be parsed as the first occurrence of `A` using rule 23. 
+
+Now suppose we choose, using our specificity relation, that we want the parse tree containing subtree `ParsedRange(23, 10, 18)`. From rule 4, the following tokens after `A` are the terminals `c` and `d`. Therefore, the next question to ask the parse forest is:
+
+"Given `ParsedRange(4, 10, 35)`, what are the parsed ranges for token 3, starting from 20?"
+
+### Key Algorithm ###
+
+Consider answering this question:
+
+"Given `ParsedRange(4, 10, 35)`, what are the parsed ranges for token 0, starting from 10?"
+
+Now there may be many ranges for the production `A` starting at position 10:
+```
+ParsedRange(22, 10, 15)
+ParsedRange(23, 10, 18)
+ParsedRange(24, 10, 21)
+ParsedRange(28, 10, 26)
+```
+
+But not all of these parses will be compatible with the attempt to parse tokens 10 to 35 using rule 4. In order to be compatible we need the following information:
+```
+(rule 4) [F = A • c d A B] can be parsed from 18 to 35
+(rule 4) [F = A • c d A B] can be parsed from 15 to 35
+```
+which says that the tokens after `A` in rule 4 can be successfully parsed using input 17 to 35, or input 15 to 35. 
+
+Therefore, only two of the parsed ranges for `A` is compatible:
+```
+ParsedRange(22, 10, 15)
+ParsedRange(23, 10, 18)
+```
