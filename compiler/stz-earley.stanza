@@ -134,6 +134,93 @@ defn Printable (f:OutputStream -> ?) :
       f(o)
 
 ;============================================================
+;================== New Parse Forest ========================
+;============================================================
+
+defstruct PartialRule <: Hashable&Equalable :
+  rule: Int
+  num-parsed: Int
+  start: Int
+  end: Int
+with:
+  printer => true
+
+defn parts (r:PartialRule) : [rule(r), num-parsed(r), start(r), end(r)]
+defmethod equal? (a:PartialRule, b:PartialRule) : parts(a) == parts(b)
+defmethod hash (r:PartialRule) : hash(parts(r))
+
+;- setlist is the setlist from the backwards parse.
+public defn NewParseForest (grammar:Grammar, setlist:ESetList) :
+  ;Convert the set index from the backwards parse to the
+  ;position in the input stream.
+  defn set-index-to-position (index:Int) -> Int :
+    length(setlist) - 1 - index
+    
+  ;Compute partial rules:
+  ;Each item PartialRule(rule, num-parsed, start, end) means:
+  ;  The input from start (inclusive) to end (exclusive) can successfully
+  ;  be parsed as the tokens at index 'num-parsed' and after in rule 'rule'.
+  val partial-rules = HashSet<PartialRule>()
+  defn init-partial-rules () :
+    for eset in sets(setlist) do :
+      for item in items(setlist,eset) do :
+        val start = set-index-to-position(index(eset))
+        val end = set-index-to-position(parent(item))
+        add(partial-rules, PartialRule(rule(item), num-parsed(item), start, end))
+
+  ;Compute production parses:
+  ;Each entry ProdPos(prod, position) => (R1, R2, ...) means:
+  ;  The production 'prod' starting from position 'position' can be
+  ;  parsed in the ways given by R1, R2, ....
+  ;To be consistent, the start position in each R1, R2 is equal to
+  ;'position'.
+  val prod-parses = HashTable<ProdPos, List<ParsedRange>>(List())
+  defn init-prod-parses () :
+    for eset in sets(setlist) do :
+      for item in items(setlist, eset) do :
+        if num-parsed(item) == 0 :
+          val prodpos = ProdPos(production(grammar,item),
+                                set-index-to-position(index(eset)))
+          val range = ParsedRange(rule(item),
+                                  set-index-to-position(index(eset)),
+                                  set-index-to-position(parent(item)))
+          update(prod-parses, cons{range, _}, prodpos)
+
+  ;Given the ParsedRange 'range', return all of the subparses of production
+  ;at index 'index' starting from 'start-position'. 
+  defn child-ranges (range:ParsedRange, index:Int, start-position:Int) -> Seqable<ParsedRange> :
+    val token = tokens!(grammar[rule(range)])[index]
+    val production = name(token as GProduction)
+    val candidates = prod-parses[ProdPos(production, start-position)]
+    println("Candidates:")
+    within indented() :
+      do(println, candidates)
+    for r in candidates filter :
+      println("Filter using: %_" % [PartialRule(rule(range), index + 1, end(r), end(range))])
+      partial-rules[PartialRule(rule(range), index + 1, end(r), end(range))]
+
+  ;Create ParseForest
+  init-partial-rules()
+  init-prod-parses()
+  println("PartialRules:")
+  within indented() :
+    do(println, partial-rules)
+  println("ProdPos:")
+  within indented() :
+    do(println, prod-parses)
+  new ParseForest :
+    defmethod get (this, r:ParsedRange, index:Int, position:Int) :
+      val result = to-tuple $ child-ranges(r, index, position)
+      println("Child of %_, index %_, position %_" % [format(grammar,r), index, position])
+      within indented() :
+        for r in result do :
+          println(format(grammar,r))
+      println("Done")
+      result
+    defmethod start (this) :
+      ParsedRange(0, 0, length(setlist) - 1)
+
+;============================================================
 ;================ Construct Parse Forest ====================
 ;============================================================
 
@@ -152,6 +239,8 @@ with:
 defstruct ProdPos <: Hashable&Equalable :
   production: Symbol
   position: Int
+with:
+  printer => true
 
 defstruct EItemCore <: Hashable&Equalable :
   rule: Int
@@ -222,7 +311,7 @@ public defn ParseForest (grammar:Grammar, setlist:ESetList) :
       pending-completions[prodpos] = chain-index
   defn pending-chains (return:EItem -> ?, prodpos:ProdPos) -> False :
     val index = get?(pending-completions, prodpos)
-    match(index:Int) :
+    match(index:Int) : 
       if not empty?(pending-completion-chains[index]) :
         within with-timer("Compute pending completion chain") :
           do(return, pending-completion-chains[index])
@@ -251,6 +340,7 @@ public defn ParseForest (grammar:Grammar, setlist:ESetList) :
           add-production-range(index(eset), item)
   defn get-production-ranges (prodpos:ProdPos) :
     within item = pending-chains(prodpos) :
+      println("Fill in right-recursion rule: %_ => %_" % [position(prodpos), format(grammar,item)])
       add-production-range(position(prodpos), item)
     production-ranges[prodpos]
 
@@ -304,6 +394,55 @@ public defn with-timer<?T> (f:() -> ?T, name:String) :
   stop(timer)
   println(timer)
   result
+
+;============================================================
+;================ Selecting the Parse Tree ==================
+;============================================================
+
+public defn new-select-tree (grammar:Grammar, forest:ParseForest) -> ParseNode :
+  val node-table = HashTable<ParsedRange,ParseNode>()
+
+  defn select (range:ParsedRange) -> ParseNode :
+    set?(node-table, range, fn () :
+      val grule = grammar[rule(range)] as GMatcherRule|GTokenRule
+      val children = Vector<ParseNode|False>()
+      val num-tokens = length(tokens(grule))
+      let loop (index:Int = 0, position:Int = start(range)) :
+        if index < num-tokens :
+          match(tokens(grule)[index]) :
+            (t:GTerminal) :
+              add(children, false)
+              loop(index + 1, position + 1)
+            (t:GProduction) :
+              val child-ranges = forest[range, index, position]
+              val child-range = minimum(child-ranges, {compare-specificity-2(grammar, rule(range), _, _) < 0})
+              val child = select(child-range)
+              add(children, child)
+              loop(index + 1, end(/range(child)))
+      ParseNode(range, to-tuple(children)))
+
+  ;Launch!
+  select(start(forest))
+
+;Return -1 if a should take priority over b during a left-to-right disambiguation sweep of the parse forest.
+defn compare-specificity-2 (grammar:Grammar, parent-rule-index:Int, a:ParsedRange, b:ParsedRange) -> Int :
+  val parent-rule = grammar[parent-rule-index] as GMatcherRule|GTokenRule
+  val rule-a = grammar[rule(a)] as GMatcherRule|GTokenRule
+  val rule-b = grammar[rule(b)] as GMatcherRule|GTokenRule
+  defn compare-associativity () :
+    switch(associativity(parent-rule)) :
+      LeftAssociative : compare(length(b), length(a))
+      RightAssociative : compare(length(a), length(b))
+  defn compare-priority () :
+    compare(priority(rule-b), priority(rule-a))
+  defn compare-order () :
+    compare(rule(a), rule(b))
+  val c1 = compare-associativity()
+  if c1 == 0 :
+    val c2 = compare-priority()
+    if c2 == 0 : compare-order()
+    else : c2
+  else : c1  
   
 ;============================================================
 ;================ Selecting the Parse Tree ==================
@@ -580,7 +719,22 @@ defn example-grammar-6 () :
 
 deftest parse-7 :
   val g = example-grammar-6()
-  test-parse(g, `(a a b c a a b c b c a a a b c))
+  test-parse(g, `(a a b c a a b c b c a a a b c a a a a a a a a a a a a a a))
+
+defn example-grammar-8 () :
+  #for E in [AS, BS] :
+    val E = GProduction(`E)
+  #for (X in [A],
+        x in [a]) :
+    val X = GKeyword(`x)
+  [GTokenRule(`Start, [GListStart() AS GListEnd()])
+   GTokenRule(`AS, [A, BS])
+   GTokenRule(`BS, [A, AS])
+   GTokenRule(`BS, [A])]
+
+let :;deftest parse-simple-mutual-right-recursive :
+  val g = example-grammar-8()
+  test-parse(g, `(a a a a a a a a a a a a a a a a a a a a a a a a a a))
 
 deftest parse-mutually-right-recursive :
   #for E in [AS BS CS A B C X] :

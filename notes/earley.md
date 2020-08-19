@@ -462,6 +462,16 @@ Now suppose we choose, using our specificity relation, that we want the parse tr
 
 "Given `ParsedRange(4, 10, 35)`, what are the parsed ranges for token 3, starting from 20?"
 
+### Backwards Parse ###
+At the end of a backwards parse, the following item
+```
+Set 25
+  (rule 2) [BS = a • AS, S1]
+```
+means:
+
+"The tokens after `•` in rule 2 can successfully be parsed from set 25 (counted from the back) and set 1 (counted from the back)."
+
 ### Key Algorithm ###
 
 Consider answering this question:
@@ -488,3 +498,26 @@ Therefore, only two of the parsed ranges for `A` is compatible:
 ParsedRange(22, 10, 15)
 ParsedRange(23, 10, 18)
 ```
+
+### Completion Chains ###
+
+Completion items such as below
+```
+Set 20
+  (rule 0) [Start = • X X X AS, S0] (complete as (rule 2) [BS = • B X CS, S17])
+```
+, can be thought of as implicitly representing an entire stack of items once expanded. The above may represent something akin to the following
+```
+Set 20
+  (rule 2) [BS = • B X CS, S17]
+  (rule 4) [CS = • C X BS, S15]
+  (rule 2) [BS = • B X CS, S13])
+  ...
+  (rule 0) [Start = • X X X AS, S0]
+```
+
+Thus the general algorithm, when answering the question:
+
+"What are all the possible parses for production `A` starting from set 13?"
+
+We need to first expand all of the items in the set corresponding to set 13. 
