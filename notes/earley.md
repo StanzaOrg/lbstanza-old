@@ -521,3 +521,48 @@ Thus the general algorithm, when answering the question:
 "What are all the possible parses for production `A` starting from set 13?"
 
 We need to first expand all of the items in the set corresponding to set 13. 
+
+### Algorithmic Strategy ###
+
+When requesting all of the valid parses of production `A` starting from position `35`, we first expand all of the completion chains in the set corresponding to position 35. Because we select a particular parse tree at the end, this strategy allows us to avoid a complete expansion of most sets.
+
+## Computing Descriptive Errors ##
+
+Each time there is an unexpected input, we save the context of the parse at that moment in a `MissingInput` datastructure.
+
+@[MissingInput Definition]
+```
+defstruct MissingInput :
+  input
+  set-index: Int
+  info: FileInfo|False
+  items: Tuple<EItem>
+```
+
+The goal is to compute a good error message from the list of partially completed EItems. The general strategy is to recognize that many items in the list are explained in as simpler way by other items, and thus do not contribute to a good error message. The following pruning rules apply:
+
+### Remove Items with Matched Wildcards ###
+
+For any items that have matched against wildcards, we assume that these have a high probability of being spurious parse directions. So all items with matched wildcards are removed. 
+
+### Assume that Productions are Complete ###
+
+If possible, we choose to interpret a production as being complete. Thus, if we see the following:
+```
+(rule 4) [CS =  C X BS •, S15]
+```
+we assume that the production `CS`, starting from position 15, is complete at this input. We then prune all pending parses of `CS` that started after position 15. 
+
+### Remove Predicted Items ###
+
+Any item that has no tokens yet parsed, such as:
+```
+(rule 4) [CS = • C X BS, S15]
+```
+is a "predicted" item, and is therefore explained as the pending production for some other rule, such as:
+```
+(rule 8) [DS = A x B • CS X, S12]
+```
+In these cases, it is better to explain the error as failing during a parse of `DS`, expecting a `CS`. 
+
+Thus we prune all predicted items from parses.
