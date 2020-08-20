@@ -576,3 +576,27 @@ is a "predicted" item, and is therefore explained as the pending production for 
 In these cases, it is better to explain the error as failing during a parse of `DS`, expecting a `CS`. 
 
 Thus we prune all predicted items from parses.
+
+### Custom Error Messages ###
+
+After pruning non-descriptive items, all remaining items have the form:
+
+```
+(rule 4) [CS = C • X BS, S15]
+```
+
+where there is a clear upcoming production or terminal that does not match against the next input. Currently, an auto-generated error message is created from this item. Instead, we can provide custom control to the user to write a descriptive error message given this context. 
+
+## Keyword Sets ##
+
+The following concepts need to be supported by the parsing system to allow for natural language extensions:
+
+Concept of Keyword Set: A keyword set is a set of symbols that are reserved as "keywords" in the language. Language extensions can freely add additional keywords to this set to grow its vocabulary.
+
+Concept of Identifer: An identifier is commonly defined as any symbol that is *not* a keyword. Because the set of keywords can be user-extended by the user, this definition of an identifier needs to updated consistently as well.
+
+Concept of Keyword Group: It is common for a given language extension to define its own set of keywords, in its own separately named group, e.g. `jitx-keywords`. The user then needs the ability
+
+- to add this group of keywords, en-masse, to another set of keywords, and
+- to remove this group of keywords, from the allowed symbols that make up an identifier. 
+
