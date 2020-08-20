@@ -1,0 +1,274 @@
+defpackage stz/earley-parse-tree :
+  import core
+  import collections
+  import stz/earley-eitems
+  import stz/earley-grammar
+
+;============================================================
+;====================== Algorithm ===========================
+;============================================================
+
+;public defstruct ParseResult :
+;  node: ParseNode
+;  inputlist: Vector<SExpToken>
+;  infolist: Vector<FileInfo|False>
+
+
+;
+;public defn parse-result (grammar:Grammar, input:List) -> ParseResult|ParsingErrors :
+;  val saved-matches = SavedMatches()
+;  val result = search(forward-search(grammar, saved-matches), SExpStream(input))
+;  match(result) :
+;    (result:SearchSuccess) :
+;      ;BACKWARD SEARCH
+;      println("==== Backward search! ====")
+;      val result2 = (search(ctrl, sexpstream) as SearchSuccess) where :
+;        val num-tokens = length(inputlist(result))
+;        val ctrl = backward-search(grammar, saved-matches, num-tokens)
+;        val sexpstream = BackwardSExpStream(inputlist(result), infolist(result))
+;      
+;
+;
+;;      val parse-forest = ParseForest(grammar, setlist(result))
+;;      val node = within with-timer("select tree") :
+;;        select-tree(grammar, parse-forest)
+;;      ParseResult(node, grammar, inputlist(result), infolist(result))      
+;
+;      val parse-forest = NewParseForest(grammar, setlist(result2))
+;      val node = within with-timer("select tree") :
+;        new-select-tree(grammar, parse-forest)
+;      ParseResult(node, grammar, inputlist(result2), infolist(result2))      
+;    (result:SearchFailure) :
+;      to-exception(grammar, missing(result))
+
+;============================================================
+;===================== Main Algorithm =======================
+;============================================================
+
+public defn parse (grammar:Grammar, setlist:ESetList) -> ParseNode :
+  val forest = ParseForest(grammar, setlist)
+  select-tree(grammar, forest)
+
+;============================================================
+;==================== Output Datastructures =================
+;============================================================
+
+public defstruct ParseNode :
+  range: ParsedRange
+  children: Tuple<ParseNode|False>
+
+public defstruct ParsedRange <: HasParts :
+  rule: Int
+  start: Int
+  end: Int
+with:
+  printer => true
+
+defmethod parts (r:ParsedRange) : [`ParsedRange, rule(r), start(r), end(r)]
+
+public defn length (r:ParsedRange) :
+  end(r) - start(r)
+
+;============================================================
+;===================== Utilities ============================
+;============================================================
+
+defstruct PartialRule <: HasParts :
+  rule: Int
+  num-parsed: Int
+  start: Int
+  end: Int
+with:
+  printer => true
+
+defmethod parts (r:PartialRule) : [`PartialRule, rule(r), num-parsed(r), start(r), end(r)]
+
+defstruct ProdPos <: HasParts :
+  production: Symbol
+  position: Int
+with:
+  printer => true
+
+defmethod parts (k:ProdPos) : [`ProdPos, production(k), position(k)]
+
+;============================================================
+;================== Simple Hash =============================
+;============================================================
+
+deftype HasParts <: Hashable & Equalable
+defmulti parts (p:HasParts) -> Tuple
+defmethod hash (p:HasParts) : hash(parts(p))
+defmethod equal? (a:HasParts, b:HasParts) : parts(a) == parts(b)
+
+;============================================================
+;=============== Parse Forest Interface =====================
+;============================================================
+
+deftype ParseForest
+
+;Retrieve the subranges for each parsed range.
+defmulti get (f:ParseForest, r:ParsedRange, index:Int, position:Int) -> Seqable<ParsedRange>
+
+;Retrieve the root ParsedRange representing the forest.
+defmulti start (f:ParseForest) -> ParsedRange
+
+;============================================================
+;=============== Construct Parse Forest =====================
+;============================================================
+;Constructs a ParseForest datastructure from the given grammar,
+;and setlist from a right-to-left search.
+defn ParseForest (grammar:Grammar, setlist:ESetList) -> ParseForest :
+  ;Convert the set index from the backwards parse to the
+  ;position in the input stream.
+  defn set-index-to-position (index:Int) -> Int :
+    length(setlist) - 1 - index
+  defn position-to-set-index (position:Int) -> Int :
+    length(setlist) - 1 - position
+    
+  ;Compute partial rules:
+  ;Each item PartialRule(rule, num-parsed, start, end) means:
+  ;  The input from start (inclusive) to end (exclusive) can successfully
+  ;  be parsed as the tokens at index 'num-parsed' and after in rule 'rule'.
+  val partial-rules = HashSet<PartialRule>()
+  defn init-partial-rules () :
+    for eset in sets(setlist) do :
+      for item in items(setlist,eset) do :
+        val start = set-index-to-position(index(eset))
+        val end = set-index-to-position(parent(item))
+        add(partial-rules, PartialRule(rule(item), num-parsed(item), start, end))
+
+  ;Compute production parses:
+  ;Each entry ProdPos(prod, position) => (R1, R2, ...) means:
+  ;  The production 'prod' starting from position 'position' can be
+  ;  parsed in the ways given by R1, R2, ....
+  ;To be consistent, the start position in each R1, R2 is equal to
+  ;'position'.
+  val prod-parses = HashTable<ProdPos, List<ParsedRange>>(List())
+  defn add-production-range (set-index:Int, item:EItem) :
+    fatal("Illegal item") when num-parsed(item) > 0
+    val prodpos = ProdPos(production(grammar,item),
+                          set-index-to-position(set-index))
+    val range = ParsedRange(rule(item),
+                            set-index-to-position(set-index),
+                            set-index-to-position(parent(item)))
+    update(prod-parses, cons{range, _}, prodpos)
+  defn init-prod-parses () :
+    for eset in sets(setlist) do :
+      for item in items(setlist, eset) do :
+        if num-parsed(item) == 0 :
+          add-production-range(index(eset), item)
+
+  ;Expand all completed items with completion roots for the given
+  ;set. For any additional completed items, add them as production-ranges.
+  val added-completed-parses = IntSet()
+  defn create-completion-production-parses (set-index:Int) -> False :
+    if add(added-completed-parses, set-index) :
+      ;Gather set of existing completed items.
+      val completion-set = HashSet<EItemCore>()
+      for item in items(setlist, setlist[set-index]) do :
+        if num-parsed(item) == 0 :
+          add(completion-set, core(item))
+      ;Expand all completed items with completion roots.
+      ;Add their production ranges if they did not exist in the
+      ;set before.
+      for item in items(setlist, setlist[set-index]) do :
+        if num-parsed(item) == 0 and completion-root(item) is-not False :
+          within x = expand-completion-item(item) :
+            if add(completion-set, core(x)) :
+              add-production-range(set-index, x)  
+  ;Given the completed item with completion root,
+  ;Return the entire chain of expanding the items not including the
+  ;final root.
+  defn expand-completion-item (return:EItem -> ?, item:EItem) :
+    val root-core = core(item)
+    let loop (x:EItem = completion-root(item) as EItem) :
+      if core(x) != root-core :
+        return(x)
+        val x* = first-item(setlist, parent(x), production(grammar,x))
+        loop(dec-num-parsed(x* as EItem, false))
+
+  ;Given the ParsedRange 'range', return all of the subparses of production
+  ;at index 'index' starting from 'start-position'. 
+  defn child-ranges (range:ParsedRange, index:Int, start-position:Int) -> Seqable<ParsedRange> :
+    create-completion-production-parses(position-to-set-index(start-position))
+    val token = tokens!(grammar[rule(range)])[index]
+    val production = name(token as GProduction)
+    val candidates = prod-parses[ProdPos(production, start-position)]
+;    println("Candidates:")
+;    within indented() :
+;      do(println, candidates)
+    for r in candidates filter :
+;      println("Filter using %_" % [PartialRule(rule(range), index + 1, end(r), end(range))])
+      partial-rules[PartialRule(rule(range), index + 1, end(r), end(range))]
+
+  ;Create ParseForest
+  init-partial-rules()
+  init-prod-parses()
+;  println("Prod Table:")
+;  within indented() :
+;    do(println, prod-parses)
+;  println("Partial Rules:")
+;  within indented() :
+;    do(println, partial-rules)
+  new ParseForest :
+    defmethod get (this, r:ParsedRange, index:Int, position:Int) :
+      child-ranges(r, index, position)
+    defmethod start (this) :
+      ParsedRange(0, 0, length(setlist) - 1)
+
+;============================================================
+;================ Selecting the Parse Tree ==================
+;============================================================
+
+defn select-tree (grammar:Grammar, forest:ParseForest) -> ParseNode :
+  ;Returns the ParseNode corresponding to the given ParsedRange.
+  defn select (range:ParsedRange) -> ParseNode :
+    ;Returns true if a is more specific than b.
+    defn more-specific? (a:ParsedRange, b:ParsedRange) -> True|False :
+      compare-specificity(grammar, rule(range), a, b) < 0
+      
+    ;Select parse nodes for children
+    val children = Vector<ParseNode|False>()
+    val grule = grammar[rule(range)] as GMatcherRule|GTokenRule    
+    val num-tokens = length(tokens(grule))
+    let loop (index:Int = 0, position:Int = start(range)) :
+      if index < num-tokens :
+        match(tokens(grule)[index]) :
+          (t:GTerminal) :
+            add(children, false)
+            loop(index + 1, position + 1)
+          (t:GProduction) :
+            val child-ranges = forest[range, index, position]
+            ;println("Lookup %_ at index %_, position %_" % [format(grammar,range), index, position])
+            ;for r in child-ranges do :
+            ;  println("  %_" % [format(grammar,r)])
+            val child-range = minimum(child-ranges, more-specific?)
+            val child = select(child-range)
+            add(children, child)
+            loop(index + 1, end(/range(child)))
+
+    ;Construct ParseNode from children
+    ParseNode(range, to-tuple(children))
+
+  ;Launch!
+  select(start(forest))
+
+;Return -1 if a should take priority over b during a left-to-right disambiguation sweep of the parse forest.
+defn compare-specificity (grammar:Grammar, parent-rule-index:Int, a:ParsedRange, b:ParsedRange) -> Int :
+  val parent-rule = grammar[parent-rule-index] as GMatcherRule|GTokenRule
+  val rule-a = grammar[rule(a)] as GMatcherRule|GTokenRule
+  val rule-b = grammar[rule(b)] as GMatcherRule|GTokenRule
+  defn compare-associativity () :
+    switch(associativity(parent-rule)) :
+      LeftAssociative : compare(length(b), length(a))
+      RightAssociative : compare(length(a), length(b))
+  defn compare-priority () :
+    compare(priority(rule-b), priority(rule-a))
+  defn compare-order () :
+    compare(rule(a), rule(b))
+  val c1 = compare-associativity()
+  if c1 == 0 :
+    val c2 = compare-priority()
+    if c2 == 0 : compare-order()
+    else : c2
+  else : c1  

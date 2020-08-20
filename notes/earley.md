@@ -305,6 +305,16 @@ The terminals that need special attention are:
 
 The reverse parse is straightforward, except that we replace these special terminals with a marker that records what position they matched upon in the forward parse. 
 
+## SavedMatches ##
+
+The `SavedMatches` datastructure is used to remember, for special terminals, which positions in the input stream they last matched.
+
+The `save-match?` function returns `true` if the given terminal is a "special" terminal, and we need to remember the positions that they matched against. @[SavedMatches save-match?]
+
+If a special terminal matches at a given position, we use the `save` function to record that the terminal matched at the given position. @[SavedMatches save]
+
+To query the SavedMatches datastructure we use the `matched?` function to ask whether a given terminal previously matched at a given position. @[SavedMatches matched?]
+
 ## Earley Search ##
 
 ### State ###
