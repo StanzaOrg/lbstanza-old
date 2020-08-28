@@ -6,6 +6,7 @@ defpackage stz/core-macros :
    import macro-utils
    import collections
    import stz/params
+   import stz/utils
 
 ;============================================================
 ;==================== Exceptions ============================
@@ -32,6 +33,143 @@ defn wrap-info (info:False|FileInfo, x) :
    match(info) :
       (info:FileInfo) : Token(x, info)
       (info:False) : x
+
+;============================================================
+;============== Anonymous Function Compilation ==============
+;============================================================
+
+deftype AfnArg
+defstruct AfnNumberedArg <: AfnArg: (index:Int)
+defstruct AfnStandardArg <: AfnArg
+
+defstruct AfnArgEntry :
+  arg: AfnArg
+  type: Maybe
+
+defsyntax anonymous-function-body :
+  import type! from core
+  
+  ;Classify form as an anonymous function argument.
+  ;Returns false if not an argument.
+  ;Either _ or _0 is accepted as arguments.
+  defn classify-arg (x) -> AfnArg|False :
+    match(unwrap-token(x)) :
+      (s:StringSymbol) :
+        if s == `_ :
+          AfnStandardArg()
+        else if prefix?(name(s), "_") :
+          val index-str = name(s)[1 to false]
+          match(to-int(index-str)) :
+            (x:Int) : AfnNumberedArg(x) when x >= 0 and x < 256
+            (x) : false
+      (f) :
+        false
+
+  ;Returns true if the given form is an appropriate
+  ;argument placeholder.
+  defn placeholder? (x) -> True|False :
+    classify-arg(x) is-not False  
+
+  ;Syntax of anonymous function form
+  public defproduction aform
+  defrule aform = (?h:((@afn | @do-afn | @quote | $quote) _ ...)) :
+    h
+  defrule aform = (?p:#placeholder ~ : ?t:#type!) :
+    AfnArgEntry(p, One(t))
+  defrule aform = (?p:#placeholder) :
+    AfnArgEntry(p, None())
+  defrule aform = ((?p:#aform ...)) :
+    p
+  defrule aform = (?x) :
+    x
+
+  ;Represents a _ or _n
+  defproduction placeholder: AfnArg
+  defrule placeholder = (?p) when placeholder?(p) :
+    classify-arg(p) as AfnArg
+
+defn compile-afn-body (afn-info:FileInfo|False, body:List) :
+  ;Create arguments.
+  val arg-table = IntTable-init<Symbol>(gensym{`arg})
+  val arg-list = Vector<AfnArgEntry>()
+  defn make-arg (e:AfnArgEntry) -> Symbol :
+    add(arg-list, e)
+    val index = match(arg(e)) :
+      (a:AfnNumberedArg) : index(a)
+      (a:AfnStandardArg) : length(arg-list) - 1
+    arg-table[index]
+
+  ;Verify proper form.
+  defn verify-form () -> True|False :
+    ;Verify that either the user uses standard arguments
+    ;or numbered arguments but not both.
+    val standard-arg? = any?({arg(_) is AfnStandardArg}, arg-list)
+    val numbered-arg? = any?({arg(_) is AfnNumberedArg}, arg-list)
+    if standard-arg? and numbered-arg? :
+      val msg = "Anonymous function cannot contain both standard placeholder \
+                 arguments as well as numbered placeholder arguments."
+      throw(CSE(afn-info, msg))
+
+  ;Assuming that it is a anonymous function using numbered arguments,
+  ;construct the type table. Ensure that all types are consistent.
+  defn type-table () :
+    val table = IntTable<?>()
+    defn arg-index (e:AfnArgEntry) : index(arg(e) as AfnNumberedArg)
+    defn arg-type (e:AfnArgEntry) : value!(type(e))
+    defn typed? (e:AfnArgEntry) : not empty?(type(e))
+    for group in group-by(arg-index, arg-type, filter(typed?,arg-list)) do :
+      val types = unique(seq(unwrap-all,value(group)))
+      if length(types) > 1 :
+        val msg = "Argument %_ in anonymous function is declared repeatedly with \
+                   different types: %,."
+        throw(CSE(afn-info, msg % [key(group), types]))
+      table[key(group)] = head(value(group))
+    table
+
+  ;Construct arg list, for functions with one argument or more.
+  defn make-arg-list () -> List :
+    match(arg(arg-list[0])) :
+      (a:AfnStandardArg) :
+        for (entry in arg-list, index in 0 to false) seq-append :
+          val name = arg-table[index]
+          if empty?(type(entry)) : List(name)
+          else : List(name, `:, value!(type(entry)))
+      (a:AfnNumberedArg) :
+        val max-arg = maximum(keys(arg-table))
+        for i in 0 through max-arg seq-append :
+          val types = type-table()
+          val name = arg-table[i]
+          if key?(types, i) : List(name, `:, types[i])
+          else : List(name)
+
+  ;Create the modified body.
+  ;Calls `make-arg` on each occurrence of a placeholder.
+  defn replace (xs) -> ? :
+    match(unwrap-token(xs)) :
+      (xs:List) : map(replace, xs)
+      (xs:AfnArgEntry) : make-arg(xs)
+      (xs) : xs
+
+  ;Perform substitutions on body
+  val aform = parse-syntax[anonymous-function-body + current-overlays / #aform](List(body))
+  val replaced = replace(aform)
+  verify-form()
+  val body* = parse-syntax[core / #exp](replaced)
+  if empty?(arg-list) :
+    val template = `(
+       multifn :
+          () : body
+          (x:?) : body)
+    parse-syntax[core / #exp](      
+       fill-template(template, [
+          `body => body*
+          `x => gensym(`x)]))
+  else :
+    val template = `(fn args : body)
+    parse-syntax[core / #exp](
+       fill-template(template, [
+          `body => body*,
+          `args => make-arg-list()]))
 
 ;============================================================
 ;====================== DefStruct Compilation ===============
@@ -1154,49 +1292,7 @@ defsyntax core :
    ;                  Anonymous Functions
    ;                  ===================
    defrule exp4 = ({?body ...}) :
-      val args = Vector<Symbol>()
-      val types = Vector<?>()
-      defn new-arg (t) :
-         val a = gensym(`arg)
-         add(args, a)
-         add(types, t)
-         a
-
-      defn replace (xs:List) -> List :
-         match-syntax[core + current-overlays](xs) :
-            (?h:((@afn | @do-afn | @quote | $quote) _ ...) ?rest ...) :
-               cons(h, replace(rest))
-            ((?h ...) ?rest ...) :
-               cons(replace(h), replace(rest))
-            (~ _ : ?t:#type! ?rest ...) :
-               cons(new-arg(t), replace(rest))
-            (~ _ ?rest ...) :
-               cons(new-arg(false), replace(rest))
-            (?h ?rest ...) :
-               cons(h, replace(rest))
-            () :
-               List()
-               
-      val body* = parse-syntax[core + current-overlays / #exp](
-         replace(List(body)))         
-
-      if empty?(args) :
-         val template = `(
-            multifn :
-               () : body
-               (x:?) : body)
-         parse-syntax[core / #exp](      
-            fill-template(template, [
-               `body => body*
-               `x => gensym(`x)]))
-      else :
-         val template = `(fn args : body)
-         parse-syntax[core / #exp](
-            fill-template(template, [
-               `body => body*
-               `args => for (x in args, t in types) seq-append :
-                  if t is False : List(x)
-                  else : qquote(~ x : ~ t)]))
+     compile-afn-body(closest-info(), body)
 
    ;                       Is/Is-Not
    ;                       =========
