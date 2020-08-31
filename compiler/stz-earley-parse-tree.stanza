@@ -62,6 +62,16 @@ with:
 defmethod parts (t:ParsedToken) :
   [`ParsedToken, rule(t), rule-start(t), token-index(t)]
 
+;Represents a parsed production that ends at the given position.
+defstruct ProdEnd <: HasParts :
+  prod: Int
+  end: Int
+with:
+  printer => true
+
+defmethod parts (t:ProdEnd) :
+  [`ProdEnd, prod(t), end(t)]
+
 ;Represents a matched terminal at a given position.
 defstruct ParsedTerminal <: HasParts :
   terminal: GTerminal
@@ -116,6 +126,16 @@ deftype ParseForest
 ;  in decreasing order.
 defmulti ends (f:ParseForest, range:ParsedRange, token-index:Int, token-start:Int) -> Seqable<Int>
 
+;Answers the query:
+;Given:
+;- The parent parsed range (a range of input parsed using some rule),
+;- The index of the token (assumed to be a production) in the rule,
+;_ The ending position of this token,
+;Return:
+;- All potential starts for the parsed range corresponding to that token, sorted
+;  in increasing order.
+defmulti starts (f:ParseForest, range:ParsedRange, token-index:Int, token-end:Int) -> Seqable<Int>
+
 ;Returns true if the given terminal matches the input at the given
 ;position.
 defmulti match? (f:ParseForest, term:GTerminal, position:Int) -> True|False
@@ -142,6 +162,10 @@ defn ParseForest (grammar:Grammar, setlist:ESetList) -> ParseForest :
   ;For all completed productions, record the rule
   ;they were parsed with.
   val prod-rules = HashTable<ParsedProd,List<Int>>(List())
+
+  ;For all parsed productions (that are not at the beginning of a rule),
+  ;record their starting position.
+  val prod-starts = HashTable<ProdEnd, List<Int>>(List())
 
   ;If an index exists in prod-calculated, then the appropriate
   ;entries in that set has been added to prod-rules.
@@ -175,27 +199,40 @@ defn ParseForest (grammar:Grammar, setlist:ESetList) -> ParseForest :
     compute-prod-rules(end(prod))
     prod-rules[prod]
 
+  ;Retrieve the rules that can successfully parse
+  ;the given production between tokens start and end.
+  defn get-prod-starts (prod:ProdEnd) -> List<Int> :
+    compute-prod-rules(end(prod))
+    prod-starts[prod]
+
   ;If not already computed, process each item
   ;in the given set, and add its entries to the
   ;prod-rules table.
   defn compute-prod-rules (set-index:Int) :
     if add(prod-calculated, set-index) :
+      val updated-prods = IntSet()
       val eset = setlist[set-index]
       for item in items(setlist, eset) do :
         if upcoming(grammar,item) is False :
-          add-prod-rule(item, index(eset))
+          add-prod-rule(item, index(eset), updated-prods)
           if completion-root(item) is-not False :
             within item = expand-completion-item(item) :
-              add-prod-rule(item, index(eset))
+              add-prod-rule(item, index(eset), updated-prods)
+      for prod in updated-prods do :
+        val prod-end = ProdEnd(prod, index(eset))
+        update(prod-starts, to-list{lazy-qsort(_)}, prod-end)
 
   ;Add the given completion (in set 'end') to the
   ;prod-rules table.
-  defn add-prod-rule (item:EItem, end:Int) :
+  defn add-prod-rule (item:EItem, end:Int, updated-prods:IntSet) :
     val prod = production(grammar,item)
     val rule = rule(item)
     val start = parent(item)
     val parsed-prod = ParsedProd(prod, start, end)
     update(prod-rules, cons{rule, _}, parsed-prod)
+    val prod-end = ProdEnd(prod, end)
+    update(prod-starts, cons{start, _}, prod-end)
+    add(updated-prods, prod)
 
   ;Given the completed item with completion root,
   ;Return the entire chain of expanding the items not including the
@@ -215,6 +252,13 @@ defn ParseForest (grammar:Grammar, setlist:ESetList) -> ParseForest :
     for i in (index + 1) to length(tokens) none? :
       tokens[i] is GProduction
 
+  ;Returns true if token at given index is the first production
+  ;in the given rule.
+  defn first-production? (rule:Int, index:Int) -> True|False :
+    val tokens = tokens(grammar[rule])
+    for i in 0 to index none? :
+      tokens[i] is GProduction
+
   ;Compute all tables
   compute-prod-ends()
 
@@ -226,10 +270,12 @@ defn ParseForest (grammar:Grammar, setlist:ESetList) -> ParseForest :
       ParsedRange(0, 0, length(setlist) - 1)
       
     defmethod ends (this, range:ParsedRange, token-index:Int, token-start:Int) :
-      ;Returns true if the current token can be parsed between
-      ;token-start and the given end. 
+      ;Get the production at token-index.
       val tokens = tokens(grammar[rule(range)])
       val prod = tokens[token-index] as GProduction
+      
+      ;Returns true if the current token can be parsed between
+      ;token-start and the given end. 
       defn feasible-end? (candidate-end:Int) -> True|False :
         if candidate-end <= end(range) :
           val prod = ParsedProd(id(prod), token-start, candidate-end)
@@ -247,6 +293,30 @@ defn ParseForest (grammar:Grammar, setlist:ESetList) -> ParseForest :
 
       ;Filter out the unfeasible ends
       filter(feasible-end?, candidate-ends)
+
+    defmethod starts (this, range:ParsedRange, token-index:Int, token-end:Int) :
+      ;Get the production at token-index.
+      val tokens = tokens(grammar[rule(range)])
+      val prod = tokens[token-index] as GProduction
+
+      ;Returns true if the current token can be parsed between
+      ;the given start and token-end.
+      defn feasible-start? (candidate-start:Int) -> True|False :
+        if candidate-start >= start(range) :
+          val prod = ParsedProd(id(prod), candidate-start, token-end)
+          not empty?(get-prod-rules(prod))
+      
+      ;Retrieve candidate starts.
+      val candidate-starts =
+        if first-production?(rule(range), token-index) :
+          val num-leading-terminals = token-index
+          List(start(range) + num-leading-terminals)
+        else :
+          val prod = ProdEnd(id(prod), token-end)
+          get-prod-starts(prod)
+          
+      ;Filter out the unfeasible starts
+      filter(feasible-start?, candidate-starts)
       
     defmethod match? (this, term:GTerminal, position:Int) :
       terminal-set[ParsedTerminal(term, position)]
@@ -352,11 +422,11 @@ defn select-tree (grammar:Grammar, forest:ParseForest) -> ParseNode :
     LazyParseNode(prod, compute-node-from-prod)
 
   ;Launch!
-  select(start(forest))
-  ;val result = select(start(forest))
-  ;let force (n:ParseNode = result) :
-  ;  do(force, filter-by<ParseNode>(children(n)))
-  ;result
+  ;select(start(forest))
+  val result = select(start(forest))
+  let force (n:ParseNode = result) :
+    do(force, filter-by<ParseNode>(children(n)))
+  result
 
 ;------------------------------------------------------------
 ;---------- Utility: Retrieve Minima of Items ---------------
