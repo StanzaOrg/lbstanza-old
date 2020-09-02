@@ -205,6 +205,24 @@ defn analyze-grammar-properties (grammar:GRules) :
     last-sets)
 
 ;============================================================
+;=================== Cache Utility ==========================
+;============================================================
+
+deftype Cache<T>
+defmulti value<?T> (cache:Cache<?T>) -> T
+defmulti invalidate (cache:Cache) -> False
+
+defn Cache<?T> (f:() -> ?T) :
+  var value:Maybe<T> = None()
+  new Cache<T> :
+    defmethod invalidate (this) :
+      value = None()
+    defmethod value (this) :
+      if empty?(value) :
+        value = One(f())
+      value!(value)
+
+;============================================================
 ;=================== Grammar Transformer ====================
 ;============================================================
 
@@ -213,6 +231,7 @@ defmulti fresh-production (t:GrammarTransformer) -> GProduction
 defmulti immediate-right-sets (t:GrammarTransformer, prod:GProduction) -> List<GToken>
 defmulti modify (t:GrammarTransformer, mod:GrammarModification) -> False
 defmulti rules (t:GrammarTransformer, prod:GProduction) -> Tuple<RuleEntry>
+defmulti num-productions (t:GrammarTransformer) -> Int
 
 defstruct RuleEntry :
   id: Int
@@ -248,6 +267,18 @@ defn GrammarTransformer (grammar:GRules) -> GrammarTransformer :
     for r in rules(grammar) seq :
       RuleEntry(next(rule-counter), r as GTokenRule)
 
+  ;Compute immediate right sets
+  val immediate-right-sets = Cache(compute-immediate-right-sets) where :
+    defn compute-immediate-right-sets () -> ProductionTable<List<GToken>> :
+      val table = ProductionTable<List<GToken>>(peek(prod-counter), List())
+      for entry in rule-list do :
+        val rule = rule(entry)
+        if not empty?(tokens(rule)) :
+          val n = length(tokens(rule))
+          val tn = tokens(rule)[n - 1]
+          add(table, id(rule), tn)
+      table
+      
   ;Create GrammarTransformer feature.
   new GrammarTransformer :
     defmethod rules (this, prod:GProduction) :
@@ -256,6 +287,8 @@ defn GrammarTransformer (grammar:GRules) -> GrammarTransformer :
     defmethod fresh-production (this) :
       GProduction(next(prod-counter))
     defmethod modify (this, gmod:GrammarModification) :
+      ;Invalidate cache
+      invalidate(immediate-right-sets)
       ;Perform production cloning, and additions.
       ;Gather deletions and substitutions.
       val delete-set = IntSet()
@@ -280,6 +313,10 @@ defn GrammarTransformer (grammar:GRules) -> GrammarTransformer :
           One(RuleEntry(id(rule), sub-table[id(rule)]))
         else :
           One(rule)
+    defmethod immediate-right-sets (this, prod:GProduction) :
+      value(immediate-right-sets)[id(prod)]
+    defmethod num-productions (this) :
+      peek(prod-counter)
 
 ;<doc>=======================================================
 ;=============== Left-Right-Recursive Transform =============
@@ -297,8 +334,86 @@ Operations needed for manipulating rules:
 ;============================================================
 ;=======================================================<doc>
 
+defn remove-left-right-recursion (gt:GrammarTransformer,
+                                  props:GrammarProperties,
+                                  prod:GProduction) :
+  ;Collect all modifications
+  val mods = Vector<GrammarMod>()
+  defn modify (m:GrammarMod) : add(mods, m)
+
+  ;Create atom production
+  val atom = fresh-production(gt)
+  modify $ CloneProduction(atom, prod)
+
+  ;Substitute entry in tuple
+  defn sub-item<?T> (xs:Tuple<?T>, index:Int, item:T) :
+    to-tuple $ for (x in xs, i in 0 to false) seq :
+      if i == index : item
+      else : x
+
+  ;Keep track of what has been replaced.
+  ;Each entry prod => prod* means that
+  ;  prod* is the version of prod where prod has been replaced with atom.
+  val left-replacement-table = ProductionTable<GProduction|False>(num-productions(gt), false)
+
+  ;Operation: Replace left occurrence of prod with atom in the given rule.
+  ;Returns false if rule is unchanged from before.
+  defn replace-left-occurrence (rule:GTokenRule) -> GTokenRule|False :
+    val t0 =
+      if tokens(rule)[0] == prod :
+        atom
+      else if tokens(rule)[0] is GProduction :
+        replaced-left-occurrence(tokens(rule)[0] as GProduction)
+    match(t0:GProduction) :
+      val tokens* = sub-item(tokens(rule), 0, t0)
+      sub-tokens(rule, tokens*)
+      
+  ;Operation: Perform modifications to grammar to replace
+  ;left occurrences of prod with atom in all rules for the given
+  ;production.
+  defn replace-left-occurrence! (prod:GProduction) -> False :
+    for entry in rules(gt, prod) do :
+      val rule* = replace-left-occurrence(rule(entry))
+      match(rule*:GTokenRule) :
+        modify $ SubstituteRule(id(entry), rule*)
+        
+  ;Operation: Return the version of prod where prod has been replaced with atom.
+  ;Returns false if production is unchanged.
+  defn replaced-left-occurrence (p:GProduction) -> GProduction|False :
+    val left-set = left-sets(props)[id(p)]
+    if contains?(left-set, prod) :
+      if not key?(left-replacement-table, id(p)) :
+        val p* = fresh-production(gt)
+        modify $ CloneProduction(p*, p)
+        for entry in rules(gt, p) do :
+          val rule* = sub-id(rule(entry), id(p*)) as GTokenRule
+          modify $ AddRule(rule*)
+        left-replacement-table[id(p)] = p*
+      left-replacement-table[id(p)] as GProduction  
+
+  fatal("Remove from transformer")
 
 defn remove-left-right-recursion (grammar:GRules) :;-> GRules :
+  ;Get properties
+  val props = analyze-grammar-properties(grammar)
+
+  ;Discover all left-right-recursive-rules
+  defn left-recursive? (prod:GProduction) -> True|False :
+    contains?(left-sets(props)[id(prod)], prod)
+  defn right-recursive? (prod:GProduction) -> True|False :
+    contains?(right-sets(props)[id(prod)], prod)
+  defn left-right-recursive? (prod:GProduction) -> True|False :
+    left-recursive?(prod) and right-recursive?(prod)
+  defn left-right-recursive-prods () -> Tuple<GProduction> :
+    val prods = seq(GProduction{id(_)}, productions(grammar))
+    to-tuple(filter(left-right-recursive?, prods))
+
+  println("Left Right Recursive Prods: %," % [left-right-recursive-prods()])
+  val lr-prod = left-right-recursive-prods()[0]
+  val gt = GrammarTransformer(grammar)
+  remove-left-right-recursion(gt, props, lr-prod)
+
+  ;<comment>
   ;Get properties
   val props = analyze-grammar-properties(grammar)
 
@@ -499,6 +614,9 @@ defn remove-left-right-recursion (grammar:GRules) :;-> GRules :
   do(println, values(prod-table))
   ;New Rule List
   do(println, rule-list)
+  ;<comment>
+
+  fatal("Not yet implemented")
   
 
 ;============================================================
