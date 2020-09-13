@@ -1,6 +1,7 @@
 defpackage stz/earley-parse-tree :
   import core
   import collections
+  import stz/utils
   import stz/earley-eitems
   import stz/earley-grammar
   import stz/earley-sexp-stream
@@ -119,6 +120,7 @@ defmulti prod-starts (t:ParseTables) -> HashTable<ProdEnd,List<Int>>
 defmulti terminal-set (t:ParseTables) -> HashSet<ParsedTerminal>
 defmulti prod-rules (t:ParseTables) -> HashTable<ParsedProd,List<Int>>
 defmulti right-recursive-items (t:ParseTables) -> ESetList
+defmulti right-recursive-prod-sets (t:ParseTables) -> HashSet<[Int,Int]>
 
 public defn ParseTables (grammar:Grammar) :  
   ;For all parsed productions record their ending position.
@@ -140,8 +142,15 @@ public defn ParseTables (grammar:Grammar) :
   ;Hold right-recursive item
   val right-recursive-items = ESetList(grammar)
 
+  ;Holds the set of productions that lead to the given root
+  ;through right-recursive completions.
+  val right-recursive-prod-sets = HashSet<[Int,Int]>()
+
+  val table-timer = MillisecondTimer("Make table")
+
   ;Add the given completed ESet to the parse tables.
   defn add-to-parse-tables (set-index:Int, eset:ESet) -> False :
+    start(table-timer)
     ;Scan through items in list to build production rules.
     for item in eset do :
       ;Add completed productions to production tables.
@@ -150,9 +159,16 @@ public defn ParseTables (grammar:Grammar) :
         val prod = production(grammar,item)
         val start = parent(item)
         val end = set-index
-        update(prod-ends, cons{end, _}, ProdStart(prod,start))
+        update(prod-ends, cons?{end, _}, ProdStart(prod,start))
         update(prod-starts, cons{start, _}, ProdEnd(prod,end))
         update(prod-rules, cons{rule, _}, ParsedProd(prod,start,end))
+
+      ;Add to right-recursive-prod-sets
+      if upcoming(grammar,item) is-not False and
+         completion-root(item) is-not False :
+        val root = completion-root(item) as EItem
+        val prod = production(grammar,item)
+        add(right-recursive-prod-sets, [rule(root), prod])
         
       ;Add scanned terminals to terminal-set,
       ;if they should be saved.
@@ -167,15 +183,27 @@ public defn ParseTables (grammar:Grammar) :
     defn right-recursive? (item:EItem) : completion-root(item) is-not False
     add(right-recursive-items, filter(right-recursive?, eset))
 
+    stop(table-timer)
+
+  ;Sort the production starts table
+  defn sort-starts-table () :
+    val buffer = Vector<Int>()
+    for entry in prod-starts map! :      
+      sort-and-dedup(value(entry), buffer)
+
   ;Return ParseTables
   new ParseTables :
     defmethod completed-set (this, set-index:Int, eset:ESet) :
       add-to-parse-tables(set-index, eset)
+    defmethod completed-all-sets (this) :
+      sort-starts-table()
+      println(table-timer)
     defmethod prod-ends (this) : prod-ends
     defmethod prod-starts (this) : prod-starts
     defmethod terminal-set (this) : terminal-set
     defmethod prod-rules (this) : prod-rules
-    defmethod right-recursive-items (this) : right-recursive-items    
+    defmethod right-recursive-items (this) : right-recursive-items
+    defmethod right-recursive-prod-sets (this) : right-recursive-prod-sets
     defmethod print (o:OutputStream, this) :
       val o2 = IndentedStream(o)
       print(o, "Prod Ends:")
@@ -184,12 +212,31 @@ public defn ParseTables (grammar:Grammar) :
       do(lnprint{o2, _}, prod-starts)
       lnprint(o, "Prod Rules:")
       do(lnprint{o2, _}, prod-rules)
+      lnprint(o, "Right Recursive Production Sets:")
+      do(lnprint{o2, _}, right-recursive-prod-sets)
 
 ;Returns true if the given terminal is of a type where we should
 ;not recalculate whether it matches a given input. If it returns
 ;false, then it is safe to recalculate. 
 defn save-terminal-match? (t:GTerminal) -> True|False :
   t is GMatcherToken|GAny|GListStart|GListRest
+
+;Helper: Call cons(a,bs) if a does not already
+;appear at the head of bs.
+defn cons? (a:Int, bs:List<Int>) -> List<Int> :
+  if empty?(bs) : List(a)
+  else if head(bs) == a : bs
+  else : cons(a, bs)
+
+;Sort and deduplicate the given list 'xs' using the buffer
+;'buffer'.
+defn sort-and-dedup (xs:List<Int>, buffer:Vector<Int>) -> List<Int> :
+  add-all(buffer, xs)
+  qsort!(buffer)
+  remove-duplicates!(buffer)
+  val result = to-list(buffer)
+  clear(buffer)
+  result  
 
 ;============================================================
 ;=================== New Parse Forest =======================
@@ -235,30 +282,28 @@ defmulti start (f:ParseForest) -> ParsedRange
 ;Construct a parse forest from an Earley setlist.
 defn ParseForest (grammar:Grammar, tables:ParseTables, inputlist:Vector<SExpToken>) -> ParseForest :
   ;Ensure that the list of starts for given production end is sorted.
+  val sort-buffer = Vector<Int>()
   defn ensure-starts-sorted (end:ProdEnd) :
     val starts = prod-starts(tables)
-    update(starts, to-list{lazy-qsort(_)}, end)
-
-  ;Sort all production ends
-  for end in to-tuple(keys(prod-starts(tables))) do :
-    ensure-starts-sorted(end)
+    update(starts, sort-and-dedup{_, sort-buffer}, end)
 
   ;If not already computed, process each item
   ;in the given set, and add its entries to the
   ;prod-rules table.
-  val added-right-recursive-completions = IntSet()
+  val added-right-recursive-completions = HashSet<EItemCore>()
   val updated-prods = IntSet()
-  defn add-right-recursive-completions (set-index:Int) :
-    if add(added-right-recursive-completions, set-index) :      
-      clear(updated-prods)
-      val rr-items = right-recursive-items(tables)
-      val eset = rr-items[set-index]
-      for item in items(rr-items, eset) do :
-        if upcoming(grammar,item) is False :
+  defn add-right-recursive-completions (set-index:Int, r-prod:Int) :
+    clear(updated-prods)
+    val rr-items = right-recursive-items(tables)
+    val rr-prod-set = right-recursive-prod-sets(tables)
+    val eset = rr-items[set-index]
+    for item in items(rr-items, eset) do :      
+      if upcoming(grammar,item) is False and rr-prod-set[[rule(item), r-prod]] :
+        if add(added-right-recursive-completions, core(item)) :
           within item = expand-completion-item(item) :
             add-prod-rule(item, index(eset), updated-prods)
-      for prod in updated-prods do :
-        ensure-starts-sorted(ProdEnd(prod, index(eset)))
+    for prod in updated-prods do :
+      ensure-starts-sorted(ProdEnd(prod, index(eset)))
 
   ;Add the given completion (in set 'end') to the
   ;prod-rules table.
@@ -275,13 +320,13 @@ defn ParseForest (grammar:Grammar, tables:ParseTables, inputlist:Vector<SExpToke
   ;Retrieve the rules that can successfully parse
   ;the given production between tokens start and end.
   defn get-prod-rules (prod:ParsedProd) -> List<Int> :
-    add-right-recursive-completions(end(prod))
+    add-right-recursive-completions(end(prod), /prod(prod))
     prod-rules(tables)[prod]
 
   ;Retrieve the rules that can successfully parse
   ;the given production between tokens start and end.
   defn get-prod-starts (prod:ProdEnd) -> List<Int> :
-    add-right-recursive-completions(end(prod))
+    add-right-recursive-completions(end(prod), /prod(prod))
     prod-starts(tables)[prod]
 
   ;Given the completed item with completion root,
@@ -414,7 +459,11 @@ defn LazyParseNode (prod:Int, range:ParsedRange, compute:ParsedRange -> ParseNod
 ;------------------------------------------------------------
 ;-------------------- Select Tree ---------------------------
 ;------------------------------------------------------------
-defn select-tree (grammar:Grammar, forest:ParseForest) -> ParseNode :
+defn select-tree (grammar:Grammar, forest:ParseForest) -> ParseNode :  
+  ;Memoization table
+  val computed-nodes = HashTable<ParsedProd|ParsedRange,ParseNode>()
+  val computed-set = HashSet<ParsedProd|ParsedRange>()
+  
   ;Compute node from ParsedProd
   defn compute-node-from-prod (prod:ParsedProd) -> ParseNode :
     val ranges = forest[prod]
@@ -522,7 +571,10 @@ defn select-tree (grammar:Grammar, forest:ParseForest) -> ParseNode :
     LazyParseNode(prod, compute-node-from-prod)
 
   ;Launch!
-  select(start(forest))
+  val result = select(start(forest))
+  let force (n:ParseNode = result) :
+    do(force, filter-by<ParseNode>(children(n)))
+  result
 
 ;------------------------------------------------------------
 ;---------- Utility: Retrieve Minima of Items ---------------
