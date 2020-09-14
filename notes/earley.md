@@ -600,3 +600,67 @@ Concept of Keyword Group: It is common for a given language extension to define 
 - to add this group of keywords, en-masse, to another set of keywords, and
 - to remove this group of keywords, from the allowed symbols that make up an identifier. 
 
+# Adding Support for Factored Productions #
+
+Consider the following rule definitions:
+
+  E = A B
+    | A C
+    | A D
+
+The key proposal is to add the mechanism required to be able to transform the above into this:
+
+  E = A X
+  X = B
+    | C
+    | D
+    
+This leads to drastically reduced earley sets for grammars containing many operators.
+
+The transformation to the grammar is, itself, quite straightforward. The difficulty is in consistently treating priority, associativity, and evaluation.
+
+## Parse Node Selection ##
+
+In full generality, the metrics we use to compare ParseNodes are:
+- length
+- priority
+- associativity
+- associativity-length
+- order
+
+The parse node selection can be thought of as being split into two stages:
+
+Stage 1: Given E [0 to 100], what rule do we use to parse E? Since length is known, this decision will be made on the metrics:
+  - priority
+  - associativity
+  - associativity-length
+  - order
+  
+Stage 2: Given E [0 to 100] = E + E, what are the lengths of the subproductions? This is decided based upon the associativity of the rule. If left-associative or non-associative, then we want to greedily choose the longest productions from left-to-right. If right-associative, then we want to greedily choose the longest productions from right-to-left. 
+
+Look at stage 1 first, for factored nodes:
+- To compare priority, we can find the set of priorities obtained by the factored production, and use the maximum.
+
+
+Step 1: Consider a rule, S [0 to 100] = A B C D E, left-associative with no factoring. Now we want to traverse left-to-right and determine lengths of subproductions. This can be done without considering whether they are factored or not, since the longer the better.
+
+Step 2: For each of the subproductions, we now know their lengths, but we don't know which rule to use. And these subproductions may be factored.
+
+Given A is from [0 to 50], and there exists one rule like this:
+  Case: A [0 to 50] = X Y (factored on X)
+  Case: A [0 to 50] = X Y (factored on Y)
+
+  Desire: Find the X with the maximum priority such that A parses. Thus, list X's ends/starts sorted by priority, then associativity. 
+  
+  
+Currently: Given E [0 to 100], I can calculate the right rule to use given only the list of rules. Priority and Associativity are easy. Associativity-Length requires computing lengths of the subrules.
+
+Next: Suppose E is left-factored. Thus we don't know the end. We can ask the left-factored production to try giving us candidate ends (sorted by priority). 
+
+Let's first tackle priority:
+  - We can get the highest priority parse node, this is possible.
+  - We can get the highest priority and associativity parse node. 
+  - If associativity is Non-Associative, we can get the order as well.
+  - Associativity-Length is harder. 
+
+Suppose we finally know the associativity. Then we would know what direction to parse these nodes in. Now, we have no choice. We have to determine the nodes up to length at least. And then we can select from them.
