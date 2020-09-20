@@ -49,6 +49,16 @@ with:
 defmethod parts (t:ParsedProd) :
   [`ParsedProd, prod(t), start(t), end(t)]
 
+defstruct ParsedRule <: HasParts :
+  rule: Int
+  start: Int
+  end: Int
+with:
+  printer => true
+
+defmethod parts (t:ParsedRule) :
+  [`ParsedRule, rule(t), start(t), end(t)]
+
 ;============================================================
 ;===================== Utilities ============================
 ;============================================================
@@ -140,6 +150,7 @@ defmulti prod-rules (t:ParseTables) -> HashTable<ParsedProd,List<GTokenRule>>
 defmulti right-recursive-items (t:ParseTables) -> ESetList
 defmulti right-recursive-prod-sets (t:ParseTables) -> HashSet<[Int,Int]>
 defmulti factor-starts (t:ParseTables) -> HashTable<RuleStart,List<Int>>
+defmulti chain-completions (t:ParseTables) -> HashTable<ParsedRule,ChainCompletion>
 
 public defn ParseTables (grammar:Grammar) :  
   ;For all parsed productions record their ending position.
@@ -148,6 +159,8 @@ public defn ParseTables (grammar:Grammar) :
 
   ;[TODO]
   val rule-ends = HashTable<RuleStart, Array<List<Int>>>()
+
+  val chain-completions = HashTable<ParsedRule, ChainCompletion>()
 
   ;For all parsed productions record their starting position.
   ;Computed lazily by compute-prod-rules.
@@ -189,10 +202,17 @@ public defn ParseTables (grammar:Grammar) :
         update(prod-starts, cons{start, _}, ProdEnd(prod,end))
         update(prod-rules, cons{rule(item), _}, ParsedProd(prod,start,end))
 
+      if completion-root(item) is ChainCompletion :
+        val c = completion-root(item) as ChainCompletion
+        val rule = ParsedRule(rule-id(item), parent(item), set-index)
+        chain-completions[rule] = c
+
       ;Add to right-recursive-prod-sets
       if upcoming(item) is-not False and
-         completion-root(item) is-not False :
-        val root = completion-root(item) as EItem
+         completion-root(item) is-not NoCompletion :
+        val root = match(completion-root(item)) :
+                     (r:ChainRoot) : item
+                     (r:ChainLink) : root(r)
         val prod = production(item)
         add(right-recursive-prod-sets, [rule-id(root), prod])
 
@@ -215,7 +235,7 @@ public defn ParseTables (grammar:Grammar) :
           add(terminal-set, parsed-terminal)
 
     ;Add right-recursive items
-    defn right-recursive? (item:EItem) : completion-root(item) is-not False
+    defn right-recursive? (item:EItem) : completion-root(item) is-not NoCompletion
     add(right-recursive-items, filter(right-recursive?, eset))
 
     stop(table-timer)
@@ -248,6 +268,7 @@ public defn ParseTables (grammar:Grammar) :
     defmethod right-recursive-items (this) : right-recursive-items
     defmethod right-recursive-prod-sets (this) : right-recursive-prod-sets
     defmethod factor-starts (this) : factor-starts
+    defmethod chain-completions (this) : chain-completions
     defmethod print (o:OutputStream, this) :
       val o2 = IndentedStream(o)
       print(o, "Prod Ends:")
@@ -346,21 +367,37 @@ defn ParseForest (grammar:Grammar, tables:ParseTables, inputlist:Vector<SExpToke
   val added-right-recursive-completions = HashSet<EItemCore>()
   val added-right-recursive-set = HashSet<[Int,Int]>()
   val updated-prods = IntSet()
-  defn add-right-recursive-completions (set-index:Int, r-prod:Int) :
-    start(stz/earley-eitems/FACTORED-TIMER)
-    if add(added-right-recursive-set, [set-index, r-prod]) :
-      clear(updated-prods)
-      val rr-items = right-recursive-items(tables)
-      val rr-prod-set = right-recursive-prod-sets(tables)
-      val eset = rr-items[set-index]
-      for item in items(rr-items, eset) do :      
-        if upcoming(item) is False and rr-prod-set[[rule-id(item), r-prod]] :
-          if add(added-right-recursive-completions, core(item)) :
-            within item = expand-completion-item(item) :
-              add-prod-rule(item, index(eset), updated-prods)
-      for prod in updated-prods do :
-        ensure-starts-sorted(ProdEnd(prod, index(eset)))
-    stop(stz/earley-eitems/FACTORED-TIMER)
+;  defn add-right-recursive-completions (set-index:Int, r-prod:Int) :
+;    start(stz/earley-eitems/FACTORED-TIMER)
+;    if add(added-right-recursive-set, [set-index, r-prod]) :
+;      clear(updated-prods)
+;      val rr-items = right-recursive-items(tables)
+;      val rr-prod-set = right-recursive-prod-sets(tables)
+;      val eset = rr-items[set-index]
+;      for item in items(rr-items, eset) do :      
+;        if upcoming(item) is False and rr-prod-set[[rule-id(item), r-prod]] :
+;          if add(added-right-recursive-completions, core(item)) :
+;            within item = expand-completion-item(item) :
+;              add-prod-rule(item, index(eset), updated-prods)
+;      for prod in updated-prods do :
+;        ensure-starts-sorted(ProdEnd(prod, index(eset)))
+;    stop(stz/earley-eitems/FACTORED-TIMER)
+
+  defn expand-right-recursive-children (rule:ParsedRule) :
+    val completions = chain-completions(tables)
+    match(get?(completions, rule)) :
+      (c:ChainCompletion) :
+        println("EXPANDING RIGHT RECURSIVE ITEMS: %_" % [rule])
+        within item = expand-completion-item(c) :
+          val prod = production(item)
+          val start = parent(item)
+          val end = end(rule)
+          val parsed-prod = ParsedProd(prod, start, end)
+          update(prod-rules(tables), cons{/rule(item), _}, parsed-prod)
+          println("Production %_ parses with %_" % [parsed-prod, rule-id(item)])
+        remove(completions, rule)
+      (f:False) :
+        false    
 
   ;Add the given completion (in set 'end') to the
   ;prod-rules table.
@@ -376,25 +413,27 @@ defn ParseForest (grammar:Grammar, tables:ParseTables, inputlist:Vector<SExpToke
   ;Retrieve the rules that can successfully parse
   ;the given production between tokens start and end.
   defn get-prod-rules (prod:ParsedProd) -> List<GTokenRule> :
-    add-right-recursive-completions(end(prod), /prod(prod))
+;    add-right-recursive-completions(end(prod), /prod(prod))
     prod-rules(tables)[prod]
 
   ;Retrieve the rules that can successfully parse
   ;the given production between tokens start and end.
   defn get-prod-starts (prod:ProdEnd) -> List<Int> :
-    add-right-recursive-completions(end(prod), /prod(prod))
+;    add-right-recursive-completions(end(prod), /prod(prod))
     prod-starts(tables)[prod]
 
   ;Given the completed item with completion root,
   ;Return the entire chain of expanding the items not including the
   ;final root.
-  defn expand-completion-item (return:EItem -> ?, item:EItem) :
-    val root-core = core(item)
-    let loop (x:EItem = completion-root(item) as EItem) :
-      if core(x) != root-core :
-        return(x)
-        val x* = first-item(right-recursive-items(tables), parent(x), production(x))
-        loop(inc-num-parsed(x* as EItem, false))
+  defn expand-completion-item (return:EItem -> ?, c:ChainCompletion) :
+    defn fill-chain (item:EItem) :
+      match(completion-root(item)) :
+        (r:ChainLink) :
+          return(inc-num-parsed(item, false))
+          fill-chain(link(r))
+        (r:ChainRoot) :
+          false
+    do(fill-chain, items(c))      
 
   ;Returns true if token at given index is the last production
   ;in the given rule.
@@ -419,6 +458,8 @@ defn ParseForest (grammar:Grammar, tables:ParseTables, inputlist:Vector<SExpToke
       ParsedRange(grammar[start-rule], 0, length(inputlist))
       
     defmethod ends (this, range:ParsedRange, token-index:Int, token-start:Int) :
+      expand-right-recursive-children(ParsedRule(rule-id(range), start(range), end(range)))
+
       ;Get the production at token-index.
       val tokens = tokens(rule(range))
       val prod = tokens[token-index] as GProduction
@@ -456,6 +497,8 @@ defn ParseForest (grammar:Grammar, tables:ParseTables, inputlist:Vector<SExpToke
       filter(feasible-end?, candidate-ends)
 
     defmethod starts (this, range:ParsedRange, token-index:Int, token-end:Int) :
+      expand-right-recursive-children(ParsedRule(rule-id(range), start(range), end(range)))
+      
       ;Get the production at token-index.
       val tokens = tokens(rule(range))
       val prod = tokens[token-index] as GProduction
