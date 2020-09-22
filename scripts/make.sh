@@ -12,7 +12,7 @@ fi
 STANZA=$1
 
 #Pkg packages
-PKGFILES="math stz/test-driver"
+PKGFILES="math stz/test-driver stz/mocker"
 
 #Delete pkg files
 rm -rf pkgs
