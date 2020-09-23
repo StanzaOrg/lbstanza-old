@@ -664,3 +664,11 @@ Let's first tackle priority:
   - Associativity-Length is harder. 
 
 Suppose we finally know the associativity. Then we would know what direction to parse these nodes in. Now, we have no choice. We have to determine the nodes up to length at least. And then we can select from them.
+
+
+# TODO #
+
+- Use EItem directly in ParsedRange so that we don't need to use the RuleStart table.
+- Store completions, sorted by start position, during search so that we can use binary search to find them.
+- With a list of start positions, we can use list intersection as a general approach. Don't need feasible-end? anymore.
+
