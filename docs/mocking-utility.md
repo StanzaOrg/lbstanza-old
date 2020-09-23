@@ -181,7 +181,6 @@ Calls to `files` will use messages tagged with the symbol `files`, and calls to 
 Note that this example forwards *all* methods to the script, but this is not necessary. Sometimes, it is easier to just implement a simple version of the method directly. 
 
 ### The Script Body ###
-@[mocking recursive-list-files mock body]
 
 The script implements the bare skeleton needed to test the `recursive-list-files` algorithm.
 
