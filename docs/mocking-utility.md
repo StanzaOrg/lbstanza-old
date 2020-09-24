@@ -18,7 +18,7 @@ stanza compile-test examples/simplemock.stanza -o simplemock
 The `MockScript` utility, defined in `stz/mocker`, is a simple coroutine-based utility that allows you to write a simple "script" that anticipates calls to it, and then replies with appropriate values. 
 
 ## Calling a MockScript ##
-@[Mocking Call Script Definition]
+@[Mocking Call Script Definition]<C921150D>
 
 To start, let's delay talking about the details of how to write a mocking script, and instead presume that we are given an already-created `MockScript` object.
 
@@ -39,7 +39,7 @@ The first element in the tuple must be a symbol, and is what we call the "messag
 The `call` function returns the value calculated by the mocking script in reply to the given message, whatever it turns out to be.
 
 ## Creating a MockScript ##
-@[Mocking Constructor Definition]
+@[Mocking Constructor Definition]<3F01E046>
 
 The constructor function for a `MockScript` has the following signature
 ```
@@ -83,7 +83,7 @@ reply(caller, 33)
 ```
 
 ## Other Forms of `Expect` ##
-@[Mocking Expect Definition]
+@[Mocking Expect Definition]<EAD168D7>
 
 We previously showed you only one form of the `expect` function. Here is the full list:
 
@@ -141,7 +141,7 @@ defmulti directory? (dir:InstallDir, file:String) -> True|False
 ```
 
 ## A Mock `InstallDir` Object ##
-@[mocking mock InstallDir implementation]
+@[mocking mock InstallDir implementation]<61500E89>
 
 The example uses the function
 ```
@@ -218,7 +218,7 @@ reply(caller, false)
 ```
 
 ### The Test ###
-@[mocking recursive-list-files test]
+@[mocking recursive-list-files test]<1269DC65>
 
 The final test is simple.
 
