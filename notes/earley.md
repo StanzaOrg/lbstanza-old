@@ -1,5 +1,162 @@
 # Earley Parser #
 
+# Search Procedure #
+
+Implemented in `stz/earley-search`.
+
+## Overall Search Algorithm ##
+
+### SearchResult ###
+
+
+
+## Reluctance Matching System ##
+
+The reluctant matching system is used to prevent input s-expressions from being expanded when unnecessary, and to allow Rest matching to work.
+
+The reluctance matching system concerns the following terminals:
+- Standard GListStart
+- Reluctant GListStart
+- Atomic GAny
+- Standard GAny
+- Reluctant GAny
+- GListRest
+
+### Classification of Terminals ###
+
+@[earley reluctant terminal definition]
+Returns true if the given terminal is a reluctant terminal.
+```
+defn reluctant-terminal? (t:GTerminal) -> True|False
+```
+
+The following terminals are classified as reluctant.
+- Reluctant GListStart
+- Reluctant GAny
+- GListRest
+
+@[earley non-reluctant terminal definition]
+Returns true if the given token (or false) is a non-reluctant terminal.
+```
+defn non-reluctant-terminal? (t:GToken|False) -> True|False :
+```
+A token is a non-reluctant terminal if it is a terminal and it is not a reluctant terminal.
+
+### Algorithm ###
+@[earley reluctant matching algorithm]
+
+The reluctant matching system is implemented via a pruning procedure to eliminate reluctant matches from the Earley set. In general, a reluctant terminal matches only if it is forced to match (by some non-reluctant terminal).
+
+This function removes reluctant items from the eset 'eset'. It returns true if the upcoming item should be expanded if it is a list. 
+```
+defn prune-conditional-matches (eset:ESet) -> True|False
+```
+
+There are three conditions to calculate:
+- scanned-non-reluctant-list-start: true if a non-reluctant list start has been scanned.
+- scanned-atomic-any: true if an atomic any has been scanned.
+- scanned-non-reluctant: true if a non-reluctant terminal has been scanned.
+
+First we compute whether the upcoming item should be expanded. The upcoming item should be expanded if:
+1. A non-reluctant list start is forcing the list to be expanded, and
+2. No atomic any is forcing the list to be regarded atomically.
+
+From the expansion calculation, we can remove items according to their type:
+List Starts:
+  List starts should be removed if the upcoming item should not be expanded.
+Any:
+  Any is only allowed to match against an atomic form, so it should be
+  removed if the upcoming item should be expanded.
+  Additionally, if the Any is reluctant, then it should be kept only
+  if a non-reluctant terminal has been scanned. 
+List Rest:
+  A list rest should removed if any non-reluctant terminal has been scanned.
+
+## ESet ##
+Used to represent the items in the current set and the next set. Has special features for:
+- Testing whether the final parse is finished
+- Implementing the reluctant matching system
+- Implementing the error recovery system
+
+### Basic Functions ###
+@[ESet Basic Functions]
+
+Adds the item 'item' to the set 's'. 
+```
+defmulti add (s:ESet, item:EItem) -> False
+```
+
+Removes all items from the set 's' after the initial 'length' number of items in the set. It is assumed that the current length is greater or equal to 'length'. The 'length' parameter is used during error recovery to reset the state of the next set to how it was immediately after scanning. 
+```
+defmulti clear (s:ESet, length:Int) -> False
+```
+
+Returns the number of items in the set 's'. 
+```
+defmulti length (s:ESet) -> Int
+```
+
+During processing of the current Earley set, new items will be added to the set while iterating through the set. The 'do' method is written specifically to handle adding additional items during iteration.
+```
+defmethod do (f:EItem -> ?, eset:ESet) :
+```
+
+### Functions for Testing for Completion ###
+@[ESet Completion Test Functions]
+
+Returns true if the starting production (production 0) has been completed. Used to test whether the parse has completed.
+```
+defmulti start-completed? (s:ESet) -> True|False
+```
+
+### Functions for Reluctant Matching System ###
+@[ESet Reluctant Matching Functions]
+
+Returns true if the set contains a scanned atomic any terminal.
+```
+defmulti scanned-atomic-any? (s:ESet) -> True|False
+```
+
+Returns true if the set contains a scanned non-reluctant terminal.
+```
+defmulti scanned-non-reluctant? (s:ESet) -> True|False
+```
+
+Returns true if the set contains a scanned non-reluctant list start terminal.
+```
+defmulti scanned-non-reluctant-list-start? (s:ESet) -> True|False
+```
+
+Returns true if the set contains a scanned rest terminal.
+```
+defmulti scanned-rest? (s:ESet) -> True|False
+```
+
+Remove all items in the set satisfying the predicate 'f'.
+```
+defmulti remove! (f:EItem -> True|False, s:ESet) -> False
+```
+
+### Functions for Error Recovery System ###
+@[ESet Error Recovery System]
+
+Returns true if the set contains any items expecting a terminal that can match against a wildcard token.
+```
+defmulti wildcard-expected? (s:ESet) -> True|False
+```
+
+Returns true if the set contains any items expecting a list token.
+```
+defmulti list-expected? (s:ESet) -> True|False
+```
+
+Returns true if the set contains any items expecting a list end token.
+```
+defmulti list-end-expected? (s:ESet) -> True|False
+```
+
+============================================================
+
 ## SExpTokens ##
 
 ### Standard SExp Forms ###
@@ -175,58 +332,6 @@ terminals, if their contents are appropriate.
 ### SExpListEnd ###
 The SExpListEnd token matches only against `GListEnd`. 
 
-## Reluctant Matching ##
-
-The reluctant matching system is used to prevent input s-expressions from being expanded when unnecessary, and to allow list rest matching to work.
-
-### Special Terminals ###
-
-The reluctance matching system concerns the following terminals:
-- Standard GListStart
-- Reluctant GListStart
-- Atomic GAny
-- Standard GAny
-- Reluctant GAny
-- GListRest
-
-### Reluctant Terminals ###
-
-The following terminals are classified as reluctant, all others are non-reluctant terminals:
-- Reluctant GListStart
-- Reluctant GAny
-- GListRest
-
-We say that a "non-reluctant terminal has been scanned", if a terminal has been scanned, and that terminal is not classified as reluctant.
-
-### Algorithm ###
-
-The reluctant matching system is implemented via a pruning procedure to eliminate reluctant matches from the Earley set. 
-
-This function removes items from the next set to satisfy the reluctant matching rules. It returns true if the matches require the input stream to expand the upcoming list.
-
-```
-Function `prune-reluctant-matches`
-Input:
-  eset:ESet
-Output:
-  expand?:True|False
-```
-
-There are three initial conditions to calculate:
-- scanned-non-reluctant: true if a non-reluctant terminal has been scanned.
-- scanned-standard-list-start: true if a Standard GListStart has been scanned.
-- scanned-atomic-any: true if an Atomic GAny has been scanned.
-
-From these initial conditions, we can compute whether or not we should expand the upcoming list.
-- expand: true if scanned-standard-list-start and not scanned-atomic-any
-
-Now, iterate and test each item in the Earley set. For each
-- Standard GListStart: Keep if expand.
-- Reluctant GListStart: Keep if expand.
-- Standard GAny: Keep if not expand.
-- Reluctant GAny: Keep if not expand and scanned-non-reluctant.
-- GListRest: Keep if not scanned-non-reluctant.
-- otherwise: Keep.
 
 ## Explanation of Parsing Tables ##
 
