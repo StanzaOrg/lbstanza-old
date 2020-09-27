@@ -668,7 +668,14 @@ Suppose we finally know the associativity. Then we would know what direction to 
 
 # TODO #
 
-- Use EItem directly in ParsedRange so that we don't need to use the RuleStart table.
-- Store completions, sorted by start position, during search so that we can use binary search to find them.
-- With a list of start positions, we can use list intersection as a general approach. Don't need feasible-end? anymore.
+- Documentation and Cleanup
+- Checks for Infinite Recursion
+- More robust transformations for left-right-ambiguity elimination
+- Grammar analysis for keyword productions (and negated productions)
+- Prevent infinite error recovery
+- Improve auto-generated error messages during error message generation
+- Custom error messages
+- Language transformation and Features
+
+
 
