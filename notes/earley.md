@@ -348,6 +348,24 @@ defn process-set (set-index:Int,
   only rules with matching first-sets.
 - error-recovery? is true if process-set is being ran after performing error recovery,
   and thus any scanned items should be tagged as containing errors.
+  
+For each item in the current set, we look at its upcoming token. There are three cases:
+Case: A terminal is upcoming
+Case: A production is upcoming
+Case: A rule is (non-null) completed.
+
+#### Case: A terminal is upcoming ####
+Test whether the given terminal matches against the given input. If it does, then advance the item, and add it to the next set if it hasn't been added already.
+
+#### Case: A production is upcoming ####
+First check whether we should perform a null-advance. If the production is nullable, then advance the item, and add it to the current set.
+
+Then add predicted rules for the upcoming production to the current set if we have not already added predicted rules for this production.
+
+####  Case: A rule is non-null completed ####
+Iterate through all the items in the parent set that have the completed production as their upcoming production. Advance these items and add them to the current set.
+
+For items with right-recursive links, we need to advance their roots instead, and also add a new chain completion to the advanced roots.
 
 ### Commiting an Earley Set ###
 @[earley search algorithm commit-set]
@@ -606,23 +624,7 @@ Uses:
   completion-set: CompletionSet
 ```
 
-For each item in the current set, we look at its upcoming token. There are three cases:
-Case: A terminal is upcoming
-Case: A production is upcoming
-Case: End of rule
 
-#### Case: A terminal is upcoming ####
-Test whether the given terminal matches against the given input. If it does, then advance the item, and add it to the next set.
-
-#### Case: A production is upcoming ####
-First check whether the production is nullable. If so, then advance the item, and use "ensure-added" to add it to the current set.
-Because a production is upcoming, we have to add all of this production's rules to the current set if we have not already done so. Tracked using `prediction-set`.
-
-####  Case: End of rule ####
-Check whether it is a trivial completion. A trivial completion is a rule that matched against a list of zero tokens.
-If it is not a trivial completion, then we need to complete the production, if it has not already been completed. Look at all the items in the parent set that had this production as the upcoming item and advance past it. The completed item is added to the current set using "ensure-added".
-
-Completing the item: If the item has a completion root (and it is not the first in the chain), then we use the advanced root as the completed item instead of the original item. The original item is stored in the completion root to indicate the originating completion. The objective is to create a "completed right-recursive item".
 
 #### Utilities ####
 ensure-added: This adds the given item to the current set if it has not already been added. Tracked using `completion-set`.
