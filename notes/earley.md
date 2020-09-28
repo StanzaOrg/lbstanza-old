@@ -381,6 +381,24 @@ The function does the following things:
 - Records new ends to items.
 - Computes the completion roots for items.
 
+#### Recording new Ends ####
+We record new ends for all items when the dot is neither at the beginning of the item, nor at the end of the item.
+
+The ends are relative to the starting position of the item. 
+
+#### Computing the Completion Root ####
+
+Compute the completion-root for each deterministic-reduction in the set.
+
+A deterministic reduction looks like this:
+```
+(rule 0) [Start = X X X • AS, S0]
+```
+It has one remaining production to parse, and this item is the only item with that upcoming production.
+
+The completion of a deterministic reduction is calculated like so:
+First search for a completion-root in the parent. Let `pitem` be the first item for production `Start` started at position 0. If `pitem` has a completion-root, then this item is a right-recursive link, and `pitem` gives us the completion root for the item. If no completion-root is found in the parent, then this item is a right-recursive root.
+
 ### Main Algorithm ###
 @[earley search algorithm process-all-sets]
 
@@ -607,28 +625,7 @@ The SExpListEnd token matches only against `GListEnd`.
 
 ## Explanation of Parsing Tables ##
 
-### Computing the Completion Root ###
 
-```
-Function `compute-completion-root`
-Input:
-  set-index: Int
-  current-set: ESet
-Uses:
-   production-count: ProductionTable<Int>
-```
-
-Compute the completion-root for each deterministic-reduction in the set.
-
-A deterministic reduction looks like this:
-```
-(rule 0) [Start = X X X • AS, S0]
-```
-It has one remaining production to parse, and this item is the only item with that upcoming production.
-
-The completion of a deterministic reduction is calculated like so:
-First search for a completion-root in the parent. Let `pitem` be the first item for production `Start` started at position 0. If `pitem` has a completion-root, then this is the completion root for the item.
-If no completion-root is found in the parent, then the item is its own completion-root.
 
 ### Main Algorithm ###
 
