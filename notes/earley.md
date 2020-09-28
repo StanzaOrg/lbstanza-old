@@ -4,11 +4,32 @@
 
 Implemented in `stz/earley-search`.
 
-## Overall Search Algorithm ##
+## Search Result ##
 
-### SearchResult ###
+The result of an Earley search is represented using SearchResult, of which there are two subtypes.
+
+If the search succeeds, then the algorithm returns a SearchSuccess object.
+```
+defstruct SearchSuccess <: SearchResult :
+  items: ECompletionList
+  terminal-set: TerminalSet
+  inputlist: Vector<SExpToken>
+  infolist: Vector<FileInfo|False>
+```
+- items stores the completed EItem objects.
+- terminal-set stores the terminals that match at each position in the input stream.
+- inputlist stores the final list of tokens in the input stream.
+- infolist stores the computed file information in the input stream.
+
+If the search fails, then the algorithm returns a SearchFailure object.
+```
+defstruct SearchFailure <: SearchResult :
+  missing: Tuple<MissingInput>
+```
+- missing stores the context for each problem in the input stream.
 
 ## TerminalSet ##
+@[earley terminal set definition]
 
 A TerminalSet represents the set of all terminals matched at each location in the input stream.
 
@@ -64,7 +85,7 @@ A token is a non-reluctant terminal if it is a terminal and it is not a reluctan
 
 The reluctant matching system is implemented via a pruning procedure to eliminate reluctant matches from the Earley set. In general, a reluctant terminal matches only if it is forced to match (by some non-reluctant terminal).
 
-This function removes reluctant items from the eset 'eset'. It returns true if the upcoming item should be expanded if it is a list. 
+This function removes reluctant items from the eset 'eset'. It returns true if the upcoming item should be expanded if it is a list.
 ```
 defn prune-conditional-matches (eset:ESet) -> True|False
 ```
@@ -85,7 +106,7 @@ Any:
   Any is only allowed to match against an atomic form, so it should be
   removed if the upcoming item should be expanded.
   Additionally, if the Any is reluctant, then it should be kept only
-  if a non-reluctant terminal has been scanned. 
+  if a non-reluctant terminal has been scanned.
 List Rest:
   A list rest should removed if any non-reluctant terminal has been scanned.
 
@@ -98,17 +119,17 @@ Used to represent the items in the current set and the next set. Has special fea
 ### Basic Functions ###
 @[ESet Basic Functions]
 
-Adds the item 'item' to the set 's'. 
+Adds the item 'item' to the set 's'.
 ```
 defmulti add (s:ESet, item:EItem) -> False
 ```
 
-Removes all items from the set 's' after the initial 'length' number of items in the set. It is assumed that the current length is greater or equal to 'length'. The 'length' parameter is used during error recovery to reset the state of the next set to how it was immediately after scanning. 
+Removes all items from the set 's' after the initial 'length' number of items in the set. It is assumed that the current length is greater or equal to 'length'. The 'length' parameter is used during error recovery to reset the state of the next set to how it was immediately after scanning.
 ```
 defmulti clear (s:ESet, length:Int) -> False
 ```
 
-Returns the number of items in the set 's'. 
+Returns the number of items in the set 's'.
 ```
 defmulti length (s:ESet) -> Int
 ```
@@ -183,14 +204,14 @@ SExpForm :
   list:List
 ```
 
-This represents a single s-expression form. For implementing matching against list rest, we also provide all subsequent forms in the `list` field. 
+This represents a single s-expression form. For implementing matching against list rest, we also provide all subsequent forms in the `list` field.
 
 ### End of List ###
 ```
 SExpListEnd
 ```
 
-This represents the end of a list in the input. 
+This represents the end of a list in the input.
 
 ### Wildcards ###
 ```
@@ -212,7 +233,7 @@ A `SExpStream` represents the input list of tokens. It is constructed from a sin
 
 ### Retrieving the Next Token ###
 
-The `peek` and `info` functions return the upcoming token and its file information. 
+The `peek` and `info` functions return the upcoming token and its file information.
 
 ```
 defmulti peek (s:SExpStream) -> SExpToken
@@ -226,19 +247,19 @@ Remember that all `SExpStream` objects end with a `SExpListEnd` followed by a `E
 
 ### Advancing the Stream ###
 
-The `advance` function steps the stream past the next upcoming token. If `expand-list?` is passed true, then the stream recursively enters the next upcoming list (if it is a list). 
+The `advance` function steps the stream past the next upcoming token. If `expand-list?` is passed true, then the stream recursively enters the next upcoming list (if it is a list).
 
 ```
 defmulti advance (s:SExpStream, expand-list?:True|False) -> False
 ```
 
-The `advance-rest` function steps past all tokens at the current list-level, ending just before `SExpListEnd`. Thus `peek` should return `SExpListEnd` after calling `advance-rest`. 
+The `advance-rest` function steps past all tokens at the current list-level, ending just before `SExpListEnd`. Thus `peek` should return `SExpListEnd` after calling `advance-rest`.
 
 ```
 defmulti advance-rest (s:SExpStream) -> False
 ```
 
-It is an error to advance the stream when the upcoming token is `EndOfInput`. 
+It is an error to advance the stream when the upcoming token is `EndOfInput`.
 
 ### Error Recovery Using Wildcards ###
 
@@ -254,7 +275,7 @@ The stream allows us to also insert an empty list to the beginning of the stream
 defmulti insert-list (s:SExpStream) -> False
 ```
 
-It is an error to insert any tokens into the stream if the upcoming token in `EndOfInput`. 
+It is an error to insert any tokens into the stream if the upcoming token in `EndOfInput`.
 
 ## Types of Terminals ##
 
@@ -280,7 +301,7 @@ GTrueToken
 GFalseToken
 ```
 
-These terminals match against upcoming primitives with the appropriate type. 
+These terminals match against upcoming primitives with the appropriate type.
 
 ### List Start Terminal ###
 ```
@@ -288,7 +309,7 @@ GListStart :
   reluctant?: True|False
 ```
 
-A `GListStart` matches against an upcoming list. If the `GListStart` is non-reluctant then upcoming lists are forced to be expanded. 
+A `GListStart` matches against an upcoming list. If the `GListStart` is non-reluctant then upcoming lists are forced to be expanded.
 
 If the `GListStart` is reluctant, then it matches against an upcoming list only if the input stream does not match against a non-reluctant terminal.
 
@@ -316,7 +337,7 @@ A standard `GAny` matches against any form.
 
 A reluctant `GAny` matches against any form if a reluctant match is allowed.
 
-An atomic `GAny` matches against any form, but if matched, then the input stream is not allowed to expand and parse within the next upcoming s-expression (in the case where the upcoming s-expression is a list). 
+An atomic `GAny` matches against any form, but if matched, then the input stream is not allowed to expand and parse within the next upcoming s-expression (in the case where the upcoming s-expression is a list).
 
 ## Matching Algorithm ##
 
@@ -330,7 +351,7 @@ Output:
   result:True|False
 ```
 
-It is assumed that the input is never `EndOfInput`. 
+It is assumed that the input is never `EndOfInput`.
 
 ### Wildcards ###
 The wildcard token matches against all terminals except for `GListStart` and `GListEnd`.
@@ -347,7 +368,7 @@ The SExpForm token matches against all
 terminals, if their contents are appropriate.
 
 ### SExpListEnd ###
-The SExpListEnd token matches only against `GListEnd`. 
+The SExpListEnd token matches only against `GListEnd`.
 
 
 ## Explanation of Parsing Tables ##
@@ -418,14 +439,14 @@ This says that, at position 20, rule 0 has been completed as the result of the c
 
 ## Backward Parse ##
 
-After completing the forward parse, we need to run the Earley parser again upon the reversed input. 
+After completing the forward parse, we need to run the Earley parser again upon the reversed input.
 
 The terminals that need special attention are:
 - reluctant list start
 - list rest
 - reluctant any
 
-The reverse parse is straightforward, except that we replace these special terminals with a marker that records what position they matched upon in the forward parse. 
+The reverse parse is straightforward, except that we replace these special terminals with a marker that records what position they matched upon in the forward parse.
 
 ## SavedMatches ##
 
@@ -449,7 +470,7 @@ missing: Vector<MissingInput>
 
 ### Process Set ###
 
-This function iterates through every Earley item in `current-set`, matches them against the given input, advances them, and puts them into `next-set`. If `include-all-rules?` is true, then prediction items cause all possible rules to be considered. If `include-all-rules?` is false, then prediction items only cause rules that can match against the next input to be considered. 
+This function iterates through every Earley item in `current-set`, matches them against the given input, advances them, and puts them into `next-set`. If `include-all-rules?` is true, then prediction items cause all possible rules to be considered. If `include-all-rules?` is false, then prediction items only cause rules that can match against the next input to be considered.
 
 ```
 Function `process-set`
@@ -469,21 +490,21 @@ Case: A terminal is upcoming
 Case: A production is upcoming
 Case: End of rule
 
-#### Case: A terminal is upcoming #### 
+#### Case: A terminal is upcoming ####
 Test whether the given terminal matches against the given input. If it does, then advance the item, and add it to the next set.
 
-#### Case: A production is upcoming #### 
+#### Case: A production is upcoming ####
 First check whether the production is nullable. If so, then advance the item, and use "ensure-added" to add it to the current set.
 Because a production is upcoming, we have to add all of this production's rules to the current set if we have not already done so. Tracked using `prediction-set`.
 
-####  Case: End of rule #### 
+####  Case: End of rule ####
 Check whether it is a trivial completion. A trivial completion is a rule that matched against a list of zero tokens.
 If it is not a trivial completion, then we need to complete the production, if it has not already been completed. Look at all the items in the parent set that had this production as the upcoming item and advance past it. The completed item is added to the current set using "ensure-added".
 
 Completing the item: If the item has a completion root (and it is not the first in the chain), then we use the advanced root as the completed item instead of the original item. The original item is stored in the completion root to indicate the originating completion. The objective is to create a "completed right-recursive item".
 
 #### Utilities ####
-ensure-added: This adds the given item to the current set if it has not already been added. Tracked using `completion-set`. 
+ensure-added: This adds the given item to the current set if it has not already been added. Tracked using `completion-set`.
 
 ### Computing the Completion Root ###
 
@@ -502,11 +523,11 @@ A deterministic reduction looks like this:
 ```
 (rule 0) [Start = X X X • AS, S0]
 ```
-It has one remaining production to parse, and this item is the only item with that upcoming production. 
+It has one remaining production to parse, and this item is the only item with that upcoming production.
 
 The completion of a deterministic reduction is calculated like so:
 First search for a completion-root in the parent. Let `pitem` be the first item for production `Start` started at position 0. If `pitem` has a completion-root, then this is the completion root for the item.
-If no completion-root is found in the parent, then the item is its own completion-root. 
+If no completion-root is found in the parent, then the item is its own completion-root.
 
 ### Main Algorithm ###
 
@@ -531,7 +552,7 @@ Case C: Next set is not empty.
 This case occurs when we have finished parsing.
 
 #### Case B: Error Recovery ####
-This case occurs when the parser is stuck and is awaiting a terminal that does not match the input stream. 
+This case occurs when the parser is stuck and is awaiting a terminal that does not match the input stream.
 
 First, we want to save the context that caused this error. So compute the first list of Earley items (without using predictive look-ahead), and save this information.
 
@@ -550,11 +571,11 @@ In terms of priority, we want to take actions with the following priority:
 #### Case C: Standard Iteration ####
 This case occurs when a normal iteration is completed.
 We need to advance the input stream, and then go to the next iteration.
-To advance the input stream we either advance to the end of the list if the rest terminal was scanned, or by a single form otherwise. 
+To advance the input stream we either advance to the end of the list if the rest terminal was scanned, or by a single form otherwise.
 
 ## Creation of Parse Forest ##
 
-The input to the parse forest algorithm is the set list from the backward parse. 
+The input to the parse forest algorithm is the set list from the backward parse.
 
 The most important interface to the parse forest is the `get` function:
 ```
@@ -569,7 +590,7 @@ defstruct ParsedRange :
   end: Int
 ```
 
-The input `ParsedRange` represents a range of input tokens, between `start` (inclusive) and `end` (exclusive), that can be parsed according to the given rule. As an example, the root range for a successful parse is `ParsedRange(start-rule, 0, total-num-tokens)`, where `start-rule` is the identifier of the starting rule, and `total-num-tokens` is the total number of tokens in the input. 
+The input `ParsedRange` represents a range of input tokens, between `start` (inclusive) and `end` (exclusive), that can be parsed according to the given rule. As an example, the root range for a successful parse is `ParsedRange(start-rule, 0, total-num-tokens)`, where `start-rule` is the identifier of the starting rule, and `total-num-tokens` is the total number of tokens in the input.
 
 The `ParseForest` allows us to query the individual subtrees that make up a `ParsedRange`. Suppose the input parsed range is
 ```
@@ -578,7 +599,7 @@ The `ParseForest` allows us to query the individual subtrees that make up a `Par
 . Then the question we are interested in is:
 
 "What can the subproductions `A` (first occurrence), `A` (second occurrence), and `B` be parsed as?"
- 
+
 To answer this question for the first occurrence of `A`, we ask the parse forest:
 
 "Given `ParsedRange(4, 10, 35)`, what are the parsed ranges for token 0, starting from 10?"
@@ -588,7 +609,7 @@ And suppose that the parse forest returns two ranges:
 ParsedRange(22, 10, 15)
 ParsedRange(23, 10, 18)
 ```
-This means that tokens 10 to 15 can be parsed as the first occurrence of `A` using rule 22, and that tokens 10 to 18 can also be parsed as the first occurrence of `A` using rule 23. 
+This means that tokens 10 to 15 can be parsed as the first occurrence of `A` using rule 22, and that tokens 10 to 18 can also be parsed as the first occurrence of `A` using rule 23.
 
 Now suppose we choose, using our specificity relation, that we want the parse tree containing subtree `ParsedRange(23, 10, 18)`. From rule 4, the following tokens after `A` are the terminals `c` and `d`. Therefore, the next question to ask the parse forest is:
 
@@ -623,7 +644,7 @@ But not all of these parses will be compatible with the attempt to parse tokens 
 (rule 4) [F = A • c d A B] can be parsed from 18 to 35
 (rule 4) [F = A • c d A B] can be parsed from 15 to 35
 ```
-which says that the tokens after `A` in rule 4 can be successfully parsed using input 17 to 35, or input 15 to 35. 
+which says that the tokens after `A` in rule 4 can be successfully parsed using input 17 to 35, or input 15 to 35.
 
 Therefore, only two of the parsed ranges for `A` is compatible:
 ```
@@ -652,7 +673,7 @@ Thus the general algorithm, when answering the question:
 
 "What are all the possible parses for production `A` starting from set 13?"
 
-We need to first expand all of the items in the set corresponding to set 13. 
+We need to first expand all of the items in the set corresponding to set 13.
 
 ### Algorithmic Strategy ###
 
@@ -675,7 +696,7 @@ The goal is to compute a good error message from the list of partially completed
 
 ### Remove Items with Matched Wildcards ###
 
-For any items that have matched against wildcards, we assume that these have a high probability of being spurious parse directions. So all items with matched wildcards are removed. 
+For any items that have matched against wildcards, we assume that these have a high probability of being spurious parse directions. So all items with matched wildcards are removed.
 
 ### Assume that Productions are Complete ###
 
@@ -683,7 +704,7 @@ If possible, we choose to interpret a production as being complete. Thus, if we 
 ```
 (rule 4) [CS =  C X BS •, S15]
 ```
-we assume that the production `CS`, starting from position 15, is complete at this input. We then prune all pending parses of `CS` that started after position 15. 
+we assume that the production `CS`, starting from position 15, is complete at this input. We then prune all pending parses of `CS` that started after position 15.
 
 ### Remove Predicted Items ###
 
@@ -695,7 +716,7 @@ is a "predicted" item, and is therefore explained as the pending production for 
 ```
 (rule 8) [DS = A x B • CS X, S12]
 ```
-In these cases, it is better to explain the error as failing during a parse of `DS`, expecting a `CS`. 
+In these cases, it is better to explain the error as failing during a parse of `DS`, expecting a `CS`.
 
 Thus we prune all predicted items from parses.
 
@@ -707,7 +728,7 @@ After pruning non-descriptive items, all remaining items have the form:
 (rule 4) [CS = C • X BS, S15]
 ```
 
-where there is a clear upcoming production or terminal that does not match against the next input. Currently, an auto-generated error message is created from this item. Instead, we can provide custom control to the user to write a descriptive error message given this context. 
+where there is a clear upcoming production or terminal that does not match against the next input. Currently, an auto-generated error message is created from this item. Instead, we can provide custom control to the user to write a descriptive error message given this context.
 
 ## Keyword Sets ##
 
@@ -720,7 +741,7 @@ Concept of Identifer: An identifier is commonly defined as any symbol that is *n
 Concept of Keyword Group: It is common for a given language extension to define its own set of keywords, in its own separately named group, e.g. `jitx-keywords`. The user then needs the ability
 
 - to add this group of keywords, en-masse, to another set of keywords, and
-- to remove this group of keywords, from the allowed symbols that make up an identifier. 
+- to remove this group of keywords, from the allowed symbols that make up an identifier.
 
 # Adding Support for Factored Productions #
 
@@ -736,7 +757,7 @@ The key proposal is to add the mechanism required to be able to transform the ab
   X = B
     | C
     | D
-    
+
 This leads to drastically reduced earley sets for grammars containing many operators.
 
 The transformation to the grammar is, itself, quite straightforward. The difficulty is in consistently treating priority, associativity, and evaluation.
@@ -757,8 +778,8 @@ Stage 1: Given E [0 to 100], what rule do we use to parse E? Since length is kno
   - associativity
   - associativity-length
   - order
-  
-Stage 2: Given E [0 to 100] = E + E, what are the lengths of the subproductions? This is decided based upon the associativity of the rule. If left-associative or non-associative, then we want to greedily choose the longest productions from left-to-right. If right-associative, then we want to greedily choose the longest productions from right-to-left. 
+
+Stage 2: Given E [0 to 100] = E + E, what are the lengths of the subproductions? This is decided based upon the associativity of the rule. If left-associative or non-associative, then we want to greedily choose the longest productions from left-to-right. If right-associative, then we want to greedily choose the longest productions from right-to-left.
 
 Look at stage 1 first, for factored nodes:
 - To compare priority, we can find the set of priorities obtained by the factored production, and use the maximum.
@@ -772,18 +793,18 @@ Given A is from [0 to 50], and there exists one rule like this:
   Case: A [0 to 50] = X Y (factored on X)
   Case: A [0 to 50] = X Y (factored on Y)
 
-  Desire: Find the X with the maximum priority such that A parses. Thus, list X's ends/starts sorted by priority, then associativity. 
-  
-  
+  Desire: Find the X with the maximum priority such that A parses. Thus, list X's ends/starts sorted by priority, then associativity.
+
+
 Currently: Given E [0 to 100], I can calculate the right rule to use given only the list of rules. Priority and Associativity are easy. Associativity-Length requires computing lengths of the subrules.
 
-Next: Suppose E is left-factored. Thus we don't know the end. We can ask the left-factored production to try giving us candidate ends (sorted by priority). 
+Next: Suppose E is left-factored. Thus we don't know the end. We can ask the left-factored production to try giving us candidate ends (sorted by priority).
 
 Let's first tackle priority:
   - We can get the highest priority parse node, this is possible.
-  - We can get the highest priority and associativity parse node. 
+  - We can get the highest priority and associativity parse node.
   - If associativity is Non-Associative, we can get the order as well.
-  - Associativity-Length is harder. 
+  - Associativity-Length is harder.
 
 Suppose we finally know the associativity. Then we would know what direction to parse these nodes in. Now, we have no choice. We have to determine the nodes up to length at least. And then we can select from them.
 
@@ -798,6 +819,3 @@ Suppose we finally know the associativity. Then we would know what direction to 
 - Improve auto-generated error messages during error message generation
 - Custom error messages
 - Language transformation and Features
-
-
-
