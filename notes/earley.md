@@ -246,6 +246,7 @@ defn advance-memoized (item:EItem, error?:True|False) -> [EItem, True|False]
 The function uses 'advance-table', and hence 'advance-table' must be cleared at the start of processing each Earley set.
 
 ### Processing a Single Earley Set ###
+@[earley search algorithm process-set]
 
 Processes the current Earley set, and adds scanned item to the next Earley set.
 ```
@@ -267,6 +268,65 @@ defn process-set (set-index:Int,
 - error-recovery? is true if process-set is being ran after performing error recovery,
   and thus any scanned items should be tagged as containing errors.
 
+### Commiting an Earley Set ###
+@[earley search algorithm commit-set]
+
+Commits the set 'eset' to the algorithm state.
+```
+defn commit-set (set-index:Int, eset:ESet) -> False
+```
+The function does the following things:
+- Adds items to the setlist.
+- Adds items to the completion list.
+- Adds scanned terminals to the terminal set.
+- Records new ends to items.
+- Computes the completion roots for items.
+
+### Main Algorithm ###
+@[earley search algorithm process-all-sets]
+
+This function processes all Earley sets. After it is completed,
+any errors will be added to the missing vector.
+```
+defn process-all-sets () -> False
+```
+
+Each iteration manages
+```
+current-set:ESet
+next-set:ESet
+```
+
+We first process the `current-set` and add advanced items to `next-set`. Then we prune the reluctant matches from `next-set`.
+
+At this point, there are a few scenarios:
+```
+Case: Next set is empty.
+  Case A: The current set contains the completed start production.
+  Case B: The current set does not contain the completed start production.
+Case C: Next set is not empty.
+```
+
+#### Case A: Finished Parse ####
+This case occurs when we have finished parsing. In this case, we just commit the current set and finish the algorithm.
+
+#### Case B: Error Recovery ####
+This case occurs when the parser is stuck and is awaiting a terminal that does not match the input stream.
+
+First, we want to save the context that caused this error. So compute the full list of Earley items (without using predictive look-ahead), and save this information.
+
+There are three cases we can be in, and the error recovery action to take.
+- An item is expecting the end of a list: Drop input.
+- An item is expecting the start of a list: Insert a list.
+- An item is expecting a terminal that matches a wildcard: Insert a wildcard.
+
+In terms of priority, we want to take actions with the following priority:
+1. Drop input
+2. Insert wildcard
+3. Insert list
+
+#### Case C: Standard Iteration ####
+This case occurs when a normal iteration is completed. We need to commit the current set, advance the input stream, and then go to the next iteration. To advance the input stream we either advance to the end of the list if the rest terminal was scanned, or by a single form otherwise.
 
 ============================================================
 
@@ -606,47 +666,7 @@ If no completion-root is found in the parent, then the item is its own completio
 
 ### Main Algorithm ###
 
-Each iteration manages
-```
-current-set:ESet
-next-set:ESet
-```
 
-We first process the `current-set` and add advanced items to `next-set`. Then we prune the reluctant matches from `next-set`.
-
-At this point, there are a few scenarios:
-
-```
-Case: Next set is empty.
-  Case A: The current set contains the completed start production.
-  Case B: The current set does not contain the completed start production.
-Case C: Next set is not empty.
-```
-
-#### Case A: Finished Parse ####
-This case occurs when we have finished parsing.
-
-#### Case B: Error Recovery ####
-This case occurs when the parser is stuck and is awaiting a terminal that does not match the input stream.
-
-First, we want to save the context that caused this error. So compute the first list of Earley items (without using predictive look-ahead), and save this information.
-
-Here is the full list of terminals awaiting, and the action to take to force the parser to continue:
-- Keyword: Insert wildcard.
-- Primitive terminals: Insert wildcard.
-- List start: Insert list.
-- List end: Drop input.
-- Any: Insert wildcard.
-
-In terms of priority, we want to take actions with the following priority:
-1. Insert wildcard
-2. Insert list
-3. Drop input
-
-#### Case C: Standard Iteration ####
-This case occurs when a normal iteration is completed.
-We need to advance the input stream, and then go to the next iteration.
-To advance the input stream we either advance to the end of the list if the rest terminal was scanned, or by a single form otherwise.
 
 ## Creation of Parse Forest ##
 
