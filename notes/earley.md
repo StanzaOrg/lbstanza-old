@@ -5,6 +5,7 @@
 Implemented in `stz/earley-search`.
 
 ## Search Result ##
+@[earley search result]
 
 The result of an Earley search is represented using SearchResult, of which there are two subtypes.
 
@@ -192,6 +193,80 @@ Returns true if the set contains any items expecting a list end token.
 ```
 defmulti list-end-expected? (s:ESet) -> True|False
 ```
+
+## Main Search Algorithm ##
+@[earley main search algorithm]
+
+The main algorithm is implemented by the `process-all-sets` algorithm, which uses two main helper functions: `process-set` and `commit-set`. Helper `process-set` completes the current Earley set and adds scanned items to the next Earley set. Helper `commit-set` commits the current set to the Earley set list.
+
+### State of Algorithm ###
+@[earley search algorithm state]
+
+Holds the input tokens.
+```
+input-stream:SExpStream
+```
+
+Holds the Earley sets. Each Earley set contains only the items necessary to continue the algorithm, the items that have upcoming productions.
+```
+setlist:ESetList
+```
+
+Holds the context of all errors that occurred during parsing.
+```
+missing:Vector<MissingInput>
+```
+
+Holds the completed Earley items.
+```
+completion-list:ECompletionList
+```
+
+Holds the terminals scanned at each position.
+```
+terminal-set:TerminalSet
+```
+
+### Utility: Creating Starting EItems ###
+
+This function creates a new EItem (with num-parsed set to 0) for the given rule starting at the given location.
+```
+defn make-eitem (rule:GTokenRule, start:Int) -> EItem
+```
+
+### Utility: Memoized Advancing of an EItem ###
+
+This function advances the num-parsed attribute for the given item. If 'error?' is true, then the item will be tagged as containing an error if it hasn't been already.
+
+The function returns [new-eitem, new?], where 'new-eitem' is the advanced version of 'item', and 'new?' is true if this item did not previously exist.
+```
+defn advance-memoized (item:EItem, error?:True|False) -> [EItem, True|False]
+```
+
+The function uses 'advance-table', and hence 'advance-table' must be cleared at the start of processing each Earley set.
+
+### Processing a Single Earley Set ###
+
+Processes the current Earley set, and adds scanned item to the next Earley set.
+```
+defn process-set (set-index:Int,
+                  current-set:ESet,
+                  next-set:ESet,
+                  next-input:SExpToken,
+                  include-all-rules?:True|False,
+                  error-recovery?:True|False) -> False
+```
+
+- set-index is the index of the Earley set.
+- current-set is the current Earley set to process.
+- next-set is the next Earley set to add scanned items.
+- next-input is the upcoming input token.
+- include-all-rules? is true if prediction should include all possible rules
+  for a given production. If false, prediction should use look-ahead to include
+  only rules with matching first-sets.
+- error-recovery? is true if process-set is being ran after performing error recovery,
+  and thus any scanned items should be tagged as containing errors.
+
 
 ============================================================
 
