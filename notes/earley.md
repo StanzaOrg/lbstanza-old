@@ -8,7 +8,24 @@ Implemented in `stz/earley-search`.
 
 ### SearchResult ###
 
+## TerminalSet ##
 
+A TerminalSet represents the set of all terminals matched at each location in the input stream.
+
+This is the most important function. Returns true if the terminal 'terminal' was matched at index 'index' in the input stream.
+```
+defmulti get (s:TerminalSet, index:Int, terminal:GTerminal) -> True|False
+```
+
+This private function adds a new match to the set. It indicates that the terminal 'terminal' successfully matched at index 'index' in the input stream.
+```
+defmulti add (s:TerminalSet, index:Int, terminal:GTerminal) -> False
+```
+
+For most terminals, it is trivial to recalculate whether or not it matches the input stream. But some terminals involve executing predicates, and we do not want to execute them repeatedly. This function returns true if the terminal 't' should be saved and not recalculated. The TerminalSet only saves the matches for which this function returns true.
+```
+defn save-terminal-match? (t:GTerminal) -> True|False :
+```
 
 ## Reluctance Matching System ##
 
