@@ -199,6 +199,87 @@ defmulti list-end-expected? (s:ESet) -> True|False
 
 The main algorithm is implemented by the `process-all-sets` algorithm, which uses two main helper functions: `process-set` and `commit-set`. Helper `process-set` completes the current Earley set and adds scanned items to the next Earley set. Helper `commit-set` commits the current set to the Earley set list.
 
+### Explanation of Parsing Tables ###
+The main parsing table is the Earley set list.
+
+Here is an example of the parsing tables:
+```
+Set 0
+  (rule 100) [Start = • ( X X X AS ), S0]
+Set 1
+  (rule 100) [Start = ( • X X X AS ), S0]
+  (rule 105) [X = • x, S1]
+Set 2
+  (rule 105) [X = x •, S1]
+  (rule 100) [Start = ( X • X X AS ), S0]
+  (rule 105) [X = • x, S2]
+Set 3
+  (rule 105) [X = x •, S2]
+  (rule 100) [Start = ( X X • X AS ), S0]
+  (rule 105) [X = • x, S3]
+Set 4
+  (rule 105) [X = x •, S3]
+  (rule 100) [Start = ( X X X • AS ), S0]
+  (rule 101) [AS = • A X BS, S4]
+  (rule 106) [A = • a, S4]
+Set 5
+  (rule 106) [A = a •, S4]
+  (rule 101) [AS = A • X BS, S4]
+  (rule 105) [X = • x, S5]
+Set 6
+  (rule 105) [X = x •, S5]
+  (rule 101) [AS = A X • BS, S4] (completion root)
+  (rule 102) [BS = • B X CS, S6]
+  (rule 107) [B = • b, S6]
+...
+Set 19
+  (rule 107) [B = b •, S18]
+  (rule 102) [BS = B • X CS, S18]
+  (rule 105) [X = • x, S19]
+Set 20
+  (rule 105) [X = x •, S19]
+  (rule 102) [BS = B X • CS, S18] (completion root = (rule 101) [AS = A X • BS, S4],
+                                   link = (rule 101) [AS = A X • BS, S16])
+  (rule 103) [CS = • X, S20] (completion root = (rule 101) [AS = A X • BS, S4],
+                              link = (rule 102) [BS = B X • CS, S18])
+  (rule 105) [X = • x, S20]
+Set 21
+  (rule 105) [X = x •, S20]
+  (rule 101) [AS = A X BS •, S4] (completion starts = (rule 103) [CS = • X, S20])
+  (rule 100) [Start = ( X X X AS • ), S0]
+```
+
+There are four main types of items:
+
+### Standard Item ###
+```
+Set 15
+  (rule 7) [A = B C • D, S10]
+```
+This says the input from position 10 to position 15 can be successfully parsed as the first two tokens of rule 7 (B C), for production A.
+
+### Right-Recursive Roots ###
+```
+Set 6
+  (rule 101) [AS = A X • BS, S4] (completion root)
+```
+This says that the item is a deterministic reduction. I.e. it is the only item in the set with upcoming production BS. It is also the root of the deterministic chain in that the set at position 4 contains multiple items with upcoming production AS.
+
+### Right-Recursive Links ###
+```
+Set 8
+  (rule 102) [BS = B X • CS, S6] (completion root = (rule 101) [AS = A X • BS, S4],
+                                  link = (rule 101) [AS = A X • BS, S4])
+```
+This says that the item is a deterministic reduction. It is the only item in the set with upcoming production CS. If the item is completed, it will immediately lead to the completion of rule 101 at position 4. And when that rule is completed, it will immediately result in the completion of other items, ending ultimately with the completion of rule 101 started at position 4.
+
+### Right-Recursive Completions ###
+```
+Set 21
+  (rule 101) [AS = A X BS •, S4] (completion starts = (rule 103) [CS = • X, S20])
+```
+This says that, at position 21, rule 101 has been completed as the result of the completion of a chain of rules originating from the completion of rule 103 started at position 20.
+
 ### State of Algorithm ###
 @[earley search algorithm state]
 
@@ -507,101 +588,6 @@ The SExpListEnd token matches only against `GListEnd`.
 
 
 ## Explanation of Parsing Tables ##
-
-Here is an example of the parsing tables:
-```
-Set 0
-  (rule 0) [Start = • X X X AS, S0]
-  (rule 5) [X = • x, S0]
-Set 1
-  (rule 5) [X = x •, S0]
-  (rule 0) [Start = X • X X AS, S0]
-  (rule 5) [X = • x, S1]
-Set 2
-  (rule 5) [X = x •, S1]
-  (rule 0) [Start = X X • X AS, S0]
-  (rule 5) [X = • x, S2]
-Set 3
-  (rule 5) [X = x •, S2]
-  (rule 0) [Start = X X X • AS, S0] (complete as (rule 0) [Start = X X X • AS, S0])
-  (rule 1) [AS = • A X BS, S3]
-  (rule 6) [A = • a, S3]
-Set 4
-  (rule 6) [A = a •, S3]
-  (rule 1) [AS = A • X BS, S3]
-  (rule 5) [X = • x, S4]
-Set 5
-  (rule 5) [X = x •, S4]
-  (rule 1) [AS = A X • BS, S3] (complete as (rule 0) [Start = X X X • AS, S0])
-  (rule 2) [BS = • B X CS, S5]
-  (rule 7) [B = • b, S5]
-Set 6
-  (rule 7) [B = b •, S5]
-  (rule 2) [BS = B • X CS, S5]
-  (rule 5) [X = • x, S6]
-Set 7
-  (rule 5) [X = x •, S6]
-  (rule 2) [BS = B X • CS, S5] (complete as (rule 0) [Start = X X X • AS, S0])
-  (rule 4) [CS = • C X AS, S7]
-  (rule 8) [C = • c, S7]
-...
-```
-
-There are three main types of items:
-
-### Standard Item ###
-```
-Set 15
-  (rule 7) [A = B C • D, S10]
-```
-This says the input from position 10 to position 15 can be successfully parsed as the first two tokens of rule 7 (B C), for production A.
-
-### Right-Recursive Item ###
-```
-Set 7
-  (rule 2) [BS = B X • CS, S5] (complete as (rule 0) [Start = X X X • AS, S0])
-```
-This says the input from position 5 to position 7 can be successfully parsed as the first two tokens of rule 2 (B X) for production BS. Furthermore, when the last production for this rule (CS) is parsed, and this rule is completed, it will immediately result in the completion of a chain of other rules, ending ultimately with the completion of rule 0 started at position 0.
-
-If the completion root is equal to the item then this is the starting item of a right-recursive chain.
-
-### Completed Right-Recursive Item ###
-```
-Set 20
-  (rule 0) [Start = X X X AS •, S0] (complete as (rule 2) [BS = B X CS •, S17])
-```
-This says that, at position 20, rule 0 has been completed as the result of the completion of a chain of rules originating from the completion of rule 2 started at position 17.
-
-## Backward Parse ##
-
-After completing the forward parse, we need to run the Earley parser again upon the reversed input.
-
-The terminals that need special attention are:
-- reluctant list start
-- list rest
-- reluctant any
-
-The reverse parse is straightforward, except that we replace these special terminals with a marker that records what position they matched upon in the forward parse.
-
-## SavedMatches ##
-
-The `SavedMatches` datastructure is used to remember, for special terminals, which positions in the input stream they last matched.
-
-The `save-match?` function returns `true` if the given terminal is a "special" terminal, and we need to remember the positions that they matched against. @[SavedMatches save-match?]
-
-If a special terminal matches at a given position, we use the `save` function to record that the terminal matched at the given position. @[SavedMatches save]
-
-To query the SavedMatches datastructure we use the `matched?` function to ask whether a given terminal previously matched at a given position. @[SavedMatches matched?]
-
-## Earley Search ##
-
-### State ###
-```
-setlist: ESetList
-inputlist: Vector<SExpToken>
-infolist: Vector<FileInfo|False>
-missing: Vector<MissingInput>
-```
 
 ### Process Set ###
 
