@@ -607,28 +607,6 @@ The SExpListEnd token matches only against `GListEnd`.
 
 ## Explanation of Parsing Tables ##
 
-### Process Set ###
-
-This function iterates through every Earley item in `current-set`, matches them against the given input, advances them, and puts them into `next-set`. If `include-all-rules?` is true, then prediction items cause all possible rules to be considered. If `include-all-rules?` is false, then prediction items only cause rules that can match against the next input to be considered.
-
-```
-Function `process-set`
-Input:
-  set-index: Int
-  current-set: ESet
-  next-set: ESet
-  next-input: SExpToken
-  include-all-rules?: True|False
-Uses:
-  prediction-set: ProductionSet
-  completion-set: CompletionSet
-```
-
-
-
-#### Utilities ####
-ensure-added: This adds the given item to the current set if it has not already been added. Tracked using `completion-set`.
-
 ### Computing the Completion Root ###
 
 ```
