@@ -267,6 +267,11 @@ defn map (f:Pattern -> Pattern, p:Pattern) -> Pattern :
     (p:Keyword) : p
     (p:ChoicePat) : ChoicePat(map(f,patterns(p)))
 
+defn do (f:Pattern -> ?, p:Pattern) -> False :
+  defn g (p:Pattern) : p
+  map(g,p)
+  false
+
 ;============================================================
 ;==================== Parse Errors ==========================
 ;============================================================
@@ -321,6 +326,7 @@ deftype BinderPos
 defmulti index (p:BinderPos) -> Int
 defstruct LeafPos <: BinderPos :
   index: Int with: (as-method => true)
+  pattern: Pattern
 defstruct RepeatPos <: BinderPos :
   index: Int with: (as-method => true)
   pos: BinderPos
@@ -334,7 +340,7 @@ defmethod print (o:OutputStream, b:AnalyzedBinder) :
 defmethod print (o:OutputStream, p:BinderPos) :
   match(p) :
     (p:LeafPos) :
-      print(o, "LeafPos(%_)" % [index(p)])
+      print(o, "LeafPos(%_, %_)" % [index(p), pattern(p)])
     (p:RepeatPos) :
       print(o, "RepeatPos(%_,%_)" % [index(p), indented-list([pos(p)])])
     (p:ChoicePos) :
@@ -365,7 +371,7 @@ defn analyze-binders (input-pattern:Pattern) -> Tuple<AnalyzedBinder> :
           within (name, pos) = scan(pattern(p)) :
             return(name, RepeatPos(i, pos))
         (p:Binder) :
-          return(name(p), LeafPos(next(index)))
+          return(name(p), LeafPos(next(index), pattern(p)))
         (p:ChoicePat) :
           val i = next(index)
           val pos-table = HashTable-init<Symbol,Vector<KeyValue<Int,BinderPos>>>(
@@ -397,10 +403,6 @@ defn to-tuple<?T> (len:Int, xs:Seqable<KeyValue<Int,?T>>) -> Tuple<T|False> :
 ;====================== ParsedBinders =======================
 ;============================================================
 
-public defstruct ChoiceResult :
-  index: Int
-  result: ParsedResult
-
 deftype BinderExtractor
 defmulti extract (e:BinderExtractor, result:ParsedResult, name:Symbol) -> ?
 
@@ -408,8 +410,9 @@ defn BinderExtractor (binders:Tuple<AnalyzedBinder>) -> BinderExtractor :
   defn compile (p:BinderPos) -> (ParsedResult -> ?) :
     match(p) :
       (p:LeafPos) :
+        val extract = binding-value-extractor(pattern(p))
         fn (result) :
-          result[index(p)]
+          extract(result[index(p)])
       (p:RepeatPos) :
         val extract = compile(pos(p))
         fn (result) :
@@ -439,19 +442,107 @@ defn ParsedBinders (e:BinderExtractor, result:ParsedResult) :
   new ParsedBinders :
     defmethod get (this, name:Symbol) :
       extract(e, result, name)
+
+;============================================================
+;===================== Choice Results =======================
+;============================================================
+
+defstruct ChoiceResult :
+  index: Int
+  result: ParsedResult
+
+;============================================================
+;===================== List Results =========================
+;============================================================
+
+deftype ListResult
+defmulti value (r:ListResult, rest:List) -> List
+
+defn list-result-extractor (p:Pattern) -> (ParsedResult -> ListResult) :
+  val index = to-seq(0 to false)
+  defn extractor (p:Pattern) -> (ParsedResult -> ListResult) :
+    match(p) :
+      (p:SeqPat) :
+        val n = length(patterns(p))
+        val extractors = map(extractor, patterns(p))
+        fn (result) :
+          new ListResult :
+            defmethod value (this, rest:List) :
+              let loop (i:Int = n - 1, rest:List = rest) :
+                if i >= 0 :
+                  val r = extractors[i](result)
+                  loop(i - 1, value(r, rest))
+                else :
+                  rest
+      (p:ListPat) :
+        next(index) ;ListStart token
+        val extract = extractor(pattern(p))
+        next(index) ;ListEnd token
+        fn (result) :
+          new ListResult :
+            defmethod value (this, rest:List) :
+              val form = value(extract(result), List())
+              cons(form, rest)              
+      (p:Repeat) :
+        val i = next(index)
+        fn (result) :
+          result[i] as ListResult
+      (p:ChoicePat) :
+        val i = next(index)
+        fn (result) :
+          result[i] as ListResult
+      (p:Keyword|Form|Prim|Production) :
+        val i = next(index)
+        fn (result) :
+          new ListResult :
+            defmethod value (this, rest:List) :
+              cons(result[i], rest)
+      (p:Rest) :
+        val i = next(index)
+        fn (result) :
+          new ListResult :
+            defmethod value (this, rest:List) :
+              result[i]
+  extractor(p)
+
+defn binding-value-extractor (p:Pattern) -> (? -> ?) :
+  match(p) :
+    (p:Keyword|Form|Prim|Production|Rest) :
+      fn (x) : x
+    (p:ChoicePat|Repeat|ListPat|SeqPat) :
+      fn (x:ListResult) : value(x,List())
         
 ;============================================================
 ;==================== Making GRules =========================
 ;============================================================
 
-public defn make-rules (p:SyntaxPackage, starting-pattern:Pattern) :
+public defstruct StartRule :
+  pattern: Pattern
+  action: ParsedBinders -> ?
+
+public defn make-rules (p:SyntaxPackage, starting-rules:Tuple<StartRule>) :
   val m = RuleMaker()
   for e in filter-by<DefProductionExp>(exps(p)) do :
     add(m, make-def(m,e))
   for e in filter-by<DefRuleExp>(exps(p)) do :
     add(m, make-rule(m,e))
-  add(m, GDefProduction(0, `Start))
-  add(m, make-starting-rule(m, starting-pattern))
+  val start-prod = fresh-prod-id(m)
+  add(m, GDefProduction(start-prod, `Start))
+  add(m, GDefProduction(0, `Top))
+  for r in starting-rules do :
+    add(m, make-starting-rule(m, start-prod, pattern(r), action(r)))
+  add(m, make-top-rule(m, GProduction(start-prod), {_}))
+  grules(m)
+
+public defn make-rules (p:SyntaxPackage, start-pattern:Pattern) :
+  val m = RuleMaker()
+  for e in filter-by<DefProductionExp>(exps(p)) do :
+    add(m, make-def(m,e))
+  for e in filter-by<DefRuleExp>(exps(p)) do :
+    add(m, make-rule(m,e))
+  add(m, GDefProduction(0, `Top))
+  val start-token = make-binder(m, 0, start-pattern)
+  add(m, make-top-rule(m, start-token, binding-value-extractor(start-pattern)))
   grules(m)
 
 ;============================================================
@@ -534,7 +625,7 @@ defn make-action (action:ParsedBinders -> ?, pattern:Pattern) -> (ParsedResult -
 defn make-rule (m:RuleMaker, exp:DefRuleExp) -> GRule :
   val rule-id = fresh-rule-id(m)
   val prod-id = production-id(m, production(exp))
-  val tokens = make-tokens(m, prod-id, pattern(exp))
+  val tokens = make-tokens(m, prod-id, pattern(exp), false)
   if empty?(guard(exp)) :
     val action = make-action(action(exp), pattern(exp))
     val params = TokenRuleParams(priority(exp), associativity(exp), action, lazy?(exp))
@@ -546,7 +637,7 @@ defn make-rule (m:RuleMaker, exp:DefRuleExp) -> GRule :
     GMatcherRule(rule-id, prod-id, terminal, matcher, action, priority(exp))
 
 ;Convert the given pattern into tuple of GToken for creating GRule.
-defn make-tokens (m:RuleMaker, prod-id:Int, p:Pattern) -> Tuple<GToken> :
+defn make-tokens (m:RuleMaker, prod-id:Int, p:Pattern, binder-pattern?:True|False) -> Tuple<GToken> :
   val tokens = Vector<GToken>()
   let loop (p:Pattern = p) :
     match(p) :
@@ -557,9 +648,9 @@ defn make-tokens (m:RuleMaker, prod-id:Int, p:Pattern) -> Tuple<GToken> :
         loop(pattern(p))
         add(tokens, GListEnd())
       (p:Repeat) :
-        add(tokens, make-repeat(m, prod-id, pattern(p)))
+        add(tokens, make-repeat(m, prod-id, pattern(p), binder-pattern?))
       (p:ChoicePat) :
-        add(tokens, make-choice(m, prod-id, patterns(p)))
+        add(tokens, make-choice(m, prod-id, patterns(p), binder-pattern?))
       (p:Production) :
         val id = production-id(m, name(p))
         add(tokens, GProduction(id))
@@ -572,56 +663,107 @@ defn make-tokens (m:RuleMaker, prod-id:Int, p:Pattern) -> Tuple<GToken> :
       (p:Keyword) :
         add(tokens, GKeyword(value(p)))
       (p:Binder) :
-        loop(pattern(p))
+        make-binder(m, prod-id, pattern(p))
   to-tuple(tokens)
+
+defn make-binder (m:RuleMaker, parent-prod-id:Int, p:Pattern) -> GToken :
+  match(p) :
+    (p:Keyword|Form|Prim|Production|Rest|Repeat|ChoicePat) :
+      val ts = make-tokens(m, parent-prod-id, p, true)
+      fatal("Expected single token.") when length(ts) != 1
+      ts[0]
+    (p:SeqPat|ListPat) :
+      val prod-id = clone-production(m, parent-prod-id)
+      val tokens = make-tokens(m, prod-id, p, true)
+      val rule-id = fresh-rule-id(m)
+      val make-result = list-result-extractor(p)
+      val params = TokenRuleParams(100, NonAssociative, make-result, false)
+      val rule = GTokenRule(rule-id, prod-id, tokens, params)
+      add(m, rule)
+      GProduction(prod-id)
 
 ;Create a new production for the given pattern, whose action
 ;simply returns the ParseResult.
-defn make-internal-production (m:RuleMaker, parent-prod-id:Int, p:Pattern) -> GProduction :
+defn make-internal-production (m:RuleMaker, parent-prod-id:Int, p:Pattern, binder-pattern?:True|False) -> GProduction :
   val prod-id = clone-production(m, parent-prod-id)
   val rule-id = fresh-rule-id(m)
-  val tokens = make-tokens(m, prod-id, p)
-  val params = TokenRuleParams(100, NonAssociative, fn (result) : result, false)
+  val tokens = make-tokens(m, prod-id, p, binder-pattern?)
+  val make-result =
+    if binder-pattern? :
+      list-result-extractor(p)
+    else :
+      fn (result:ParsedResult) :
+        result
+  val params = TokenRuleParams(100, NonAssociative, make-result, false)
   val rule = GTokenRule(rule-id, prod-id, tokens, params)
   add(m, rule)
   GProduction(prod-id)
 
 ;Create a production for representing the choice between patterns 'ps'.
-defn make-choice (m:RuleMaker, parent-prod-id:Int, patterns:Tuple<Pattern>) -> GProduction :
+defn make-choice (m:RuleMaker, parent-prod-id:Int, patterns:Tuple<Pattern>, binder-pattern?:True|False) -> GProduction :
   val prod-id = clone-production(m, parent-prod-id)
   for (pattern in patterns, index in 0 to false) do :
     val rule = GTokenRule(rule-id, prod-id, tokens, params) where :
       val rule-id = fresh-rule-id(m)
-      val tokens = make-tokens(m, prod-id, pattern)
-      defn choice-result (result:ParsedResult) : ChoiceResult(index, result)
-      val params = TokenRuleParams(100, NonAssociative, choice-result, false)
+      val tokens = make-tokens(m, prod-id, pattern, binder-pattern?)
+      val make-result =
+        if binder-pattern? :
+          list-result-extractor(pattern)
+        else :
+          fn (result:ParsedResult) :
+            ChoiceResult(index, result)
+      val params = TokenRuleParams(100, NonAssociative, make-result, false)
     add(m, rule)
   GProduction(prod-id)
 
 ;Create a production for representing the repetition of the pattern 'p'.
 ;The associated action returns List<ParseResult>.
-defn make-repeat (m:RuleMaker, parent-prod-id:Int, p:Pattern) -> GProduction :
+defn make-repeat (m:RuleMaker, parent-prod-id:Int, p:Pattern, binder-pattern?:True|False) -> GProduction :
   val prod-id = clone-production(m, parent-prod-id)
   val rule1 = GTokenRule(rule-id, prod-id, tokens, params) where :
     val tokens = [
-      make-internal-production(m, prod-id, p),
+      make-internal-production(m, prod-id, p, binder-pattern?),
       GProduction(prod-id)]
     val rule-id = fresh-rule-id(m)
-    defn make-list (result:ParsedResult) : cons(result[0], result[1])           
-    val params = TokenRuleParams(100, NonAssociative, make-list, false)
+    val make-result =
+      if binder-pattern? :
+        fn (result:ParsedResult) :
+          val x = result[0] as ListResult
+          val xs = result[1] as ListResult
+          new ListResult :
+            defmethod value (this, rest:List) :
+              value(x, value(xs, rest))
+      else :
+        fn (result:ParsedResult) :
+          cons(result[0] as ParsedResult, result[1] as List<ParsedResult>)
+    val params = TokenRuleParams(100, NonAssociative, make-result, false)
   val rule2 = GTokenRule(rule-id, prod-id, [], params) where :
     val rule-id = fresh-rule-id(m)
-    val params = TokenRuleParams(100, NonAssociative, fn (result) : List(), false)
+    val make-result =
+      if binder-pattern? :
+        fn (result:ParsedResult) :
+          new ListResult :
+            defmethod value (this, rest:List) :
+              rest
+      else :
+        fn (result:ParsedResult) :
+          List()
+    val params = TokenRuleParams(100, NonAssociative, make-result, false)
   add(m, rule1)
   add(m, rule2)
   GProduction(prod-id)
 
-;Create the starting rule for the paser.
-defn make-starting-rule (m:RuleMaker, p:Pattern) -> GTokenRule :
-  val tokens = Vector<GToken>()
-  add(tokens, GListStart())
-  add-all(tokens, make-tokens(m, 0, p))
-  add(tokens, GListEnd())
-  GTokenRule(rule-id, 0, to-tuple(tokens), params) where :
+;Create a starting rule for the parser.
+defn make-starting-rule (m:RuleMaker, prod:Int, p:Pattern, binder-action:ParsedBinders -> ?) -> GTokenRule :
+  GTokenRule(rule-id, prod, tokens, params) where :
     val rule-id = fresh-rule-id(m)
-    val params = TokenRuleParams(100, NonAssociative, fn (result) : result[1], false)
+    val tokens = make-tokens(m, prod, p, false)
+    val action = make-action(binder-action, p)
+    val params = TokenRuleParams(100, NonAssociative, action, false)
+
+;Create the top launcher rule for the grammar.
+defn make-top-rule (m:RuleMaker, start-token:GToken, extract:? -> ?) -> GTokenRule :
+  GTokenRule(rule-id, 0, tokens, params) where :
+    val rule-id = fresh-rule-id(m)
+    val tokens = [GListStart(), start-token, GListEnd()]
+    val params = TokenRuleParams(100, NonAssociative, fn (result) : extract(result[1]), false)
