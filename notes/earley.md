@@ -3,7 +3,7 @@
 @[file:earley-search.md] Explains the Earley search procedure.
 @[file:earley-sexpstream.md] Explains the `SExpStream` utility for controlling the input stream.
 @[file:earley-parse-tree.md] Explains the selection of the appropriate tree from the Earley search results.
-
+@[file:earley-lang.md] Explains the translation of the surface pattern syntax into the underlying grammar rules.
 
 
 ============================================================
