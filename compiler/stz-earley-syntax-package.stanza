@@ -4,5 +4,242 @@ defpackage stz/earley-syntax-package :
   import stz/earley-lang
 
 ;============================================================
+;================= AnalyzedSyntaxPackage ====================
 ;============================================================
+public defstruct AnalyzedSyntaxPackage :
+  name: Symbol
+  exps: Tuple<SyntaxExp>
+  idtable: Tuple<KeyValue<Symbol,Int>>
+
 ;============================================================
+;================== Pattern Resolution ======================
+;============================================================
+
+deftype SyntaxPackageTables
+defmulti get (t:SyntaxPackageTables, name:Symbol) -> SyntaxPackage|False
+
+defn resolve (p:SyntaxPackage, tables:SyntaxPackageTables) -> AnalyzedSyntaxPackage|PatternResolutionErrors :
+  ;Error Buffer
+  val errors = Vector<PatternResolutionError>()
+  defn error! (e:PatternResolutionError) : add(errors, e)
+
+  ;Gather table of all imported packages
+  defn gather-imported-packages () -> HashTable<Symbol,SyntaxPackage|False> :
+    val packages = HashTable<Symbol,SyntaxPackage|False>()
+
+    ;Gather transitively imported packages
+    defn gather (e:ImportExp) :
+      ;Bring in package if not already loaded.
+      if not key?(packages, package(e)) :
+        val pkg = tables[package(e)]
+        packages[package(e)] = pkg
+        match(pkg:SyntaxPackage) :
+          do(gather, filter-by<ImportExp>(exps(pkg)))
+      if get?(packages, package(e)) is False :
+        error!(MissingImportedPackage(info(e), package(e)))
+
+    ;Launch!
+    packages[name(p)] = p
+    do(gather, filter-by<ImportExp>(exps(p)))
+    packages
+
+  ;Assign unique ids for all packages
+  defn assign-ids (packages:HashTable<Symbol,SyntaxPackage|False>) -> ProductionTable :
+    val prodtable = ProductionTable()
+    defn assign-ids (pkg:SyntaxPackage) -> SyntaxPackage :
+      defn register-id (info:FileInfo|False, prod-name:Symbol, public?:True|False) -> Int|False :
+        match(register(prodtable, name(pkg), prod-name, public?)) :
+          (id:Int) :
+            id
+          (e:ProductionExists) :
+            error!(CannotDefineDuplicateProduction(info, prod-name))
+            false
+      val exps* = for e in exps(pkg) map :
+        match(e) :
+          (e:DefProductionExp) :
+            sub-id(e, register-id(info(e), name(e), public?(e)))
+          (e:DefKeywordsExp) :
+            sub-id(e, register-id(info(e), name(e), public?(e)))
+          (e:DefProductionsExp) :
+            val clones* = for e in clones(e) map :
+              sub-id(e, register-id(info(e), name(e), public?(e)))
+            sub-clones(e, clones*)
+          (e) : e
+      SyntaxPackage(name(pkg), exps*)
+    for entry in packages map! :
+      match(value(entry)) :
+        (pkg:SyntaxPackage) : assign-ids(pkg)
+        (f:False) : false
+    prodtable
+
+  ;Resolve ids
+  defn resolve-ids (p:SyntaxPackage, prodtable:ProductionTable) -> SyntaxPackage :
+    ;Create idtable to use for resolving ids in this package.
+    defn build-idtable () :
+      ;Get initial entries
+      val entries = for e in exps(p) seq-cat :
+        match(e) :
+          (e:DefProductionExp) :
+            [name(e) => id(e)]
+          (e:DefKeywordsExp) :
+            [name(e) => id(e)]
+          (e:DefProductionsExp) :
+            for e in clones(e) seq :
+              name(e) => id(e)
+          (e:ImportExp) :
+            match(prodtable[package(e), name(e), true]) :
+              (id:Int) :
+                [name(e) => id]
+              (s:ProductionMissing) :
+                error!(CannotResolveImportedProduction(info(e), package(e), name(e)))
+                []
+              (s:ProductionNotPublic) :
+                error!(CannotImportNonPublicProduction(info(e), package(e), name(e)))
+                []
+      ;Filter and build table
+      to-hashtable<Symbol,Int>(filtered-entries as Seq<KeyValue<Symbol,Int>>) where :
+        val filtered-entries = filter({value(_) is Int}, entries)
+
+    ;Use the following idtable to resolve expressions
+    val idtable = build-idtable()
+
+    ;Try to resolve the given production. Issues an error if
+    ;it cannot be resolved.
+    defn resolve-id (info:FileInfo|False, prod:Symbol) -> Int|False :
+      val id = get?(idtable,prod)
+      match(id:False) :
+        error!(CannotResolveProduction(info, prod))
+      id
+
+    ;Resolve all productions in the given pattern.    
+    defn resolve (info:FileInfo|False, p:Pattern) -> Pattern :
+      let loop (p:Pattern = p) :
+        match(p:Production) : sub-id(p, resolve-id(info, name(p)))
+        else : map(loop, p)
+
+    ;Resolve all productions in the given expression.
+    defn resolve (e:SyntaxExp) -> SyntaxExp :
+      match(e) :
+        (e:DefProductionsExp) :
+          val clones* = for e in clones(e) map :
+            sub-prod-id(e, resolve-id(info(e), prod(e)))
+          sub-clones(e, clones*)
+        (e:DefKeywordRuleExp) :
+          val id* = resolve-id(info(e), production(e))
+          val pattern* = resolve(info(e), pattern(e))
+          sub-pattern(sub-id(e, id*), pattern*)
+        (e:DefNotRuleExp) :
+          val id* = resolve-id(info(e), production(e))
+          val pattern* = resolve(info(e), pattern(e))
+          sub-pattern(sub-id(e, id*), pattern*)
+        (e:DefRuleExp) :
+          val id* = resolve-id(info(e), production(e))
+          val pattern* = resolve(info(e), pattern(e))
+          sub-pattern(sub-id(e, id*), pattern*)
+        (e:ImportExp) :
+          sub-id(e, get?(idtable, name(e)))
+          
+    ;Launch!      
+    SyntaxPackage(name(p), map(resolve, exps(p)))
+
+  ;Retrieve all public ids in syntax package
+  defn public-ids (p:SyntaxPackage) -> Tuple<KeyValue<Symbol,Int>> :
+    to-tuple $ for e in exps(p) seq-cat :
+      match(e) :
+        (e:DefProductionExp) :
+          if public?(e) : [name(e) => id(e) as Int]
+          else : []
+        (e:DefKeywordsExp) :
+          if public?(e) : [name(e) => id(e) as Int]
+          else : []
+        (e:DefProductionsExp) :
+          for e in clones(e) seq? :
+            if public?(e) : One(name(e) => id(e) as Int)
+            else : None()
+        (e) : []
+
+  ;Main algorithm
+  defn main () :
+    val packages = gather-imported-packages()
+    val prodtable = assign-ids(packages)
+    for entry in packages map! :
+      val pkg = value(entry)
+      match(pkg:SyntaxPackage) :
+        resolve-ids(pkg, prodtable)
+    if empty?(errors) :
+      val all-exps = to-tuple $
+        seq-cat(exps{_ as SyntaxPackage}, values(packages))
+      AnalyzedSyntaxPackage(name(p), all-exps, public-ids(p))
+    else :
+      PatternResolutionErrors(to-tuple(errors))
+
+  ;Launch!
+  main()
+  
+
+;============================================================
+;==================== Production Table ======================
+;============================================================
+
+deftype ProductionTable
+defmulti register (t:ProductionTable, package:Symbol, prod:Symbol, public?:True|False) -> Int|ProductionStatus
+defmulti get (t:ProductionTable, package:Symbol, prod:Symbol, only-public?:True|False) -> Int|ProductionStatus
+
+defn ProductionTable () :
+  val idtable = HashTable<[Symbol,Symbol],ProductionId|False>()
+  new ProductionTable :
+    defmethod register (this, package:Symbol, prod:Symbol, public?:True|False) :
+      val k = [package,prod]
+      if key?(idtable,k) :
+        ProductionExists
+      else :
+        val id = genid()
+        idtable[[package,prod]] = ProductionId(id, public?)
+        id
+    defmethod get (this, package:Symbol, prod:Symbol, only-public?:True|False) :
+      match(get?(idtable, [package,prod])) :
+        (pid:ProductionId) :
+          if only-public? and not public?(pid) : ProductionNotPublic
+          else : id(pid)
+        (f:False) :
+          ProductionMissing
+
+defstruct ProductionId :
+  id: Int
+  public?: True|False
+
+defenum ProductionStatus :
+  ProductionMissing
+  ProductionNotPublic
+  ProductionExists
+
+;============================================================
+;===================== Errors ===============================
+;============================================================
+
+public deftype PatternResolutionError <: Exception
+
+public defstruct PatternResolutionErrors <: Exception :
+  errors: Tuple<PatternResolutionError>
+
+public defstruct CannotResolveProduction <: PatternResolutionError :
+  info: FileInfo|False
+  production: Symbol
+
+public defstruct CannotResolveImportedProduction <: PatternResolutionError :
+  info: FileInfo|False
+  package: Symbol
+  production: Symbol
+
+public defstruct CannotImportNonPublicProduction <: PatternResolutionError :
+  info: FileInfo|False
+  package: Symbol
+  production: Symbol
+
+public defstruct MissingImportedPackage <: PatternResolutionError :
+  info: FileInfo|False
+  package: Symbol
+
+public defstruct CannotDefineDuplicateProduction <: PatternResolutionError :
+  info: FileInfo|False
+  production: Symbol
