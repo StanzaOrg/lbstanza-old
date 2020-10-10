@@ -2,13 +2,15 @@ defpackage stz/earley-syntax-package :
   import core
   import collections
   import stz/earley-lang
+  import stz/algorithms
+  import stz/utils
 
 ;============================================================
 ;================= AnalyzedSyntaxPackage ====================
 ;============================================================
 public defstruct AnalyzedSyntaxPackage :
   name: Symbol
-  exps: Tuple<SyntaxExp>
+  exps: Tuple<SyntaxExp> with: (updater => sub-exps)
   idtable: Tuple<KeyValue<Symbol,Int>>
 
 ;============================================================
@@ -168,7 +170,9 @@ defn resolve (p:SyntaxPackage, tables:SyntaxPackageTables) -> AnalyzedSyntaxPack
         resolve-ids(pkg, prodtable)
     if empty?(errors) :
       val all-exps = to-tuple $
-        seq-cat(exps{_ as SyntaxPackage}, values(packages))
+        for package in values(packages) seq-cat :
+          for e in exps(package as SyntaxPackage) filter :
+            e is-not ImportExp
       AnalyzedSyntaxPackage(name(p), all-exps, public-ids(p))
     else :
       PatternResolutionErrors(to-tuple(errors))
@@ -214,6 +218,186 @@ defenum ProductionStatus :
   ProductionExists
 
 ;============================================================
+;================= Pattern Cloning ==========================
+;============================================================
+
+defn clone-patterns (p:AnalyzedSyntaxPackage) -> AnalyzedSyntaxPackage|PatternResolutionErrors :
+  ;Check for cycles in cloning graph.
+  defn check-cloning-cycles () -> PatternResolutionErrors|False :
+    ;Collect information about clones and
+    ;cloning edges.
+    val clone-def = IntTable<CloneDef>()
+    val entries = Vector<KeyValue<Int,Int>>()
+    for e in exps(p) do :
+      match(e:DefProductionsExp) :
+        for e in clones(e) do :
+          val clone-id = id(e) as Int
+          val prod-id = prod-id(e) as Int
+          add(entries, clone-id => prod-id)
+          clone-def[clone-id] = CloneDef(info(e), name(e))
+    ;Create cyclic cloning errors if any.
+    val errors = Vector<MutuallyCyclicClones>()
+    val cycles = filter-by<List<Int>>(strong-components(entries*)) where :
+      val entries* = for e in entries seq :
+        key(e) => List(value(e))
+    for ids in cycles do :
+      val clones = to-tuple $ seq({clone-def[_]}, ids)
+      add(errors, MutuallyCyclicClones(clones))
+    PatternResolutionErrors(to-tuple(errors)) when not empty?(errors)
+
+  ;Discover cloning groups.
+  ;Entry (a, b, c) means that productions 'a', 'b', and 'c' reference each other,
+  ;and must be cloned together.
+  defn clone-groups () -> Tuple<List<Int>> :
+    ;Gather cloning edges
+    val edges = HashSet<KeyValue<Int,Int>>()
+    defn scan (e:SyntaxExp) :
+      match(e) :
+        (e:DefKeywordRuleExp) : scan(id(e) as Int, pattern(e))
+        (e:DefNotRuleExp) : scan(id(e) as Int, pattern(e))
+        (e:DefRuleExp) : scan(id(e) as Int, pattern(e))
+        (e) : false
+    defn scan (prod:Int, p:Pattern) :
+      match(p:Production) : add(edges, prod => id(p) as Int)
+      else : do(scan{prod, _}, p)
+    do(scan, exps(p))
+    
+    ;Discover reference cycles
+    val grouped-edges = group-by(key, value, edges)
+    to-tuple(filter-by<List<Int>>(strong-components(grouped-edges)))
+
+  ;Find all clone substitutions.
+  defn clone-substitutions (cycles:Tuple<List<Int>>) -> Vector<CloneSubstitution> :
+    ;Accumulate all substitutions
+    val subs = Vector<CloneSubstitution>()
+    
+    ;Compute cycle index of each clone.
+    val cycle-ids = IntTable<Int>()
+    for (ids in cycles, index in 0 to false) do :
+      for id in ids do :
+        cycle-ids[id] = index
+
+    ;Create substitutions for given productions exp.
+    defn create-subs (e:DefProductionsExp) :
+      ;Categorize as cycle clones and no-cycle clones.
+      val no-cycle-clones = to-tuple $
+        for c in clones(e) filter :
+          not key?(cycle-ids, prod-id(c) as Int)
+      val cycle-clones = to-tuple $
+        for c in clones(e) group-by :
+          cycle-ids[prod-id(c) as Int]
+      ;Create substitutions for non-cycle clones.
+      for clone in no-cycle-clones do :
+        val new-id = id(clone) as Int
+        val old-id = prod-id(clone) as Int
+        add(subs, CloneSubstitution(new-id, old-id, false))
+      ;Create substitutions for cycle clones.
+      for entries in cycle-clones do :
+        val index = key(entries)
+        val clones = value(entries)
+        ;Construct substitution table.
+        val subtable = IntTable<Int>()
+        for c in clones do :
+          subtable[prod-id(c) as Int] = id(c) as Int
+        for id in cycles[index] do :
+          if not key?(subtable, id) :
+            subtable[id] = genid()
+        ;Create substitutions
+        for entry in subtable do :
+          add(subs, CloneSubstitution(value(entry), key(entry), subtable))
+
+    ;Create all substitutions
+    do(create-subs, filter-by<DefProductionsExp>(exps(p)))
+    subs
+    
+  ;Perform clone substitutions
+  defn perform-substitutions (subs:Vector<CloneSubstitution>) -> Tuple<SyntaxExp> :
+
+    ;Perform given substitutions on pattern 'p' if table is given.
+    defn make-substitutions (p:Pattern, f:False) :
+      p
+    defn make-substitutions (p:Pattern, table:IntTable<Int>) :
+      match(p:Production) : sub-id(p, get?(table, id(p) as Int, id(p) as Int))
+      else : map(make-substitutions{_, table}, p)
+      
+    ;Create a new SyntaxExp resulting from applying the given
+    ;CloneSubstitution.
+    defn make-clone (e:DefProductionExp, s:CloneSubstitution) :
+      sub-id(e, new-id(s))
+    defn make-clone (e:DefKeywordsExp, s:CloneSubstitution) :
+      sub-id(e, new-id(s))
+    defn make-clone (e:DefKeywordRuleExp, s:CloneSubstitution) :
+      val pattern* = make-substitutions(pattern(e), subtable(s))
+      sub-pattern(sub-id(e, new-id(s)), pattern*)
+    defn make-clone (e:DefNotRuleExp, s:CloneSubstitution) :
+      val pattern* = make-substitutions(pattern(e), subtable(s))
+      sub-pattern(sub-id(e, new-id(s)), pattern*)
+    defn make-clone (e:DefRuleExp, s:CloneSubstitution) :
+      val pattern* = make-substitutions(pattern(e), subtable(s))
+      sub-pattern(sub-id(e, new-id(s)), pattern*)
+    defn make-clone (e:SyntaxExp, f:False) :
+      false
+
+    ;Add a new expression to the given vector if it is not false.
+    defn add? (es:Vector<SyntaxExp>, e:SyntaxExp|False) :
+      match(e:SyntaxExp) : add(es, e)
+
+    ;Table of all substitutions keyed by their old-id.
+    val sub-table = to-inttable(old-id, subs)
+
+    ;Hold final accumulated expressions.
+    val accum = Vector<SyntaxExp>()
+
+    ;Hold working queue of expressions.
+    val queue = Queue<SyntaxExp>()
+
+    ;Process every expression
+    do(add{queue, _}, exps(p))
+    while not empty?(queue) :
+      match(pop(queue)) :
+        (e:DefProductionExp) :
+          add(accum, e)
+          add?(accum, make-clone(e, get?(sub-table, id(e) as Int)))
+        (e:DefKeywordsExp) :
+          add(accum, e)
+          add?(accum, make-clone(e, get?(sub-table, id(e) as Int)))
+        (e:DefKeywordRuleExp) :
+          add(accum, e)
+          add?(accum, make-clone(e, get?(sub-table, id(e) as Int)))
+        (e:DefNotRuleExp) :
+          add(accum, e)
+          add?(accum, make-clone(e, get?(sub-table, id(e) as Int)))
+        (e:DefRuleExp) :
+          add(accum, e)
+          add?(accum, make-clone(e, get?(sub-table, id(e) as Int)))
+        (e:DefProductionsExp) :
+          false
+          
+    ;Return final expressions      
+    to-tuple(accum)      
+
+  ;Main algorithm
+  defn main () :
+    match(check-cloning-cycles()) :
+      (es:PatternResolutionErrors) :
+        es
+      (f:False) :
+        val clone-subs = clone-substitutions(clone-groups())
+        val exps* = perform-substitutions(clone-subs)
+        sub-exps(p, exps*)
+       
+  ;Launch! 
+  main()
+
+;This object means that production 'old-id' should be cloned as
+;production 'new-id' and the table 'subtable' should be used as
+;substitutions.
+defstruct CloneSubstitution :
+  new-id: Int
+  old-id: Int
+  subtable: IntTable<Int>|False
+
+;============================================================
 ;===================== Errors ===============================
 ;============================================================
 
@@ -243,3 +427,10 @@ public defstruct MissingImportedPackage <: PatternResolutionError :
 public defstruct CannotDefineDuplicateProduction <: PatternResolutionError :
   info: FileInfo|False
   production: Symbol
+
+public defstruct MutuallyCyclicClones <: PatternResolutionError :
+  clones: Tuple<CloneDef>
+
+public defstruct CloneDef :
+  info: FileInfo|False
+  name: Symbol
