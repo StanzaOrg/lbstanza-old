@@ -4,6 +4,7 @@ defpackage stz/earley-syntax-package :
   import stz/earley-lang
   import stz/algorithms
   import stz/utils
+  import stz/earley-grammar
 
 ;============================================================
 ;================= AnalyzedSyntaxPackage ====================
@@ -434,6 +435,296 @@ defstruct CloneSubstitution :
   old-id: Int
   subtable: IntTable<Int>|False
 
+;<doc>=======================================================
+;=================== Keyword Analysis =======================
+;============================================================
+
+Given that P is a keyword production, all rules for P must be either:
+  DefKeywordRuleExp, or
+  DefNotRuleExp
+
+For a DefKeywordRuleExp, the allowed patterns are:  
+  Production if production is a keyword production.
+  Keyword
+  ChoicePat if all patterns are allowed patterns.
+A DefKeywordRuleExp can only be used for a keyword production.
+
+For a DefNotRuleExp, the allowed patterns are:
+  Production if production is a keyword production.
+  Keyword
+  ChoicePat if all patterns are allowed patterns.
+A DefNotRuleExp can only be used for:
+  1. Keyword productions.
+  2. Single form productions.
+
+Given that P is a single form production, all rules for P must be either:
+  DefRuleExp where pattern is a single form pattern
+  DefNotRuleExp
+
+A single form pattern is:
+  Prim
+  Form
+  Keyword
+
+;============================================================
+;=======================================================<doc>
+
+;A KeywordSet represents all possible keywords to match.
+deftype KeywordSet
+defstruct LeafKeyword <: KeywordSet :
+  value: Symbol
+defstruct NamedKeywordSet <: KeywordSet :
+  id: Int
+defstruct KeywordUnion <: KeywordSet :
+  sets: Tuple<KeywordSet>
+defstruct KeywordDifference <: KeywordSet :
+  a: KeywordSet
+  b: KeywordSet
+defstruct EmptyKeywordSet <: KeywordSet
+
+defn analyze-keyword-sets (p:AnalyzedSyntaxPackage) ->
+                           AnalyzedSyntaxPackage|KeywordProductionErrors :
+  ;Convert a single pattern into a keyword set.
+  defn to-keyword-set (p:Pattern) -> KeywordSet :
+    match(p) :
+      (p:Production) : NamedKeywordSet(id(p) as Int)
+      (p:Keyword) : LeafKeyword(value(p))
+      (p:ChoicePat) : KeywordUnion(map(to-keyword-set, patterns(p)))
+
+  ;Gather all keyword definitions and subtractions
+  ;defined by the expressions in package 'p'.
+  defn gather-keyword-sets () -> [Tuple<KeywordDefinition>, Tuple<KeywordSubtraction>] :
+    ;Gather all positive and negative sets.
+    val positive-sets = IntTable<List<KeywordSet>>(List())
+    val negative-sets = IntTable<List<KeywordSet>>(List())
+    val keyword-prods = IntTable<DefKeywordsExp>()
+    for e in exps(p) do :
+      match(e) :
+        (e:DefKeywordRuleExp) :
+          val kset = to-keyword-set(pattern(e))
+          update(positive-sets, cons{kset, _}, id(e) as Int)
+        (e:DefNotRuleExp) :
+          val kset = to-keyword-set(pattern(e))
+          update(negative-sets, cons{kset, _}, id(e) as Int)
+        (e:DefKeywordsExp) :
+          keyword-prods[id(e) as Int] = e
+        (e) : false
+    ;Create a keyword union from list of keyword sets.
+    defn make-union (ss:List<KeywordSet>) -> KeywordSet :
+      fatal("Illegal argument.") when empty?(ss)
+      if empty?(tail(ss)) : head(ss)
+      else : KeywordUnion(to-tuple(ss))
+    ;Construct definitions
+    val keyword-defs = to-tuple $
+      for e in values(keyword-prods) seq :
+        val pos = positive-sets[id(e) as Int]
+        val neg = negative-sets[id(e) as Int]
+        val kset = match(empty?(pos), empty?(neg)) :
+          (ep:True, en) : EmptyKeywordSet()
+          (ep:False, en:True) : make-union(pos)
+          (ep:False, en:False) : KeywordDifference(make-union(pos), make-union(neg))
+        KeywordDefinition(e, kset)
+    ;Construct subtractions
+    val keyword-subs = to-tuple $
+      for e in negative-sets seq? :
+        val id = key(e)
+        val neg = value(e)
+        if key?(keyword-prods, id) : None()
+        else if empty?(neg) : None()
+        else : One(KeywordSubtraction(id, make-union(neg)))
+    ;Return definitions and subtractions
+    [keyword-defs, keyword-subs]
+
+  ;Ensure no keyword cycles
+  defn check-keyword-cycles (defs:Tuple<KeywordDefinition>) ->
+                            Tuple<KeywordDefinition>|KeywordProductionErrors :
+    ;Return all referenced keyword ids.
+    defn referenced-ids (kset:KeywordSet) -> List<Int> :
+      val ids = IntSet()
+      let loop (kset:KeywordSet = kset) :
+        match(kset) :
+          (kset:KeywordUnion) :
+            do(loop, sets(kset))
+          (kset:KeywordDifference) :
+            loop(a(kset))
+            loop(b(kset))
+          (kset:NamedKeywordSet) :
+            add(ids, id(kset))
+          (kset) :
+            false
+      to-list(ids)
+    ;Create table of defs
+    val deftable = to-inttable({id(def(_)) as Int}, defs)
+    ;Find strong-connected components in keyword definitions.
+    val components = strong-components $
+      for d in defs seq :
+        val id = id(def(d)) as Int
+        id => referenced-ids(kset(d))
+    ;Find cycles in components
+    val errors = Vector<MutuallyCyclicKeywords>()
+    for cycle in filter-by<List<Int>>(components) do :
+      val proddefs = to-tuple $ for id in cycle seq :
+        val def = def(deftable[id])
+        CloneDef(info(def), name(def))
+      add(errors, MutuallyCyclicKeywords(proddefs))
+    ;Return definitions in topological order if there
+    ;are no cycles.
+    if empty?(errors) :
+      to-tuple $
+        for id in components as List<Int> seq :
+          deftable[id]
+    else :
+      KeywordProductionErrors(to-tuple(errors))
+
+  ;Given that all referenced keywords exist in the given table in simplified form,
+  ;compute the simplified form of the given keyword set.
+  ;The simplified form of a keyword set is either:
+  ;  1. The empty keyword set.
+  ;  2. A single LeafKeyword.
+  ;  3. A union of LeafKeyword.
+  defn simplify (kset:KeywordSet, keyword-table:IntTable<KeywordSet>) -> KeywordSet :
+    ;Return all values in the given simplified keyword set.
+    defn all-values (kset:KeywordSet) -> Seqable<Symbol> :
+      match(kset) :
+        (kset:LeafKeyword) :
+          [value(kset)]
+        (kset:EmptyKeywordSet) :
+          []
+        (kset:KeywordUnion) :
+          seq(value, sets(kset) as Tuple<LeafKeyword>)
+
+    ;Convert a set of symbols into a simplified KeywordSet
+    defn make-keyword-set (values:HashSet<Symbol>) -> KeywordSet :
+      switch(length(values)) :
+        0 : EmptyKeywordSet()
+        1 : LeafKeyword(next(to-seq(values)))
+        else : KeywordUnion(to-tuple(seq(LeafKeyword, values)))
+
+    ;Construct the simplified version of the given keyword set.
+    defn simplify (kset:KeywordSet) -> KeywordSet :
+      match(kset) :
+        (kset:LeafKeyword) : kset
+        (kset:EmptyKeywordSet) : kset
+        (kset:NamedKeywordSet) : keyword-table[id(kset)]
+        (kset:KeywordUnion) :
+          make-keyword-set $ to-hashset<Symbol> $
+            seq-cat(all-values{simplify(_)}, sets(kset))          
+        (kset:KeywordDifference) :
+          val values = to-hashset<Symbol> $
+            all-values(simplify(a(kset)))
+          for v in all-values(simplify(b(kset))) do :
+            remove(values,v)
+          make-keyword-set(values)
+          
+    ;Launch!
+    simplify(kset)
+
+  ;Compute the simplified versions of the given definitions
+  ;and subtractions. The definitions must be given in topological order.
+  defn simplify (defs:Tuple<KeywordDefinition>,
+                 subs:Tuple<KeywordSubtraction>) ->
+                 [Tuple<KeywordDefinition>, Tuple<KeywordSubtraction>] :
+    val keyword-table = IntTable<KeywordSet>()
+    val defs* = for d in defs map :
+      val kset* = simplify(kset(d), keyword-table)
+      keyword-table[id(def(d)) as Int] = kset*
+      sub-kset(d, kset*)
+    val subs* = for sub in subs map :
+      val kset* = simplify(kset(sub), keyword-table)
+      sub-kset(sub, kset*)
+    [defs*, subs*]
+
+  ;Transform all expressions to using the computed keyword definitions
+  defn transformed-exps (defs:Tuple<KeywordDefinition>,
+                         subs:Tuple<KeywordSubtraction>) -> Tuple<SyntaxExp> :
+    ;Put defs and subs in tables first.
+    val deftable = to-inttable<KeywordSet> $
+      for d in defs seq :
+        (id(def(d)) as Int) => kset(d)        
+    val subtable = to-inttable<KeywordSet> $
+      for s in subs seq :
+        id(s) => kset(s)
+
+    ;Create a predicate for representing when a value matches the
+    ;given keyword set.
+    defn make-predicate (kset:KeywordSet) -> (? -> True|False) :
+      match(kset) :
+        (kset:LeafKeyword) :
+          val v = value(kset)
+          {unwrap-token(_) == v}
+        (kset:KeywordUnion) :
+          val vs = to-hashset<?> $
+            seq(value{_ as LeafKeyword}, sets(kset))
+          {vs[unwrap-token(_)]}
+
+    ;Add a guard to the given expression such that
+    ;it passes only if value is not in keyword set.
+    defn add-subtraction (e:DefRuleExp, kset:KeywordSet) -> DefRuleExp :
+      val in-kset? = make-predicate(kset)
+      val guard* =
+        if empty?(guard(e)) :
+          fn (x) : not in-kset?(x)
+        else :
+          val g = value!(guard(e))
+          fn (x) : g(x) and not in-kset?(x)
+      sub-guard(e, One(guard*)) 
+
+    ;Second, iterate through existing expressions and transform each.
+    val exps* = Vector<SyntaxExp>()
+    for e in exps(p) do :
+      match(e) :
+        ;Transform into DefProduction with DefRule
+        (e:DefKeywordsExp) :
+          val kset = deftable[id(e) as Int]
+          add(exps*, DefProductionExp(
+            info(e), name(e), id(e) as Int, public?(e)))
+          if kset is-not EmptyKeywordSet :
+            defn return-x (b:ParsedBinders) : b[`x]
+            add(exps*, DefRuleExp(
+              info(e), name(e), id(e) as Int, Binder(`x,Form()),
+              One(make-predicate(kset)), return-x, 100, NonAssociative, false))
+        ;Discard if rule for keyword set.
+        ;Add guard if it has subtraction.
+        (e:DefRuleExp) :
+          if not key?(deftable, id(e) as Int) :
+            match(get?(subtable, id(e) as Int)) :
+              (kset:EmptyKeywordSet) : add(exps*, e)
+              (kset:KeywordSet) : add(exps*, add-subtraction(e, kset))
+              (f:False) : add(exps*, e)
+        ;Keep unchanged      
+        (e:DefProductionExp) : add(exps*, e)
+        ;No longer necessary
+        (e:DefKeywordRuleExp) : false
+        ;No longer necessary
+        (e:DefNotRuleExp) : false
+
+    ;Return new expressions
+    to-tuple(exps*)
+
+  ;Main algorithm
+  defn main () :
+    val [defs, subs] = gather-keyword-sets()
+    match(check-keyword-cycles(defs)) :
+      (defs:Tuple<KeywordDefinition>) :
+        val [simple-defs, simple-subs] = simplify(defs, subs)
+        val exps* = transformed-exps(simple-defs, simple-subs)
+        sub-exps(p, exps*)
+      (e:KeywordProductionErrors) :
+        e
+
+  ;Launch!
+  main()
+
+;Represents a keyword production definition using a KeywordSet.
+defstruct KeywordDefinition :
+  def: DefKeywordsExp
+  kset: KeywordSet with: (updater => sub-kset)
+  
+;Represents a guard that must be added 
+defstruct KeywordSubtraction :
+  id: Int
+  kset: KeywordSet with: (updater => sub-kset)
+
 ;============================================================
 ;===================== Errors ===============================
 ;============================================================
@@ -471,3 +762,11 @@ public defstruct MutuallyCyclicClones <: PatternResolutionError :
 public defstruct CloneDef :
   info: FileInfo|False
   name: Symbol
+
+public deftype KeywordProductionError <: Exception
+
+public defstruct KeywordProductionErrors <: Exception :
+  errors: Tuple<KeywordProductionError>
+
+public defstruct MutuallyCyclicKeywords <: KeywordProductionError :
+  defs: Tuple<CloneDef>
