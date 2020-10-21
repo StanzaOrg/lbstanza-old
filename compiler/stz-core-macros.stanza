@@ -6,6 +6,7 @@ defpackage stz/core-macros :
    import macro-utils
    import collections
    import stz/params
+   import stz/utils
 
 ;============================================================
 ;==================== Exceptions ============================
@@ -34,6 +35,143 @@ defn wrap-info (info:False|FileInfo, x) :
       (info:False) : x
 
 ;============================================================
+;============== Anonymous Function Compilation ==============
+;============================================================
+
+deftype AfnArg
+defstruct AfnNumberedArg <: AfnArg: (index:Int)
+defstruct AfnStandardArg <: AfnArg
+
+defstruct AfnArgEntry :
+  arg: AfnArg
+  type: Maybe
+
+defsyntax anonymous-function-body :
+  import type! from core
+  
+  ;Classify form as an anonymous function argument.
+  ;Returns false if not an argument.
+  ;Either _ or _0 is accepted as arguments.
+  defn classify-arg (x) -> AfnArg|False :
+    match(unwrap-token(x)) :
+      (s:StringSymbol) :
+        if s == `_ :
+          AfnStandardArg()
+        else if prefix?(name(s), "_") :
+          val index-str = name(s)[1 to false]
+          match(to-int(index-str)) :
+            (x:Int) : AfnNumberedArg(x) when x >= 0 and x < 256
+            (x) : false
+      (f) :
+        false
+
+  ;Returns true if the given form is an appropriate
+  ;argument placeholder.
+  defn placeholder? (x) -> True|False :
+    classify-arg(x) is-not False  
+
+  ;Syntax of anonymous function form
+  public defproduction aform
+  defrule aform = (?h:((@afn | @do-afn | @quote | $quote) _ ...)) :
+    h
+  defrule aform = (?p:#placeholder ~ : ?t:#type!) :
+    AfnArgEntry(p, One(t))
+  defrule aform = (?p:#placeholder) :
+    AfnArgEntry(p, None())
+  defrule aform = ((?p:#aform ...)) :
+    p
+  defrule aform = (?x) :
+    x
+
+  ;Represents a _ or _n
+  defproduction placeholder: AfnArg
+  defrule placeholder = (?p) when placeholder?(p) :
+    classify-arg(p) as AfnArg
+
+defn compile-afn-body (afn-info:FileInfo|False, body:List) :
+  ;Create arguments.
+  val arg-table = IntTable-init<Symbol>(gensym{`arg})
+  val arg-list = Vector<AfnArgEntry>()
+  defn make-arg (e:AfnArgEntry) -> Symbol :
+    add(arg-list, e)
+    val index = match(arg(e)) :
+      (a:AfnNumberedArg) : index(a)
+      (a:AfnStandardArg) : length(arg-list) - 1
+    arg-table[index]
+
+  ;Verify proper form.
+  defn verify-form () -> True|False :
+    ;Verify that either the user uses standard arguments
+    ;or numbered arguments but not both.
+    val standard-arg? = any?({arg(_) is AfnStandardArg}, arg-list)
+    val numbered-arg? = any?({arg(_) is AfnNumberedArg}, arg-list)
+    if standard-arg? and numbered-arg? :
+      val msg = "Anonymous function cannot contain both standard placeholder \
+                 arguments as well as numbered placeholder arguments."
+      throw(CSE(afn-info, msg))
+
+  ;Assuming that it is a anonymous function using numbered arguments,
+  ;construct the type table. Ensure that all types are consistent.
+  defn type-table () :
+    val table = IntTable<?>()
+    defn arg-index (e:AfnArgEntry) : index(arg(e) as AfnNumberedArg)
+    defn arg-type (e:AfnArgEntry) : value!(type(e))
+    defn typed? (e:AfnArgEntry) : not empty?(type(e))
+    for group in group-by(arg-index, arg-type, filter(typed?,arg-list)) do :
+      val types = unique(seq(unwrap-all,value(group)))
+      if length(types) > 1 :
+        val msg = "Argument %_ in anonymous function is declared repeatedly with \
+                   different types: %,."
+        throw(CSE(afn-info, msg % [key(group), types]))
+      table[key(group)] = head(value(group))
+    table
+
+  ;Construct arg list, for functions with one argument or more.
+  defn make-arg-list () -> List :
+    match(arg(arg-list[0])) :
+      (a:AfnStandardArg) :
+        for (entry in arg-list, index in 0 to false) seq-append :
+          val name = arg-table[index]
+          if empty?(type(entry)) : List(name)
+          else : List(name, `:, value!(type(entry)))
+      (a:AfnNumberedArg) :
+        val max-arg = maximum(keys(arg-table))
+        for i in 0 through max-arg seq-append :
+          val types = type-table()
+          val name = arg-table[i]
+          if key?(types, i) : List(name, `:, types[i])
+          else : List(name)
+
+  ;Create the modified body.
+  ;Calls `make-arg` on each occurrence of a placeholder.
+  defn replace (xs) -> ? :
+    match(unwrap-token(xs)) :
+      (xs*:List) : sub-token-item?(xs, map(replace, xs*))
+      (xs*:AfnArgEntry) : make-arg(xs*)
+      (xs*) : xs
+
+  ;Perform substitutions on body
+  val aform = parse-syntax[anonymous-function-body / #aform](List(body))
+  val replaced = replace(aform)
+  verify-form()
+  val body* = parse-syntax[core + current-overlays / #exp$](replaced)
+  if empty?(arg-list) :
+    val template = `(
+       multifn :
+          () : body
+          (x:?) : body)
+    parse-syntax[core / #exp](      
+       fill-template(template, [
+          `body => body*
+          `x => gensym(`x)]))
+  else :
+    val template = `(fn args : body)
+    parse-syntax[core / #exp](
+       fill-template(template, [
+          `body => body*,
+          `args => make-arg-list()]))
+
+;============================================================
 ;====================== DefStruct Compilation ===============
 ;============================================================
 
@@ -47,6 +185,7 @@ defmulti has-init? (s:StructField) -> True|False
 defmulti has-ensure? (s:StructField) -> True|False
 
 defn StructField (name:Token|Symbol,              ;Name of field
+                  doc-string:Maybe,               ;Doc String
                   type,                           ;Type of field
                   as-method?:True|False,          ;Define as method?
                   setter:Maybe,                   ;Setter for field
@@ -80,6 +219,8 @@ defn StructField (name:Token|Symbol,              ;Name of field
     defmethod bindings (this, sname:Token|Symbol) :
      [`name => name
       `type => type
+      `doc-string => value?(doc-string)
+      `doc-string? => choice(not empty?(doc-string))
       `description => to-string("field %_/%_" % [sname, name])
       `full-name => to-string("%_/%_" % [sname, name])
       `method? => choice(as-method?)
@@ -135,13 +276,6 @@ defn gen-defstruct (sname:Token|Symbol,
     ;Type declaration
     deftype Struct<targs{name}> parent?{<: Parent}{}
     
-    ;Multi declarations
-    fields{method?{}{
-      defmulti name<targs{?name}> (x:Struct<targs{?name}>) -> type
-      setter?{defmulti setter<targs{?name}> (x:Struct<targs{?name}>, v:type) -> False}{}
-      updater?{defmulti updater<targs{?name}> (x:Struct<targs{?name}>, v:type) -> Struct<targs{name}>}{}
-    }}
-      
     sub-constructors?{      
       ;Main constructor
       defn MainConstructor<targs{name}> (fields{name:voidable?{type|Uninitialized}{type}}) :
@@ -290,6 +424,15 @@ defn gen-defstruct (sname:Token|Symbol,
               print(o, "%~(%,)" % [`Struct, print-items])
           }{}
     }
+
+    ;Multi declarations
+    fields{method?{}{
+      doc-string?{ doc-string }{ }
+      defmulti name<targs{?name}> (x:Struct<targs{?name}>) -> type
+      setter?{defmulti setter<targs{?name}> (x:Struct<targs{?name}>, v:type) -> False}{}
+      updater?{defmulti updater<targs{?name}> (x:Struct<targs{?name}>, v:type) -> Struct<targs{name}>}{}
+    }}
+    
   ))
 
   ;===== Fill Template =====
@@ -316,7 +459,7 @@ defn gen-defstruct (sname:Token|Symbol,
     `printer? => choice(printer?)
     `print-items => gensym(`print-items)])
 
-  ;println(filled)
+  ; println(filled)
 
   filled
 
@@ -349,15 +492,19 @@ defn compile (def:EnumDef) :
     }
     defmethod equal? (a:Enum, b:Enum) : to-int(a) == to-int(b)
     defmethod hash (x:Enum) : to-int(x)
-    
+
+    val Enum-length = num-args
     val enum-vals = [args{Name}]
+    defn Enum? (i:Int) :
+      enum-vals[i] when i >= 0 and i < num-args
     defn Enum (i:Int) :
-      if i < 0 or i >= num-args :
-        fatal("Cannot convert int %_ into enum %_." % [i, to-string-Enum])
-      enum-vals[i]))
+      if i >= 0 and i < num-args : enum-vals[i]
+      else : fatal("Cannot convert int %_ into enum %_." % [i, to-string-Enum])))
   fill-template(template, [
     ;Place holders
     `Enum => name(def)
+    `Enum? => symbol-join([name(def), "?"])
+    `Enum-length => symbol-join([name(def), "-length"])
     `to-string-Enum => to-string(name(def))
     `parent? => choice(not empty?(parent(def)))
     `parent => value?(parent(def))
@@ -382,7 +529,7 @@ defsyntax core :
 
    val TAG-TABLE = HashSet<Symbol>()
    for tag in `(
-      $package $import $prefix-of $prefix $public $protected $private $deftype $defchild $def
+      $package $import $prefix-of $prefix $public $protected $private $doc $deftype $defchild $def
       $defvar $defn $defn* $defmulti $defmethod $defmethod* $fn $fn*
       $multi $begin $let $match $branch $new $as $as? $set $do
       $prim $tuple $quote $none $of $and $or $->
@@ -419,6 +566,12 @@ defsyntax core :
    defproduction bool : Token|True|False
    defrule bool = (?v:true) : v
    defrule bool = (?v:false) : v
+
+   defproduction string : Token|String
+   defrule string = (?x) when unwrap-token(x) is String : x
+
+   defproduction symbol : Token|Symbol
+   defrule symbol = (?x) when unwrap-token(x) is Symbol : x
 
    ;                Error Handling
    ;                ==============
@@ -585,6 +738,18 @@ defsyntax core :
    ;Not yet implemented
    
 
+   ;                Doc String
+   ;                ==========
+
+   defproduction doc-string
+   defrule doc-string = (doc : ?x:#string) : qquote($doc ~ x)
+
+   defproduction doc-string? : Maybe
+   defrule doc-string? = (?x:#doc-string) : One(x)
+   defrule doc-string? = () : None()
+
+   defrule exp4 = (?x:#doc-string) : x
+
    ;                Function Call
    ;                =============
    defrule exp4 = (?x:#exp4(?ys:#exps!)) : qquote($do ~ x ~@ ys)
@@ -624,6 +789,7 @@ defsyntax core :
    ;                   =========
    defproduction $binder!
    defrule $binder! = (?x:#$binder) : x
+   fail-if $binder! = (?x:#symbol) : CSE(closest-info(), "'%~' is a reserved keyword or an invalid identifier and cannot be used as an argument name." % [x])
    fail-if $binder! = () : CSE(closest-info(), "Expected a binder here.")
 
    defproduction $binder
@@ -633,6 +799,7 @@ defsyntax core :
    defproduction argbinding : KeyValue
    defrule argbinding = (?x:#$binder : ?t:#type!) : x => t
    defrule argbinding = (?x:#$binder) : x => `($none)
+   fail-if argbinding = (?x:#symbol) : CSE(closest-info(), "'%~' is a reserved keyword or an invalid identifier and cannot be used as an argument name." % [x])
    fail-if argbinding = () : CSE(closest-info(), "Expected an argument declaration here.")
 
    defproduction arglist : [? ?]
@@ -1130,49 +1297,7 @@ defsyntax core :
    ;                  Anonymous Functions
    ;                  ===================
    defrule exp4 = ({?body ...}) :
-      val args = Vector<Symbol>()
-      val types = Vector<?>()
-      defn new-arg (t) :
-         val a = gensym(`arg)
-         add(args, a)
-         add(types, t)
-         a
-
-      defn replace (xs:List) -> List :
-         match-syntax[core + current-overlays](xs) :
-            (?h:((@afn | @do-afn | @quote | $quote) _ ...) ?rest ...) :
-               cons(h, replace(rest))
-            ((?h ...) ?rest ...) :
-               cons(replace(h), replace(rest))
-            (~ _ : ?t:#type! ?rest ...) :
-               cons(new-arg(t), replace(rest))
-            (~ _ ?rest ...) :
-               cons(new-arg(false), replace(rest))
-            (?h ?rest ...) :
-               cons(h, replace(rest))
-            () :
-               List()
-               
-      val body* = parse-syntax[core + current-overlays / #exp](
-         replace(List(body)))         
-
-      if empty?(args) :
-         val template = `(
-            multifn :
-               () : body
-               (x:?) : body)
-         parse-syntax[core / #exp](      
-            fill-template(template, [
-               `body => body*
-               `x => gensym(`x)]))
-      else :
-         val template = `(fn args : body)
-         parse-syntax[core / #exp](
-            fill-template(template, [
-               `body => body*
-               `args => for (x in args, t in types) seq-append :
-                  if t is False : List(x)
-                  else : qquote(~ x : ~ t)]))
+     compile-afn-body(closest-info(), body)
 
    ;                       Is/Is-Not
    ;                       =========
@@ -1470,7 +1595,7 @@ defsyntax core :
    fail-if struct-option! = () : CSE(closest-info(), "Expected struct option declaration here.")
 
    defproduction struct-field!:StructField
-   defrule struct-field! = (?name:#id! ?t:#field-type ?ops:#field-options) :
+   defrule struct-field! = (?ds:#doc-string? ?name:#id! ?t:#field-type ?ops:#field-options) :
      val init = lookup?(ops, `init, None())
      val default = lookup?(ops, `default, None())
      val setter = lookup?(ops, `setter, None())
@@ -1480,7 +1605,7 @@ defsyntax core :
        throw(CSE(closest-info(), "Field '%~' cannot have both an initialization and a default value." % [name]))
      if void?(init) and empty?(setter) and empty?(updater) :
        throw(CSE(closest-info(), "Field '%~' is uninitialized and has no setter or updater." % [name]))     
-     StructField(name, t,
+     StructField(name, ds, t,
        lookup?(ops, `as-method),
        setter,
        updater,
@@ -1744,6 +1869,20 @@ defsyntax core :
    defrule exp4 = ((@quote ?rest ...)) :
       if length(rest) == 1 : qquote($quote ~ (head(rest)))
       else : CSE(closest-info(rest), "Expected a single form here.")
+
+   ;                   #FILEINFO
+   ;                   =========
+   defrule exp4 = (~ #FILEINFO) :
+     match(closest-info()) :
+       (info:FileInfo) :
+         val filled = fill-template(`(core/FileInfo(filename, line, column)), [
+           `filename => filename(info),
+           `line => line(info),
+           `column => column(info)])
+         parse-syntax[core / #exp](filled)
+       (f:False) :
+         false
+   defrule id != (~ #FILEINFO)
 
    ;                  Begin Expression
    ;                  ================

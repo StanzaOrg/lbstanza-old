@@ -54,7 +54,8 @@ protected extern file_write_block: (ptr<?>, ptr<byte>, long) -> long
 protected extern file_time_modified: ptr<byte> -> long
 
 ;Process libraries
-protected extern launch_process: (ptr<byte>, ptr<ptr<byte>>, int, int, int, ptr<?>) -> int
+protected extern launch_process: (ptr<byte>, ptr<ptr<byte>>, int, int, int, int, ptr<?>) -> int
+protected extern delete_process_pipes: (ptr<?>, ptr<?>, ptr<?>, int) -> int
 protected extern retrieve_process_state: (long, ptr<?>, int) -> int
 protected extern initialize_launcher_process: () -> int
 
@@ -1902,6 +1903,58 @@ defmethod equal? (a:List, b:List) -> True|False :
 
 defmethod equal? (a:Symbol, b:Symbol) -> True|False :
   ($prim identical? a b)
+
+;============================================================
+;==================== Compare Contents ======================
+;============================================================
+
+public deftype HasContents :
+  Equalable <: HasContents
+  KeyValue<K,V> <: HasContents
+  Tuple<T> <: HasContents
+  IndexedCollection<T> <: HasContents
+
+public defmulti same-contents? (a:HasContents, b:HasContents) -> True|False
+
+;By default, two objects do not have the same contents.
+defmethod same-contents? (a, b) : false
+
+;Two objects have the same contents if they are equal.
+defmethod same-contents? (a:Equalable, b:Equalable) : a == b
+
+;Two keyvalue pairs have the same contents if their keys are equal
+;and their values contain the same contents.
+defmethod same-contents? (a:KeyValue, b:KeyValue) :
+  key(a) == key(b) and
+  same-contents?(value(a), value(b))
+
+;Two Tuples contain the same contents if they have the same length
+;and their items respectively contain the same contents.
+defmethod same-contents? (a:Tuple, b:Tuple) :
+  length(a) == length(b) and all?(same-contents?, a, b)
+
+;Two Lists contain the same contents if they have the same length
+;and their items respectively contain the same contents.
+defmethod same-contents? (a:List, b:List) :
+  let loop (a:List = a, b:List = b) :
+    match(empty?(a), empty?(b)) :
+      (ae:True, be:True) : true
+      (ae:True, be:False) : false
+      (ae:False, be:True) : false
+      (ae:False, be:False) : same-contents?(head(a), head(b)) and
+                             loop(tail(a), tail(b))
+
+;Two IndexedCollections contain the same contents if they have the same length
+;and their items respectively contain the same contents.
+defmethod same-contents? (a:IndexedCollection, b:IndexedCollection) :
+  length(a) == length(b) and
+  for i in 0 to length(a) all? :
+    same-contents?(a[i], b[i])
+
+;Two wrapped Maybe objects contain the same contents if their
+;wrapped value contains the same contents.
+defmethod same-contents? (a:One, b:One) :
+  same-contents?(value!(a), value!(b))
 
 ;============================================================
 ;====================== Lengthable ==========================
@@ -4623,24 +4676,24 @@ public defn IndentedStream (o:OutputStream) :
   IndentedStream(o, 2)
 
 public defn IndentedStream (o:OutputStream, n:Int) :
-   match(o) :
-      (o:IndentedStream) :
-         IndentedStream(stream(o), n + indent(o))
-      (o) :
-         var start-of-line? = true
-         val spaces = String(n, ' ')
-         defn put (c:Char) :
-            if start-of-line? :
-               print(o, spaces)
-               start-of-line? = false
-            print(o, c)
-            if c == '\n' :
-               start-of-line? = true
-
-         new IndentedStream :
-            defmethod stream (this) : o
-            defmethod indent (this) : n
-            defmethod print (this, c:Char) : put(c)
+  match(o) :
+    (o:IndentedStream) :
+      IndentedStream(stream(o), n + indent(o))
+    (o) :
+      var start-of-line? = true
+      val spaces = String(n, ' ')
+      defn put (c:Char) :
+        if c == '\n' :
+          print(o, c)
+          start-of-line? = true
+        else :
+          print(o, spaces) when start-of-line?
+          print(o, c)
+          start-of-line? = false
+      new IndentedStream :
+        defmethod stream (this) : o
+        defmethod indent (this) : n
+        defmethod print (this, c:Char) : put(c)
 
 public defn do-indented<?T> (f: IndentedStream -> ?T, o:OutputStream) :
    f(IndentedStream(o))
@@ -6078,6 +6131,12 @@ public defn unwrap-token (t) :
       (t:Token) : unwrap-token(item(t))
       (t) : t
 
+public defn sub-token-item? (t, x) -> ? :
+  match(t, x) :
+    (t, x:Token) : x
+    (t:Token, x) : Token(x, info(t))
+    (t, x) : x
+
 public defn unwrap-all (t) -> ? :
    match(t) :
       (t:Token) : unwrap-all(item(t))
@@ -7260,8 +7319,11 @@ public lostanza defn sleep-us (us:ref<Long>) -> ref<False> :
 ;                   Process Structure
 ;                   =================
 
+lostanza var NEXT-PIPE-ID:int = 0
+
 public lostanza deftype Process :
   pid: long
+  var pipeid: int
   input: ptr<?>
   output: ptr<?>
   error: ptr<?>
@@ -7341,7 +7403,7 @@ defn SystemCallException (msg:String) :
     next(args-seq) ;Remove first one
     val cmd = escape-shell-command(cat([file], args-seq))
     val r = call-system(cmd)
-    throw(SystemCallException(linux-error-msg())) when r < 0
+    throw(SystemCallException(linux-error-msg())) when r != 0
     r
 
   public defn initialize-process-launcher () :
@@ -7361,7 +7423,8 @@ defn SystemCallException (msg:String) :
                                 error:ref<StreamSpecifier>) -> ref<Process> :
     ensure-valid-stream-specifiers(input, output, error)
     val args = to-tuple(args0)
-    val proc = new Process{0, null, null, null, false, false, false}
+    val proc = new Process{0, NEXT-PIPE-ID, null, null, null, false, false, false}
+    NEXT-PIPE-ID = NEXT-PIPE-ID + 1
     val input_v = value(input).value
     val output_v = value(output).value
     val error_v = value(error).value
@@ -7371,8 +7434,8 @@ defn SystemCallException (msg:String) :
     for (var i:long = 0, i < nargs, i = i + 1) :
       argvs[i] = addr!(args.items[i].chars)
     val launch_succ = call-c clib/launch_process(addr!(filename.chars), argvs,
-      input_v, output_v, error_v, addr!([proc]))
-    if launch_succ < 0 :
+      input_v, output_v, error_v, proc.pipeid, addr!([proc]))
+    if launch_succ != 0 :
       throw(SystemCallException(linux-error-msg()))
     return proc
   public defn Process (filename:String, args:Seqable<String>) :
@@ -7425,6 +7488,12 @@ defn SystemCallException (msg:String) :
     val TERMINATED = 2
     val STOPPED = 3
 
+    if s.state != RUNNING and p.pipeid != -1 :
+      val res = call-c clib/delete_process_pipes(p.input, p.output, p.error, p.pipeid)
+      if res < 0 :
+        throw(SystemCallException(linux-error-msg()))
+      p.pipeid = -1
+      
     ;Translation
     if s.state == RUNNING :
       return ProcessRunning()
@@ -7893,6 +7962,7 @@ public deftype Timer
 public defmulti start (t:Timer) -> False
 public defmulti stop (t:Timer) -> False
 public defmulti time (t:Timer) -> Long
+public defmulti running? (t:Timer) -> True|False
 
 defn Timer (name:String, get-time: () -> Long) :
    var total-time:Long = 0L
@@ -7912,6 +7982,8 @@ defn Timer (name:String, get-time: () -> Long) :
       defmethod time (this) :
          if running : total-time + get-time() - last-time
          else : total-time
+      defmethod running? (this) :
+         running
       defmethod print (o:OutputStream, this) :
          print(o, "[%_ Timer : %_]" % [name, time(this)])
 

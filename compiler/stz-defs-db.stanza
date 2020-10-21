@@ -1,0 +1,188 @@
+defpackage stz/defs-db :
+  import core
+  import collections
+  import stz/namemap
+  import stz/compiler
+  import stz/front-end
+  import stz/visibility
+  import stz/il-ir
+  import stz/pkg
+  import stz/dl-ir
+  import stz/vm-ir
+  import stz/algorithms
+  import stz/proj-manager
+  import stz/defs-db-serializer
+  import stz/proj
+  import stz/params
+  import stz/config
+
+;============================================================
+;=================== Driver Arguments =======================
+;============================================================
+
+public defstruct DefsDbInput :
+  proj-files: Tuple<String>
+  platform: Symbol|False
+  flags: Tuple<Symbol>
+  optimize?: True|False
+
+public defn defs-db (input:DefsDbInput, filename:String) :
+  ;Compute platform
+  read-config-file()
+  val db-platform = match(platform(input)) :
+    (s:Symbol) : s
+    (f:False) : OUTPUT-PLATFORM
+    
+  ;Read all listed packages from given project files
+  val proj-file = read-proj-files(proj-files(input), db-platform)
+  val input-packages = all-packages(proj-file)
+
+  ;Construct build settings
+  val proj-files-and-packages = to-tuple $
+    cat(proj-files(input), input-packages)
+  val build-settings = BuildSettings(
+    BuildPackages(proj-files-and-packages), ;inputs
+    [],                                     ;vm-packages
+    db-platform,                            ;platform
+    false,                                  ;assembly
+    false                                   ;output
+    false,                                  ;pkg-dir
+    optimize?(input),                       ;optimize?
+    [],                                     ;ccfiles
+    [],                                     ;ccflags
+    flags(input))                           ;flags
+    
+  ;Compute dependencies
+  val dep-result = dependencies(build-settings, true)
+
+  ;Call generation of definitions database
+  gen-defs-db(filename, namemap(dep-result), packages(dep-result))
+
+
+;============================================================
+;============= Retrieve All Packages in Proj File ===========
+;============================================================
+
+defn all-packages (proj-file:ProjFile) -> Tuple<Symbol> :
+  val defined = filter-by<DefinedInStmt>(stmts(proj-file))
+  to-tuple(seq(package, defined))
+
+;============================================================
+;============================================================
+;============================================================
+public defmulti kindof (e) -> SrcDefinitionKind
+public defmethod kindof (e): 
+  SrcDefUnknown
+
+public defmethod kindof (e:IDefmulti): 
+  SrcDefMulti
+
+public defmethod kindof (e:IDefmethod|ILSDefmethod): 
+  SrcDefMethod
+
+public defmethod kindof (e:IDefn|ILSDefn): 
+  SrcDefFunction
+
+public defmethod kindof (e:IDefType|ILSDefType): 
+  SrcDefType
+
+defstruct DefRec :
+  name: Symbol
+  info: FileInfo
+
+defmulti public-definitions (pkg:IPackage|Pkg, nm:NameMap) -> Seq<Definition>
+
+defn lookup (nm:NameMap, e:IExp) -> False|Symbol :
+  match(e:VarN) : name(nm[n(e)])
+  else: false
+
+;find all public definitions in ipackage
+defmethod public-definitions (ipackage:IPackage, nm:NameMap) -> Seq<Definition> :
+  val exps = generate<IExp> :
+    defn loop (e:IExp) :
+      defn* loop-public (e:IExp, public?:True|False) :
+        match(e) :
+          (e:IBegin) :
+            do(loop-public{_, public?}, exps(e))
+          (e:IDefn|IDef|IDefChild|IDefType|IDefVar|IDefmulti|IDefmethod|ILSDefn|ILSDefType|ILSDefmethod|IDoc) :
+            yield(e)
+          (e:IVisibility) :
+            loop-public(exp(e), visibility(e) is Public)
+          (e) :
+            false
+      match(e) :
+        (e:IBegin) :
+          do(loop, exps(e))
+        (e:IDoc) :
+          yield(e)
+        (e:IDefmethod|ILSDefmethod) :
+          yield(e)
+        (e:IVisibility) :
+          loop-public(exp(e), visibility(e) is Public)
+        (e) :
+          false
+    for e in exps(ipackage) do :
+      loop(e)
+  generate<Definition> :
+    for exp in exps do :
+      defn add-def (e-name:IExp, info:False|FileInfo) :
+        match(info:FileInfo) :
+          match(lookup(nm, e-name)) :
+            (e-name:Symbol) : 
+              yield $ Definition(e-name, info, kindof(exp), SrcDefinition, name(ipackage))
+            (o) : false
+      match(exp) :
+        (e:ILSDefType|IDef|IDefVar|ILSDefn|IDefn|IDefmulti) :
+          add-def(name(e), info(e))
+        (e:IDefType) :
+          add-def(class(e), info(e))
+        (e:ILSDefmethod|IDefmethod) :
+          add-def(multi(e), info(e))
+        (e) :
+          false
+    
+defn collect-public-definitions (packageio:PackageIO) -> Seq<Definition> :
+  generate<Definition> :
+    defn add-def (name:Symbol, info:False|FileInfo) :
+      match(info:FileInfo) : 
+        yield $ Definition(name, info, SrcDefUnknown, PkgDefinition, package(packageio))
+
+    for e in exports(packageio) do :
+      if visibility(e) is Public :
+        add-def(name(id(rec(e))), info(e))
+
+defmethod public-definitions (pkg:FastPkg, nm:NameMap) -> Seq<Definition> :
+  collect-public-definitions(packageio(pkg))
+
+defmethod public-definitions (pkg:StdPkg, nm:NameMap) -> Seq<Definition> :
+  collect-public-definitions(packageio(vmp(pkg)))
+
+val stanza-reserved-words = [
+  "package" "import" "prefix-of" "prefix" "public" "protected" "private" "doc" "deftype" "defchild" "def"
+  "defpackage" "defvar" "defn" "defn*" "defmulti" "defmethod" "defmethod*" "fn" "fn*"
+  "multi" "begin" "let" "match" "branch" "new" "as" "as?" "set" "do"
+  "prim" "tuple" "quote" "none" "of" "and" "or" "->" 
+  "cap" "void" "new" "struct" "addr" "addr!" "deref"
+  "slot" "field" "do" "call-c" "prim" "sizeof" "tagof" 
+  "letexp" "and" "or" "set" "label" "labels" "block" "goto" "return"
+  "let" "if" "match" "branch" "func" "def" "defvar" "deftype" "deffield"
+  "extern" "extern-fn" "byte" "int" "long" "float" "double"
+  "?" "of" "ptr" "ref"
+  ]
+
+public defn gen-defs-db (
+  out-path: String, 
+  name-map:    NameMap,
+  packages: Seqable<IPackage|Pkg>
+):
+  val all-definitions = HashTable<Symbol, List<Definition>>(List())
+  for package in packages do : 
+    val definitions = to-tuple $ public-definitions(package, name-map)
+    for def in definitions do : 
+      val name = name(def)
+      update(all-definitions, cons{def, _}, name)
+  val ddb = DefinitionsDatabase(stanza-reserved-words, all-definitions)
+  val ostream = FileOutputStream(out-path)
+  serialize(ostream, ddb)
+  close(ostream)
+  
