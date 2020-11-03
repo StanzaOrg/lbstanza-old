@@ -374,6 +374,27 @@ defn clone-and-analyze (gt:GrammarTransformer, mods:Vector<GrammarMod>, analyze:
       p*
   [analyze-prod, table]
 
+;Given a production for creating new rules, create a
+;function that returns a new production cloned from an existing
+;production with the analyzed rules.
+defn clone-and-analyze<T> (gt:GrammarTransformer,
+                           mods:Vector<GrammarMod>,
+                           analyze:(GTokenRule, T) -> Seqable<GTokenRule>) ->
+                          [(GProduction, T) -> GProduction, HashTable<[GProduction,T], GProduction>]:
+  val table = HashTable<[GProduction,T], GProduction>()
+  defn analyze-prod (p:GProduction, params:T) -> GProduction :
+    val k = [p, params]
+    if key?(table, k) :
+      table[k]
+    else :
+      val p* = fresh-production(gt)
+      add(mods, CloneProduction(p*, p))
+      table[k] = p*
+      for r in seq-cat(analyze{_, params}, token-rules(gt, p)) do :
+        add(mods, AddRule(sub-prod(make-fresh(gt, r), id(p*))))
+      p*
+  [analyze-prod, table]
+
 ;Replace the rules for the given productions with the results
 ;of running the given analysis function.
 defn replace-rules-for-prods (gt:GrammarTransformer,
@@ -384,6 +405,86 @@ defn replace-rules-for-prods (gt:GrammarTransformer,
     for r in seq-cat(analyze, token-rules(gt,p)) do :
       add(mods, DeleteRule(id(r)))
       add(mods, AddRule(make-fresh(gt, r)))
+
+;============================================================
+;================== Recursion Status ========================
+;============================================================
+
+;Compute the recursion status of the given token.
+defn rec-status (t:GToken, group:Int,
+                 null-set:HashSet<GProduction>,
+                 sets:GProduction -> List<GToken>,
+                 prod-group:GProduction -> Int|False) -> RecStatus :
+  defn group-status (t:GToken) -> GroupStatus|NullProd :
+    match(t) :
+      (t:GTerminal) :
+        Terminal
+      (t:GProduction) :
+        if null-set[t] :
+          NullProd
+        else :
+          match(prod-group(t)) :
+            (g:Int) :
+              if g == group : SameGroup
+              else : DifferentGroup
+            (f:False) : NotInGroup
+  switch(group-status(t)) :
+    NullProd : NullProd
+    Terminal : NRec
+    SameGroup : Rec
+    DifferentGroup : NRec
+    NotInGroup :
+      val set-tokens = sets(t as GProduction)
+      if any?({group-status(_) == SameGroup}, set-tokens) :
+        if any?({group-status(_) is Terminal|DifferentGroup}, set-tokens) : Rec+NRec
+        else : Rec
+      else : NRec
+
+;Create the recursion status functions.
+defn rec-status-functions (props:GrammarProperties,
+                           rec-group:HashTable<GProduction,Int>,
+                           null-set:HashSet<GProduction>) :
+  defn left-sets (p:GProduction) -> List<GToken> : /left-sets(props)[id(p)]
+  defn right-sets (p:GProduction) -> List<GToken> : /right-sets(props)[id(p)]
+  defn prod-group (p:GProduction) : get?(rec-group, p)
+  defn left-rec-status (t:GToken, group:Int) -> RecStatus :
+    rec-status(t, group, null-set, left-sets, prod-group)
+  defn right-rec-status (t:GToken, group:Int) -> RecStatus :
+    rec-status(t, group, null-set, right-sets, prod-group)
+  [left-rec-status, right-rec-status]    
+
+;Represents the group classification of a given token.
+;- SameGroup: The token is in the same recursion group.
+;- DifferentGroup: The token is also left-right-recursive but in a different group.
+;- NotInGroup: The token is not left-right-recursive.
+;- Terminal: The token is a terminal.
+defenum GroupStatus :
+  SameGroup
+  DifferentGroup
+  NotInGroup
+  Terminal
+
+;Represents the recursion status of a production.
+;Productions can be:
+;- Null production (NullProd). All rules for production are null.
+;- Only recursive (Rec). All rules for production end/begin with recursive production.
+;- Not recursive (NRec). No rules for production end/begin with recursive production.
+;- Both recursive and not recursive (Rec+NRec). Some rules for production
+;  end/begin with recursive production.
+defenum RecStatus :
+  NullProd
+  Rec
+  NRec
+  Rec+NRec
+
+;Returns [rec?, nrec?] where:
+;rec? is true if status includes recursive rules.
+;nrec? is true if status includes nonrecursive rules.
+defn flags (status:RecStatus) -> [True|False, True|False] :
+  switch(status) :
+    Rec : [true, false]
+    NRec : [false, true]
+    Rec+NRec : [true, true]
 
 ;<doc>=======================================================
 ;=============== Left-Right-Recursive Transform =============
@@ -400,6 +501,8 @@ Operations needed for manipulating rules:
 
 ;============================================================
 ;=======================================================<doc>
+
+
 
 defn remove-null-endings (grammar:GRules,
                           lr-prods:Tuple<GProduction>,
@@ -495,13 +598,14 @@ defn remove-null-endings (grammar:GRules,
 
   ;Launch!
   main()
+
+
   
-;<remove-partial-recursion>
 defn remove-partial-recursion (grammar:GRules,
-                               rec-group:IntTable<Int|False>,
-                               null-set:IntSet) -> GRules :
+                               rec-group:HashTable<GProduction,Int>,
+                               null-set:HashSet<GProduction>) -> GRules :
   ;Compute grammar properties
-  val lr-prods = to-tuple(seq(GProduction, keys(rec-group)))
+  val lr-prods = to-tuple(keys(rec-group))
   val props = analyze-grammar-properties(grammar, lr-prods)
 
   ;Create transformer
@@ -510,35 +614,8 @@ defn remove-partial-recursion (grammar:GRules,
   ;Accumulate modifications
   val mods = Vector<GrammarMod>()
 
-  ;Utility: Create a fresh identifier for the given rule.
-  defn make-fresh (r:GTokenRule) -> GTokenRule :
-    sub-id(r, fresh-rule(gt)) as GTokenRule
-
-  ;Modify the LR productions.
-  ;Replace each rule for a LR production, with the analyzed rules from the given
-  ;analysis function.
-  defn modify-lr-prods (analyze-rule:GTokenRule -> Seqable<GTokenRule>) :
-    for e in lr-prods do :
-      for r in token-rules(gt,e) do :
-        add(mods, DeleteRule(id(r)))
-        for r* in analyze-rule(r) do :
-          add(mods, AddRule(make-fresh(r*)))    
-
-  ;Given a production for creating new rules, create a
-  ;function that returns a new production cloned from an existing
-  ;production with the analyzed rules.
-  defn clone-and-analyze (analyze:GTokenRule -> Seqable<GTokenRule>) :
-    val table = HashTable<[Int,Int],GProduction>()
-    fn (p:GProduction, group:Int) -> GProduction :
-      if key?(table, [id(p), group]) :
-        table[[id(p), group]]
-      else :
-        val p* = fresh-production(gt)
-        add(mods, CloneProduction(p*, p))
-        table[[id(p), group]] = p*
-        for r in seq-cat(analyze, token-rules(gt, p)) do :
-          add(mods, AddRule(sub-prod(make-fresh(r), id(p*))))
-        p*
+  ;Functions for computing recursion status
+  val [left-rec-status, right-rec-status] = rec-status-functions(props, rec-group, null-set)
 
   ;Functions for analyzing productions
   var prod-with-left-rec:(GProduction, Int) -> GProduction
@@ -546,53 +623,17 @@ defn remove-partial-recursion (grammar:GRules,
   var prod-with-right-rec:(GProduction, Int) -> GProduction
   var prod-without-right-rec:(GProduction, Int) -> GProduction
 
-  ;Compute the recursion status of the given token.
-  ;Must pass the production set to use, representing either the left-sets or right-sets of the
-  ;production.
-  defn rec-status (sets:GrammarProperties -> ProductionTable<List<GToken>>, t:GToken, group:Int) -> RecStatus :
-    defn group-status (t:GToken) -> GroupStatus|NullProd :
-      match(t) :
-        (t:GTerminal) : Terminal
-        (t:GProduction) :
-          if null-set[id(t)] :
-            NullProd
-          else :
-            match(get?(rec-group, id(t))) :
-              (g:Int) :
-                if g == group : SameGroup
-                else : DifferentGroup
-              (f:False) : NotInGroup
-    switch(group-status(t)) :
-      NullProd : NullProd
-      Terminal : NRec
-      SameGroup : Rec
-      DifferentGroup : NRec
-      NotInGroup :
-        val set-tokens = sets(props)[id(t as GProduction)]
-        if any?({group-status(_) == SameGroup}) :
-          if any?({group-status(_) is Terminal|DifferentGroup}) : Rec+NRec
-          else : Rec
-        else : NRec
-
-  ;Returns [rec?, nrec?] where:
-  ;rec? is true if status indicates that recursive rules should be kept.
-  ;nrec? is true if status indicates that nonrecursive rules should be kept.
-  defn flags (status:RecStatus) -> [True|False, True|False] :
-    switch(status) :
-      Rec : [true, false]
-      NRec : [false, true]
-      Rec+NRec : [true, true]
-
   ;Split up the given rule into multiple rules such that,
   ;for every rule, the beginning token is either entirely left-recursive
   ;or never left-recursive.
   defn split-partial-left-recursion (r:GTokenRule, status:RecStatus, group:Int) -> Seqable<GTokenRule> :
     ;Compute rules to keep.
-    val [rec?, nrec?] = flags(status)    
+    val [rec?, nrec?] = flags(status)
+    ;Accumulate rules
     val rules* = Vector<GTokenRule>()
     let loop (i:Int = 0) :
       val t = tokens(r)[i]
-      switch(rec-status(left-sets, t, group)) :
+      switch(left-rec-status(t, group)) :
         NullProd :
           loop(i + 1)
         Rec+NRec :
@@ -618,7 +659,7 @@ defn remove-partial-recursion (grammar:GRules,
     val num-tokens = length(tokens(r))
     let loop (i:Int = num-tokens - 1) :
       val t = tokens(r)[i]
-      switch(rec-status(right-sets, t, group)) :
+      switch(right-rec-status(t, group)) :
         NullProd :
           loop(i - 1)
         Rec+NRec :
@@ -637,29 +678,22 @@ defn remove-partial-recursion (grammar:GRules,
   ;Split up the given rule into multiples rules such that rules do not
   ;begin/end with tokens that are neither entirely recursive nor non-recursive.
   defn split-partial-recursion (r:GTokenRule) -> Seqable<GTokenRule> :
-    val group = rec-group[prod(r)]
+    val group = rec-group[GProduction(prod(r))]
     for r in split-partial-left-recursion(r, Rec+NRec, group) seq-cat :
       split-partial-right-recursion(r, Rec+NRec, group)
 
   ;Main algorithm
   defn main () :
-    prod-with-left-rec = clone-and-analyze(split-partial-left-recursion{_, Rec})
-    prod-without-left-rec = clone-and-analyze(split-partial-left-recursion{_, NRec})
-    prod-with-right-rec = clone-and-analyze(split-partial-right-recursion{_, Rec})
-    prod-without-right-rec = clone-and-analyze(split-partial-right-recursion{_, NRec})
-    analyze-lr-prods(split-partial-recursion)
-    modify(gt, GrammarModification(to-tuple(mods)))
+    prod-with-left-rec = fst $ clone-and-analyze<Int>(gt, mods, split-partial-left-recursion{_, Rec, _})
+    prod-without-left-rec = fst $ clone-and-analyze<Int>(gt, mods, split-partial-left-recursion{_, NRec, _})
+    prod-with-right-rec = fst $ clone-and-analyze<Int>(gt, mods, split-partial-right-recursion{_, Rec, _})
+    prod-without-right-rec = fst $ clone-and-analyze<Int>(gt, mods, split-partial-right-recursion{_, NRec, _})
+    replace-rules-for-prods(gt, lr-prods, mods, split-partial-recursion)
+    modify(gt, mods)
     /grammar(gt)
     
   ;Launch!
   main()
-
-defenum GroupStatus :
-  SameGroup
-  DifferentGroup
-  NotInGroup
-  Terminal
-;<remove-partial-recursion>
 
 ;<comment>
 defn transform-left-right-recursion (grammar:GRules,
@@ -963,14 +997,49 @@ defn remove-left-right-recursion (grammar:GRules) -> GRules :
   val props = analyze-grammar-properties(grammar, [])
 
   ;Discover all left-right-recursive productions.
-  defn left-recursive? (prod:GProduction) -> True|False :
-    contains?(left-sets(props)[id(prod)], prod)
-  defn right-recursive? (prod:GProduction) -> True|False :
-    contains?(right-sets(props)[id(prod)], prod)
-  defn left-right-recursive? (prod:GProduction) -> True|False :
-    left-recursive?(prod) and right-recursive?(prod)
-  val lrprods = to-tuple(filter(left-right-recursive?, prods)) where :
+  defn left-right-recursive-productions () -> Tuple<GProduction> :
+    defn left-recursive? (prod:GProduction) -> True|False :
+      contains?(left-sets(props)[id(prod)], prod)
+    defn right-recursive? (prod:GProduction) -> True|False :
+      contains?(right-sets(props)[id(prod)], prod)
+    defn left-right-recursive? (prod:GProduction) -> True|False :
+      left-recursive?(prod) and right-recursive?(prod)
     val prods = seq(GProduction{id(_)}, productions(grammar))
+    to-tuple(filter(left-right-recursive?, prods))
+
+  ;Compute the recursion groups for LR productions.
+  defn recursion-groups (lr-prods:Tuple<GProduction>) -> HashTable<GProduction,Int> :
+    ;Set of LR productions
+    val lr-prod-set = to-hashset<GToken>(lr-prods)
+    
+    ;Create initial table
+    defn rec-entry (p:GProduction) -> KeyValue<GProduction,List<GProduction>> :
+      val set-tokens = cat(left-sets(props)[id(p)], right-sets(props)[id(p)])
+      val set-prods = to-list(filter({lr-prod-set[_]}, set-tokens)) as List<GProduction>
+      p => set-prods
+
+    ;Compute mutually recursive productions
+    val components = strong-components(seq(rec-entry, lr-prods))
+
+    ;Compute table
+    val table = HashTable<GProduction,Int>()
+    val group-counter = to-seq(0 to false)
+    for c in components do :
+      match(c:List<GProduction>) :
+        val g = next(group-counter)
+        for p in c do : table[p] = g
+        
+    ;Return table    
+    table    
+
+  println("===== Original Grammar =====")
+  println(grammar)
+  println("===== Left Right Recursive Productions =====")
+  val lr-prods = left-right-recursive-productions()
+  println(lr-prods)
+  println("===== Recursion Groups =====")
+  val rec-groups = recursion-groups(lr-prods)
+  do(println, rec-groups)
 
   ;Create atoms for all left-right-recursive productions
   ;val gt = GrammarTransformer(grammar)
@@ -987,14 +1056,14 @@ defn remove-left-right-recursion (grammar:GRules) -> GRules :
   ;println(grammar1)
 
   ;Remove null endings
-  val [grammar15, null-set] = remove-null-endings(grammar, lrprods, props)
+  val [grammar-a, null-set] = remove-null-endings(grammar, lr-prods, props)
   println("===== REMOVED NULL ENDINGS =====")
-  println(grammar15)
+  println(grammar-a)
 
   ;Remove partial recursion
-  ;val grammar16 = remove-partial-recursion(grammar15, atom-table, null-set)
-  ;println("===== REMOVED PARTIAL RECURSION =====")
-  ;println(grammar16)
+  val grammar-b = remove-partial-recursion(grammar-a, rec-groups, null-set)
+  println("===== REMOVED PARTIAL RECURSION =====")
+  println(grammar-b)
 
   ;;Remove left recursion
   ;val grammar2 = remove-left-recursion(grammar1, atom-table)
@@ -1007,18 +1076,6 @@ defn remove-left-right-recursion (grammar:GRules) -> GRules :
   ;grammar3
 
   fatal("Not yet finished")
-
-;Represents the recursion status of a production.
-;Productions can be:
-;- Only recursive (Rec). All rules for production end/begin with recursive production.
-;- Not recursive (NRec). No rules for production end/begin with recursive production.
-;- Both recursive and not recursive (Rec+NRec). Some rules for production
-;  end/begin with recursive production.
-defenum RecStatus :
-  NullProd
-  Rec
-  NRec
-  Rec+NRec
 
 ;Substitute entry in tuple
 defn sub-item<?T> (xs:Tuple<?T>, index:Int, item:T) :
