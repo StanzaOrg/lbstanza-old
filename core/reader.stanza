@@ -255,6 +255,11 @@ defstruct Operator :
 defmethod print (o:OutputStream, t:Operator) :
   print(o, "Operator(%~)" % [symbol(t)])
 
+defstruct ReluctantEnd :
+  empty-line?:True|False
+defmethod print (o:OutputStream, e:ReluctantEnd) :
+  print(o, "ReluctantEnd(%_)" % [empty-line?(e)])
+
 defstruct StreamEnd
 
 ;============================================================
@@ -324,7 +329,8 @@ defn tokenize (s:ParseStream, reluctant?:True|False) :
   generate<Token> :
     ;Eat until next non-ignored character.
     ;Whitespace and comments are ignored.
-    defn eat-ignored-chars () :
+    ;Returns true if line contains comments.
+    defn eat-ignored-chars () -> True|False :
       defn eat-whitespace () :
         while whitespace?(peek?(s)) :
           get-char!(s)
@@ -344,9 +350,10 @@ defn tokenize (s:ParseStream, reluctant?:True|False) :
                 loop()
           ;Comment successfully read
           true
-      let loop () :
+      let loop (has-comments?:True|False = false) :
         eat-whitespace()
-        loop() when eat-comment()
+        if eat-comment() : loop(true)
+        else : has-comments?
 
     ;Tagged Properties
     ;Returns [tag-length, block-length]
@@ -583,23 +590,25 @@ defn tokenize (s:ParseStream, reluctant?:True|False) :
       val star-token = eat-starred-structural-token(token)
       match(star-token:Token) :
         emit-and-update-stack(star-token)
-
-    defn* eat-lexemes () :
-      eat-ignored-chars()
+        
+    defn* eat-lexemes (lexemes-on-line?:True|False) :
+      val commented-line? = eat-ignored-chars()
       if peek?(s) is-not False :
         ;Case: End of line
         if peek?(s) == '\n' :          
           get-char!(s)
-          if not (reluctant? and empty?(scopes)) :
-            eat-lexemes()
+          if reluctant? :
+            val empty-line? = not lexemes-on-line? and not commented-line?
+            yield(Token(ReluctantEnd(empty-line?), line-info(s)))
+          eat-lexemes(false)
         ;Case: Lexeme ahead.
         else :
           issue-indentation?()
           eat-lexeme!()
-          eat-lexemes()
+          eat-lexemes(true)
 
     ;Launch
-    eat-lexemes()
+    eat-lexemes(false)
     yield(Token(StreamEnd(), line-info(s)))
 
 ;============================================================
@@ -627,11 +636,16 @@ defn convert-indentations-to-structural-tokens (tokens:Seq<Token>) -> Seq<Token>
     ;Test whether the given token is a line-ending colon.
     ;If it is, then we pop the next indentation from the token stream and pass
     ;it to the 'yes' result.
-    defn* line-ending-colon?<?T> (x:Operator, yes:(Int, FileInfo) -> ?T, no:() -> ?T) :
+    defn* line-ending-colon?<?T> (x:Operator, yes:(Int, FileInfo) -> ?T, no:() -> ?T) -> T :
       if symbol(x) == `: :
         match(item(peek(tokens))) :
-          (item:Indentation) : yes(indent(item), info(next(tokens)))
-          (item:StreamEnd) : yes(0, info(next(tokens)))
+          (item:Indentation) :
+            yes(indent(item), info(next(tokens)))
+          (item:ReluctantEnd) :
+            next(tokens)
+            line-ending-colon?(x, yes, no)
+          (item:StreamEnd) :
+            throw(ExpectingIndentedBlock(info(peek(tokens))))
           (item) : no()
       else : no()
 
@@ -724,11 +738,42 @@ defn convert-indentations-to-structural-tokens (tokens:Seq<Token>) -> Seq<Token>
               throw(InvalidBlock(info(t), indent(item), base-info as FileInfo, prev-base))
           add(stack, t)
 
-    ;Process a given token
-    defn* process (t:Token) :
+    ;Process a given token.
+    ;Returns true if StreamEnd has been processed, and processing is finished.
+    defn* process (t:Token) -> True|False :
       match(item(t)) :
-        (item:Indentation|CloseToken|StreamEnd) :
+        (item:ReluctantEnd) :
+          ;Helper: Return true if the given stack context represents
+          ;an IndentedBlock with indent = 0.
+          defn zero-indent? (c:StackCtxt) :
+            match(c:IndentedBlock) :
+              indent(c) == 0
+          ;Helper: Process the reluctant end as a confirmed stream end.
+          defn* process-as-stream-end () :
+            process(sub-token-item?(t, StreamEnd()))
+          ;Helper: Return true if there are no open scopes on the stack.
+          defn* no-open-scopes? () :
+            none?({/item(_) is OpenToken}, stack)
+          ;Helper: Return true if there are no indented blocks on the stack.
+          defn* no-indented-blocks? () :
+            for s in stack none? :
+              val b = /item(s)
+              match(b:IndentedBlock) :
+                indent(b) > 0
+          ;Case: If it's an empty line, then it's a confirmed end as long
+          ;      as there are no open scopes.
+          ;Case: If it's not an empty line, then it's a confirmed end as long
+          ;      as there are no open scopes or indented blocks > 0.
+          if empty-line?(item) :
+            process-as-stream-end() when no-open-scopes?()
+          else :
+            process-as-stream-end() when no-open-scopes?()
+                                     and no-indented-blocks?()
+        (item:Indentation|CloseToken) :
           update-stack(t)
+        (item:StreamEnd) :
+          update-stack(t)
+          true
         (item:OpenToken) :
           yield(t)
           update-stack(t)
@@ -746,8 +791,10 @@ defn convert-indentations-to-structural-tokens (tokens:Seq<Token>) -> Seq<Token>
           yield(t)            
 
     ;Process all tokens in stream
-    do(process, tokens)
-
+    let loop () :
+      if not empty?(tokens) :
+        val done? = process(next(tokens))
+        loop() when not done?
 
 ;============================================================
 ;===================== Parsing ==============================
@@ -958,9 +1005,15 @@ public defstruct NoQuotedValue <: LexerException :
 defmethod print (o:OutputStream, e:NoQuotedValue) :
   print(o, "%_: No s-expression following quote operator." % [info(e)])
 
+public defstruct ExpectingIndentedBlock <: LexerException :
+  info:FileInfo
+
+defmethod print (o:OutputStream, e:ExpectingIndentedBlock) :
+  print(o, "%_: Expecting an indented block following line-ending colon." % [info(e)])
+
 ;============================================================
 ;==================== Incomplete Input ======================
 ;============================================================
 
 public defn caused-by-incomplete-input? (e:LexerException) -> True|False :
-  e is NoForm|NoEndTagFound|UnclosedCharString|UnclosedString|UnclosedSymbol|NoClosingToken
+  e is NoForm|NoEndTagFound|UnclosedCharString|UnclosedString|UnclosedSymbol|NoClosingToken|ExpectingIndentedBlock
