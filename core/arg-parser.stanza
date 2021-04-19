@@ -1,0 +1,595 @@
+;See License.txt for details about licensing.
+
+defpackage arg-parser :
+   import core
+   import collections
+   import line-wrap
+
+;============================================================
+;================== Types of Flags ==========================
+;============================================================
+
+public defstruct Command :
+  name: String
+  argtype: ArgType
+  arg-description: String|False
+  flags: Tuple<Flag>
+  description: String|False
+  long-description: String|False with: (default => false)
+  verify-args: CommandArgs -> ? with: (default => default-verify)
+  action: CommandArgs -> ?
+
+public defenum ArgType :
+  OneArg
+  ZeroArg
+  ZeroOrOneArg
+  AtLeastOneArg
+  ZeroOrMoreArg
+
+public defenum FlagOptionalSetting :
+  RequiredFlag
+  OptionalFlag
+
+public defstruct Flag :
+  name: String
+  type: FlagType
+  optional?: FlagOptionalSetting
+  description: String|False
+
+public defenum FlagType :
+  GreedyFlag
+  OneFlag
+  ZeroFlag
+  ZeroOrOneFlag
+  AtLeastOneFlag
+  ZeroOrMoreFlag  
+
+public defn default-verify (args:CommandArgs) :
+  false
+
+;------------------------------------------------------------
+;-------------------- Arguments to Command ------------------
+;------------------------------------------------------------
+
+public defstruct CommandArgs :
+  args: Tuple<String>
+  flags: Tuple<ParsedFlag>
+  all-flags: Tuple<String>
+
+defstruct ParsedFlag :
+  flagname:String
+  value
+
+;------------------------------------------------------------
+;-------------------- Result of Parse -----------------------
+;------------------------------------------------------------
+
+public deftype CommandResult
+public defstruct FoundCommand <: CommandResult :
+  command:Command
+  args:CommandArgs
+
+public defstruct NoCommand <: CommandResult :
+  name:String
+
+public defstruct MissingCommandName <: CommandResult  
+
+public defstruct ArgParseFailure <: CommandResult :
+  command:Command
+  cause:ArgParseError
+
+;============================================================
+;==================== Preconditions =========================
+;============================================================
+
+defn ensure-valid-commands! (commands:Tuple<Command>,
+                             default-command:String|False) :
+  ;Ensure no duplicate commands!
+  val command-set = HashSet<String>()
+  val duplicate-cmds = to-tuple $
+    filter({not add(command-set, name(_))}, commands)
+  if not empty?(duplicate-cmds) :
+    fatal("Duplicate commands: %,." % [duplicate-cmds])
+
+  ;Ensure default command exists
+  match(default-command:String) :
+    if not command-set[default-command] :
+      fatal("Invalid default command %_." % [default-command])
+
+  ;Ensure no duplicate flags in commands
+  for command in commands do :
+    ;Ensure no duplicate flags!
+    val flag-set = HashSet<String>()
+    val duplicate-flags = to-tuple $
+      filter({not add(flag-set, name(_))}, flags(command))
+    if not empty?(duplicate-flags) :
+      fatal("Duplicate flags in '%_' command: %,." % [name(command), duplicate-flags])
+
+;============================================================
+;================= CommandArgs API ==========================
+;============================================================
+
+public defn arg (a:CommandArgs, i:Int) -> String :
+  args(a)[i]
+
+public defn num-args (a:CommandArgs) -> Int :
+  length(args(a))
+
+public defn get (a:CommandArgs, name:String) :
+  if not contains?(all-flags(a), name) :
+    fatal("-%_ is not a supported flag for this command." % [name])
+  val flag = find({flagname(_) == name}, flags(a))
+  match(flag:ParsedFlag) : value(flag)
+  else : fatal("Flag -%_ was not given." % [name])
+
+public defn get? (a:CommandArgs, name:String, default) :
+  if not contains?(all-flags(a), name) :
+    fatal("-%_ is not a supported flag for this command." % [name])
+  val flag = find({flagname(_) == name}, flags(a))
+  match(flag:ParsedFlag) : value(flag)
+  else : default  
+
+public defn flag? (a:CommandArgs, name:String) :
+  if not contains?(all-flags(a), name) :
+    fatal("-%_ is not a supported flag for this command." % [name])
+  any?({flagname(_) == name}, flags(a))
+
+;============================================================
+;============== Argument Parsing Algorithm ==================
+;============================================================
+
+;Parse the command with the given arguments.
+defn parse-command (command:Command, arguments:Tuple<String>) -> CommandArgs :
+  val [args, flags] = parse-args-and-flags(flags(command), arguments)
+  ensure-valid-arg-arity(name(command), argtype(command), args)
+  ensure-flags-are-present(name(command), /flags(command), flags)  
+  val comm-args = CommandArgs(args, flags, map(name,/flags(command)))
+  try : verify-args(command)(comm-args)
+  catch (e:Exception) : throw(ArgParseError(to-string(e)))
+  comm-args
+
+defn parse-args-and-flags (flags:Tuple<Flag>, arguments:Tuple<String>) ->
+                          [Tuple<String>, Tuple<ParsedFlag>] :
+  ;Table of flags
+  val flag-table = to-hashtable<String,Flag> $
+    for f in flags seq :
+      name(f) => f
+
+  ;Sequence of arguments  
+  val argseq = to-seq(arguments)
+
+  ;Returns true if the given argument is a flag.
+  defn flag? (arg:String) :
+    prefix?(arg, "-") and any?(letter?, arg)    
+
+  ;Read algorithm
+  defn* eat-args () -> Tuple<String> :
+    val args = Vector<String>()
+    while not empty?(argseq) and
+          not flag?(peek(argseq)) :
+      add(args, next(argseq))
+    to-tuple(args)
+
+  ;Return all parsed flags
+  defn eat-flags () -> Tuple<ParsedFlag> :
+    val flags = Vector<ParsedFlag>()
+    while not empty?(argseq) :
+      val flagstr = next(argseq)
+      fatal("Not a flag") when not flag?(flagstr)
+      val flagname = flagstr[1 to false]
+      match(get?(flag-table, flagname)) :
+        (flag:Flag) :
+          val arg = eat-flag-arg(flagname, type(flag))
+          add(flags, ParsedFlag(flagname, arg))
+        (f:False) :
+          throw(UnrecognizedFlag(flagname))
+    to-tuple(flags)      
+
+  ;Eat the arguments for the given flag type.
+  defn* eat-flag-arg (flagname:String, type:FlagType) :
+    val args = eat-args-until-next-flag(type == GreedyFlag)
+    ensure-valid-flag-arity(flagname, type, args)
+    switch(type) :
+      GreedyFlag: args[0]
+      OneFlag: args[0]
+      ZeroFlag: true
+      ZeroOrOneFlag: None() when empty?(args) else One(args[0])
+      AtLeastOneFlag: args
+      ZeroOrMoreFlag: args
+
+  ;Eat the arguments until the next flag.
+  defn* eat-args-until-next-flag (first-arg-greedy?:True|False) -> Tuple<String> :
+    val args = Vector<String>()
+    let loop (greedy?:True|False = first-arg-greedy?) :
+      if not empty?(argseq) :
+        if greedy? or not flag?(peek(argseq)) :
+          add(args, next(argseq))
+          loop(false)
+    to-tuple(args)
+
+  ;Launch!
+  val ate-args = eat-args()
+  val ate-flags = eat-flags()
+  [ate-args, ate-flags]
+
+;Check flag arity
+defn ensure-valid-flag-arity (flagname:String, type:FlagType, args:Tuple<String>) :
+  val [min-arity, max-arity] = switch(type) :
+    GreedyFlag: [1, 1]
+    OneFlag: [1, 1]
+    ZeroFlag: [0, 0]
+    ZeroOrOneFlag: [0, 1]
+    AtLeastOneFlag: [1, false]
+    ZeroOrMoreFlag: [0, false]
+  val actual-arity = length(args)
+  val valid? = 
+    match(max-arity:Int) : actual-arity >= min-arity and actual-arity <= max-arity
+    else : actual-arity >= min-arity
+  if not valid? :
+    throw(WrongFlagArityError(flagname, type, args))
+
+;Check arg arity
+defn ensure-valid-arg-arity (command-name:String, type:ArgType, args:Tuple<String>) :
+  val [min-arity, max-arity] = switch(type) :
+    OneArg: [1, 1]
+    ZeroArg: [0, 0]
+    ZeroOrOneArg: [0, 1]
+    AtLeastOneArg: [1, false]
+    ZeroOrMoreArg: [0, false]
+  val actual-arity = length(args)
+  val valid? = 
+    match(max-arity:Int) : actual-arity >= min-arity and actual-arity <= max-arity
+    else : actual-arity >= min-arity
+  if not valid? :
+    throw(WrongArgArityError(command-name, type, args))
+
+;Ensure that all required flags are given.
+defn ensure-flags-are-present (command-name:String, flags:Tuple<Flag>, parsed:Tuple<ParsedFlag>) :
+  ;Compute set of duplicate flags together with set of parsed flags names.
+  val parsed-set = HashSet<String>()
+  val duplicate-flags = to-tuple $ for flag in parsed filter :
+    not add(parsed-set, flagname(flag))
+
+  ;Ensure there are no duplicate flags.
+  if not empty?(duplicate-flags) :
+    throw(DuplicateFlagsError(map(flagname,duplicate-flags)))
+  
+  ;Compute all required and missing flags.
+  val missing-flags = to-tuple $ for flag in flags filter :
+    switch(optional?(flag)) :
+      RequiredFlag : not parsed-set[name(flag)]
+      OptionalFlag : false
+
+  ;Ensure there are no missing flags.
+  if not empty?(missing-flags) :
+    throw(MissingFlagsError(command-name, map(name, missing-flags)))
+
+;============================================================
+;==================== Help Command ==========================
+;============================================================
+
+public defn add-help-command (description:String|False, commands:Tuple<Command>) -> Tuple<Command> :
+  ;Late bound action
+  var print-help:CommandArgs -> ? 
+  
+  ;Help command
+  val help-msg = "The 'help' command prints the usage instructions \
+  for the program and individual commands."
+  val help-command = Command("help",
+                             ZeroOrOneArg, "the command name.",
+                             [],
+                             help-msg,
+                             print-help{_})
+  val commands* = to-tuple(cat(commands, [help-command]))
+
+  ;Print the help usage instructions
+  print-help = fn (cmd-args) :
+    defn wrapped-println (x) :
+      println(LineWrapped("%_\n" % [x]))
+      
+    if num-args(cmd-args) == 0 :
+      wrapped-println(program-usage-instructions(description, commands*))
+    else :
+      val cmd-name = arg(cmd-args,0)
+      val cmd = find({name(_) == cmd-name}, commands*)
+      match(cmd:Command) :
+        wrapped-println(command-usage-instructions(cmd))
+      else :
+        val msg = within o = printable() :
+          print(o, "'%_' is not a supported command for this program.\n" % [cmd-name])
+          lnprint(o, program-usage-instructions(false, commands*))
+        throw(Exception(msg))
+
+  ;Return new commands
+  commands*
+
+;<doc>=======================================================
+;================== Usage Instructions ======================
+;============================================================
+
+PROGRAM USAGE INSTRUCTIONS:
+
+Available commands:
+
+install : No description.
+
+update : No description.
+
+unzip : No description.
+
+
+COMMAND USAGE INSTRUCTIONS:
+
+The 'install' command is a command for installing the version
+of the software that exists on the server.
+
+The 'install' command takes no arguments.
+
+Available flags for the 'install' command:
+-s : (Single argument) The assembly file.
+-i : (Optional argument)
+-o : (At least one argument) The output file.
+-f : (Optional) The force argument.
+
+;============================================================
+;=======================================================<doc>
+
+public defn program-usage-instructions (prog-description:String|False, commands:Tuple<Command>) :
+  within o = printable() :
+    ;Print program description
+    match(prog-description:String) :
+      print(o, "DESCRIPTION:")
+      lnprint(o, Indented("\n%_" % [prog-description]))
+
+    ;Print available commands
+    print(o, "\n\n") when prog-description is String
+    print(o, "AVAILABLE COMMANDS:")
+
+    ;Get command descriptions
+    val command-descriptions =
+      within o = printable() :
+        for c in commands do :
+          lnprint(o, "\n%_" % [name(c)])
+          match(description(c):String) :
+            lnprint(o, Indented("\n%_" % [description(c)]))
+            
+    print(o, Indented(command-descriptions))
+
+public defn command-usage-instructions (c:Command) :
+  within o = printable() :
+    ;Print command description
+    val desc-str = match(description(c), long-description(c)) :
+      (d, ld:String) : ld
+      (d:String, ld) : d
+      (d, ld) : false
+    match(desc-str:String) :
+      print(o, "USAGE OF COMMAND '%_':" % [name(c)])
+      lnprint(o, Indented("\n%_" % [desc-str]))
+
+    ;Print argument description
+    print(o, "\n\n") when desc-str is String
+    print(o, "ARGUMENTS:")
+    lnprint(o, Indented("\n%_" % [arg-description-str(c)]))
+
+    ;Print available flags
+    if not empty?(flags(c)) :      
+      ;Get flag descriptions
+      val flag-descriptions =
+        within o = printable() :
+          for flag in flags(c) do :
+            lnprint(o, "\n%_" % [flag-description(flag)])
+      ;Print      
+      lnprint(o, "\nAVAILABLE FLAGS:")
+      print(o, Indented(flag-descriptions))
+
+defn arg-description-str (c:Command) :
+  ;Description of arity of argument
+  val arity-str = switch(argtype(c)) :
+    ZeroArg: " takes no arguments"
+    OneArg: " requires a single argument"
+    AtLeastOneArg: " requires at least one argument"
+    ZeroOrOneArg: " takes one optional argument"
+    ZeroOrMoreArg: " takes multiple arguments"
+
+  ;Written description of argument
+  val desc-str = match(arg-description(c)) :
+    (d:String) : ", %_" % [d]
+    (f:False) : "."
+
+  ;Put it together:
+  "The '%_' command%_%_" % [
+    name(c), arity-str, desc-str]
+
+defn flag-description (f:Flag) :
+  defn optional-str () :
+    switch(optional?(f)) :
+      RequiredFlag : ""
+      OptionalFlag : "Optional, "
+  defn type-str () :
+    switch(type(f)) :
+      GreedyFlag: "Single argument"
+      OneFlag: "Single argument"
+      ZeroFlag: "No arguments"
+      ZeroOrOneFlag: "Optional argument"
+      AtLeastOneFlag: "At least one argument"
+      ZeroOrMoreFlag: "Multiple arguments"
+  defn desc-str () :
+    if description(f) is False : ""
+    else : Indented("\n\n%_" % [description(f)])
+
+  ;Launch!
+  "-%_ (%_%_)%_" % [
+    name(f),
+    optional-str(),
+    type-str(),
+    desc-str()]
+      
+defn printable (body:OutputStream -> ?) :
+  new Printable :
+    defmethod print (o:OutputStream, this) :
+      body(o)
+  
+
+;============================================================
+;=================== Main Driver ============================
+;============================================================
+
+;Parse the argument list using the given commands.
+public defn parse-args (commands:Tuple<Command>,
+                        default-command:String|False,
+                        arguments:Tuple<String>) -> CommandResult :
+  ;Preconditions                      
+  ensure-valid-commands!(commands, default-command)
+
+  ;Parse the given command with the arguments from the given
+  ;starting index.
+  defn parse-comm (c:Command, start-index:Int) -> CommandResult :
+    try :
+      val args = parse-command(c, arguments[start-index to false])
+      FoundCommand(c, args)
+    catch (e:ArgParseError) :
+      ArgParseFailure(c, e)
+      
+  ;Launch!
+  if empty?(arguments) :
+    match(default-command:String) :
+      val comm = find!({name(_) == default-command}, commands)
+      parse-comm(comm, 0)
+    else :
+      MissingCommandName()
+  else :
+    val comm = find({name(_) == arguments[0]}, commands)
+    match(comm:Command) :
+      parse-comm(comm, 1)
+    else :
+      match(default-command:String) :
+        val comm = find!({name(_) == default-command}, commands)
+        parse-comm(comm, 0)        
+      else :
+        NoCommand(arguments[0])
+
+;Execute the found command.
+public defn execute (c:FoundCommand) :
+  action(command(c))(args(c))
+
+;============================================================
+;================= Convenience Drivers ======================
+;============================================================
+
+public defn simple-command-line-cli (description:String|False,
+                                     commands:Tuple<Command>,
+                                     default-command:String|False,
+                                     help?:True|False) :
+  simple-command-line-cli(description, commands, default-command, help?, true)
+
+public defn simple-command-line-cli (description:String|False,
+                                     commands:Tuple<Command>,
+                                     default-command:String|False,
+                                     help?:True|False
+                                     exit-on-success?:True|False) :
+  val cmd-args = to-tuple(command-line-arguments()[1 to false])
+  val commands* = if help? : add-help-command(description, commands)
+                  else : commands
+  match(parse-args(commands*, default-command, cmd-args)) :
+    (r:FoundCommand) :
+      try :
+        execute(r)
+        exit(0) when exit-on-success?
+      catch (e:Exception) :
+        println(LineWrapped(e))
+        exit(-1)
+    (r:NoCommand) :
+      println(LineWrapped("'%_' is not a supported command for this program.\n" % [name(r)]))
+      println(LineWrapped("%_\n" % [program-usage-instructions(false, commands*)]))
+      exit(-1)
+    (r:MissingCommandName) :
+      println(LineWrapped("The first argument to the program is expected to be the command name.\n"))
+      println(LineWrapped("%_\n" % [program-usage-instructions(false, commands*)]))
+      exit(-1)
+    (r:ArgParseFailure) :
+      println(LineWrapped("Invalid call to the '%_' command. %_\n" % [name(command(r)), cause(r)]))
+      println(LineWrapped("%_\n" % [command-usage-instructions(command(r))]))
+      exit(-1)
+
+;============================================================
+;====================== Errors ==============================
+;============================================================
+
+public deftype ArgParseError <: Exception
+
+public defn ArgParseError (message) :
+  new ArgParseError :
+    defmethod print (o:OutputStream, this) :
+      print(o, message)
+
+public defstruct MissingFlagsError <: ArgParseError :
+  command-name: String
+  flags: Tuple<String>
+
+defmethod print (o:OutputStream, e:MissingFlagsError) :
+  defn flag-str (x:String) : append("-", x)
+  switch(length(flags(e))) :
+    1 : print(o, "The '%_' command requires the -%_ flag but it is missing." % [
+                  command-name(e), flags(e)[0]])
+    else : print(o, "The '%_' command requires the %, flags but they are missing." % [
+                     command-name(e), seq(flag-str,flags(e))])
+
+public defstruct DuplicateFlagsError <: ArgParseError :
+  flags: Tuple<String>
+
+defmethod print (o:OutputStream, e:DuplicateFlagsError) :
+  defn flag-str (x:String) : append("-", x)
+  switch(length(flags(e))) :
+    1 : print(o, "The -%_ flag was provided multiple times." % [flags(e)[0]])
+    else : print(o, "The %, flags has been provided multiple times." % [seq(flag-str, flags(e))])
+
+public defstruct WrongFlagArityError <: ArgParseError :
+  flagname: String
+  type: FlagType
+  args: Tuple<String>
+
+defmethod print (o:OutputStream, e:WrongFlagArityError) :
+  print(o, "The -%_ flag" % [flagname(e)])
+  print{o, _} $ switch(type(e)) :
+    ZeroFlag: " takes no arguments"
+    OneFlag: " requires a single argument"
+    GreedyFlag: " requires a single argument"
+    AtLeastOneFlag: " requires at least one argument"
+    ZeroOrOneFlag: " takes one optional argument"
+    else : fatal("Unreachable")
+  val actual-arity = length(args(e)) 
+  switch(actual-arity) :
+    0 : print(o, ", but no arguments were given.")
+    1 : print(o, ", but it was given: %~." % [args(e)[0]])
+    else : print(o, ", but %_ arguments were given: %,." % [
+             actual-arity, seq(written,args(e))])
+
+public defstruct WrongArgArityError <: ArgParseError :
+  command-name: String
+  type: ArgType
+  args: Tuple<String>
+
+defmethod print (o:OutputStream, e:WrongArgArityError) :
+  print(o, "The '%_' command" % [command-name(e)])
+  print{o, _} $ switch(type(e)) :
+    ZeroArg: " takes no arguments"
+    OneArg: " requires a single argument"
+    AtLeastOneArg: " requires at least one argument"
+    ZeroOrOneArg: " takes one optional argument"
+    else : fatal("Unreachable")
+  val actual-arity = length(args(e)) 
+  switch(actual-arity) :
+    0 : print(o, ", but no arguments were given.")
+    1 : print(o, ", but it was given: %~." % [args(e)[0]])
+    else : print(o, ", but %_ arguments were given: %,." % [
+             actual-arity, seq(written,args(e))])
+
+public defstruct UnrecognizedFlag <: ArgParseError :
+  flagname:String
+
+defmethod print (o:OutputStream, e:UnrecognizedFlag) :
+  print(o, "-%_ is not a supported flag." % [flagname(e)])
+
+defn written (x) :
+  "%~" % [x]
+

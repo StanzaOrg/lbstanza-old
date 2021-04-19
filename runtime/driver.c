@@ -408,15 +408,21 @@ void stringlist_add (StringList* list, char* string){
 //================== Directory Handling ======================
 //============================================================
 
-int get_file_type (char* filename) {
-  struct stat filestat;
-  if(stat(filename, &filestat) == 0){
+int get_file_type (char* filename, int follow_sym_links) {
+  struct stat filestat;  
+  int result;
+  if(follow_sym_links) result = stat(filename, &filestat);
+  else result = lstat(filename, &filestat);
+                         
+  if(result == 0){
     if(S_ISREG(filestat.st_mode))
       return 0;
     else if(S_ISDIR(filestat.st_mode))
       return 1;
+    else if(S_ISLNK(filestat.st_mode))
+      return 2;
     else
-      return 2;    
+      return 3;    
   }
   else{
     return -1;
