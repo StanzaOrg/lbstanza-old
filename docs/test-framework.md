@@ -4,12 +4,12 @@ Stanza comes with a built-in testing framework for quickly defining tests. This 
 
 # Example
 
-Look at `example/simpletests.stanza` in the Stanza distribution.
+Look at `examples/simpletests.stanza` in the Stanza distribution.
 
 Compile and run it like this:
 
 ```
-stanza compile-test example/simpletests.stanza -o simpletests
+stanza compile-test examples/simpletests.stanza -o simpletests
 ./simpletests
 ```
 
@@ -27,7 +27,7 @@ deftest mytest :
   #ASSERT(x == 4)
 ```
 
-A pass fails is:
+A test fails if:
 
 1. An `#ASSERT` statement fails, or
 2. an uncaught exception is thrown, or
