@@ -2000,7 +2000,8 @@ defmethod length (x:List) :
 ;============================================================
 defstruct Winder :
   in: False|(() -> ?)
-  out: False|(? -> ?)
+  out: False|(() -> ?)
+  final: False|(() -> ?)
 
 var WINDER-STACK:List<Winder>
 var NUM-WINDERS:Int
@@ -2040,19 +2041,15 @@ defn wind-in (ws:List<Winder>) :
     wind-in(tail(ws))
     call?(in(head(ws)))
 
-defn wind-out (ws:List<Winder>, f:True|False) :
+defn wind-out (ws:List<Winder>, call-out:True|False, call-final:True|False) :
   if not empty?(ws) :
-    call?(out(head(ws)), f)
-    wind-out(tail(ws), f)
+    call?(out(head(ws))) when call-out
+    call?(final(head(ws))) when call-final
+    wind-out(tail(ws), call-out, call-final)
 
 defn* call? (f: False|(() -> ?)) :
   match(f) :
     (f:() -> ?) : f()
-    (f:False) : false
-
-defn* call? (f: False|(? -> ?), x: ?) :
-  match(f) :
-    (f:? -> ?) : f(x)
     (f:False) : false
 
 lostanza defn inc-winders (c:ref<RawCoroutine>, n:ref<Int>) -> ref<False> :
@@ -2064,14 +2061,14 @@ lostanza defn num-winders (c:ref<RawCoroutine>) -> ref<Int> :
 
 public defn dynamic-wind<?T> (in:False|(() -> ?),
                               body:() -> ?T,
-                              out:False|(True|False -> ?)) -> T :
+                              out:False|(() -> ?)) -> T :
   call?(in)
-  push-winder(Winder(in, out))
+  push-winder(Winder(in, out, false))
   inc-winders(current-coroutine, 1)
   val result = body()
   pop-winder()
   inc-winders(current-coroutine, -1)
-  call?(out, true)
+  call?(out)
   result
 
 ;============================================================
@@ -2115,13 +2112,20 @@ public defmulti close (c:Coroutine) -> False
   defmethod print (o:OutputStream, c:WrappedCoroutine) :
     print(o, raw(c))
 
-protected lostanza deftype RawCoroutine <: Coroutine :
+protected lostanza deftype RawCoroutine <: Coroutine & Unique :
   id: long
   var stack: ref<Stack>
   var parent: ref<False|RawCoroutine>
   var status: ref<Int>
   var num-winders: int
   var crsp: long
+  saved-winders: ref<SavedWinders>
+
+lostanza deftype SavedWinders :
+  var winders: ref<List<Winder>>
+
+lostanza deftype WinderFinalizer <: Finalizer :
+  saved-winders: ref<SavedWinders>
 
 lostanza deftype CoroutineParams :
   parent-stack: ref<Stack>
@@ -2135,7 +2139,7 @@ lostanza defn initialize-coroutines () -> ref<False> :
   val vms:ptr<VMState> = call-prim flush-vm()
   val current-stack = vms.current-stack as ref<Stack>
   val crsp = call-prim crsp() as long
-  current-coroutine = new RawCoroutine{0L, current-stack, false, COROUTINE-ACTIVE, 0, crsp}
+  current-coroutine = new RawCoroutine{0L, current-stack, false, COROUTINE-ACTIVE, 0, crsp, new SavedWinders{List()}}
   COROUTINE-COUNTER = 1L
   return false
 
@@ -2149,7 +2153,7 @@ lostanza defn allocate-stack () -> ref<Stack> :
   frames.return = -1L
   frames.liveness-map = 0L
   stack.frames = frames
-  return stack;
+  return stack
 
 public lostanza defn RawCoroutine (enter:ref<((RawCoroutine, ?) -> ?)>) -> ref<RawCoroutine> :
   val stk = allocate-stack()
@@ -2173,9 +2177,17 @@ lostanza defmethod open? (c:ref<RawCoroutine>) -> ref<True|False> :
   if c.status == COROUTINE-OPEN : return true
   else : return false
 
+lostanza defmethod run (f:ref<WinderFinalizer>) -> ref<False> :
+  val winders = f.saved-winders.winders
+  if empty?(winders) == false :
+    f.saved-winders.winders = List()
+    wind-out(winders, false, true)    
+  return false
+
 lostanza defn* setup-coroutine (stack:ref<Stack>, parent-stack:ref<Stack>, enter:ref<((RawCoroutine, ?) -> ?)>) -> ref<?> :
   val crsp = call-prim crsp() as long
-  val co = new RawCoroutine{COROUTINE-COUNTER, stack, false, COROUTINE-OPEN, 0, crsp}
+  val co = new RawCoroutine{COROUTINE-COUNTER, stack, false, COROUTINE-OPEN, 0, crsp, new SavedWinders{List()}}
+  add-finalizer(new WinderFinalizer{co.saved-winders}, co)
   ;call-c clib/printf("Created coroutine %ld #%d (stack frames = %p)\n", co, co.id, co.stack.frames)
   COROUTINE-COUNTER = COROUTINE-COUNTER + 1L
   val x0 = call-prim yield(parent-stack, co)
@@ -2212,8 +2224,8 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   ensure-target-in-same-c-ctxt!(c)
 
   ;Set target winder environment and wind out
-  val winders = pop-winders(total-winders(c.parent))
-  wind-out(winders, false)
+  c.saved-winders.winders = pop-winders(total-winders(c.parent))
+  wind-out(c.saved-winders.winders, true, false)
 
   ;Detach coroutine
   detach-coroutine(c)
@@ -2222,6 +2234,8 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   val result = call-prim yield(current-coroutine.stack, x)
 
   ;Wind in and restore original winder environment
+  val winders = c.saved-winders.winders
+  c.saved-winders.winders = List()
   wind-in(winders)
   push-winders(winders)
 
@@ -2237,6 +2251,13 @@ lostanza defmethod close (c:ref<RawCoroutine>) -> ref<False> :
     return fatal("Cannot close coroutine. Coroutine is active.")
   else if c.status == COROUTINE-SUSPENDED :
     return fatal("Cannot close coroutine. Coroutine's parent is suspended.")
+
+  ;Execute any final winders if necessary
+  val winders = c.saved-winders.winders
+  if empty?(winders) == false :
+    c.saved-winders.winders = List()
+    wind-out(winders, false, true)
+
   free-coroutine(c)
   return false
 
@@ -2256,7 +2277,7 @@ lostanza defmethod break (c:ref<RawCoroutine>, x:ref<?>) -> ref<Void> :
 
   ;Set target winder environment and wind out
   val winders = pop-winders(total-winders(c.parent))
-  wind-out(winders, false)
+  wind-out(winders, true, true)
 
   ;Adjust state
   detach-coroutine(c)
@@ -2313,6 +2334,65 @@ lostanza defn detach-coroutine (c:ref<RawCoroutine>) -> int :
       else :
         cc.status = COROUTINE-SUSPENDED
         goto loop(cc)
+
+;============================================================
+;==================== LivenessTracker =======================
+;============================================================
+
+public deftype Unique
+
+public lostanza deftype LivenessTracker :
+  value: ref<False|Unique>
+  tail: ptr<?>
+
+public lostanza defn LivenessTracker (value:ref<Unique>) -> ref<LivenessTracker> :
+  return new LivenessTracker{value, null}
+
+public lostanza defn value (t:ref<LivenessTracker>) -> ref<False|Unique> :
+  return t.value
+
+;============================================================
+;======================= Finalizers =========================
+;============================================================
+
+;LivenessHandler/run returns true if the LivenessHandler ran,
+;and thus should be removed from the LivenessHandler list.
+deftype LivenessHandler
+defmulti run (f:LivenessHandler) -> True|False
+
+;Global lists
+var LIVENESS-HANDLERS:Vector<LivenessHandler>
+var QUEUED-LIVENESS-HANDLERS:Vector<LivenessHandler>
+
+;Initialize lists of handlers
+defn initialize-liveness-handlers () :
+  LIVENESS-HANDLERS = Vector<LivenessHandler>()
+  QUEUED-LIVENESS-HANDLERS = Vector<LivenessHandler>()
+  add-gc-notifier $ fn () :
+    add-all(LIVENESS-HANDLERS, QUEUED-LIVENESS-HANDLERS)
+    clear(QUEUED-LIVENESS-HANDLERS)
+    remove-when(run, LIVENESS-HANDLERS)
+
+public deftype Finalizer
+public defmulti run (f:Finalizer) -> ?
+
+public defn add-finalizer (f:Finalizer, v:Unique) :
+  val tracker = LivenessTracker(v)
+  val liveness-handler = new LivenessHandler :
+    defmethod run (this) :
+      if value(tracker) is False :
+        run(f)
+        true
+  add(QUEUED-LIVENESS-HANDLERS, liveness-handler)
+
+public defn add-finalizer (f:() -> ?, v:Unique) :
+  val tracker = LivenessTracker(v)
+  val liveness-handler = new LivenessHandler :
+    defmethod run (this) :
+      if value(tracker) is False :
+        f()
+        true
+  add(QUEUED-LIVENESS-HANDLERS, liveness-handler)
 
 ;============================================================
 ;================== Runtime Configuration ===================
@@ -2389,6 +2469,7 @@ initialize-launcher()
 initialize-winders()
 initialize-coroutines()
 initialize-gc-notifiers()
+initialize-liveness-handlers()
 initialize-symbol-table()
 
 ;================================================================================
@@ -3046,7 +3127,7 @@ public defn with-error-stream<?T> (o:OutputStream, body: () -> ?T) -> T :
   dynamic-wind(
     fn () : set-current-error-stream(o)
     body
-    fn (f) : set-current-error-stream(oldv))
+    fn () : set-current-error-stream(oldv))
 
 public defn current-error-stream () :
   CURRENT-ERROR-STREAM
@@ -4066,14 +4147,14 @@ public defn with-exception-handler<?T> (body: () -> ?T,
       (r:ExceptionResult) : handler(exception(r))
       (r:NormalResult) : result(r)
 
-public defn with-finally<?T> (body: () -> ?T, finally: (True|False) -> ?) -> T :
-   var entered? = false
-   dynamic-wind(
-      fn () :
-         fatal("Cannot re-enter body with finally clause.") when entered?
-         entered? = true
-      body
-      finally)
+public defn with-finally<?T> (body: () -> ?T, finally: () -> ?) -> T :
+  push-winder(Winder(false, false, finally))
+  inc-winders(current-coroutine, 1)
+  val result = body()
+  pop-winder()
+  inc-winders(current-coroutine, -1)
+  finally()
+  result
 
 ;============================================================
 ;============== Input/Output Exceptions =====================
@@ -6300,15 +6381,14 @@ public defmulti free (s:Seq) -> False
 defmethod free (s:Seq) : false
 
 defn* do-seq<?T,?R> (f: Seq<T> -> ?R, s:Seqable<?T>) -> R :
-   match(s) :
-      (s:Seq<T>) :
-         f(s)
-      (s) :
-         val s-seq = to-seq(s)
-         dynamic-wind(
-            false,
-            fn* () : f(s-seq)
-            fn* (final?) : free(s-seq) when final?)
+  match(s) :
+   (s:Seq<T>) :
+     f(s)
+   (s) :
+     val s-seq = to-seq(s)
+     with-finally(
+       fn* () : f(s-seq)
+       fn* () : free(s-seq))
 
 ;===== Conversion to Sequence =====
 
@@ -7780,59 +7860,6 @@ public defmulti free (r:Resource) -> False
 protected defn with-resource<?T,?S> (f:T -> ?S, x:?T&Resource) -> S :
    try : f(x)
    finally : free(x)
-
-;============================================================
-;==================== LivenessTracker =======================
-;============================================================
-
-public deftype Unique
-
-public lostanza deftype LivenessTracker :
-  value: ref<False|Unique>
-  tail: ptr<?>
-
-public lostanza defn LivenessTracker (value:ref<Unique>) -> ref<LivenessTracker> :
-  return new LivenessTracker{value, null}
-
-public lostanza defn value (t:ref<LivenessTracker>) -> ref<False|Unique> :
-  return t.value
-
-;============================================================
-;======================= Finalizers =========================
-;============================================================
-
-;LivenessHandler/run returns true if the LivenessHandler ran,
-;and thus should be removed from the LivenessHandler list.
-deftype LivenessHandler
-defmulti run (f:LivenessHandler) -> True|False
-
-val LIVENESS-HANDLERS = Vector<LivenessHandler>()
-val QUEUED-LIVENESS-HANDLERS = Vector<LivenessHandler>()
-add-gc-notifier $ fn () :
-  add-all(LIVENESS-HANDLERS, QUEUED-LIVENESS-HANDLERS)
-  clear(QUEUED-LIVENESS-HANDLERS)
-  remove-when(run, LIVENESS-HANDLERS)
-
-public deftype Finalizer
-public defmulti run (f:Finalizer) -> ?
-
-public defn add-finalizer (f:Finalizer, v:Unique) :
-  val tracker = LivenessTracker(v)
-  val liveness-handler = new LivenessHandler :
-    defmethod run (this) :
-      if value(tracker) is False :
-        run(f)
-        true
-  add(QUEUED-LIVENESS-HANDLERS, liveness-handler)
-
-public defn add-finalizer (f:() -> ?, v:Unique) :
-  val tracker = LivenessTracker(v)
-  val liveness-handler = new LivenessHandler :
-    defmethod run (this) :
-      if value(tracker) is False :
-        f()
-        true
-  add(QUEUED-LIVENESS-HANDLERS, liveness-handler)
 
 ;============================================================
 ;==================== Autofree ==============================
