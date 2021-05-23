@@ -17,14 +17,28 @@ protected defmulti tags (t:DefTest) -> List<Symbol>
 ;============================================================
 
 protected deftype Assertion
-protected defmulti run (a:Assertion) -> True|False
+protected defmulti run (a:Assertion, vs:AssertionValues) -> True|False
 protected defmulti description (a:Assertion) -> String|False
 protected defmulti info (a:Assertion) -> FileInfo|False
-protected defmulti values (a:Assertion) -> Tuple<AssertionValue>
+protected defmulti num-subexps (a:Assertion) -> Int
+protected defmulti subexp-descriptions (a:Assertion) -> Tuple<String>
+protected defmulti halt-on-failure? (a:Assertion) -> True|False
 
-protected defstruct AssertionValue :
-  description: String
-  value: ?
+;============================================================
+;================== AssertionValues =========================
+;============================================================
+
+protected deftype AssertionValues <: Collection<Maybe>
+protected defmulti set<?T> (v:AssertionValues, i:Int, v:?T) -> T
+
+defn AssertionValues (len:Int) :
+  val values = Array<Maybe>(len, None())
+  new AssertionValues :
+    defmethod set<?T> (this, i:Int, v:?T) -> T :
+      values[i] = One(v)
+      v
+    defmethod to-seq (this) :
+      to-seq(values)
 
 ;============================================================
 ;================ Command-line Interface ====================
@@ -67,17 +81,43 @@ defn testing-state () -> TestingState :
   TESTING-STATE as TestingState
 
 ;============================================================
-;======================== Run Test ==========================
+;===================== Testing State ========================
 ;============================================================
 
+;Record of all tests
 defstruct TestingState :
-  num-tests: Int with: (init => 0, setter => set-num-tests)
-  num-passed: Int with: (init => 0, setter => set-num-passed)
-  num-skipped: Int with: (init => 0, setter => set-num-skipped)
+  records: Vector<TestRecord> with: (init => Vector<TestRecord>())
   logger: Logger|False
   tests: List<String>|False
   tags: List<Symbol>|False
   not-tags: List<Symbol>|False
+
+;A single test record
+deftype TestRecord
+defmulti name (r:TestRecord) -> String
+
+defstruct SkippedTest <: TestRecord :
+  name:String with: (as-method => true)
+defstruct RanTest <: TestRecord :
+  name:String with: (as-method => true)
+  time:TestTime
+  passed?:True|False
+
+;Represents time taken to run a test
+defstruct TestTime :
+  value:Long
+  unit:TimeUnit
+
+defenum TimeUnit :
+  Milliseconds
+  Microseconds
+
+defn num-tests (s:TestingState) -> Int :
+  length(records(s))
+
+;============================================================
+;======================== Run Test ==========================
+;============================================================
 
 deftype RunTestResult
 defstruct SkipTest <: RunTestResult
@@ -120,15 +160,36 @@ protected defn run-test (t:DefTest) :
     (result:IgnoreTest) :
       false
     (result:SkipTest) :
+      add(records(testing-state()), SkippedTest(name(t)))
       val test-num = num-tests(testing-state()) + 1
-      set-num-tests(testing-state(), num-tests(testing-state()) + 1)
-      set-num-skipped(testing-state(), num-skipped(testing-state()) + 1)
       println(out, "[Test %_] %_ [SKIPPED]\n" % [test-num, name(t)])
-    (result:RunTest) :          
+    (result:RunTest) :
+      ;Prepare timers
+      val millisecond-timer = MillisecondTimer("Test")
+      val microsecond-timer = MicrosecondTimer("Test")
+      
+      defn start-timers () :
+        start(millisecond-timer)
+        start(microsecond-timer)
+        
+      defn read-time () -> TestTime :
+        stop(millisecond-timer)
+        stop(microsecond-timer)
+        val ms = time(millisecond-timer)
+        if ms < 10L : TestTime(time(microsecond-timer), Microseconds)
+        else : TestTime(ms, Milliseconds)
+
+      ;Record whether test ran to completion successfully
+      var encountered-error?:True|False = false
+      
       ;Print out test label
       val test-num = num-tests(testing-state()) + 1
-      set-num-tests(testing-state(), num-tests(testing-state()) + 1)
-      print(out, "[Test %_] %_ " % [test-num, name(t)])     
+      print(out, "[Test %_] %_ " % [test-num, name(t)])
+
+      ;Save test record
+      defn save-test-record (passed?:True|False) :
+        val rec = RanTest(name(t), read-time(), passed?)
+        add(records(testing-state()), rec)
 
       ;Print new line if log is not captured.
       defn newline-if-not-logged () :
@@ -149,11 +210,15 @@ protected defn run-test (t:DefTest) :
         else : body()
 
       ;Executed upon assertion failure
-      defn handle-assertion (a:Assertion) :
+      defn handle-assertion (a:Assertion, vs:AssertionValues) :
         println(out, "[FAIL]")
-        println(out2, a)
-        save-output-log()
-        println(out, "")
+        println-assertion-failure(out2, a, vs)
+        if halt-on-failure?(a) :
+          save-output-log()
+          println(out, "")
+          save-test-record(false)
+        else :
+          encountered-error? = true          
 
       ;Executed upon uncaught exception
       defn handle-exception (e:Exception) :
@@ -161,6 +226,7 @@ protected defn run-test (t:DefTest) :
         println(out2, "Uncaught Exception: %_" % [e])
         save-output-log()
         println(out, "")
+        save-test-record(false)
 
       ;Executed upon fatal error
       defn handle-error () :
@@ -168,13 +234,15 @@ protected defn run-test (t:DefTest) :
         println(out2, "Fatal Error.")
         save-output-log()
         println(out, "")
+        save-test-record(false)
 
-      ;Executed when test completes successfully
-      defn handle-success () :
-        println(out, "[PASS]")
+      ;Executed when test runs to completion
+      defn handle-test-end () :
+        if not encountered-error? :
+          println(out, "[PASS]")
         save-output-log()
-        set-num-passed(testing-state(), num-passed(testing-state()) + 1)
         println(out, "")
+        save-test-record(not encountered-error?)
 
       ;Launch test
       newline-if-not-logged()
@@ -182,8 +250,9 @@ protected defn run-test (t:DefTest) :
         within with-exception-handler(handle-exception) :
           within with-assertion-handler(handle-assertion) :
             within with-logger?(logger(testing-state())) :
+              start-timers()
               run(t)
-              handle-success()
+              handle-test-end()
 
 ;============================================================
 ;================== Assertion Handler =======================
@@ -192,36 +261,36 @@ protected defn run-test (t:DefTest) :
 ;The default assertion handler runs when not in a deftest.
 ;This happens normally when working by loading in some test code
 ;into the REPL, and uncommenting the deftest. 
-defn default-assertion-handler (a:Assertion) :
+defn default-assertion-handler (a:Assertion, vs:AssertionValues) :
   println(STANDARD-ERROR-STREAM, "[FAIL]")
-  println(IndentedStream(STANDARD-ERROR-STREAM), a)
-  fatal("Assertion failed outside of deftest.")
+  println-assertion-failure(IndentedStream(STANDARD-ERROR-STREAM), a, vs)
+  fatal("Assertion failed outside of deftest.") when halt-on-failure?(a)
 
-var CURRENT-ASSERTION-HANDLER:Assertion -> ? = default-assertion-handler
+var CURRENT-ASSERTION-HANDLER:(Assertion, AssertionValues) -> ? = default-assertion-handler
 
-defn with-assertion-handler (body:() -> ?, handler:Assertion -> ?) :
+defn with-assertion-handler (body:() -> ?, handler:(Assertion, AssertionValues) -> ?) :
   label break :
-    defn assertion-failed (a:Assertion) :
-      handler(a)
-      break()
+    defn assertion-failed (a:Assertion, vs:AssertionValues) :
+      handler(a,vs)
+      break() when halt-on-failure?(a)
     let-var CURRENT-ASSERTION-HANDLER = assertion-failed :
       body()
     
 protected defn assert (a:Assertion) :
-  if not run(a) :
-    CURRENT-ASSERTION-HANDLER(a)
+  val vs = AssertionValues(num-subexps(a))
+  if not run(a,vs) :
+    CURRENT-ASSERTION-HANDLER(a,vs)
 
-defmethod print (o:OutputStream, a:Assertion) :
+defn println-assertion-failure (o:OutputStream, a:Assertion, vs:AssertionValues) :
   val info-str = "" when info(a) is False
             else "%_: " % [info(a)]
   val name-str = "" when description(a) is False
             else " \"%_\"" % [description(a)]
-  print(o, "%_Assertion%_ failed." % [info-str, name-str])
-  val o2 = IndentedStream(o)
-  do(lnprint{o2, _}, values(a))
-
-defmethod print (o:OutputStream, v:AssertionValue) :
-  print(o, "%_ = %_" % [description(v), value(v)])
+  val type-str = "Assertion" when halt-on-failure?(a) else "Expectation"
+  println(o, "%_%_%_ failed." % [info-str, type-str, name-str])
+  for (description in subexp-descriptions(a), v in vs) do :
+    if not empty?(v) :
+      println(o, Indented("%_ = %~" % [description, value!(v)]))
 
 ;============================================================
 ;====================== Logger ==============================
@@ -325,13 +394,41 @@ defn sanitize-filename (s:String) :
 ;====================== Final Report ========================
 ;============================================================
 
+defmethod print (o:OutputStream, r:SkippedTest) :
+  print(o, "[SKIPPED] %_" % [name(r)])
+
+defmethod print (o:OutputStream, r:RanTest) :
+  val pass-str = "PASS" when passed?(r) else "FAIL"
+  print(o, "[%_] %_ (%_)" % [pass-str, name(r), time(r)])
+
+defmethod print (o:OutputStream, t:TestTime) :
+  val unit-str = switch(unit(t)) :
+    Milliseconds : "ms"
+    Microseconds : "us"
+  print(o, "%_ %_" % [value(t), unit-str])
+
 protected defn print-test-report (exit-on-fail?:True|False) :
   val s = testing-state()
-  val num-failed = num-tests(s) - num-passed(s) - num-skipped(s)
+
+  ;Count statistics
+  val skip-counter = to-seq(0 to false)
+  val pass-counter = to-seq(0 to false)
+  val fail-counter = to-seq(0 to false)
+  for r in records(s) do :
+    match(r) :
+      (r:SkippedTest) : next(skip-counter)
+      (r:RanTest) : next(pass-counter when passed?(r) else fail-counter)
+  ;Print statistics
   println(STANDARD-OUTPUT-STREAM, "Tests Finished: %_/%_ tests passed. %_ tests skipped. %_ tests failed." % [
-    num-passed(s), num-tests(s), num-skipped(s), num-failed])
+    peek(pass-counter), num-tests(s), peek(skip-counter), peek(fail-counter)])
+  for r in records(s) do :
+    println(STANDARD-OUTPUT-STREAM, r)
+    
+  ;Release the logger
   match(logger(s)) :
     (l:Logger) : free(l)
     (f:False) : false
-  if exit-on-fail? and num-failed > 0 :
+
+  ;Exit with proper exit code when requested
+  if exit-on-fail? and peek(fail-counter) > 0 :
     exit(-1)
