@@ -87,9 +87,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Resolve Methods", resolve-methods, "resolved-methods", false)
     val defstruct-table = to-inttable<EDefStruct> $
       for e in filter-by<EDefStruct>(exps(epackage)) seq : n(e) => e
-    val folded = IntSet()
-    run-pass("box-unbox Fold", box-unbox-fold{_, _, defstruct-table, folded}, "box-unbox-fold", false)
-    println("FOLDED %_" % [to-tuple $ folded])
+    run-pass("box-unbox Fold", box-unbox-fold{_, _, defstruct-table}, "box-unbox-fold", false)
   run-pass("Resolve Matches", resolve-matches, "resolved-matches", false)
   run-pass("Lift Closures", lift-closures, "closurelifted", false)
   run-pass("Lift Type Objects", lift-type-objects, "typelifted", false)
@@ -2406,11 +2404,12 @@ defn union (input-ts:Seqable<EType>) :
   else : reduce(EOr, ts)
 
 ;============================================================
-;====================== BOX-UNBOX ===========================
+;==================== BOX-UNBOX-FOLD ========================
 ;============================================================
 defn inc (t:IntTable<Int>, k:Int) -> Int :
   update(t, { _ + 1 }, k)
 
+; count all writes per binding
 defn walk-writes (e:EBody, num-writes:IntTable) :
   defn walk-writes (e:ELItem, writer:False|EIns) :
     match(e) :
@@ -2427,66 +2426,49 @@ defn walk-writes (e:EBody, num-writes:IntTable) :
         do(walk-writes{_, false}, e)
   for i in ins(e) do : walk-writes(i, false)
 
-val trace-box-unbox-folding? = true
-
-defn box-unbox-fold (epackage:EPackage, gvt:VarTable, defstruct-table:IntTable<EDefStruct>, folded:IntSet) -> EPackage :
+; folds field access by digging into immutable fields of objects
+; bindings to objects are tracked through creation and rebinding
+; so that when field access happens through known binding can fold it
+defn box-unbox-fold (epackage:EPackage, gvt:VarTable, defstruct-table:IntTable<EDefStruct>) -> EPackage :
   val num-writes = IntTable<Int>(0)
   defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
-    val hi-bindings = IntTable<ENewObject>()
-    val lo-bindings = IntTable<EObject>()
-    println("--- FOLDING-BOX-UNBOX")
+    val bindings = IntTable<EObject|ENewObject>()
     walk-writes(e, num-writes)
     defn walk (e:ELItem) -> ELItem :
       defn default () : map(walk, e)
       match(e) :
-        (e:EObject) :
-          println("DEFINING LO %_ -> %_" % [n(x(e)), e]) when trace-box-unbox-folding?
-          lo-bindings[n(x(e))] = e
-          map(walk, e)
-        (e:ENewObject) :
-          println("DEFINING HI %_ -> %_" % [n(x(e)), e]) when trace-box-unbox-folding?
-          hi-bindings[n(x(e))] = e
+        (e:EObject|ENewObject) : ; record object in bindings
+          bindings[n(x(e))] = e
           map(walk, e)
         (e:EDef) :
-          if num-writes[n(x(e))] < 2 :
-            match(y(e)) :
-              (y:EVar) :
-                if key?(hi-bindings, n(y)) :
-                  println("DEFINING HI %_ -> %_" % [n(x(e)), hi-bindings[n(y)]]) when trace-box-unbox-folding?
-                  hi-bindings[n(x(e))] = hi-bindings[n(y)]
-                else if key?(lo-bindings, n(y)) :
-                  println("DEFINING LO %_ -> %_" % [n(x(e)), lo-bindings[n(y)]]) when trace-box-unbox-folding?
-                  lo-bindings[n(x(e))] = lo-bindings[n(y)]
-              (y) : false
+          if num-writes[n(x(e))] < 2 : ; make sure only def binding holds one value
+            val y = y(e)
+            match(y:EVar) :
+              if key?(bindings, n(y)) : ; if rhs points to previous binding then record lhs binding
+                bindings[n(x(e))] = bindings[n(y)]
           e
         (e:EObjectGet) :
           match(y(e)) :
             (y:EVar) :
-              match(get?(hi-bindings, n(y), false)) :
-                (o:ENewObject) :
-                  println("---- FOLDING %_ / %_[%_]" % [e, o, index(e)]) when trace-box-unbox-folding?
-                  if index(e) > length(ys(o)) :
-                    println("ERROR INDEX %_ EXCEEDS LENGTH OF %_" % [index(e), ys(o)])
-                  walk(EDef(x(e), ys(o)[index(e)]))
+              match(get?(bindings, n(y), false)) :
+                (o:ENewObject) : walk(EDef(x(e), ys(o)[index(e)])) ; perform field access through object
                 (f:False) : default()
             (y) : default()
-        (e:ELoad) :
-          match(loc(e)) :
+        (e:ELoad) :       ; EObjects are accessed through loads which have more complicated form
+          match(loc(e)) : ; pattern match for field access through var form
             (f:EField) :
               match(loc(f)) :
                 (l:EDeref) :
                   match(y(l)) :
                     (v:EVar) :
-                      match(get?(lo-bindings, n(v), false)) :
+                      match(get?(bindings, n(v), false)) : ; if rhs points to previous binding
                         (v:EObject) :
-                          val ds = get?(defstruct-table, n(v))
+                          val ds = get?(defstruct-table, n(v)) ; have defstruct in table
                           match(ds:EDefStruct) :
-                            if mutable?(base(ds)[index(f)]) :
+                            if mutable?(base(ds)[index(f)]) :  ; don't do opt if mutable
                               default()
                             else :
-                              println("OBJ FOLDING(%_) %_ -> %_" % [n(v), e, ys(v)[index(f)]]) when trace-box-unbox-folding?
-                              add(folded, n(v))
-                              walk(EDef(x(e), ys(v)[index(f)]))
+                              walk(EDef(x(e), ys(v)[index(f)]))  ; perform field access through object
                           else :
                             default()
                         (o) : default()
@@ -2494,7 +2476,7 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable, defstruct-table:IntTable<E
                 (v) : default()
             (l) : default()
         (e) :
-          map(walk, e)
+          default()
     val ins* = for ins in ins(e) map : walk(ins) as EIns
     sub-ins(e, ins*)
 
@@ -2502,7 +2484,7 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable, defstruct-table:IntTable<E
     val result = let loop (x:ELBigItem = x) :
       match(x) :
         (e:EFn) :
-          for a in args(e) do : num-writes[a] = 1
+          for a in args(e) do : num-writes[a] = 1 ; initialize num-writes for args
           map(loop, e)
         (e:EBody) :
           map(loop, fold-in-body(e, vt))
