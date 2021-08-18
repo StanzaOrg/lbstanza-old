@@ -59,69 +59,6 @@ typedef struct{
   int pc;
 } Stack;
 
-#define STACK_TYPE 6
-
-int64_t stanza_entry (VMInit* init);
-
-//     Command line arguments
-//     ======================
-int input_argc;
-char** input_argv;
-int input_argv_needs_free;
-
-//     Main Driver
-//     ===========
-void* alloc (VMInit* init, long type, long size){
-  void* ptr = init->heap_top + 8;
-  *(long*)(init->heap_top) = type;
-  init->heap_top += 8 + size;
-  return ptr;  
-}
-
-uint64_t alloc_stack (VMInit* init){
-  Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
-  int initial_stack_size = 4 * 1024;
-  long size = initial_stack_size + sizeof(StackFrameHeader);
-  StackFrameHeader* frameheader = (StackFrameHeader*)stz_malloc(size);
-  frameheader->pool_index = -1;
-  frameheader->mark = 0;
-  stack->size = initial_stack_size;
-  stack->frames = frameheader->frames;
-  stack->stack_pointer = NULL;
-  return (uint64_t)stack - 8 + 1;  
-}
-
-int main (int argc, char* argv[]) {
-  #if defined(FMALLOC)
-    init_fmalloc();
-  #endif
-  
-  input_argc = argc;
-  input_argv = argv;
-  input_argv_needs_free = 0;
-  VMInit init;
-
-  //Allocate heap and freespace
-  const int initial_heap_size = 1024 * 1024;
-  const long maximum_heap_size = 4L * 1024 * 1024 * 1024;
-
-  init.heap = (char*)stz_memory_map(initial_heap_size, maximum_heap_size);
-  init.heap_limit = init.heap + initial_heap_size;
-  init.heap_top = init.heap;
-  init.free = (char*)stz_memory_map(initial_heap_size, maximum_heap_size);
-  init.free_limit = init.free + initial_heap_size;
-
-  //Allocate stacks
-  init.current_stack = alloc_stack(&init);
-  init.system_stack = alloc_stack(&init);
-
-  //Call Stanza entry
-  stanza_entry(&init);
-
-  //Heap and freespace are disposed by OS at process termination
-  return 0;
-}
-
 //     Macro Readers
 //     =============
 FILE* get_stdout () {return stdout;}
@@ -1012,3 +949,66 @@ void retrieve_process_state (long pid, ProcessState* s, int wait_for_termination
 //============================================================
 //============== End Process Runtime =========================
 //============================================================
+
+#define STACK_TYPE 6
+
+int64_t stanza_entry (VMInit* init);
+
+//     Command line arguments
+//     ======================
+int input_argc;
+char** input_argv;
+int input_argv_needs_free;
+
+//     Main Driver
+//     ===========
+void* alloc (VMInit* init, long type, long size){
+  void* ptr = init->heap_top + 8;
+  *(long*)(init->heap_top) = type;
+  init->heap_top += 8 + size;
+  return ptr;  
+}
+
+uint64_t alloc_stack (VMInit* init){
+  Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
+  int initial_stack_size = 4 * 1024;
+  long size = initial_stack_size + sizeof(StackFrameHeader);
+  StackFrameHeader* frameheader = (StackFrameHeader*)stz_malloc(size);
+  frameheader->pool_index = -1;
+  frameheader->mark = 0;
+  stack->size = initial_stack_size;
+  stack->frames = frameheader->frames;
+  stack->stack_pointer = NULL;
+  return (uint64_t)stack - 8 + 1;  
+}
+
+int main (int argc, char* argv[]) {
+  #if defined(FMALLOC)
+    init_fmalloc();
+  #endif
+
+  input_argc = argc;
+  input_argv = argv;
+  input_argv_needs_free = 0;
+  VMInit init;
+
+  //Allocate heap and freespace
+  const int initial_heap_size = 1024 * 1024;
+  const long maximum_heap_size = 4L * 1024 * 1024 * 1024;
+
+  init.heap = (char*)stz_memory_map(initial_heap_size, maximum_heap_size);
+  init.heap_limit = init.heap + initial_heap_size;
+  init.heap_top = init.heap;
+  init.free = (char*)stz_memory_map(initial_heap_size, maximum_heap_size);
+  init.free_limit = init.free + initial_heap_size;
+
+  //Allocate stacks
+  init.current_stack = alloc_stack(&init);
+  init.system_stack = alloc_stack(&init);
+
+  //Call Stanza entry
+  stanza_entry(&init);
+
+  //Heap and freespace are disposed by OS at process termination
+  return 0;
+}
