@@ -101,21 +101,24 @@ int main (int argc, char* argv[]) {
   input_argv_needs_free = 0;
   VMInit init;
 
-  //Allocate heap and free
-  int initial_heap_size = 1024 * 1024;
-  init.heap = (char*)stz_malloc(initial_heap_size);
+  //Allocate heap and freespace
+  const int initial_heap_size = 1024 * 1024;
+  const long maximum_heap_size = 4L * 1024 * 1024 * 1024;
+
+  init.heap = (char*)stz_memory_map(initial_heap_size, maximum_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
   init.heap_top = init.heap;
-  init.free = (char*)stz_malloc(initial_heap_size);
+  init.free = (char*)stz_memory_map(initial_heap_size, maximum_heap_size);
   init.free_limit = init.free + initial_heap_size;
 
   //Allocate stacks
   init.current_stack = alloc_stack(&init);
-  init.system_stack = alloc_stack(&init);   
+  init.system_stack = alloc_stack(&init);
 
   //Call Stanza entry
   stanza_entry(&init);
-  
+
+  //Heap and freespace are disposed by OS at process termination
   return 0;
 }
 
@@ -564,6 +567,48 @@ int open_pipe (char* prefix, char* suffix, int options){
 int make_pipe (char* prefix, char* suffix){
   char* name = string_join(prefix, suffix);
   return mkfifo(name, S_IRUSR|S_IWUSR);
+}
+
+//============================================================
+//================== Stanza Memory Mapping ===================
+//============================================================
+
+//Set protection bits on address range p (inclusive) to p + size (exclusive).
+//Fatal error if size > 0 and mprotect fails.
+static void protect(void* p, long size, int prot) {
+  if (size && mprotect(p, size, prot)) exit_with_error();
+}
+
+//Allocates a segment of memory that is min_size allocated, and can be
+//resized up to max_size. 
+void* stz_memory_map (long min_size, long max_size) {
+  void* p = mmap(NULL, max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) exit_with_error();
+
+  protect(p, min_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+  return p;
+}
+
+//Unmaps the region of mememory. 
+void stz_memory_unmap (void* p, long size) {
+  if (p && munmap(p, size)) exit_with_error();
+}
+
+//Resizes the given segment.
+//old_size is assumed to be the size that is already allocated.
+//new_size is the size that we desired to be allocated.
+void stz_memory_resize (void* p, long old_size, long new_size) {
+  long min_size = old_size;
+  long max_size = new_size;
+  int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+
+  if (min_size > max_size) {
+    min_size = new_size;
+    max_size = old_size;
+    prot = PROT_NONE;
+  }
+
+  protect((char*)p + min_size, max_size - min_size, prot);
 }
 
 //------------------------------------------------------------
