@@ -8,7 +8,8 @@
 
 defpackage clib
 
-protected extern memcpy: (ptr<?>, ptr<?>, long) -> int
+protected extern memcpy: (ptr<?>, ptr<?>, long) -> ptr<?>
+protected extern memset: (ptr<?>, long, long) -> ptr<?>
 protected extern remove: (ptr<byte>) -> int
 protected extern rename: (ptr<byte>, ptr<byte>) -> int
 protected extern symlink: (ptr<byte>, ptr<byte>) -> int
@@ -998,6 +999,194 @@ lostanza defn collect-garbage (size:long) -> long :
 
   ;Return the remaining space
   return vms.heap-limit - vms.heap-top
+
+;============================================================
+;================== New Garbage Collector ===================
+;============================================================
+
+lostanza val LOG-BITS-IN-BYTE:long = 3
+lostanza val LOG-BYTES-IN-LONG:long = 3
+lostanza val LOG-BITS-IN-LONG:long = LOG-BYTES-IN-LONG + LOG-BITS-IN-BYTE
+lostanza val BYTES-IN-LONG:long = 1 << LOG-BYTES-IN-LONG
+lostanza val BITS-IN-LONG:long = 1 << LOG-BITS-IN-LONG
+
+lostanza deftype Heap :
+  var top: ptr<long>
+  var limit: ptr<long>
+  var start: ptr<long>
+  var size: long
+  var bitset: ptr<long>
+
+lostanza defn bitset-size (heap-size:long) -> long :
+  val heap-size-in-longs = ((heap-size + (BYTES-IN-LONG - 1)) >> LOG-BYTES-IN-LONG)
+  val bitset-size-in-longs = (heap-size-in-longs + (BITS-IN-LONG - 1)) >> LOG-BITS-IN-LONG
+  return bitset-size-in-longs << LOG-BYTES-IN-LONG
+
+lostanza defn clear (start:ptr<?>, size:long) -> ptr<?> :
+  return call-c clib/memset(start, 0, size)
+
+lostanza defn initialize-heap (heap:ptr<Heap>, min-size:long, max-size:long) -> int :
+  ;Assert 0 <= min-size && min-size <= max-size
+  val min-heap-size = round-up-to-whole-pages(min-size)
+  val max-heap-size = round-up-to-whole-pages(max-size)
+  heap.size = max-heap-size
+  heap.start = call-c clib/stz_memory_map(min-heap-size, max-heap-size)
+  heap.top = heap.start
+  heap.limit = heap.start + min-heap-size
+
+  val min-bitset-size = round-up-to-whole-pages(bitset-size(min-heap-size))
+  val max-bitset-size = round-up-to-whole-pages(bitset-size(max-heap-size))
+  heap.bitset = call-c clib/stz_memory_map(min-bitset-size, max-bitset-size)
+  clear(heap.bitset, min-bitset-size)
+  return 0
+
+lostanza defn finalize-heap (heap:ptr<Heap>) -> int :
+  val current-heap-size = heap.limit - heap.start
+  val current-bitset-size = bitset-size(current-heap-size)
+
+  call-c clib/stz_memory_unmap(heap.start, round-up-to-whole-pages(current-heap-size))
+  call-c clib/stz_memory_unmap(heap.bitset, round-up-to-whole-pages(current-bitset-size))
+  return 0
+
+lostanza defn expand-heap (heap:ptr<Heap>, size:long) -> int :
+  val current-heap-size = round-up-to-whole-pages(heap.limit - heap.start)
+  val desired-heap-size = round-up-to-whole-pages(size)
+  if current-heap-size >= desired-heap-size : return 0
+
+  call-c clib/stz_memory_resize(heap.start, current-heap-size, desired-heap-size)
+
+  val current-bitset-size = round-up-to-whole-pages(bitset-size(current-heap-size))
+  val desired-bitset-size = round-up-to-whole-pages(bitset-size(desired-heap-size))
+  if current-bitset-size < desired-bitset-size :
+    call-c clib/stz_memory_resize(heap.bitset, current-bitset-size, desired-bitset-size)
+    clear(heap.bitset + current-bitset-size, desired-bitset-size - current-bitset-size)
+  return 0
+
+lostanza defn check-range (heap:ptr<Heap>, p:ptr<?>) -> int :
+  #if-not-defined(OPTIMIZE) :
+    if (p < heap.start) or  (p >= heap.top) :
+      fatal("Pointer is outside of heap.")
+  return 0
+
+lostanza defn check-range (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> int :
+  #if-not-defined(OPTIMIZE) :
+    if (start < heap.start) or (start > limit) or (limit > heap.top) :
+      fatal("Invalid heap address range.")
+  return 0
+
+lostanza defn bit-index (heap:ptr<Heap>, p:ptr<?>) -> long :
+  check-range(heap, p)
+  return (p - heap.start) >> LOG-BYTES-IN-LONG
+
+lostanza defn bit-address (heap:ptr<Heap>, bit-index:long) -> ptr<long> :
+  return heap.bitset + ((bit-index >> LOG-BITS-IN-LONG) << LOG-BYTES-IN-LONG)
+
+lostanza defn bit-shift (bit-index:long) -> long :
+  return bit-index & (BITS-IN-LONG - 1)
+
+lostanza defn bit-mask (bit-index:long) -> long :
+  return 1L << bit-shift(bit-index)
+
+lostanza defn test-mark (heap:ptr<Heap>, p:ptr<?>) -> long :
+  val index = bit-index(heap, p)
+  return ([bit-address(heap, index)] >> bit-shift(index)) & 1
+
+lostanza defn set-mark (heap:ptr<Heap>, p:ptr<?>) -> int :
+  val index = bit-index(heap, p)
+  val address = bit-address(heap, index)
+  [address] = [address] | bit-mask(index)
+  return 0
+
+lostanza defn test-and-set-mark (heap:ptr<Heap>, p:ptr<?>) -> long :
+  val index = bit-index(heap, p)
+  val address = bit-address(heap, index)
+  val mask = bit-mask(index)
+
+  val old-value = [address]
+  [address] = old-value | mask
+  return old-value & mask
+
+lostanza defn clear-mark (heap:ptr<Heap>, p:ptr<?>) -> int :
+  val index = bit-index(heap, p)
+  val address = bit-address(heap, index)
+  [address] = [address] & (~ bit-mask(index))
+  return 0
+
+lostanza defn clear-mark (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> int :
+  check-range(heap, start, limit)
+
+  val start-bit-index = bit-index(heap, start)
+  val end-bit-index = bit-index(heap, limit - 1)
+  val start-bit-address = bit-address(heap, start-bit-index)
+  val end-bit-address = bit-address(heap, end-bit-index)
+  val start-bit-mask = bit-mask(start-bit-index) - 1
+  val end-bit-mask = (- (bit-mask(end-bit-index) << 1))
+
+  ;Special case: the first bit word is the last bit word
+  if start-bit-address == end-bit-address :
+    [start-bit-address] = [start-bit-address] & (start-bit-mask | end-bit-mask)
+  else :
+    [start-bit-address] = [start-bit-address] & start-bit-mask
+    [end-bit-address] = [end-bit-address] & end-bit-mask
+    clear(start-bit-address + BYTES-IN-LONG, end-bit-address - start-bit-address - BYTES-IN-LONG)
+  return 0
+
+lostanza defn iterate-bit-word (heap:ptr<Heap>, start:ptr<?>, bit-word:long, f:ptr<((ptr<Heap>, ptr<?>) -> int)>) -> int :
+  ;Ones are rare, expect zeroes
+  var p:ptr<?> = start
+  var bits:long = bit-word
+  while bits != 0 :
+    ;TODO: introduce BSF instruction and use it here
+    if (bits & 0xFFFFFFFFL) == 0 :
+      bits = bits >> 32
+      p = p + (32 * BYTES-IN-LONG)
+    if (bits & 0xFFFFL) == 0 :
+      bits = bits >> 16
+      p = p + (16 * BYTES-IN-LONG)
+    if (bits & 0xFFL) == 0 :
+      bits = bits >> 8
+      p = p + (8 * BYTES-IN-LONG)
+    if (bits & 0xFL) == 0 :
+      bits = bits >> 4
+      p = p + (4 * BYTES-IN-LONG)
+    if (bits & 0x3) == 0 :
+      bits = bits >> 2
+      p = p + (2 * BYTES-IN-LONG)
+    if (bits & 1) != 0 :
+      [f](heap, p)
+    bits = bits >> 1
+    p = p + (1 * BYTES-IN-LONG)
+  return 0
+
+lostanza defn iterate-marked (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>, f:ptr<((ptr<Heap>, ptr<?>) -> int)>) -> int :
+  check-range(heap, start, limit)
+
+  val start-bit-index = bit-index(heap, start)
+  val end-bit-index = bit-index(heap, limit - 1)
+  val start-bit-address = bit-address(heap, start-bit-index)
+  val end-bit-address = bit-address(heap, end-bit-index)
+  val start-bit-shift = bit-shift(start-bit-index)
+  val end-bit-mask = (bit-mask(end-bit-index) << 1) - 1
+
+  ;Special case: the first bit word is the last bit word
+  if start-bit-address == end-bit-address :
+    iterate-bit-word(heap, start, ([start-bit-address] & end-bit-mask) >> start-bit-shift, f)
+    return 0
+
+  ;Process the first bit word
+  iterate-bit-word(heap, start, [start-bit-address] >> start-bit-shift, f)
+
+  var p:ptr<?> = start + ((BITS-IN-LONG - start-bit-shift) * BYTES-IN-LONG)
+  var bit-address:ptr<long> = start-bit-address + BYTES-IN-LONG
+  while bit-address < end-bit-address :
+    if [bit-address] != 0 :     ;Rarely taken
+      iterate-bit-word(heap, p, [bit-address], f)
+    bit-address = bit-address + BYTES-IN-LONG
+    p = p + (BITS-IN-LONG * BYTES-IN-LONG)
+
+  ;Process the last bit word
+  iterate-bit-word(heap, p, [end-bit-address] & end-bit-mask, f)
+  return 0
 
 ;============================================================
 ;==================== Garbage Collector =====================
