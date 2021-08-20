@@ -86,6 +86,9 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   if optimize? :
     run-pass("Resolve Methods", resolve-methods, "resolved-methods", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce", false)
+    val defstruct-table = to-inttable<EDefStruct> $
+      for e in filter-by<EDefStruct>(exps(epackage)) seq : n(e) => e
+    run-pass("box-unbox Fold", box-unbox-fold{_, _, defstruct-table}, "box-unbox-fold", false)
   run-pass("Resolve Matches", resolve-matches, "resolved-matches", false)
   run-pass("Lift Closures", lift-closures, "closurelifted", false)
   run-pass("Lift Type Objects", lift-type-objects, "typelifted", false)
@@ -2513,6 +2516,97 @@ defn union (input-ts:Seqable<EType>) :
   val ts = to-seq(input-ts)
   if empty?(ts) : EBot()
   else : reduce(EOr, ts)
+
+;============================================================
+;==================== BOX-UNBOX-FOLD ========================
+;============================================================
+defn inc (t:IntTable<Int>, k:Int) -> Int :
+  update(t, { _ + 1 }, k)
+
+; count all writes per binding
+defn walk-writes (e:EBody, num-writes:IntTable) :
+  defn walk-writes (e:ELItem, writer:False|EIns) :
+    match(e) :
+      (e:EVarLoc) :
+        match(writer) :
+          (writer:EIns) : inc(num-writes, n(e))
+          (writer) :      false
+      (e:EPtr|ELoad) :
+        walk-writes(loc(e), false)
+        walk-writes(x(e),   e)
+      (e:EIns) :
+        do(walk-writes{_, e}, e)
+      (e) :
+        do(walk-writes{_, false}, e)
+  for i in ins(e) do : walk-writes(i, false)
+
+; folds field access by digging into immutable fields of objects
+; bindings to objects are tracked through creation and rebinding
+; so that when field access happens through known binding can fold it
+defn box-unbox-fold (epackage:EPackage, gvt:VarTable, defstruct-table:IntTable<EDefStruct>) -> EPackage :
+  val num-writes = IntTable<Int>(0)
+  defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
+    val bindings = IntTable<EObject|ENewObject>()
+    walk-writes(e, num-writes)
+    defn walk (e:ELItem) -> ELItem :
+      defn default () : map(walk, e)
+      match(e) :
+        (e:EObject|ENewObject) : ; record object in bindings
+          bindings[n(x(e))] = e
+          map(walk, e)
+        (e:EDef) :
+          if num-writes[n(x(e))] < 2 : ; make sure only def binding holds one value
+            val y = y(e)
+            match(y:EVar) :
+              if key?(bindings, n(y)) : ; if rhs points to previous binding then record lhs binding
+                bindings[n(x(e))] = bindings[n(y)]
+          e
+        (e:EObjectGet) :
+          match(y(e)) :
+            (y:EVar) :
+              match(get?(bindings, n(y), false)) :
+                (o:ENewObject) : walk(EDef(x(e), ys(o)[index(e)])) ; perform field access through object
+                (f:False) : default()
+            (y) : default()
+        (e:ELoad) :       ; EObjects are accessed through loads which have more complicated form
+          match(loc(e)) : ; pattern match for field access through var form
+            (f:EField) :
+              match(loc(f)) :
+                (l:EDeref) :
+                  match(y(l)) :
+                    (v:EVar) :
+                      match(get?(bindings, n(v), false)) : ; if rhs points to previous binding
+                        (v:EObject) :
+                          val ds = get?(defstruct-table, n(v)) ; have defstruct in table
+                          match(ds:EDefStruct) :
+                            if mutable?(base(ds)[index(f)]) :  ; don't do opt if mutable
+                              default()
+                            else :
+                              walk(EDef(x(e), ys(v)[index(f)]))  ; perform field access through object
+                          else :
+                            default()
+                        (o) : default()
+                    (v) : default()
+                (v) : default()
+            (l) : default()
+        (e) :
+          default()
+    val ins* = for ins in ins(e) map : walk(ins) as EIns
+    sub-ins(e, ins*)
+
+  defn fold-texp (x:ETExp, vt:VarTable) :
+    val result = let loop (x:ELBigItem = x) :
+      match(x) :
+        (e:EFn) :
+          for a in args(e) do : num-writes[a] = 1 ; initialize num-writes for args
+          map(loop, e)
+        (e:EBody) :
+          map(loop, fold-in-body(e, vt))
+        (x) :
+          map(loop, x)
+    result as ETExp
+
+  map-with-var-table(fold-texp, gvt, epackage)
 
 ;============================================================
 ;=================== Closure Lifting ========================
