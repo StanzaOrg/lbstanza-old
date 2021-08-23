@@ -33,6 +33,12 @@ public defn lower-unoptimized (epackage:EPackage) -> EPackage :
 ;========================= Lowering =========================
 ;============================================================
 
+val PARAMS = unwrap-all(reader/read-file("params.txt"))
+val NUM-INLINE = PARAMS[0] as Int
+val INLINE-COUNTER = to-seq(0 to false)
+val NUM-BETA = PARAMS[1] as Int
+val BETA-COUNTER = to-seq(0 to false)
+
 defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   ;Reset id generation
   take-ids(epackage)
@@ -55,7 +61,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     within time-ms!(pass-name) :
       cur-package = f(cur-package)
       update-tables() when update-tables?
-    ;dump(cur-package, "logs", suffix)
+    dump(cur-package, "logs", suffix)
     #if-not-defined(OPTIMIZE) :
       ensure-unique-identifiers!(cur-package)
   defn run-pass (pass-name:String, f:(EPackage, VarTable) -> EPackage, suffix:String, update-tables?:True|False) :
@@ -86,6 +92,10 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   if optimize? :
     run-pass("Resolve Methods", resolve-methods, "resolved-methods", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce", false)
+    run-pass("Within Package Inline", within-package-inline, "wp-inlined", false)
+    run-pass("Simple Inline", simple-inline, "inlined", false)
+    run-pass("Beta Reduce", beta-reduce, "beta-reduce", false)
+    run-pass("Within Package Inline", within-package-inline, "wp-inlined", false)    
   run-pass("Resolve Matches", resolve-matches, "resolved-matches", false)
   run-pass("Lift Closures", lift-closures, "closurelifted", false)
   run-pass("Lift Type Objects", lift-type-objects, "typelifted", false)
@@ -1478,6 +1488,8 @@ defn simple-inline (epackage:EPackage) :
 ;================== Renaming ================================
 ;============================================================
 
+
+
 ;Scans through the given package and performing function
 ;inlining. Only functions defined within the given
 ;package are considered for inlining.
@@ -1492,35 +1504,58 @@ defn within-package-inline (epackage:EPackage) :
       (f:EMultifn) :
         all?(inline?, funcs(f))
       (f:EFn) :
-        empty?(localfns(body(f))) and
-        empty?(localobjs(body(f))) and
-        length(ins(body(f))) < 8
+        if empty?(localfns(body(f))) and empty?(localobjs(body(f))) :
+          val leaf? = none?({_ is ECall|ETCall}, ins(body(f)))
+          val limit = 12 when leaf? else 8
+          length(ins(body(f))) < limit
+
+  ;Scans through the top-level definitions in the package,
+  ;and collects the functions that are appropriate for
+  ;inlining.
+  defn compute-global-inlining-table () -> IntTable<EFunction> :
+    val entries = for exp in exps(epackage) seq? :
+      match(exp) :
+        (exp:EDefn) : One(n(exp) => func(exp))
+        (exp:EDefmethod) : One(n(exp) => func(exp))
+        (exp) : None()
+    to-inttable<EFunction> $ for entry in entries filter :
+      inline?(value(entry))
+
+  ;Determine whether the function function with the given
+  ;arity exists in either the local inlining table (lit),
+  ;or the global inlining table (git). The arity is used for inlining
+  ;variable-arity functions to retrieve the appropriate branch.
+  defn get-inlined-function (fid:Int, arity:Int,
+                             git:IntTable<EFunction>,
+                             lit:IntTable<EFunction>) -> EFn|False :
+    ;Lookup function in both tables.
+    val func = match(get?(lit, fid), get?(git, fid)) :
+      (lf:EFunction, gf) : lf
+      (lf:False, gf:EFunction) : gf
+      (lf:False, gf:False) : false
+    ;Lookup appropriate arity branch.
+    match(func:EFunction) :
+      for f in efns(func) find :
+        arity == length(args(f))
 
   ;Recursively performing inlining on all definitions
   ;and nested definitions within the given top-level
   ;expression.
-  defn inline-texp (e:ETExp) -> ETExp :
-    ;Hold table of functions appropriate to be inlined.
+  ;- git is the global inlining table.
+  defn inline-texp (e:ETExp, git:IntTable<EFunction>) -> ETExp :
+    ;Hold table of local functions appropriate to be inlined.
     ;An entry, n => f, in this table indicates that
     ;all calls to the function with identifier 'n' will be
     ;inlined.
-    val inlined-functions = IntTable<ELocalFn>()
+    val inlined-functions = IntTable<EFunction>()
     defn add-to-inline-table (l:ELocalFn) :
-      inlined-functions[n(l)] = l
-
-    ;Determine whether the given function with the given
-    ;arity exists in the inlining table. The arity
-    ;is used for inlining variable-arity functions to retrieve
-    ;the appropriate branch.
-    defn get-inlined-function (fid:Int, arity:Int) -> EFn|False :
-      if key?(inlined-functions, fid) :
-        val efns = efns(func(inlined-functions[fid]))
-        for f in efns find :
-          arity == length(args(f))
+      inlined-functions[n(l)] = func(l)
 
     ;Return a version of e with inlining performed. 
     defn inline (e:ELBigItem) -> ELBigItem :
       match(e:EBody) :
+        val counter = peek(INLINE-COUNTER)
+        
         ;Scan through local functions within this body,
         ;and add them to the inline table if they
         ;are appropriate to be inlined.
@@ -1536,41 +1571,71 @@ defn within-package-inline (epackage:EPackage) :
           emit(buffer, inline(l) as ELocalFn)
         for o in localobjs(e) do :
           emit(buffer, inline(o) as ELocalObj)
+
+        if counter < NUM-INLINE :
           
-        ;Scan through each instruction and for
-        ;function calls inline them when appropriate.
-        ;Pass through other instructions changed.
-        for i in ins(e) do :
-          match(i:ECall|ETCall) :
-            ;Retrieve the function being called, and the
-            ;type arguments it is called with.
-            val f* = deconstruct-function(f(i))
-            if empty?(f*) :
-              ;Cannot determine the name of the
-              ;function being called.
-              emit(buffer, i)
+          ;Scan through each instruction and for
+          ;function calls inline them when appropriate.
+          ;Pass through other instructions changed.
+          var progress? = false
+          for i in ins(e) do :
+            match(i:ECall|ETCall) :
+              ;Retrieve the function being called, and the
+              ;type arguments it is called with.
+              val f* = deconstruct-function(f(i))
+              if empty?(f*) :
+                ;Cannot determine the name of the
+                ;function being called.
+                emit(buffer, i)
+              else :
+                ;Calling fid with type arguments targs.
+                val [fid, targs] = value!(f*)
+                match(get-inlined-function(fid, length(ys(i)), git, inlined-functions)) :
+                  (func:EFn) :
+                    ;Retrieve the variable the function call
+                    ;is returned to, and whether it is a tail call
+                    ;or not.
+                    val [ret, tail?] = match(i) :
+                      (i:ECall) : [x(i), false]
+                      (i:ETCall) : [false, true]
+                    ;Inline all of the instruction in the function body
+                    ;into the current buffer.
+                    inline-call(buffer, ret, rename-fn(func), targs, ys(i), tail?)
+                    progress? = true
+                  (_:False) :
+                    emit(buffer, i)          
             else :
-              ;Calling fid with type arguments targs.
-              val [fid, targs] = value!(f*)
-              match(get-inlined-function(fid, length(ys(i)))) :
-                (func:EFn) :
-                  ;Retrieve the variable the function call
-                  ;is returned to, and whether it is a tail call
-                  ;or not.
-                  val [ret, tail?] = match(i) :
-                    (i:ECall) : [x(i), false]
-                    (i:ETCall) : [false, true]
-                  ;Inline all of the instruction in the function body
-                  ;into the current buffer.
-                  inline-call(buffer, ret, rename-fn(func), targs, ys(i), tail?)
-                (_:False) :
-                  emit(buffer, i)          
-          else :
-            emit(buffer, i)
+              emit(buffer, i)
+
+          val result = to-body(buffer, true, false, false)
+
+          if progress? :
+            next(INLINE-COUNTER)
+            println("Inline iteration %_" % [counter])
+            println("Before Inlining")
+            println(Indented(e))
+            println("After Inlining")
+            println(Indented(result))
+            println("\n\n")
+
+          result
+        else :
+          do(emit{buffer, _}, ins(e))
+          to-body(buffer, true, false, false)
             
-        ;Return the body with the new instructions, nested functions,
-        ;and objects. Keep the existing locals.
-        to-body(buffer, true, false, false)
+;        ;Return the body with the new instructions, nested functions,
+;        ;and objects. Keep the existing locals.
+;        val result = to-body(buffer, true, false, false)          
+;
+;        if progress? :
+;          val i = next(INLINE-COUNTER)
+;          if i < NUM-INLINE :
+
+;            result
+;          else :
+;            e
+;        else :
+;          result
       else :
         ;Recursively perform inlining on all nested bodies.
         map(inline, e)        
@@ -1578,8 +1643,11 @@ defn within-package-inline (epackage:EPackage) :
     ;Inline the top level.
     inline(e) as ETExp
 
-  ;Inline all top-level expressions
-  sub-exps(epackage, map(inline-texp, exps(epackage)))  
+  ;Launch!
+  val git = compute-global-inlining-table()
+  val texps* = for e in exps(epackage) map :
+    inline-texp(e, git)
+  sub-exps(epackage, texps*)
 
 ;Return a behaviourally-identical function with fresh
 ;identifiers generated for all local definitions. 
@@ -2435,8 +2503,7 @@ defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
           if not mutable?(vt, v) :
             match(y(i)) :
               (y:EVar) : not mutable?(vt, n(y))
-              (y:EImm) : true
-              (y:False) : false
+              (y) : false
         if appropriate? : add(defs, v, i)
         else : add(remove-set, v)
       else :
@@ -2449,28 +2516,19 @@ defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
     ;Return defs
     defs
 
-  ;Returns true if a and b refer to the same thing.
-  ;Doesn't handle EMix,ECurry as they won't appear for this pass.
-  defn equal-imm? (a:EImm, b:EImm) -> True|False :
-    match(a, b) :
-      (a:ELSLiteral, b:ELSLiteral) : value(a) == value(b)
-      (a:ELiteral, b:ELiteral) : value(a) == value(b)
-      (a:EVar, b:EVar) : n(a) == n(b)
-      (a:ESizeof, b:ESizeof) : type(a) == type(b)
-      (a:ETagof, b:ETagof) : n(a) == n(b)
-      (a:EConstClosure, b:EConstClosure) : n(a) == n(b)
-      (a:EConstType, b:EConstType) : n(a) == n(b)
-      (a, b) : false
+  ;Returns true if a and b refer to the same variable.
+  defn equal-imm? (a:EVar, b:EVar) -> True|False :
+    n(a) == n(b)
 
   ;Compute the substitution table to use for beta reduction.
   ;If n => e appears in the result table, then any reference to variable
   ;n should be replaced by e.
-  defn compute-sub-table (e:EBody, vt:VarTable) -> IntTable<EImm> :
+  defn compute-sub-table (e:EBody, vt:VarTable) -> IntTable<EVar> :
     ;Returns an entry in the substitution table if the given
     ;entry in the deftable is appropriate.
-    defn subentry? (e:KeyValue<Int,List<EDef>>) -> Maybe<KeyValue<Int,EImm>> :
+    defn subentry? (e:KeyValue<Int,List<EDef>>) -> Maybe<KeyValue<Int,EVar>> :
       ;Compute whether all the def values are the same.
-      val ys = map({y(_) as EImm}, value(e))
+      val ys = map({y(_) as EVar}, value(e))
       val y0 = head(ys)
       val all-equal-to-y0? = all?(equal-imm?{y0, _}, tail(ys))
       
@@ -2480,7 +2538,7 @@ defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
       else : None()
 
     ;Compute the initial substitution table.
-    val table = to-inttable<EImm> $
+    val table = to-inttable<EVar> $
       seq?(subentry?, collect-defs(e,vt))
 
     ;Iteratively follow chains of substitutions until we reach
@@ -2490,8 +2548,8 @@ defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
       for v in table-vars do :
         val y = table[v]
         match(y:EVar) :
-          val y* = get?(table, n(y))
-          match(y*:EImm) :
+          val y* = get?(table, n(y)) 
+          match(y*:EVar) :
             table[v] = y*
             progress()
             
@@ -2509,14 +2567,34 @@ defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
       e
     else :
       ;Perform substitutions on all immediates in the instruction.
+      var overall-progress? = false
       defn sub? (e:EIns) -> EIns :
+        var progress? = false
         defn sub-imm? (e:EImm) :
-          match(e:EVar) : get?(subtable, n(e), e)
+          match(e:EVar) :
+            if key?(subtable, n(e)) : progress? = true
+            get?(subtable, n(e), e)
           else : e
-        map(sub-imm?, e)
+        val result = map(sub-imm?, e)
+        if progress? :
+          val i = next(BETA-COUNTER)
+          if i < NUM-BETA :
+            println("Beta-reduce %_) %_ with %_" % [i, e, result])
+            overall-progress? = true
+            result
+          else : e
+        else :
+          e
 
       ;Perform substitution on all instructions.
-      sub-ins(e, map(sub?, ins(e)))
+      val result = sub-ins(e, map(sub?, ins(e)))
+
+      if overall-progress? :
+        println("Beta reduction Iteration")
+        println("Before reduction\n%_" % [Indented(e)])
+        println("After reduction\n%_\n\n" % [Indented(result)])
+
+      result
 
   ;Beta-reduce all bodies in the package.
   defn beta-reduce-texp (e:ETExp, vt:VarTable) :
