@@ -98,11 +98,13 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined", false)
     run-pass("Simple Inline", simple-inline, "inlined", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce", false)
+    run-pass("Box Unbox", box-unbox-fold, "box-unbox", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code", false)
     ;Phase 2
     run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined", false)
     run-pass("Simple Inline", simple-inline, "inlined", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce", false)
+    run-pass("Box Unbox", box-unbox-fold, "box-unbox", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code", false)
   run-pass("Resolve Matches", resolve-matches, "resolved-matches", false)
   run-pass("Lift Closures", lift-closures, "closurelifted", false)
@@ -2760,6 +2762,138 @@ defn union (input-ts:Seqable<EType>) :
   val ts = to-seq(input-ts)
   if empty?(ts) : EBot()
   else : reduce(EOr, ts)
+
+;============================================================
+;==================== BOX-UNBOX-FOLD ========================
+;============================================================
+
+;------------------------------------------------------------
+;-------------------- DefStructTable ------------------------
+;------------------------------------------------------------
+
+;Represents the struct information in the package.
+deftype DefStructTable
+
+;Returns true if the 'index' field of struct 'n' is mutable.
+defmulti mutable-field? (t:DefStructTable, n:Int, index:Int) -> True|False
+
+defn DefStructTable (epackage:EPackage) -> DefStructTable :
+  ;Create table of all structs in package.
+  val defstructs = filter-by<EDefStruct>(exps(epackage))
+  val table = to-inttable<EDefStruct> $
+    for e in defstructs seq: n(e) => e
+
+  new DefStructTable :
+    defmethod mutable-field? (this, n:Int, index:Int) :
+      val struct = table[n]
+      val fields = base(struct)
+      fatal("Index out of bounds.") when index >= length(fields)
+      val field = fields[index]
+      mutable?(field)
+
+;------------------------------------------------------------
+;-------------------- Analysis ------------------------------
+;------------------------------------------------------------
+
+defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
+  ;Compute defstruct table
+  val defstruct-table = DefStructTable(epackage)
+
+  ;Compute binding table.
+  ;Every entry in the binding table, x => e, indicates that
+  ;x is defined exactly once by the EObject or ENewObject instruction.
+  defn binding-table (e:EBody) -> IntTable<EObject|ENewObject> :
+    val table = IntListTable<EObject|ENewObject>()
+    val remove-set = IntSet()
+    for i in ins(e) do :
+      match(i:EObject|ENewObject) : add(table, n(x(i)), i)
+      else : do(add{remove-set, n(_)}, varlocs(i))
+    to-inttable<EObject|ENewObject> $
+      for entry in table seq? :
+        if remove-set[key(entry)] : None()
+        else if length(value(entry)) == 1 : One(key(entry) => head(value(entry)))
+        else : None()
+
+  ;Returns true if the given value represents an immutable
+  ;quantity.
+  defn immutable? (vt:VarTable, value:EImm) -> True|False :
+    match(value:EVar) : not mutable?(vt,n(value))
+    else : true
+
+  ;If the given EObjectGet expression corresponds to retrieval
+  ;of a known object field then return the destination and the
+  ;field. Calls fail() if not a match.
+  defn unbox-object-get (e:EObjectGet,
+                         vt:VarTable,
+                         bindings:IntTable<EObject|ENewObject>) -> [EVarLoc, EImm] :
+    val v = y(e) as? EVar
+    val o = get?(bindings, n(v)) as? ENewObject
+    val value = ys(o)[index(e)]
+    fail() when not immutable?(vt,value)      
+    [x(e), value]
+
+  ;If the given ELoad expression corresponds to a retrieval
+  ;of a known object field then return the destination and the field.
+  ;Calls fail() if not a match.
+  defn unbox-load (e:ELoad,
+                   vt:VarTable,
+                   bindings:IntTable<EObject|ENewObject>, ) -> [EVarLoc, EImm] :
+    val field = loc(e) as? EField
+    val v = y(loc(field) as? EDeref) as? EVar
+    val o = get?(bindings, n(v)) as? EObject
+    fail() when mutable-field?(defstruct-table, n(o), index(field))
+    val value = ys(o)[index(field)]
+    fail() not immutable?(vt,value)      
+    [x(e), value]
+
+  ;Perform unboxing folds in the given body.
+  ;Assumes that all nested bodies have already been folded.
+  defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
+    ;Compute the binding table
+    val bindings = binding-table(e)
+    
+    ;Attempt to fold the given instruction.
+    var progress? = false
+    defn fold? (i:EIns) -> EIns :
+      match(i) :
+        (i:EObjectGet) :
+          attempt :
+            val [x, v] = unbox-object-get(i, vt, bindings)
+            println("Fold %_" % [i])
+            progress? = true
+            EDef(x, v, false)
+          else : i            
+        (i:ELoad) :
+          attempt :
+            val [x, v] = unbox-load(i, vt, bindings)
+            println("Fold %_" % [i])
+            progress? = true
+            EDef(x, v, false)
+          else : i
+        (i) : i
+
+    ;Attempt to fold all instructions.
+    val result = sub-ins(e, map(fold?, ins(e)))
+
+    if progress? :
+      println("Before Folding:")
+      println(Indented(e))
+      println("After Folding")
+      println(Indented(result))
+      println("\n\n")
+
+    result
+
+  ;Fold all bodies in top-level expression.
+  defn fold-texp (e:ETExp, vt:VarTable) -> ETExp :
+    val result = let loop (e:ELBigItem = e) :
+      match(map(loop, e)) :
+        (e:EBody) : fold-in-body(e, vt)
+        (e) : e
+    result as ETExp
+
+  ;Launch!
+  map-with-var-table(fold-texp, gvt, epackage)
 
 ;============================================================
 ;=================== Closure Lifting ========================
