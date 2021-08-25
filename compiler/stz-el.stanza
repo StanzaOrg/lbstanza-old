@@ -88,6 +88,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   run-pass("Detect Loops", detect-loops, "looped", false)
   run-pass("Simple Inline", simple-inline, "inlined", false)
   run-pass("Within Package Inline", within-package-inline{_, true}, "wp-inlined", false)
+  run-pass("Cleanup Labels", cleanup-labels, "cleanup-labels", false)
   if optimize? :
     run-pass("Remove Reified Types", force-remove-types, "removed-types", true)
   run-pass("Lambda Lift", lambda-lift, "lambda", true)
@@ -95,14 +96,16 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   if optimize? :
     run-pass("Resolve Methods", resolve-methods, "resolved-methods", false)
     ;Phase 1
-    run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined", false)
     run-pass("Simple Inline", simple-inline, "inlined", false)
+    run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined", false)
+    run-pass("Cleanup Labels", cleanup-labels, "cleanup-labels", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce", false)
     run-pass("Box Unbox", box-unbox-fold, "box-unbox", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code", false)
     ;Phase 2
-    run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined", false)
     run-pass("Simple Inline", simple-inline, "inlined", false)
+    run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined", false)
+    run-pass("Cleanup Labels", cleanup-labels, "cleanup-labels", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce", false)
     run-pass("Box Unbox", box-unbox-fold, "box-unbox", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code", false)
@@ -1753,6 +1756,58 @@ defn rename-fn (f:EFn) -> EFn :
   rename(f) as EFn
 
 ;============================================================
+;==================== Label Cleanup =========================
+;============================================================
+
+;Remove simple occurrences of immediate jumps to the next label.
+;For this pattern:
+;  goto n
+;  label n
+;We can remove those two instructions if that is the only
+;usage of that label.
+;This pattern occurs as a result of function inlining.
+
+defn cleanup-labels (epackage:EPackage) -> EPackage :
+  defn cleanup-body (e:EBody) -> EBody :
+    ;Collect all used labels
+    val num-uses = IntTable<Int>(0)
+    for i in ins(e) do :
+      for v in label-uses(i) do :
+        update(num-uses, {_ + 1}, v)
+    ;Remove simple label patterns
+    val buffer = BodyBuffer(e)
+    val len = length(ins(e))
+    let loop (i:Int = 0) :
+      if i < len - 1 :
+        val ins1 = ins(e)[i]
+        val ins2 = ins(e)[i + 1]
+        match(ins1:EGoto, ins2:ELabel) :
+          if n(ins1) == n(ins2) and num-uses[n(ins2)] == 1 :
+            loop(i + 2)
+          else :
+            emit(buffer, ins1)
+            emit(buffer, ins2)
+            loop(i + 2)
+        else :
+          emit(buffer, ins1)
+          loop(i + 1)
+      else if i < len :
+        emit(buffer, ins(e)[i])
+    ;Return the new body    
+    to-body(buffer)
+
+  ;Recursively clean up all nested definitions
+  defn cleanup-item (e:ELBigItem) -> ELBigItem :
+    match(map(cleanup-item, e)) :
+      (b:EBody) : cleanup-body(b)
+      (item) : item
+
+  ;Launch!
+  val exps* = for e in exps(epackage) map :
+    cleanup-item(e) as ETExp
+  sub-exps(epackage, exps*)
+
+;============================================================
 ;=================== Lambda Lifting =========================
 ;============================================================
 
@@ -2451,12 +2506,14 @@ defn MethodTable (epackage:EPackage) :
     method-table
 
   ;Create a dispatch Dag
-  defn create-dag (class-tree:DynTree, ms:Tuple<EDefmethod>) -> MethodDag :
+  defn create-dag (class-tree:DynTree, multi:Int, ms:Tuple<EDefmethod>) -> MethodDag :
     defn to-branch (m:EDefmethod) :
       val method-types = a1(func(m))
       val args* = map(etype-to-arg{class-tree, _, true}, method-types)
       Branch(args*)
     val branch-table = BranchTable(map(to-branch, ms), non-leaves(class-tree))
+    println("Created branch table for multi %_" % [multi])
+    println(Indented(branch-table))
     val dag = compute-dispatch-dag(branch-table, true)
     MethodDag(dag, map(n,ms))
 
@@ -2464,15 +2521,19 @@ defn MethodTable (epackage:EPackage) :
   defn create-dag-table (class-tree:DynTree, method-table:IntListTable<EDefmethod>) :
     val dag-table = IntTable<MethodDag>()
     for entry in method-table do :
-      dag-table[key(entry)] = create-dag(class-tree, to-tuple(value(entry)))
+      dag-table[key(entry)] = create-dag(class-tree, key(entry), to-tuple(value(entry)))
     dag-table
 
   ;Resolve through dag
   defn resolve-target (class-tree:DynTree, dag-table:IntTable<MethodDag>, multi:Int, types:Tuple<EType>) -> Int|False :
+    println("resolve-target for multi %_ and types %," % [multi,types])
     val mdag = get?(dag-table, multi)
+    println("mdag = %_" % [mdag])
     match(mdag:MethodDag) :
       val args = map(etype-to-arg{class-tree, _, false}, types)
+      println("args = %," % [args])
       val solns = all-solns(dag(mdag), args, false)
+      println("solns = %," % [solns])
       if length(solns) == 1 :
         val i = index(solns[0] as UniqueSoln)
         targets(mdag)[i]
@@ -2492,16 +2553,19 @@ defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
     val ins* = for i in ins(e) map :
       ;Resolve target of call
       defn resolve-call (f:EImm, ys:Tuple<EImm>) -> EImm|False :
+        println("resolve-call %_(%,)" % [f, ys])
         val fid = match(f) :
           (f:EVar) : n(f)
           (f:ECurry) : n(x(f))
           (f) : false
+        println("  fid = %_" % [fid])
         defn sub-fid (n:Int) :
           match(f) :
             (f:EVar) : EVar(n)
             (f:ECurry) : ECurry(EVar(n), targs(f))
         match(fid:Int) :
           val ys-types = map(type{vt, _}, ys)
+          println("  ys-types = %," % [ys-types])
           match(resolve-target(method-table, fid, ys-types)) :
             (n:Int) : sub-fid(n)
             (n:False) : false
