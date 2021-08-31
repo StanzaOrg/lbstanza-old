@@ -1,7 +1,8 @@
 #ifdef PLATFORM_WINDOWS
-  #include<Windows.h>
+  #include<windows.h>
 #else
   #include<sys/wait.h>
+  #include<sys/mman.h>
 #endif
 #include<stdint.h>
 #include<unistd.h>
@@ -14,7 +15,6 @@
 #include<string.h>
 #include<sys/stat.h>
 #include<sys/types.h>
-#include<sys/mman.h>
 #include<dirent.h>
 #include<pthread.h>
 
