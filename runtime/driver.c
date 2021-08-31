@@ -350,6 +350,18 @@ void stringlist_add (StringList* list, const stz_byte* string){
 //================== Directory Handling ======================
 //============================================================
 
+#ifdef PLATFORM_WINDOWS
+// `stat()` doesn't exist on Windows, but _stat *does*, and
+// symlinks (as far as I can tell) aren't used.
+#define stat _stat
+#define lstat _stat
+#define S_ISLNK(x) 0
+
+stz_int symlink(const stz_byte* target, const stz_byte* linkpath) {
+  return -1;
+}
+#endif
+
 stz_int get_file_type (const stz_byte* filename, stz_int follow_sym_links) {
   struct stat filestat;  
   int result;
