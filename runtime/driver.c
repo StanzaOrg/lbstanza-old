@@ -18,6 +18,7 @@
 #include<dirent.h>
 #include<pthread.h>
 
+#include "common.h"
 #include "types.h"
 
 //       Forward Declarations
@@ -25,9 +26,6 @@
 
 //FMalloc Debugging
 static void init_fmalloc ();
-
-void* stz_malloc (stz_long size);
-void stz_free (void* ptr);
 
 //     Stanza Defined Entities
 //     =======================
