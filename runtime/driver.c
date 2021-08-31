@@ -24,7 +24,7 @@
 //       ====================
 
 //FMalloc Debugging
-void init_fmalloc ();
+static void init_fmalloc ();
 
 void* stz_malloc (stz_long size);
 void stz_free (void* ptr);
@@ -116,7 +116,7 @@ stz_long file_write_block (FILE* f, char* data, stz_long len) {
 //     Path Resolution
 //     ===============
 #ifdef PLATFORM_WINDOWS
-  int file_exists (const stz_byte* filename) {
+  static int file_exists (const stz_byte* filename) {
     int attrib = GetFileAttributes((LPCSTR)filename);
     return attrib != INVALID_FILE_ATTRIBUTES;
   }
@@ -190,13 +190,13 @@ typedef struct {
   void** items;
 } FreeList;
 
-FreeList make_freelist (int c){
+static FreeList make_freelist (int c){
   void** items = (void**)malloc(c * sizeof(void*));
   FreeList f = {c, 0, items};
   return f;
 }
 
-void ensure_capacity (FreeList* list, int c){
+static void ensure_capacity (FreeList* list, int c){
   if(list->capacity < c){
     int c2 = list->capacity;
     while(c2 < c) c2 *= 2;
@@ -208,7 +208,7 @@ void ensure_capacity (FreeList* list, int c){
   }
 }
 
-void delete_index (FreeList* list, int xi){
+static void delete_index (FreeList* list, int xi){
   int yi = list->size - 1;
   void* x = list->items[xi];
   void* y = list->items[yi];
@@ -219,7 +219,7 @@ void delete_index (FreeList* list, int xi){
   list->size--;
 }
 
-void add_item (FreeList* list, void* item){
+static void add_item (FreeList* list, void* item){
   int i = list->size;
   ensure_capacity(list, i + 1);
   list->items[i] = item;
@@ -239,7 +239,7 @@ char* mem_top;
 char* mem_limit;
 FreeList mem_chunks;
 
-void init_fmalloc () {
+static void init_fmalloc () {
   mem_chunks = make_freelist(8);
   long size = 8L * 1024L * 1024L * 1024L;
   mem_top = (char*)0x700000000L;
@@ -256,7 +256,7 @@ void init_fmalloc () {
   }  
 }
 
-Chunk* alloc_chunk (long size){  
+static Chunk* alloc_chunk (long size){
   long total_size = (size + sizeof(Chunk) + 7) & -8;
   Chunk* chunk = (Chunk*)mem_top;
   mem_top += total_size;
@@ -268,7 +268,7 @@ Chunk* alloc_chunk (long size){
   return chunk;
 }
 
-Chunk* find_chunk (long size){
+static Chunk* find_chunk (long size){
   Chunk* best = 0;
   int besti = 0;
   for(int i=0; i<mem_chunks.size; i++){
@@ -288,13 +288,13 @@ Chunk* find_chunk (long size){
   return best;
 }
 
-void* fmalloc (long size){
+static void* fmalloc (long size){
   Chunk* c = find_chunk(size);
   if(!c) c = alloc_chunk(size);
   return c->bytes;
 }
 
-void ffree (void* ptr){
+static void ffree (void* ptr){
   Chunk* c = (Chunk*)((char*)ptr - sizeof(Chunk));
   add_item(&mem_chunks, c);
 }
@@ -317,7 +317,7 @@ StringList* make_stringlist (stz_int capacity){
   return list;
 }
 
-void ensure_stringlist_capacity (StringList* list, stz_int c) {
+static void ensure_stringlist_capacity (StringList* list, stz_int c) {
   if(list->capacity < c){
     stz_int new_capacity = list->capacity;
     while(new_capacity < c) new_capacity *= 2;
@@ -473,19 +473,19 @@ typedef struct {
 //-------------------- Utilities -----------------------------
 //------------------------------------------------------------
 
-void exit_with_error (){
+static void exit_with_error (){
   fprintf(stderr, "%s\n", strerror(errno));
   exit(-1);
 }
 
-int count_non_null (void** xs){
+static int count_non_null (void** xs){
   int n=0;
   while(xs[n] != NULL)
     n++;
   return n;
 }
 
-char* string_join (const char* a, const char* b){
+static char* string_join (const char* a, const char* b){
   int len = strlen(a) + strlen(b);
   char* buffer = (char*)stz_malloc(len + 1);
   sprintf(buffer, "%s%s", a, b);
@@ -493,7 +493,7 @@ char* string_join (const char* a, const char* b){
 }
 
 //Opening a named pipe
-int open_pipe (const char* prefix, const char* suffix, int options){
+static int open_pipe (const char* prefix, const char* suffix, int options){
   char* name = string_join(prefix, suffix);
   int fd = open(name, options);
   stz_free(name);
@@ -501,7 +501,7 @@ int open_pipe (const char* prefix, const char* suffix, int options){
 }
 
 //Creating a named pipe
-int make_pipe (char* prefix, char* suffix){
+static int make_pipe (char* prefix, char* suffix){
   char* name = string_join(prefix, suffix);
   return mkfifo(name, S_IRUSR|S_IWUSR);
 }
@@ -553,13 +553,13 @@ void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
 //------------------------------------------------------------
 
 // ===== Serialization =====
-void write_int (FILE* f, stz_int x){
+static void write_int (FILE* f, stz_int x){
   fwrite(&x, sizeof(stz_int), 1, f);
 }
-void write_long (FILE* f, stz_long x){
+static void write_long (FILE* f, stz_long x){
   fwrite(&x, sizeof(stz_long), 1, f);
 }
-void write_string (FILE* f, stz_byte* s){
+static void write_string (FILE* f, stz_byte* s){
   if(s == NULL)
     write_int(f, -1);
   else{
@@ -568,13 +568,13 @@ void write_string (FILE* f, stz_byte* s){
     fwrite(s, 1, n, f);
   }
 }
-void write_strings (FILE* f, stz_byte** s){
+static void write_strings (FILE* f, stz_byte** s){
   int n = count_non_null((void**)s);
   write_int(f, (stz_int)n);
   for(int i=0; i<n; i++)
     write_string(f, s[i]);
 }
-void write_earg (FILE* f, EvalArg* earg){
+static void write_earg (FILE* f, EvalArg* earg){
   write_string(f, earg->pipe);
   write_string(f, earg->in_pipe);
   write_string(f, earg->out_pipe);
@@ -582,13 +582,13 @@ void write_earg (FILE* f, EvalArg* earg){
   write_string(f, earg->file);
   write_strings(f, earg->argvs);
 }
-void write_process_state (FILE* f, ProcessState* s){
+static void write_process_state (FILE* f, ProcessState* s){
   write_int(f, s->state);
   write_int(f, s->code);
 }
 
 // ===== Deserialization =====
-void bread (void* xs0, int size, int n0, FILE* f){
+static void bread (void* xs0, int size, int n0, FILE* f){
   char* xs = xs0;
   int n = n0;
   while(n > 0){
@@ -601,17 +601,17 @@ void bread (void* xs0, int size, int n0, FILE* f){
     xs = xs + size*c;
   }
 }
-stz_int read_int (FILE* f){
+static stz_int read_int (FILE* f){
   stz_int n;
   bread(&n, sizeof(stz_int), 1, f);
   return n;
 }
-stz_long read_long (FILE* f){
+static stz_long read_long (FILE* f){
   stz_long n;
   bread(&n, sizeof(stz_long), 1, f);
   return n;
 }
-stz_byte* read_string (FILE* f){
+static stz_byte* read_string (FILE* f){
   stz_int n = read_int(f);
   if(n < 0)
     return NULL;
@@ -622,7 +622,7 @@ stz_byte* read_string (FILE* f){
     return s;
   }
 }
-stz_byte** read_strings (FILE* f){
+static stz_byte** read_strings (FILE* f){
   stz_int n = read_int(f);
   stz_byte** xs = (stz_byte**)stz_malloc(sizeof(stz_byte*)*(n + 1));
   for(int i=0; i<n; i++)
@@ -630,7 +630,7 @@ stz_byte** read_strings (FILE* f){
   xs[n] = NULL;
   return xs;
 }
-EvalArg* read_earg (FILE* f){
+static EvalArg* read_earg (FILE* f){
   EvalArg* earg = (EvalArg*)stz_malloc(sizeof(EvalArg));
   earg->pipe = read_string(f);
   earg->in_pipe = read_string(f);
@@ -640,13 +640,13 @@ EvalArg* read_earg (FILE* f){
   earg->argvs = read_strings(f);
   return earg;
 }
-void read_process_state (FILE* f, ProcessState* s){  
+static void read_process_state (FILE* f, ProcessState* s){
   s->state = read_int(f);
   s->code = read_int(f);
 }
 
 //===== Free =====
-void free_earg (EvalArg* arg){
+static void free_earg (EvalArg* arg){
   stz_free(arg->pipe);
   if(arg->in_pipe != NULL) stz_free(arg->in_pipe);
   if(arg->out_pipe != NULL) stz_free(arg->out_pipe);
@@ -661,7 +661,7 @@ void free_earg (EvalArg* arg){
 //-------------------- Process Queries -----------------------
 //------------------------------------------------------------
 
-void get_process_state (stz_long pid, ProcessState* s, int wait_for_termination){
+static void get_process_state (stz_long pid, ProcessState* s, int wait_for_termination){
   int status;
   int ret = waitpid((pid_t)pid, &status, wait_for_termination? 0 : WNOHANG);
   
@@ -685,14 +685,14 @@ void get_process_state (stz_long pid, ProcessState* s, int wait_for_termination)
 #define STATE_COMMAND 1
 #define WAIT_COMMAND 2
 
-void write_error_and_exit (int fd){
+static void write_error_and_exit (int fd){
   int code = errno;
   write(fd, &code, sizeof(int));
   close(fd);
   exit(-1);
 }
 
-void launcher_main (FILE* lin, FILE* lout){
+static void launcher_main (FILE* lin, FILE* lout){
   while(1){
     //Read in command
     int comm = fgetc(lin);
@@ -784,9 +784,9 @@ void launcher_main (FILE* lin, FILE* lout){
   }
 }
 
-stz_long launcher_pid = -1;
-FILE* launcher_in = NULL;
-FILE* launcher_out = NULL;
+static stz_long launcher_pid = -1;
+static FILE* launcher_in = NULL;
+static FILE* launcher_out = NULL;
 void initialize_launcher_process (){
   if(launcher_pid < 0){    
     //Create pipes
@@ -824,11 +824,11 @@ void initialize_launcher_process (){
   }
 }
 
-void make_pipe_name (char* pipe_name, int pipeid) {
+static void make_pipe_name (char* pipe_name, int pipeid) {
   sprintf(pipe_name, "/tmp/stanza_exec_pipe_%ld_%ld", (long)getpid(), (long)pipeid);
 }
 
-int delete_process_pipe (FILE* fd, char* pipe_name, char* suffix) {
+static int delete_process_pipe (FILE* fd, char* pipe_name, char* suffix) {
   if (fd != NULL) {
     int close_res = fclose(fd);
     if (close_res == EOF) return -1;
@@ -962,14 +962,14 @@ stz_int input_argv_needs_free;
 
 //     Main Driver
 //     ===========
-void* alloc (VMInit* init, long type, long size){
+static void* alloc (VMInit* init, long type, long size){
   void* ptr = init->heap_top + 8;
   *(long*)(init->heap_top) = type;
   init->heap_top += 8 + size;
   return ptr;  
 }
 
-uint64_t alloc_stack (VMInit* init){
+static uint64_t alloc_stack (VMInit* init){
   Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
   int initial_stack_size = 4 * 1024;
   long size = initial_stack_size + sizeof(StackFrameHeader);
