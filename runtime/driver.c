@@ -958,11 +958,12 @@ void retrieve_process_state (stz_long pid, ProcessState* s, stz_int wait_for_ter
   //Read back process state
   read_process_state(launcher_out, s);
 }
-
-#endif
+#else
+#include "process-win32.c"
 //============================================================
 //============== End Process Runtime =========================
 //============================================================
+#endif
 
 #define STACK_TYPE 6
 
