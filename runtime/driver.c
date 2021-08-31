@@ -25,7 +25,9 @@
 //       ====================
 
 //FMalloc Debugging
+#ifdef FMALLOC
 static void init_fmalloc ();
+#endif
 
 //     Stanza Defined Entities
 //     =======================
@@ -178,6 +180,7 @@ stz_long file_time_modified (const stz_byte* filename){
   return 0;
 }
 
+#ifdef FMALLOC
 //============================================================
 //======================= Free List ==========================
 //============================================================
@@ -296,6 +299,7 @@ static void ffree (void* ptr){
   Chunk* c = (Chunk*)((char*)ptr - sizeof(Chunk));
   add_item(&mem_chunks, c);
 }
+#endif
 
 //============================================================
 //===================== String List ==========================
