@@ -1003,8 +1003,8 @@ int main (int argc, char* argv[]) {
   VMInit init;
 
   //Allocate heap and freespace
-  const int initial_heap_size = 1024 * 1024;
-  const long maximum_heap_size = 4L * 1024 * 1024 * 1024;
+  const stz_long initial_heap_size = 1024 * 1024;
+  const stz_long maximum_heap_size = STZ_LONG(4) * 1024 * 1024 * 1024;
 
   init.heap = (stz_byte*)stz_memory_map(initial_heap_size, maximum_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
