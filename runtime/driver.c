@@ -29,6 +29,11 @@
 static void init_fmalloc ();
 #endif
 
+static void exit_with_error (){
+  fprintf(stderr, "%s\n", strerror(errno));
+  exit(-1);
+}
+
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
@@ -487,11 +492,6 @@ typedef struct {
 //-------------------- Utilities -----------------------------
 //------------------------------------------------------------
 
-static void exit_with_error (){
-  fprintf(stderr, "%s\n", strerror(errno));
-  exit(-1);
-}
-
 static int count_non_null (void** xs){
   int n=0;
   while(xs[n] != NULL)
@@ -519,41 +519,126 @@ static int make_pipe (char* prefix, char* suffix){
   char* name = string_join(prefix, suffix);
   return mkfifo(name, S_IRUSR|S_IWUSR);
 }
+#endif
 
 //============================================================
 //================== Stanza Memory Mapping ===================
 //============================================================
 
-//Set protection bits on address range p (inclusive) to p + size (exclusive).
-//Fatal error if size > 0 and mprotect fails.
-static void protect(void* p, stz_long size, stz_int prot) {
-  if (size && mprotect(p, (size_t)size, prot)) exit_with_error();
-}
-
+#ifdef PLATFORM_WINDOWS
 //Allocates a segment of memory that is min_size allocated, and can be
-//resized up to max_size. 
+//resized up to max_size.
 void* stz_memory_map (stz_long min_size, stz_long max_size) {
-  void* p = mmap(NULL, (size_t)max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (p == MAP_FAILED) exit_with_error();
+  void *p;
 
-  protect(p, min_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+  // Reserve the max size with no access
+  p = VirtualAlloc(NULL, (SIZE_T)max_size, MEM_RESERVE, PAGE_NOACCESS);
+  if (p == NULL) exit_with_error();
+
+  // Commit the min size with RWX access
+  p = VirtualAlloc(p, (SIZE_T)min_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if (p == NULL) exit_with_error();
+
   return p;
 }
 
-//Unmaps the region of mememory. 
+//Unmaps the region of memory.
 void stz_memory_unmap (void* p, stz_long size) {
-  if (p && munmap(p, (size_t)size)) exit_with_error();
+  if (p == NULL) {
+    return;
+  }
+
+  if (!VirtualFree(p, 0, MEM_RELEASE)) {
+    exit_with_error();
+  }
 }
 
 //Resizes the given segment.
 //old_size is assumed to be the size that is already allocated.
 //new_size is the size that we desired to be allocated.
 void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
-  stz_long min_size = old_size;
-  stz_long max_size = new_size;
-  int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+  stz_long min_size, max_size;
+  enum {
+    SHRINK,
+    GROW
+  } resize;
 
-  if (min_size > max_size) {
+  if (new_size > old_size) {
+    resize = GROW;
+    min_size = old_size;
+    max_size = new_size;
+  } else {
+    resize = SHRINK;
+    min_size = new_size;
+    max_size = old_size;
+  }
+
+  switch (resize) {
+    case SHRINK:
+      // TODO: this is incorrect, in that it doesn't de-commit pages in the
+      // region `p + min_size` -> `p + max_size`, and so accesses in the
+      // previously-allocated part of the region will not cause access
+      // violations as they should. However, for now this is fine, because we
+      // don't actually shrink memory regions (yet).
+      if (!VirtualAlloc(p, (SIZE_T)min_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+        exit_with_error();
+      }
+      break;
+    case GROW:
+      if (!VirtualAlloc(p, (SIZE_T)max_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+        exit_with_error();
+      }
+      break;
+  }
+}
+
+#else
+
+//Set protection bits on address range p (inclusive) to p + size (exclusive).
+//Fatal error if size > 0 and protect fails.
+static void protect(void* p, stz_long size, stz_int prot) {
+  if (size == 0) {
+    return;
+  }
+
+  if (mprotect(p, (size_t)size, prot) != 0) {
+    exit_with_error();
+  }
+}
+
+//Allocates a segment of memory that is min_size allocated, and can be
+//resized up to max_size.
+void* stz_memory_map (stz_long min_size, stz_long max_size) {
+  void *p = mmap(NULL, (size_t)max_size, STZ_MPROTECT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) exit_with_error();
+
+  protect(p, min_size, PROT_EXEC | PROT_WRITE | PROT_READ);
+  return p;
+}
+
+//Unmaps the region of memory.
+void stz_memory_unmap (void* p, stz_long size) {
+  if (p == NULL) {
+    return;
+  }
+
+  if (munmap(p, (size_t)size) != 0) {
+    exit_with_error();
+  }
+}
+
+//Resizes the given segment.
+//old_size is assumed to be the size that is already allocated.
+//new_size is the size that we desired to be allocated.
+void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
+  stz_long min_size, max_size;
+  int prot;
+
+  if (new_size > old_size) {
+    min_size = old_size;
+    max_size = new_size;
+    prot = PROT_EXEC | PROT_WRITE | PROT_READ;
+  } else {
     min_size = new_size;
     max_size = old_size;
     prot = PROT_NONE;
@@ -561,7 +646,9 @@ void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
 
   protect((char*)p + min_size, max_size - min_size, prot);
 }
+#endif
 
+#if defined(PLATFORM_LINUX) | defined(PLATFORM_OS_X)
 //------------------------------------------------------------
 //----------------------- Serialization ----------------------
 //------------------------------------------------------------
