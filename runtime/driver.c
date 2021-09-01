@@ -29,10 +29,31 @@
 static void init_fmalloc ();
 #endif
 
+#ifdef PLATFORM_WINDOWS
+#define exit_with_error() exit_with_error_line_and_func(__FILE__, __LINE__)
+static void exit_with_error_line_and_func(const char* file, int line) {
+  char* lpMsgBuf;
+
+  FormatMessage(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER |
+      FORMAT_MESSAGE_FROM_SYSTEM |
+      FORMAT_MESSAGE_IGNORE_INSERTS,
+      NULL,
+      GetLastError(),
+      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      (char*)&lpMsgBuf,
+      0, NULL );
+  fprintf(stderr, "[%s:%d] %s", file, line, lpMsgBuf);
+  LocalFree(lpMsgBuf);
+
+  exit(-1);
+}
+#else
 static void exit_with_error (){
   fprintf(stderr, "%s\n", strerror(errno));
   exit(-1);
 }
+#endif
 
 //     Stanza Defined Entities
 //     =======================
