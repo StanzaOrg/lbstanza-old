@@ -8,7 +8,8 @@
 
 defpackage clib
 
-protected extern memcpy: (ptr<?>, ptr<?>, long) -> int
+protected extern memcpy: (ptr<?>, ptr<?>, long) -> ptr<?>
+protected extern memset: (ptr<?>, long, long) -> ptr<?>
 protected extern remove: (ptr<byte>) -> int
 protected extern rename: (ptr<byte>, ptr<byte>) -> int
 protected extern symlink: (ptr<byte>, ptr<byte>) -> int
@@ -978,9 +979,11 @@ lostanza defn collect-garbage (size:long) -> long :
   var desired-space:long = vms.heap-top + size - vms.heap  
   ;Increase the desired space if it is insufficient
   ;to satisfy the requested size.
-  if available-space < desired-space :
+  if available-space < desired-space :  
     ;Double the desired space until it is sufficient.
-    while available-space < desired-space :
+    val requested-space = desired-space
+    desired-space = available-space * 2
+    while desired-space < requested-space :
       desired-space = desired-space * 2
   ;Increase the desired space if the usage ratio
   ;is too high.
@@ -998,6 +1001,301 @@ lostanza defn collect-garbage (size:long) -> long :
 
   ;Return the remaining space
   return vms.heap-limit - vms.heap-top
+
+;============================================================
+;================== New Garbage Collector ===================
+;============================================================
+
+;Define various constants for the relations between
+;bits, bytes, and longs.
+lostanza val LOG-BITS-IN-BYTE:long = 3
+lostanza val LOG-BYTES-IN-LONG:long = 3
+lostanza val LOG-BITS-IN-LONG:long = LOG-BYTES-IN-LONG + LOG-BITS-IN-BYTE
+lostanza val BYTES-IN-LONG:long = 1 << LOG-BYTES-IN-LONG
+lostanza val BITS-IN-LONG:long = 1 << LOG-BITS-IN-LONG
+
+;Structure for representing a Heap space.
+;- start is the starting address of the heap.
+;- top is the top address of the heap.
+;- limit is equal to start + number of currently available bytes in the heap.
+;- size is the maximum size that the heap can be expanded to.
+;- bitset is the starting address of the marking bits for the heap.
+lostanza deftype Heap :
+  var top: ptr<long>
+  var limit: ptr<long>
+  var start: ptr<long>
+  var size: long
+  var bitset: ptr<long>
+
+;Given the current number of bytes in the heap, return
+;the number of bytes in the heap's bitset, rounded up
+;to the nearest long. 
+lostanza defn bitset-size (heap-size:long) -> long :
+  ;heap-size-in-longs = ceil( heap-size * (1 long / 8 bytes) )
+  val heap-size-in-longs = ((heap-size + (BYTES-IN-LONG - 1)) >> LOG-BYTES-IN-LONG)
+  ;bitset-size-in-longs = ceil( heap-size-in-longs * (1 bit-in-bitset / 1 long) * (1 long / 64 bits) )  
+  val bitset-size-in-longs = (heap-size-in-longs + (BITS-IN-LONG - 1)) >> LOG-BITS-IN-LONG
+  ;return bitset-size-in-longs * bytes-in-long
+  return bitset-size-in-longs << LOG-BYTES-IN-LONG
+
+;Sets the first 'size' bytes in the address range starting from 'start' to 0.
+;Returns 'start'. 
+lostanza defn clear (start:ptr<?>, size:long) -> ptr<?> :
+  return call-c clib/memset(start, 0, size)
+
+;Initialize the current heap structure.
+;- min-size is the initial size of the heap.
+;- max-size is the maximum size that heap can be expanded to.
+lostanza defn initialize-heap (heap:ptr<Heap>, min-size:long, max-size:long) -> ref<False> :
+  ;Precondition: Assert 0 <= min-size && min-size <= max-size
+  #if-not-defined(OPTIMIZE) :
+    if min-size < 0L or max-size < min-size :
+      fatal("Illegal arguments to initialize-heap.")
+  ;Round up sizes to the nearest page size so that it behaves wrt. mmap.
+  val min-heap-size = round-up-to-whole-pages(min-size)
+  val max-heap-size = round-up-to-whole-pages(max-size)
+  ;Initialize the memory for the main heap.
+  heap.size = max-heap-size
+  heap.start = call-c clib/stz_memory_map(min-heap-size, max-heap-size)
+  heap.top = heap.start
+  heap.limit = heap.start + min-heap-size
+  ;Initialize the memory for the heap's bitset.
+  val min-bitset-size = round-up-to-whole-pages(bitset-size(min-heap-size))
+  val max-bitset-size = round-up-to-whole-pages(bitset-size(max-heap-size))
+  heap.bitset = call-c clib/stz_memory_map(min-bitset-size, max-bitset-size)
+  clear(heap.bitset, min-bitset-size)
+  ;No meaningful return value.
+  return false
+
+;Remove all associated memory reserved for the current heap structure.
+lostanza defn finalize-heap (heap:ptr<Heap>) -> ref<False> :
+  ;Compute the current size of the heap and it's bitset.
+  val current-heap-size = heap.limit - heap.start
+  val current-bitset-size = bitset-size(current-heap-size)
+  ;Unmap the currently reserved pages.
+  call-c clib/stz_memory_unmap(heap.start, round-up-to-whole-pages(current-heap-size))
+  call-c clib/stz_memory_unmap(heap.bitset, round-up-to-whole-pages(current-bitset-size))
+  ;No meaningful return value.
+  return false
+
+;Ensure that the given heap is at least the given size.
+;Assumes that the given size is less than the maximum size that heap can be expanded to.
+lostanza defn expand-heap (heap:ptr<Heap>, size:long) -> ref<False> :
+  ;Precondition: Ensure that size is less than maximum allowed size.
+  #if-not-defined(OPTIMIZE) :
+    if heap.size < size :
+      fatal("Cannot expand heap past its maximum size.")
+      
+  ;Exit immediately if heap is already the desired size (or bigger).
+  val current-heap-size = round-up-to-whole-pages(heap.limit - heap.start)
+  val desired-heap-size = round-up-to-whole-pages(size)
+  if current-heap-size >= desired-heap-size : return false
+
+  ;Resize the heap.
+  call-c clib/stz_memory_resize(heap.start, current-heap-size, desired-heap-size)
+
+  ;Resize the bitset.
+  val current-bitset-size = round-up-to-whole-pages(bitset-size(current-heap-size))
+  val desired-bitset-size = round-up-to-whole-pages(bitset-size(desired-heap-size))
+  ;If necessary, clear the newly-allocated bytes in the bitset.
+  if current-bitset-size < desired-bitset-size :
+    call-c clib/stz_memory_resize(heap.bitset, current-bitset-size, desired-bitset-size)
+    clear(heap.bitset + current-bitset-size, desired-bitset-size - current-bitset-size)
+    
+  ;No meaningful return value.
+  return false
+
+;Sanity check: Ensure that the given pointer points to within the given heap.
+;Calls fatal if it is not.
+lostanza defn ensure-pointer-in-heap! (heap:ptr<Heap>, p:ptr<?>) -> ref<False> :
+  #if-not-defined(OPTIMIZE) :
+    if p < heap.start or  p >= heap.top :
+      fatal("Pointer is outside of heap.")
+  return false
+
+;Sanity check: Ensure that the given address range: start (inclusive) to limit (exclusive)
+;is contained within the given heap.
+;Calls fatal if it is not.
+lostanza defn ensure-address-range-in-heap! (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> ref<False> :
+  #if-not-defined(OPTIMIZE) :
+    if start < heap.start or start > limit or limit > heap.top :
+      fatal("Address range is outside of heap.")
+  return false
+
+;Return the index in the heap's bitset that acts as the mark for the given heap pointer.
+lostanza defn bit-index (heap:ptr<Heap>, p:ptr<?>) -> long :
+  ensure-pointer-in-heap!(heap, p)
+  return (p - heap.start) >> LOG-BYTES-IN-LONG
+
+;Returns the pointer in the heap's bitset containing the given mark bit.
+lostanza defn bit-address (heap:ptr<Heap>, bit-index:long) -> ptr<long> :
+  return heap.bitset + (bit-index >> LOG-BITS-IN-LONG) << LOG-BYTES-IN-LONG
+
+;Returns bit-index % BITS-IN-LONG.
+lostanza defn bit-shift (bit-index:long) -> long :
+  return bit-index & (BITS-IN-LONG - 1)
+
+;Assumes the bit-index designates a bit within some 64-bit long.
+;Returns a mask containing a 1 in the same position as that bit within the long.
+lostanza defn bit-mask (bit-index:long) -> long :
+  return 1L << bit-shift(bit-index)
+
+;Returns 1 if the given heap pointer has been marked
+;in the heap's bitset, and 0 otherwise.
+lostanza defn test-mark (heap:ptr<Heap>, p:ptr<?>) -> long :
+  val index = bit-index(heap, p)
+  return ([bit-address(heap, index)] >> bit-shift(index)) & 1
+
+;Marks the given heap pointer in the heap's bitset.
+lostanza defn set-mark (heap:ptr<Heap>, p:ptr<?>) -> ref<False> :
+  val index = bit-index(heap, p)
+  val address = bit-address(heap, index)
+  [address] = [address] | bit-mask(index)
+  ;No meaningful return value.
+  return 0
+
+;Marks the given heap pointer in the heap's bitset.
+;Returns a non-zero value if the pointer was previously marked.
+;Returns zero if the pointer was not previously marked.
+lostanza defn test-and-set-mark (heap:ptr<Heap>, p:ptr<?>) -> long :
+  val index = bit-index(heap, p)
+  val address = bit-address(heap, index)
+  val mask = bit-mask(index)
+
+  val old-value = [address]
+  [address] = old-value | mask
+  return old-value & mask
+
+;Clears the mark for the given heap pointer in the heap's bitset.
+lostanza defn clear-mark (heap:ptr<Heap>, p:ptr<?>) -> ref<False> :
+  val index = bit-index(heap, p)
+  val address = bit-address(heap, index)
+  [address] = [address] & (~ bit-mask(index))
+  ;No meaningful return value.
+  return false
+
+;Clears the mark for the given heap address range.
+lostanza defn clear-mark (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> ref<False> :
+  ensure-address-range-in-heap!(heap, start, limit)
+
+  ;Compute start and ending masks.
+  ;Supposing that start-bit-index is 9, then
+  ;start-bit-mask is 0000 0000 1111 1111, which is used to zero-out all bits
+  ;after the start-bit-index (inclusive).
+  ;Supposing that end-bit-index is 9, then
+  ;end-bit-mask is 1111 1110 0000 0000, which is used to zero-out all its
+  ;before the end-bit-index (inclusive).
+  val start-bit-index = bit-index(heap, start)
+  val end-bit-index = bit-index(heap, limit - 1)
+  val start-bit-address = bit-address(heap, start-bit-index)
+  val end-bit-address = bit-address(heap, end-bit-index)
+  val start-bit-mask = bit-mask(start-bit-index) - 1
+  val end-bit-mask = (- (bit-mask(end-bit-index) << 1))
+
+  ;Special case: the first bit word is the last bit word
+  if start-bit-address == end-bit-address :
+    ;Zero-out all bits where both masks are zero.
+    [start-bit-address] = [start-bit-address] & (start-bit-mask | end-bit-mask)
+  else :
+    ;Zero-out the bits in the start and end words.
+    [start-bit-address] = [start-bit-address] & start-bit-mask
+    [end-bit-address] = [end-bit-address] & end-bit-mask
+    ;Clear the intervening words completely.
+    clear(start-bit-address + BYTES-IN-LONG, end-bit-address - start-bit-address - BYTES-IN-LONG)
+  ;No meaningful return value.
+  return false
+
+;Given the 64-long address range starting at 'start' in the heap,
+;and the 64-bit mask given in 'bit-word', 
+;call 'f' on every pointer corresponding to a 1 in 'bit-word'. 
+lostanza defn iterate-bit-word (heap:ptr<Heap>, start:ptr<?>, bit-word:long,
+                                f:ptr<((ptr<Heap>, ptr<?>) -> ref<False>)>) -> ref<False> :
+  ;Ones are rare, expect zeroes
+  var p:ptr<?> = start
+  var bits:long = bit-word
+  while bits != 0 :
+    ;TODO: introduce BSF instruction and use it here
+    ;If the next 32 bits in 'bits' is zero, then
+    ;advance bits and pointer p by 32. 
+    if (bits & 0xFFFFFFFFL) == 0 :
+      bits = bits >> 32
+      p = p + (32 * BYTES-IN-LONG)
+    ;If the next 16 bits in 'bits' is zero, then
+    ;advance bits and pointer p by 16. 
+    if (bits & 0xFFFFL) == 0 :
+      bits = bits >> 16
+      p = p + (16 * BYTES-IN-LONG)
+    ;If the next 8 bits in 'bits' is zero, then
+    ;advance bits and pointer p by 8. 
+    if (bits & 0xFFL) == 0 :
+      bits = bits >> 8
+      p = p + (8 * BYTES-IN-LONG)
+    ;If the next 4 bits in 'bits' is zero, then
+    ;advance bits and pointer p by 4. 
+    if (bits & 0xFL) == 0 :
+      bits = bits >> 4
+      p = p + (4 * BYTES-IN-LONG)
+    ;If the next 2 bits in 'bits' is zero, then
+    ;advance bits and pointer p by 2. 
+    if (bits & 0x3) == 0 :
+      bits = bits >> 2
+      p = p + (2 * BYTES-IN-LONG)
+    ;If the next bit is set, then call f on the
+    ;current pointer.
+    if (bits & 1) != 0 :
+      [f](heap, p)
+    ;Advance bits and p by 1.
+    bits = bits >> 1
+    p = p + (1 * BYTES-IN-LONG)
+  ;No meaningful return value.
+  return false
+
+;Iterate through the heap address range given by start and limit,
+;and call f on all pointers in that range that are marked in the heap's bitset.
+lostanza defn iterate-marked (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>,
+                              f:ptr<((ptr<Heap>, ptr<?>) -> ref<False>)>) -> ref<False> :
+  ensure-address-range-in-heap!(heap, start, limit)
+
+  ;Compute starting shift and ending mask.
+  ;Supposing that end-bit-index is 9, then end-bit-mask contains 0000 0001 1111 1111.
+  val start-bit-index = bit-index(heap, start)
+  val end-bit-index = bit-index(heap, limit - 1)
+  val start-bit-address = bit-address(heap, start-bit-index)
+  val end-bit-address = bit-address(heap, end-bit-index)
+  val start-bit-shift = bit-shift(start-bit-index)
+  val end-bit-mask = (bit-mask(end-bit-index) << 1) - 1
+
+  ;Special case: the first bit word is the last bit word
+  if start-bit-address == end-bit-address :
+    ;The '[start-bit-address] & end-bit-mask' expression contains the bitset word
+    ;with mark bits for pointers beyond the ending pointer masked off.
+    ;That word is then shifted to the right by 'start-bit-shift' to align with the start pointer.
+    iterate-bit-word(heap, start, ([start-bit-address] & end-bit-mask) >> start-bit-shift, f)
+
+  else :
+    ;Process the first bit word.
+    ;[start-bit-address] is the 64-bit long in the bitset containing the mark for the start pointer.
+    ;It is shifted to the right by 'start-bit-shift' to align with the start pointer.
+    iterate-bit-word(heap, start, [start-bit-address] >> start-bit-shift, f)
+
+    ;Initialize p to the pointer right after the 64-pointer chunk containing the start pointer.
+    var p:ptr<?> = start + ((BITS-IN-LONG - start-bit-shift) * BYTES-IN-LONG)
+    var bit-address:ptr<long> = start-bit-address + BYTES-IN-LONG
+    ;Process every intervening chunk, not including the last chunk containing the end pointer.
+    while bit-address < end-bit-address :
+      ;Iterate through every marked pointer in this chunk.
+      if [bit-address] != 0 :     ;Rarely taken
+        iterate-bit-word(heap, p, [bit-address], f)
+      ;Advance to the next chunk
+      bit-address = bit-address + BYTES-IN-LONG
+      p = p + (BITS-IN-LONG * BYTES-IN-LONG)
+
+    ;Process the last bit word.
+    ;Mask off the bits in the bitset that are beyond the last pointer.
+    iterate-bit-word(heap, p, [end-bit-address] & end-bit-mask, f)
+
+  ;No meaningful return value
+  return false
 
 ;============================================================
 ;==================== Garbage Collector =====================
