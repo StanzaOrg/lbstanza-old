@@ -617,7 +617,7 @@ void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
 
 //Set protection bits on address range p (inclusive) to p + size (exclusive).
 //Fatal error if size > 0 and protect fails.
-static void protect(void* p, stz_long size, stz_int prot) {
+static void protect(void* p, stz_long size, int prot) {
   if (size == 0) {
     return;
   }
@@ -630,10 +630,10 @@ static void protect(void* p, stz_long size, stz_int prot) {
 //Allocates a segment of memory that is min_size allocated, and can be
 //resized up to max_size.
 void* stz_memory_map (stz_long min_size, stz_long max_size) {
-  void *p = mmap(NULL, (size_t)max_size, STZ_MPROTECT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *p = mmap(NULL, (size_t)max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) exit_with_error();
 
-  protect(p, min_size, PROT_EXEC | PROT_WRITE | PROT_READ);
+  protect(p, min_size, PROT_READ | PROT_WRITE | PROT_EXEC);
   return p;
 }
 
