@@ -18,6 +18,7 @@
 #include<dirent.h>
 #include<pthread.h>
 
+#include "common.h"
 #include "types.h"
 
 //       Forward Declarations
