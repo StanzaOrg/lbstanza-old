@@ -506,34 +506,68 @@ static int make_pipe (char* prefix, char* suffix){
   char* name = string_join(prefix, suffix);
   return mkfifo(name, S_IRUSR|S_IWUSR);
 }
+#endif
 
 //============================================================
 //================== Stanza Memory Mapping ===================
 //============================================================
 
+#ifndef PLATFORM_WINDOWS
 //Set protection bits on address range p (inclusive) to p + size (exclusive).
-//Fatal error if size > 0 and mprotect fails.
+//Fatal error if size > 0 and protect fails.
 static void protect(void* p, stz_long size, stz_int prot) {
-  if (size && mprotect(p, (size_t)size, prot)) exit_with_error();
+  if (size == 0) {
+    return;
+  }
+
+  if (mprotect(p, (size_t)size, prot) != 0) {
+    exit_with_error();
+  }
 }
+#endif
 
 //Allocates a segment of memory that is min_size allocated, and can be
 //resized up to max_size.
 //This function is called from within Stanza, and min_size and max_size
 //are assumed to be multiples of the system page size.
 void* stz_memory_map (stz_long min_size, stz_long max_size) {
-  void* p = mmap(NULL, (size_t)max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *p = NULL;
+
+#ifdef PLATFORM_WINDOWS
+  // Reserve the max size with no access
+  p = VirtualAlloc(NULL, (SIZE_T)max_size, MEM_RESERVE, PAGE_NOACCESS);
+  if (p == NULL) exit_with_error();
+
+  // Commit the min size with RWX access
+  p = VirtualAlloc(p, (SIZE_T)min_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if (p == NULL) exit_with_error();
+#else // POSIX
+  p = mmap(NULL, (size_t)max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) exit_with_error();
 
   protect(p, min_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+#endif
+
   return p;
 }
 
-//Unmaps the region of mememory. 
-//This function is called from within Stanza, and size is 
+//Unmaps the region of memory.
+//This function is called from within Stanza, and size is
 //assumed to be a multiple of the system page size.
 void stz_memory_unmap (void* p, stz_long size) {
-  if (p && munmap(p, (size_t)size)) exit_with_error();
+  if (p == NULL) {
+    return;
+  }
+
+#ifdef PLATFORM_WINDOWS
+  if (!VirtualFree(p, 0, MEM_RELEASE)) {
+    exit_with_error();
+  }
+#else // POSIX
+  if (munmap(p, (size_t)size) != 0) {
+    exit_with_error();
+  }
+#endif
 }
 
 //Resizes the given segment.
@@ -541,19 +575,37 @@ void stz_memory_unmap (void* p, stz_long size) {
 //new_size is the size that we desired to be allocated, and
 //must be a multiple of the system page size.
 void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
-  stz_long min_size = old_size;
-  stz_long max_size = new_size;
-  int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+#ifdef PLATFORM_WINDOWS
+  if (new_size > old_size) {
+    // Growing the allocation: commit all memory pages from the old limit to the new limit.
+    if (!VirtualAlloc((char*)p + old_size, (SIZE_T)(new_size - old_size), MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+      exit_with_error();
+    }
+  } else {
+    // Shrinking the allocation: decommit all memory pages from the new limit to the old limit.
+    if (!VirtualFree((char*)p + new_size, (SIZE_T)(old_size - new_size), MEM_DECOMMIT)) {
+      exit_with_error();
+    }
+  }
+#else // POSIX
+  stz_long min_size, max_size;
+  int prot;
 
-  if (min_size > max_size) {
+  if (new_size > old_size) {
+    min_size = old_size;
+    max_size = new_size;
+    prot = PROT_EXEC | PROT_WRITE | PROT_READ;
+  } else {
     min_size = new_size;
     max_size = old_size;
     prot = PROT_NONE;
   }
 
   protect((char*)p + min_size, max_size - min_size, prot);
+#endif
 }
 
+#if defined(PLATFORM_LINUX) | defined(PLATFORM_OS_X)
 //------------------------------------------------------------
 //----------------------- Serialization ----------------------
 //------------------------------------------------------------
