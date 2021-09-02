@@ -574,6 +574,10 @@ void stz_memory_unmap (void* p, stz_long size) {
   }
 }
 
+#define ROUND_UP(n, divisor) ((((n) + (divisor) - 1) / (divisor)) * (divisor))
+#define PAGE_SIZE 0x1000
+#define ROUND_UP_TO_NEAREST_PAGE(n) ROUND_UP((n), PAGE_SIZE)
+
 //Resizes the given segment.
 //old_size is assumed to be the size that is already allocated.
 //new_size is the size that we desired to be allocated.
@@ -594,19 +598,23 @@ void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
     max_size = old_size;
   }
 
+  const SIZE_T start_page = ROUND_UP_TO_NEAREST_PAGE((SIZE_T)(char*)p + min_size);
+  const SIZE_T end_page   = ROUND_UP_TO_NEAREST_PAGE((SIZE_T)(char*)p + max_size);
+  if (start_page == end_page) {
+    return;
+  }
+
+  const LPVOID modified_start = (LPVOID)start_page;
+  const SIZE_T modified_size  = end_page - start_page;
+
   switch (resize) {
     case SHRINK:
-      // TODO: this is incorrect, in that it doesn't de-commit pages in the
-      // region `p + min_size` -> `p + max_size`, and so accesses in the
-      // previously-allocated part of the region will not cause access
-      // violations as they should. However, for now this is fine, because we
-      // don't actually shrink memory regions (yet).
-      if (!VirtualAlloc(p, (SIZE_T)min_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+      if (!VirtualFree(modified_start, modified_size, MEM_DECOMMIT)) {
         exit_with_error();
       }
       break;
     case GROW:
-      if (!VirtualAlloc(p, (SIZE_T)max_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
+      if (!VirtualAlloc(modified_start, modified_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) {
         exit_with_error();
       }
       break;
