@@ -18,6 +18,7 @@
 #include<dirent.h>
 #include<pthread.h>
 
+#include "common.h"
 #include "types.h"
 
 //       Forward Declarations
@@ -517,7 +518,9 @@ static void protect(void* p, stz_long size, stz_int prot) {
 }
 
 //Allocates a segment of memory that is min_size allocated, and can be
-//resized up to max_size. 
+//resized up to max_size.
+//This function is called from within Stanza, and min_size and max_size
+//are assumed to be multiples of the system page size.
 void* stz_memory_map (stz_long min_size, stz_long max_size) {
   void* p = mmap(NULL, (size_t)max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) exit_with_error();
@@ -527,13 +530,16 @@ void* stz_memory_map (stz_long min_size, stz_long max_size) {
 }
 
 //Unmaps the region of mememory. 
+//This function is called from within Stanza, and size is 
+//assumed to be a multiple of the system page size.
 void stz_memory_unmap (void* p, stz_long size) {
   if (p && munmap(p, (size_t)size)) exit_with_error();
 }
 
 //Resizes the given segment.
 //old_size is assumed to be the size that is already allocated.
-//new_size is the size that we desired to be allocated.
+//new_size is the size that we desired to be allocated, and
+//must be a multiple of the system page size.
 void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
   stz_long min_size = old_size;
   stz_long max_size = new_size;

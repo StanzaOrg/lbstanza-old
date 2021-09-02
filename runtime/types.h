@@ -20,4 +20,13 @@ typedef float   stz_float;
 #define STZ_STR(x)  ((stz_byte*)(x))
 #define STZ_CSTR(x) ((const stz_byte*)(x))
 
+// Macro to create an integer literal of size `stz_long`. Using LL is probably
+// always OK but using an explicit macro helps keep definition/declarations in
+// sync. (compare `stz_long i = 4LL` to `stz_long i = STZ_LONG(4)`)
+#ifdef PLATFORM_WINDOWS
+#define STZ_LONG(N) ((stz_long)N##LL)
+#else
+#define STZ_LONG(N) ((stz_long)N##L)
+#endif
+
 #endif
