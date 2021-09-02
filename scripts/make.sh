@@ -1,51 +1,93 @@
+#!/usr/bin/env bash
+
 # USAGES:
-# ./scripts/make.sh ./stanza
+# ./scripts/make.sh ./stanza os-x
+# ./scripts/make.sh lstanza windows
+
+HERE="$(dirname "${BASH_SOURCE[0]}")"
 
 set -e
 set -o pipefail
 
-if [ $# -lt 1 ]; then
+if [ $# -lt 2 ]; then
     echo "Not enough arguments"
     exit 2
 fi
 
-STANZA=$1
+STANZA="$1"
+PLATFORM="$2"
+COMMAND="${3:-compile-clean}" # default to `compile-clean` if no command is passed
+
+case "$COMMAND" in
+    compile)
+        CLEAN=0 COMPILE=1 FINISH=1 ;;
+    compile-clean)
+        CLEAN=1 COMPILE=1 FINISH=1 ;;
+    compile-without-finish)
+        CLEAN=0 COMPILE=1 FINISH=0 ;;
+    compile-clean-without-finish)
+        CLEAN=1 COMPILE=1 FINISH=0 ;;
+    clean)
+        CLEAN=1 COMPILE=0 FINISH=0 ;;
+    *) cat 1>&2 <<EOF
+Error: unsupported/unrecognized command: \`$COMMAND\`
+Supported commands: compile, compile-clean, compile-without-finish, compile-clean-without-finish, clean
+EOF
+esac
+
+case "$PLATFORM" in
+    windows) PLATFORM_PREFIX="w" ;;
+    linux)   PLATFORM_PREFIX="l" ;;
+    os-x)    PLATFORM_PREFIX=""  ;;
+    *) cat 1>&2 <<EOF
+Error: unsupported/unrecognized platform: \`$PLATFORM\`
+Supported platforms: windows, linux, os-x
+EOF
+       exit 2 ;;
+esac
+
+case "$PLATFORM" in
+    windows) DPLATFORM="Windows" ;;
+    linux)   DPLATFORM="Linux"   ;;
+    os-x)    DPLATFORM="OS X"    ;;
+esac
+
+echo "Building Stanza for $DPLATFORM"
 
 #Pkg packages
 PKGFILES="math arg-parser line-wrap stz/test-driver stz/mocker stz/arg-parser"
-
-#Delete pkg files
-rm -rf pkgs
-rm -rf lpkgs
-#rm -rf wpkgs
-
-#Create folders
-mkdir -p pkgs
-mkdir -p lpkgs
-#mkdir -p wpkgs
+PKGDIR="${PLATFORM_PREFIX}pkgs"
+STANZA_S="${PLATFORM_PREFIX}stanza.s"
 
 #Clean
-$STANZA clean
+if [[ "$CLEAN" == 1 ]]; then
+    echo "Cleaning Stanza files"
 
-#Compile OSX Pkgs and Executable
-echo "Compiling OSX Pkgs"
-$STANZA build-stanza.proj stz/driver $PKGFILES -pkg pkgs
-$STANZA build-stanza.proj stz/driver $PKGFILES -pkg pkgs -optimize
-echo "Compiling OSX Executable"
-$STANZA build-stanza.proj stz/driver -pkg pkgs -s stanza.s -optimize
+    #Delete pkg files
+    rm -rf "$PKGDIR"
 
-#Compile Linux Pkgs and Executable
-echo "Compiling Linux Pkgs"
-$STANZA build-stanza.proj stz/driver $PKGFILES -pkg lpkgs -platform linux
-$STANZA build-stanza.proj stz/driver $PKGFILES -pkg lpkgs -optimize -platform linux
-echo "Compiling Linux Executable"
-$STANZA build-stanza.proj stz/driver -pkg lpkgs -s lstanza.s -optimize -platform linux
+    "$STANZA" clean
+fi
 
-#Finish on osx
-#gcc -std=gnu99 -c compiler/cvm.c -O3 -o cvm.o
-#gcc -std=gnu99 runtime/driver.c runtime/linenoise.c cvm.o stanza.s -o stanza -DPLATFORM_OS_X -lm
-#Finish on linux
-#gcc -std=gnu99 -c compiler/cvm.c -O3 -o cvm.o
-#gcc -std=gnu99 runtime/driver.c runtime/linenoise.c cvm.o lstanza.s -o lstanza -DPLATFORM_LINUX -lm -ldl -fPIC
-#Finish on windows
-#gcc -std=gnu99 runtime/driver.c wstanza.s -o wstanza -DPLATFORM_WINDOWS -lm
+#Make pkg dir if it doesn't exist
+mkdir -p "$PKGDIR"
+
+if [[ "$COMPILE" == 1 ]]; then
+    echo "Compiling $DPLATFORM Stanza Pkgs"
+    "$STANZA" build-stanza.proj stz/driver $PKGFILES -pkg "$PKGDIR" -platform $PLATFORM
+
+    echo "Compiling $DPLATFORM Stanza Optimized Pkgs"
+    "$STANZA" build-stanza.proj stz/driver $PKGFILES -pkg "$PKGDIR" -optimize -platform $PLATFORM
+
+    echo "Compiling $DPLATFORM Stanza Executable"
+    "$STANZA" build-stanza.proj stz/driver -pkg "$PKGDIR" -s "$STANZA_S" -optimize -platform $PLATFORM
+fi
+
+if [[ "$FINISH" == 1 ]]; then
+    echo "Finishing $DPLATFORM executable"
+    case "$PLATFORM" in
+        windows) "$HERE"/wfinish.sh ;;
+        linux)   "$HERE"/lfinish.sh ;;
+        os-x)    "$HERE"/finish.sh  ;;
+    esac
+fi
