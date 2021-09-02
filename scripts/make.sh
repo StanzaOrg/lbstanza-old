@@ -16,6 +16,24 @@ fi
 
 STANZA="$1"
 PLATFORM="$2"
+COMMAND="${3:-compile-clean}" # default to `compile-clean` if no command is passed
+
+case "$COMMAND" in
+    compile)
+        CLEAN=0 COMPILE=1 FINISH=1 ;;
+    compile-clean)
+        CLEAN=1 COMPILE=1 FINISH=1 ;;
+    compile-without-finish)
+        CLEAN=0 COMPILE=1 FINISH=0 ;;
+    compile-clean-without-finish)
+        CLEAN=1 COMPILE=1 FINISH=0 ;;
+    clean)
+        CLEAN=1 COMPILE=0 FINISH=0 ;;
+    *) cat 1>&2 <<EOF
+Error: unsupported/unrecognized command: \`$COMMAND\`
+Supported commands: compile, compile-clean, compile-without-finish, compile-clean-without-finish, clean
+EOF
+esac
 
 case "$PLATFORM" in
     windows) PLATFORM_PREFIX="w" ;;
@@ -41,26 +59,35 @@ PKGFILES="math arg-parser line-wrap stz/test-driver stz/mocker stz/arg-parser"
 PKGDIR="${PLATFORM_PREFIX}pkgs"
 STANZA_S="${PLATFORM_PREFIX}stanza.s"
 
-#Delete pkg files
-rm -rf "$PKGDIR"
+#Clean
+if [[ "$CLEAN" == 1 ]]; then
+    echo "Cleaning Stanza files"
 
-#Create folders
+    #Delete pkg files
+    rm -rf "$PKGDIR"
+
+    "$STANZA" clean
+fi
+
+#Make pkg dir if it doesn't exist
 mkdir -p "$PKGDIR"
 
-#Clean
-"$STANZA" clean
+if [[ "$COMPILE" == 1 ]]; then
+    echo "Compiling $DPLATFORM Stanza Pkgs"
+    "$STANZA" build-stanza.proj stz/driver $PKGFILES -pkg "$PKGDIR" -platform $PLATFORM
 
-echo "Compiling $DPLATFORM Stanza Pkgs"
-"$STANZA" build-stanza.proj stz/driver $PKGFILES -pkg "$PKGDIR" -platform $PLATFORM
-echo "Compiling $DPLATFORM Stanza Optimized Pkgs"
-"$STANZA" build-stanza.proj stz/driver $PKGFILES -pkg "$PKGDIR" -optimize -platform $PLATFORM
+    echo "Compiling $DPLATFORM Stanza Optimized Pkgs"
+    "$STANZA" build-stanza.proj stz/driver $PKGFILES -pkg "$PKGDIR" -optimize -platform $PLATFORM
 
-echo "Compiling $DPLATFORM Stanza Executable"
-"$STANZA" build-stanza.proj stz/driver -pkg "$PKGDIR" -s "$STANZA_S" -optimize -platform $PLATFORM
+    echo "Compiling $DPLATFORM Stanza Executable"
+    "$STANZA" build-stanza.proj stz/driver -pkg "$PKGDIR" -s "$STANZA_S" -optimize -platform $PLATFORM
+fi
 
-echo "Finishing $DPLATFORM executable"
-case "$PLATFORM" in
-    windows) "$HERE"/wfinish.sh ;;
-    linux)   "$HERE"/lfinish.sh ;;
-    os-x)    "$HERE"/finish.sh  ;;
-esac
+if [[ "$FINISH" == 1 ]]; then
+    echo "Finishing $DPLATFORM executable"
+    case "$PLATFORM" in
+        windows) "$HERE"/wfinish.sh ;;
+        linux)   "$HERE"/lfinish.sh ;;
+        os-x)    "$HERE"/finish.sh  ;;
+    esac
+fi
