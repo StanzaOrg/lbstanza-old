@@ -425,6 +425,111 @@ void stz_free (void* ptr){
 }
 
 //============================================================
+//============= Stanza Memory Mapping on POSIX ===============
+//============================================================
+#if defined(PLATFORM_LINUX) | defined(PLATFORM_OS_X)
+
+//Set protection bits on address range p (inclusive) to p + size (exclusive).
+//Fatal error if size > 0 and mprotect fails.
+static void protect(void* p, stz_long size, stz_int prot) {
+  if (size && mprotect(p, (size_t)size, prot)) exit_with_error();
+}
+
+//Allocates a segment of memory that is min_size allocated, and can be
+//resized up to max_size.
+//This function is called from within Stanza, and min_size and max_size
+//are assumed to be multiples of the system page size.
+void* stz_memory_map (stz_long min_size, stz_long max_size) {
+  void* p = mmap(NULL, (size_t)max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) exit_with_error();
+
+  protect(p, min_size, PROT_READ | PROT_WRITE | PROT_EXEC);
+  return p;
+}
+
+//Unmaps the region of mememory. 
+//This function is called from within Stanza, and size is 
+//assumed to be a multiple of the system page size.
+void stz_memory_unmap (void* p, stz_long size) {
+  if (p && munmap(p, (size_t)size)) exit_with_error();
+}
+
+//Resizes the given segment.
+//old_size is assumed to be the size that is already allocated.
+//new_size is the size that we desired to be allocated, and
+//must be a multiple of the system page size.
+void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
+  stz_long min_size = old_size;
+  stz_long max_size = new_size;
+  int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+
+  if (min_size > max_size) {
+    min_size = new_size;
+    max_size = old_size;
+    prot = PROT_NONE;
+  }
+
+  protect((char*)p + min_size, max_size - min_size, prot);
+}
+
+#endif
+
+//============================================================
+//============= Stanza Memory Mapping on Windows =============
+//============================================================
+#ifdef PLATFORM_WINDOWS
+
+//Allocates a segment of memory that is min_size allocated, and can be
+//resized up to max_size.
+//This function is called from within Stanza, and min_size and max_size
+//are assumed to be multiples of the system page size.
+void* stz_memory_map (stz_long min_size, stz_long max_size) {
+  // Reserve the max size with no access
+  void* p = VirtualAlloc(NULL, (SIZE_T)max_size, MEM_RESERVE, PAGE_NOACCESS);
+  if (p == NULL) exit_with_error();
+
+  // Commit the min size with RWX access.
+  p = VirtualAlloc(p, (SIZE_T)min_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if (p == NULL) exit_with_error();
+
+  // Return the reserved and committed pointer.
+  return p;
+}
+
+//Unmaps the region of mememory. 
+//This function is called from within Stanza, and size is 
+//assumed to be a multiple of the system page size.
+void stz_memory_unmap (void* p, stz_long size) {
+  // End doing nothing if p is null.
+  if (p == NULL) return;
+
+  // Release the memory and fatal if it fails.
+  if (!VirtualFree(p, 0, MEM_RELEASE))
+    exit_with_error();
+}
+
+//Resizes the given segment.
+//old_size is assumed to be the size that is already allocated.
+//new_size is the size that we desired to be allocated, and
+//must be a multiple of the system page size.
+void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
+  //Case: if growing the allocated size.
+  if (new_size > old_size) {
+    // Growing the allocation: commit all memory pages from the old limit to the new limit.
+    if (!VirtualAlloc((char*)p + old_size, (SIZE_T)(new_size - old_size), MEM_COMMIT, PAGE_EXECUTE_READWRITE))
+      exit_with_error();
+  }
+  //Case: if shrinking the allocated size.
+  else if(new_size < old_size) {
+    // Shrinking the allocation: decommit all memory pages from the new limit to the old limit.
+    if (!VirtualFree((char*)p + new_size, (SIZE_T)(old_size - new_size), MEM_DECOMMIT))
+      exit_with_error();
+  }
+}
+
+#endif
+
+//============================================================
 //================= Process Runtime ==========================
 //============================================================
 #if defined(PLATFORM_OS_X) || defined(PLATFORM_LINUX)
@@ -506,57 +611,12 @@ static int make_pipe (char* prefix, char* suffix){
   char* name = string_join(prefix, suffix);
   return mkfifo(name, S_IRUSR|S_IWUSR);
 }
-
-//============================================================
-//================== Stanza Memory Mapping ===================
-//============================================================
-
-//Set protection bits on address range p (inclusive) to p + size (exclusive).
-//Fatal error if size > 0 and mprotect fails.
-static void protect(void* p, stz_long size, stz_int prot) {
-  if (size && mprotect(p, (size_t)size, prot)) exit_with_error();
-}
-
-//Allocates a segment of memory that is min_size allocated, and can be
-//resized up to max_size.
-//This function is called from within Stanza, and min_size and max_size
-//are assumed to be multiples of the system page size.
-void* stz_memory_map (stz_long min_size, stz_long max_size) {
-  void* p = mmap(NULL, (size_t)max_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (p == MAP_FAILED) exit_with_error();
-
-  protect(p, min_size, PROT_READ | PROT_WRITE | PROT_EXEC);
-  return p;
-}
-
-//Unmaps the region of mememory. 
-//This function is called from within Stanza, and size is 
-//assumed to be a multiple of the system page size.
-void stz_memory_unmap (void* p, stz_long size) {
-  if (p && munmap(p, (size_t)size)) exit_with_error();
-}
-
-//Resizes the given segment.
-//old_size is assumed to be the size that is already allocated.
-//new_size is the size that we desired to be allocated, and
-//must be a multiple of the system page size.
-void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
-  stz_long min_size = old_size;
-  stz_long max_size = new_size;
-  int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-
-  if (min_size > max_size) {
-    min_size = new_size;
-    max_size = old_size;
-    prot = PROT_NONE;
-  }
-
-  protect((char*)p + min_size, max_size - min_size, prot);
-}
+#endif
 
 //------------------------------------------------------------
 //----------------------- Serialization ----------------------
 //------------------------------------------------------------
+#if defined(PLATFORM_LINUX) | defined(PLATFORM_OS_X)
 
 // ===== Serialization =====
 static void write_int (FILE* f, stz_int x){
