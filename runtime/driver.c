@@ -669,19 +669,6 @@ void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
 //------------------------------------------------------------
 
 typedef struct {
-  stz_long pid;
-  stz_int pipeid;
-  FILE* in;
-  FILE* out;
-  FILE* err;
-} Process;
-
-typedef struct {
-  stz_int state;
-  stz_int code;
-} ProcessState;
-
-typedef struct {
   stz_byte* pipe;
   stz_byte* in_pipe;
   stz_byte* out_pipe;
@@ -689,19 +676,6 @@ typedef struct {
   stz_byte* file;
   stz_byte** argvs;
 } EvalArg;
-
-#define PROCESS_RUNNING 0
-#define PROCESS_DONE 1
-#define PROCESS_TERMINATED 2
-#define PROCESS_STOPPED 3
-
-#define STANDARD_IN 0
-#define STANDARD_OUT 1
-#define PROCESS_IN 2
-#define PROCESS_OUT 3
-#define STANDARD_ERR 4
-#define PROCESS_ERR 5
-#define NUM_STREAM_SPECS 6
 
 #define RETURN_NEG(x) {int r=(x); if(r < 0) return -1;}
 
@@ -1135,11 +1109,12 @@ void retrieve_process_state (stz_long pid, ProcessState* s, stz_int wait_for_ter
   //Read back process state
   read_process_state(launcher_out, s);
 }
-
-#endif
+#else
+#include "process-win32.c"
 //============================================================
 //============== End Process Runtime =========================
 //============================================================
+#endif
 
 #define STACK_TYPE 6
 
