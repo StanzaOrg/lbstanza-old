@@ -32,6 +32,44 @@ static void init_fmalloc ();
 void* stz_malloc (stz_long size);
 void stz_free (void* ptr);
 
+#ifdef PLATFORM_WINDOWS
+char* get_windows_api_error() {
+  char* lpMsgBuf;
+  char* ret;
+
+  FormatMessage(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER |
+      FORMAT_MESSAGE_FROM_SYSTEM |
+      FORMAT_MESSAGE_IGNORE_INSERTS,
+      NULL,
+      GetLastError(),
+      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      (char*)&lpMsgBuf,
+      0, NULL );
+
+  ret = strdup(lpMsgBuf);
+  LocalFree(lpMsgBuf);
+
+  return ret;
+}
+#endif
+
+#ifdef PLATFORM_WINDOWS
+static void exit_with_error_line_and_func (const char* file, int line) {
+  fprintf(stderr, "[%s:%d] %s", file, line, get_windows_api_error());
+  exit(-1);
+}
+#endif
+
+#if defined(PLATFORM_LINUX) || defined(PLATFORM_OSX)
+static void exit_with_error_line_and_func (const char* file, int line){
+  fprintf(stderr, "[%s:%d] %s\n", file, line, strerror(errno));
+  exit(-1);
+}
+#endif
+
+#define exit_with_error() exit_with_error_line_and_func(__FILE__, __LINE__)
+
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
@@ -582,11 +620,6 @@ typedef struct {
 //------------------------------------------------------------
 //-------------------- Utilities -----------------------------
 //------------------------------------------------------------
-
-static void exit_with_error (){
-  fprintf(stderr, "%s\n", strerror(errno));
-  exit(-1);
-}
 
 static int count_non_null (void** xs){
   int n=0;
