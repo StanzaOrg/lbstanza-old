@@ -52,6 +52,22 @@ char* get_windows_api_error() {
 }
 #endif
 
+#ifdef PLATFORM_WINDOWS
+static void exit_with_error_line_and_func (const char* file, int line) {
+  fprintf(stderr, "[%s:%d] %s", file, line, get_windows_api_error());
+  exit(-1);
+}
+#endif
+
+#if defined(PLATFORM_LINUX) || defined(PLATFORM_OSX)
+static void exit_with_error_line_and_func (const char* file, int line){
+  fprintf(stderr, "[%s:%d] %s\n", file, line, strerror(errno));
+  exit(-1);
+}
+#endif
+
+#define exit_with_error() exit_with_error_line_and_func(__FILE__, __LINE__)
+
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
@@ -495,11 +511,6 @@ typedef struct {
 //------------------------------------------------------------
 //-------------------- Utilities -----------------------------
 //------------------------------------------------------------
-
-static void exit_with_error (){
-  fprintf(stderr, "%s\n", strerror(errno));
-  exit(-1);
-}
 
 static int count_non_null (void** xs){
   int n=0;
