@@ -30,6 +30,28 @@ static void init_fmalloc ();
 void* stz_malloc (stz_long size);
 void stz_free (void* ptr);
 
+#ifdef PLATFORM_WINDOWS
+char* get_windows_api_error() {
+  char* lpMsgBuf;
+  char* ret;
+
+  FormatMessage(
+      FORMAT_MESSAGE_ALLOCATE_BUFFER |
+      FORMAT_MESSAGE_FROM_SYSTEM |
+      FORMAT_MESSAGE_IGNORE_INSERTS,
+      NULL,
+      GetLastError(),
+      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+      (char*)&lpMsgBuf,
+      0, NULL );
+
+  ret = strdup(lpMsgBuf);
+  LocalFree(lpMsgBuf);
+
+  return ret;
+}
+#endif
+
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
