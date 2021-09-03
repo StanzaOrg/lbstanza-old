@@ -1,7 +1,8 @@
 #ifdef PLATFORM_WINDOWS
-  #include<Windows.h>
+  #include<windows.h>
 #else
   #include<sys/wait.h>
+  #include<sys/mman.h>
 #endif
 #include<stdint.h>
 #include<unistd.h>
@@ -14,7 +15,6 @@
 #include<string.h>
 #include<sys/stat.h>
 #include<sys/types.h>
-#include<sys/mman.h>
 #include<dirent.h>
 #include<pthread.h>
 
@@ -25,7 +25,9 @@
 //       ====================
 
 //FMalloc Debugging
+#ifdef FMALLOC
 static void init_fmalloc ();
+#endif
 
 void* stz_malloc (stz_long size);
 void stz_free (void* ptr);
@@ -181,6 +183,7 @@ stz_long file_time_modified (const stz_byte* filename){
   return 0;
 }
 
+#ifdef FMALLOC
 //============================================================
 //======================= Free List ==========================
 //============================================================
@@ -299,6 +302,7 @@ static void ffree (void* ptr){
   Chunk* c = (Chunk*)((char*)ptr - sizeof(Chunk));
   add_item(&mem_chunks, c);
 }
+#endif
 
 //============================================================
 //===================== String List ==========================
@@ -1059,8 +1063,8 @@ int main (int argc, char* argv[]) {
   VMInit init;
 
   //Allocate heap and freespace
-  const int initial_heap_size = 1024 * 1024;
-  const long maximum_heap_size = 4L * 1024 * 1024 * 1024;
+  const stz_long initial_heap_size = 1024 * 1024;
+  const stz_long maximum_heap_size = STZ_LONG(4) * 1024 * 1024 * 1024;
 
   init.heap = (stz_byte*)stz_memory_map(initial_heap_size, maximum_heap_size);
   init.heap_limit = init.heap + initial_heap_size;
