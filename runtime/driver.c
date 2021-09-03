@@ -4,6 +4,7 @@
   #include<sys/wait.h>
 #endif
 #include<stdint.h>
+#include<stdbool.h>
 #include<unistd.h>
 #include<stdlib.h>
 #include<stdio.h>
@@ -116,32 +117,140 @@ stz_long file_write_block (FILE* f, char* data, stz_long len) {
 
 //     Path Resolution
 //     ===============
-#ifdef PLATFORM_WINDOWS
-  static int file_exists (const stz_byte* filename) {
-    int attrib = GetFileAttributes((LPCSTR)filename);
-    return attrib != INVALID_FILE_ATTRIBUTES;
-  }
-
-  stz_byte* resolve_path (const stz_byte* filename){
-    if(file_exists(filename)){
-      char* fileext;
-      char* path = (char*)stz_malloc(2048);
-      int ret = GetFullPathName((LPCSTR)filename, 2048, path, &fileext);
-      if(ret == 0){
-        stz_free(path);
-        return NULL;
-      }else{
-        return STZ_STR(path);
-      }
-    }
-    else{
-      return NULL;
-    }
-  }
-#else
+#if defined(PLATFORM_LINUX) || defined(PLATFORM_OSX)
   stz_byte* resolve_path (const stz_byte* filename){
     return STZ_STR(realpath(C_CSTR(filename), 0));
   }
+#endif
+
+#ifdef PLATFORM_WINDOWS
+stz_int symlink(const stz_byte* target, const stz_byte* linkpath) {
+  DWORD attributes, flags;
+
+  attributes = GetFileAttributes((LPCSTR)target);
+  flags = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ?
+    SYMBOLIC_LINK_FLAG_DIRECTORY : 0;
+
+  if (!CreateSymbolicLink((LPCSTR)linkpath, (LPCSTR)target, flags)) {
+    return -1;
+  }
+
+  return 0;
+}
+
+// Resolve a given file path to its fully-resolved ("final") path name.
+stz_byte* resolve_path(const stz_byte* path) {
+  HANDLE hFile;
+  LPSTR ret;
+
+  // First, open the file (to get a handle to it)
+  hFile = CreateFile(
+      /* lpFileName            */ (LPCSTR)path,
+      /* dwDesiredAccess       */ 0,
+      /* dwShareMode           */ FILE_SHARE_READ | FILE_SHARE_WRITE,
+      /* lpSecurityAttributes  */ NULL,
+      /* dwCreationDisposition */ OPEN_EXISTING,
+                               // necessary to open directories
+      /* dwFlagsAndAttributes  */ FILE_FLAG_BACKUP_SEMANTICS,
+      /* hTemplateFile         */ NULL);
+
+  if (hFile == INVALID_HANDLE_VALUE) {
+    return NULL;
+  }
+
+  // Then resolve it into its fully-resolved ("final") path name
+  ret = stz_malloc(sizeof(CHAR) * MAX_PATH);
+  if (GetFinalPathNameByHandle(hFile, ret, MAX_PATH, FILE_NAME_OPENED) == 0) {
+    stz_free(ret);
+    ret = NULL;
+  }
+
+  CloseHandle(hFile);
+  return STZ_STR(ret);
+}
+
+stz_int get_file_type (const stz_byte* filename0, stz_int follow_sym_links) {
+  WIN32_FILE_ATTRIBUTE_DATA attributes;
+  LPCSTR filename = C_CSTR(filename0);
+  bool is_directory = false,
+       is_symlink   = false;
+
+  if (follow_sym_links) {
+    // If following symlinks, resolve the symlink and recurse
+    stz_byte* resolved_path = resolve_path(filename0);
+    stz_int resolved_file_type = get_file_type(resolved_path, (stz_int)false);
+    stz_free(resolved_path);
+    return resolved_file_type;
+  }
+
+  // First grab the file's attributes
+  if (!GetFileAttributesEx(filename, GetFileExInfoStandard, &attributes)) {
+    return -1; // Non-existent or inaccessible file
+  }
+
+  // Check if it's a directory
+  if (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+    is_directory = true;
+  }
+
+  // Check for possible symlink (reparse point *may* be a symlink)
+  if (attributes.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    // To know for sure, find the file and check its reparse tags
+    WIN32_FIND_DATA find_data;
+    HANDLE find_handle = FindFirstFile(filename, &find_data);
+
+    if (find_handle == INVALID_HANDLE_VALUE) {
+      return -1;
+    }
+
+    if (// Mount point a.k.a Junction (should be treated as a symlink)
+        find_data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT ||
+        // Actual symlinks (like those created by symlink())
+        find_data.dwReserved0 == IO_REPARSE_TAG_SYMLINK) {
+      is_symlink = true;
+    }
+
+    FindClose(find_handle);
+  }
+
+  // Now we can determine what kind of file it is
+  if (!is_directory && !is_symlink) {
+    return 0; // Regular file
+  }
+  else if (is_directory && !is_symlink) {
+    return 1; // Directory (non-symlink)
+  }
+  else if (is_symlink) {
+    return 2; // Symlink
+  }
+  else {
+    return 3; // Unknown (other)
+  }
+}
+#endif
+
+#if defined(PLATFORM_LINUX) || defined(PLATFORM_OSX)
+stz_int get_file_type (const stz_byte* filename, stz_int follow_sym_links) {
+  struct stat filestat;
+  int result;
+  if(follow_sym_links) result = stat(C_CSTR(filename), &filestat);
+  else result = lstat(C_CSTR(filename), &filestat);
+
+  if(result == 0){
+    if(S_ISREG(filestat.st_mode))
+      return 0;
+    else if(S_ISDIR(filestat.st_mode))
+      return 1;
+    else if(S_ISLNK(filestat.st_mode))
+      return 2;
+    else
+      return 3;
+  }
+  else{
+    return -1;
+  }
+}
+
 #endif
 
 //     Environment Variable Setting
@@ -348,27 +457,6 @@ void stringlist_add (StringList* list, const stz_byte* string){
 //============================================================
 //================== Directory Handling ======================
 //============================================================
-
-stz_int get_file_type (const stz_byte* filename, stz_int follow_sym_links) {
-  struct stat filestat;  
-  int result;
-  if(follow_sym_links) result = stat(C_CSTR(filename), &filestat);
-  else result = lstat(C_CSTR(filename), &filestat);
-                         
-  if(result == 0){
-    if(S_ISREG(filestat.st_mode))
-      return 0;
-    else if(S_ISDIR(filestat.st_mode))
-      return 1;
-    else if(S_ISLNK(filestat.st_mode))
-      return 2;
-    else
-      return 3;    
-  }
-  else{
-    return -1;
-  }
-}
 
 StringList* list_dir (const stz_byte* filename){
   //Open directory
