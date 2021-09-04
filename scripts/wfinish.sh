@@ -18,13 +18,11 @@ CCFLAGS="-DPLATFORM_WINDOWS -std=gnu99 -O3 -fPIC -Wall $CCFLAGS"
 
 "$CC" $CCFLAGS -c core/sha256.c       -o build/sha256.o
 "$CC" $CCFLAGS -c compiler/cvm.c      -o build/cvm.o
-"$CC" $CCFLAGS -c runtime/linenoise.c -o build/linenoise.o
 "$CC" $CCFLAGS -c runtime/driver.c    -o build/driver.o
 
 "$CC" \
     build/sha256.o    \
     build/cvm.o       \
-    build/linenoise.o \
     build/driver.o    \
     wstanza.s         \
     -o wstanza -lm -lpthread -fPIC
