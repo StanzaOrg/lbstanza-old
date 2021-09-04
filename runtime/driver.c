@@ -21,6 +21,7 @@
 
 #include "common.h"
 #include "types.h"
+#include "process.h"
 
 //       Forward Declarations
 //       ====================
@@ -62,7 +63,7 @@ static void exit_with_error_line_and_func (const char* file, int line) {
 }
 #endif
 
-#if defined(PLATFORM_LINUX) || defined(PLATFORM_OSX)
+#if defined(PLATFORM_LINUX) || defined(PLATFORM_OS_X)
 static void exit_with_error_line_and_func (const char* file, int line){
   fprintf(stderr, "[%s:%d] %s\n", file, line, strerror(errno));
   exit(-1);
@@ -157,7 +158,7 @@ stz_long file_write_block (FILE* f, char* data, stz_long len) {
 
 //     Path Resolution
 //     ===============
-#if defined(PLATFORM_LINUX) || defined(PLATFORM_OSX)
+#if defined(PLATFORM_LINUX) || defined(PLATFORM_OS_X)
   stz_byte* resolve_path (const stz_byte* filename){
     return STZ_STR(realpath(C_CSTR(filename), 0));
   }
@@ -269,7 +270,7 @@ stz_int get_file_type (const stz_byte* filename0, stz_int follow_sym_links) {
 }
 #endif
 
-#if defined(PLATFORM_LINUX) || defined(PLATFORM_OSX)
+#if defined(PLATFORM_LINUX) || defined(PLATFORM_OS_X)
 stz_int get_file_type (const stz_byte* filename, stz_int follow_sym_links) {
   struct stat filestat;
   int result;
