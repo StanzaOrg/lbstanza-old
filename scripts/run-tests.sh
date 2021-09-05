@@ -1,1 +1,1 @@
-stanza run-test tests/stanza.proj tests/run-tests.stanza
+stanza run-test tests/stanza.proj stz/stanza-tests
