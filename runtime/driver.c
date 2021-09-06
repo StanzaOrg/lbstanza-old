@@ -32,6 +32,9 @@
 //       Forward Declarations
 //       ====================
 
+//Creating Stanza heap objects
+stz_int stanza_boxed_string (stz_int n, stz_byte* chars);
+
 //FMalloc Debugging
 #ifdef FMALLOC
 static void init_fmalloc ();
@@ -163,10 +166,80 @@ stz_long file_write_block (FILE* f, char* data, stz_long len) {
 
 
 //     Path Resolution
-//     ===============
+//     ===============  
 #if defined(PLATFORM_LINUX) || defined(PLATFORM_OS_X)
-  stz_byte* resolve_path (const stz_byte* filename){
-    return STZ_STR(realpath(C_CSTR(filename), 0));
+  stz_int resolve_path (const stz_byte* filename){
+    //Call the Linux realpath function.
+    char* path = realpath(C_CSTR(filename), 0);
+    
+    //Return -1 if realpath fails.
+    if(path == NULL) return -1;
+    
+    //Put the string in the Stanza heap, and
+    //free the returned result.
+    stz_int s = stanza_boxed_string(strlen(path), STZ_STR(path));
+    free(path);
+
+    //Return the Stanza string.
+    return s;
+  }
+#endif
+
+#if defined(PLATFORM_WINDOWS)
+  // Return a bitmask that represents which of the 26 letters correspond
+  // to valid drive letters.
+  stz_int windows_logical_drives_bitmask (){
+    return GetLogicalDrives();
+  }
+
+  // Resolve a given file path to its fully-resolved ("final") path name.
+  // This function tries to return an absolute path with symbolic links
+  // resolved. Sometimes it returns an UNC path, which is not usable.
+  stz_int windows_final_path_name (stz_byte* path){
+    // First, open the file (to get a handle to it)
+    HANDLE hFile = CreateFile(
+        /* lpFileName            */ (LPCSTR)path,
+        /* dwDesiredAccess       */ 0,
+        /* dwShareMode           */ FILE_SHARE_READ | FILE_SHARE_WRITE,
+        /* lpSecurityAttributes  */ NULL,
+        /* dwCreationDisposition */ OPEN_EXISTING,
+                                 // necessary to open directories
+        /* dwFlagsAndAttributes  */ FILE_FLAG_BACKUP_SEMANTICS,
+        /* hTemplateFile         */ NULL);
+
+    // Return -1 if a handle cannot be created.
+    if (hFile == INVALID_HANDLE_VALUE) return -1;
+
+    // Then resolve it into its fully-resolved ("final") path name
+    LPSTR ret = stz_malloc(sizeof(CHAR) * MAX_PATH);
+    int numchars = GetFinalPathNameByHandle(hFile, ret, MAX_PATH, FILE_NAME_OPENED);
+
+    // Prepare Stanza heap string.
+    stz_int stanza_str = -1;
+    if(numchars > 0)
+      stanza_str = stanza_boxed_string(numchars, ret);
+
+    // Free memory and return.
+    stz_free(ret);
+    return stanza_str;
+  }
+
+  // Resolve a given file path using its "full" path name.
+  // This function tries to return an absolute path. Symbolic
+  // links are not resolved.
+  stz_int windows_full_path_name (stz_byte* filename){
+    char* fileext;
+    char* path = (char*)stz_malloc(2048);
+    int numchars = GetFullPathName((LPCSTR)filename, 2048, path, &fileext);
+
+    //Prepare Stanza heap string
+    stz_int stanza_str = -1;
+    if(numchars > 0)
+      stanza_str = stanza_boxed_string(numchars, path);
+
+    //Free memory and return
+    stz_free(path);
+    return stanza_str;
   }
 #endif
 
@@ -185,50 +258,14 @@ stz_int symlink(const stz_byte* target, const stz_byte* linkpath) {
   return 0;
 }
 
-// Resolve a given file path to its fully-resolved ("final") path name.
-stz_byte* resolve_path(const stz_byte* path) {
-  HANDLE hFile;
-  LPSTR ret;
-
-  // First, open the file (to get a handle to it)
-  hFile = CreateFile(
-      /* lpFileName            */ (LPCSTR)path,
-      /* dwDesiredAccess       */ 0,
-      /* dwShareMode           */ FILE_SHARE_READ | FILE_SHARE_WRITE,
-      /* lpSecurityAttributes  */ NULL,
-      /* dwCreationDisposition */ OPEN_EXISTING,
-                               // necessary to open directories
-      /* dwFlagsAndAttributes  */ FILE_FLAG_BACKUP_SEMANTICS,
-      /* hTemplateFile         */ NULL);
-
-  if (hFile == INVALID_HANDLE_VALUE) {
-    return NULL;
-  }
-
-  // Then resolve it into its fully-resolved ("final") path name
-  ret = stz_malloc(sizeof(CHAR) * MAX_PATH);
-  if (GetFinalPathNameByHandle(hFile, ret, MAX_PATH, FILE_NAME_OPENED) == 0) {
-    stz_free(ret);
-    ret = NULL;
-  }
-
-  CloseHandle(hFile);
-  return STZ_STR(ret);
-}
-
-stz_int get_file_type (const stz_byte* filename0, stz_int follow_sym_links) {
+//This function does not follow symbolic links. If we need
+//to follow symbolic links, the caller should call this
+//call this function with the result of resolve-path. 
+stz_int get_file_type (const stz_byte* filename0) {
   WIN32_FILE_ATTRIBUTE_DATA attributes;
   LPCSTR filename = C_CSTR(filename0);
   bool is_directory = false,
        is_symlink   = false;
-
-  if (follow_sym_links) {
-    // If following symlinks, resolve the symlink and recurse
-    stz_byte* resolved_path = resolve_path(filename0);
-    stz_int resolved_file_type = get_file_type(resolved_path, (stz_int)false);
-    stz_free(resolved_path);
-    return resolved_file_type;
-  }
 
   // First grab the file's attributes
   if (!GetFileAttributesEx(filename, GetFileExInfoStandard, &attributes)) {
