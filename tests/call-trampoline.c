@@ -1,5 +1,6 @@
 #include<stdio.h>
 #include<stdlib.h>
+#include<stdint.h>
 
 //============================================================
 //================ C Trampoline Definition ===================
@@ -92,6 +93,10 @@ void push_float (float x){
 void push_double (double x){
   double* ptr = (double*)(&argbuffer[argindex]);
   *ptr = x;
+  argindex++;
+}
+
+void skip_arg () {
   argindex++;
 }
 
@@ -325,6 +330,253 @@ void call4 () {
 //==============================================================
 //=================== Windows Calls ============================
 //==============================================================
+#if defined(PLATFORM_WINDOWS)
+
+void call1 () {
+  void* f = int_myfunction_int_float;
+  int i0 = 100;
+  int i1 = 101;
+  int i2 = 102;
+  int i3 = 103;
+  int i4 = 104;
+  int i5 = 105;
+  int i6 = 106;
+  int i7 = 107;
+  int i8 = 108;
+  int i9 = 109;
+  float f0 = 0.05f;
+  float f1 = 0.1f;
+  float f2 = 0.2f;
+  float f3 = 0.3f;
+  float f4 = 0.4f;
+  float f5 = 0.5f;
+  float f6 = 0.6f;
+  float f7 = 0.7f;
+  float f8 = 0.8f;
+  float f9 = 0.9f;
+
+  //i0: Int 0
+  //f0: Float 1, Shadow(Int 1)
+  //i1: Int 2
+  //f1: Float 3, Shadow(Int 3)
+  //i2: Stack 0
+  //f2: Stack 1
+  //i3: Stack 2
+  //f3: Stack 3
+  //i4: Stack 4
+  //f4: Stack 5
+  //i5: Stack 6
+  //f5: Stack 7
+  //i6: Stack 8
+  //f6: Stack 9
+  //i7: Stack 10
+  //f7: Stack 11
+  //i8: Stack 12
+  //f8: Stack 13
+  //i9: Stack 14 
+  //f9: Stack 15
+  //Num stack 16
+  //Num float 4
+  //Num integer 4
+  
+  fill_argbuffer();
+  //Stack arguments
+  push_long(16);
+  push_float(f9);
+  push_long(i9);
+  push_float(f8);
+  push_long(i8);
+  push_float(f7);
+  push_long(i7);
+  push_float(f6);
+  push_long(i6);
+  push_float(f5);
+  push_long(i5);
+  push_float(f4);
+  push_long(i4);
+  push_float(f3);
+  push_long(i3);
+  push_float(f2);
+  push_long(i2);
+  //Float arguments
+  push_long(4);
+  push_float(f1);
+  skip_arg();
+  push_float(f0);
+  skip_arg();
+  //Int arguments
+  push_long(4 + 1);
+  push_float(f1);
+  push_long(i1);
+  push_float(f0);
+  push_long(i0);
+  push_long(10);
+
+  //Perform call
+  printf("Call1()\n");
+  c_trampoline(f, argbuffer, argbuffer);
+
+  //Print result
+  printf("Return = %d\n", int_ret());  
+}
+
+void call2 () {
+  void* f = int_myfunction_int;
+  int i0 = 100;
+  int i1 = 101;
+  int i2 = 102;
+
+  //i0: Int 0
+  //i1: Int 1
+  //i2: Int 2
+  //Num stack 0
+  //Num float 0
+  //Num integer 3
+  
+  fill_argbuffer();
+  //Stack arguments
+  push_long(0);
+  //Float arguments
+  push_long(0);
+  //Int arguments
+  push_long(3 + 1);
+  push_long(i2);
+  push_long(i1);
+  push_long(i0);
+  push_long(0);
+
+  //Perform call
+  printf("Call2()\n");
+  c_trampoline(f, argbuffer, argbuffer);
+
+  //Print result
+  printf("Return = %d\n", int_ret());    
+}
+
+void call3 () {
+  void* f = printf;
+  char* fmt = "IntsAndFloats\n(%d,%f)\n(%d,%f)\n(%d,%f)\n(%d,%f)\n(%d,%f)\n(%d,%f)\n(%d,%f)\n(%d,%f)\n(%d,%f)\n(%d,%f)\n";
+  int i0 = 100;
+  int i1 = 101;
+  int i2 = 102;
+  int i3 = 103;
+  int i4 = 104;
+  int i5 = 105;
+  int i6 = 106;
+  int i7 = 107;
+  int i8 = 108;
+  int i9 = 109;
+  float f0 = 0.1f;
+  float f1 = 0.2f;
+  float f2 = 0.3f;
+  float f3 = 0.4f;
+  float f4 = 0.5f;
+  float f5 = 0.6f;
+  float f6 = 0.7f;
+  float f7 = 0.8f;
+  float f8 = 0.9f;
+  float f9 = 1.0f;
+
+  //Argument layout
+  //fmt: Int 0
+  //i0: Int 1
+  //f0: Float 2, Shadow(Int 2)
+  //i1: Int 3
+  //f1: Stack 0
+  //i2: Stack 1
+  //f2: Stack 2
+  //i3: Stack 3
+  //f3: Stack 4
+  //i4: Stack 5
+  //f4: Stack 6
+  //i5: Stack 7
+  //f5: Stack 8
+  //i6: Stack 9
+  //f6: Stack 10
+  //i7: Stack 11
+  //f7: Stack 12
+  //i8: Stack 13
+  //f8: Stack 14
+  //i9: Stack 15
+  //f9: Stack 16
+  //Num stack 17
+  //Num float 3
+  //Num integer 4
+  
+  fill_argbuffer();
+  //Stack arguments
+  push_long(17);
+  push_double(f9);
+  push_long(i9);
+  push_double(f8);
+  push_long(i8);
+  push_double(f7);
+  push_long(i7);
+  push_double(f6);
+  push_long(i6);
+  push_double(f5);
+  push_long(i5);
+  push_double(f4);
+  push_long(i4);
+  push_double(f3);
+  push_long(i3);
+  push_double(f2);
+  push_long(i2);
+  push_double(f1); 
+  //Float arguments
+  push_long(3);
+  push_double(f0);
+  skip_arg();
+  skip_arg();
+  //Int arguments
+  push_long(4 + 1);
+  push_long(i3);
+  push_double(f0);
+  push_long(i0);
+  push_ptr(fmt);
+  push_long(10);
+
+  printf("Call3()\n");
+  c_trampoline(f, argbuffer, argbuffer);
+}
+
+void call4 () {
+  void* f = float_myfunction_float;
+  float f0 = 0.1f;
+  float f1 = 0.2f;
+  float f2 = 0.3f;
+  
+  //f0: Float 0, Shadow(Int 0)
+  //f1: Float 1, Shadow(Int 1)
+  //f2: Float 2, Shadow(Int 2)
+  //Num stack 0
+  //Num float 3
+  //Num integer 3
+  
+  fill_argbuffer();
+  //Stack arguments
+  push_long(0);
+  //Float arguments
+  push_long(3);
+  push_float(f2);
+  push_float(f1);
+  push_float(f0);
+  //Int arguments
+  push_long(3 + 1);
+  push_float(f2);
+  push_float(f1);
+  push_float(f0);
+  push_long(3);
+
+  //Perform call
+  printf("Call4()\n");
+  c_trampoline(f, argbuffer, argbuffer);
+
+  //Print result
+  printf("Return = %f\n", float_ret());    
+}
+
+#endif
 
 //==============================================================
 //==================== Main Launcher ===========================
