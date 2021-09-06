@@ -1,4 +1,10 @@
 #ifdef PLATFORM_WINDOWS
+  //This define is necessary as a workaround for accessing CreateSymbolicLink
+  //function. This #define is added automatically by the MSVC compiler, but
+  //must be added manually when using gcc.
+  //Must be defined before including windows.h
+  #define _WIN32_WINNT 0x600
+
   #include<windows.h>
 #else
   #include<sys/wait.h>
