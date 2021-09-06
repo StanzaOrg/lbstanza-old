@@ -680,7 +680,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case CALLC_OPCODE_WIDE : {
       DECODE_D();
-      void* faddr = (void*)value;
+      void* faddr = (void*)(uint64_t)value;
       int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
