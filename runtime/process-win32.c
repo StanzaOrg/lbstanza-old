@@ -188,6 +188,61 @@ static void setup_file_handles(
   }
 }
 
+static void close_and_null_if_not_null(PHANDLE handle_ptr) {
+  if (handle_ptr != NULL && *handle_ptr != NULL) {
+    CloseHandle(*handle_ptr);
+    *handle_ptr = NULL:
+  }
+}
+
+// Close all inherited file handles that we passed into the child process. This may seem
+// overcomplicated, but is necessary due to the fact that we allow multiple streams to be redirected
+// to the same stream. For example, we allow `STDOUT` and `STDERR` to be redirected to both be
+// redirected to `PROCESS-OUT` (or `PROCESS-ERR`) simulataneously. In such a case, we have to be
+// careful not to naively call `CloseHandle()` on both streams, since that would cause the pipe end
+// to be closed twice, causing an exception in the Windows API (and likely a segfault upstream.)
+static void close_inherited_file_handles(
+    stz_int input, stz_int output, stz_int error,
+    PHANDLE stdin_read, PHANDLE stdout_write, PHANDLE stderr_write) {
+
+  // The streams we are going to close (if they are in-use).
+  // Mark them all NULL (not in-use) to start.
+  PHANDLE input_handle  = NULL,
+          output_handle = NULL,
+          error_handle  = NULL;
+
+  // Input can only be redirected to PROCESS-IN or STANDARD-IN
+  input_handle = stdin_read;
+
+  // Output can be redirected to PROCESS-OUT, PROCESS-ERR, or STANDARD-OUT
+  if (output == PROCESS_OUT) {
+    output_handle = stdout_write;
+  }
+  else if (output == PROCESS_ERR) {
+    error_handle = stdout_write;
+  }
+  else {
+    output_handle = stdout_write;
+  }
+
+  // Error can be redirected to PROCESS-OUT, PROCESS-ERR, or STANDARD-ERR
+  if (error == PROCESS_OUT) {
+    output_handle = stderr_write;
+  }
+  else if (error == PROCESS_ERR) {
+    error_handle = stderr_write;
+  }
+  else {
+    error_handle = stderr_write;
+  }
+
+  // Now {input,output,error}_handle should all be NULL, point to NULL, or point to a unique file
+  // handle. We can now safely close the non-NULL ones.
+  close_and_null_if_not_null(input_handle);
+  close_and_null_if_not_null(output_handle);
+  close_and_null_if_not_null(error_handle);
+}
+
 stz_int launch_process(stz_byte* command_line, stz_int input, stz_int output, stz_int error, Process* process) {
   PROCESS_INFORMATION proc_info;
   STARTUPINFO start_info;
@@ -235,9 +290,8 @@ stz_int launch_process(stz_byte* command_line, stz_int input, stz_int output, st
     process->err = file_from_handle(stderr_read, FT_READ);
 
     // Close the handles we passed into the child process
-    if (stdin_read   != NULL) CloseHandle(stdin_read);
-    if (stdout_write != NULL) CloseHandle(stdout_write);
-    if (stderr_write != NULL) CloseHandle(stderr_write);
+    close_inherited_file_handles(input, output, error,
+        &stdin_read, &stdout_write, &stderr_write);
 
     // Close these left-over handles to the process
     CloseHandle(proc_info.hThread);
