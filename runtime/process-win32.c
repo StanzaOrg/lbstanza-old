@@ -97,12 +97,12 @@ static void create_pipe(PHANDLE read, PHANDLE write, PipeType type) {
   SetHandleInformation(*our_end, HANDLE_FLAG_INHERIT, 0);
 }
 
-static HANDLE duplicate_standard_handle(int handle) {
+static HANDLE duplicate_handle(HANDLE handle) {
   HANDLE ret;
 
   if (!DuplicateHandle(
         /* hSourceProcessHandle */ GetCurrentProcess(),
-        /* hSourceHandle        */ GetStdHandle(handle),
+        /* hSourceHandle        */ handle,
         /* hTargetProcessHandle */ GetCurrentProcess(),
         /* lpTargetHandle       */ &ret,
         /* dwDesiredAccess      */ 0,
@@ -114,23 +114,37 @@ static HANDLE duplicate_standard_handle(int handle) {
   return ret;
 }
 
+// Set up the file handles for the process we are about to create, in order to
+// redirect its STDIN/STDOUT/STDERR to the corresponding standard stream or
+// pipe. The following redirections are supported:
+//   STDIN -> STANDARD-IN,
+//   STDIN -> PROCESS-IN,
+//   STDOUT -> STANDARD-OUT,
+//   STDOUT -> PROCESS-OUT,
+//   STDOUT -> PROCESS-ERR,
+//   STDERR -> STANDARD-ERR,
+//   STDERR -> PROCESS-OUT,
+//   STDERR -> PROCESS-ERR,
+//
+// NOTE: We are careful to duplicate all handles that are passed into the child
+// process so that we do not inadvertently assign the same handle to two
+// different streams (for example when both STDOUT/STDERR are redirected to
+// PROCESS-OUT or to PROCESS-ERR). This is not strictly invalid, but would
+// cause an error when closing these handles after launching the process.
 static void setup_file_handles(
     stz_int input, stz_int output, stz_int error,
     PHANDLE process_stdin_read, PHANDLE process_stdin_write,
     PHANDLE process_stdout_read, PHANDLE process_stdout_write,
     PHANDLE process_stderr_read, PHANDLE process_stderr_write) {
 
-  HANDLE stdin_read, stdin_write,
-         stdout_read, stdout_write,
-         stderr_read, stderr_write;
+  HANDLE stdin_read  = NULL, stdin_write = NULL,
+         stdout_read = NULL, stdout_write = NULL,
+         stderr_read = NULL, stderr_write = NULL;
 
   // Initialize all our handles to NULL (just in case)
-  *process_stdin_read   = NULL;
-  *process_stdin_write  = NULL;
-  *process_stdout_read  = NULL;
-  *process_stdout_write = NULL;
-  *process_stderr_read  = NULL;
-  *process_stderr_write = NULL;
+  *process_stdin_read   = NULL; *process_stdin_write  = NULL;
+  *process_stdout_read  = NULL; *process_stdout_write = NULL;
+  *process_stderr_read  = NULL; *process_stderr_write = NULL;
 
   // Compute which pipes we want to open
   int pipe_sources[NUM_STREAM_SPECS] = { -1 };
@@ -151,41 +165,46 @@ static void setup_file_handles(
 
   // Input can either be redirected to an IN pipe or re-use parent's STDIN
   if (input == PROCESS_IN) {
-    *process_stdin_read  = stdin_read;
+    *process_stdin_read  = duplicate_handle(stdin_read);
     *process_stdin_write = stdin_write;
   }
   else {
-    *process_stdin_read  = duplicate_standard_handle(STD_INPUT_HANDLE);
+    *process_stdin_read  = duplicate_handle(GetStdHandle(STD_INPUT_HANDLE));
     *process_stdin_write = NULL;
   }
 
   // Output can be redirected to an OUT or ERR pipe or re-use parent's STDOUT
   if (output == PROCESS_OUT) {
     *process_stdout_read  = stdout_read;
-    *process_stdout_write = stdout_write;
+    *process_stdout_write = duplicate_handle(stdout_write);
   }
   else if (output == PROCESS_ERR) {
     *process_stderr_read  = stdout_read;
-    *process_stderr_write = stdout_write;
+    *process_stderr_write = duplicate_handle(stdout_write);
   }
   else {
     *process_stdout_read  = NULL;
-    *process_stdout_write = duplicate_standard_handle(STD_OUTPUT_HANDLE);
+    *process_stdout_write = duplicate_handle(GetStdHandle(STD_OUTPUT_HANDLE));
   }
 
   // Error can be redirected to an OUT or ERR pipe or re-use parent's STDERR
   if (error == PROCESS_OUT) {
     *process_stderr_read  = stdout_read;
-    *process_stderr_write = stdout_write;
+    *process_stderr_write = duplicate_handle(stdout_write);
   }
   else if (error == PROCESS_ERR) {
     *process_stderr_read  = stderr_read;
-    *process_stderr_write = stderr_write;
+    *process_stderr_write = duplicate_handle(stderr_write);
   }
   else {
     *process_stderr_read  = NULL;
-    *process_stderr_write = duplicate_standard_handle(STD_ERROR_HANDLE);
+    *process_stderr_write = duplicate_handle(GetStdHandle(STD_ERROR_HANDLE));
   }
+
+  // Close any pipe ends that we may have passed into the child.
+  if (stdin_read   != NULL) CloseHandle(stdin_read);
+  if (stdout_write != NULL) CloseHandle(stdout_write);
+  if (stderr_write != NULL) CloseHandle(stderr_write);
 }
 
 stz_int launch_process(stz_byte* command_line, stz_int input, stz_int output, stz_int error, Process* process) {
