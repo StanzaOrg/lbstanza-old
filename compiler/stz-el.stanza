@@ -1473,6 +1473,10 @@ defn simple-inline (epackage:EPackage) :
               val xs* = for x in xs(i) filter : not key?(inlined-functions, n(x))
               if not empty?(xs*) :
                 emit(buffer, EInitClosures(to-tuple(xs*), info(i)))
+            (i:ELive) :
+              val xs* = to-tuple $ for x in xs(i) filter : not key?(inlined-functions, n(x as EVar))
+              if not empty?(xs*) :
+                emit(buffer, ELive(xs*))
             (i) :
               emit(buffer, i)
         to-body(buffer, true, false, false)
@@ -2050,6 +2054,8 @@ defn annotate-body-instructions (e:EBody, state0:Table<Int,EType>, vt:VarTable) 
       (i:EInterpret) : untrusted(x(i))
       (i:EConv) : untrusted(x(i))
       (i:EPrim) : trusted(x(i))
+      (i:EBox) : trusted(x(i))
+      (i:EBoxGet) : untrusted(x(i))
       (i:ENewObject) : trusted(x(i))
       (i:ECall) :
         match(x(i)) :
@@ -2274,21 +2280,21 @@ defn add-type-annotations (epackage:EPackage, gvt:VarTable) -> EPackage :
 ;  n: Int
 ;  type: EType
 
+;Retrieve the inferred type of variable or trusted declared type
+defn var-type (v:Int, state:Table<Int,EType>, vt:VarTable) :
+  if key?(state,v) :
+    state[v]
+  else :
+    val t = type(vt,v)
+    if lostanza?(vt,v) : erase(t)
+    else : t
+
+;Retrieve the type of the given immediate
+defn imm-type (x:EImm, state:Table<Int,EType>, vt:VarTable) :
+  match(x:EVar) : var-type(n(x), state, vt)
+  else : type(vt, x)
+
 defn elide-checks (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
-  ;Retrieve the trusted declared type of a variable
-  defn var-type (v:Int, state:Table<Int,EType>, vt:VarTable) :
-    if key?(state,v) :
-      state[v]
-    else :
-      val t = type(vt,v)
-      if lostanza?(vt,v) : erase(t)
-      else : t
-
-  ;Retrieve the type of the given immediate
-  defn imm-type (x:EImm, state:Table<Int,EType>, vt:VarTable) :
-    match(x:EVar) : var-type(n(x), state, vt)
-    else : type(vt, x)
-
   ;Elide all checks in body
   defn elide-checks (e:EBody, vt:VarTable) -> EBody :
     val buffer = BodyBuffer(e)
@@ -2507,9 +2513,10 @@ defn MethodTable (epackage:EPackage) :
   driver()
 
 defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
-  val method-table = MethodTable(epackage)
   defn resolve-in-body (e:EBody, vt:VarTable) -> EBody :
-    val ins* = for i in ins(e) map :
+    val state = IntTable<EType>()
+    val buffer = BodyBuffer(e)
+    for i in ins(e) do :
       ;Resolve target of call
       defn resolve-call (f:EImm, ys:Tuple<EImm>) -> EImm|False :
         val fid = match(f) :
@@ -2521,25 +2528,60 @@ defn resolve-methods (epackage:EPackage, gvt:VarTable) -> EPackage :
             (f:EVar) : EVar(n)
             (f:ECurry) : ECurry(EVar(n), targs(f))
         match(fid:Int) :
-          val ys-types = map(type{vt, _}, ys)
-          match(resolve-target(method-table, fid, ys-types)) :
+          val precise-ys-types = map(imm-type{_, state, vt}, ys)
+          val precise-target = resolve-target(method-table, fid, precise-ys-types)
+          match(precise-target) :
             (n:Int) : sub-fid(n)
             (n:False) : false
 
-      ;Resolve calls and tcalls
-      match(i) :
-        (i:ECall|ETCall) :
-          val f* = resolve-call(f(i), ys(i))
-          match(f*:EImm) : sub-f(i, f*)
-          else : i
-        (i) : i
-    sub-ins(e, ins*)
+      defn resolve-match (i:EMatch) -> EIns :
+        defn to-args (types:Tuple<EType>) -> Tuple<Arg> :
+          map(etype-to-arg{class-tree(method-table), _, false}, types)
+        val ys-types = map(imm-type{_, state, vt}, ys(i))
+        val args = to-args $ ys-types
+        val eligible-branches = to-tuple $ for b in branches(i) filter :
+          all?(overlap?, args, to-args $ types(b))
+        if length(eligible-branches) == length(branches(i)) :
+          i
+        else if empty?(eligible-branches) :
+          sub-branches(i, [])
+        else if all?(subarg?, args, to-args $ types(eligible-branches[0])) :
+          EGoto(n(eligible-branches[0]))
+        else :
+          sub-branches(i, eligible-branches)
+
+      ;Resolve calls, tcalls, and matches
+      match(i:EAnnotate) :
+        state[n(i)] = type(i)
+      else :
+        val ni = match(i) :
+          (i:ECall|ETCall) :
+            val f* = resolve-call(f(i), ys(i))
+            match(f*:EImm) : sub-f(i, f*)
+            else : i
+          (i:EMatch) :
+            resolve-match(i)
+          (i) : i
+        emit(buffer, ni)
+    to-body(buffer)
+
   defn resolve-texp (x:ETExp, vt:VarTable) :
-    val result = let loop (x:ELBigItem = x) :
-      match(map(loop, x)) :
+    defn resolve-methods-in-bodies (e:ELBigItem) :
+      val result = match(map(resolve-methods-in-bodies, e)) :
         (e:EBody) : resolve-in-body(e,vt)
         (e) : e
-    result as ETExp
+      result as ETExp
+
+    ;Annotate and process
+    defn process (e:ELBigItem) :
+      match(e) :
+        (e:EFn) : resolve-methods-in-bodies(annotate-function(e, IntTable<EType>(), vt))
+        (e:EBody) : resolve-methods-in-bodies(annotate-body(e, IntTable<EType>(), vt))
+        (e) : map(process, e)
+    
+    ;Compute free variables and then process
+    process(analyze-freevars(x,vt)) as ETExp
+
   map-with-var-table(resolve-texp, gvt, epackage)
 
 defstruct MethodDag :
