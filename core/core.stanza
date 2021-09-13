@@ -203,6 +203,8 @@ protected lostanza deftype VMState :
   info-table: ptr<FileInfoTable>
   extern-table: ptr<ExternTable>
   callback-index-table: ptr<ExternDefnTable>
+  ;New garbage collector - currently unused
+  var new-heap: Heap
 
 lostanza deftype ExternTable :
   length: long
@@ -1043,6 +1045,17 @@ lostanza deftype Heap :
   var size: long
   var bitset: ptr<long>
 
+  ;Marking stack
+  ;Note that the stack grows downwards so stack-bottom is equal to
+  ;stack-start + stack-size, and stack-top decreases as we push new items.
+  var stack-start: ptr<long>
+  var stack-bottom: ptr<long>
+  var stack-top: ptr<long>
+
+  ;Heap segment with the objects incompletely marked due to stack overflow
+  var min-incomplete: ptr<?>
+  var max-incomplete: ptr<?>
+
 ;Given the current number of bytes in the heap, return
 ;the number of bytes in the heap's bitset, rounded up
 ;to the nearest long. 
@@ -1062,7 +1075,7 @@ lostanza defn clear (start:ptr<?>, size:long) -> ptr<?> :
 ;Initialize the current heap structure.
 ;- min-size is the initial size of the heap.
 ;- max-size is the maximum size that heap can be expanded to.
-lostanza defn initialize-heap (heap:ptr<Heap>, min-size:long, max-size:long) -> ref<False> :
+lostanza defn initialize-heap (min-size:long, max-size:long, vms:ptr<VMState>) -> ref<False> :
   ;Precondition: Assert 0 <= min-size && min-size <= max-size
   #if-not-defined(OPTIMIZE) :
     if min-size < 0L or max-size < min-size :
@@ -1071,26 +1084,35 @@ lostanza defn initialize-heap (heap:ptr<Heap>, min-size:long, max-size:long) -> 
   val min-heap-size = round-up-to-whole-pages(min-size)
   val max-heap-size = round-up-to-whole-pages(max-size)
   ;Initialize the memory for the main heap.
-  heap.size = max-heap-size
-  heap.start = call-c clib/stz_memory_map(min-heap-size, max-heap-size)
-  heap.top = heap.start
-  heap.limit = heap.start + min-heap-size
+  vms.new-heap.size = max-heap-size
+  vms.new-heap.start = call-c clib/stz_memory_map(min-heap-size, max-heap-size)
+  vms.new-heap.top = vms.new-heap.start
+  vms.new-heap.limit = vms.new-heap.start + min-heap-size
   ;Initialize the memory for the heap's bitset.
   val min-bitset-size = round-up-to-whole-pages(bitset-size(min-heap-size))
   val max-bitset-size = round-up-to-whole-pages(bitset-size(max-heap-size))
-  heap.bitset = call-c clib/stz_memory_map(min-bitset-size, max-bitset-size)
-  clear(heap.bitset, min-bitset-size)
+  vms.new-heap.bitset = call-c clib/stz_memory_map(min-bitset-size, max-bitset-size)
+  clear(vms.new-heap.bitset, min-bitset-size)
+  ;Allocate space for marking stack (1024L * sizeof(long))
+  ;Initialize stack-top and stack-bottom to just past the allocated memory.
+  val stack-size = round-up-to-whole-pages(1024L << LOG-BYTES-IN-LONG)
+  vms.new-heap.stack-start = call-c clib/stz_memory_map(stack-size, stack-size)
+  vms.new-heap.stack-bottom = vms.new-heap.stack-start + stack-size
+  vms.new-heap.stack-top = vms.new-heap.stack-bottom
   ;No meaningful return value.
   return false
 
 ;Remove all associated memory reserved for the current heap structure.
-lostanza defn finalize-heap (heap:ptr<Heap>) -> ref<False> :
+lostanza defn finalize-heap (vms:ptr<VMState>) -> ref<False> :
   ;Compute the current size of the heap and it's bitset.
-  val current-heap-size = heap.limit - heap.start
+  val current-heap-size = vms.new-heap.limit - vms.new-heap.start
   val current-bitset-size = bitset-size(current-heap-size)
   ;Unmap the currently reserved pages.
-  call-c clib/stz_memory_unmap(heap.start, round-up-to-whole-pages(current-heap-size))
-  call-c clib/stz_memory_unmap(heap.bitset, round-up-to-whole-pages(current-bitset-size))
+  call-c clib/stz_memory_unmap(vms.new-heap.start, round-up-to-whole-pages(current-heap-size))
+  call-c clib/stz_memory_unmap(vms.new-heap.bitset, round-up-to-whole-pages(current-bitset-size))
+  ;Compute the size of the marking size (note that it grows downwards).
+  val marking-stack-size = vms.new-heap.stack-bottom - vms.new-heap.stack-start
+  call-c clib/stz_memory_unmap(vms.new-heap.stack-start, marking-stack-size)
   ;No meaningful return value.
   return false
 
@@ -1121,31 +1143,31 @@ lostanza defn expand-heap (heap:ptr<Heap>, size:long) -> ref<False> :
   ;No meaningful return value.
   return false
 
-;Sanity check: Ensure that the given pointer points to within the given heap.
+;Sanity check: Ensure that the given pointer points to within the heap of given VMState.
 ;Calls fatal if it is not.
-lostanza defn ensure-pointer-in-heap! (heap:ptr<Heap>, p:ptr<?>) -> ref<False> :
+lostanza defn ensure-pointer-in-heap! (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if p < heap.start or  p >= heap.top :
+    if p < vms.new-heap.start or  p >= vms.new-heap.top :
       fatal("Pointer is outside of heap.")
   return false
 
 ;Sanity check: Ensure that the given address range: start (inclusive) to limit (exclusive)
-;is contained within the given heap.
+;is contained within the heap of given VMState.
 ;Calls fatal if it is not.
-lostanza defn ensure-address-range-in-heap! (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> ref<False> :
+lostanza defn ensure-address-range-in-heap! (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if start < heap.start or start > limit or limit > heap.top :
+    if start < vms.new-heap.start or start > limit or limit > vms.new-heap.top :
       fatal("Address range is outside of heap.")
   return false
 
-;Return the index in the heap's bitset that acts as the mark for the given heap pointer.
-lostanza defn bit-index (heap:ptr<Heap>, p:ptr<?>) -> long :
-  ensure-pointer-in-heap!(heap, p)
-  return (p - heap.start) >> LOG-BYTES-IN-LONG
+;Return the index in the state's heap bitset that acts as the mark for the state's heap pointer.
+lostanza defn bit-index (p:ptr<?>, vms:ptr<VMState>) -> long :
+  ensure-pointer-in-heap!(p, vms)
+  return (p - vms.new-heap.start) >> LOG-BYTES-IN-LONG
 
-;Returns the pointer in the heap's bitset containing the given mark bit.
-lostanza defn bit-address (heap:ptr<Heap>, bit-index:long) -> ptr<long> :
-  return heap.bitset + (bit-index >> LOG-BITS-IN-LONG) << LOG-BYTES-IN-LONG
+;Returns the pointer in the state's heap's bitset containing the given mark bit.
+lostanza defn bit-address (bit-index:long, vms:ptr<VMState>) -> ptr<long> :
+  return vms.new-heap.bitset + (bit-index >> LOG-BITS-IN-LONG) << LOG-BYTES-IN-LONG
 
 ;Returns bit-index % BITS-IN-LONG.
 lostanza defn bit-shift (bit-index:long) -> long :
@@ -1157,42 +1179,42 @@ lostanza defn bit-mask (bit-index:long) -> long :
   return 1L << bit-shift(bit-index)
 
 ;Returns 1 if the given heap pointer has been marked
-;in the heap's bitset, and 0 otherwise.
-lostanza defn test-mark (heap:ptr<Heap>, p:ptr<?>) -> long :
-  val index = bit-index(heap, p)
-  return ([bit-address(heap, index)] >> bit-shift(index)) & 1
+;in the state's heap bitset, and 0 otherwise.
+lostanza defn test-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
+  val index = bit-index(p, vms)
+  return ([bit-address(index, vms)] >> bit-shift(index)) & 1
 
-;Marks the given heap pointer in the heap's bitset.
-lostanza defn set-mark (heap:ptr<Heap>, p:ptr<?>) -> ref<False> :
-  val index = bit-index(heap, p)
-  val address = bit-address(heap, index)
+;Marks the given heap pointer in the state's heap bitset.
+lostanza defn set-mark (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+  val index = bit-index(p, vms)
+  val address = bit-address(index, vms)
   [address] = [address] | bit-mask(index)
   ;No meaningful return value.
   return false
 
-;Marks the given heap pointer in the heap's bitset.
+;Marks the given heap pointer in the state's heap bitset.
 ;Returns a non-zero value if the pointer was previously marked.
 ;Returns zero if the pointer was not previously marked.
-lostanza defn test-and-set-mark (heap:ptr<Heap>, p:ptr<?>) -> long :
-  val index = bit-index(heap, p)
-  val address = bit-address(heap, index)
+lostanza defn test-and-set-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
+  val index = bit-index(p, vms)
+  val address = bit-address(index, vms)
   val mask = bit-mask(index)
 
   val old-value = [address]
   [address] = old-value | mask
   return old-value & mask
 
-;Clears the mark for the given heap pointer in the heap's bitset.
-lostanza defn clear-mark (heap:ptr<Heap>, p:ptr<?>) -> ref<False> :
-  val index = bit-index(heap, p)
-  val address = bit-address(heap, index)
+;Clears the mark for the given heap pointer in the state's heap's bitset.
+lostanza defn clear-mark (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+  val index = bit-index(p, vms)
+  val address = bit-address(index, vms)
   [address] = [address] & (~ bit-mask(index))
   ;No meaningful return value.
   return false
 
 ;Clears the mark for the given heap address range.
-lostanza defn clear-mark (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> ref<False> :
-  ensure-address-range-in-heap!(heap, start, limit)
+lostanza defn clear-mark (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+  ensure-address-range-in-heap!(start, limit, vms)
 
   ;Compute start and ending masks.
   ;Supposing that start-bit-index is 9, then
@@ -1201,10 +1223,10 @@ lostanza defn clear-mark (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> ref<Fal
   ;Supposing that end-bit-index is 9, then
   ;end-bit-mask is 1111 1110 0000 0000, which is used to zero-out all its
   ;before the end-bit-index (inclusive).
-  val start-bit-index = bit-index(heap, start)
-  val end-bit-index = bit-index(heap, limit - 1)
-  val start-bit-address = bit-address(heap, start-bit-index)
-  val end-bit-address = bit-address(heap, end-bit-index)
+  val start-bit-index = bit-index(start, vms)
+  val end-bit-index = bit-index(limit - 1, vms)
+  val start-bit-address = bit-address(start-bit-index, vms)
+  val end-bit-address = bit-address(end-bit-index, vms)
   val start-bit-mask = bit-mask(start-bit-index) - 1
   val end-bit-mask = (- (bit-mask(end-bit-index) << 1))
 
@@ -1224,8 +1246,9 @@ lostanza defn clear-mark (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>) -> ref<Fal
 ;Given the 64-long address range starting at 'start' in the heap,
 ;and the 64-bit mask given in 'bit-word', 
 ;call 'f' on every pointer corresponding to a 1 in 'bit-word'. 
-lostanza defn iterate-bit-word (heap:ptr<Heap>, start:ptr<?>, bit-word:long,
-                                f:ptr<((ptr<Heap>, ptr<?>) -> ref<False>)>) -> ref<False> :
+lostanza defn iterate-bit-word (start:ptr<?>, bit-word:long,
+                                f:ptr<((ptr<?>, ptr<VMState>) -> ref<False>)>,
+                                vms:ptr<VMState>) -> ref<False> :
   ;Ones are rare, expect zeroes
   var p:ptr<?> = start
   var bits:long = bit-word
@@ -1259,7 +1282,7 @@ lostanza defn iterate-bit-word (heap:ptr<Heap>, start:ptr<?>, bit-word:long,
     ;If the next bit is set, then call f on the
     ;current pointer.
     if (bits & 1) != 0 :
-      [f](heap, p)
+      [f](p, vms)
     ;Advance bits and p by 1.
     bits = bits >> 1
     p = p + (1 * BYTES-IN-LONG)
@@ -1267,17 +1290,18 @@ lostanza defn iterate-bit-word (heap:ptr<Heap>, start:ptr<?>, bit-word:long,
   return false
 
 ;Iterate through the heap address range given by start and limit,
-;and call f on all pointers in that range that are marked in the heap's bitset.
-lostanza defn iterate-marked (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>,
-                              f:ptr<((ptr<Heap>, ptr<?>) -> ref<False>)>) -> ref<False> :
-  ensure-address-range-in-heap!(heap, start, limit)
+;and call f on all pointers in that range that are marked in the state's heap bitset.
+lostanza defn iterate-marked (start:ptr<?>, limit:ptr<?>,
+                              f:ptr<((ptr<?>, ptr<VMState>) -> ref<False>)>,
+                              vms:ptr<VMState>) -> ref<False> :
+  ensure-address-range-in-heap!(start, limit, vms)
 
   ;Compute starting shift and ending mask.
   ;Supposing that end-bit-index is 9, then end-bit-mask contains 0000 0001 1111 1111.
-  val start-bit-index = bit-index(heap, start)
-  val end-bit-index = bit-index(heap, limit - 1)
-  val start-bit-address = bit-address(heap, start-bit-index)
-  val end-bit-address = bit-address(heap, end-bit-index)
+  val start-bit-index = bit-index(start, vms)
+  val end-bit-index = bit-index(limit - 1, vms)
+  val start-bit-address = bit-address(start-bit-index, vms)
+  val end-bit-address = bit-address(end-bit-index, vms)
   val start-bit-shift = bit-shift(start-bit-index)
   val end-bit-mask = (bit-mask(end-bit-index) << 1) - 1
 
@@ -1286,13 +1310,13 @@ lostanza defn iterate-marked (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>,
     ;The '[start-bit-address] & end-bit-mask' expression contains the bitset word
     ;with mark bits for pointers beyond the ending pointer masked off.
     ;That word is then shifted to the right by 'start-bit-shift' to align with the start pointer.
-    iterate-bit-word(heap, start, ([start-bit-address] & end-bit-mask) >> start-bit-shift, f)
+    iterate-bit-word(start, ([start-bit-address] & end-bit-mask) >> start-bit-shift, f, vms)
 
   else :
     ;Process the first bit word.
     ;[start-bit-address] is the 64-bit long in the bitset containing the mark for the start pointer.
     ;It is shifted to the right by 'start-bit-shift' to align with the start pointer.
-    iterate-bit-word(heap, start, [start-bit-address] >> start-bit-shift, f)
+    iterate-bit-word(start, [start-bit-address] >> start-bit-shift, f, vms)
 
     ;Initialize p to the pointer right after the 64-pointer chunk containing the start pointer.
     var p:ptr<?> = start + ((BITS-IN-LONG - start-bit-shift) * BYTES-IN-LONG)
@@ -1301,15 +1325,222 @@ lostanza defn iterate-marked (heap:ptr<Heap>, start:ptr<?>, limit:ptr<?>,
     while bit-address < end-bit-address :
       ;Iterate through every marked pointer in this chunk.
       if [bit-address] != 0 :     ;Rarely taken
-        iterate-bit-word(heap, p, [bit-address], f)
+        iterate-bit-word(p, [bit-address], f, vms)
       ;Advance to the next chunk
       bit-address = bit-address + BYTES-IN-LONG
       p = p + (BITS-IN-LONG * BYTES-IN-LONG)
 
     ;Process the last bit word.
     ;Mask off the bits in the bitset that are beyond the last pointer.
-    iterate-bit-word(heap, p, [end-bit-address] & end-bit-mask, f)
+    iterate-bit-word(p, [end-bit-address] & end-bit-mask, f, vms)
 
+  ;No meaningful return value
+  return false
+
+;Reset the incomplete range to the null interval.
+;We deliberately set min to greater than any pointer in the heap,
+;and set max to lower than any pointer in the heap,
+;to prepare the incomplete range to be extended using extend-incomplete-range.
+lostanza defn reset-incomplete-range (vms:ptr<VMState>) -> ref<False> :
+  vms.new-heap.min-incomplete = vms.new-heap.limit
+  vms.new-heap.max-incomplete = vms.new-heap.start
+  ;No meaningful return value
+  return false
+
+;Extend the incomplete range by ensuring the given heap pointer p
+;is within the incomplete range.
+lostanza defn extend-incomplete-range (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+  if p < vms.new-heap.min-incomplete : vms.new-heap.min-incomplete = p
+  if p > vms.new-heap.max-incomplete : vms.new-heap.max-incomplete = p
+  ;No meaningful return value
+  return false
+
+;Push a new pointer onto the marking stack.
+;Note that the marking stack grows downwards.
+lostanza defn push-to-marking-stack (p:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  #if-not-defined(OPTIMIZE) :
+    if marking-stack-full(vms) : fatal("Marking stack overflow.")
+  vms.new-heap.stack-top = vms.new-heap.stack-top - BYTES-IN-LONG
+  [vms.new-heap.stack-top] = p as long
+  return false
+
+;Pop a pointer from the marking stack.
+;Note that the marking stack grows downwards.
+lostanza defn pop-marking-stack (vms:ptr<VMState>) -> ptr<long> :
+  #if-not-defined(OPTIMIZE) :
+    if marking-stack-empty(vms) : fatal("Marking stack underflow.")
+  val value = [vms.new-heap.stack-top]
+  vms.new-heap.stack-top = vms.new-heap.stack-top + BYTES-IN-LONG
+  return value as ptr<long>
+
+;Returns 1L if the marking stack is not empty.
+;The marking stack grows downwards, so it is not empty
+;if the top is less than the bottom. 
+lostanza defn marking-stack-not-empty (vms:ptr<VMState>) -> long :
+  return vms.new-heap.stack-top < vms.new-heap.stack-bottom
+
+;Returns 1L if the marking stack is empty.
+lostanza defn marking-stack-empty (vms:ptr<VMState>) -> long :
+  return vms.new-heap.stack-top == vms.new-heap.stack-bottom
+
+;Return 1L if the marking stack is full.
+lostanza defn marking-stack-full (vms:ptr<VMState>) -> long :
+  return vms.new-heap.stack-top == vms.new-heap.stack-start
+
+;Mark the object at the given heap pointer.
+;On marking stack overflow the depth-first object traversal is pruned, and
+;the marked objects with possibly unmarked children are added to the range
+;of incompletely marked objects.
+lostanza defn mark-and-push (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  ;Retrieve the value at the given heap pointer.
+  val v = [ref]
+  ;Is this a reference to a Stanza heap object?
+  val tagbits = v & 7L
+  if tagbits == 1L :
+    ;Remove the tagbits to retrieve the object pointer.
+    val p = (v - 1) as ptr<long>
+    ;Mark the object, and test whether it has already previously been marked.
+    if test-and-set-mark(p, vms) == 0 :
+      ;If there is still space in the marking stack add the object to the
+      ;marking stack, otherwise add it to the incomplete range.
+      if marking-stack-full(vms) : extend-incomplete-range(p, vms)
+      else : push-to-marking-stack(p, vms)
+        
+  ;No meaningful return value
+  return false
+
+;Given 'ref', a pointer to a root variable (e.g. global, const, etc.),
+;mark it and iteratively traverse through its referenced objects.
+lostanza defn mark-from-root (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  ;Retrieve the value at the given heap pointer.
+  val v = [ref]
+  ;Is this a reference to a Stanza heap object?
+  val tagbits = v & 7L
+  if tagbits == 1L :
+    ;Remove the tag bits to retrieve the object pointer.
+    val p = (v - 1) as ptr<long>
+    ;Mark the object, and continue marking the object graph if it
+    ;has not previously been marked.
+    if test-and-set-mark(p, vms) == 0 :
+      continue-marking(p, vms)
+  ;No meaningful return value
+  return false
+
+;Given the pointer p to an already-marked object,
+;mark all the objects that it references and traverse the object graph.
+;Marks as many objects as possible given the size of the marking stack.
+lostanza defn continue-marking (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+  #if-not-defined(OPTIMIZE) :
+    if test-mark(p, vms) == 0 : fatal("Marked object expected.")
+  ;Initialize the marking stack with p.
+  push-to-marking-stack(p, vms)
+  ;Iteratively traverse and mark the object graph.
+  while marking-stack-not-empty(vms) :
+    iterate-references(pop-marking-stack(vms), addr(mark-and-push), vms)
+  ;No meaningful return value
+  return false
+
+;Recover from possible marking stack overflow by using marked objects from
+;the range of incompletely marked objects as additional roots
+lostanza defn complete-marking (vms:ptr<VMState>) -> ref<False> :
+  ;If the incomplete range is not empty,
+  while vms.new-heap.min-incomplete <= vms.new-heap.max-incomplete :
+    ;We add BYTES-IN-LONG to max-incomplete because max-incomplete is inclusive
+    ;and 'iterate-marked' needs exclusive bounds.
+    val incomplete-start = vms.new-heap.min-incomplete
+    val incomplete-limit = vms.new-heap.max-incomplete + BYTES-IN-LONG
+    
+    ;Call continue-marking on all marked pointers in the incomplete range.
+    ;We reset the incomplete range before we do this so that if the marking
+    ;stack overflows, the remaining pointers are stored in the incomplete range.
+    reset-incomplete-range(vms)
+    iterate-marked(incomplete-start, incomplete-limit, addr(continue-marking), vms)
+
+  ;No meaningful return value
+  return false
+
+;Call f on all root pointers.
+lostanza defn iterate-roots (f:ptr<((ptr<long>, ptr<VMState>) -> ref<False>)>,
+                             vms:ptr<VMState>) -> ref<False> :
+  ;Scan globals
+  val globals = vms.global-mem as ptr<long>
+  val roots = vms.global-root-table
+  val nroots = roots.length
+  for (var i:int = 0, i < nroots, i = i + 1) :
+    val r = roots.roots[i]
+    [f](addr(globals[r]), vms)
+
+  ;Scan const roots
+  val consts = vms.const-table
+  val nconsts = [vms.const-mem as ptr<int>]
+  for (var i:int = 0, i < nconsts, i = i + 1) :
+    [f](addr(consts[i]), vms)
+
+  ;Scan stack roots
+  ;call-c clib/printf("scan stacks\n")
+  [f](addr(vms.current-stack), vms)
+  [f](addr(vms.system-stack), vms)
+  ;No meaningful return value
+  return false
+
+;Call f on all references stored in the object pointed to by p.
+lostanza defn iterate-references (p:ptr<long>,
+                                  f:ptr<((ptr<long>, ptr<VMState>) -> ref<False>)>,
+                                  vms:ptr<VMState>) -> ref<False> :
+  val tag = [p]
+  val class-rec = vms.class-table[tag]
+  if class-rec.item-size == 0 :
+    if tag == tagof(Stack) :
+      val stackmap-table = vms.stackmap-table
+      val s = (p + BYTES-IN-LONG) as ptr<Stack>
+      var frame:ptr<StackFrame> = s.frames
+      var end-frame:ptr<StackFrame> = s.stack-pointer
+      if frame != null :
+        while frame <= end-frame :
+          val map = stackmap-table[frame.liveness-map]
+          val num-live = map.num-roots
+          for (var i:int = 0, i < num-live, i = i + 1) :
+            val r = map.roots[i]
+            [f](addr(frame.slots[r]), vms)
+    val roots = addr(class-rec.roots)
+    val num-roots = class-rec.num-roots
+    val obj = p as ptr<ObjectLayout>
+    for (var i:int = 0, i < num-roots, i = i + 1) :
+      val r = roots[i]
+      [f](addr(obj.slots[r]), vms)
+  ;Array class
+  else :
+    val array-rec = class-rec as ptr<ArrayRecord>
+    val array = p as ptr<ObjectLayout>
+
+    val num-base-roots = array-rec.num-base-roots
+    val base-roots = addr(array-rec.roots)
+    for (var i:int = 0, i < num-base-roots, i = i + 1) :
+      val r = base-roots[i]
+      [f](addr(array.slots[r]), vms)
+
+    val num-item-roots = array-rec.num-item-roots
+    if num-item-roots > 0 :
+      var items:ptr<?> = addr(array.slots) + array-rec.base-size
+      val item-size = array-rec.item-size
+      val item-roots = addr(array-rec.roots[num-base-roots])
+      val len = array.slots[0]
+      for (var n:long = 0, n < len, n = n + 1) :
+        for (var i:int = 0, i < num-item-roots, i = i + 1) :
+          [f](items + item-roots[i], vms)
+        items = items + item-size
+  ;No meaningful return value
+  return false
+
+;Mark all reachable objects.
+lostanza defn mark-reachable-objects (vms:ptr<VMState>) -> ref<False> :
+  ;Reset the incomplete range and call mark-from-root
+  ;on all roots.
+  reset-incomplete-range(vms)
+  iterate-roots(addr(mark-from-root), vms)
+  ;Iteratively call continue-marking on all pointers in the
+  ;incomplete range until we're finished.
+  complete-marking(vms)
   ;No meaningful return value
   return false
 
@@ -4493,10 +4724,10 @@ val EP-MSG = "Could not determine project name. The given path is empty."
 ;============================================================
 
 public defn delete-recursive (path:String, follow-symlinks?:True|False) :
-  val dir = stz/parsed-path/parse-path(path)
+  val dir = core/parsed-path/parse-path(path)
   if file-type(path, follow-symlinks?) is DirectoryType :
     for file in dir-files(path) do :
-      val path = to-string(stz/parsed-path/relative-to-dir(dir, stz/parsed-path/parse-path(file)))
+      val path = to-string(core/parsed-path/relative-to-dir(dir, file))
       delete-recursive(path, follow-symlinks?)
   delete-file(path)
 
