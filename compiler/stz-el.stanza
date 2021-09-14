@@ -1775,25 +1775,6 @@ defn cleanup-labels (epackage:EPackage) -> EPackage :
 ;============================================================
 ;==================== CONSTANT FOLD =========================
 ;============================================================
-defn inc (t:IntTable<Int>, k:Int) -> Int :
-  update(t, { _ + 1 }, k)
-
-defn walk-writes (e:EBody, num-writes:IntTable) :
-  defn walk-writes (e:ELItem, writer:False|EIns) :
-    match(e) :
-      (e:EVarLoc) :
-        match(writer) :
-          (writer:EIns) : inc(num-writes, n(e))
-          (writer) :      false
-      (e:EPtr|ELoad) :
-        walk-writes(loc(e), false)
-        walk-writes(x(e),   e)
-      (e:EIns) :
-        do(walk-writes{_, e}, e)
-      (e) :
-        do(walk-writes{_, false}, e)
-  for i in ins(e) do : walk-writes(i, false)
-
 defmulti hi-partial-fold-binary-op (op:EOp, f:? -> EIns, a0:?, a1:?) -> False|EIns
   
 defmethod hi-partial-fold-binary-op (op:EOp, f:? -> EIns, a0:?, a1:?) : false
@@ -1945,24 +1926,42 @@ defmethod lo-fold-unary-op (op:EOp, f:? -> EIns, a0:?) : false
 #for (Prim in [Byte Int Long]) :
   defmethod lo-fold-unary-op (op:NotOp, f:? -> EIns, a0:Prim) :    f(bit-not(a0))
 
+; Compiler pass to fold constants in both primitives and if operations.
+; Tracks immutable literal bindings and then uses them
+; to feed a large set of functions that run operations at compile time on
+; values of these literals and produce new literal bindings as a result or
+; in partial folding cases just create simplifications.
 defn constant-fold (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
-  val num-writes = IntTable<Int>(0)
-  val bindings = IntTable<EImm>()
+  ;Compute binding table.
+  ;Every entry in the binding table, x => e, indicates that
+  ;x is defined exactly once by the EDef to literal instruction.
+  defn binding-table (e:EBody) -> IntTable<ELSLiteral|ELiteral> :
+    val table = IntListTable<ELSLiteral|ELiteral>()
+    val remove-set = IntSet()
+    defn default (i:EIns) :
+      do(add{remove-set, n(_)}, varlocs(i))     
+    for i in ins(e) do :
+      match(i:EDef) :
+        match(y(i)) :
+          (y:ELSLiteral|ELiteral) : add(table, n(x(i)), i)
+          (y) : default(i)
+      else : default(i)
+    to-inttable<EObject|ENewObject> $
+      for entry in table seq? :
+        if remove-set[key(entry)] : None()
+        else if length(value(entry)) == 1 : One(key(entry) => head(value(entry)))
+        else : None()
 
   defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
     defn hi-constant? (e:EImm) :
       match(e) :
        (e:ELiteral) : true
-       (e:EVar) :
-         val b  = get?(bindings, n(e))
-         match(b:ELiteral) : value(b) is-not EObject
+       (e:EVar) : hi-constant?(get?(bindings, n(e)))
        (e) : false
     defn lo-constant? (e:EImm) :
       match(e) :
        (e:ELSLiteral) : true
-       (e:EVar) :
-         val b  = get?(bindings, n(e))
-         match(b:ELSLiteral) : value(b) is-not EObject
+       (e:EVar) : lo-constant?(get?(bindings, n(e)))
        (e) : false
     defn constant-value (e:EImm) :
       match(e) :
@@ -1970,24 +1969,15 @@ defn constant-fold (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
         (e:EVar) : constant-value(bindings[n(e)]) when key?(bindings, n(e)) else e
         (e) : e
 
-    defn walk (e:ELItem) -> ELItem :
-      defn default () : map(walk, e)
-      match(e) :
-        (e:EVar|ELive) : e
-        (e:EDef) :
-          if num-writes[n(x(e))] < 2 :
-            match(y(e)) :
-              (y:ELSLiteral|ELiteral) : bindings[n(x(e))] = y
-              (y) : false
-          e
+    defn walk (i:EIns, bindings:IntTable<ELSLiteral|ELiteral>) -> EIns :
+      match(i) :
         (i:EPrim) :
           defn result (value, f:? -> EImm) :
             match(value) :
               (value:EImm) :
                 EDef(x(i), value)
               (value) :
-                val lit = match(value:EObject) : EVar(n(x(value)))
-                          else : f(value)
+                val lit = f(value)
                 bindings[n(x(i))] = lit
                 EDef(x(i), lit)
           if any?(hi-constant?, ys(i)) :
@@ -2032,23 +2022,18 @@ defn constant-fold (epackage:EPackage, ehier:EHier, gvt:VarTable) -> EPackage :
               else : i
           else :
             i
-        (e) :
-          map(walk, e)
+        (i) :
+          i
 
-    walk-writes(e, num-writes)
-    val ins* = for ins in ins(e) map : walk(ins) as EIns
+    val bindings = binding-table(e)
+    val ins* = for ins in ins(e) map : walk(ins, bindings) as EIns
     sub-ins(e, ins*)
 
   defn fold-texp (x:ETExp, vt:VarTable) :
     val result = let loop (x:ELBigItem = x) :
       match(x) :
-        (e:EFn) :
-          for a in args(e) do : num-writes[a] = 1
-          map(loop, e)
-        (e:EBody) :
-          map(loop, fold-in-body(e, vt))
-        (x) :
-          map(loop, x)
+        (e:EBody) : map(loop, fold-in-body(e, vt))
+        (x) : map(loop, x)
     result as ETExp
 
   map-with-var-table(fold-texp, gvt, epackage)
