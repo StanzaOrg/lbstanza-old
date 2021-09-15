@@ -2846,13 +2846,18 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
   ;Compute binding table.
   ;Every entry in the binding table, x => e, indicates that
   ;x is defined exactly once by the EObject or ENewObject instruction.
-  defn binding-table (e:EBody) -> IntTable<EObject|ENewObject> :
-    val table = IntListTable<EObject|ENewObject>()
+  defn binding-table (e:EBody) -> IntTable<ELItem> :
+    val table = IntListTable<ELItem>()
     val remove-set = IntSet()
+    defn cmp-prim? (e:EPrim) -> True|False :
+      op(e) is EqOp|NeOp|LtOp|GtOp|LeOp|GeOp|UleOp|UltOp|UgtOp|UgeOp|IntLtOp|IntGtOp|IntLeOp|IntGeOp
+    defn remove-varloc-vars (i:EIns) : do(add{remove-set, n(_)}, varlocs(i))
     for i in ins(e) do :
-      match(i:EObject|ENewObject) : add(table, n(x(i)), i)
-      else : do(add{remove-set, n(_)}, varlocs(i))
-    to-inttable<EObject|ENewObject> $
+      match(i) :
+        (i:EObject|ENewObject) : add(table, n(x(i)), i)
+        (i:EPrim) :  add(table, n(x(i)), i) when cmp-prim?(i) else remove-varloc-vars(i)
+        (i) : remove-varloc-vars(i)
+    to-inttable<ELItem> $
       for entry in table seq? :
         if remove-set[key(entry)] : None()
         else if length(value(entry)) == 1 : One(key(entry) => head(value(entry)))
@@ -2864,12 +2869,28 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
     match(value:EVar) : not mutable?(vt,n(value))
     else : true
 
+  ;x is a small immediate if it can fit as an x86 immediate operand.
+  defn check-cmp-arg? (x:EImm, vt:VarTable) -> True|False :
+    val max = 1 << 16
+    val min = -1 << 16
+    defn small? (v:Int) : v >= min and v <= max
+    defn small? (v:Long) : v >= to-long(min) and v <= to-long(max)
+    match(x) :
+      (x:ELSLiteral) :
+        match(value(x)) :
+          (x:Byte) : true
+          (x:Int|Long) : small?(x)
+          (x) : false
+      (x:EVar) : not mutable?(vt, n(x))
+      (x:ETagof) : true
+      (x) : false
+
   ;If the given EObjectGet expression corresponds to retrieval
   ;of a known object field then return the destination and the
   ;field. Calls fail() if not a match.
   defn unbox-object-get (e:EObjectGet,
                          vt:VarTable,
-                         bindings:IntTable<EObject|ENewObject>) -> [EVarLoc, EImm] :
+                         bindings:IntTable<ELItem>) -> [EVarLoc, EImm] :
     val v = y(e) as? EVar
     val o = get?(bindings, n(v)) as? ENewObject
     val value = ys(o)[index(e)]
@@ -2881,7 +2902,7 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
   ;Calls fail() if not a match.
   defn unbox-load (e:ELoad,
                    vt:VarTable,
-                   bindings:IntTable<EObject|ENewObject>, ) -> [EVarLoc, EImm] :
+                   bindings:IntTable<ELItem>) -> [EVarLoc, EImm] :
     val field = loc(e) as? EField
     val v = y(loc(field) as? EDeref) as? EVar
     val o = get?(bindings, n(v)) as? EObject
@@ -2890,12 +2911,59 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
     fail() when not immutable?(vt,value)      
     [x(e), value]
 
+  defn check-prim-args (ys:Tuple<EImm>, vt:VarTable) :
+    fail() when not all?(check-cmp-arg?{_, vt}, ys)
+
+  ;If the given EMatch expression corresponds to retrieval
+  ;boolean from comparison prim then return the op, args, and
+  ;branch targets. Calls fail() if not a match.
+  ;Optimizing:
+  ;  c = x < y
+  ;  match(c) :
+  ;   (True) => L0
+  ;   (False) => L1
+  ;  =>
+  ;  L0 when x < y else L1
+  defn match-get (i:EMatch,
+                  vt:VarTable,
+                  bindings:IntTable<ELItem>) -> [EOp, Tuple<EImm>, Int, Int] :
+    fail() when not (length(ys(i)) == 1 and length(branches(i)) == 2)
+    val b0 = branches(i)[0]
+    val b1 = branches(i)[1]
+    val bt0 = types(b0)[0] as? EOf
+    val bt1 = types(b1)[0] as? EOf
+    fail() when not (n(bt0) == n(iotable(vt), CORE-TRUE-ID) and n(bt1) == n(iotable(vt), CORE-FALSE-ID))
+    val v = ys(i)[0] as? EVar
+    fail() when not immutable?(vt,v)
+    val p = get?(bindings, n(v)) as? EPrim
+    check-prim-args(ys(p), vt)
+    val op = convert-prim-to-branch-op(op(p))
+    [op, ys(p), n(b0), n(b1)]
+
+  ;If the given EIf expression corresponds to retrieval
+  ;boolean from comparison prim then return the op, args, and
+  ;branch targets. Calls fail() if not a match.
+  ;Optimizing:
+  ;  c = x < y
+  ;  L0 when c else L1
+  ;  =>
+  ;  L0 when x < y else L1
+  defn if-get (i:EIf,
+               vt:VarTable,
+               bindings:IntTable<ELItem>) -> [EOp, Tuple<EImm>, Int, Int] :
+    fail() when length(ys(i)) != 1
+    val v = ys(i)[0] as? EVar
+    val p = get?(bindings, n(v)) as? EPrim
+    val op = convert-prim-to-branch-op(op(p))
+    check-prim-args(ys(p), vt)
+    [op, ys(p), n1(i), n2(i)]
+
   ;Perform unboxing folds in the given body.
   ;Assumes that all nested bodies have already been folded.
   defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
     ;Compute the binding table
     val bindings = binding-table(e)
-    
+
     ;Attempt to fold the given instruction.
     defn fold? (i:EIns) -> EIns :
       match(i) :
@@ -2909,6 +2977,16 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
             val [x, v] = unbox-load(i, vt, bindings)
             EDef(x, v, false)
           else : i
+        (i:EMatch) : 
+          attempt :
+            val [op, ys, n1, n2] = match-get(i, vt, bindings)
+            EIf(n1, n2, op, ys)
+          else : i            
+        (i:EIf) : 
+          attempt :
+            val [op, ys, n1, n2] = if-get(i, vt, bindings)
+            EIf(n1, n2, op, ys)
+          else : i            
         (i) : i
 
     ;Attempt to fold all instructions.
