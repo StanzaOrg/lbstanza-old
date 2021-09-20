@@ -13,38 +13,42 @@ defpackage stz/el-bb-infer-pass :
 ;===================== Main Driver ==========================
 ;============================================================
 
-public defn construct-code (epackage:EPackage, gvt:VarTable) -> Code :
-  defn process-body (b:EBody, vt:VarTable) :
-    fatal("Process Body")
-  defn process-fn (f:EFn, vt:VarTable) :
-    construct-code(-1, args(f), a1(f), body(f), free(f))
-    fatal("Process fn")
-  defn process (texp:ELBigItem, vt:VarTable) -> ELBigItem :
-    match(texp) :
-      (texp:EBody) : process-body(texp, vt)
-      (texp:EFn) : process-fn(texp, vt)
-      (texp) : map(process{_, vt}, texp)
+public defn construct-code (epackage:EPackage, gvt:VarTable, trust-declared-types?:True|False) -> EPackage :
+  within (e, vt) = analyze-package(gvt, epackage) :
+    match(e) :
+      (e:EInit) :
+        val code = analyze-top-level-let(e, vt, trust-declared-types?)
+        println("Analyzed:\n%_" % [Indented(e)])
+        println("Code:")
+        println(Indented(code))
+      (e:EDefn|EDefClosure|EDefmethod|EExternFn) :
+        val codes = analyze-top-level-func(e, vt, trust-declared-types?)
+        println("Analyzed:\n%_" % [Indented(e)])
+        println("Code:")
+        do(println{Indented(_)}, codes)
+    ;Temporary
+    e
 
-
+;Run free variable analysis and compute local VarTables on all top-level
+;expressions to run inference algorithm, f.
+defn analyze-package (f:(EInit|EDefn|EDefClosure|EDefmethod|EExternFn, VarTable) -> ETExp,
+                      gvt:VarTable,
+                      epackage:EPackage) -> EPackage :
   within (texp, vt) = map-with-var-table(gvt, epackage) :
-    val texp* = analyze-freevars(texp, vt)
-    process(texp*, vt) as ETExp
+    defn mapf (e:ELBigItem) -> ELBigItem :
+      match(e:EInit|EDefn|EDefClosure|EDefmethod|EExternFn) : f(e,vt)
+      else : map(mapf, e)
+    mapf(analyze-freevars(texp, vt)) as ETExp
 
-  fatal("Not yet implemented")
-
-defn construct-code (n:Int, args:Tuple<Int>, a1:Tuple<EType>, body:EBody, free:Free) -> Code : 
-  defn analyze-block (block:BBlock) -> Block :
-    println("Analyzing block %_" % [lbl(block)])
-    do(println, instructions(block))
-    fatal("Not yet implemented")
-
-  ;Get the basic blocks
-  val bbtable = analyze-basic-blocks(ins(body))
-  do(analyze-block, bbtable)
-
-  fatal("Not yet implemented")
-
-defn map-with-var-table (f:(ETExp, VarTable) -> ETExp, gvt:VarTable, epackage:EPackage) -> EPackage :
+;Compute the VarTable on all top-level expressions and call f(texp, vt)
+;on the result.
+;- texp: is the top-level expression
+;- vt: is the computed local VarTable
+;- gvt: is the global VarTable for the package
+;- epackage: is the package to analyze.
+defn map-with-var-table (f:(ETExp, VarTable) -> ETExp,
+                         gvt:VarTable,
+                         epackage:EPackage) -> EPackage :
   val exps* = for e in exps(epackage) map :
     f(e, LocalVarTable(gvt, e))
   sub-exps(epackage, exps*)
@@ -101,14 +105,58 @@ defn trusted-global-type (vt:VarTable, n:Int) -> EType :
 ;==================== Code Analysis =========================
 ;============================================================
 
+;------------------------------------------------------------
+;--------------------- Entry Points -------------------------
+;------------------------------------------------------------
+
+;Analyze the given top-level init let construct.
+;Free variable analysis must already have been performed.
+defn analyze-top-level-let (e:EInit,
+                            vt:VarTable,
+                            trust-declared-types?:True|False) -> Code :
+  analyze-code(to-seq(0 to false), -1, [], [], body(e),
+               lostanza?(e), Free([], []), vt, trust-declared-types?)  
+
+;Analyze the given top-level function construct.
+;Free variable analysis must already have been performed.
+defn analyze-top-level-func (e:EDefn|EDefClosure|EDefmethod|EExternFn,
+                             vt:VarTable,
+                             trust-declared-types?:True|False) -> Tuple<Code> :
+  ;Depending upon the construct gather [n,f,lostanza?].
+  ;- n: The identifier of the construct.
+  ;- f: The EFunction for the function.
+  ;- lostanza?: Whether this is a LoStanza construct.
+  val [n,f,lostanza?] = match(e) :
+    (e:EDefn) : [n(e), func(e), lostanza?(e)]
+    (e:EDefClosure) : [n(e), func(e), false]
+    (e:EDefmethod) : [n(e), func(e), lostanza?(e)]
+    (e:EExternFn) : [n(e), func(e), true]
+  ;Analyze codes
+  val codes = Vector<Code>()
+  let loop (f:EFunction = f) :
+    match(f) :
+      (f:EMultifn) :
+        do(loop, funcs(f))
+      (f:EFn) :
+        val code = analyze-code(to-seq(0 to false), n, args(f), a1(f), body(f),
+                                lostanza?, free(f), vt, trust-declared-types?)
+        add(codes, code)                        
+  ;Return codes
+  to-tuple(codes)
+
+;------------------------------------------------------------
+;------------------- Core Algorithm -------------------------
+;------------------------------------------------------------
+
 ;Analyze the given code block.
 ;- n: the identifier of the code block. We use a generated
 ;  id for this. 
 ;- family: the family of this code block. We use this
 ;  to store the actual identifier of the function/object.
-;- args: the arguments to this body. 
+;- args: the arguments to this body.
 ;- a1: the types of the arguments.
 ;- body: the body of the code block.
+;- lostanza?: true if this body is within a LoStanza context.
 ;- free: the analyzed freevars of the code block.
 ;- vt: the local vartable.
 ;- trust-declared-types?: true if we should trust the
@@ -119,9 +167,13 @@ defn analyze-code (id-counter:Seq<Int>,
                    args:Tuple<Int>,
                    a1:Tuple<EType>,
                    body:EBody,
+                   lostanza?:True|False,
                    free:Free,
                    vt:VarTable,
                    trust-declared-types?:True|False) -> Code :
+  ;Get id to use for code
+  val code-id = next(id-counter)
+  
   ;Compute locals
   val locals = to-tuple $ for l in locals(body) seq? :
     if inferred-var?(vt, n(l)) : One(Local(n(l), mutable?(l), type(l)))
@@ -134,7 +186,7 @@ defn analyze-code (id-counter:Seq<Int>,
     let loop (func:EFunction = func(f)) :
       match(func) :
         (func:EFn) :
-          val code = analyze-code(id-counter, n(f), /args(func), /a1(func), /body(func),
+          val code = analyze-code(id-counter, n(f), /args(func), /a1(func), /body(func), false
                                   /free(func), vt, trust-declared-types?)
           add(nested,code)
         (func:EMultifn) : do(loop, funcs(func))
@@ -142,7 +194,7 @@ defn analyze-code (id-counter:Seq<Int>,
   for obj in localobjs(body) do :
     for m in methods(obj) do :
       val func = func(m)
-      val code = analyze-code(id-counter, n(m), /args(func), /a1(func), /body(func),
+      val code = analyze-code(id-counter, n(m), /args(func), /a1(func), /body(func), false
                               /free(func), vt, trust-declared-types?)
       add(nested,code)                        
 
@@ -154,14 +206,30 @@ defn analyze-code (id-counter:Seq<Int>,
   ;Analyze each basic block in the body.
   val bbtable = analyze-basic-blocks(ins(body))
   val blocks = to-tuple $
-    for block in bbtable seq :
+    for (block in bbtable, i in 0 to false) seq :
+      ;Hold all the inference commands for this block.
       val instructions = Vector<Ins>()
+      
+      ;For the first block, add the guards on the arguments.
+      if i == 0 :
+        ;Trust the coming argument types if it's a HiStanza function
+        ;(where arguments are checked by caller), or if we're requesting
+        ;deliberately to trust the declared types. 
+        val trust-argument-types? = (not lostanza?) or trust-declared-types?
+        for (arg in args, t in a1) do :
+          if inferred-var?(vt,arg) :
+            val t* = t when trust-argument-types? else ETop()
+            add(instructions, Def(arg,t*))
+
+      ;Generate inference commands to the instructions buffer.                        
       within ins = analyze-single-block(block, vt, object-method-table, trust-declared-types?) :
         add(instructions, ins)
+        
+      ;Return the analyzed block.
       Block(lbl(block), to-tuple(instructions), predecessors(block))
 
   ;Create final code
-  Code(next(id-counter), family, locals, to-tuple(nested), blocks, vars(free))
+  Code(code-id, family, locals, to-tuple(nested), blocks, vars(free))
 
 ;============================================================
 ;================ Single Block Analysis =====================
@@ -222,10 +290,10 @@ defn analyze-single-block (emit:Ins -> ?,
   ;  Cast          - The cast command
   defn gen-cast-commands (ins:ECheck) :
     gen-uses(ins)
+    emit(Wrapped<EIns>(ins))
     if inferred-var?(vt,y(ins)) :
       val v = n(y(ins) as EVar)
-      emit(Cast(v, type(ins)))
-    emit(Wrapped<EIns>(ins))
+      emit(Cast(v, type(ins)))    
 
   ;Generate the commands for a match command.
   ;Structure:
@@ -293,7 +361,8 @@ defn analyze-single-block (emit:Ins -> ?,
     ;Helper: Return true if the return type of the given function
     ;is trusted.
     defn return-type-trusted? (f:Int, arity:Int) -> True|False :
-      if trust-declared-types? : true
+      if not function?(vt,f) : false
+      else if trust-declared-types? : true
       else if lostanza?(vt,f) or tail?(vt,f,arity) : false
       else : true
 
