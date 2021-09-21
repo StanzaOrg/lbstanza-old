@@ -29,30 +29,34 @@ defmethod print (o:OutputStream, e:EAnnotate) :
 ;- vt: The local VarTable for this top-level expression.
 ;- trust-declared-types?: Use true if we should implicitly trust the declared types of variables.
 ;  Used in optimized mode for more aggressive type inference.
-public defn add-type-annotations (e:EDefn|EDefClosure|EDefmethod|EExternFn|EInit,
+public defn add-type-annotations (e:ETExp,
+                                  defobjects:IntTable<EDefObject>,
                                   vt:VarTable,
-                                  trust-declared-types?:True|False) -> EDefn|EDefClosure|EDefmethod|EExternFn|EInit :
-  match(analyze-freevars(e, vt)) :
-    (e:EInit) :
-      val code = analyze-top-level-let(e, vt, trust-declared-types?)
-      val inferred = infer-types(code, trust-declared-types?)
-      migrate-annotations(e, inferred)
-    (e:EDefn|EDefClosure|EDefmethod|EExternFn) :
-      val codes = analyze-top-level-func(e, vt, trust-declared-types?)
-      val inferred = map(infer-types{_, trust-declared-types?}, codes)
-      migrate-annotations(e, inferred)
+                                  trust-declared-types?:True|False) -> ETExp :
+  defn annotate (e:ELBigItem) :
+    match(e) :
+      (e:EInit) :
+        val code = analyze-top-level-let(e, defobjects, vt, trust-declared-types?)
+        val inferred = infer-types(code, trust-declared-types?)
+        migrate-annotations(e, inferred)
+      (e:EDefn|EDefClosure|EDefmethod|EExternFn) :
+        val codes = analyze-top-level-func(e, defobjects, vt, trust-declared-types?)
+        val inferred = map(infer-types{_, trust-declared-types?}, codes)
+        migrate-annotations(e, inferred)
+      (e) :
+        map(annotate, e)
+  annotate(analyze-freevars(e, vt)) as ETExp
 
 ;Add type annotations to the entire package.
 ;Useful for debugging.
 public defn add-type-annotations (epackage:EPackage,
                                   trust-declared-types?:True|False) -> EPackage :
   val gvt = GlobalVarTable(epackage)
+  val defobjects = to-inttable<EDefObject> $
+    for e in filter-by<EDefObject>(exps(epackage)) seq :
+      n(e) => e
   within (texp, vt) = map-with-var-table(gvt, epackage) :
-    defn add-annotations (e:ELBigItem) -> ELBigItem :
-      match(e:EInit|EDefn|EDefClosure|EDefmethod|EExternFn) :
-        add-type-annotations(e, vt, trust-declared-types?)
-      else : map(add-annotations, e)
-    add-annotations(texp) as ETExp
+    add-type-annotations(texp, defobjects, vt, trust-declared-types?)
 
 ;Compute the VarTable on all top-level expressions and call f(texp, vt)
 ;on the result.
@@ -126,14 +130,16 @@ defn trusted-global-type (vt:VarTable, n:Int) -> EType :
 ;Analyze the given top-level init let construct.
 ;Free variable analysis must already have been performed.
 defn analyze-top-level-let (e:EInit,
+                            defobjects:IntTable<EDefObject>,
                             vt:VarTable,
                             trust-declared-types?:True|False) -> Code :
   analyze-code(to-seq(0 to false), -1, [], [], body(e),
-               lostanza?(e), Free([], []), vt, trust-declared-types?)  
+               lostanza?(e), Free([], []), vt, defobjects, trust-declared-types?)  
 
 ;Analyze the given top-level function construct.
 ;Free variable analysis must already have been performed.
 defn analyze-top-level-func (e:EDefn|EDefClosure|EDefmethod|EExternFn,
+                             defobjects:IntTable<EDefObject>,
                              vt:VarTable,
                              trust-declared-types?:True|False) -> Tuple<Code> :
   ;Depending upon the construct gather [n,f,lostanza?].
@@ -153,7 +159,7 @@ defn analyze-top-level-func (e:EDefn|EDefClosure|EDefmethod|EExternFn,
         do(loop, funcs(f))
       (f:EFn) :
         val code = analyze-code(to-seq(0 to false), n, args(f), a1(f), body(f),
-                                lostanza?, free(f), vt, trust-declared-types?)
+                                lostanza?, free(f), vt, defobjects, trust-declared-types?)
         add(codes, code)                        
   ;Return codes
   to-tuple(codes)
@@ -184,6 +190,7 @@ defn analyze-code (id-counter:Seq<Int>,
                    lostanza?:True|False,
                    free:Free,
                    vt:VarTable,
+                   defobject-table:IntTable<EDefObject>,
                    trust-declared-types?:True|False) -> Code :
   ;Get id to use for code
   val code-id = next(id-counter)
@@ -205,7 +212,7 @@ defn analyze-code (id-counter:Seq<Int>,
       match(func) :
         (func:EFn) :
           val code = analyze-code(id-counter, n(f), /args(func), /a1(func), /body(func), false
-                                  /free(func), vt, trust-declared-types?)
+                                  /free(func), vt, defobject-table, trust-declared-types?)
           add(nested,code)
         (func:EMultifn) : do(loop, funcs(func))
   ;Compute nested code arising from nested objects.
@@ -213,13 +220,13 @@ defn analyze-code (id-counter:Seq<Int>,
     for m in methods(obj) do :
       val func = func(m)
       val code = analyze-code(id-counter, n(m), /args(func), /a1(func), /body(func), false
-                              /free(func), vt, trust-declared-types?)
+                              /free(func), vt, defobject-table, trust-declared-types?)
       add(nested,code)                        
 
   ;Compute object method table
-  val object-method-table = to-inttable<Tuple<Int>> $
+  val object-table = to-inttable<ELocalObj> $
     for obj in localobjs(body) seq :
-      n(obj) => map(n,methods(obj))
+      n(obj) => obj
 
   ;Analyze each basic block in the body.
   val bbtable = analyze-basic-blocks(ins(body))
@@ -240,7 +247,8 @@ defn analyze-code (id-counter:Seq<Int>,
             add(instructions, Def(arg,t*))
 
       ;Generate inference commands to the instructions buffer.                        
-      within ins = analyze-single-block(block, vt, object-method-table, trust-declared-types?) :
+      within ins = analyze-single-block(block, vt, object-table,
+                                        defobject-table trust-declared-types?) :
         add(instructions, ins)
         
       ;Return the analyzed block.
@@ -257,13 +265,16 @@ defn analyze-code (id-counter:Seq<Int>,
 ;- emit: is called for every generated inference command.
 ;- block: is the block to analyze.
 ;- vt: is the local VarTable for the current top-level expression.
-;- object-method-table: Holds the identifiers of all object methods.
+;- object-table: Holds all the declared local objects in the body
+;  that the block is from.
+;- object-parent-table: 
 ;- trust-declared-types?: If true indicates that we should trust
 ;  the declared types of functions and global variables.
 defn analyze-single-block (emit:Ins -> ?,
                            block:BBlock,
                            vt:VarTable,
-                           object-method-table:IntTable<Tuple<Int>>,
+                           object-table:IntTable<ELocalObj>,
+                           defobject-table:IntTable<EDefObject>,
                            trust-declared-types?:True|False) :
   ;Overall algorithm for the different classes of instructions.
   ;  Cast commands: ECheck
@@ -388,9 +399,11 @@ defn analyze-single-block (emit:Ins -> ?,
       (ins:EArray) : emit-def(EOf(n(ins)))
       (ins:EObject) : emit-def(EOf(n(ins)))
       (ins:EBox) : emit-def(core-type(vt, CORE-BOX-ID))
-      (ins:ENewObject) : emit-def(EOf(n(ins)))
       (ins:ELetRec) : emit-def(core-type(vt, CORE-FN-ID))
       (ins:EClosureGet|EObjectGet|EBoxGet|EInterpret|ELoad|ETupleGet) : emit-def(ETop())
+      (ins:ENewObject) :
+        val defobj = defobject-table[n(ins)]
+        emit-def(parent(defobj))
       (ins:EPrim) :
         val t = op-result-type(op(ins))
         match(t:EType) : emit-def(t)
@@ -455,9 +468,10 @@ defn analyze-single-block (emit:Ins -> ?,
           emit(InitCode(n(x)))
       (ins:ENew) :
         fatal("ENew is not an inferred variable.") when not inferred-var?(vt,x(ins))
-        emit(Def(n(x(ins)), EOf(n(ins))))
-        for n in object-method-table[n(ins)] do :
-          emit(InitCode(n))
+        val obj = object-table[n(ins)]
+        emit(Def(n(x(ins)), type(obj)))
+        for m in methods(object-table[n(ins)]) do :
+          emit(InitCode(n(m)))
 
   ;Generate the commands for trivial expressions.
   ;Structure:
