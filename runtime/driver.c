@@ -25,8 +25,8 @@
 #include<dirent.h>
 #include<pthread.h>
 
-#include "common.h"
-#include "types.h"
+#include <stanza/types.h>
+
 #include "process.h"
 
 //       Forward Declarations

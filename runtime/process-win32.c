@@ -8,9 +8,9 @@
 #include <stdarg.h>
 #include <stdbool.h>
 
-#include "common.h"
+#include <stanza/types.h>
+
 #include "process.h"
-#include "types.h"
 
 typedef enum {
   FT_READ,
