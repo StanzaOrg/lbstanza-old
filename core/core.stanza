@@ -1052,12 +1052,14 @@ lostanza val BITS-IN-LONG:long = 1 << LOG-BITS-IN-LONG
 ;- limit is equal to start + number of currently available bytes in the heap.
 ;- size is the maximum size that the heap can be expanded to.
 ;- bitset is the starting address of the marking bits for the heap.
+;- compaction-start is the lowest moving object in collection area.
 lostanza deftype Heap :
   var top: ptr<long>
   var limit: ptr<long>
   var start: ptr<long>
   var size: long
   var bitset: ptr<long>
+  var compaction-start: ptr<long>
 
   ;Marking stack
   ;Note that the stack grows downwards so stack-bottom is equal to
@@ -1206,18 +1208,6 @@ lostanza defn set-mark (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
   ;No meaningful return value.
   return false
 
-;Marks the given heap pointer in the state's heap bitset.
-;Returns 1L if the pointer was previously unmarked and hence is now
-;marked, otherwise returns 0L if the pointer was already marked.
-lostanza defn test-and-set-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
-  val index = bit-index(p, vms)
-  val address = bit-address(index, vms)
-  val mask = bit-mask(index)
-
-  val old-value = [address]
-  [address] = old-value | mask
-  return (old-value & mask) == 0
-
 ;Clears the mark for the given heap pointer in the state's heap's bitset.
 lostanza defn clear-mark (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
   val index = bit-index(p, vms)
@@ -1225,6 +1215,28 @@ lostanza defn clear-mark (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
   [address] = [address] & (~ bit-mask(index))
   ;No meaningful return value.
   return false
+
+;Fused operation. Marks the given heap pointer in the state's heap bitset.
+;Returns non-zero value if the pointer was previously marked, otherwise 0L.
+lostanza defn test-and-set-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
+  val index = bit-index(p, vms)
+  val address = bit-address(index, vms)
+  val mask = bit-mask(index)
+
+  val old-value = [address]
+  [address] = old-value | mask
+  return old-value & mask
+
+;Fused operation. Clears the mark for the given heap pointer in the state's heap's bitset.
+;Returns non-zero value if the pointer was previously marked, otherwise 0L.
+lostanza defn test-and-clear-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
+  val index = bit-index(p, vms)
+  val address = bit-address(index, vms)
+  val mask = bit-mask(index)
+
+  val old-value = [address]
+  [address] = old-value & (~ mask)
+  return old-value & mask
 
 ;Clears the mark for the given heap address range.
 lostanza defn clear-mark (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<False> :
@@ -1414,7 +1426,7 @@ lostanza defn mark-and-push (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
     ;Remove the tagbits to retrieve the object pointer.
     val p = (v - 1) as ptr<long>
     ;Mark the object, and test whether it has already previously been marked.
-    if test-and-set-mark(p, vms) :
+    if test-and-set-mark(p, vms) == 0 :
       ;If there is still space in the marking stack add the object to the
       ;marking stack, otherwise add it to the incomplete range.
       if marking-stack-full(vms) : extend-incomplete-range(p, vms)
@@ -1435,7 +1447,7 @@ lostanza defn mark-from-root (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
     val p = (v - 1) as ptr<long>
     ;Mark the object, and continue marking the object graph if it
     ;has not previously been marked.
-    if test-and-set-mark(p, vms) :
+    if test-and-set-mark(p, vms) == 0 :
       continue-marking(p, vms)
   ;No meaningful return value
   return false
@@ -1546,6 +1558,20 @@ lostanza defn iterate-references (p:ptr<long>,
   ;No meaningful return value
   return false
 
+lostanza defn allocation-size (p:ptr<long>, vms:ptr<VMState>) -> long :
+  val tag = [p]
+  val class-rec = vms.class-table[tag]
+  if class-rec.item-size == 0 :
+    return object-size-on-heap(class-rec.size)
+  ;Array class
+  else :
+    val array-rec = class-rec as ptr<ArrayRecord>
+    val base-size = array-rec.base-size
+    val item-size = array-rec.item-size
+    val array = p as ptr<ObjectLayout>
+    val len = array.slots[0]
+    return object-size-on-heap(base-size + item-size * len)
+
 ;Mark all reachable objects.
 lostanza defn mark-reachable-objects (vms:ptr<VMState>) -> ref<False> :
   ;Reset the incomplete range and call mark-from-root
@@ -1558,9 +1584,29 @@ lostanza defn mark-reachable-objects (vms:ptr<VMState>) -> ref<False> :
   ;No meaningful return value
   return false
 
+;Scans the heap from given start to heap top until first unmarked object found.
+;Clear the scanned objects marks. Returns address of the first unmarked object,
+;or the limit if it is not found.
+lostanza defn skip-and-clear-marked (start:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
+  val limit = vms.new-heap.top
+  #if-not-defined(OPTIMIZE) :
+    if start > limit : fatal("Invalid range.")
+  var p:ptr<long> = start
+  while p < limit :
+    if test-and-clear-mark(p, vms) == 0 : return p
+    p = p + allocation-size(p, vms)
+  #if-not-defined(OPTIMIZE) :
+    if p != limit : fatal("Invalid limit.")
+  return limit
+
 lostanza defn new-collect-garbage (vms:ptr<VMState>) -> ref<False> :
   mark-reachable-objects(vms)
   scan-liveness-trackers(vms)
+
+  vms.new-heap.compaction-start = skip-and-clear-marked(vms.new-heap.start, vms)
+  ;Are there any unmarked objects?
+  if vms.new-heap.compaction-start == vms.new-heap.top : return false
+
   ;No meaningful return value
   return false
 
