@@ -2,222 +2,629 @@ defpackage stz/el-infer :
   import core
   import collections
   import stz/el-ir
+  import stz/dl-ir
+  import stz/el-var-table
+  import stz/el-infer-engine
+  import stz/el
+  import stz/basic-ops
+  import stz/el-utils
+  import stz/el-basic-blocks
+  import stz/el-freevars
 
 ;============================================================
-;==================== Input Specification ===================
+;===================== Annotated Type =======================
 ;============================================================
 
-public deftype Input
-public defmulti blocks (i:Input) -> Seqable<Block>
-public defmulti entry-state (i:Input, n:Int) -> EType
-
-public deftype Block
-public defmulti n (b:Block) -> Int
-public defmulti instructions (b:Block) -> Seqable<Ins>
-public defmulti predecessors (b:Block) -> Tuple<Int>
-
-public deftype Ins
-
-public deftype Def <: Ins
-public defmulti n (d:Def) -> Int
-public defmulti type (d:Def) -> EType
-
-public deftype Inherit <: Ins
-public defmulti n (i:Inherit) -> Int
-public defmulti inherit (i:Inherit) -> Int
-
-public deftype Cast <: Ins
-public defmulti n (c:Cast) -> Int
-public defmulti type (c:Cast) -> EType
-
-public deftype Match <: Ins
-public defmulti branches (m:Match) -> Tuple<Branch>
-
-public deftype Use <: Ins
-public defmulti n (u:Use) -> Int
-
-public defstruct Annotation <: Ins :
+;This instruction represents that variable 'v' is of type 'type'.
+public defstruct EAnnotate <: EIns :
   n: Int
   type: EType
-defmethod print (o:OutputStream, a:Annotation) :
-  print(o, "annotate %_ : %_" % [n(a), type(a)])
-  
-public deftype Branch
-public defmulti n (b:Branch) -> Int
-public defmulti casts (b:Branch) -> Tuple<Cast>
+
+defmethod print (o:OutputStream, e:EAnnotate) :
+  print(o, "annotate V%_ : %_" % [n(e), type(e)])
 
 ;============================================================
-;==================== Algorithm =============================
+;============== Process Annotations on EBody ================
 ;============================================================
 
-defstruct EnterType <: EType :
-  n: Int
-  block: Int
-with: (printer => true)
+;A stateful processor for computing the type of an immediate.
+public deftype EBodyAnnotations
 
-defstruct ExitType <: EType :
-  n: Int
-  block: Int
-with: (printer => true)
+;Retrieve the instructions one at a time from the body.
+public defmulti ins (a:EBodyAnnotations) -> Seq<EIns>
 
-defn EAnd? (a:EType, b:EType|False) :
-  match(b:EType) : EAnd(a, b)
-  else : a
+;Retrieve the current type of the given variable.
+public defmulti get (a:EBodyAnnotations, v:Int) -> EType
 
-defmethod hash (v:EnterType) : hash $ [n(v) block(v)]
-defmethod hash (v:ExitType) : hash $ [n(v) block(v)]
-defmethod equal? (a:EnterType, b:EnterType) :
-  n(a) == n(b) and block(a) == block(b)
-defmethod equal? (a:ExitType, b:ExitType) :
-  n(a) == n(b) and block(a) == block(b)
+;Retrieve the current type of the given immediate.
+public defmulti get (a:EBodyAnnotations, x:EImm) -> EType
 
-defmethod map (f:ELItem -> ELItem, item:EnterType|ExitType) : item
+;Create the annotations.
+;- body: the EBody to analyze.
+;- vt: the local VarTable. 
+public defn EBodyAnnotations (body:EBody,
+                              vt:VarTable,
+                              trust-declared-types?:True|False) :
+  ;Each entry, v => type, indicates that the inferred variable
+  ;v has the type 'type'. 
+  val state = IntTable<EType>()
   
-public defn infer (input:Input) -> Collection<Ins> :
-  val vartable = HashTable<EType, EType>()  
-  val edge-cast = HashTable<[Int, Int, Int], EType>()
-  val predecessors-table = IntTable<Tuple<Int>>()
-  val soln-table = HashTable<EType,EType>()
-  val soln-ordering = Vector<EType>()
-  val var-queue = Queue<EnterType|ExitType>()
-  var block0
-
-  ;Driver
-  defn driver () :
-    val ins = build-equations()
-    solve()
-    ins
-
-  ;Add all variables in type to queue
-  defn add-all-vars-to-queue (t:EType) :
-    match(t:EnterType|ExitType) : add(var-queue, t)
-    else : do*(add-all-vars-to-queue, t)
-
-  ;Create an annotation statement
-  defn make-annotation (n:Int, t:EType) :
-    add-all-vars-to-queue(t)
-    new Annotation :
-      defmethod n (this) : n
-      defmethod type (this) : sub-solns(t, false)
-
-  ;Build up equations
-  defn build-equations () :
-    val buffer = Vector<Ins>()
-    for (block in blocks(input), i in 0 to false) do :
-      if i == 0 : block0 = n(block)
-      val state = IntTable-init<EType>(EnterType{_, n(block)})
-      for ins in instructions(block) do :
-        match(ins) :
-          (ins:Def) :
-            add(buffer, ins)
-            state[n(ins)] = type(ins)
-          (ins:Inherit) :
-            add(buffer, ins)
-            state[n(ins)] = state[inherit(ins)]
-          (ins:Cast) :
-            add(buffer, ins)
-            state[n(ins)] = EAnd(state[n(ins)], type(ins))
-          (ins:Match) :
-            add(buffer, ins)
-            for b in branches(ins) do :
-              for c in casts(b) do :
-                edge-cast[[n(block), n(b), n(c)]] = type(c)
-          (ins:Use) :
-            add(buffer, make-annotation(n(ins), state[n(ins)]))
-          (ins) :
-            add(buffer, ins)
-      for entry in state do :
-        vartable[ExitType(key(entry), n(block))] = value(entry)
-      predecessors-table[n(block)] = predecessors(block)
-    buffer  
-
-  ;Retrieve type of variable
-  defn var-type (v:EType) :
-    if key?(vartable, v) :
-      vartable[v]
+  ;Retrieve the trusted declared type of a variable.
+  ;Assumes that the variable is a reftype variable.
+  defn var-type (v:Int) :
+    if key?(state,v) :
+      state[v]
     else :
-      match(v) :
-        (v:EnterType) :
-          if block(v) == block0 :
-            entry-state(input, n(v))
-          else :          
-            val ts = for p in predecessors-table[block(v)] seq :
-              val cast = get?(edge-cast, [p, block(v), n(v)])
-              EAnd?(ExitType(n(v), p), cast)
-            reduce(EOr, ts)
-        (v:ExitType) :
-          EnterType(n(v), block(v))
+      ;If the variable type is not inferred, then it must be a global variable.
+      fatal("Illegal variable to EBody annotations: %_" % [v]) when not global?(vt,v)
+      ;Trust the variable type only if it is a HiStanza variable.
+      val trust-type? = trust-declared-types? or not lostanza?(vt,v)
+      type(vt,v) when trust-type? else ETop()
 
-  ;Solve solutions
-  ;Recursively substitute variables.
-  ;Normalize after each substitution to keep size down.
-  defn sub-solns-recur (t:EType) :
-    ;Perform one layer of substitutions.
-    defn sub1 (t:EType) -> EType|False :
-      var progress?:True|False = false
-      val t* = let loop (t:EType = t) :
-        match(t:EnterType|ExitType) :
-          if key?(soln-table, t) :
-            progress? = true
-            soln-table[t]
-          else : t
+  ;Retrieve the type of the given immediate.
+  defn imm-type (x:EImm) :
+    match(x:EVar) : var-type(n(x))
+    else : type(vt, x)  
+
+  ;Return annotations
+  new EBodyAnnotations :
+    defmethod get (this, v:Int) : var-type(v)
+    defmethod get (this, x:EImm) : imm-type(x)
+    defmethod ins (this) :
+      clear(state)
+      for e in ins(body) seq? :
+        match(e:EAnnotate) :
+          state[n(e)] = type(e)
+          None()
         else :
-          map(loop, t)
-      t* when progress?
+          One(e)
 
-    ;Launch!
-    let loop (t:EType = t) :
-      match(sub1(t)) :
-        (t:EType) : loop(normalize(t))
-        (f:False) : t   
-    
-  defn sub-solns (t:EType, recur?:True|False) :
-    let loop (t:EType = t) :
-      match(t) :
-        (t:EnterType|ExitType) :
-          match(get?(soln-table, t)) :
-            (t*:EType) :
-              if recur? : loop(t*)
-              else : t*
-            (_:False) :
-              t
-        (t) :
-          map(loop, t)
+;============================================================
+;===================== Main Driver ==========================
+;============================================================
 
-  ;Substitute known solutions and put it in solution table.
-  ;Return new substituted type.
-  defn forward-solve (v:EType) :
-    val t = var-type(v)
-    soln-table[v] = EBot()
-    val subbed = sub-solns-recur(t)
-    val t* = normalize(subbed)
-    soln-table[v] = t*
-    add(soln-ordering, v)
-    t*
+;Add type annotations to the given top-level expression.
+;- defobjects: Holds the set of top-level DefObject in the package.
+;  Necessary to infer types of ENewObject expressions.
+;- vt: The local VarTable for this top-level expression.
+;- trust-declared-types?: Use true if we should implicitly trust the declared types of variables.
+;  Used in optimized mode for more aggressive type inference.
+public defn add-type-annotations (e:ETExp,
+                                  defobjects:IntTable<EDefObject>,
+                                  vt:VarTable,
+                                  trust-declared-types?:True|False) -> ETExp :
+  defn annotate (e:ELBigItem) :
+    match(e) :
+      (e:EInit) :
+        val code = analyze-top-level-let(e, defobjects, vt, trust-declared-types?)
+        val inferred = infer-types(code, trust-declared-types?)
+        migrate-annotations(e, inferred)
+      (e:EDefn|EDefClosure|EDefmethod|EExternFn) :
+        val codes = analyze-top-level-func(e, defobjects, vt, trust-declared-types?)
+        val inferred = map(infer-types{_, trust-declared-types?}, codes)
+        migrate-annotations(e, inferred)
+      (e) :
+        map(annotate, e)
+  annotate(analyze-freevars(e, vt)) as ETExp
 
-  ;Hold variables to process
-  defn solve () :
-    ;Forward substitute
-    while not empty?(var-queue) :
-      val v = pop(var-queue)
-      if not key?(soln-table,v) :
-        add-all-vars-to-queue(forward-solve(v))
+;Add type annotations to the entire package.
+;Useful for debugging.
+public defn add-type-annotations (epackage:EPackage,
+                                  trust-declared-types?:True|False) -> EPackage :
+  val gvt = GlobalVarTable(epackage)
+  val defobjects = to-inttable<EDefObject> $
+    for e in filter-by<EDefObject>(exps(epackage)) seq :
+      n(e) => e
+  within (texp, vt) = map-with-var-table(gvt, epackage) :
+    add-type-annotations(texp, defobjects, vt, trust-declared-types?)
 
-    ;println("Forward substitution:")
-    ;within indented() :
-    ;  for v in soln-ordering do :
-    ;    println(v => soln-table[v])
+;Compute the VarTable on all top-level expressions and call f(texp, vt)
+;on the result.
+;- texp: is the top-level expression
+;- vt: is the computed local VarTable
+;- gvt: is the global VarTable for the package
+;- epackage: is the package to analyze.
+defn map-with-var-table (f:(ETExp, VarTable) -> ETExp,
+                         gvt:VarTable,
+                         epackage:EPackage) -> EPackage :
+  val exps* = for e in exps(epackage) map :
+    f(e, LocalVarTable(gvt, e))
+  sub-exps(epackage, exps*)
 
-    ;Back substitute
-    for v in in-reverse(soln-ordering) do :
-      val t = soln-table[v]
-      soln-table[v] = normalize(sub-solns(t, false))
+;============================================================
+;==================== Utilities =============================
+;============================================================
 
-    ;println("Backwards substitution:")
-    ;within indented() :
-    ;  for v in soln-ordering do :
-    ;    println(v => soln-table[v])
+;Return true if the given variable refers to a
+;variable that is handled by the inference engine.
+;Variables must be local, and have a reftype. 
+defn inferred-var? (vt:VarTable, n:Int) -> True|False :
+  val record = vt[n]
+  if not global?(record) :
+    match(entry(record)) :
+      ;Local functions are always simple closures.
+      (e:FnEntry) : true 
+      (e:VarEntry) : reftype?(type(e) as EType)
 
-  ;Launch
-  driver()
+;Return true if the given immediate refers to a
+;inferred variable in the inference engine.
+defn inferred-var? (vt:VarTable, y:EImm) -> True|False :
+  match(y:EVar) :
+    inferred-var?(vt, n(y))
+
+;Return true if the given variable location refers
+;to an inferred variable in the inference engine.
+defn inferred-var? (vt:VarTable, x:ELoc) -> True|False :
+  match(x:EVarLoc) :
+    inferred-var?(vt, n(x))
+
+;Return the trusted type of the given global variable.
+;It is assumed that the global variable has a reftype.
+defn trusted-global-type (vt:VarTable, n:Int) -> EType :
+  fatal("Not a global") when not global?(vt,n)
+  if variable?(vt,n) :
+    val t = type(vt,n)
+    fatal("Not a reftype") when not reftype?(t)
+    if lostanza?(vt,n) : ETop() ;Do not trust declared types of LoStanza variables.
+    else : t                    ;Trust declared types of HiStanza variables.
+  else if lostanza?(vt,n) :
+    ;Ensure that the function can be used as a closure.
+    val t = type(vt,n) as EFnT
+    fatal("Cannot be a closure.") when r(t) is-not False
+    fatal("Cannot be a closure.") when not all?(reftype?,a(t))
+    fatal("Cannot be a closure.") when not reftype?(b(t))    
+    ;Global functions just have type Fn
+    EOf(/n(iotable(vt), CORE-FN-ID))
+  else :
+    ;Global functions just have type Fn
+    EOf(/n(iotable(vt), CORE-FN-ID))
+
+;============================================================
+;==================== Code Analysis =========================
+;============================================================
+
+;------------------------------------------------------------
+;--------------------- Entry Points -------------------------
+;------------------------------------------------------------
+
+;Analyze the given top-level init let construct.
+;Free variable analysis must already have been performed.
+defn analyze-top-level-let (e:EInit,
+                            defobjects:IntTable<EDefObject>,
+                            vt:VarTable,
+                            trust-declared-types?:True|False) -> Code :
+  analyze-code(to-seq(0 to false), -1, [], [], body(e),
+               lostanza?(e), Free([], []), vt, defobjects, trust-declared-types?)  
+
+;Analyze the given top-level function construct.
+;Free variable analysis must already have been performed.
+defn analyze-top-level-func (e:EDefn|EDefClosure|EDefmethod|EExternFn,
+                             defobjects:IntTable<EDefObject>,
+                             vt:VarTable,
+                             trust-declared-types?:True|False) -> Tuple<Code> :
+  ;Depending upon the construct gather [n,f,lostanza?].
+  ;- n: The identifier of the construct.
+  ;- f: The EFunction for the function.
+  ;- lostanza?: Whether this is a LoStanza construct.
+  val [n,f,lostanza?] = match(e) :
+    (e:EDefn) : [n(e), func(e), lostanza?(e)]
+    (e:EDefClosure) : [n(e), func(e), false]
+    (e:EDefmethod) : [n(e), func(e), lostanza?(e)]
+    (e:EExternFn) : [n(e), func(e), true]
+  ;Analyze codes
+  val codes = Vector<Code>()
+  let loop (f:EFunction = f) :
+    match(f) :
+      (f:EMultifn) :
+        do(loop, funcs(f))
+      (f:EFn) :
+        val code = analyze-code(to-seq(0 to false), n, args(f), a1(f), body(f),
+                                lostanza?, free(f), vt, defobjects, trust-declared-types?)
+        add(codes, code)                        
+  ;Return codes
+  to-tuple(codes)
+
+;------------------------------------------------------------
+;------------------- Core Algorithm -------------------------
+;------------------------------------------------------------
+
+;Analyze the given code block.
+;- n: the identifier of the code block. We use a generated
+;  id for this. 
+;- family: the family of this code block. We use this
+;  to store the actual identifier of the function/object.
+;- args: the arguments to this body.
+;- a1: the types of the arguments.
+;- body: the body of the code block.
+;- lostanza?: true if this body is within a LoStanza context.
+;- free: the analyzed freevars of the code block.
+;- vt: the local vartable.
+;- trust-declared-types?: true if we should trust the
+;  declared types.
+
+defn analyze-code (id-counter:Seq<Int>,
+                   family:Int,
+                   args:Tuple<Int>,
+                   a1:Tuple<EType>,
+                   body:EBody,
+                   lostanza?:True|False,
+                   free:Free,
+                   vt:VarTable,
+                   defobject-table:IntTable<EDefObject>,
+                   trust-declared-types?:True|False) -> Code :
+  ;Get id to use for code
+  val code-id = next(id-counter)
   
+  ;Compute locals
+  val locals = Vector<Local>()
+  for (a in args, t in a1) do :
+    add(locals, Local(a, false, t)) when inferred-var?(vt,a)
+  for f in localfns(body) do :
+    add(locals, Local(n(f), false, core-type(vt, CORE-FN-ID)))
+  for l in /locals(body) do :
+    add(locals, Local(n(l), mutable?(l), type(l))) when inferred-var?(vt, n(l))
+
+  ;Compute nested code
+  val nested = Vector<Code>()
+  ;Compute nested code arising from nested functions.
+  for f in localfns(body) do :
+    let loop (func:EFunction = func(f)) :
+      match(func) :
+        (func:EFn) :
+          val code = analyze-code(id-counter, n(f), /args(func), /a1(func), /body(func), false
+                                  /free(func), vt, defobject-table, trust-declared-types?)
+          add(nested,code)
+        (func:EMultifn) : do(loop, funcs(func))
+  ;Compute nested code arising from nested objects.
+  for obj in localobjs(body) do :
+    for m in methods(obj) do :
+      val func = func(m)
+      val code = analyze-code(id-counter, n(m), /args(func), /a1(func), /body(func), false
+                              /free(func), vt, defobject-table, trust-declared-types?)
+      add(nested,code)                        
+
+  ;Compute object method table
+  val object-table = to-inttable<ELocalObj> $
+    for obj in localobjs(body) seq :
+      n(obj) => obj
+
+  ;Analyze each basic block in the body.
+  val bbtable = analyze-basic-blocks(ins(body))
+  val blocks = to-tuple $
+    for (block in bbtable, i in 0 to false) seq :
+      ;Hold all the inference commands for this block.
+      val instructions = Vector<Ins>()
+      
+      ;For the first block, add the guards on the arguments.
+      if i == 0 :
+        ;Trust the coming argument types if it's a HiStanza function
+        ;(where arguments are checked by caller), or if we're requesting
+        ;deliberately to trust the declared types. 
+        val trust-argument-types? = (not lostanza?) or trust-declared-types?
+        for (arg in args, t in a1) do :
+          if inferred-var?(vt,arg) :
+            val t* = t when trust-argument-types? else ETop()
+            add(instructions, Def(arg,t*))
+
+      ;Generate inference commands to the instructions buffer.                        
+      within ins = analyze-single-block(block, vt, object-table,
+                                        defobject-table trust-declared-types?) :
+        add(instructions, ins)
+        
+      ;Return the analyzed block.
+      Block(lbl(block), to-tuple(instructions), predecessors(block))
+
+  ;Create final code
+  Code(code-id, family, to-tuple(locals), to-tuple(nested), blocks, vars(free))
+
+;============================================================
+;================ Single Block Analysis =====================
+;============================================================
+
+;Generate inference commands for a single block.
+;- emit: is called for every generated inference command.
+;- block: is the block to analyze.
+;- vt: is the local VarTable for the current top-level expression.
+;- object-table: Holds all the declared local objects in the body
+;  that the block is from.
+;- defobject-table: Holds the set of top-level DefObject in the package.
+;  Necessary to infer types of ENewObject expressions.
+;- trust-declared-types?: If true indicates that we should trust
+;  the declared types of functions and global variables.
+defn analyze-single-block (emit:Ins -> ?,
+                           block:BBlock,
+                           vt:VarTable,
+                           object-table:IntTable<ELocalObj>,
+                           defobject-table:IntTable<EDefObject>,
+                           trust-declared-types?:True|False) :
+  ;Overall algorithm for the different classes of instructions.
+  ;  Cast commands: ECheck
+  ;  Match commands: EMatch|EDispatch|EIf|ETypeof
+  ;  Simple result commands: ETuple|EVoidTuple|EArray|EObject|EBox|
+  ;                          ENewObject|ELetRec|EClosureGet|EObjectGet|
+  ;                          EBoxGet|EInterpret|ELoad|ETupleGet|EPrim|ECall
+  ;  Inherit commands: EDef|EStore
+  ;  Initcode commands: EInitClosures|ENew
+  ;  Trivial commands: ETupleSet|EStruct|EPtr|ELabel|ETCall|
+  ;                    EDump|EConv|EGoto|ECheckLength|ECheckSet|
+  ;                    EBoxSet|EReturn|EObjectTGet|EClosureTGet|
+  ;                    ETDef|ETypeObject|EEnd|ELive|ECheckFail
+  defn gen-commands (ins:EIns) :
+    match(ins) :
+      (ins:ECheck) : gen-cast-commands(ins)
+      (ins:EMatch|EDispatch|EIf|ETypeof) : gen-match-commands(ins)
+      (ins:ETuple|EVoidTuple|EArray|EObject|EBox|
+           ENewObject|ELetRec|EClosureGet|EObjectGet|
+           EBoxGet|EInterpret|ELoad|ETupleGet|EPrim|ECall) : gen-simple-result-commands(ins)
+      (ins:EDef|EStore) : gen-inherit-commands(ins)
+      (ins:EInitClosures|ENew) : gen-init-commands(ins)
+      (ins:ETupleSet|EStruct|EPtr|ELabel|ETCall|
+           EDump|EConv|EGoto|ECheckLength|ECheckSet|
+           EBoxSet|EReturn|EObjectTGet|EClosureTGet|
+           ETDef|ETypeObject|EEnd|ELive|ECheckFail) : gen-trivial-commands(ins)
+
+  ;Utility: For any uses of inferred variables generate
+  ;them here.
+  defn gen-uses (ins:EIns) :
+    ;Detect special case of store: the store location
+    ;does not count as a use if it is a simple VarLoc.
+    val store-to-varloc? = match(ins:EStore) : loc(ins) is EVarLoc
+
+    ;For special case: only search for uses in the
+    ;stored value.
+    if store-to-varloc? :
+      val y = y(ins as EStore)
+      emit(Use(n(y as EVar))) when inferred-var?(vt,y)
+    ;Otherwise, treat all usages equivalently.
+    else :
+      for y in uses(ins) do :
+        emit(Use(n(y as EVar))) when inferred-var?(vt,y)
+
+  ;Generate the commands for a cast command.
+  ;Structure:
+  ;  Use ...       - All referenced variables
+  ;  Wrapped<Ins>  - The original wrapped instruction
+  ;  Cast          - The cast command
+  defn gen-cast-commands (ins:ECheck) :
+    gen-uses(ins)
+    emit(Wrapped<EIns>(ins))
+    if inferred-var?(vt,y(ins)) :
+      val v = n(y(ins) as EVar)
+      emit(Cast(v, type(ins)))    
+
+  ;Generate the commands for a match command.
+  ;Structure:
+  ;  Use ...       - All referenced variables
+  ;  Wrapped<Ins>  - The original wrapped instruction
+  ;  Match         - The match command 
+  defn gen-match-commands (ins:EMatch|EDispatch|EIf|ETypeof) :
+    gen-uses(ins)
+    emit(Wrapped<EIns>(ins))
+    val branches = match(ins) :
+      (ins:EMatch|EDispatch) :
+        ;Each entry, [v, i], in var-indices indicates that
+        ;variable v is an inferred variable and is argument i
+        ;in the match.
+        val var-indices = to-tuple $
+          for (y in ys(ins), i in 0 to false) seq? :
+            if inferred-var?(vt,y) : One([n(y as EVar), i])
+            else : None()
+        ;Create branches and casts
+        for b in branches(ins) map :
+          val casts = for [v,i] in var-indices map :
+            Cast(v, types(b)[i])
+          Branch(n(b), casts)
+      (ins:EIf) :
+        [Branch(n1(ins), [])
+         Branch(n2(ins), [])]
+      (ins:ETypeof) :
+        if inferred-var?(vt,y(ins)) :
+          val v = n(y(ins) as EVar)
+          [Branch(n1(ins), [Cast(v,type(ins))])
+           Branch(n2(ins), [Cast(v,ETop())])]
+        else :
+          [Branch(n1(ins), [])
+           Branch(n2(ins), [])]
+    emit(Match(branches))
+
+  ;Generate the commands for expressions that create a simple result.
+  ;Structure:
+  ;  Use ...        - All referenced variables
+  ;  Wrapped<Ins>   - The original wrapped instruction
+  ;  Def            - The new result
+  defn gen-simple-result-commands (ins:ETuple|EVoidTuple|EArray|EObject|EBox|
+                                       ENewObject|ELetRec|EClosureGet|EObjectGet|
+                                       EBoxGet|EInterpret|ELoad|ETupleGet|EPrim|ECall) :
+    ;Helper: Emit Def for all inferred variables defined
+    ;by this instruction.
+    defn emit-def (t:EType) :
+      for v in varlocs(ins) do :
+        if inferred-var?(vt,v) :
+          emit(Def(n(v), t))         
+
+    ;Helper: If the given primitive operation returns a guaranteed reftype
+    ;then return it.
+    defn op-result-type (op:EOp) -> EType|False :
+      match(op) :
+        (op:IntAddOp|IntSubOp|IntMulOp|IntDivOp|IntModOp|
+            IntAndOp|IntOrOp|IntXorOp|IntNotOp|IntShlOp|
+            IntShrOp|IntAshrOp|IntNegOp) :
+          core-type(vt, CORE-INT-ID)
+        (op:IntLtOp|IntGtOp|IntLeOp|IntGeOp) : 
+          EOr(core-type(vt, CORE-FALSE-ID),
+              core-type(vt, CORE-TRUE-ID))
+        (op) : false
+ 
+    ;Helper: Return true if the return type of the given function
+    ;is trusted.
+    defn return-type-trusted? (f:Int, arity:Int) -> True|False :
+      if not function?(vt,f) : false
+      else if trust-declared-types? : true
+      else if lostanza?(vt,f) or tail?(vt,f,arity) : false
+      else : true
+
+    ;Overall algorithm
+    gen-uses(ins)
+    emit(Wrapped<EIns>(ins))          
+    match(ins) :
+      (ins:ETuple|EVoidTuple) : emit-def(core-type(vt, CORE-TUPLE-ID))
+      (ins:EArray) : emit-def(EOf(n(ins)))
+      (ins:EObject) : emit-def(EOf(n(ins)))
+      (ins:EBox) : emit-def(core-type(vt, CORE-BOX-ID))
+      (ins:ELetRec) : emit-def(core-type(vt, CORE-FN-ID))
+      (ins:EClosureGet|EObjectGet|EBoxGet|EInterpret|ELoad|ETupleGet) : emit-def(ETop())
+      (ins:ENewObject) :
+        val defobj = defobject-table[n(ins)]
+        emit-def(parent(defobj))
+      (ins:EPrim) :
+        val t = op-result-type(op(ins))
+        match(t:EType) : emit-def(t)
+        else : emit-def(ETop())
+      (ins:ECall) :
+        ;Compute return type
+        val return-type = let :
+          val parts = deconstruct-function(f(ins))
+          if not empty?(parts) :
+            val [f, targs] = value!(parts)
+            val arity = length(ys(ins))
+            if return-type-trusted?(f,arity) :
+              val [a1, a2] = fn-types(vt, f, arity, targs)
+              a2
+        ;Emit def
+        match(return-type:EType) : emit-def(return-type)
+        else : emit-def(ETop())
+
+  ;Generate the commands for expressions that may emit an inherit command.
+  ;Structure:
+  ;  Use ...        - All referenced variables
+  ;  Wrapped<Ins>   - The original wrapped instruction
+  ;  Def/Inherit    - The new result
+  defn gen-inherit-commands (ins:EDef|EStore) :
+    gen-uses(ins)
+    emit(Wrapped<EIns>(ins))
+
+    ;Helper: Generate either def/inherit command when assigning
+    ;x to the given immediate.
+    defn assign (x:Int, y:EImm) :
+      match(y:EVar) :
+        if inferred-var?(vt,y) : emit(Inherit(x,n(y)))
+        else if trust-declared-types? : emit(Def(x,type(vt,y)))
+        else : emit(Def(x,trusted-global-type(vt,n(y))))
+      else :
+        emit(Def(x,type(vt,y)))
+    
+    match(ins) :
+      (ins:EDef) :
+        if inferred-var?(vt,x(ins)) :
+          match(y(ins)) :
+            (y:EImm) : assign(n(x(ins)), y)
+            (y:False) : emit(Def(n(x(ins)), EBot()))
+      (ins:EStore) :
+        if inferred-var?(vt,loc(ins)) :
+          val x = n(loc(ins) as EVarLoc)
+          assign(x, y(ins))
+
+  ;Generate the commands for expressions.
+  ;Structure:
+  ;  Wrapped<Ins>  - The original wrapped instruction
+  ;  Def           - The new objects/closures
+  ;  InitCode ...  - The initializing marker
+  defn gen-init-commands (ins:EInitClosures|ENew) :
+    emit(Wrapped<EIns>(ins))
+    match(ins) :
+      (ins:EInitClosures) :
+        for x in xs(ins) do :
+          fatal("InitClosures is not an inferred variable.") when not inferred-var?(vt,x)
+          emit(Def(n(x), core-type(vt, CORE-FN-ID)))
+        for x in xs(ins) do :
+          emit(InitCode(n(x)))
+      (ins:ENew) :
+        fatal("ENew is not an inferred variable.") when not inferred-var?(vt,x(ins))
+        val obj = object-table[n(ins)]
+        emit(Def(n(x(ins)), type(obj)))
+        for m in methods(object-table[n(ins)]) do :
+          emit(InitCode(n(m)))
+
+  ;Generate the commands for trivial expressions.
+  ;Structure:
+  ;  Uses ...       - All referenced variables
+  ;  Wrapped<Ins>   - The original wrapped instruction
+  defn gen-trivial-commands (ins:ETupleSet|EStruct|EPtr|ELabel|ETCall|
+                                 EDump|EConv|EGoto|ECheckLength|ECheckSet|
+                                 EBoxSet|EReturn|EObjectTGet|EClosureTGet|
+                                 ETDef|ETypeObject|EEnd|ELive|ECheckFail) :
+    gen-uses(ins)
+    emit(Wrapped<EIns>(ins))
+    for x in varlocs(ins) do :
+      if inferred-var?(vt,x) :
+        fatal("Unexpected inferred variable %_ in instruction %_." % [x, ins])
+
+  ;Launch!
+  do(gen-commands, instructions(block))    
+
+;============================================================
+;==================== Utilities =============================
+;============================================================
+
+;Utility: Retrieve the core type with the given id.
+defn core-type (vt:VarTable, id:TypeId) -> EOf :
+  EOf(n(iotable(vt), id))
+
+;============================================================
+;===================== Migrate Annotations ==================
+;============================================================
+
+;Migrate type annotations from code to EInit.
+defn migrate-annotations (e:EInit, code:Code) -> EInit :
+  val body* = migrate-annotations(body(e), code)
+  sub-body(e, body*)
+
+;Migrate type annotations from codes to top level definitions.
+defn migrate-annotations (e:EDefn|EDefClosure|EDefmethod|EExternFn, code:Tuple<Code>) -> EDefn|EDefClosure|EDefmethod|EExternFn :
+  val func* = match(func(e)) :
+    (f:EFn) :
+      fatal("Mismatched structure") when length(code) != 1
+      migrate-annotations(f, code[0])
+    (f:EMultifn) :
+      fatal("Mismatched structure") when length(funcs(f)) != length(code)
+      EMultifn $ to-tuple $ seq(migrate-annotations, funcs(f), code)
+  sub-func(e, func*)
+
+;Migrate type annotations from code to function f.
+defn migrate-annotations (f:EFn, code:Code) -> EFn :
+  sub-body(f, migrate-annotations(body(f), code))
+
+;Migrate type annotations from code to body.
+defn migrate-annotations (body:EBody, code:Code) -> EBody :
+  ;Ensure matching structure
+  val nested-families = to-tuple(cat(fn-ids, obj-ids)) where :
+    defn families (n:Int, f:EFunction) -> Tuple<Int> :
+      match(f) :
+        (f:EMultifn) : map({n}, funcs(f))
+        (f:EFn) : [n]
+    val fn-ids = for f in localfns(body) seq-cat : families(n(f), func(f))
+    val obj-ids = for obj in localobjs(body) seq-cat : seq(n, methods(obj))
+  fatal("Mismatched structure") when nested-families != map(family, nested(code))
+    
+  ;Migrate each of the nested definitions
+  val nested-codes = to-seq(nested(code))
+  defn migrate-nested (e:ELBigItem) :
+    match(e:EBody) : migrate-annotations(e, next(nested-codes))
+    else : map(migrate-nested, e)
+  val localfns* = map({migrate-nested(_) as ELocalFn}, localfns(body))
+  val localobjs* = map({migrate-nested(_) as ELocalObj}, localobjs(body))
+
+  ;Reconstruct instructions from code
+  val instructions* = to-tuple $
+    for block in blocks(code) seq-cat :
+      for ins in instructions(block) seq :
+        match(ins) :
+          (ins:Wrapped<EIns>) : value(ins)
+          (ins:Annotate) : EAnnotate(n(ins), type(ins))
+
+  ;Return new body
+  EBody(locals(body),
+        localtypes(body),
+        localfns*,
+        localobjs*,
+        instructions*)

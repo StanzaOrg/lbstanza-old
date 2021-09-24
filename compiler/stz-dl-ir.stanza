@@ -31,7 +31,7 @@ public defstruct Export :
 
 public defstruct Import :
   n: Int with: (updater => sub-n)
-  rec: Rec
+  rec: Rec with: (updater => sub-rec)
   transient?: True|False
 
 ;============================================================
@@ -107,6 +107,8 @@ public defstruct TypeDecl <: Rec :
   id: TypeId with: (as-method => true)
   ntargs: Int
   parent: False|DType
+  lostanza?: True|False
+  children: Tuple<Child> with: (updater => sub-children)
 
 public defstruct StructField <: Equalable :
   name: Symbol
@@ -305,6 +307,9 @@ public defn DAnd? (ts:Seqable<DType>) :
 ;======================= Matching ===========================
 ;============================================================
 
+;------------------------------------------------------------
+;--------------- Equality on Ids and Recs -------------------
+;------------------------------------------------------------
 defmethod equal? (x:TypeId, y:TypeId) :
   package(x) == package(y) and
   name(x) == name(y)
@@ -320,6 +325,20 @@ defmethod equal? (x:FnId, y:FnId) :
   ncargs(x) == ncargs(y) and
   a1(x) == a1(y)
 
+defmethod equal? (a:StructField, b:StructField) :
+  name(a) == name(b) and
+  type(a) == type(b) and
+  mutable?(a) == mutable?(b)
+
+defmethod equal? (a:Child, b:Child) :
+  id(a) == id(b) and
+  ntargs(a) == ntargs(b) and
+  parent(a) == parent(b)
+
+;------------------------------------------------------------
+;--------------------- Hashing ------------------------------
+;------------------------------------------------------------
+
 defmethod hash (x:ValId) :
   hash $ [1, package(x), name(x)]
 
@@ -329,9 +348,26 @@ defmethod hash (x:TypeId) :
 defmethod hash (x:FnId) :
   hash $ [3, package(x), name(x), ntargs(x), ncargs(x), a1(x)]
 
-public defn match? (x:Rec, y:Rec) :
-  ;x is imported
-  ;y is exported
+;------------------------------------------------------------
+;---------------------- Matching Algorithm ------------------
+;------------------------------------------------------------
+
+;Given the package io, returns a predicate that can test
+;whether an imported record is consistent against an exported
+;record from a parent package.
+public defn match? (io:PackageIO) -> (Rec,Rec) -> True|False :
+  ;Compute all the referenced types in the given PackageIO.
+  ;If it exists in types-in-io, then this type is referenced.
+  defn type-id? (r:Rec) -> Maybe<TypeId> :
+    match(r:StructRec|TypeRec|TypeDecl) : One(id(r) as TypeId)
+    else : None()
+  val types-in-io = to-hashset<TypeId> $
+    seq?(type-id?{rec(_)}, cat(imports(io), exports(io)))
+  ;Return curried function.
+  match?{_, _, types-in-io}
+
+;Returns true if the two ValRec records match.
+public defn match? (x:Rec, y:Rec, types-in-io:HashSet<TypeId>|False) -> True|False :
   match(x, y) :
     (x:ValRec, y:ValRec) :
       type(x) == type(y) and
@@ -359,20 +395,28 @@ public defn match? (x:Rec, y:Rec) :
       parent(x) == parent(y) and
       children(x) == children(y)
     (x:TypeDecl, y:TypeRec|StructRec) :
-      ntargs(x) == ntargs(y) and
-      parent(x) == parent(y)
+      ;Assert that types-in-io is given.
+      fatal("Type set in current PackageIO must be given.") when types-in-io is False
+      val types-in-io = types-in-io as HashSet<TypeId>
+      
+      match(lostanza?(x), y) :
+        (lox:True, y:StructRec) :
+          ntargs(x) == ntargs(y) and parent(x) == parent(y)
+        (lox:False, y:TypeRec) :
+          if ntargs(x) == ntargs(y) and parent(x) == parent(y) :
+            ;Condition 1) All children in x, must also be children in y, and must match the definition.
+            ;Condition 2) All children in y must either be children of x, or not a type in io.
+            if ntargs(x) == ntargs(y) and parent(x) == parent(y) :
+              defn keyed (c:Child) : id(c) => c
+              val xchildren = to-hashtable<TypeId,Child> $ seq(keyed, children(x))
+              val ychildren = to-hashtable<TypeId,Child> $ seq(keyed, children(y))
+              val cond1 = for c in children(x) all? :
+                c == get?(ychildren, id(c))
+              val cond2 = for c in children(y) all? :
+                key?(xchildren, id(c)) or not types-in-io[id(c)]
+              cond1 and cond2
     (x, y) :
       false
-
-defmethod equal? (a:StructField, b:StructField) :
-  name(a) == name(b) and
-  type(a) == type(b) and
-  mutable?(a) == mutable?(b)
-
-defmethod equal? (a:Child, b:Child) :
-  id(a) == id(b) and
-  ntargs(a) == ntargs(b) and
-  parent(a) == parent(b)
 
 ;============================================================
 ;===================== Convenience ==========================
@@ -494,7 +538,9 @@ defmethod print (o:OutputStream, r:TypeRec) :
 
 defmethod print (o:OutputStream, r:TypeDecl) :
   val pstr = "" when parent(r) is False else " <: %_" % [parent(r)]
-  print(o, "type-decl %_<%_>%_" % [id(r), ntargs(r), pstr])
+  val lostanzastr = " (lostanza)" when lostanza?(r) else ""
+  print(o, "type-decl %_<%_>%_%_ :" % [id(r), ntargs(r), pstr, lostanzastr])
+  bprint(o, children(r))
 
 defmethod print (o:OutputStream, x:Import) :
   val tstr = " transient" when transient?(x) else ""
@@ -597,8 +643,12 @@ defsyntax dl-ir :
     StructRec(id, ntargs, p, to-tuple(fs), false)
   defrule rec = (type ?id:#tid<?ntargs:#int> ?p:#parent? : (?cs:#child ...)) :
     TypeRec(id, ntargs, p, to-tuple(cs))
-  defrule rec = (type-decl ?id:#tid<?ntargs:#int> ?p:#parent?) :
-    TypeDecl(id, ntargs, p)
+  defrule rec = (type-decl ?id:#tid<?ntargs:#int> ?p:#parent? ?lo:#lostanza? : (?cs:#child ...)) :
+    TypeDecl(id, ntargs, p, lo, to-tuple(cs))
+
+  defproduction lostanza?: True|False
+  defrule lostanza? = ((lostanza)) : true
+  defrule lostanza? = () : false
 
   defproduction vtag : [True|False, True|False]
   defrule vtag = (val) : [false, false]
@@ -684,7 +734,7 @@ public defn do (f:DItem -> ?, x:DItem) :
     (x:ExternRec) : (g(id(x)), g(type(x)))
     (x:StructRec) : (g(id(x)), g(parent(x)), g(base(x)), g(items(x)))
     (x:TypeRec) : (g(id(x)), g(parent(x)), g(children(x)))
-    (x:TypeDecl) : (g(id(x)), g(parent(x)))
+    (x:TypeDecl) : (g(id(x)), g(parent(x)), g(children(x)))
     (x:StructField) : g(type(x))
     (x:Child) : (g(id(x)), g(parent(x)))
     ;RecIds
@@ -887,7 +937,7 @@ defn Formatter () :
 
     defn fieldf (f:StructField) :
       val mut-str = "var " when mutable?(f) else ""
-      "%~%~: %_" % [mut-str, name(f), typef(type(f), true)]
+      "%_%~: %_" % [mut-str, name(f), typef(type(f), true)]
 
     defn deftypef (id:TypeId, ntargs:Int, parent:False|DType) :
       val tvar-str = "" when ntargs == 0
