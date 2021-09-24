@@ -1060,6 +1060,7 @@ lostanza deftype Heap :
   var size: long
   var bitset: ptr<long>
   var compaction-start: ptr<long>
+  var log2-bucket-size: int
 
   ;Marking stack
   ;Note that the stack grows downwards so stack-bottom is equal to
@@ -1111,6 +1112,8 @@ lostanza defn initialize-heap (min-size:long, max-size:long, vms:ptr<VMState>) -
   clear(vms.new-heap.bitset, min-bitset-size)
   ;Allocate space for marking stack (1024L * sizeof(long))
   ;Initialize stack-top and stack-bottom to just past the allocated memory.
+  ;TODO: If marking stack were reserved right above the heap end, the entire address
+  ;range from heap-top to stack-bottom could be occupied by the stack.
   val stack-size = round-up-to-whole-pages(1024L << LOG-BYTES-IN-LONG)
   vms.new-heap.stack-start = call-c clib/stz_memory_map(stack-size, stack-size)
   vms.new-heap.stack-bottom = vms.new-heap.stack-start + stack-size
@@ -1623,15 +1626,100 @@ lostanza defn skip-and-clear-marked (start:ptr<long>, vms:ptr<VMState>) -> ptr<l
   ;Return the heap-top to indicate no unmarked object found.
   return heap-top
 
+;Scans the heap from given start to heap top until first marked object found.
+;Returns address of the first unmarked object or the limit if it is not found.
+lostanza defn skip-unmarked (start:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
+  val limit = vms.new-heap.top
+  #if-not-defined(OPTIMIZE) :
+    if start > limit : fatal("Invalid range.")
+  var p:ptr<long> = start
+  while p < limit :
+    if test-mark(p, vms) : return p
+    p = p + allocation-size(p, vms)
+  #if-not-defined(OPTIMIZE) :
+    if p != limit : fatal("Invalid limit.")
+  return limit
+
+lostanza defn write-live-range (location:ptr<long>, live:ptr<long>, dead:ptr<long>) -> ref<False> :
+  if addr(location[1]) == live :
+    location[0] = (dead as long) | 1
+  else :
+    location[0] = live as long
+    location[1] = dead as long
+  ;No meaningful return value
+  return false
+
+lostanza deftype LiveRange :
+  live:ptr<long>
+  dead:ptr<long>
+
+lostanza defn read-live-range (location:ptr<long>) -> LiveRange :
+  val location0 = location[0]
+  if location0 & 1L : return LiveRange{addr(location[1]), (location0 - 1) as ptr<long>}
+  else : return LiveRange{location0 as ptr<long>, location[1] as ptr<long>}
+
+lostanza deftype BreakTableEntry :
+  var first-break-location:ptr<long>
+  var accumulated-offset:long
+
+lostanza defn log2-bucket-size (break-table-length:long, vms:ptr<VMState>) -> int :
+  var count:int = 0
+  var compaction-area-size:long = vms.new-heap.top - vms.new-heap.compaction-start - 1L
+  while compaction-area-size >= break-table-length :
+    count = count + 1
+    compaction-area-size = compaction-area-size >> 1
+  return count
+
+lostanza defn break-table-index (p:ptr<?>, vms:ptr<VMState>) -> long :
+  return (p - vms.new-heap.compaction-start) >> vms.new-heap.log2-bucket-size
+
+lostanza defn create-break-table (compaction-start:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  vms.new-heap.compaction-start = compaction-start
+
+  ;Marking stack is used only during marking phase. Now we reuse its memory
+  ;for the root of break table.
+  val break-table = vms.new-heap.stack-start as ptr<BreakTableEntry>
+  val break-table-length = (vms.new-heap.stack-bottom - break-table) / sizeof(BreakTableEntry)
+  vms.new-heap.log2-bucket-size = log2-bucket-size(break-table-length, vms)
+
+  ;An object can only move downwards during compaction phase,
+  ;so the object address offset can only be negative.
+  var index:long = -1
+  var offset:long = 0
+  val limit = vms.new-heap.top
+  var current-unmarked:ptr<long> = compaction-start
+  while current-unmarked < limit :
+    val next-marked = skip-unmarked(current-unmarked, vms)
+    if next-marked == limit :
+      vms.new-heap.top = current-unmarked
+      return false
+    val next-unmarked = skip-and-clear-marked(next-marked, vms)
+    write-live-range(current-unmarked, next-marked, next-unmarked)
+    val break-length = next-marked - current-unmarked
+    offset = offset - break-length
+    ;Fill break table root entries
+    val start-index = break-table-index(next-marked, vms)
+    if index < start-index : index = start-index
+    val end-index = break-table-index(next-unmarked - 1, vms)
+    while index <= end-index :
+      #if-not-defined(OPTIMIZE) :
+        if index >= break-table-length : fatal("Index out of range.")
+      break-table[index] = BreakTableEntry{next-unmarked, offset}
+      index = index + 1
+    current-unmarked = next-unmarked
+
+  ;No meaningful return value
+  return false
+
 lostanza defn new-collect-garbage (vms:ptr<VMState>) -> ref<False> :
   mark-reachable-objects(vms)
   scan-liveness-trackers(vms)
 
   ;Find the first unmarked object. If there are no unmarked objects at all
   ;then collect-garbage exits without doing anything.
-  vms.new-heap.compaction-start = skip-and-clear-marked(vms.new-heap.start, vms)
-  if vms.new-heap.compaction-start == vms.new-heap.top : return false
-
+  val compaction-start = skip-and-clear-marked(vms.new-heap.start, vms)
+  if compaction-start < vms.new-heap.top :
+    create-break-table(compaction-start, vms)
   ;No meaningful return value
   return false
 
