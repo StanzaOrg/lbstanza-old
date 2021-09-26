@@ -2337,7 +2337,7 @@ defn max (a:UsageType, b:UsageType) -> UsageType :
 ;Removes any pure instructions in the package whose
 ;results are not used at all.
 defn eliminate-dead-code (epackage:EPackage) -> EPackage :
-  ;Collect all uses of variables in the given body.
+  ;Collect all uses of variables in the given top-level expression.
   defn collect-defs-and-uses (e:ETExp) -> [IntListTable<EIns>, IntTable<UsageType>] :
     val def-table = IntListTable<EIns>()
     val use-table = IntTable<UsageType>()
@@ -2359,16 +2359,20 @@ defn eliminate-dead-code (epackage:EPackage) -> EPackage :
     ;Return def and use tables    
     [def-table, use-table]
 
-  ;Compute variables to eliminate.
+  ;Compute the set of variables to eliminate based on their definitions and usages.
   defn vars-to-eliminate (def-table:IntListTable<EIns>, use-table:IntTable<UsageType>) -> IntSet :
     ;Returns true if the given instruction can be eliminated.
-    ;Note that for 'EDef x = v' instructions, we consider
+    ;Note that for 'EDef x = v' instructions, where v is a variable, we consider
     ;ELive as a proper usage so that object live ranges are preserved.
     defn eliminate? (i:EIns) -> True|False :
       if pure?(i) :
-        match(i:EDef) :
+        ;Determine whether ELive is considered as a usage.
+        val consider-live? = match(i:EDef) : y(i) is EVar
+        ;If Elive is considered then see whether any
+        ;varloc is used.
+        if consider-live? :
           for v in varlocs(i) none? :
-            key?(use-table, n(v))
+            get?(use-table, n(v)) is UsedInLive|UsedAsArg
         else :
           for v in varlocs(i) none? :
             get?(use-table, n(v)) is UsedAsArg
@@ -2377,54 +2381,96 @@ defn eliminate-dead-code (epackage:EPackage) -> EPackage :
     ;it can be eliminated.
     to-intset $ for entry in def-table seq? :
       if all?(eliminate?, value(entry)) : One(key(entry))
-      else : None()      
+      else : None()
+
+  ;Eliminate dead instructions in the given body.
+  defn eliminate-vars-in-body (e:EBody, elim-vars:IntSet) -> EBody :
+    ;Gather new instructions in buffer.
+    val buffer = BodyBuffer(e)
+    ;Keep only the instructions that are not eliminated.
+    ;Record all the used objects and fns during this sweep.
+    val used-objs-and-fns = IntSet()
+    for i in ins(e) do :
+      match(i:ELive) :
+        ;Remove any references to eliminated variables
+        ;in the ELive instruction.
+        val xs* = to-tuple $ for x in xs(i) filter :
+          not elim-vars[n(x as EVar)]
+        if not empty?(xs*) :
+          emit(buffer, ELive(xs*))
+      else :
+        ;Eliminate the instruction if any of the variables
+        ;it defines is supposed to be eliminated.
+        val elim? = for v in varlocs(i) any? :
+          elim-vars[n(v)]
+        if not elim? :
+          emit(buffer, i)
+          ;Since we keep the instruction, record whether
+          ;they reference a local function or object.
+          match(i) :
+            (i:ENew) : add(used-objs-and-fns, n(i))
+            (i:EInitClosures) : do(add{used-objs-and-fns, n(_)}, xs(i))
+            (i) : false
+    ;Keep all the locals that are not eliminated.
+    for l in locals(e) do :
+      emit(buffer,l) when not elim-vars[n(l)]
+    ;Keep only the fns and objects that are not eliminated.
+    for f in localfns(e) do :
+      emit(buffer,f) when used-objs-and-fns[n(f)]
+    for obj in localobjs(e) do :
+      emit(buffer, obj) when used-objs-and-fns[n(obj)]
+    ;Create new body
+    to-body(buffer, false, false, false)    
+
+  ;Peephole prune redundant live var instructions.
+  defn consolidate-live-vars (e:EBody) -> EBody :
+    ;Gather new instructions in buffer.
+    val buffer = BodyBuffer(e)
+    
+    ;Track pending live vars to be emitted next.
+    ;If x exists in this set, that means that we have scanned through
+    ;a sequence of ELive instructions in a row, and x is one of the live variables.
+    val pending-live-vars = HashSet<EVar>()
+
+    ;Create an ELive instruction containing the set of all
+    ;pending live variables. Doesn't do anything if there aren't any.
+    defn emit-pending-live-vars () :
+      if not empty?(pending-live-vars) :
+        emit(buffer, ELive(to-tuple(pending-live-vars)))
+        clear(pending-live-vars)
+
+    ;Scan through the instructions. If they're ELive
+    ;instructions then add to the pending-live-vars set,
+    ;otherwise emit the pending vars before emitting the original
+    ;instruction.
+    for i in ins(e) do :
+      match(i:ELive) :
+        add-all(pending-live-vars, xs(i) as Tuple<EVar>)
+      else :
+        emit-pending-live-vars()
+        emit(buffer, i)
+    ;Emit any remaining live variables.    
+    emit-pending-live-vars()
+
+    ;Return the new body
+    to-body(buffer)
 
   ;Eliminate dead code in body.
   defn eliminate-in-item (e:ELBigItem, elim-vars:IntSet) -> ELBigItem :
-    val e* = map(eliminate-in-item{_, elim-vars}, e)
-    match(e*:EBody) :
-      val buffer = BodyBuffer(e*)
-      ;Keep all the locals that are not eliminated.
-      for l in locals(e*) do :
-        emit(buffer,l) when not elim-vars[n(l)]
-      ;Keep only the instructions that are not eliminated.
-      ;Record all the used objects and fns during this sweep.
-      val used-objs-and-fns = IntSet()
-      for i in ins(e*) do :
-        match(i:ELive) :
-          val xs* = to-tuple $ for x in xs(i) filter :
-            not elim-vars[n(x as EVar)]
-          if not empty?(xs*) :
-            emit(buffer, ELive(xs*))
-        else :
-          val elim? = for v in varlocs(i) any? :
-            elim-vars[n(v)]
-          if not elim? :
-            emit(buffer, i)
-            ;Since we keep the instruction, record whether
-            ;they reference a local function or object.
-            match(i) :
-              (i:ENew) : add(used-objs-and-fns, n(i))
-              (i:EInitClosures) : do(add{used-objs-and-fns, n(_)}, xs(i))
-              (i) : false
-      ;Keep only the fns and objects that are not eliminated.
-      for f in localfns(e*) do :
-        emit(buffer,f) when used-objs-and-fns[n(f)]
-      for obj in localobjs(e*) do :
-        emit(buffer, obj) when used-objs-and-fns[n(obj)]
-      ;Create new body
-      to-body(buffer, false, false, false)
+    match(e:EBody) :
+      val e* = consolidate-live-vars $
+               eliminate-vars-in-body(e, elim-vars)
+      map(eliminate-in-item{_, elim-vars}, e*)         
     else :
-      e*
+      map(eliminate-in-item{_, elim-vars}, e)
 
   ;Launch!
   val texps* = for e in exps(epackage) map :
     val [defs, uses] = collect-defs-and-uses(e)
     val elim-vars = vars-to-eliminate(defs, uses)
-    if empty?(elim-vars) : e
-    else : eliminate-in-item(e, elim-vars) as ETExp
+    eliminate-in-item(e, elim-vars) as ETExp
   sub-exps(epackage, texps*)
-
+  
 ;============================================================
 ;=================== RESOLVE MATCHES ========================
 ;============================================================
@@ -2869,3 +2915,4 @@ defn has-tvar? (t:EType) :
 
 defn select<?T> (xs:Tuple<?T>, mask:Tuple<True|False>) -> Tuple<T> :
   to-tuple(filter(xs, mask))
+
