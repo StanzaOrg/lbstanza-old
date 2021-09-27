@@ -1,5 +1,5 @@
-#ifndef RUNTIME_TYPES_H
-#define RUNTIME_TYPES_H
+#ifndef STANZA_TYPES_H
+#define STANZA_TYPES_H
 #include <stdint.h>
 
 // These types match the size/signedness of the corresponding Stanza type,
