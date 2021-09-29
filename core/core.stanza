@@ -283,6 +283,7 @@ defn cast-message (t:Type, x, ctxt:Int) :
 public lostanza defn fatal! (msg:ptr<byte>) -> ref<Void> :
   call-c clib/fflush(stdout)
   call-c clib/fprintf(current-err, "FATAL ERROR: %s\n", msg)
+  call-c clib/fflush(current-err)
   print-stack-trace()
   call-c clib/exit(-1)
   ;Unreachable
@@ -490,6 +491,7 @@ lostanza val stdout:ptr<?> = call-c clib/get_stdout()
 lostanza val stderr:ptr<?> = call-c clib/get_stderr()
 lostanza val stdin:ptr<?> = call-c clib/get_stdin()
 lostanza val EOF:int = call-c clib/get_eof()
+lostanza var current-err:ptr<?> = stderr
 
 ;============================================================
 ;================ Constant Initialization ===================
@@ -636,6 +638,8 @@ public lostanza defn round-up-to-whole-pages (x:long) -> long :
 ;If it cannot do that, then it fails with an unrecoverable
 ;"Out Of Memory" error.
 lostanza defn extend-heap (size:long) -> long :
+  ;Ensure that the stack pool is wellformed.
+  ensure-stack-pool-wellformed!(addr(STACK-POOL), 0)
   ;Collect garbage, and ensure we freed enough space
   val remaining = call-prim collect-garbage(size)
   free-unmarked-stacks(addr(STACK-POOL))
@@ -757,8 +761,46 @@ lostanza defn StackPool () -> StackPool :
     stacks[i] = alloc-stack-frames(i, INITIAL-STACK-SIZE)
   ;Allocate pool for big stacks
   val big-capacity = 4
-  val big-stacks = call-c clib/stz_malloc(big-capacity * sizeof(ptr<?>))
-  return StackPool{capacity, 0, stacks, big-capacity, 0, big-stacks}
+  val big-stacks:ptr<ptr<StackFrameHeader>> = call-c clib/stz_malloc(big-capacity * sizeof(ptr<?>))
+  ;Set first big stack to be the entrant stack
+  val vms:ptr<VMState> = call-prim flush-vm()
+  val entry-stack:ptr<Stack> = untag(vms.current-stack)
+  big-stacks[0] = header(entry-stack.frames)
+  val entry-system-stack:ptr<Stack> = untag(vms.system-stack)
+
+  ;Create StackPool
+  return StackPool{capacity, 0, stacks, big-capacity, 1, big-stacks}
+
+lostanza defn ensure-stack-pool-wellformed! (pool:ptr<StackPool>, after-marking?:long) -> ref<False> :
+  ;Ensure that pool.num-used is in bounds.
+  if pool.num-used < 0 or pool.num-used > pool.capacity :
+    fatal!("Stack pool num-used is out of bounds.")
+  ;Ensure that each of the small stacks are wellformed.
+  ;They must have the correct pool-index and mark.
+  for (var i:int = 0, i < pool.capacity, i = i + 1) :
+    val s = pool.stacks[i]
+    if s.pool-index != i :
+      fatal!("Small stack does not have correct pool index.")
+    if after-marking? :
+      if s.mark != 0 and i >= pool.num-used :
+        fatal!("Small stack is marked but is not one of the used stacks.")
+    else :
+      if s.mark != 0 :
+        fatal!("Small stack is marked when it should not be.")
+
+  ;Ensure that pool.big-size is in bounds.
+  if pool.big-size < 0 or pool.big-size > pool.big-capacity :
+    fatal!("Size of big stack pool is out of bounds.")
+  ;Ensure that each of the big stacks are wellformed.
+  for (var i:int = 0, i < pool.big-size, i = i + 1) :    
+    val s = pool.big-stacks[i]
+    if s.pool-index != -1 :
+      fatal!("Big stack must have -1 as its pool index.")
+    if after-marking? == 0 :
+      if s.mark != 0 :
+        fatal!("Big stack is marked when it should not be.")
+  ;Meaningless return    
+  return false
 
 lostanza defn ensure-capacity (pool:ptr<StackPool>, capacity:int) -> int :
   ;Do something only if we are under capacity
@@ -885,6 +927,9 @@ lostanza defn gc-if-no-stacks (pool:ptr<StackPool>) -> int :
   return 0
 
 lostanza defn free-unmarked-stacks (pool:ptr<StackPool>) -> int :
+  ;First ensure that the stack pool is wellformed.
+  ensure-stack-pool-wellformed!(addr(STACK-POOL), 1)
+  
   ;Free all stacks in small pool
   labels :
     begin : goto loop(0)
@@ -897,21 +942,28 @@ lostanza defn free-unmarked-stacks (pool:ptr<StackPool>) -> int :
         else :
           s.mark = 0
           goto loop(i + 1)
+          
   ;Free all stacks in big pool
   labels :
     begin : goto loop(0, 0)
+    ;- n: the number of live big stacks encountered thus far.
+    ;- i: the index of the next big stack to process.
     loop (n:int, i:int) :
       if i < pool.big-size :
         val s = pool.big-stacks[i]
         if s.mark == 0 :
+          ;If the stack is unmarked (dead) then free it.
           call-c clib/stz_free(s)
           goto loop(n, i + 1)
         else :
+          ;If the stack is marked (live), then clear the mark
+          ;and move it down to the appropriate position.
           s.mark = 0
           pool.big-stacks[n] = s
           goto loop(n + 1, i + 1)
       else :
         pool.big-size = n
+        
   ;Check that all stacks are now unmarked.
   #if-not-defined(OPTIMIZE) :
     for (var i:int = 0, i < pool.capacity, i = i + 1) :
@@ -1976,13 +2028,16 @@ lostanza defn collect-garbage (vms:ptr<VMState>) -> long :
     consts[i] = post-gc-object(consts[i], vms)
 
   ;Scan stack roots
+  val current-stack-obj = untag(vms.current-stack) as ptr<Stack>
+  val system-stack-obj = untag(vms.system-stack) as ptr<Stack>
   ;call-c clib/printf("scan stacks\n")
   vms.current-stack = post-gc-object(vms.current-stack, vms)
   vms.system-stack = post-gc-object(vms.system-stack, vms)
 
   ;Scan heap
   ;call-c clib/printf("scan heap\n")
-  scan-heap(vms)
+  val gc-stack-obj:ptr<Stack> = untag(vms.current-stack)
+  scan-heap(vms, gc-stack-obj.frames)
 
   ;Scan tracker chain
   ;call-c clib/printf("scan tracker chain\n")
@@ -2002,8 +2057,19 @@ lostanza defn object-size-on-heap (sz:ref<Int>) -> ref<Int> :
   return new Int{object-size-on-heap(sz.value) as int}
 
 lostanza defn scan-frames (frames:ptr<StackFrame>, f-end:ptr<StackFrame>, vms:ptr<VMState>) -> int :
-  if frames != null :
+  if frames != null :    
     val frameheader = header(frames)
+
+    ;Sanity check: The frames should never have been scanned before (and therefore should be unmarked).
+    if frameheader.mark != 0 :
+      fatal!("Repeated scanning of stack frame.")
+    if frameheader.pool-index >= 0 :
+      val i = frameheader.pool-index
+      if i >= STACK-POOL.num-used :
+        fatal!("Stack is reachable but not considered a used stack.")
+      else if STACK-POOL.stacks[i] != frameheader :
+        fatal!("Stack pool index field does not match stack stored in the pool.")
+
     frameheader.mark = 1
     var f:ptr<StackFrame> = frames
     while f <= f-end :
@@ -2018,10 +2084,10 @@ lostanza defn scan-frames (frames:ptr<StackFrame>, f-end:ptr<StackFrame>, vms:pt
       f = f + map.size
   return 0
 
-lostanza defn scan-heap (vms:ptr<VMState>) -> int :
+lostanza defn scan-heap (vms:ptr<VMState>, gc-stack-frames:ptr<StackFrame>) -> int :
   var p:ptr<long> = vms.heap
   while p < vms.heap-top :
-    p = scan-object(p, vms)
+    p = scan-object(p, vms, gc-stack-frames)
   return 0
 
 lostanza defn scan-tracker-chain (tracker-chain:ptr<LivenessTrackerObj>) -> int :
@@ -2049,7 +2115,7 @@ lostanza defn post-gc-weak-object (ref:long) -> long :
 lostanza defn false-marker () -> long :
   return tagof(False) << 3L + 2
 
-lostanza defn scan-object (p:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
+lostanza defn scan-object (p:ptr<long>, vms:ptr<VMState>, gc-stack-frames:ptr<StackFrame>) -> ptr<long> :
   ;p is [tag, cells ...]
   val tag = [p] as int
   ;call-c clib/printf("scan-object %p (tag = %d)\n", p, tag)
@@ -2065,9 +2131,10 @@ lostanza defn scan-object (p:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
       return p + sizeof(LivenessTrackerObj)
     else :
       ;Scan the frames of a stack
-      if tag == tagof(Stack) :
+      if tag == tagof(Stack) :        
         val s = (p + 8) as ptr<Stack>
-        scan-frames(s.frames, s.stack-pointer, vms)
+        if s.frames != gc-stack-frames :
+          scan-frames(s.frames, s.stack-pointer, vms)
       ;Get properties
       val size = object-size-on-heap(class-rec.size)
       val roots = addr(class-rec.roots)
@@ -4034,7 +4101,6 @@ public defn set-current-output-stream (o:OutputStream) :
 ;                 ====================
 
 var CURRENT-ERROR-STREAM : OutputStream = STANDARD-ERROR-STREAM
-lostanza var current-err:ptr<?> = stderr
 
 public defn with-error-stream<?T> (o:OutputStream, body: () -> ?T) -> T :
   val oldv = CURRENT-ERROR-STREAM
