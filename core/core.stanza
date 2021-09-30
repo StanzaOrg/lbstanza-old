@@ -1838,16 +1838,14 @@ lostanza defn create-break-table (compaction-start:ptr<long>, vms:ptr<VMState>) 
       vms.new-heap.top = current-unmarked
       return false
     val next-unmarked = skip-and-clear-marked(next-marked, vms)
-
     ;Store the live range information in the heap in the
     ;current break.
     write-live-range(current-unmarked, LiveRange{next-marked, next-unmarked})
 
     ;Compute the length of the current break, and update the
     ;accumulated offset.
-    val break-length = next-marked - current-unmarked
-    offset = offset - break-length
-    
+    offset = offset - (next-marked - current-unmarked)
+
     ;Fill break table root entries.
     ;The upcoming live range can potentially span multiple buckets.
     ;Compute 'start-index' and 'end-index' the indices of the first
@@ -1873,7 +1871,78 @@ lostanza defn create-break-table (compaction-start:ptr<long>, vms:ptr<VMState>) 
       
     ;Advance past the live range to the next potential break.
     current-unmarked = next-unmarked
+  ;No meaningful return value
+  return false
 
+;Returns the offset that needs to be added to an object to
+;compute its new address after compaction.
+;- p: The pointer to the object header.
+lostanza defn relocation-offset (p:ptr<?>, vms:ptr<VMState>) -> long :
+  ;Retrieve the break table from the memory originally used for the
+  ;marking stack.
+  val break-table = vms.new-heap.stack-start as ptr<BreakTableEntry>
+  ;Compute the index of the bucket that this object falls in, and
+  ;retrieve the corresponding break table entry for that object.
+  val break-table-entry = break-table[break-table-index(p, vms)]
+  ;If the object is located within the first live range in the
+  ;bucket, then the accumulated offset is equal to the final offset
+  ;to return.
+  var offset:long = break-table-entry.accumulated-offset
+  ;dead starts off holding the address just after the first live range
+  ;in the bucket. So if dead < p, then the object is *not* in the
+  ;first live range in the bucket, and we need to add the other
+  ;breaks to the final offset.
+  var dead:ptr<long> = break-table-entry.first-break-location
+  while dead < p :
+    ;Read the next live range in the bucket.
+    val next = read-live-range(dead)
+    ;Compute the length of the next break and subtract it
+    ;from the final offset. The next break proceeds from
+    ;the end of the previous break (dead) to the beginning
+    ;of the next break (next.live).     
+    offset = offset - (next.live - dead)
+    ;Update dead to be the end of the next break.
+    dead = next.dead
+  ;Return the final offset.
+  return offset
+
+;Given a pointer to an object reference, write its new value after compaction in-place.
+lostanza defn relocate-reference (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  ;Retrieve the value at the given heap pointer.
+  val v = [ref]
+  ;Is this a reference to a Stanza heap object?
+  val tagbits = v & 7L
+  if tagbits == 1L :
+    ;Remove the tag bits to retrieve the object pointer.
+    val p = (v - 1) as ptr<long>  ;This decrement is not really necessary
+    ;Check explicitly whether the pointer is in the compaction area because
+    ;relocation-offset is only designed to work if that holds.
+    if p > vms.new-heap.compaction-start :
+      [ref] = v + relocation-offset(p, vms)
+  ;No meaningful return value
+  return false
+
+;Relocate all object references as part of compaction.
+lostanza defn relocate-references (vms:ptr<VMState>) -> ref<False> :
+  ;Relocate all GC roots. 
+  iterate-roots(addr(relocate-reference), vms)
+  ;Relocate liveness trackers separately because their
+  ;references are not typed as references.
+  relocate-liveness-trackers(vms)
+  ;Scan the live ranges
+  val limit = vms.new-heap.top
+  var dead:ptr<long> = vms.new-heap.compaction-start
+  while dead < limit :
+    ;Read the annotated LiveRange record for the current
+    ;break.
+    val next = read-live-range(dead)
+    ;Relocate references in every object in the live range
+    var p:ptr<long> = next.live
+    while p < next.dead :
+      iterate-references(p, addr(relocate-reference), vms)
+      p = p + allocation-size(p, vms)
+    ;Advance to next break.
+    dead = next.dead
   ;No meaningful return value
   return false
 
@@ -1887,7 +1956,7 @@ lostanza defn new-collect-garbage (vms:ptr<VMState>) -> ref<False> :
   val compaction-start = skip-and-clear-marked(vms.new-heap.start, vms)
   if compaction-start < vms.new-heap.top :
     create-break-table(compaction-start, vms)
-    
+    relocate-references(vms)
   ;No meaningful return value
   return false
 
@@ -1931,6 +2000,7 @@ lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
   ;p is a pointer to the list being scanned.
   var p:ptr<ptr<NewLivenessTracker>> = addr(LIVENESS-TRACKERS)
   ;Scan until we reach the end of the list (represented using null pointer).
+  ;TODO: In generational GC scan the list while [p] >= collection-area-start
   while [p] != null :
     ;Retrieve the next ptr<LivenessTracker> in the list.
     val tracker = [p]
@@ -1962,6 +2032,27 @@ lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
         ;Go to the next element in the list.
         p = addr(tracker.tail)
 
+  ;No meaningful return value
+  return false
+
+;Relocate the referenced objects in the global list of liveness trackers
+;as part of compaction.
+lostanza defn relocate-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
+  val compaction-start = vms.new-heap.compaction-start
+  ;p is a pointer to the list being scanned.
+  var p:ptr<ptr<NewLivenessTracker>> = addr(LIVENESS-TRACKERS)
+  ;GC preserves the allocation order, so:
+  ;  1) Tracker value is always below the tracker.
+  ;  2) Later trackers in the list are below earlier trackers.
+  while [p] > compaction-start :
+    ;Retrieve the next ptr<LivenessTracker> in the list.
+    val tracker = [p]
+    ;Relocate the pointer to the tracker
+    [p] = tracker + relocation-offset(tracker, vms)
+    ;Relocate the tracker value
+    relocate-reference(addr(tracker.value), vms)
+    ;Go to the next element in the list.
+    p = addr(tracker.tail)
   ;No meaningful return value
   return false
 
