@@ -82,11 +82,14 @@ static void exit_with_error_line_and_func (const char* file, int line){
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
-  stz_byte* heap;
+  stz_byte* heap_start;
   stz_byte* heap_top;
   stz_byte* heap_limit;
-  stz_byte* free;
-  stz_byte* free_limit;
+  stz_byte* heap_bitset;
+  stz_long heap_size;
+  stz_byte* marking_stack_start;
+  stz_byte* marking_stack_bottom;
+  stz_byte* marking_stack_top;
   stz_long current_stack;
   stz_long system_stack;
 } VMInit;
@@ -1190,6 +1193,23 @@ static uint64_t alloc_stack (VMInit* init){
   return (uint64_t)stack - 8 + 1;  
 }
 
+enum {
+  LOG_BITS_IN_BYTE = 3,
+  LOG_BYTES_IN_LONG = 3,
+  LOG_BITS_IN_LONG = LOG_BYTES_IN_LONG + LOG_BITS_IN_BYTE,
+  BYTES_IN_LONG = 1 << LOG_BYTES_IN_LONG,
+  BITS_IN_LONG = 1 << LOG_BITS_IN_LONG
+};
+
+#define SYSTEM_PAGE_SIZE 4096UL
+#define ROUND_UP_TO_WHOLE_PAGES(x) (((x) + (SYSTEM_PAGE_SIZE - 1)) & ~(SYSTEM_PAGE_SIZE - 1))
+
+static stz_long bitset_size (stz_long heap_size) {
+  long heap_size_in_longs = (heap_size + (BYTES_IN_LONG - 1)) >> LOG_BYTES_IN_LONG;
+  long bitset_size_in_longs = (heap_size_in_longs + (BITS_IN_LONG - 1)) >> LOG_BITS_IN_LONG;
+  return ROUND_UP_TO_WHOLE_PAGES(bitset_size_in_longs << LOG_BYTES_IN_LONG);
+}
+
 STANZA_API_FUNC int main (int argc, char* argv[]) {
   #if defined(FMALLOC)
     init_fmalloc();
@@ -1200,15 +1220,23 @@ STANZA_API_FUNC int main (int argc, char* argv[]) {
   input_argv_needs_free = 0;
   VMInit init;
 
-  //Allocate heap and freespace
-  const stz_long initial_heap_size = 1024 * 1024;
-  const stz_long maximum_heap_size = STZ_LONG(4) * 1024 * 1024 * 1024;
+  //Allocate heap
+  const stz_long min_heap_size = ROUND_UP_TO_WHOLE_PAGES(1024 * 1024);
+  const stz_long max_heap_size = ROUND_UP_TO_WHOLE_PAGES(STZ_LONG(4) * 1024 * 1024 * 1024);
+  init.heap_size = max_heap_size;
+  init.heap_start = (stz_byte*)stz_memory_map(min_heap_size, max_heap_size);
+  init.heap_limit = init.heap_start + min_heap_size;
+  init.heap_top = init.heap_start;
 
-  init.heap = (stz_byte*)stz_memory_map(initial_heap_size, maximum_heap_size);
-  init.heap_limit = init.heap + initial_heap_size;
-  init.heap_top = init.heap;
-  init.free = (stz_byte*)stz_memory_map(initial_heap_size, maximum_heap_size);
-  init.free_limit = init.free + initial_heap_size;
+  const stz_long min_bitset_size = bitset_size(min_heap_size);
+  const stz_long max_bitset_size = bitset_size(max_heap_size);
+  init.heap_bitset = (stz_byte*)stz_memory_map(min_bitset_size, max_bitset_size);
+  memset(init.heap_bitset, 0, min_bitset_size);
+
+  const stz_long marking_stack_size = ROUND_UP_TO_WHOLE_PAGES(1024L << LOG_BYTES_IN_LONG);
+  init.marking_stack_start = stz_memory_map(marking_stack_size, marking_stack_size);
+  init.marking_stack_bottom = init.marking_stack_start + marking_stack_size;
+  init.marking_stack_top = init.marking_stack_bottom;
 
   //Allocate stacks
   init.current_stack = alloc_stack(&init);
