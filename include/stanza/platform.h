@@ -1,0 +1,12 @@
+#ifndef STANZA_PLATFORM_H
+#define STANZA_PLATFORM_H
+
+#ifdef PLATFORM_WINDOWS
+#define STANZA_EXPORTED_SYMBOL __declspec(dllexport)
+#else
+#define STANZA_EXPORTED_SYMBOL
+#endif
+
+#define STANZA_API_FUNC STANZA_EXPORTED_SYMBOL
+
+#endif
