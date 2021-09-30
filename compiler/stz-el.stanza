@@ -92,6 +92,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Beta Reduce", beta-reduce, "beta-reduce1", false)
     run-pass("Box Unbox", box-unbox-fold, "box-unbox1", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code1", false)
+    run-pass("Remove Boxes", remove-boxes, "remove-boxes1", false)
     ;Phase 2
     run-pass("Simple Inline", simple-inline, "inlined2", false)
     run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined2", false)
@@ -99,6 +100,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Beta Reduce", beta-reduce, "beta-reduce2", false)
     run-pass("Box Unbox", box-unbox-fold, "box-unbox2", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code2", false)
+    run-pass("Remove Boxes", remove-boxes, "remove-boxes2", false)
     ;Finish by removing checks 
     run-pass("Force Remove Checks", force-remove-checks, "removed-checks", false)
   run-pass("Resolve Matches", resolve-matches, "resolved-matches", false)
@@ -941,7 +943,7 @@ defn box-mutables (epackage:EPackage, gvt:VarTable) -> EPackage :
         for i in ins(e) do :
           match(map(retrieve-var, i)) :
             (i:EDef) :
-              if boxed[n(x(i))] : emit(buffer,EBox(x(i), y(i)))
+              if boxed[n(x(i))] : emit(buffer,EBox(x(i), y(i), type(vt, n(x(i)))))
               else : emit(buffer,i)
             (i:EStore) :
               match(loc(i)) :
@@ -2500,6 +2502,96 @@ defn union (input-ts:Seqable<EType>) :
   val ts = to-seq(input-ts)
   if empty?(ts) : EBot()
   else : reduce(EOr, ts)
+
+;============================================================
+;===================== REMOVE-BOXES =========================
+;============================================================
+;Currently boxes are used to hold variables that are written to.
+;In this pass, we remove boxes for those boxes that are only
+;accessed locally in a single body, since the ELIR supports
+;writing to local vars. This permits a number of follow-on
+;optimizations to trigger as well.  
+defn remove-boxes (epackage:EPackage, gvt:VarTable) -> EPackage :
+
+  ;Translate all local boxes and their accesses to operations
+  ;on regular mutable variables.
+  ;Assumes that all nested definitions have been analyzed.
+  defn remove-local-boxes-in-body (e:EBody, vt:VarTable) -> EBody :
+    ;Compute set of closed-over variables. If a box is closed-over
+    ;then we cannot convert it to a local mutable variable.
+    val closed-over = IntSet()
+    defn add-to-closed (e:ELBigItem) :
+      match(e:EFn) : add-all(closed-over, vars(free(e)))
+      else : do*(add-to-closed, e)
+    do(add-to-closed, cat(localfns(e), localobjs(e)))
+
+    ;Compute set of variables that are read from instructions
+    ;other than EBoxGet instructions. 
+    defn collect-non-box-reads (ins:EIns) -> Seqable<Int> :
+      val imms = match(ins) :
+        (ins:EBoxGet) : []
+        (ins:EBoxSet) : [z(ins)]
+        (ins) : uses(ins)
+      seq(n, filter-by<EVar>(imms))
+    val non-box-read = to-intset $
+      seq-cat(collect-non-box-reads, ins(e))
+
+    ;Collect all the definitions of all boxes.
+    val box-defs = group-by(n{x(_)}, filter-by<EBox>(ins(e)))
+
+    ;If the given variable corresponds to a locally defined
+    ;box then return its initializing box expression. Otherwise
+    ;return false.
+    defn local-box? (n:Int) -> EBox|False :
+      if not mutable?(vt,n) and
+         not closed-over[n] and
+         not non-box-read[n] and
+         length(box-defs[n]) == 1 :
+        head(box-defs[n])
+
+    ;Remove operations on local boxes and replace them
+    ;with the equivalent operation assuming the local box
+    ;is now a regular mutable variable.
+    defn remove-local-boxes (e:EIns) -> EIns :
+      match(e) :
+        (e:EBox) :
+          match(local-box?(n(x(e)))) :
+            (b:EBox) : EDef(x(e), y(b))
+            (f:False) : e
+        (e:EBoxGet) :
+          match(local-box?(n(y(e) as EVar))) :
+            (b:EBox) : EDef(x(e), y(e))
+            (f:False) : e
+        (e:EBoxSet) :
+          match(local-box?(n(y(e) as EVar))) :
+            (b:EBox) : EStore(EVarLoc(n(y(e) as EVar)), z(e), type(b), false)
+            (f:False) : e
+        (e) :
+          e
+          
+    ;If the given local is initialized as a local box,
+    ;then convert it to a regular mutable variable meant for holding
+    ;the contents of the local box.
+    defn convert-local-box-to-var (local:ELocal) -> ELocal :
+      match(local-box?(n(local))) :
+        (b:EBox) : ELocal(n(local), type(b), true)
+        (f:False) : local
+
+    ;Launch!
+    val ins* = map(remove-local-boxes, ins(e))
+    val locals* = map(convert-local-box-to-var, locals(e))
+    sub-locals(sub-ins(e, ins*), locals*)
+
+  ;Remove all local boxes in the given item. 
+  defn remove-boxes (e:ELBigItem, vt:VarTable) -> ELBigItem :
+    match(map(remove-boxes{_, vt}, e)) :
+      (e:EBody) : remove-local-boxes-in-body(e,vt)
+      (e) : e
+
+  ;Compute local VarTable and freevars for each
+  ;top-level expression and then remove the local boxes.
+  within (texp, vt) = map-with-var-table(gvt, epackage) :
+    remove-boxes(analyze-freevars(texp, vt), vt) as ETExp
 
 ;============================================================
 ;==================== BOX-UNBOX-FOLD ========================
