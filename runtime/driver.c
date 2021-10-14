@@ -25,8 +25,9 @@
 #include<dirent.h>
 #include<pthread.h>
 
-#include "common.h"
-#include "types.h"
+#include <stanza/platform.h>
+#include <stanza/types.h>
+
 #include "process.h"
 
 //       Forward Declarations
@@ -1178,7 +1179,7 @@ static uint64_t alloc_stack (VMInit* init){
   return (uint64_t)stack - 8 + 1;  
 }
 
-int main (int argc, char* argv[]) {
+STANZA_API_FUNC int main (int argc, char* argv[]) {
   #if defined(FMALLOC)
     init_fmalloc();
   #endif

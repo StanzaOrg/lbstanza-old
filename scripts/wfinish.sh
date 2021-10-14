@@ -12,7 +12,7 @@ if [[ -z "$CC" ]]; then
     fi
 fi
 
-CCFLAGS="-DPLATFORM_WINDOWS -std=gnu99 -O3 -fPIC -Wall $CCFLAGS"
+CCFLAGS="-I include -DPLATFORM_WINDOWS -std=gnu99 -O3 -fPIC -Wall $CCFLAGS"
 
 [[ ! -d "build" ]] && mkdir "build"
 

@@ -3,7 +3,7 @@
 
 #include <stdio.h>
 
-#include "types.h"
+#include <stanza/types.h>
 
 typedef struct {
   stz_long pid;
