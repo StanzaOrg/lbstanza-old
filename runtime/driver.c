@@ -1088,7 +1088,7 @@ STANZA_API_FUNC int main (int argc, char* argv[]) {
   init.heap_bitset = (stz_byte*)stz_memory_map(min_bitset_size, max_bitset_size);
   memset(init.heap_bitset, 0, min_bitset_size);
 
-  const stz_long marking_stack_size = ROUND_UP_TO_WHOLE_PAGES((256 * 1024L) << LOG_BYTES_IN_LONG);
+  const stz_long marking_stack_size = ROUND_UP_TO_WHOLE_PAGES((1024 * 1024L) << LOG_BYTES_IN_LONG);
   init.marking_stack_start = stz_memory_map(marking_stack_size, marking_stack_size);
   init.marking_stack_bottom = init.marking_stack_start + marking_stack_size;
   init.marking_stack_top = init.marking_stack_bottom;
