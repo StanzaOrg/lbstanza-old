@@ -25,4 +25,4 @@ CCFLAGS="-I include -DPLATFORM_WINDOWS -std=gnu99 -O3 -fPIC -Wall $CCFLAGS"
     build/cvm.o       \
     build/driver.o    \
     wstanza.s         \
-    -o wstanza -lm -lpthread -fPIC
+    -o wstanza -Wl,-Bstatic -lm -lpthread -fPIC
