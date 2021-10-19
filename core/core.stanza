@@ -141,6 +141,100 @@ protected lostanza deftype Stack :
   var frames: ptr<StackFrame>
   var stack-pointer: ptr<StackFrame>
   var pc: long
+  var tail: ptr<Stack>
+
+;Global list of live Stacks.
+;New Stacks are added to this list when they are created.
+lostanza var STACKS:ptr<Stack> = null
+
+lostanza defn allocate-stack () -> ref<Stack> :
+  ;Note: The stack must be allocated before retrieving the stack frames.
+  ;Because,
+  val stack-size = INITIAL-STACK-SIZE
+  val stack = new Stack{stack-size, null, null, 0, STACKS}
+  STACKS = addr!([stack])
+  val frameheader = take-next-stack(addr(STACK-POOL), stack-size)
+  val frames = addr(frameheader.frames)
+  frames.return = -1L
+  frames.liveness-map = 0L
+  stack.frames = frames
+  return stack
+
+;lostanza defn free-stack (stack:ptr<Stack>) -> ref<False> :
+; val frames = stack.frames
+;  if frames != null :
+;    val header = header(frames)
+;    if header.pool-index < 0 :
+;      call-c clib/stz_free(frames)
+;    else:
+;      free-stack(addr(STACK-POOL), header)
+;  ;No meaningful return value
+;  return false
+
+lostanza defn iterate-references-in-stack-frames (stack:ptr<Stack>,
+                                                  f:ptr<((ptr<long>, ptr<VMState>) -> ref<False>)>,
+                                                  vms:ptr<VMState>) -> ref<False> :
+  var frame:ptr<StackFrame> = stack.frames
+  if frame == null : return false
+
+  header(frame).mark = 1
+  val current-stack = (vms.current-stack - 1) as ptr<Stack> ;Tag
+  if stack == current-stack : return false
+
+  var end-frame:ptr<StackFrame> = stack.stack-pointer
+  val stackmap-table = vms.stackmap-table
+  while frame <= end-frame :
+    val map = stackmap-table[frame.liveness-map]
+    val num-live = map.num-roots
+    for (var i:int = 0, i < num-live, i = i + 1) :
+      val r = map.roots[i]
+      [f](addr(frame.slots[r]), vms)
+    frame = frame + map.size
+  ;No meaningful return value
+  return false
+
+
+;Scan through the global list STACK and update them.
+;After this function finishes:
+;1) The STACKS list shall contain only Stacks that are still live.
+lostanza defn scan-stacks (vms:ptr<VMState>) -> ref<False> :
+  var live-stacks:ptr<Stack> = null
+  var previous-stacks:ptr<Stack> = STACKS
+  ;Some stacks were marked at previous iteration
+  while live-stacks != previous-stacks :
+    previous-stacks = live-stacks
+    complete-marking(vms)
+    var p:ptr<ptr<Stack>> = addr(STACKS)
+    while [p] != null :
+      val stack = [p]
+      val stack-obj = stack as ptr<?> - sizeof(long)
+      if test-mark(stack-obj, vms) == 0 :
+        p = addr(stack.tail)
+      else :
+        iterate-references-in-stack-frames(stack, addr(mark-from-root), vms)
+        [p] = stack.tail
+        stack.tail = live-stacks
+        live-stacks = stack
+  ;Now STACKS contains unreachable stacks only
+  ;TODO: free stack frames of these stacks
+  STACKS = live-stacks
+  ;No meaningful return value
+  return false
+
+lostanza defn relocate-stacks (vms:ptr<VMState>) -> ref<False> :
+  val compaction-start = vms.heap.compaction-start
+  ;p is a pointer to the list being scanned.
+  var p:ptr<ptr<Stack>> = addr(STACKS)
+  while [p] != null :
+    val stack = [p]
+    if stack > compaction-start :
+      [p] = stack + relocation-offset(stack, vms)
+    iterate-references-in-stack-frames(stack, addr(relocate-reference), vms)
+    ;Go to the next element in the list.
+    p = addr(stack.tail)
+  ;No meaningful return value
+  return false
+
 
 lostanza deftype GlobalRoots :
   length: int
@@ -896,6 +990,8 @@ lostanza defn StackPool () -> StackPool :
   val entry-stack:ptr<Stack> = untag(vms.current-stack)
   big-stacks[0] = header(entry-stack.frames)
   val entry-system-stack:ptr<Stack> = untag(vms.system-stack)
+  entry-stack.tail = entry-system-stack
+  STACKS = entry-stack
 
   ;Create StackPool
   return StackPool{capacity, 0, stacks, big-capacity, 1, big-stacks}
@@ -1714,21 +1810,6 @@ lostanza defn iterate-references (p:ptr<long>,
   val tag = [p]
   val class-rec = vms.class-table[tag]
   if class-rec.item-size == 0 :
-    if tag == tagof(Stack) :
-      val stackmap-table = vms.stackmap-table
-      val s = (p + BYTES-IN-LONG) as ptr<Stack>
-      var frame:ptr<StackFrame> = s.frames
-      var end-frame:ptr<StackFrame> = s.stack-pointer
-      if frame != null :
-        ;Mark the frames
-        header(frame).mark = 1
-        while frame <= end-frame :
-          val map = stackmap-table[frame.liveness-map]
-          val num-live = map.num-roots
-          for (var i:int = 0, i < num-live, i = i + 1) :
-            val r = map.roots[i]
-            [f](addr(frame.slots[r]), vms)
-          frame = frame + map.size
     val roots = addr(class-rec.roots)
     val num-roots = class-rec.num-roots
     val obj = p as ptr<ObjectLayout>
@@ -1794,6 +1875,7 @@ lostanza defn mark-reachable-objects (vms:ptr<VMState>) -> ref<False> :
   ;Iteratively call continue-marking on all pointers in the
   ;incomplete range until we're finished.
   complete-marking(vms)
+  scan-stacks(vms)
   ;No meaningful return value
   return false
 
@@ -2083,6 +2165,8 @@ lostanza defn relocate-references (vms:ptr<VMState>) -> ref<False> :
   ;Relocate liveness trackers separately because their
   ;references are not typed as references.
   relocate-liveness-trackers(vms)
+  ;Relocate stacks separately because of their list and off-heap frames.
+  relocate-stacks(vms)
   ;Relocate references in solid prefix
   var dead:ptr<long> = relocate-references(vms.heap.start, vms.heap.compaction-start, vms)
   ;Scan the live ranges
@@ -3160,18 +3244,6 @@ lostanza defn initialize-coroutines () -> ref<False> :
   current-coroutine = new RawCoroutine{0L, current-stack, false, COROUTINE-ACTIVE, 0, crsp, new SavedWinders{List()}}
   COROUTINE-COUNTER = 1L
   return false
-
-lostanza defn allocate-stack () -> ref<Stack> :
-  ;Note: The stack must be allocated before retrieving the stack frames.
-  ;Because,
-  val stack-size = INITIAL-STACK-SIZE
-  val stack = new Stack{stack-size, null, null, 0}
-  val frameheader = take-next-stack(addr(STACK-POOL), stack-size)
-  val frames = addr(frameheader.frames)
-  frames.return = -1L
-  frames.liveness-map = 0L
-  stack.frames = frames
-  return stack
 
 public lostanza defn RawCoroutine (enter:ref<((RawCoroutine, ?) -> ?)>) -> ref<RawCoroutine> :
   val stk = allocate-stack()

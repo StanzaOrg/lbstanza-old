@@ -111,6 +111,7 @@ typedef struct{
   StackFrame* frames;
   StackFrame* stack_pointer;
   stz_long pc;
+  struct Stack* tail;
 } Stack;
 
 //     Macro Readers
@@ -1190,6 +1191,7 @@ static uint64_t alloc_stack (VMInit* init){
   stack->size = initial_stack_size;
   stack->frames = frameheader->frames;
   stack->stack_pointer = NULL;
+  stack->tail = NULL;
   return (uint64_t)stack - 8 + 1;  
 }
 
