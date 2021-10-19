@@ -433,6 +433,7 @@ typedef struct{
   StackFrame* frames;
   StackFrame* stack_pointer;
   uint64_t pc;
+  struct Stack* tail;
 } Stack;
 
 //============================================================
