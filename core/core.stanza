@@ -149,27 +149,14 @@ lostanza var STACKS:ptr<Stack> = null
 
 lostanza defn allocate-stack () -> ref<Stack> :
   ;Note: The stack must be allocated before retrieving the stack frames.
-  ;Because,
   val stack-size = INITIAL-STACK-SIZE
   val stack = new Stack{stack-size, null, null, 0, STACKS}
   STACKS = addr!([stack])
-  val frameheader = take-next-stack(addr(STACK-POOL), stack-size)
-  val frames = addr(frameheader.frames)
+  val frames = allocate-stack-frames(stack-size)
   frames.return = -1L
   frames.liveness-map = 0L
   stack.frames = frames
   return stack
-
-;lostanza defn free-stack (stack:ptr<Stack>) -> ref<False> :
-; val frames = stack.frames
-;  if frames != null :
-;    val header = header(frames)
-;    if header.pool-index < 0 :
-;      call-c clib/stz_free(frames)
-;    else:
-;      free-stack(addr(STACK-POOL), header)
-;  ;No meaningful return value
-;  return false
 
 lostanza defn iterate-references-in-stack-frames (stack:ptr<Stack>,
                                                   f:ptr<((ptr<long>, ptr<VMState>) -> ref<False>)>,
@@ -177,7 +164,6 @@ lostanza defn iterate-references-in-stack-frames (stack:ptr<Stack>,
   var frame:ptr<StackFrame> = stack.frames
   if frame == null : return false
 
-  header(frame).mark = 1
   val current-stack = (vms.current-stack - 1) as ptr<Stack> ;Tag
   if stack == current-stack : return false
 
@@ -202,21 +188,28 @@ lostanza defn scan-stacks (vms:ptr<VMState>) -> ref<False> :
   var previous-stacks:ptr<Stack> = STACKS
   ;Some stacks were marked at previous iteration
   while live-stacks != previous-stacks :
+    ;Remember current state of live-staks list
     previous-stacks = live-stacks
+    ;Complete previous marking before testing if the stacks are marked.
     complete-marking(vms)
     var p:ptr<ptr<Stack>> = addr(STACKS)
     while [p] != null :
       val stack = [p]
       val stack-obj = stack as ptr<?> - sizeof(long)
       if test-mark(stack-obj, vms) == 0 :
+        ;Proceed to next stack in STACKS list
         p = addr(stack.tail)
       else :
+        ;Mark references in stack frames
         iterate-references-in-stack-frames(stack, addr(mark-from-root), vms)
+        ;Remove stack from STACKS list
         [p] = stack.tail
+        ;Insert stack to live-stacks list
         stack.tail = live-stacks
         live-stacks = stack
-  ;Now STACKS contains unreachable stacks only
-  ;TODO: free stack frames of these stacks
+  ;Now STACKS contains unreachable stacks only. Dispose their frames.
+  for (var stack:ptr<Stack> = STACKS, stack != null, stack = stack.tail) :
+    free-stack-frames(stack.frames)
   STACKS = live-stacks
   ;No meaningful return value
   return false
@@ -862,10 +855,8 @@ public lostanza defn run-garbage-collector () -> ref<False> :
 ;"Out Of Memory" error.
 lostanza defn extend-heap (size:long) -> long :
   ;Ensure that the stack pool is wellformed.
-  ensure-stack-pool-wellformed!(addr(STACK-POOL), 0)
-  ;Collect garbage, and ensure we freed enough space
+    ;Collect garbage, and ensure we freed enough space
   val remaining = call-prim collect-garbage(size)
-  free-unmarked-stacks(addr(STACK-POOL))
   if remaining < size : fatal!("Out of memory.")
   ;Now run the GC notifiers, if they have been initialized
   if initialized-gc-notifiers? :
@@ -877,7 +868,6 @@ lostanza defn extend-heap (size:long) -> long :
   if remaining-after-notifiers < size :
     ;Collect garbage, and ensure we freed enough space
     val remaining = call-prim collect-garbage(size)
-    free-unmarked-stacks(addr(STACK-POOL))
     if remaining < size : fatal!("Out of memory.")
   ;Unused return value
   return 0
@@ -900,317 +890,41 @@ defn run-gc-notifiers () :
 public defn add-gc-notifier (f: () -> ?) :
    add(GC-NOTIFIERS, f)
 
-;<doc>=======================================================
+;====>=======================================================
 ;====================== Stack Pool ==========================
 ;============================================================
 
-Concerns:
-  - How do we retrieve a new stack from the stack pool?
-  - How do we put a stack back into the stack pool?
-  - How are the initial stacks created by the driver tracked?
-  - What happens during stack extension? When we double the size of
-    the current stack?
-  - After GC, how do we release the frames used by all the dead
-    stacks?
+lostanza defn allocate-stack-frames (size:long) -> ptr<StackFrame> :
+  val frames:ptr<StackFrame> = call-c clib/stz_malloc(size)
+  if frames == null : fatal("Cannot allocate stack frames")
+  return frames
 
-State of Stack Pool:
-  stacks:ptr<StackFrameHeader>
-    - Array holding the allocated pointers of all the frames in
-      the pool.
-    - The used stacks are all in the first half of the array.
-    - The free stacks are in the second half of the array.
-    - All stacks in the array are of size INITIAL-STACK-SIZE.
-  capacity:int
-    - The length of the stacks array.
-  num-used:int
-    - The number of used stacks in the stack pool.
-  big-stacks:ptr<StackFrameHeader>
-    - Array holding all the larger stacks.
-  big-capacity:int
-    - The length of the big-stacks array.
-  big-size:int
-    - The number of stacks stored in the big-stacks.
-
-Memory Layout of Stack Frame Header:
-  pool-index:int
-    - The index of the stack frame in the stack pool.
-    - This index is -1 if the frame does not exist in the stack pool.
-  mark:int
-    - This mark is 0 by default during normal operation.
-    - The mark will be set to 1 during GC to indicate that the frames
-      are currently in use.
-  frames:StackFrame ...
-    - The frames start immediately after the header. The stack size is
-      counted starting from here.
-
-Global Variables:
-  INITIAL-STACK-SIZE:long
-    - The size of all stacks in the stack pool.
-  STACK-POOL:StackPool
-    - The global stack pool.
-Interface:
-  take-next-stack(pool:ptr<StackPool>, size:long)
-    - Retrieve a stack of the desired size from the StackPool.
-  free-stack(pool:ptr<StackPool>, stack:ptr<StackFrameHeader>)
-    - Release the given stack into the StackPool.
-  gc-if-no-stacks(pool:ptr<StackPool>)
-    - If there are no stacks available, and it is appropriate to do so,
-      run the garbage collector in an effort to free up some stacks.
-  free-unmarked-stacks(pool:ptr<StackPool>)
-    - Free all unmarked stacks. Meant as a hook to be used by the
-      garbage collector.
-
-;============================================================
-;=======================================================<doc>
-
-lostanza deftype StackFrameHeader :
-  var pool-index:int
-  var mark:int
-  frames:StackFrame ...
-
-lostanza deftype StackPool :
-  var capacity:int
-  var num-used:int
-  var stacks:ptr<ptr<StackFrameHeader>>
-  var big-capacity:int
-  var big-size:int
-  var big-stacks:ptr<ptr<StackFrameHeader>>
-
-lostanza defn StackPool () -> StackPool :
-  ;Allocate pool for small stacks
-  val capacity = 4
-  val stacks:ptr<ptr<StackFrameHeader>> = call-c clib/stz_malloc(capacity * sizeof(ptr<?>))
-  for (var i:int = 0, i < capacity, i = i + 1) :
-    stacks[i] = alloc-stack-frames(i, INITIAL-STACK-SIZE)
-  ;Allocate pool for big stacks
-  val big-capacity = 4
-  val big-stacks:ptr<ptr<StackFrameHeader>> = call-c clib/stz_malloc(big-capacity * sizeof(ptr<?>))
-  ;Set first big stack to be the entrant stack
-  val vms:ptr<VMState> = call-prim flush-vm()
-  val entry-stack:ptr<Stack> = untag(vms.current-stack)
-  big-stacks[0] = header(entry-stack.frames)
-  val entry-system-stack:ptr<Stack> = untag(vms.system-stack)
-  entry-stack.tail = entry-system-stack
-  STACKS = entry-stack
-
-  ;Create StackPool
-  return StackPool{capacity, 0, stacks, big-capacity, 1, big-stacks}
-
-lostanza defn ensure-stack-pool-wellformed! (pool:ptr<StackPool>, after-marking?:long) -> ref<False> :
-  ;Ensure that pool.num-used is in bounds.
-  if pool.num-used < 0 or pool.num-used > pool.capacity :
-    fatal!("Stack pool num-used is out of bounds.")
-  ;Ensure that each of the small stacks are wellformed.
-  ;They must have the correct pool-index and mark.
-  for (var i:int = 0, i < pool.capacity, i = i + 1) :
-    val s = pool.stacks[i]
-    if s.pool-index != i :
-      fatal!("Small stack does not have correct pool index.")
-    if after-marking? :
-      if s.mark != 0 and i >= pool.num-used :
-        fatal!("Small stack is marked but is not one of the used stacks.")
-    else :
-      if s.mark != 0 :
-        fatal!("Small stack is marked when it should not be.")
-
-  ;Ensure that pool.big-size is in bounds.
-  if pool.big-size < 0 or pool.big-size > pool.big-capacity :
-    fatal!("Size of big stack pool is out of bounds.")
-  ;Ensure that each of the big stacks are wellformed.
-  for (var i:int = 0, i < pool.big-size, i = i + 1) :
-    val s = pool.big-stacks[i]
-    if s.pool-index != -1 :
-      fatal!("Big stack must have -1 as its pool index.")
-    if after-marking? == 0 :
-      if s.mark != 0 :
-        fatal!("Big stack is marked when it should not be.")
-  ;Meaningless return
+lostanza defn free-stack-frames (frames:ptr<StackFrame>) -> ref<False> :
+  if frames != null :
+    call-c clib/stz_free(frames)
   return false
 
-lostanza defn ensure-capacity (pool:ptr<StackPool>, capacity:int) -> int :
-  ;Do something only if we are under capacity
-  if pool.capacity < capacity :
-    ;Double the capacity until it reaches desired capacity
-    var c:int = pool.capacity
-    while c < capacity : c = c * 2
-    ;Allocate a new stacks array, and copy the old contents over.
-    pool.stacks = resize-ptr(pool.stacks, pool.capacity * sizeof(ptr<?>), c * sizeof(ptr<?>))
-    ;Fill the newly-allocated slots with new stacks
-    for (var i:int = pool.capacity, i < c, i = i + 1) :
-      pool.stacks[i] = alloc-stack-frames(i, INITIAL-STACK-SIZE)
-    ;Register the newly-increased capacity
-    pool.capacity = c
-  return 0
-
-lostanza defn ensure-big-capacity (pool:ptr<StackPool>, capacity:int) -> int :
-  ;Do something only if we are under capacity
-  if pool.big-capacity < capacity :
-    ;Double the capacity until it reaches desired capacity
-    var c:int = pool.big-capacity
-    while c < capacity : c = c * 2
-    ;Allocate a new stacks array, and copy the old contents over.
-    pool.big-stacks = resize-ptr(pool.big-stacks, pool.big-capacity * sizeof(ptr<?>), c * sizeof(ptr<?>))
-    ;Register the newly-increased capacity
-    pool.big-capacity = c
-  return 0
-
-lostanza defn alloc-stack-frames (index:int, size:long) -> ptr<StackFrameHeader> :
-  ;The total size of the StackFrame object is the size of the header
-  ;with the size of the stack frames.
-  val frame-size = sizeof(StackFrameHeader) + size
-  val fh:ptr<StackFrameHeader> = call-c clib/stz_malloc(frame-size)
-  ;Initialize parameters and return
-  fh.pool-index = index
-  ;call-c clib/printf("A) set pool index of %p to %d\n", fh, index)
-  fh.mark = 0
-  return fh
-
-lostanza defn print-pool-state (pool:ptr<StackPool>) -> int :
-  call-c clib/printf("Pool State:\n")
-  var good?:int = 1
-  for (var i:int = 0, i < pool.capacity, i = i + 1) :
-    val s = pool.stacks[i]
-    call-c clib/printf("%d) %p (index = %d, mark = %d)", i, s, s.pool-index, s.mark)
-    if i != s.pool-index : good? = 0
-    if i < pool.num-used :
-      call-c clib/printf(" (used)\n")
-    else :
-      call-c clib/printf("\n")
-  if good? == 0 :
-    call-c clib/printf("corrupted state\n")
-    call-c clib/exit(-1)
-
-  return 0
-
-lostanza defn take-next-stack (pool:ptr<StackPool>, size:long) -> ptr<StackFrameHeader> :
-  ;call-c clib/printf("take-next-stack(%ld)\n", size)
-  ;If the size is equal to INITIAL-STACK-SIZE then allocate the stack
-  ;from the stack pool.
-  if size == INITIAL-STACK-SIZE :
-    ;call-c clib/printf("Request a standard stack\n")
-    ;call-c clib/printf("There are %d used stacks\n", pool.num-used)
-    ;Create more stacks if none available
-    ensure-capacity(pool, pool.num-used + 1)
-    ;Retrieve the next free stack
-    val s = pool.stacks[pool.num-used]
-    ;Increment the number of used stacks
-    pool.num-used = pool.num-used + 1
-    ;call-c clib/printf("Return new standard stack frame %p (index = %d)\n", s, s.pool-index)
-    ;Return the stack
-    return s
-  ;Otherwise, allocate the stack from the big pool.
-  else :
-    ;Allocate the stack frame object
-    val s = alloc-stack-frames(-1, size)
-    ;And register it within the big pool
-    ensure-big-capacity(pool, pool.big-size + 1)
-    pool.big-stacks[pool.big-size] = s
-    pool.big-size = pool.big-size + 1
-    ;Return the stack
-    ;call-c clib/printf("Return new big stack frame %p\n", s)
-    return s
-
-lostanza defn free-stack (pool:ptr<StackPool>, stack:ptr<StackFrameHeader>) -> int :
-  ;call-c clib/printf("free-stack(%p)\n", stack)
-  ;This function does nothing if the stack is not in the stack pool.
-  if stack.pool-index < 0 :
-    ;call-c clib/printf("Freeing a stack %p that is not in the pool.\n", stack)
-    return 0
-
-  ;A used stack is in the first half of the pool.
-  ;To return the stack, it must be moved to the second half of the pool.
-  ;So swap its place with the last used one in the pool.
-  ;call-c clib/printf("Free stack index %d\n", stack.pool-index)
-  val swap-index = pool.num-used - 1
-  ;call-c clib/printf("swap-index = %d\n", swap-index)
-  if swap-index != stack.pool-index :
-    val x = stack
-    val xi = stack.pool-index
-    val y = pool.stacks[swap-index]
-    val yi = swap-index
-    pool.stacks[xi] = y
-    pool.stacks[yi] = x
-    x.pool-index = yi
-    ;call-c clib/printf("B) set pool index of %p to %d\n", x, yi)
-    y.pool-index = xi
-    ;call-c clib/printf("C) set pool index of %p to %d\n", y, xi)
-  ;Decrement the number of used stacks
-  pool.num-used = pool.num-used - 1
-  ;call-c clib/printf("Now there are %d used stacks\n", pool.num-used)
-  return 0
-
-lostanza defn gc-if-no-stacks (pool:ptr<StackPool>) -> int :
-  ;This function tries running the garbage collector to free up some stacks.
-  ;To prevent thrashing, the remaining logic is for ensuring a specific usage ratio.
-  ;If there are no stacks remaining, then run the garbage collector.
-  ;Next measure the usage ratio: if the usage ratio is over 0.6 then
-  ;increase the number of stacks (capped by the maximum number of stacks).
-
-  if pool.num-used == pool.capacity :
-    ;call-c clib/printf("Running garbage collector to release some stacks\n")
-    extend-heap(0)
-  return 0
-
-lostanza defn free-unmarked-stacks (pool:ptr<StackPool>) -> int :
-  ;First ensure that the stack pool is wellformed.
-  ensure-stack-pool-wellformed!(addr(STACK-POOL), 1)
-
-  ;Free all stacks in small pool
-  labels :
-    begin : goto loop(0)
-    loop (i:int) :
-      if i < pool.num-used :
-        val s = pool.stacks[i]
-        if s.mark == 0 :
-          free-stack(pool, s)
-          goto loop(i)
-        else :
-          s.mark = 0
-          goto loop(i + 1)
-
-  ;Free all stacks in big pool
-  labels :
-    begin : goto loop(0, 0)
-    ;- n: the number of live big stacks encountered thus far.
-    ;- i: the index of the next big stack to process.
-    loop (n:int, i:int) :
-      if i < pool.big-size :
-        val s = pool.big-stacks[i]
-        if s.mark == 0 :
-          ;If the stack is unmarked (dead) then free it.
-          call-c clib/stz_free(s)
-          goto loop(n, i + 1)
-        else :
-          ;If the stack is marked (live), then clear the mark
-          ;and move it down to the appropriate position.
-          s.mark = 0
-          pool.big-stacks[n] = s
-          goto loop(n + 1, i + 1)
-      else :
-        pool.big-size = n
-
-  ;Check that all stacks are now unmarked.
-  #if-not-defined(OPTIMIZE) :
-    for (var i:int = 0, i < pool.capacity, i = i + 1) :
-      val s = pool.stacks[i]
-      if s.mark : fatal!("Marked stacks remaining.\n")
-    for (var i:int = 0, i < pool.big-size, i = i + 1) :
-      val s = pool.big-stacks[i]
-      if s.mark : fatal!("Marked stacks remaining.\n")
-  return 0
-
-lostanza defn header (p:ptr<StackFrame>) -> ptr<StackFrameHeader> :
-  return (p - sizeof(StackFrameHeader)) as ptr<StackFrameHeader>
-
-lostanza defn free (s:ref<Stack>) -> int :
-  free-stack(addr(STACK-POOL), header(s.frames))
+lostanza defn free (s:ref<Stack>) -> ref<False> :
+  ;call-c clib/printf("freeing coroutine\n")
+  free-stack-frames(s.frames)
   s.frames = null
   s.stack-pointer = null
-  return 0
+  return false
 
 ;Global stack pool
 lostanza val INITIAL-STACK-SIZE:long = 4L * 1024L
-lostanza val STACK-POOL:StackPool = StackPool()
+
+lostanza defn initialize-stack-pool () -> ref<False> :
+  val vms:ptr<VMState> = call-prim flush-vm()
+  val entry-stack:ptr<Stack> = untag(vms.current-stack)
+  val entry-system-stack:ptr<Stack> = untag(vms.system-stack)
+  entry-stack.tail = entry-system-stack
+  STACKS = entry-stack
+  ;call-c clib/printf("Entry stack frames %p\n", entry-stack.frames)
+  ;call-c clib/printf("Entry system stack frames %p\n", entry-system-stack.frames)
+  ;No meaningful return value.
+  return false
+initialize-stack-pool()
 
 ;<doc>=======================================================
 ;====================== Stack Extension =====================
@@ -1235,37 +949,22 @@ lostanza defn extend-stack (size:long) -> long :
   ;Compute new size of stack
   val maximum-size = 1024L * 1024L * 1024L
   val desired-size = s.stack-pointer + size - s.frames
-  val old-size = s.size
   var new-size:long = s.size
-  while new-size < desired-size : new-size = new-size * 2
+  while new-size < desired-size : new-size = new-size << 1
   new-size = min(new-size, maximum-size)
 
   ;Check for stack overflow
-  if new-size < desired-size :
-    fatal!("Stack overflow")
+  if new-size < desired-size : fatal!("Stack overflow")
 
-  ;Allocate new frames
-  val old-frameheader = header(s.frames)
-  val old-frames = s.frames
-  val new-frameheader = take-next-stack(addr(STACK-POOL), new-size)
-  val new-frames = addr(new-frameheader.frames)
-
-  ;Copy over old frames
-  call-c clib/memcpy(new-frames, old-frames, old-size)
-
-  ;Transition over mark from old frames to new frames.
-  ;(In case this code is executing within the garbage collector code.)
-  new-frameheader.mark = old-frameheader.mark
-  old-frameheader.mark = 0
-
-  ;Free old frames
-  free-stack(addr(STACK-POOL), old-frameheader)
+  ;Allocate new frames and copy over old frames
+  val new-frames = allocate-stack-frames(new-size)
+  call-c clib/memcpy(new-frames, s.frames, s.size)
+  free-stack-frames(s.frames)
 
   ;Swap in new frames
   s.stack-pointer = s.stack-pointer + (new-frames - old-frames)
   s.size = new-size
   s.frames = new-frames
-
 
   ;Return
   return 0
