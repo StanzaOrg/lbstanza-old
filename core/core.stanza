@@ -283,6 +283,7 @@ defn cast-message (t:Type, x, ctxt:Int) :
 public lostanza defn fatal! (msg:ptr<byte>) -> ref<Void> :
   call-c clib/fflush(stdout)
   call-c clib/fprintf(current-err, "FATAL ERROR: %s\n", msg)
+  call-c clib/fflush(current-err)
   print-stack-trace()
   call-c clib/exit(-1)
   ;Unreachable
@@ -490,6 +491,7 @@ lostanza val stdout:ptr<?> = call-c clib/get_stdout()
 lostanza val stderr:ptr<?> = call-c clib/get_stderr()
 lostanza val stdin:ptr<?> = call-c clib/get_stdin()
 lostanza val EOF:int = call-c clib/get_eof()
+lostanza var current-err:ptr<?> = stderr
 
 ;============================================================
 ;================ Constant Initialization ===================
@@ -636,6 +638,8 @@ public lostanza defn round-up-to-whole-pages (x:long) -> long :
 ;If it cannot do that, then it fails with an unrecoverable
 ;"Out Of Memory" error.
 lostanza defn extend-heap (size:long) -> long :
+  ;Ensure that the stack pool is wellformed.
+  ensure-stack-pool-wellformed!(addr(STACK-POOL), 0)
   ;Collect garbage, and ensure we freed enough space
   val remaining = call-prim collect-garbage(size)
   free-unmarked-stacks(addr(STACK-POOL))
@@ -757,8 +761,46 @@ lostanza defn StackPool () -> StackPool :
     stacks[i] = alloc-stack-frames(i, INITIAL-STACK-SIZE)
   ;Allocate pool for big stacks
   val big-capacity = 4
-  val big-stacks = call-c clib/stz_malloc(big-capacity * sizeof(ptr<?>))
-  return StackPool{capacity, 0, stacks, big-capacity, 0, big-stacks}
+  val big-stacks:ptr<ptr<StackFrameHeader>> = call-c clib/stz_malloc(big-capacity * sizeof(ptr<?>))
+  ;Set first big stack to be the entrant stack
+  val vms:ptr<VMState> = call-prim flush-vm()
+  val entry-stack:ptr<Stack> = untag(vms.current-stack)
+  big-stacks[0] = header(entry-stack.frames)
+  val entry-system-stack:ptr<Stack> = untag(vms.system-stack)
+
+  ;Create StackPool
+  return StackPool{capacity, 0, stacks, big-capacity, 1, big-stacks}
+
+lostanza defn ensure-stack-pool-wellformed! (pool:ptr<StackPool>, after-marking?:long) -> ref<False> :
+  ;Ensure that pool.num-used is in bounds.
+  if pool.num-used < 0 or pool.num-used > pool.capacity :
+    fatal!("Stack pool num-used is out of bounds.")
+  ;Ensure that each of the small stacks are wellformed.
+  ;They must have the correct pool-index and mark.
+  for (var i:int = 0, i < pool.capacity, i = i + 1) :
+    val s = pool.stacks[i]
+    if s.pool-index != i :
+      fatal!("Small stack does not have correct pool index.")
+    if after-marking? :
+      if s.mark != 0 and i >= pool.num-used :
+        fatal!("Small stack is marked but is not one of the used stacks.")
+    else :
+      if s.mark != 0 :
+        fatal!("Small stack is marked when it should not be.")
+
+  ;Ensure that pool.big-size is in bounds.
+  if pool.big-size < 0 or pool.big-size > pool.big-capacity :
+    fatal!("Size of big stack pool is out of bounds.")
+  ;Ensure that each of the big stacks are wellformed.
+  for (var i:int = 0, i < pool.big-size, i = i + 1) :    
+    val s = pool.big-stacks[i]
+    if s.pool-index != -1 :
+      fatal!("Big stack must have -1 as its pool index.")
+    if after-marking? == 0 :
+      if s.mark != 0 :
+        fatal!("Big stack is marked when it should not be.")
+  ;Meaningless return    
+  return false
 
 lostanza defn ensure-capacity (pool:ptr<StackPool>, capacity:int) -> int :
   ;Do something only if we are under capacity
@@ -885,6 +927,9 @@ lostanza defn gc-if-no-stacks (pool:ptr<StackPool>) -> int :
   return 0
 
 lostanza defn free-unmarked-stacks (pool:ptr<StackPool>) -> int :
+  ;First ensure that the stack pool is wellformed.
+  ensure-stack-pool-wellformed!(addr(STACK-POOL), 1)
+  
   ;Free all stacks in small pool
   labels :
     begin : goto loop(0)
@@ -897,21 +942,28 @@ lostanza defn free-unmarked-stacks (pool:ptr<StackPool>) -> int :
         else :
           s.mark = 0
           goto loop(i + 1)
+          
   ;Free all stacks in big pool
   labels :
     begin : goto loop(0, 0)
+    ;- n: the number of live big stacks encountered thus far.
+    ;- i: the index of the next big stack to process.
     loop (n:int, i:int) :
       if i < pool.big-size :
         val s = pool.big-stacks[i]
         if s.mark == 0 :
+          ;If the stack is unmarked (dead) then free it.
           call-c clib/stz_free(s)
           goto loop(n, i + 1)
         else :
+          ;If the stack is marked (live), then clear the mark
+          ;and move it down to the appropriate position.
           s.mark = 0
           pool.big-stacks[n] = s
           goto loop(n + 1, i + 1)
       else :
         pool.big-size = n
+        
   ;Check that all stacks are now unmarked.
   #if-not-defined(OPTIMIZE) :
     for (var i:int = 0, i < pool.capacity, i = i + 1) :
@@ -1053,6 +1105,10 @@ lostanza val BITS-IN-LONG:long = 1 << LOG-BITS-IN-LONG
 ;- size is the maximum size that the heap can be expanded to.
 ;- bitset is the starting address of the marking bits for the heap.
 ;- compaction-start is the lowest moving object in collection area.
+;- log2-bucket-size: The heap is divided into equal-sized buckets for
+;  enabling fast lookup in the break table. Each bucket is sized to be
+;  a power-of-2 number of bytes. log2-bucket-size holds the log2 of the
+;  size of the bucket.
 lostanza deftype Heap :
   var top: ptr<long>
   var limit: ptr<long>
@@ -1060,6 +1116,7 @@ lostanza deftype Heap :
   var size: long
   var bitset: ptr<long>
   var compaction-start: ptr<long>
+  var log2-bucket-size: int
 
   ;Marking stack
   ;Note that the stack grows downwards so stack-bottom is equal to
@@ -1111,6 +1168,8 @@ lostanza defn initialize-heap (min-size:long, max-size:long, vms:ptr<VMState>) -
   clear(vms.new-heap.bitset, min-bitset-size)
   ;Allocate space for marking stack (1024L * sizeof(long))
   ;Initialize stack-top and stack-bottom to just past the allocated memory.
+  ;TODO: If marking stack were reserved right above the heap end, the entire address
+  ;range from heap-top to stack-bottom could be occupied by the stack.
   val stack-size = round-up-to-whole-pages(1024L << LOG-BYTES-IN-LONG)
   vms.new-heap.stack-start = call-c clib/stz_memory_map(stack-size, stack-size)
   vms.new-heap.stack-bottom = vms.new-heap.stack-start + stack-size
@@ -1623,15 +1682,334 @@ lostanza defn skip-and-clear-marked (start:ptr<long>, vms:ptr<VMState>) -> ptr<l
   ;Return the heap-top to indicate no unmarked object found.
   return heap-top
 
+;Scans the heap from given start to heap top until first marked object found.
+;Returns address of the first unmarked object or the heap top if it is not found.
+lostanza defn skip-unmarked (start:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
+  ;Precondition: Ensure that given start is below or equal to heap top.
+  val heap-top = vms.new-heap.top
+  #if-not-defined(OPTIMIZE) :
+    if start > heap-top : fatal("Invalid range.")
+    
+  ;Start scan pointer from the given start, proceeding until
+  ;we hit heap top.    
+  var p:ptr<long> = start
+  while p < heap-top :
+    ;If the pointer points to a marked object
+    ;then return that pointer immediately.    
+    if test-mark(p, vms) : return p
+    ;Advance the pointer by the object size, so that p
+    ;points to the next object in the heap.
+    p = p + allocation-size(p, vms)
+
+  ;Sanity check: If none of the objects in the heap are
+  ;marked, then we should be at heap-top exactly by the
+  ;end of the scan. 
+  #if-not-defined(OPTIMIZE) :
+    if p != heap-top : fatal("Invalid heap-top.")
+
+  ;Return heap-top to indicate no marked object found.
+  return heap-top
+
+;Write the live range r into the heap address at the given break location.
+;
+;Live ranges are stored directly in the heap memory, in the space
+;currently occupied by dead objects: the breaks.
+;
+;The encoding varies depending upon the size of the break.
+;The minimum size of a break is 8 bytes long, but the live range struct is
+;in general 16 bytes long.
+;
+;Encoding:
+;Case break >= 16 bytes: then just directly store the live range.
+;Case break == 8 bytes: only store the 'dead' field, tagged with 1.
+;
+;Since heap addresses are always 8-byte aligned, the tagged 1 will tell us
+;which encoding we are using. 
+lostanza defn write-live-range (location:ptr<long>, r:LiveRange) -> ref<False> :
+  ;Case: break == 8 bytes.
+  if addr(location[1]) == r.live :
+    ;Store the tagged 'dead' field.
+    location[0] = (r.dead as long) | 1
+  ;Case: break >= 16 bytes.
+  else :
+    ;Store the live range directly.    
+    location[0] = r.live as long
+    location[1] = r.dead as long
+  ;No meaningful return value
+  return false
+
+;Represents a live range: a region of live objects.
+;- live: the address of the first live object in the range.
+;- dead: the address just past the last live object in the range.
+lostanza deftype LiveRange :
+  live:ptr<long>
+  dead:ptr<long>
+
+;Read the live range at the given break location.
+lostanza defn read-live-range (location:ptr<long>) -> LiveRange :
+  ;Read the first word at the location.
+  val location0 = location[0]
+  ;Test the tag bit to determine which encoding we are using.
+  if location0 & 1L :
+    ;Case break == 8 bytes.
+    val live = addr(location[1])             ;Computed from size of break.
+    val dead = (location0 - 1) as ptr<long>  ;Remove tag bit.
+    return LiveRange{live, dead}
+  else :
+    ;Case break >= 16 bytes.
+    val live = location0 as ptr<long>
+    val dead = location[1] as ptr<long>
+    return LiveRange{live, dead}
+
+;The break table considers the heap broken up into equal-sized buckets.
+;Each bucket stores its information in a BreakTableEntry.
+;- first-break-location: the address right after the first live range in this break.
+;- accumulated-offset: the total number of bytes occupied by unmarked objects
+;  before the first live range in this break.
+lostanza deftype BreakTableEntry :
+  var first-break-location:ptr<long>
+  var accumulated-offset:long
+
+;Computes log2 of the bucket size. Bucket size must be power-of-2 and satisfy:
+;  bucket-size * break-table-length >= total-compaction-area
+;Returns bucket-size = ceil(log2( total-compaction-area / break-table-length ))
+lostanza defn log2-bucket-size (break-table-length:long, vms:ptr<VMState>) -> int :
+  ;Goal: Compute minimum n such that:
+  ;      2^n * break-table-length >= total-compaction-area
+  ;Equivalent to: ceil(total-compaction-area / 2^n)  <=  break-table-length
+  ;Equivalent to: floor((total-compaction-area - 1) / 2^n) + 1  <=  break-table-length
+  ;Equivalent to: floor((total-compaction-area - 1) / 2^n)  <  break-table-length
+  var count:int = 0
+  var compaction-area-size:long = vms.new-heap.top - vms.new-heap.compaction-start - 1L
+  while compaction-area-size >= break-table-length :
+    count = count + 1
+    compaction-area-size = compaction-area-size >> 1
+  return count
+
+;Given that p is a heap pointer, return the index of the break table bucket
+;that contains p.
+lostanza defn break-table-index (p:ptr<?>, vms:ptr<VMState>) -> long :
+  return (p - vms.new-heap.compaction-start) >> vms.new-heap.log2-bucket-size
+
+;Create the break table in the memory originally used for the marking stack, at vms.new-heap.stack-start.
+;- compaction-start is the address of the lowest unmarked object if one exists, or
+;  heap-top if it doesn't. 
+;After this function finishes:
+;1) The break table entries will be created properly.
+;2) The heap top will be updated.
+;3) The information about live ranges will be annotated directly in the breaks.
+;4) The compaction start address will be recorded.
+lostanza defn create-break-table (compaction-start:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  ;Record the compaction-start address.
+  vms.new-heap.compaction-start = compaction-start
+
+  ;Marking stack is used only during marking phase. Now we reuse its memory
+  ;for the root of break table. Compute the number of entries (and
+  ;hence buckets) in the break table. We plan to use the entire space
+  ;originally reserved for the marking stack for break table entries.
+  val marking-stack-size = vms.new-heap.stack-bottom - vms.new-heap.stack-start
+  val break-table-length = marking-stack-size / sizeof(BreakTableEntry)
+  
+  ;Based upon the number of entries in the break table, compute and
+  ;store the size of the buckets.
+  vms.new-heap.log2-bucket-size = log2-bucket-size(break-table-length, vms)
+
+  ;Construct break table using the memory of the marking stack.
+  val break-table = vms.new-heap.stack-start as ptr<BreakTableEntry>  
+
+  ;Fill the break table and annotate the breaks with the live ranges.
+  ;- index: the index of the last bucket whose entry has been filled.
+  ;- limit: the top of the heap
+  ;- offset: the accumulated offset that all objects in the current bucket
+  ;  should be shifted by. Guaranteed to be strictly negative because
+  ;  objects can only move downwards during compaction phase.
+  ;- current-unmarked: points to the next break in the heap.
+  var index:long = -1
+  val limit = vms.new-heap.top
+  var offset:long = 0
+  var current-unmarked:ptr<long> = compaction-start
+  while current-unmarked < limit :
+    ;Compute the details of the next live range.
+    ;The live range starts at 'next-marked' and ends at 'next-unmarked'.
+    ;If there are no more marked objects, then record current-unmarked
+    ;as the top of the heap, and return immediately.
+    val next-marked = skip-unmarked(current-unmarked, vms)
+    if next-marked == limit :
+      vms.new-heap.top = current-unmarked
+      return false
+    val next-unmarked = skip-and-clear-marked(next-marked, vms)
+    ;Store the live range information in the heap in the
+    ;current break.
+    write-live-range(current-unmarked, LiveRange{next-marked, next-unmarked})
+
+    ;Compute the length of the current break, and update the
+    ;accumulated offset.
+    offset = offset - (next-marked - current-unmarked)
+
+    ;Fill break table root entries.
+    ;The upcoming live range can potentially span multiple buckets.
+    ;Compute 'start-index' and 'end-index' the indices of the first
+    ;(inclusive) and last (inclusive) buckets that the live range
+    ;spans.
+    val start-index = break-table-index(next-marked, vms)
+    val end-index = break-table-index(next-unmarked - 1, vms)
+
+    ;Advance the index to be at least the starting index of the
+    ;live range.
+    if index < start-index : index = start-index
+
+    ;For all buckets that the live range spans (that haven't already
+    ;been filled with a BreakTableEntry), fill in the same
+    ;BreakTableEntry.
+    while index <= end-index :
+      ;Sanity check: the index should never exceed the break table length.
+      #if-not-defined(OPTIMIZE) :
+        if index >= break-table-length : fatal("Index out of range.")
+      ;Store the break table entry, and advance to the next bucket.
+      break-table[index] = BreakTableEntry{next-unmarked, offset}
+      index = index + 1
+      
+    ;Advance past the live range to the next potential break.
+    current-unmarked = next-unmarked
+  ;No meaningful return value
+  return false
+
+;Returns the offset that needs to be added to an object to
+;compute its new address after compaction.
+;- p: The pointer to the object. Can point at the object's header, inside the object,
+;  or right above the object.
+lostanza defn relocation-offset (p:ptr<?>, vms:ptr<VMState>) -> long :
+  ;Retrieve the break table from the memory originally used for the
+  ;marking stack.
+  val break-table = vms.new-heap.stack-start as ptr<BreakTableEntry>
+  ;Compute the index of the bucket that this object falls in, and
+  ;retrieve the corresponding break table entry for that object.
+  val break-table-entry = break-table[break-table-index(p, vms)]
+  ;If the object is located within the first live range in the
+  ;bucket, then the accumulated offset is equal to the final offset
+  ;to return.
+  var offset:long = break-table-entry.accumulated-offset
+  ;dead starts off holding the address just after the first live range
+  ;in the bucket. So if dead < p, then the object is *not* in the
+  ;first live range in the bucket, and we need to add the other
+  ;breaks to the final offset.
+  var dead:ptr<long> = break-table-entry.first-break-location
+  while dead < p :
+    ;Read the next live range in the bucket.
+    val next = read-live-range(dead)
+    ;Compute the length of the next break and subtract it
+    ;from the final offset. The next break proceeds from
+    ;the end of the previous break (dead) to the beginning
+    ;of the next break (next.live).     
+    offset = offset - (next.live - dead)
+    ;Update dead to be the end of the next break.
+    dead = next.dead
+  ;Return the final offset.
+  return offset
+
+;Given a pointer to an object reference, write its new value after compaction in-place.
+lostanza defn relocate-reference (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  ;Retrieve the value at the given heap pointer.
+  val v = [ref]
+  ;Is this a reference to a Stanza heap object?
+  val tagbits = v & 7L
+  if tagbits == 1L :
+    ;Remove the tag bits to retrieve the object pointer.
+    val p = (v - 1) as ptr<long>  ;This decrement is not really necessary
+    ;Only pointers to objects in the compaction area are relocated.
+    if p > vms.new-heap.compaction-start :
+      [ref] = v + relocation-offset(p, vms)
+  ;No meaningful return value
+  return false
+
+;Relocate all object references as part of compaction.
+lostanza defn relocate-references (vms:ptr<VMState>) -> ref<False> :
+  ;Relocate all GC roots. 
+  iterate-roots(addr(relocate-reference), vms)
+  ;Relocate liveness trackers separately because their
+  ;references are not typed as references.
+  relocate-liveness-trackers(vms)
+  ;Scan the live ranges
+  val limit = vms.new-heap.top
+  var dead:ptr<long> = vms.new-heap.compaction-start
+  while dead < limit :
+    ;Read the annotated LiveRange record for the current
+    ;break.
+    val next = read-live-range(dead)
+    ;Relocate references in every object in the live range
+    var p:ptr<long> = next.live
+    while p < next.dead :
+      iterate-references(p, addr(relocate-reference), vms)
+      p = p + allocation-size(p, vms)
+    ;Advance to next break.
+    dead = next.dead
+  ;No meaningful return value
+  return false
+
+;Move objects in heap to lower memory as part of compaction.
+lostanza defn compact (vms:ptr<VMState>) -> ref<False> :
+  ;offset holds the amount that objects need to be
+  ;shifted by to reach their new location.
+  var offset:long = 0
+  val top = vms.new-heap.top
+  var dead:ptr<long> = vms.new-heap.compaction-start
+  while dead < top :
+    ;Read the live range annotated in the current break.
+    val next = read-live-range(dead)
+    ;The span of dead objects spans from dead (the end of the previous
+    ;live range) to next.live (the start of the next live range).
+    offset = offset - (next.live - dead)
+    ;Shift the entire live range down by 'offset'.
+    call-c clib/memcpy(next.live + offset, next.live, next.dead - next.live)
+    ;Advance to the next break.
+    dead = next.dead
+  ;Record the new heap top.
+  vms.new-heap.top = top + offset
+  ;No meaningful return value
+  return false
+
+;Used as callback to iterate-marked. GC is incorrect if ever called.
+lostanza defn fatal-object-marked! (p:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+  fatal("Unexpected marked object.")
+  ;No meaningful return value
+  return false
+
+;Calls fatal if any object in the heap is marked.
+lostanza defn ensure-no-marks-in-collection-area! (vms:ptr<VMState>) -> ref<False> :
+  #if-not-defined(OPTIMIZE) :
+    ;There must be no marks in collection area and above heap top
+    iterate-marked(vms.new-heap.start, vms.new-heap.limit, addr(fatal-object-marked!), vms)
+  ;No meaningful return value
+  return false
+
 lostanza defn new-collect-garbage (vms:ptr<VMState>) -> ref<False> :
+  ;Precondition: No objects should be marked.
+  ensure-no-marks-in-collection-area!(vms)
+
+  ;Four phases:
+  ;1) Mark
+  ;2) Construct break table
+  ;3) Relocate references
+  ;4) Compact
+
+  ;Phase 1. Mark
   mark-reachable-objects(vms)
   scan-liveness-trackers(vms)
 
-  ;Find the first unmarked object. If there are no unmarked objects at all
-  ;then collect-garbage exits without doing anything.
-  vms.new-heap.compaction-start = skip-and-clear-marked(vms.new-heap.start, vms)
-  if vms.new-heap.compaction-start == vms.new-heap.top : return false
+  ;Find the first unmarked object. If there is one, then this is where
+  ;compaction begins.
+  val compaction-start = skip-and-clear-marked(vms.new-heap.start, vms)
+  if compaction-start < vms.new-heap.top :
+    ;Phase 2. Construct break table
+    create-break-table(compaction-start, vms)
+    ;Phase 3. Relocate references
+    relocate-references(vms)
+    ;Phase 4. Compact
+    compact(vms)
 
+  ;Post condition: All marks should be cleared.
+  ensure-no-marks-in-collection-area!(vms)
+  
   ;No meaningful return value
   return false
 
@@ -1675,6 +2053,7 @@ lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
   ;p is a pointer to the list being scanned.
   var p:ptr<ptr<NewLivenessTracker>> = addr(LIVENESS-TRACKERS)
   ;Scan until we reach the end of the list (represented using null pointer).
+  ;TODO: In generational GC scan the list while [p] >= collection-area-start
   while [p] != null :
     ;Retrieve the next ptr<LivenessTracker> in the list.
     val tracker = [p]
@@ -1706,6 +2085,27 @@ lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
         ;Go to the next element in the list.
         p = addr(tracker.tail)
 
+  ;No meaningful return value
+  return false
+
+;Relocate the referenced objects in the global list of liveness trackers
+;as part of compaction.
+lostanza defn relocate-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
+  val compaction-start = vms.new-heap.compaction-start
+  ;p is a pointer to the list being scanned.
+  var p:ptr<ptr<NewLivenessTracker>> = addr(LIVENESS-TRACKERS)
+  ;GC preserves the allocation order, so:
+  ;  1) Tracker value is always below the tracker.
+  ;  2) Later trackers in the list are below earlier trackers.
+  while [p] > compaction-start :
+    ;Retrieve the next ptr<LivenessTracker> in the list.
+    val tracker = [p]
+    ;Relocate the pointer to the tracker
+    [p] = tracker + relocation-offset(tracker, vms)
+    ;Relocate the tracker value
+    relocate-reference(addr(tracker.value), vms)
+    ;Go to the next element in the list.
+    p = addr(tracker.tail)
   ;No meaningful return value
   return false
 
@@ -1772,13 +2172,16 @@ lostanza defn collect-garbage (vms:ptr<VMState>) -> long :
     consts[i] = post-gc-object(consts[i], vms)
 
   ;Scan stack roots
+  val current-stack-obj = untag(vms.current-stack) as ptr<Stack>
+  val system-stack-obj = untag(vms.system-stack) as ptr<Stack>
   ;call-c clib/printf("scan stacks\n")
   vms.current-stack = post-gc-object(vms.current-stack, vms)
   vms.system-stack = post-gc-object(vms.system-stack, vms)
 
   ;Scan heap
   ;call-c clib/printf("scan heap\n")
-  scan-heap(vms)
+  val gc-stack-obj:ptr<Stack> = untag(vms.current-stack)
+  scan-heap(vms, gc-stack-obj.frames)
 
   ;Scan tracker chain
   ;call-c clib/printf("scan tracker chain\n")
@@ -1798,8 +2201,19 @@ lostanza defn object-size-on-heap (sz:ref<Int>) -> ref<Int> :
   return new Int{object-size-on-heap(sz.value) as int}
 
 lostanza defn scan-frames (frames:ptr<StackFrame>, f-end:ptr<StackFrame>, vms:ptr<VMState>) -> int :
-  if frames != null :
+  if frames != null :    
     val frameheader = header(frames)
+
+    ;Sanity check: The frames should never have been scanned before (and therefore should be unmarked).
+    if frameheader.mark != 0 :
+      fatal!("Repeated scanning of stack frame.")
+    if frameheader.pool-index >= 0 :
+      val i = frameheader.pool-index
+      if i >= STACK-POOL.num-used :
+        fatal!("Stack is reachable but not considered a used stack.")
+      else if STACK-POOL.stacks[i] != frameheader :
+        fatal!("Stack pool index field does not match stack stored in the pool.")
+
     frameheader.mark = 1
     var f:ptr<StackFrame> = frames
     while f <= f-end :
@@ -1814,10 +2228,10 @@ lostanza defn scan-frames (frames:ptr<StackFrame>, f-end:ptr<StackFrame>, vms:pt
       f = f + map.size
   return 0
 
-lostanza defn scan-heap (vms:ptr<VMState>) -> int :
+lostanza defn scan-heap (vms:ptr<VMState>, gc-stack-frames:ptr<StackFrame>) -> int :
   var p:ptr<long> = vms.heap
   while p < vms.heap-top :
-    p = scan-object(p, vms)
+    p = scan-object(p, vms, gc-stack-frames)
   return 0
 
 lostanza defn scan-tracker-chain (tracker-chain:ptr<LivenessTrackerObj>) -> int :
@@ -1845,7 +2259,7 @@ lostanza defn post-gc-weak-object (ref:long) -> long :
 lostanza defn false-marker () -> long :
   return tagof(False) << 3L + 2
 
-lostanza defn scan-object (p:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
+lostanza defn scan-object (p:ptr<long>, vms:ptr<VMState>, gc-stack-frames:ptr<StackFrame>) -> ptr<long> :
   ;p is [tag, cells ...]
   val tag = [p] as int
   ;call-c clib/printf("scan-object %p (tag = %d)\n", p, tag)
@@ -1861,9 +2275,10 @@ lostanza defn scan-object (p:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
       return p + sizeof(LivenessTrackerObj)
     else :
       ;Scan the frames of a stack
-      if tag == tagof(Stack) :
+      if tag == tagof(Stack) :        
         val s = (p + 8) as ptr<Stack>
-        scan-frames(s.frames, s.stack-pointer, vms)
+        if s.frames != gc-stack-frames :
+          scan-frames(s.frames, s.stack-pointer, vms)
       ;Get properties
       val size = object-size-on-heap(class-rec.size)
       val roots = addr(class-rec.roots)
@@ -3830,7 +4245,6 @@ public defn set-current-output-stream (o:OutputStream) :
 ;                 ====================
 
 var CURRENT-ERROR-STREAM : OutputStream = STANDARD-ERROR-STREAM
-lostanza var current-err:ptr<?> = stderr
 
 public defn with-error-stream<?T> (o:OutputStream, body: () -> ?T) -> T :
   val oldv = CURRENT-ERROR-STREAM
@@ -4722,8 +5136,10 @@ lostanza defn ptr-to-string? (p:ptr<byte>) -> ref<String|False> :
 
     ;Utility: If path has form X:\mydir, then return X. 
     defn drive-letter? (path:String) -> Char|False :
-      if length(path) >= 3 and path[1 to 3] == ":\\" :
-        path[0]
+      if length(path) >= 3 :
+        val chars = path[1 to 3]
+        if chars == ":\\" or chars == ":/" :
+          path[0]
 
     ;Step 2.
     defn resolve-by-substituting-drive-letter (unc-path:String) :
