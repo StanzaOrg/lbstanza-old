@@ -33,11 +33,6 @@
 //       Forward Declarations
 //       ====================
 
-//FMalloc Debugging
-#ifdef FMALLOC
-static void init_fmalloc ();
-#endif
-
 void* stz_malloc (stz_long size);
 void stz_free (void* ptr);
 
@@ -362,127 +357,6 @@ stz_long file_time_modified (const stz_byte* filename){
   return 0;
 }
 
-#ifdef FMALLOC
-//============================================================
-//======================= Free List ==========================
-//============================================================
-
-typedef struct {
-  int capacity;
-  int size;
-  void** items;
-} FreeList;
-
-static FreeList make_freelist (int c){
-  void** items = (void**)malloc(c * sizeof(void*));
-  FreeList f = {c, 0, items};
-  return f;
-}
-
-static void ensure_capacity (FreeList* list, int c){
-  if(list->capacity < c){
-    int c2 = list->capacity;
-    while(c2 < c) c2 *= 2;
-    void** items2 = (void**)malloc(c2 * sizeof(void*));
-    memcpy(items2, list->items, list->capacity * sizeof(void*));
-    free(list->items);
-    list->items = items2;
-    list->capacity = c2;
-  }
-}
-
-static void delete_index (FreeList* list, int xi){
-  int yi = list->size - 1;
-  void* x = list->items[xi];
-  void* y = list->items[yi];
-  if(xi != yi){
-    list->items[xi] = y;
-    list->items[yi] = x;
-  }
-  list->size--;
-}
-
-static void add_item (FreeList* list, void* item){
-  int i = list->size;
-  ensure_capacity(list, i + 1);
-  list->items[i] = item;
-  list->size++;
-}
-
-//============================================================
-//================== Fixed Memory Allocator ==================
-//============================================================
-
-typedef struct {
-  long size;
-  char bytes[];
-} Chunk;
-
-char* mem_top;
-char* mem_limit;
-FreeList mem_chunks;
-
-static void init_fmalloc () {
-  mem_chunks = make_freelist(8);
-  long size = 8L * 1024L * 1024L * 1024L;
-  mem_top = (char*)0x700000000L;
-  mem_limit = mem_top + size;
-  void* result = mmap(mem_top,
-                      size,
-                      PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
-                      0,
-                      0);
-  if(!result){
-    printf("Could not allocate fixed memory.\n");
-    exit(-1);
-  }
-}
-
-static Chunk* alloc_chunk (long size){
-  long total_size = (size + sizeof(Chunk) + 7) & -8;
-  Chunk* chunk = (Chunk*)mem_top;
-  mem_top += total_size;
-  if(mem_top > mem_limit){
-    printf("Out of fixed memory.\n");
-    exit(-1);
-  }
-  chunk->size = size;
-  return chunk;
-}
-
-static Chunk* find_chunk (long size){
-  Chunk* best = 0;
-  int besti = 0;
-  for(int i=0; i<mem_chunks.size; i++){
-    Chunk* c = mem_chunks.items[i];
-    int is_best = 0;
-    if(c->size >= size){
-      if(best) is_best = c->size < best->size;
-      else is_best = 1;
-    }
-    if(is_best){
-      best = c;
-      besti = i;
-    }
-  }
-  if(best)
-    delete_index(&mem_chunks, besti);
-  return best;
-}
-
-static void* fmalloc (long size){
-  Chunk* c = find_chunk(size);
-  if(!c) c = alloc_chunk(size);
-  return c->bytes;
-}
-
-static void ffree (void* ptr){
-  Chunk* c = (Chunk*)((char*)ptr - sizeof(Chunk));
-  add_item(&mem_chunks, c);
-}
-#endif
-
 //============================================================
 //===================== String List ==========================
 //============================================================
@@ -571,19 +445,11 @@ stz_int sleep_us (stz_long us){
 //============================================================
 
 void* stz_malloc (stz_long size){
-  #if defined(FMALLOC)
-    return fmalloc(size);
-  #else
-    return malloc(size);
-  #endif
+  return malloc(size);
 }
 
 void stz_free (void* ptr){
-  #if defined(FMALLOC)
-    ffree(ptr);
-  #else
-    free(ptr);
-  #endif
+  free(ptr);
 }
 
 //============================================================
@@ -658,7 +524,7 @@ void* stz_memory_map (stz_long min_size, stz_long max_size) {
   return p;
 }
 
-//Unmaps the region of memory.
+//Unmaps given segment of memory.
 //This function is called from within Stanza, and size is
 //assumed to be a multiple of the system page size.
 void stz_memory_unmap (void* p, stz_long size) {
@@ -1207,10 +1073,6 @@ static stz_long bitset_size (stz_long heap_size) {
 }
 
 STANZA_API_FUNC int main (int argc, char* argv[]) {
-  #if defined(FMALLOC)
-    init_fmalloc();
-  #endif
-
   input_argc = (stz_int)argc;
   input_argv = (stz_byte **)argv;
   input_argv_needs_free = 0;
