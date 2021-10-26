@@ -705,6 +705,7 @@ typedef struct {
   stz_byte* out_pipe;
   stz_byte* err_pipe;
   stz_byte* file;
+  stz_byte* working_dir;
   stz_byte** argvs;
 } EvalArg;
 
@@ -776,6 +777,7 @@ static void write_earg (FILE* f, EvalArg* earg){
   write_string(f, earg->out_pipe);
   write_string(f, earg->err_pipe);
   write_string(f, earg->file);
+  write_string(f, earg->working_dir);
   write_strings(f, earg->argvs);
 }
 static void write_process_state (FILE* f, ProcessState* s){
@@ -833,6 +835,7 @@ static EvalArg* read_earg (FILE* f){
   earg->out_pipe = read_string(f);
   earg->err_pipe = read_string(f);
   earg->file = read_string(f);
+  earg->working_dir = read_string(f);
   earg->argvs = read_strings(f);
   return earg;
 }
@@ -954,6 +957,14 @@ static void launcher_main (FILE* lin, FILE* lout){
           if(fd < 0) write_error_and_exit(exec_error[WRITE]);
           dup2(fd, 2);
         }
+
+        //Set the working directory of the child process if explicitly
+        //requested.
+        if (earg->working_dir) {
+          if (chdir(C_CSTR(earg->working_dir)) == -1) {
+            write_error_and_exit(exec_error[WRITE]);
+          }
+        }
         
         //Launch child process      
         execvp(C_CSTR(earg->file), (char**)earg->argvs);
@@ -1050,7 +1061,7 @@ stz_int delete_process_pipes (FILE* input, FILE* output, FILE* error, stz_int pi
 
 stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
                        stz_int output, stz_int error, stz_int pipeid,
-                       Process* process) {
+                       stz_byte* working_dir, Process* process) {
   //Initialize launcher if necessary
   initialize_launcher_process();
   
@@ -1075,7 +1086,7 @@ stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
     RETURN_NEG(make_pipe(pipe_name, "_err"))
   
   //Write in command and evaluation arguments
-  EvalArg earg = {STZ_STR(pipe_name), NULL, NULL, NULL, file, argvs};
+  EvalArg earg = {STZ_STR(pipe_name), NULL, NULL, NULL, file, working_dir, argvs};
   if(input == PROCESS_IN) earg.in_pipe = STZ_STR("_in");
   if(output == PROCESS_OUT) earg.out_pipe = STZ_STR("_out");
   if(output == PROCESS_ERR) earg.out_pipe = STZ_STR("_err");
