@@ -93,6 +93,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Box Unbox", box-unbox-fold, "box-unbox1", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code1", false)
     run-pass("Remove Boxes", remove-boxes, "remove-boxes1", false)
+    run-pass("Constant Fold", constant-fold, "constant-fold1", false)
     ;Phase 2
     run-pass("Simple Inline", simple-inline, "inlined2", false)
     run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined2", false)
@@ -101,6 +102,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Box Unbox", box-unbox-fold, "box-unbox2", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code2", false)
     run-pass("Remove Boxes", remove-boxes, "remove-boxes2", false)
+    run-pass("Constant Fold", constant-fold, "constant-fold2", false)
     ;Finish by removing checks 
     run-pass("Force Remove Checks", force-remove-checks, "removed-checks", false)
   run-pass("Resolve Matches", resolve-matches, "resolved-matches", false)
@@ -1633,6 +1635,407 @@ defn cleanup-labels (epackage:EPackage) -> EPackage :
   val exps* = for e in exps(epackage) map :
     cleanup-item(e) as ETExp
   sub-exps(epackage, exps*)
+
+;============================================================
+;==================== CONSTANT FOLD =========================
+;============================================================
+
+;Primitive numbers supported by constant folding.
+deftype ConstantValue :
+  Byte <: ConstantValue
+  Int <: ConstantValue
+  Long <: ConstantValue
+  Float <: ConstantValue
+  Double <: ConstantValue
+  True <: ConstantValue
+  False <: ConstantValue
+
+;The multis for handling the different cases of folding.
+;- fold-binary-op: Responsible for folding binary operations when both arguments are known constants.
+;- fold-unary-op: Responsible for folding unary operations when argument is a known constant.
+;- partial-fold-binary-op: Responsible for folding binary operations when one argument is a known constant.
+;For each folding function, if we are able to successfully statically evaluate the operator,
+;then f is called with the result, and the returned instruction by f is returned by the folder. Otherwise, we
+;return false.
+defmulti fold-binary-op (op:EOp, f:ConstantValue -> EIns|False, a0:ConstantValue, a1:ConstantValue) -> False|EIns
+defmulti fold-unary-op (op:EOp, f:ConstantValue -> EIns|False, a0:ConstantValue) -> False|EIns
+defmulti partial-fold-binary-op (op:EOp, f:ConstantValue|EImm -> EIns|False, a0:ConstantValue|EImm, a1:ConstantValue|EImm) -> False|EIns
+
+;------------------------------------------------------------
+;-------------------- Defaults ------------------------------
+;------------------------------------------------------------
+
+;Return false by default to signal no successful constant folding.
+defmethod fold-binary-op (op:EOp, f:ConstantValue -> EIns|False, a0:ConstantValue, a1:ConstantValue) : false
+defmethod fold-unary-op (op:EOp, f:ConstantValue -> EIns|False, a0:ConstantValue) : false
+defmethod partial-fold-binary-op (op:EOp, f:ConstantValue|EImm -> EIns|False, a0:ConstantValue|EImm, a1:ConstantValue|EImm) : false
+defmethod partial-fold-binary-op (op:EOp, f:ConstantValue|EImm -> EIns|False, a0:ConstantValue, a1:ConstantValue) : fatal("Invalid arguments.")
+defmethod partial-fold-binary-op (op:EOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:EImm) : fatal("Invalid arguments.")
+
+;<doc>-------------------------------------------------------
+;------------------- Binary Op Folding ----------------------
+;------------------------------------------------------------
+
+## Description of Folding Table ##
+Guard:
+- Simple: No guard is needed. The final value can always be computed from input values.
+- Guarded: Guard is needed. For some specific values, we do not attempt to compute the final value.
+Types:
+- B: Byte
+- I: Int
+- L: Long
+- F: Float
+- D: Double
+Stanza Operator:
+- existing: The behaviour of the operator can be implemented using an existing Stanza operator.
+- custom: The behaviour of the operator needs some custom logic to be implemented.
+Left Operand Folding / Right Operand Folding:
+- Z: Do something if the argument is zero.
+- 1: Do something if the argument is one.
+- unchanged: The result is the other argument unchanged.
+- zeroed: The result is zero.
+- multiply: The zero/one multiply relation.
+
+Arity  | Op        | Guard   | Types  | Stanza Operator | Left Operand Folding | Right Operand Folding
+======================================================================================================
+Binary | IntAddOp  | Simple  | I      | existing        | Z_ -> unchanged      | _Z -> unchanged
+Binary | IntSubOp  | Simple  | I      | existing        |                      | _Z -> unchanged
+Binary | IntMulOp  | Simple  | I      | existing        | Z1_ -> multiply      | _Z1 -> multiply
+Binary | IntDivOp  | Guarded | I      | existing        |                      | _1 -> unchanged
+Binary | IntModOp  | Guarded | I      | existing        |                      | _1 -> zeroed
+Binary | IntAndOp  | Simple  | I      | existing        | Z_ -> zeroed         | _Z -> zeroed
+Binary | IntOrOp   | Simple  | I      | existing        | Z_ -> unchanged      | _Z -> unchanged
+Binary | IntXorOp  | Simple  | I      | existing        | Z_ -> unchanged      | _Z -> unchanged
+Binary | IntShlOp  | Simple  | I      | existing        | Z_ -> zeroed         | _Z -> unchanged
+Binary | IntShrOp  | Simple  | I      | existing        | Z_ -> zeroed         | _Z -> unchanged
+Binary | IntAshrOp | Simple  | I      | existing        | Z_ -> zeroed         | _Z -> unchanged
+Binary | IntLtOp   | Simple  | I      | existing        | 
+Binary | IntGtOp   | Simple  | I      | existing        | 
+Binary | IntLeOp   | Simple  | I      | existing        | 
+Binary | IntGeOp   | Simple  | I      | existing        | 
+Binary | AddOp     | Simple  | BILFD  | existing        | Z_ -> unchanged      | _Z -> unchanged
+Binary | SubOp     | Simple  | BILFD  | existing        |                      | _Z -> unchanged
+Binary | MulOp     | Simple  | BILFD  | existing        | Z1_ -> multiply      | _Z1 -> multiply
+Binary | DivOp     | Guarded | ILFD   | existing        |                      | _1 -> unchanged
+Binary | ModOp     | Guarded | IL     | existing        |                      | _1 -> zeroed
+Binary | AndOp     | Simple  | BIL    | existing        | Z_ -> zeroed         | _Z -> zeroed
+Binary | OrOp      | Simple  | BIL    | existing        | Z_ -> unchanged      | _Z -> unchanged
+Binary | XorOp     | Simple  | BIL    | existing        | Z_ -> unchanged      | _Z -> unchanged
+Binary | ShlOp     | Simple  | BIL    | existing        | Z_ -> zeroed         | _Z -> unchanged
+Binary | ShrOp     | Simple  | BIL    | existing        | Z_ -> zeroed         | _Z -> unchanged
+Binary | AshrOp    | Simple  | IL     | existing        | Z_ -> zeroed         | _Z -> unchanged
+Binary | EqOp      | Simple  | BILFD  | custom          | 
+Binary | NeOp      | Simple  | BILFD  | custom          |
+Binary | LtOp      | Simple  | BILFD  | custom          |
+Binary | GtOp      | Simple  | BILFD  | custom          |
+Binary | LeOp      | Simple  | BILFD  | custom          |
+Binary | GeOp      | Simple  | BILFD  | custom          |
+Unary  | IntNotOp  | Simple  | I      | existing        |
+Unary  | IntNegOp  | Simple  | I      | existing        |
+Unary  | NotOp     | Simple  | BIL    | existing        |
+Unary  | NegOp     | Simple  | ILFD   | existing        |
+
+;------------------------------------------------------------
+;-------------------------------------------------------<doc>
+
+;------------------------------------------------------------
+;--------------------- Full Folding -------------------------
+;------------------------------------------------------------
+
+;Definition Class: Binary | --- | Simple | I | existing
+#for (Op in [IntAddOp, IntSubOp, IntMulOp, IntAndOp, IntOrOp, IntXorOp, IntShlOp, IntShrOp, IntAshrOp, IntLtOp, IntGtOp, IntLeOp, IntGeOp],
+      op in [+, -, *, &, |, ^, <<, >>, >>>, <, >, <=, >=]) :
+  defmethod fold-binary-op (operator:Op, f:ConstantValue -> EIns|False, a0:Int, a1:Int) : f(a0 op a1)
+
+;Definition Class: Binary | --- | Guarded | I | existing
+#for (Op in [IntDivOp, IntModOp],
+      op in [/, %]) :
+  defmethod fold-binary-op (operator:Op, f:ConstantValue -> EIns|False, a0:Int, a1:Int) : f(a0 op a1) when a1 != 0
+
+;Definition Class: Binary | --- | Simple | BILFD | existing
+#for (Op in [AddOp, SubOp, MulOp],
+      op in [+, -, *]) :
+  #for Prim in [Byte, Int, Long, Float, Double] :
+    defmethod fold-binary-op (operator:Op, f:ConstantValue -> EIns|False, a0:Prim, a1:Prim) : f(a0 op a1)
+
+;Definition Class: Binary | DivOp | Guarded | ILFD | existing
+#for (Prim in [Int, Long, Float, Double],
+      zero in [0, 0L, 0.0f, 0.0]) :
+  defmethod fold-binary-op (operator:DivOp, f:ConstantValue -> EIns|False, a0:Prim, a1:Prim) : f(a0 / a1) when a1 != zero
+
+;Definition Class: Binary | ModOp | Guarded | IL | existing
+#for (Prim in [Int, Long],
+      zero in [0, 0L]) :
+  defmethod fold-binary-op (operator:ModOp, f:ConstantValue -> EIns|False, a0:Prim, a1:Prim) : f(a0 % a1) when a1 != zero
+
+;Definition Class: Binary | --- | Simple |BIL |existing
+#for (Op in [AndOp, OrOp, XorOp, ShlOp, ShrOp],
+      op in [&, |, ^, <<, >>]) :
+  #for Prim in [Byte, Int, Long] :
+    defmethod fold-binary-op (operator:Op, f:ConstantValue -> EIns|False, a0:Prim, a1:Prim) : f(a0 op a1)
+
+;Definition Class: Binary | --- | Simple |IL |existing
+#for Prim in [Int, Long] :
+  defmethod fold-binary-op (operator:AshrOp, f:ConstantValue -> EIns|False, a0:Prim, a1:Prim) : f(a0 >>> a1)
+
+;Definition Class: Binary | --- | Simple | BILFD | custom
+#for (Op in [EqOp, NeOp, LtOp, GtOp, LeOp, GeOp],
+      op in [==, !=, <, >, <=, >=]) :
+  #for Prim in [Byte, Int, Long, Float, Double] :
+    defmethod fold-binary-op (operator:Op, f:ConstantValue -> EIns|False, a0:Prim, a1:Prim) : f(1L when a0 op a1 else 0L)
+
+;Definition Class: Unary | --- | Simple | I | existing
+#for (Op in [IntNotOp, IntNegOp],
+      op in [bit-not, negate]) :
+  defmethod fold-unary-op (operator:Op, f:ConstantValue -> EIns|False, a0:Int) : f(op(a0))
+
+;Definition Class: Unary | NotOp | Simple | BIL | existing
+#for Prim in [Byte, Int, Long] :
+  defmethod fold-unary-op (operator:NotOp, f:ConstantValue -> EIns|False, a0:Prim) : f(bit-not(a0))
+
+;Definition Class: Unary | NegOp | Simple | ILFD | existing
+#for Prim in [Int, Long, Float, Double] :
+  defmethod fold-unary-op (operator:NegOp, f:ConstantValue -> EIns|False, a0:Prim) : f(negate(a0))
+    
+;------------------------------------------------------------
+;-------------- Partial Folding Left Operand  ---------------
+;------------------------------------------------------------
+
+;Definition class: Binary | --- | --- | I | --- | Z_ -> unchanged | ---
+#for Op in [IntAddOp, IntOrOp, IntXorOp] :
+  defmethod partial-fold-binary-op (operator:Op, f:ConstantValue|EImm -> EIns|False, a0:Int, a1:EImm) :
+    f(a1) when a0 == 0
+
+;Definition class: Binary | IntMulOp | --- | I | --- | 1_ -> unchanged | ---
+defmethod partial-fold-binary-op (operator:IntMulOp, f:ConstantValue|EImm -> EIns|False, a0:Int, a1:EImm) :
+  switch(a0) :
+    0 : f(0)
+    1 : f(a1)
+    else : false
+
+;Definition class: Binary | --- | --- | I | --- | Z_ -> zeroed | ---
+#for Op in [IntAndOp, IntShlOp, IntShrOp, IntAshrOp] :
+  defmethod partial-fold-binary-op (operator:Op, f:ConstantValue|EImm -> EIns|False, a0:Int, a1:EImm) :
+    f(0) when a0 == 0
+
+;Definition class: Binary | AddOp | --- | BILFD | --- | Z_ -> unchanged | ---
+#for (Prim in [Byte, Int, Long, Float, Double],
+      zero in [0Y, 0, 0L, 0.0f, 0.0]) :
+  defmethod partial-fold-binary-op (operator:AddOp, f:ConstantValue|EImm -> EIns|False, a0:Prim, a1:EImm) :
+    f(a1) when a0 == zero
+
+;Definition class: Binary | MulOp | --- | BILFD | --- | 1_ -> unchanged | ---
+#for (Prim in [Byte, Int, Long],
+      zero in [0Y, 0, 0L]
+      one in [1Y, 1, 1L]) :
+  defmethod partial-fold-binary-op (operator:MulOp, f:ConstantValue|EImm -> EIns|False, a0:Prim, a1:EImm) :
+    switch(a0) :
+      zero : f(zero)
+      one : f(a1)
+      else : false
+#for (Prim in [Float, Double],
+      one in [1.0f, 1.0]) :
+  defmethod partial-fold-binary-op (operator:MulOp, f:ConstantValue|EImm -> EIns|False, a0:Prim, a1:EImm) :
+    f(a1) when a0 == one
+
+;Definition class: Binary | --- | --- | BIL | --- | Z_ -> zeroed | ---
+#for (Prim in [Byte, Int, Long]
+      zero in [0Y, 0, 0L]) :
+  #for Op in [AndOp, ShlOp, ShrOp, AshrOp] :
+    defmethod partial-fold-binary-op (operator:Op, f:ConstantValue|EImm -> EIns|False, a0:Prim, a1:EImm) :
+      f(zero) when a0 == zero
+
+;Definition class: Binary | --- | --- | BIL | --- | Z_ -> unchanged | ---
+#for (Prim in [Byte, Int, Long]
+      zero in [0Y, 0, 0L]) :
+  #for Op in [OrOp, XorOp] :
+    defmethod partial-fold-binary-op (operator:Op, f:ConstantValue|EImm -> EIns|False, a0:Prim, a1:EImm) :
+      f(a1) when a0 == zero
+
+;------------------------------------------------------------
+;------------- Partial Folding Right Operand ----------------
+;------------------------------------------------------------
+
+;Definition class: Binary | --- | --- | I | --- | --- | _Z -> unchanged
+#for Op in [IntAddOp, IntSubOp, IntOrOp, IntXorOp, IntShlOp, IntShrOp, IntAshrOp] :
+  defmethod partial-fold-binary-op (operator:Op, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Int) :
+    f(a0) when a1 == 0
+
+;Definition class: Binary | --- | --- | I | --- | --- | _Z1 -> multiply
+defmethod partial-fold-binary-op (operator:IntMulOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Int) :
+  switch(a1) :
+    0 : f(0)
+    1 : f(a0)
+    else : false
+
+;Definition class: Binary | --- | --- | I | --- | --- | _1 -> unchanged
+defmethod partial-fold-binary-op (operator:IntDivOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Int) :
+  f(a0) when a1 == 1
+
+;Definition class: Binary | --- | --- | I | --- | --- | _1 -> zeroed
+defmethod partial-fold-binary-op (operator:IntModOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Int) :
+  f(0) when a1 == 1
+
+;Definition class: Binary | --- | --- | I | --- | --- | _Z -> zeroed
+defmethod partial-fold-binary-op (operator:IntAndOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Int) :
+  f(0) when a1 == 0
+
+;Definition class: Binary | --- | --- | BILFD | --- | --- | _Z -> unchanged
+#for (Prim in [Byte, Int, Long, Float, Double],
+      zero in [0Y, 0, 0L, 0.0f, 0.0]) :
+  #for Op in [AddOp, SubOp] :
+    defmethod partial-fold-binary-op (operator:Op, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+      f(a0) when a1 == zero
+
+;Definition class: Binary | --- | --- | BILFD | --- | --- | _Z1 -> multiply
+#for (Prim in [Byte, Int, Long],
+      zero in [0Y, 0, 0L],
+      one in [1Y, 1, 1L]) :
+  defmethod partial-fold-binary-op (operator:MulOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+    switch(a1) :
+      zero : f(zero)
+      one : f(a0)
+      else : false
+#for (Prim in [Float, Double],
+      one in [1.0f, 1.0]) :
+  defmethod partial-fold-binary-op (operator:MulOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+    f(a0) when a1 == one
+
+;Definition class: Binary | --- | --- | ILFD | --- | --- | _1 -> unchanged
+#for (Prim in [Int, Long, Float, Double],
+      one in [1, 1L, 1.0f, 1.0]) :
+  defmethod partial-fold-binary-op (operator:DivOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+    f(a0) when a1 == one
+
+;Definition class: Binary | --- | --- | IL | --- | --- | _1 -> zeroed
+#for (Prim in [Int, Long],
+      one in [1, 1L]
+      zero in [0, 0L]) :
+  defmethod partial-fold-binary-op (operator:ModOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+    f(zero) when a1 == one
+
+;Definition class: Binary | --- | --- | BIL | --- | --- | _Z -> zeroed
+#for (Prim in [Byte, Int, Long],
+      zero in [0Y, 0, 0L]) :
+  defmethod partial-fold-binary-op (operator:AndOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+    f(zero) when a1 == zero
+
+;Definition class: Binary | --- | --- | BIL | --- | --- | _Z -> unchanged
+#for (Prim in [Byte, Int, Long],
+      zero in [0Y, 0, 0L]) :
+  #for Op in [OrOp, XorOp, ShlOp, ShrOp] :     
+    defmethod partial-fold-binary-op (operator:Op, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+      f(a0) when a1 == zero
+
+;Definition class: Binary | --- | --- | BIL | --- | --- | _Z -> unchanged
+#for (Prim in [Int, Long],
+      zero in [0, 0L]) :
+  defmethod partial-fold-binary-op (operator:AshrOp, f:ConstantValue|EImm -> EIns|False, a0:EImm, a1:Prim) :
+    f(a0) when a1 == zero
+
+;------------------------------------------------------------
+;------------------ Constant Classification -----------------
+;------------------------------------------------------------
+
+;Utility structure to represent the result of classifying an EImm.
+deftype ClassifiedEImm
+defstruct ConstantEImm <: ClassifiedEImm : (histanza?:True|False, value:ConstantValue)
+defstruct NonConstantEImm <: ClassifiedEImm : (value:EImm)
+
+;Classify the given EImm.
+defn classify-eimm (eimm:EImm) -> ClassifiedEImm :
+  match(eimm) :
+    (eimm:ELiteral|ELSLiteral) :
+      match(value(eimm)) :
+        (v:ConstantValue) : ConstantEImm(eimm is ELiteral, v)
+        (v) : NonConstantEImm(eimm)
+    (eimm) : NonConstantEImm(eimm)      
+
+;Classify the given arguments and fold them if appropriate.
+;Returns an EIns if both folding and creating instruction is sucessful.
+;Otherwise returns false.
+;- make-ins (histanza?, value): The function for creating the resulting instruction
+;  after constant folding has been performed.
+defn* fold-args (make-ins:(True|False, ConstantValue|EImm) -> EIns|False,
+                 op:EOp|False,
+                 args:Tuple<EImm>) -> EIns|False :
+  switch(length(args)) :
+    1 :
+      match(classify-eimm(args[0])) :
+        (a0:ConstantEImm) :
+          match(op:EOp) : fold-unary-op(op, make-ins{histanza?(a0), _}, value(a0))
+          else : make-ins(histanza?(a0), value(a0))
+        (a0:NonConstantEImm) :
+          false
+    2 :
+      match(classify-eimm(args[0]), classify-eimm(args[1])) :
+        (a0:ConstantEImm, a1:ConstantEImm) :
+          if histanza?(a0) == histanza?(a1) :
+            fold-binary-op(op as EOp, make-ins{histanza?(a0), _}, value(a0), value(a1))
+        (a0:ConstantEImm, a1:NonConstantEImm) :
+          partial-fold-binary-op(op as EOp, make-ins{histanza?(a0), _}, value(a0), value(a1))
+        (a0:NonConstantEImm, a1:ConstantEImm) :
+          partial-fold-binary-op(op as EOp, make-ins{histanza?(a1), _}, value(a0), value(a1))
+        (a0:NonConstantEImm, a1:NonConstantEImm) :
+          false
+    else :
+      false
+
+;------------------------------------------------------------
+;---------------------- Driver ------------------------------
+;------------------------------------------------------------
+
+; Compiler pass to fold constants in both primitives and if operations.
+; Tracks immutable literal bindings and then uses them
+; to feed a large set of functions that run operations at compile time on
+; values of these literals and produce new literal bindings as a result or
+; in partial folding cases just create simplifications.
+defn constant-fold (epackage:EPackage) -> EPackage :
+
+  ;Perform constant folding on all instructions in the given body.
+  ;Assumes that nested bodies are already folded.
+  defn fold-in-body (e:EBody) -> EBody :
+    ;Return the constant-folded version of the given instruction.
+    defn fold (i:EIns) -> EIns :
+      match(i) :
+        (i:EPrim) :
+          ;Create EDef instruction out of ConstantValue|EImm
+          defn make-def (histanza?:True|False, v:ConstantValue|EImm) -> EDef :
+            val value = match(histanza?, v) :
+              (hi-stanza?:True, v:ConstantValue) : ELiteral(v)
+              (hi-stanza?:False, v:ConstantValue) : ELSLiteral(v)
+              (hi-stanza?, v:EImm) : v
+            EDef(x(i), value)
+          ;Fold the arguments and store result in EDef instruction.
+          match(fold-args(make-def, op(i), ys(i))) :
+            (ins:EIns) : ins
+            (f:False) : i
+        (i:EIf) :
+          ;Create EGoto instruction out of ConstantValue
+          defn make-goto (histanza?:True|False, v:ConstantValue|EImm) -> EGoto|False :
+            match(histanza?, v) :
+              (histanza?:True, v:True) : EGoto(n1(i))
+              (histanza?:True, v:False) : EGoto(n2(i))
+              (histanza?:False, v:Long) : EGoto(n2(i) when v == 0L else n1(i))
+              (histanza?, v) : false
+          ;Fold the arguments and create goto instruction.
+          match(fold-args(make-goto, op(i), ys(i))) :
+            (ins:EIns) : ins
+            (f:False) : i
+        (i) :
+          i
+    ;Launch!
+    val ins* = map(fold, ins(e))
+    sub-ins(e, ins*)
+
+  ;Recursively perform constant folding on all bodies.
+  defn fold-all-bodies (x:ELBigItem) -> ELBigItem :
+    match(map(fold-all-bodies, x)) :
+      (x:EBody) : fold-in-body(x)
+      (x) : x
+
+  ;Launch!
+  fold-all-bodies(epackage) as EPackage
 
 ;============================================================
 ;=================== Lambda Lifting =========================
