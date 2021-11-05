@@ -142,17 +142,18 @@ protected lostanza deftype Stack :
   var pc: long
   var tail: ptr<Stack>
 
-;Global list of live Stacks.
-;New Stacks are added to this list when they are created.
-lostanza var STACKS:ptr<Stack> = null
-
-lostanza defn allocate-stack () -> ref<Stack> :
+lostanza defn allocate-stack (vms:ptr<VMState>) -> ref<Stack> :
   val stack-size = INITIAL-STACK-SIZE
   val frames = allocate-stack-frames(stack-size)
   frames.return = -1L
   frames.liveness-map = 0L
-  val stack = new Stack{stack-size, frames, null, 0, STACKS}
-  STACKS = addr!([stack])
+  ;vms.heap.stacks cannot be passed as an argument to new Stack{...}.
+  ;vms.heap.stacks is a ptr<...>. new Stack{...} can cause a GC.
+  ;GC is aware of vms.heap.stacks and can update it. However it is not
+  ;aware of its local copy passed as a argument, so it keeps the old value.
+  val stack = new Stack{stack-size, frames, null, 0, null}
+  stack.tail = vms.heap.stacks
+  vms.heap.stacks = addr!([stack])
   return stack
 
 lostanza defn iterate-references-in-stack-frames (stack:ptr<Stack>,
@@ -173,45 +174,48 @@ lostanza defn iterate-references-in-stack-frames (stack:ptr<Stack>,
   ;No meaningful return value
   return false
 
+lostanza defn free-stack-list (list:ptr<Stack>) -> ref<False> :
+  for (var stack:ptr<Stack> = list, stack != null, stack = stack.tail) :
+    free-stack-frames(stack.frames, stack.size)
+  ;No meaningful return value
+  return false
 
-;Scan through the global list STACK and update them.
-;After this function finishes:
-;1) The STACKS list shall contain only Stacks that are still live.
+;Scan through current heap stacks list and update them. After this function finishes
+;current heap stacks list shall contain only Stacks that are still live.
 lostanza defn scan-stacks (vms:ptr<VMState>) -> ref<False> :
   var live-stacks:ptr<Stack> = null
-  var previous-stacks:ptr<Stack> = STACKS
+  var previous-stacks:ptr<Stack> = vms.heap.stacks
   ;Some stacks were marked at previous iteration
   while live-stacks != previous-stacks :
-    ;Remember current state of live-staks list
+    ;Remember current state of live-stacks list
     previous-stacks = live-stacks
     ;Complete previous marking before testing if the stacks are marked.
     complete-marking(vms)
-    var p:ptr<ptr<Stack>> = addr(STACKS)
+    var p:ptr<ptr<Stack>> = addr(vms.heap.stacks)
     while [p] != null :
       val stack = [p]
       val stack-obj = stack as ptr<?> - sizeof(long)
       if test-mark(stack-obj, vms) == 0 :
-        ;Proceed to next stack in STACKS list
+        ;Proceed to next stack in stacks list
         p = addr(stack.tail)
       else :
         ;Mark references in stack frames
         iterate-references-in-stack-frames(stack, addr(mark-from-root), vms)
-        ;Remove stack from STACKS list
+        ;Remove stack from stacks list
         [p] = stack.tail
         ;Insert stack to live-stacks list
         stack.tail = live-stacks
         live-stacks = stack
-  ;Now STACKS list contains unreachable stacks only. Dispose their frames.
-  for (var stack:ptr<Stack> = STACKS, stack != null, stack = stack.tail) :
-    free-stack-frames(stack.frames, stack.size)
-  STACKS = live-stacks
+  ;Now stacks list contains unreachable stacks only. Dispose their frames.
+  free-stack-list(vms.heap.stacks)
+  vms.heap.stacks = live-stacks
   ;No meaningful return value
   return false
 
 lostanza defn relocate-stacks (vms:ptr<VMState>) -> ref<False> :
   val compaction-start = vms.heap.compaction-start
   ;p is a pointer to the list being scanned.
-  var p:ptr<ptr<Stack>> = addr(STACKS)
+  var p:ptr<ptr<Stack>> = addr(vms.heap.stacks)
   while [p] != null :
     val stack = [p]
     if stack > compaction-start :
@@ -935,12 +939,11 @@ lostanza defn initialize-stack-pool () -> ref<False> :
   val entry-stack:ptr<Stack> = untag(vms.current-stack)
   val entry-system-stack:ptr<Stack> = untag(vms.system-stack)
   entry-stack.tail = entry-system-stack
-  STACKS = entry-stack
+  vms.heap.stacks = entry-stack
   ;call-c clib/printf("Entry stack frames %p\n", entry-stack.frames)
   ;call-c clib/printf("Entry system stack frames %p\n", entry-system-stack.frames)
   ;No meaningful return value.
   return false
-initialize-stack-pool()
 
 ;<doc>=======================================================
 ;====================== Stack Extension =====================
@@ -1050,23 +1053,27 @@ lostanza val BITS-IN-LONG:long = 1 << LOG-BITS-IN-LONG
 ;- bitset is the starting address of the marking bits for the heap.
 ;- compaction-start is the lowest moving object in collection area.
 public lostanza deftype Heap :
-  var top: ptr<long>
-  var limit: ptr<long>
-  var start: ptr<long>
-  var bitset: ptr<long>
-  var size: long
-  var compaction-start: ptr<long>
+  var top:ptr<long>
+  var limit:ptr<long>
+  var start:ptr<long>
+  var bitset:ptr<long>
+  var size:long
+  var compaction-start:ptr<long>
 
   ;Marking stack
   ;Note that the stack grows downwards so stack-bottom is equal to
   ;stack-start + stack-size, and stack-top decreases as we push new items.
-  var stack-start: ptr<long>
-  var stack-bottom: ptr<long>
-  var stack-top: ptr<long>
+  var stack-start:ptr<long>
+  var stack-bottom:ptr<long>
+  var stack-top:ptr<long>
 
   ;Heap segment with the objects incompletely marked due to stack overflow
-  var min-incomplete: ptr<?>
-  var max-incomplete: ptr<?>
+  var min-incomplete:ptr<?>
+  var max-incomplete:ptr<?>
+
+  ;List of live Stacks in this heap.
+  ;New Stacks are added to this list when they are created.
+  var stacks:ptr<Stack>
 
 ;Given the current number of bytes in the heap, return
 ;the number of bytes in the heap's bitset, rounded up
@@ -1113,11 +1120,16 @@ public lostanza defn initialize-heap (min-size:long, max-size:long, vms:ptr<VMSt
   vms.heap.stack-start = call-c clib/stz_memory_map(stack-size, stack-size)
   vms.heap.stack-bottom = vms.heap.stack-start + stack-size
   vms.heap.stack-top = vms.heap.stack-bottom
+  ;Initialize stack list
+  vms.heap.stacks = null
   ;No meaningful return value.
   return false
 
 ;Remove all associated memory reserved for the current heap structure.
 public lostanza defn finalize-heap (vms:ptr<VMState>) -> ref<False> :
+  ;Dispose stack frames
+  free-stack-list(vms.heap.stacks)
+
   ;Compute the current size of the heap and it's bitset.
   val current-heap-size = vms.heap.limit - vms.heap.start
   val current-bitset-size = bitset-size(current-heap-size)
@@ -1161,7 +1173,7 @@ lostanza defn expand-heap (size:long, vms:ptr<VMState>) -> ref<False> :
 ;Calls fatal if it is not.
 lostanza defn ensure-pointer-in-heap! (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if p < vms.heap.start or  p >= vms.heap.top :
+    if (p < vms.heap.start) or (p >= vms.heap.top) :
       fatal("Pointer is outside of heap.")
   return false
 
@@ -1170,7 +1182,7 @@ lostanza defn ensure-pointer-in-heap! (p:ptr<?>, vms:ptr<VMState>) -> ref<False>
 ;Calls fatal if it is not.
 lostanza defn ensure-address-range-in-heap! (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if start < vms.heap.start or start > limit or limit > vms.heap.top :
+    if (start < vms.heap.start) or (start > limit) or (limit > vms.heap.top) :
       fatal("Address range is outside of heap.")
   return false
 
@@ -2006,7 +2018,13 @@ lostanza var LIVENESS-TRACKERS:ptr<LivenessTracker> = null
 ;Create a new LivenessTracker, wrapped around the given Unique object,
 ;and add it to the global LIVENESS-TRACKERS list.
 public lostanza defn LivenessTracker (value:ref<Unique>) -> ref<LivenessTracker> :
-  val tracker = new LivenessTracker{value as long, LIVENESS-TRACKERS}
+  ;LIVENESS-TRACKERS cannot be passed as an argument to new LivenessTracker{...}.
+  ;LIVENESS-TRACKERS is a ptr<>. new LivenessTracker{...} can cause a GC.
+  ;GC is aware of LIVENESS-TRACKERS and so can update it.
+  ;But local copy of LIVENESS-TRACKERS passed as an argument keeps the old value.
+  val tracker = new LivenessTracker{0L, null}
+  tracker.value = value as long
+  tracker.tail = LIVENESS-TRACKERS
   LIVENESS-TRACKERS = addr!([tracker])
   return tracker
 
@@ -2982,9 +3000,9 @@ lostanza defn initialize-coroutines () -> ref<False> :
   return false
 
 public lostanza defn RawCoroutine (enter:ref<((RawCoroutine, ?) -> ?)>) -> ref<RawCoroutine> :
-  val stk = allocate-stack()
-  stk.pc = addr(setup-coroutine) as long
   val vms:ptr<VMState> = call-prim flush-vm()
+  val stk = allocate-stack(vms)
+  stk.pc = addr(setup-coroutine) as long
   val current-stack = vms.current-stack as ref<Stack>
   return call-prim enter-stack(stk, current-stack, enter)
 
@@ -3289,6 +3307,7 @@ protected val uninitialized = new Uninitialized
 ;============================================================
 
 initialize-error-handler()
+initialize-stack-pool()
 initialize-command-launcher()
 initialize-winders()
 initialize-coroutines()
