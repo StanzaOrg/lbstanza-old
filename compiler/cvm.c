@@ -53,14 +53,14 @@
 #define INT_GT_OPCODE 47
 #define INT_LE_OPCODE 48
 #define INT_GE_OPCODE 49
-#define EQ_OPCODE_REF_REF 50
+#define REF_EQ_OPCODE 50
 #define EQ_OPCODE_REF 51
 #define EQ_OPCODE_BYTE 52
 #define EQ_OPCODE_INT 53
 #define EQ_OPCODE_LONG 54
 #define EQ_OPCODE_FLOAT 55
 #define EQ_OPCODE_DOUBLE 56
-#define NE_OPCODE_REF_REF 57
+#define REF_NE_OPCODE 57
 #define NE_OPCODE_REF 58
 #define NE_OPCODE_BYTE 59
 #define NE_OPCODE_INT 60
@@ -861,7 +861,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       SET_LOCAL(x, BOOLREF((int64_t)(LOCAL(y)) >= (int64_t)(LOCAL(value))));
       continue;
     }
-    case EQ_OPCODE_REF_REF : {
+    case REF_EQ_OPCODE : {
       DECODE_C();
       SET_LOCAL(x, BOOLREF(LOCAL(y) == LOCAL(value)));
       continue;
@@ -896,7 +896,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       SET_LOCAL(x, LOCAL_DOUBLE(y) == LOCAL_DOUBLE(value));
       continue;
     }
-    case NE_OPCODE_REF_REF : {
+    case REF_NE_OPCODE : {
       DECODE_C();
       SET_LOCAL(x, BOOLREF(LOCAL(y) != LOCAL(value)));
       continue;

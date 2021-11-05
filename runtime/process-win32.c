@@ -207,7 +207,10 @@ static void setup_file_handles(
   if (stderr_write != NULL) CloseHandle(stderr_write);
 }
 
-stz_int launch_process(stz_byte* command_line, stz_int input, stz_int output, stz_int error, Process* process) {
+stz_int launch_process(stz_byte* command_line,
+                       stz_int input, stz_int output, stz_int error,
+                       stz_byte* working_dir, Process* process) {
+
   PROCESS_INFORMATION proc_info;
   STARTUPINFO start_info;
   HANDLE stdin_read, stdin_write,
@@ -241,7 +244,7 @@ stz_int launch_process(stz_byte* command_line, stz_int input, stz_int output, st
       /* bInheritHandles      */ TRUE,
       /* dwCreationFlags      */ 0,
       /* lpEnvironment        */ NULL,
-      /* lpCurrentDirectory   */ NULL,
+      /* lpCurrentDirectory   */ (LPSTR)working_dir,
       /* lpStartupInfo        */ &start_info,
       /* lpProcessInformation */ &proc_info);
 
