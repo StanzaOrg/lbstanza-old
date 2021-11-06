@@ -248,7 +248,7 @@
 //============================================================
 
 #define PC_INT() \
-  ({unsigned int _x = *(unsigned int*)pc; \
+  ({uint32_t _x = *(uint32_t*)pc; \
     pc += 4; \
     _x;});
 
@@ -258,46 +258,46 @@
     _x;});
 
 #define DECODE_A_UNSIGNED() \
-  int value = W1 >> 8; \
+  int32_t value = W1 >> 8; \
   /*if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);*/
 
 #define DECODE_A_SIGNED() \
-  int value = (int)W1 >> 8; \
+  int32_t value = (int32_t)W1 >> 8; \
   /*if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);*/
 
 #define DECODE_B_UNSIGNED() \
-  int x = (W1 >> 8) & 0x3FF; \
-  int value = W1 >> 18; \
+  int32_t x = (W1 >> 8) & 0x3FF; \
+  int32_t value = W1 >> 18; \
   /*if(iprint) printf("          %ld) [%d | %d | %d]\n", icounter, opcode, x, value);*/
 
 #define DECODE_C() \
-  int x = (W1 >> 8) & 0x3FF; \
-  int y = (W1 >> 22) & 0x3FF; \
-  int value = PC_INT(); \
+  int32_t x = (W1 >> 8) & 0x3FF; \
+  int32_t y = (W1 >> 22) & 0x3FF; \
+  uint32_t value = PC_INT(); \
   /*if(iprint) printf("          %ld) [%d | %d | %d | %d]\n", icounter, opcode, x, y, value);*/
 
 #define DECODE_D() \
-  int x = (W1 >> 22) & 0x3FF; \
-  long value = PC_LONG(); \
+  uint32_t x = (W1 >> 22) & 0x3FF; \
+  uint64_t value = PC_LONG(); \
   /*if(iprint) printf("          %ld) [%d | _ | %d | %ld]\n", icounter, opcode, x, value);*/
 
 #define DECODE_E() \
-  unsigned int W2 = PC_INT(); \
+  uint32_t W2 = PC_INT(); \
   uint64_t W12 = W1 | ((uint64_t)W2 << 32); \
-  int x = (int)(W12 >> 8) & 0x3FF;  \
-  int y = (int)(W12 >> 18) & 0x3FF; \
-  int z = (int)(W12 >> 28) & 0x3FF; \
-  int value = (int)((int64_t)W12 >> 38); \
+  int32_t x = (int32_t)(W12 >> 8) & 0x3FF;  \
+  int32_t y = (int32_t)(W12 >> 18) & 0x3FF; \
+  int32_t z = (int32_t)(W12 >> 28) & 0x3FF; \
+  int32_t value = (int32_t)((int64_t)W12 >> 38); \
   /*if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, z, value);*/
 
 #define DECODE_F() \
-  unsigned int W2 = PC_INT(); \
+  uint32_t W2 = PC_INT(); \
   uint64_t W12 = W1 | ((uint64_t)W2 << 32); \
-  int x = (int)(W12 >> 8) & 0x3FF;  \
-  int y = (int)(W12 >> 18) & 0x3FF; \
-  int _n1 = (int)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
-  int n1 = (int)(_n1 >> 14); /*Extend sign-bit*/ \
-  int n2 = (int)((int)W2 >> 14); /*Extend sign-bit of first word*/ \
+  int32_t x = (int32_t)(W12 >> 8) & 0x3FF;  \
+  int32_t y = (int32_t)(W12 >> 18) & 0x3FF; \
+  int32_t _n1 = (int32_t)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
+  int32_t n1 = (int32_t)(_n1 >> 14); /*Extend sign-bit*/ \
+  int32_t n2 = (int32_t)((int32_t)W2 >> 14); /*Extend sign-bit of first word*/ \
   /*if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, n1, n2);*/
 
 #define F_JUMP(condition) \
@@ -311,9 +311,9 @@
   }
 
 #define DECODE_TGTS() \
-  int n = PC_INT(); \
+  uint32_t n = PC_INT(); \
   for(int i=0; i<n; i++){ \
-    int tgt = PC_INT(); \
+    uint32_t tgt = PC_INT(); \
     /*printf("            tgt: %d\n", tgt);*/ \
   }
 
@@ -430,7 +430,7 @@ typedef struct{
   uint64_t size;
   StackFrame* frames;
   StackFrame* stack_pointer;
-  long pc;
+  uint64_t pc;
 } Stack;
 
 //============================================================
@@ -439,7 +439,7 @@ typedef struct{
 
 int call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
-char* retrieve_class_name (VMState* vms, long id);
+char* retrieve_class_name (VMState* vms, uint64_t id);
 void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
 
 //============================================================
@@ -515,7 +515,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     //Save pre-decode PC because jump offsets are relative to
     //pre-decode PC.
     char* pc0 = pc;
-    unsigned int W1 = PC_INT();
+    uint32_t W1 = PC_INT();
     int opcode = W1 & 0xFF;
 
     //uint64_t curtime = current_time_ms();
@@ -537,7 +537,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case SET_OPCODE_SIGNED : {
       DECODE_C();
-      SET_LOCAL(y, (int64_t)value);      
+      SET_LOCAL(y, (int64_t)(int32_t)value);      
       continue;
     }
     case SET_OPCODE_CODE : {
@@ -579,7 +579,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case SET_REG_OPCODE_SIGNED : {
       DECODE_C();
-      SET_REG(y, (int64_t)value); 
+      SET_REG(y, (int64_t)(int32_t)value); 
       continue;
     }
     case SET_REG_OPCODE_CODE : {
@@ -1619,7 +1619,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case CLASS_NAME_OPCODE : {
       DECODE_B_UNSIGNED();
-      long id = (long)LOCAL(value);
+      uint64_t id = (uint64_t)LOCAL(value);
       char* name = retrieve_class_name(vms, id);
       SET_LOCAL(x, (uint64_t)name);
       continue;
@@ -1967,7 +1967,7 @@ int lookup_etable (DKV* etable, int slot, int t, int n){
 }
 
 int dhash (int d, int x, int n){
-  unsigned int a = x;
+  uint32_t a = x;
   a = (a + 0x7ed55d16 + d) + (a << 12);
   a = (a ^ 0xc761c23c) ^ (a >> 19);
   a = (a + 0x165667b1) + (a << 5);
