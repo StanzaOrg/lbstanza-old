@@ -30,6 +30,11 @@
 
 #include "process.h"
 
+int gc_counter = 0;
+int testgc_initialized = 0;
+int testgc_min;
+int testgc_max;
+
 //       Forward Declarations
 //       ====================
 
