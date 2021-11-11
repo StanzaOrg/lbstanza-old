@@ -319,7 +319,7 @@
   }
 
 #define SET_REG(r,v) \
-  registers[r] = v    
+  registers[r] = v
 #define SET_LOCAL(l,v) \
   stack_pointer->slots[l] = v;
 #define SET_LOCAL_FLOAT(l,v) \
@@ -342,12 +342,12 @@
   stack_pointer->returnpc = (uint64_t)(pc - instructions);
 
 #define POP_FRAME(num_locals) \
-  stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);  
+  stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);
 
 #define SAVE_STATE() \
   vms->heap_top = heap_top; \
   vms->current_stack = current_stack; \
-  stk->stack_pointer = stack_pointer; 
+  stk->stack_pointer = stack_pointer;
 
 #define RESTORE_STATE() \
   heap_top = vms->heap_top; \
@@ -388,31 +388,30 @@
 //==================== Machine Types =========================
 //============================================================
 
+//The first fields in VMState are used by the core library
+//in both compiled and interpreted mode. The last fields
+//are used only in interpreted mode.
+//Permanent state changes in-between each code load.
+//Variable state changes in-between each boundary change.
 typedef struct{
-  //Permanent State
-  //Changes in-between each code load
-  char* instructions;
-  uint64_t* registers;
-  uint64_t* global_offsets;
-  char* global_mem;
-  uint64_t* const_table;
-  char* const_mem;
-  uint32_t* data_offsets;
-  char* data_mem;
-  uint32_t* code_offsets;
-  //Variable State
-  //Changes in_between each boundary change
-  char* heap;
-  char* heap_top;
-  char* heap_limit;
-  char* free;
-  char* free_limit;
-  uint64_t current_stack;
-  //System state
-  uint64_t system_stack;  
-  uint64_t* system_registers;
-  //Trie table
-  void** trie_table;
+  uint64_t* global_offsets;   //(Permanent State)
+  char* global_mem;           //(Permanent State)
+  uint64_t* const_table;      //(Permanent State)
+  char* const_mem;            //(Permanent State)
+  uint32_t* data_offsets;     //(Permanent State)
+  char* data_mem;             //(Permanent State)
+  uint32_t* code_offsets;     //(Permanent State)
+  uint64_t current_stack;     //(Variable State)
+  uint64_t system_stack;      //(Variable State)
+  uint64_t* registers;        //(Permanent State)
+  uint64_t* system_registers; //(Permanent State)
+  char* instructions;         //(Permanent State)
+  char* heap;                 //(Variable State)
+  char* heap_top;             //(Variable State)
+  char* heap_limit;           //(Variable State)
+  char* free;                 //(Variable State)
+  char* free_limit;           //(Variable State)
+  void** trie_table;          //(Permanent State)
 } VMState;
 
 typedef struct{
@@ -498,7 +497,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
   Stack* stk = untag_stack(current_stack);
   StackFrame* stack_pointer = stk->stack_pointer;
   char* stack_limit = (char*)(stk->frames) + stk->size;
-  char* pc = instructions + stk->pc;  
+  char* pc = instructions + stk->pc;
 
   //Timing
   //uint64_t* timings = (uint64_t*)malloc(255 * sizeof(uint64_t));
@@ -513,7 +512,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
   while(1){
     //icounter++;
     //int iprint = icounter >= iprint_start && icounter <= iprint_end && icounter % iprint_step == 0;
-    
+
     //Save pre-decode PC because jump offsets are relative to
     //pre-decode PC.
     char* pc0 = pc;
@@ -525,21 +524,21 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     //  timings[last_opcode] += curtime - last_time;
     //last_opcode = opcode;
     //last_time = curtime;
-    
+
     switch(opcode){
     case SET_OPCODE_LOCAL : {
       DECODE_C();
-      SET_LOCAL(y, LOCAL(value));      
+      SET_LOCAL(y, LOCAL(value));
       continue;
     }
     case SET_OPCODE_UNSIGNED : {
       DECODE_C();
-      SET_LOCAL(y, (uint64_t)value);      
+      SET_LOCAL(y, (uint64_t)value);
       continue;
     }
     case SET_OPCODE_SIGNED : {
       DECODE_C();
-      SET_LOCAL(y, (int64_t)(int32_t)value);      
+      SET_LOCAL(y, (int64_t)(int32_t)value);
       continue;
     }
     case SET_OPCODE_CODE : {
@@ -566,7 +565,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case SET_OPCODE_WIDE : {
       DECODE_D();
-      SET_LOCAL(x, value);      
+      SET_LOCAL(x, value);
       continue;
     }
     case SET_REG_OPCODE_LOCAL : {
@@ -576,12 +575,12 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case SET_REG_OPCODE_UNSIGNED : {
       DECODE_C();
-      SET_REG(y, (uint64_t)value);   
+      SET_REG(y, (uint64_t)value);
       continue;
     }
     case SET_REG_OPCODE_SIGNED : {
       DECODE_C();
-      SET_REG(y, (int64_t)(int32_t)value); 
+      SET_REG(y, (int64_t)(int32_t)value);
       continue;
     }
     case SET_REG_OPCODE_CODE : {
@@ -608,7 +607,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case SET_REG_OPCODE_WIDE : {
       DECODE_D();
-      SET_REG(x, value);      
+      SET_REG(x, value);
       continue;
     }
     case GET_REG_OPCODE : {
@@ -629,7 +628,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       int num_locals = y;
       uint64_t fid = value;
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
       PUSH_FRAME(num_locals);
       pc = instructions + fpos;
       continue;
@@ -656,7 +655,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       int num_locals = y;
       uint64_t fid = value;
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;      
+      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
       pc = instructions + fpos;
       continue;
     }
@@ -674,9 +673,9 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       int num_locals = y;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
-      c_trampoline(faddr, registers, registers);      
+      c_trampoline(faddr, registers, registers);
       RESTORE_STATE();
-      pc = instructions + stack_pointer->returnpc;      
+      pc = instructions + stack_pointer->returnpc;
       POP_FRAME(num_locals);
       continue;
     }
@@ -686,9 +685,9 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       int num_locals = x;
       PUSH_FRAME(num_locals);
       SAVE_STATE();
-      c_trampoline(faddr, registers, registers);      
+      c_trampoline(faddr, registers, registers);
       RESTORE_STATE();
-      pc = instructions + stack_pointer->returnpc;      
+      pc = instructions + stack_pointer->returnpc;
       POP_FRAME(num_locals);
       continue;
     }
@@ -751,10 +750,10 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         registers = vms->registers;
         //Continue where we were
         retpc = stk->pc;
-        
+
         pc = instructions + retpc;
-        continue;        
-      }      
+        continue;
+      }
       else if(retpc < 0){
         //Save registers
         SAVE_STATE();
@@ -771,7 +770,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_A_UNSIGNED();
       int64_t xl = (int64_t)LOCAL(value);
       char xb = (char)xl;
-      int xi = (int)xl;        
+      int xi = (int)xl;
       float xf = LOCAL_FLOAT(value);
       float xd = LOCAL_DOUBLE(value);
       printf("DUMP LOCAL %d: (byte = %d, int = %d, long = %" PRId64 ", ptr = %p, float = %f, double = %f)\n",
@@ -1007,7 +1006,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       SET_LOCAL_DOUBLE(x, LOCAL_DOUBLE(y) * LOCAL_DOUBLE(value));
       continue;
-    }      
+    }
     case DIV_OPCODE_BYTE : {
       DECODE_C();
       SET_LOCAL(x, (char)(LOCAL(y)) / (char)(LOCAL(value)));
@@ -1032,7 +1031,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       SET_LOCAL_DOUBLE(x, LOCAL_DOUBLE(y) / LOCAL_DOUBLE(value));
       continue;
-    }            
+    }
     case MOD_OPCODE_BYTE : {
       DECODE_C();
       SET_LOCAL(x, (char)(LOCAL(y)) % (char)(LOCAL(value)));
@@ -1273,7 +1272,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       SET_LOCAL(x, (uint64_t)(LOCAL(y)) >= (uint64_t)(LOCAL(value)));
       continue;
-    }      
+    }
     case INT_NOT_OPCODE : {
       DECODE_B_UNSIGNED();
       uint64_t y = LOCAL(value);
@@ -1285,7 +1284,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       int64_t y = LOCAL(value);
       SET_LOCAL(x, - y);
       continue;
-    }      
+    }
     case NOT_OPCODE_BYTE : {
       DECODE_B_UNSIGNED();
       SET_LOCAL(x, ~ ((uint8_t)LOCAL(value)));
@@ -1313,12 +1312,12 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case NEG_OPCODE_FLOAT : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL_FLOAT(x, - LOCAL_FLOAT(value));      
+      SET_LOCAL_FLOAT(x, - LOCAL_FLOAT(value));
       continue;
     }
     case NEG_OPCODE_DOUBLE : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL_DOUBLE(x, - LOCAL_DOUBLE(value));      
+      SET_LOCAL_DOUBLE(x, - LOCAL_DOUBLE(value));
       continue;
     }
     case DEREF_OPCODE : {
@@ -1482,14 +1481,14 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_E();
       int32_t* address = (int32_t*)(LOCAL(x) + value);
       int32_t storeval = (int32_t)(LOCAL(z));
-      *address = storeval;     
+      *address = storeval;
       continue;
     }
     case STORE_OPCODE_8 : {
       DECODE_E();
       int64_t* address = (int64_t*)(LOCAL(x) + value);
       int64_t storeval = (int64_t)(LOCAL(z));
-      *address = storeval;     
+      *address = storeval;
       continue;
     }
     case STORE_OPCODE_1_VAR_OFFSET : {
@@ -1510,7 +1509,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_E();
       int64_t* address = (int64_t*)(LOCAL(x) + LOCAL(y) + value);
       int64_t storeval = (int64_t)(LOCAL(z));
-      *address = storeval;     
+      *address = storeval;
       continue;
     }
     case LOAD_OPCODE_1 : {
@@ -1666,9 +1665,9 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     case JUMP_INT_GE_OPCODE : {
       DECODE_F();
       F_JUMP((int64_t)LOCAL(x) >= (int64_t)LOCAL(y));
-    }      
+    }
     case JUMP_EQ_OPCODE_REF : {
-      DECODE_F();      
+      DECODE_F();
       F_JUMP(LOCAL(x) == LOCAL(y));
     }
     case JUMP_EQ_OPCODE_BYTE : {
@@ -1690,9 +1689,9 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     case JUMP_EQ_OPCODE_DOUBLE : {
       DECODE_F();
       F_JUMP(LOCAL_DOUBLE(x) == LOCAL_DOUBLE(y));
-    }      
+    }
     case JUMP_NE_OPCODE_REF : {
-      DECODE_F();      
+      DECODE_F();
       F_JUMP(LOCAL(x) != LOCAL(y));
     }
     case JUMP_NE_OPCODE_BYTE : {
@@ -1714,7 +1713,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     case JUMP_NE_OPCODE_DOUBLE : {
       DECODE_F();
       F_JUMP(LOCAL_DOUBLE(x) != LOCAL_DOUBLE(y));
-    }      
+    }
     case JUMP_LT_OPCODE_INT : {
       DECODE_F();
       F_JUMP((int32_t)LOCAL(x) < (int32_t)LOCAL(y));
@@ -1790,7 +1789,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     case JUMP_ULE_OPCODE_LONG : {
       DECODE_F();
       F_JUMP((uint64_t)LOCAL(x) <= (uint64_t)LOCAL(y));
-    }      
+    }
     case JUMP_ULT_OPCODE_BYTE : {
       DECODE_F();
       F_JUMP((uint8_t)LOCAL(x) < (uint8_t)LOCAL(y));
@@ -1802,7 +1801,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     case JUMP_ULT_OPCODE_LONG : {
       DECODE_F();
       F_JUMP((uint64_t)LOCAL(x) < (uint64_t)LOCAL(y));
-    }      
+    }
     case JUMP_UGE_OPCODE_BYTE : {
       DECODE_F();
       F_JUMP((uint8_t)LOCAL(x) >= (uint8_t)LOCAL(y));
@@ -1885,22 +1884,22 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         stack_pointer = stk->stack_pointer;
         stack_limit = (char*)(stk->frames) + stk->size;
         registers = vms->registers;
-        //Set arguments        
+        //Set arguments
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1L);
         SET_REG(2, size_required);
         stack_pointer = stk->frames;
         stack_pointer->returnpc = SYSTEM_RETURN_STUB;
-        //Jump to stack extender          
+        //Jump to stack extender
         uint64_t fpos = (uint64_t)(code_offsets[EXTEND_STACK_FN]) * 4;
         pc = instructions + fpos;
-        continue;        
+        continue;
       }
       continue;
     }
     }
 
-    //Done    
+    //Done
     printf("Invalid opcode: %d\n", opcode);
     exit(-1);
   }
@@ -2001,7 +2000,7 @@ int lookup_trie_table (VMState* vms, TrieTable* trie_table){
       int slot = d < 0? -d - 1 : dhash(d, type, n);
       return lookup_etable(big_etable(dtable,n), slot, type, n);
     }
-  }  
+  }
 }
 
 int read_dispatch_table (VMState* vms, int format){
