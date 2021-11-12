@@ -142,91 +142,22 @@ protected lostanza deftype Stack :
   var pc: long
   var tail: ptr<Stack>
 
-lostanza defn allocate-stack (vms:ptr<VMState>) -> ref<Stack> :
-  val stack-size = INITIAL-STACK-SIZE
-  val frames = allocate-stack-frames(stack-size)
-  frames.return = -1L
-  frames.liveness-map = 0L
-  ;vms.heap.stacks cannot be passed as an argument to new Stack{...}.
-  ;vms.heap.stacks is a ptr<...>. new Stack{...} can cause a GC.
-  ;GC is aware of vms.heap.stacks and can update it. However it is not
-  ;aware of its local copy passed as a argument, so it keeps the old value.
-  val stack = new Stack{stack-size, frames, null, 0, null}
-  stack.tail = vms.heap.stacks
-  vms.heap.stacks = addr!([stack])
-  return stack
-
-lostanza defn iterate-references-in-stack-frames (stack:ptr<Stack>,
-                                                  f:ptr<((ptr<long>, ptr<VMState>) -> ref<False>)>,
-                                                  vms:ptr<VMState>) -> ref<False> :
-  if stack == untag(vms.heap.current-stack) : return false
-  var frame:ptr<StackFrame> = stack.frames
-  if frame != null :
-    var end-frame:ptr<StackFrame> = stack.stack-pointer
-    val stackmap-table = vms.stackmap-table
-    while frame <= end-frame :
-      val map = stackmap-table[frame.liveness-map]
-      val num-live = map.num-roots
-      for (var i:int = 0, i < num-live, i = i + 1) :
-        val r = map.roots[i]
-        [f](addr(frame.slots[r]), vms)
-      frame = frame + map.size
+lostanza defn core-iterate-references-in-stack-frames (start-frame:ptr<StackFrame>,
+                                                       end-frame:ptr<StackFrame>,
+                                                       f:ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>,
+                                                       heap:ptr<Heap>) -> ref<False> :
+  val vms:ptr<VMState> = heap.env
+  val stackmap-table = vms.stackmap-table
+  var frame:ptr<StackFrame> = start-frame
+  while frame <= end-frame :
+    val map = stackmap-table[frame.liveness-map]
+    val num-live = map.num-roots
+    for (var i:int = 0, i < num-live, i = i + 1) :
+      val r = map.roots[i]
+      [f](addr(frame.slots[r]), heap)
+    frame = frame + map.size
   ;No meaningful return value
   return false
-
-lostanza defn free-stack-list (list:ptr<Stack>) -> ref<False> :
-  for (var stack:ptr<Stack> = list, stack != null, stack = stack.tail) :
-    free-stack-frames(stack.frames, stack.size)
-  ;No meaningful return value
-  return false
-
-;Scan through current heap stacks list and update them. After this function finishes
-;current heap stacks list shall contain only Stacks that are still live.
-lostanza defn scan-stacks (vms:ptr<VMState>) -> ref<False> :
-  var live-stacks:ptr<Stack> = null
-  var previous-stacks:ptr<Stack> = vms.heap.stacks
-  ;Some stacks were marked at previous iteration
-  while live-stacks != previous-stacks :
-    ;Remember current state of live-stacks list
-    previous-stacks = live-stacks
-    ;Complete previous marking before testing if the stacks are marked.
-    complete-marking(vms)
-    var p:ptr<ptr<Stack>> = addr(vms.heap.stacks)
-    while [p] != null :
-      val stack = [p]
-      val stack-obj = stack as ptr<?> - sizeof(long)
-      if test-mark(stack-obj, vms) == 0 :
-        ;Proceed to next stack in stacks list
-        p = addr(stack.tail)
-      else :
-        ;Mark references in stack frames
-        iterate-references-in-stack-frames(stack, addr(mark-from-root), vms)
-        ;Remove stack from stacks list
-        [p] = stack.tail
-        ;Insert stack to live-stacks list
-        stack.tail = live-stacks
-        live-stacks = stack
-  ;Now stacks list contains unreachable stacks only. Dispose their frames.
-  free-stack-list(vms.heap.stacks)
-  vms.heap.stacks = live-stacks
-  ;No meaningful return value
-  return false
-
-lostanza defn relocate-stacks (vms:ptr<VMState>) -> ref<False> :
-  val compaction-start = vms.heap.compaction-start
-  ;p is a pointer to the list being scanned.
-  var p:ptr<ptr<Stack>> = addr(vms.heap.stacks)
-  while [p] != null :
-    val stack = [p]
-    if stack > compaction-start :
-      val stack-obj = (stack as ptr<long>) - sizeof(long)
-      [p] = stack + relocation-offset(stack-obj)
-    iterate-references-in-stack-frames(stack, addr(relocate-reference), vms)
-    ;Go to the next element in the list.
-    p = addr(stack.tail)
-  ;No meaningful return value
-  return false
-
 
 lostanza deftype GlobalRoots :
   length: int
@@ -602,7 +533,7 @@ lostanza defn stack-trace-record (ret:long, trace-table:ptr<StackTraceTable>) ->
 ;====================== LS Long Vector ======================
 ;============================================================
 
-lostanza defn realloc (p:ptr<?>, size*:long) -> ptr<?> :
+protected lostanza defn realloc (p:ptr<?>, size*:long) -> ptr<?> :
   val p* = call-c clib/realloc(p, size*)
   if p* == null : fatal!("Failed to realloc")
   return p*
@@ -872,26 +803,13 @@ lostanza defn extend-heap (size:long) -> long :
   return 0
 
 ;============================================================
-;================== GC Notifiers ============================
-;============================================================
-
-var GC-NOTIFIERS:Vector<(() -> ?)>
-
-lostanza defn initialize-gc-notifiers () -> ref<False> :
-  GC-NOTIFIERS = Vector<(() -> ?)>()
-  initialized-gc-notifiers? = 1L
-  return false
-
-defn run-gc-notifiers () :
-  for f in GC-NOTIFIERS do :
-    f()
-
-public defn add-gc-notifier (f: () -> ?) :
-   add(GC-NOTIFIERS, f)
-
-;====>=======================================================
 ;====================== Stack Pool ==========================
 ;============================================================
+
+lostanza val INITIAL-STACK-SIZE:long = 4L * 1024L
+lostanza val STACKS-IN-BLOCK:long = 64L
+lostanza val STACK-BLOCK-SIZE:long = INITIAL-STACK-SIZE * STACKS-IN-BLOCK
+lostanza var FREE-STACK-LIST:ptr<long> = null
 
 lostanza defn allocate-stack-frames (size:long) -> ptr<StackFrame> :
   if size == INITIAL-STACK-SIZE :
@@ -930,6 +848,20 @@ lostanza defn extend-stack-frames (frames:ptr<StackFrame>, size:long, new-size:l
   else :
     return realloc(frames, new-size)
 
+lostanza defn allocate-stack (heap:ptr<Heap>) -> ref<Stack> :
+  val stack-size = INITIAL-STACK-SIZE
+  val frames = allocate-stack-frames(stack-size)
+  frames.return = -1L
+  frames.liveness-map = 0L
+  ;heap.stacks cannot be passed as an argument to new Stack{...}.
+  ;heap.stacks is a ptr<...>. new Stack{...} can cause a GC.
+  ;GC is aware of heap.stacks and can update it. However it is not
+  ;aware of its local copy passed as a argument, so it keeps the old value.
+  val stack = new Stack{stack-size, frames, null, 0, null}
+  stack.tail = heap.stacks
+  heap.stacks = addr!([stack])
+  return stack
+
 lostanza defn free (s:ref<Stack>) -> ref<False> :
   ;call-c clib/printf("freeing coroutine\n")
   free-stack-frames(s.frames, s.size)
@@ -937,21 +869,10 @@ lostanza defn free (s:ref<Stack>) -> ref<False> :
   s.stack-pointer = null
   return false
 
-;Global stack pool
-lostanza val INITIAL-STACK-SIZE:long = 4L * 1024L
-lostanza val STACKS-IN-BLOCK:long = 64L
-lostanza val STACK-BLOCK-SIZE:long = INITIAL-STACK-SIZE * STACKS-IN-BLOCK
-lostanza var FREE-STACK-LIST:ptr<long> = null
-
-lostanza defn initialize-stack-pool () -> ref<False> :
-  val vms:ptr<VMState> = call-prim flush-vm()
-  val entry-stack:ptr<Stack> = untag(vms.heap.current-stack)
-  val entry-system-stack:ptr<Stack> = untag(vms.heap.system-stack)
-  entry-stack.tail = entry-system-stack
-  vms.heap.stacks = entry-stack
-  ;call-c clib/printf("Entry stack frames %p\n", entry-stack.frames)
-  ;call-c clib/printf("Entry system stack frames %p\n", entry-system-stack.frames)
-  ;No meaningful return value.
+lostanza defn free-stack-list (list:ptr<Stack>) -> ref<False> :
+  for (var stack:ptr<Stack> = list, stack != null, stack = stack.tail) :
+    free-stack-frames(stack.frames, stack.size)
+  ;No meaningful return value
   return false
 
 ;<doc>=======================================================
@@ -969,10 +890,9 @@ Computing the new size of the stack:
 ;============================================================
 ;=======================================================<doc>
 
-lostanza defn extend-stack (size:long) -> long :
+lostanza defn extend-stack (size:long, heap:ptr<Heap>) -> ref<False> :
   ;Retrieve stack
-  val vms:ptr<VMState> = call-prim flush-vm()
-  val s:ptr<Stack> = addr!([vms.heap.system-stack as ref<Stack>])
+  val s:ptr<Stack> = addr!([heap.system-stack as ref<Stack>])
 
   ;Compute new size of stack
   val maximum-size = 1024L * 1024L * 1024L
@@ -990,61 +910,9 @@ lostanza defn extend-stack (size:long) -> long :
   s.size = new-size
   s.frames = new-frames
 
-  ;Return
-  return 0
+  ;No meaningful return value
+  return false
 
-;============================================================
-;============= Garbage Collector with Resizing ==============
-;============================================================
-
-;Uses virtual memory system to allocate more pages.
-;- space is a pointer to a virtual address region created using mmap.
-;- current-size is the current number of bytes that has been concretely allocated.
-;- desired-size is the new number of bytes that we want to be concretely allocated.
-public lostanza defn stz-memory-resize (space:ptr<long>, current-size:long, desired-size:long) -> ptr<long> :
-  call-c clib/stz_memory_resize(space, current-size, desired-size)
-  return space + desired-size
-
-;This function is called by the "call-prim collect-garbage" primitive.
-;It runs the garbage collector, and returns the new number of bytes
-;remaining after the garbage collector runs.
-;- size: the number of bytes that we desire from the heap. This is
-;  used to compute whether or not to grow the heap.
-lostanza defn collect-garbage (size:long) -> long :
-  ;Retrieve state
-  val vms:ptr<VMState> = call-prim flush-vm()
-
-  ;First run the garbage collector,
-  collect-garbage(vms)
-
-  ;Compute the new desired size of the heap.
-  val available-space = vms.heap.limit - vms.heap.start
-  var desired-space:long = vms.heap.top + size - vms.heap.start
-  ;Increase the desired space if it is insufficient
-  ;to satisfy the requested size.
-  if available-space < desired-space :
-    ;Double the desired space until it is sufficient.
-    val requested-space = desired-space
-    desired-space = available-space * 2
-    while desired-space < requested-space :
-      desired-space = desired-space * 2
-  ;Increase the desired space if the usage ratio is too high.
-  else :
-    val usage-ratio = (desired-space as float) / (available-space as float)
-    if usage-ratio > 0.5f :
-      desired-space = available-space * 2
-  ;Ensure that the desired space
-  desired-space = min(desired-space, MAXIMUM-HEAP-SIZE)
-  expand-heap(desired-space, vms)
-
-  val available-after-collection = vms.heap.limit - vms.heap.top
-  if available-after-collection < size : fatal!("Out of memory.")
-  ;Unused return value
-  return 0
-
-;============================================================
-;================== New Garbage Collector ===================
-;============================================================
 
 ;Define various constants for the relations between
 ;bits, bytes, and longs.
@@ -1090,6 +958,95 @@ public lostanza deftype Heap :
   ;New liveness trackers are added to this list when they are created.
   var liveness-trackers:ptr<LivenessTracker>
 
+  ;Refence to environment with object layout metadata.
+  var env:ptr<?>
+  var allocation-size:ptr<((ptr<long>, long, ptr<Heap>) -> long)>
+  var iterate-roots:ptr<((ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>, ptr<Heap>) -> ref<False>)>
+  var iterate-references:ptr<((ptr<long>, long, ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>, ptr<Heap>) -> ref<False>)>
+  var iterate-references-in-stack-frames:ptr<((ptr<StackFrame>, ptr<StackFrame>,
+                                               ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>,
+                                               ptr<Heap>) -> ref<False>)>
+;Initialize the current heap structure.
+;- min-size is the initial size of the heap.
+;- max-size is the maximum size that heap can be expanded to.
+lostanza defn initialize-heap (heap:ptr<Heap>, min-size:long, max-size:long, env:ptr<?>) -> ref<False> :
+  heap.env = env
+  ;Precondition: Assert 0 <= min-size && min-size <= max-size
+  #if-not-defined(OPTIMIZE) :
+    if min-size < 0L or max-size < min-size :
+      fatal("Illegal arguments to initialize-heap.")
+  ;Round up sizes to the nearest page size so that it behaves wrt. mmap.
+  val min-heap-size = round-up-to-whole-pages(min-size)
+  val max-heap-size = round-up-to-whole-pages(max-size)
+  ;Initialize the memory for the main heap.
+  heap.size = max-heap-size
+  heap.start = call-c clib/stz_memory_map(min-heap-size, max-heap-size)
+  heap.top = heap.start
+  heap.limit = heap.start + min-heap-size
+  ;Initialize the memory for the heap's bitset.
+  val min-bitset-size = round-up-to-whole-pages(bitset-size(min-heap-size))
+  val max-bitset-size = round-up-to-whole-pages(bitset-size(max-heap-size))
+  heap.bitset = call-c clib/stz_memory_map(min-bitset-size, max-bitset-size)
+  clear(heap.bitset, min-bitset-size)
+  ;Allocate space for marking stack (1024L * sizeof(long))
+  ;Initialize stack-top and stack-bottom to just past the allocated memory.
+  ;TODO: If marking stack were reserved right above the heap end, the entire address
+  ;range from heap-top to stack-bottom could be occupied by the stack.
+  val stack-size = round-up-to-whole-pages(1024L << LOG-BYTES-IN-LONG)
+  heap.stack-start = call-c clib/stz_memory_map(stack-size, stack-size)
+  heap.stack-bottom = heap.stack-start + stack-size
+  heap.stack-top = heap.stack-bottom
+  ;Initialize stack list
+  heap.stacks = null
+  ;Initialize liveness tracker list
+  heap.liveness-trackers = null
+  ;No meaningful return value.
+  return false
+
+;Remove all associated memory reserved for the current heap structure.
+lostanza defn finalize-heap (heap:ptr<Heap>) -> ref<False> :
+  ;Dispose stack frames
+  free-stack-list(heap.stacks)
+
+  ;Compute the current size of the heap and it's bitset.
+  val current-heap-size = heap.limit - heap.start
+  val current-bitset-size = bitset-size(current-heap-size)
+  ;Unmap the currently reserved pages.
+  call-c clib/stz_memory_unmap(heap.start, round-up-to-whole-pages(current-heap-size))
+  call-c clib/stz_memory_unmap(heap.bitset, round-up-to-whole-pages(current-bitset-size))
+  ;Compute the size of the marking size (note that it grows downwards).
+  val marking-stack-size = heap.stack-bottom - heap.stack-start
+  call-c clib/stz_memory_unmap(heap.stack-start, marking-stack-size)
+  ;No meaningful return value.
+  return false
+
+;Ensure that the given heap is at least the given size.
+;Assumes that the given size is less than the maximum size that heap can be expanded to.
+lostanza defn expand-heap (size:long, heap:ptr<Heap>) -> ref<False> :
+  ;Precondition: Ensure that size is less than maximum allowed size.
+  #if-not-defined(OPTIMIZE) :
+    if heap.size < size :
+      fatal("Cannot expand heap past its maximum size.")
+
+  ;Exit immediately if heap is already the desired size (or bigger).
+  val current-heap-size = round-up-to-whole-pages(heap.limit - heap.start)
+  val desired-heap-size = round-up-to-whole-pages(size)
+  if current-heap-size >= desired-heap-size : return false
+
+  ;Resize the heap.
+  heap.limit = stz-memory-resize(heap.start, current-heap-size, desired-heap-size)
+
+  ;Resize the bitset.
+  val current-bitset-size = round-up-to-whole-pages(bitset-size(current-heap-size))
+  val desired-bitset-size = round-up-to-whole-pages(bitset-size(desired-heap-size))
+  ;If necessary, clear the newly-allocated bytes in the bitset.
+  if current-bitset-size < desired-bitset-size :
+    call-c clib/stz_memory_resize(heap.bitset, current-bitset-size, desired-bitset-size)
+    clear(heap.bitset + current-bitset-size, desired-bitset-size - current-bitset-size)
+
+  ;No meaningful return value.
+  return false
+
 ;Given the current number of bytes in the heap, return
 ;the number of bytes in the heap's bitset, rounded up
 ;to the nearest long.
@@ -1101,116 +1058,31 @@ lostanza defn bitset-size (heap-size:long) -> long :
   ;return bitset-size-in-longs * bytes-in-long
   return bitset-size-in-longs << LOG-BYTES-IN-LONG
 
-;Sets the first 'size' bytes in the address range starting from 'start' to 0.
-;Returns 'start'.
-lostanza defn clear (start:ptr<?>, size:long) -> ptr<?> :
-  return call-c clib/memset(start, 0, size)
-
-;Initialize the current heap structure.
-;- min-size is the initial size of the heap.
-;- max-size is the maximum size that heap can be expanded to.
-public lostanza defn initialize-heap (min-size:long, max-size:long, vms:ptr<VMState>) -> ref<False> :
-  ;Precondition: Assert 0 <= min-size && min-size <= max-size
-  #if-not-defined(OPTIMIZE) :
-    if min-size < 0L or max-size < min-size :
-      fatal("Illegal arguments to initialize-heap.")
-  ;Round up sizes to the nearest page size so that it behaves wrt. mmap.
-  val min-heap-size = round-up-to-whole-pages(min-size)
-  val max-heap-size = round-up-to-whole-pages(max-size)
-  ;Initialize the memory for the main heap.
-  vms.heap.size = max-heap-size
-  vms.heap.start = call-c clib/stz_memory_map(min-heap-size, max-heap-size)
-  vms.heap.top = vms.heap.start
-  vms.heap.limit = vms.heap.start + min-heap-size
-  ;Initialize the memory for the heap's bitset.
-  val min-bitset-size = round-up-to-whole-pages(bitset-size(min-heap-size))
-  val max-bitset-size = round-up-to-whole-pages(bitset-size(max-heap-size))
-  vms.heap.bitset = call-c clib/stz_memory_map(min-bitset-size, max-bitset-size)
-  clear(vms.heap.bitset, min-bitset-size)
-  ;Allocate space for marking stack (1024L * sizeof(long))
-  ;Initialize stack-top and stack-bottom to just past the allocated memory.
-  ;TODO: If marking stack were reserved right above the heap end, the entire address
-  ;range from heap-top to stack-bottom could be occupied by the stack.
-  val stack-size = round-up-to-whole-pages(1024L << LOG-BYTES-IN-LONG)
-  vms.heap.stack-start = call-c clib/stz_memory_map(stack-size, stack-size)
-  vms.heap.stack-bottom = vms.heap.stack-start + stack-size
-  vms.heap.stack-top = vms.heap.stack-bottom
-  ;Initialize stack list
-  vms.heap.stacks = null
-  ;Initialize liveness tracker list
-  vms.heap.liveness-trackers = null
-  ;No meaningful return value.
-  return false
-
-;Remove all associated memory reserved for the current heap structure.
-public lostanza defn finalize-heap (vms:ptr<VMState>) -> ref<False> :
-  ;Dispose stack frames
-  free-stack-list(vms.heap.stacks)
-
-  ;Compute the current size of the heap and it's bitset.
-  val current-heap-size = vms.heap.limit - vms.heap.start
-  val current-bitset-size = bitset-size(current-heap-size)
-  ;Unmap the currently reserved pages.
-  call-c clib/stz_memory_unmap(vms.heap.start, round-up-to-whole-pages(current-heap-size))
-  call-c clib/stz_memory_unmap(vms.heap.bitset, round-up-to-whole-pages(current-bitset-size))
-  ;Compute the size of the marking size (note that it grows downwards).
-  val marking-stack-size = vms.heap.stack-bottom - vms.heap.stack-start
-  call-c clib/stz_memory_unmap(vms.heap.stack-start, marking-stack-size)
-  ;No meaningful return value.
-  return false
-
-;Ensure that the given heap is at least the given size.
-;Assumes that the given size is less than the maximum size that heap can be expanded to.
-lostanza defn expand-heap (size:long, vms:ptr<VMState>) -> ref<False> :
-  ;Precondition: Ensure that size is less than maximum allowed size.
-  #if-not-defined(OPTIMIZE) :
-    if vms.heap.size < size :
-      fatal("Cannot expand heap past its maximum size.")
-
-  ;Exit immediately if heap is already the desired size (or bigger).
-  val current-heap-size = round-up-to-whole-pages(vms.heap.limit - vms.heap.start)
-  val desired-heap-size = round-up-to-whole-pages(size)
-  if current-heap-size >= desired-heap-size : return false
-
-  ;Resize the heap.
-  vms.heap.limit = stz-memory-resize(vms.heap.start, current-heap-size, desired-heap-size)
-
-  ;Resize the bitset.
-  val current-bitset-size = round-up-to-whole-pages(bitset-size(current-heap-size))
-  val desired-bitset-size = round-up-to-whole-pages(bitset-size(desired-heap-size))
-  ;If necessary, clear the newly-allocated bytes in the bitset.
-  if current-bitset-size < desired-bitset-size :
-    call-c clib/stz_memory_resize(vms.heap.bitset, current-bitset-size, desired-bitset-size)
-    clear(vms.heap.bitset + current-bitset-size, desired-bitset-size - current-bitset-size)
-
-  ;No meaningful return value.
-  return false
-
-;Sanity check: Ensure that the given pointer points to within the heap of given VMState.
+;Sanity check: Ensure that the given pointer points to within the heap.
 ;Calls fatal if it is not.
-lostanza defn ensure-pointer-in-heap! (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn ensure-pointer-in-heap! (p:ptr<?>, heap:ptr<Heap>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if p < vms.heap.start or p >= vms.heap.top :
+    if p < heap.start or p >= heap.top :
       fatal("Pointer is outside of heap.")
   return false
 
 ;Sanity check: Ensure that the given address range: start (inclusive) to limit (exclusive)
-;is contained within the heap of given VMState.
+;is contained within the heap.
 ;Calls fatal if it is not.
-lostanza defn ensure-address-range-in-heap! (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn ensure-address-range-in-heap! (start:ptr<?>, limit:ptr<?>, heap:ptr<Heap>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if start < vms.heap.start or start > limit or limit > vms.heap.top :
+    if start < heap.start or start > limit or limit > heap.top :
       fatal("Address range is outside of heap.")
   return false
 
-;Return the index in the state's heap bitset that acts as the mark for the state's heap pointer.
-lostanza defn bit-index (p:ptr<?>, vms:ptr<VMState>) -> long :
-  ensure-pointer-in-heap!(p, vms)
-  return (p - vms.heap.start) >> LOG-BYTES-IN-LONG
+;Return the index in the heap's bitset that acts as the mark for the heap pointer.
+lostanza defn bit-index (p:ptr<?>, heap:ptr<Heap>) -> long :
+  ensure-pointer-in-heap!(p, heap)
+  return (p - heap.start) >> LOG-BYTES-IN-LONG
 
-;Returns the pointer in the state's heap's bitset containing the given mark bit.
-lostanza defn bit-address (bit-index:long, vms:ptr<VMState>) -> ptr<long> :
-  return vms.heap.bitset + (bit-index >> LOG-BITS-IN-LONG) << LOG-BYTES-IN-LONG
+;Returns the pointer in the heap's bitset containing the given mark bit.
+lostanza defn bit-address (bit-index:long, heap:ptr<Heap>) -> ptr<long> :
+  return heap.bitset + (bit-index >> LOG-BITS-IN-LONG) << LOG-BYTES-IN-LONG
 
 ;Returns bit-index % BITS-IN-LONG.
 lostanza defn bit-shift (bit-index:long) -> long :
@@ -1222,43 +1094,43 @@ lostanza defn bit-mask (bit-index:long) -> long :
   return 1L << bit-shift(bit-index)
 
 ;Returns 1 if the given heap pointer has been marked
-;in the state's heap bitset, and 0 otherwise.
-lostanza defn test-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
-  val index = bit-index(p, vms)
-  return ([bit-address(index, vms)] >> bit-shift(index)) & 1
+;in the heap's bitset, and 0 otherwise.
+lostanza defn test-mark (p:ptr<?>, heap:ptr<Heap>) -> long :
+  val index = bit-index(p, heap)
+  return ([bit-address(index, heap)] >> bit-shift(index)) & 1
 
-;Marks the given heap pointer in the state's heap bitset.
-lostanza defn set-mark (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
-  val index = bit-index(p, vms)
-  val address = bit-address(index, vms)
+;Marks the given heap pointer in the heap's bitset.
+lostanza defn set-mark (p:ptr<?>, heap:ptr<Heap>) -> ref<False> :
+  val index = bit-index(p, heap)
+  val address = bit-address(index, heap)
   [address] = [address] | bit-mask(index)
   ;No meaningful return value.
   return false
 
-;Clears the mark for the given heap pointer in the state's heap's bitset.
-lostanza defn clear-mark (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
-  val index = bit-index(p, vms)
-  val address = bit-address(index, vms)
+;Clears the mark for the given heap pointer in the heap's bitset.
+lostanza defn clear-mark (p:ptr<?>, heap:ptr<Heap>) -> ref<False> :
+  val index = bit-index(p, heap)
+  val address = bit-address(index, heap)
   [address] = [address] & (~ bit-mask(index))
   ;No meaningful return value.
   return false
 
-;Fused operation. Marks the given heap pointer in the state's heap bitset.
+;Fused operation. Marks the given heap pointer in the heap's bitset.
 ;Returns non-zero value if the pointer was previously marked, otherwise 0L.
-lostanza defn test-and-set-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
-  val index = bit-index(p, vms)
-  val address = bit-address(index, vms)
+lostanza defn test-and-set-mark (p:ptr<?>, heap:ptr<Heap>) -> long :
+  val index = bit-index(p, heap)
+  val address = bit-address(index, heap)
   val mask = bit-mask(index)
 
   val old-value = [address]
   [address] = old-value | mask
   return old-value & mask
 
-;Fused operation. Clears the mark for the given heap pointer in the state's heap's bitset.
+;Fused operation. Clears the mark for the given heap pointer in the heap's bitset.
 ;Returns non-zero value if the pointer was previously marked, otherwise 0L.
-lostanza defn test-and-clear-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
-  val index = bit-index(p, vms)
-  val address = bit-address(index, vms)
+lostanza defn test-and-clear-mark (p:ptr<?>, heap:ptr<Heap>) -> long :
+  val index = bit-index(p, heap)
+  val address = bit-address(index, heap)
   val mask = bit-mask(index)
 
   val old-value = [address]
@@ -1266,8 +1138,8 @@ lostanza defn test-and-clear-mark (p:ptr<?>, vms:ptr<VMState>) -> long :
   return old-value & mask
 
 ;Clears the mark for the given heap address range.
-lostanza defn clear-mark (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<False> :
-  ensure-address-range-in-heap!(start, limit, vms)
+lostanza defn clear-mark (start:ptr<?>, limit:ptr<?>, heap:ptr<Heap>) -> ref<False> :
+  ensure-address-range-in-heap!(start, limit, heap)
 
   ;Compute start and ending masks.
   ;Supposing that start-bit-index is 9, then
@@ -1276,10 +1148,10 @@ lostanza defn clear-mark (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<F
   ;Supposing that end-bit-index is 9, then
   ;end-bit-mask is 1111 1110 0000 0000, which is used to zero-out all its
   ;before the end-bit-index (inclusive).
-  val start-bit-index = bit-index(start, vms)
-  val end-bit-index = bit-index(limit - 1, vms)
-  val start-bit-address = bit-address(start-bit-index, vms)
-  val end-bit-address = bit-address(end-bit-index, vms)
+  val start-bit-index = bit-index(start, heap)
+  val end-bit-index = bit-index(limit - 1, heap)
+  val start-bit-address = bit-address(start-bit-index, heap)
+  val end-bit-address = bit-address(end-bit-index, heap)
   val start-bit-mask = bit-mask(start-bit-index) - 1
   val end-bit-mask = (- (bit-mask(end-bit-index) << 1))
 
@@ -1300,8 +1172,8 @@ lostanza defn clear-mark (start:ptr<?>, limit:ptr<?>, vms:ptr<VMState>) -> ref<F
 ;and the 64-bit mask given in 'bit-word',
 ;call 'f' on every pointer corresponding to a 1 in 'bit-word'.
 lostanza defn iterate-bit-word (start:ptr<?>, bit-word:long,
-                                f:ptr<((ptr<?>, ptr<VMState>) -> ref<False>)>,
-                                vms:ptr<VMState>) -> ref<False> :
+                                f:ptr<((ptr<?>, ptr<Heap>) -> ref<False>)>,
+                                heap:ptr<Heap>) -> ref<False> :
   ;Ones are rare, expect zeroes
   var p:ptr<?> = start
   var bits:long = bit-word
@@ -1335,7 +1207,7 @@ lostanza defn iterate-bit-word (start:ptr<?>, bit-word:long,
     ;If the next bit is set, then call f on the
     ;current pointer.
     if (bits & 1) != 0 :
-      [f](p, vms)
+      [f](p, heap)
     ;Advance bits and p by 1.
     bits = bits >> 1
     p = p + (1 * BYTES-IN-LONG)
@@ -1343,18 +1215,18 @@ lostanza defn iterate-bit-word (start:ptr<?>, bit-word:long,
   return false
 
 ;Iterate through the heap address range given by start and limit,
-;and call f on all pointers in that range that are marked in the state's heap bitset.
+;and call f on all pointers in that range that are marked in the heap's bitset.
 lostanza defn iterate-marked (start:ptr<?>, limit:ptr<?>,
-                              f:ptr<((ptr<?>, ptr<VMState>) -> ref<False>)>,
-                              vms:ptr<VMState>) -> ref<False> :
-  ensure-address-range-in-heap!(start, limit, vms)
+                              f:ptr<((ptr<?>, ptr<Heap>) -> ref<False>)>,
+                              heap:ptr<Heap>) -> ref<False> :
+  ensure-address-range-in-heap!(start, limit, heap)
 
   ;Compute starting shift and ending mask.
   ;Supposing that end-bit-index is 9, then end-bit-mask contains 0000 0001 1111 1111.
-  val start-bit-index = bit-index(start, vms)
-  val end-bit-index = bit-index(limit - 1, vms)
-  val start-bit-address = bit-address(start-bit-index, vms)
-  val end-bit-address = bit-address(end-bit-index, vms)
+  val start-bit-index = bit-index(start, heap)
+  val end-bit-index = bit-index(limit - 1, heap)
+  val start-bit-address = bit-address(start-bit-index, heap)
+  val end-bit-address = bit-address(end-bit-index, heap)
   val start-bit-shift = bit-shift(start-bit-index)
   val end-bit-mask = (bit-mask(end-bit-index) << 1) - 1
 
@@ -1363,13 +1235,13 @@ lostanza defn iterate-marked (start:ptr<?>, limit:ptr<?>,
     ;The '[start-bit-address] & end-bit-mask' expression contains the bitset word
     ;with mark bits for pointers beyond the ending pointer masked off.
     ;That word is then shifted to the right by 'start-bit-shift' to align with the start pointer.
-    iterate-bit-word(start, ([start-bit-address] & end-bit-mask) >> start-bit-shift, f, vms)
+    iterate-bit-word(start, ([start-bit-address] & end-bit-mask) >> start-bit-shift, f, heap)
 
   else :
     ;Process the first bit word.
     ;[start-bit-address] is the 64-bit long in the bitset containing the mark for the start pointer.
     ;It is shifted to the right by 'start-bit-shift' to align with the start pointer.
-    iterate-bit-word(start, [start-bit-address] >> start-bit-shift, f, vms)
+    iterate-bit-word(start, [start-bit-address] >> start-bit-shift, f, heap)
 
     ;Initialize p to the pointer right after the 64-pointer chunk containing the start pointer.
     var p:ptr<?> = start + ((BITS-IN-LONG - start-bit-shift) * BYTES-IN-LONG)
@@ -1378,14 +1250,14 @@ lostanza defn iterate-marked (start:ptr<?>, limit:ptr<?>,
     while bit-address < end-bit-address :
       ;Iterate through every marked pointer in this chunk.
       if [bit-address] != 0 :     ;Rarely taken
-        iterate-bit-word(p, [bit-address], f, vms)
+        iterate-bit-word(p, [bit-address], f, heap)
       ;Advance to the next chunk
       bit-address = bit-address + BYTES-IN-LONG
       p = p + (BITS-IN-LONG * BYTES-IN-LONG)
 
     ;Process the last bit word.
     ;Mask off the bits in the bitset that are beyond the last pointer.
-    iterate-bit-word(p, [end-bit-address] & end-bit-mask, f, vms)
+    iterate-bit-word(p, [end-bit-address] & end-bit-mask, f, heap)
 
   ;No meaningful return value
   return false
@@ -1394,57 +1266,57 @@ lostanza defn iterate-marked (start:ptr<?>, limit:ptr<?>,
 ;We deliberately set min to greater than any pointer in the heap,
 ;and set max to lower than any pointer in the heap,
 ;to prepare the incomplete range to be extended using extend-incomplete-range.
-lostanza defn reset-incomplete-range (vms:ptr<VMState>) -> ref<False> :
-  vms.heap.min-incomplete = vms.heap.limit
-  vms.heap.max-incomplete = vms.heap.start
+lostanza defn reset-incomplete-range (heap:ptr<Heap>) -> ref<False> :
+  heap.min-incomplete = heap.limit
+  heap.max-incomplete = heap.start
   ;No meaningful return value
   return false
 
 ;Extend the incomplete range by ensuring the given heap pointer p
 ;is within the incomplete range.
-lostanza defn extend-incomplete-range (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
-  if p < vms.heap.min-incomplete : vms.heap.min-incomplete = p
-  if p > vms.heap.max-incomplete : vms.heap.max-incomplete = p
+lostanza defn extend-incomplete-range (p:ptr<?>, heap:ptr<Heap>) -> ref<False> :
+  if p < heap.min-incomplete : heap.min-incomplete = p
+  if p > heap.max-incomplete : heap.max-incomplete = p
   ;No meaningful return value
   return false
 
 ;Push a new pointer onto the marking stack.
 ;Note that the marking stack grows downwards.
-lostanza defn push-to-marking-stack (p:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn push-to-marking-stack (p:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if marking-stack-full(vms) : fatal("Marking stack overflow.")
-  vms.heap.stack-top = vms.heap.stack-top - BYTES-IN-LONG
-  [vms.heap.stack-top] = p as long
+    if marking-stack-full(heap) : fatal("Marking stack overflow.")
+  heap.stack-top = heap.stack-top - BYTES-IN-LONG
+  [heap.stack-top] = p as long
   return false
 
 ;Pop a pointer from the marking stack.
 ;Note that the marking stack grows downwards.
-lostanza defn pop-marking-stack (vms:ptr<VMState>) -> ptr<long> :
+lostanza defn pop-marking-stack (heap:ptr<Heap>) -> ptr<long> :
   #if-not-defined(OPTIMIZE) :
-    if marking-stack-empty(vms) : fatal("Marking stack underflow.")
-  val value = [vms.heap.stack-top]
-  vms.heap.stack-top = vms.heap.stack-top + BYTES-IN-LONG
+    if marking-stack-empty(heap) : fatal("Marking stack underflow.")
+  val value = [heap.stack-top]
+  heap.stack-top = heap.stack-top + BYTES-IN-LONG
   return value as ptr<long>
 
 ;Returns 1L if the marking stack is not empty.
 ;The marking stack grows downwards, so it is not empty
 ;if the top is less than the bottom.
-lostanza defn marking-stack-not-empty (vms:ptr<VMState>) -> long :
-  return vms.heap.stack-top < vms.heap.stack-bottom
+lostanza defn marking-stack-not-empty (heap:ptr<Heap>) -> long :
+  return heap.stack-top < heap.stack-bottom
 
 ;Returns 1L if the marking stack is empty.
-lostanza defn marking-stack-empty (vms:ptr<VMState>) -> long :
-  return vms.heap.stack-top == vms.heap.stack-bottom
+lostanza defn marking-stack-empty (heap:ptr<Heap>) -> long :
+  return heap.stack-top == heap.stack-bottom
 
 ;Return 1L if the marking stack is full.
-lostanza defn marking-stack-full (vms:ptr<VMState>) -> long :
-  return vms.heap.stack-top == vms.heap.stack-start
+lostanza defn marking-stack-full (heap:ptr<Heap>) -> long :
+  return heap.stack-top == heap.stack-start
 
 ;Mark the object at the given heap pointer.
 ;On marking stack overflow the depth-first object traversal is pruned, and
 ;the marked objects with possibly unmarked children are added to the range
 ;of incompletely marked objects.
-lostanza defn mark-and-push (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn mark-and-push (ref:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   ;Retrieve the value at the given heap pointer.
   val v = [ref]
   ;Is this a reference to a Stanza heap object?
@@ -1453,18 +1325,17 @@ lostanza defn mark-and-push (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
     ;Remove the tagbits to retrieve the object pointer.
     val p = (v - 1) as ptr<long>
     ;Mark the object, and test whether it has already previously been marked.
-    if test-and-set-mark(p, vms) == 0 :
+    if test-and-set-mark(p, heap) == 0 :
       ;If there is still space in the marking stack add the object to the
       ;marking stack, otherwise add it to the incomplete range.
-      if marking-stack-full(vms) : extend-incomplete-range(p, vms)
-      else : push-to-marking-stack(p, vms)
-
+      if marking-stack-full(heap) : extend-incomplete-range(p, heap)
+      else : push-to-marking-stack(p, heap)
   ;No meaningful return value
   return false
 
 ;Given 'ref', a pointer to a root variable (e.g. global, const, etc.),
 ;mark it and iteratively traverse through its referenced objects.
-lostanza defn mark-from-root (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn mark-from-root (ref:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   ;Retrieve the value at the given heap pointer.
   val v = [ref]
   ;Is this a reference to a Stanza heap object?
@@ -1474,158 +1345,154 @@ lostanza defn mark-from-root (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
     val p = (v - 1) as ptr<long>
     ;Mark the object, and continue marking the object graph if it
     ;has not previously been marked.
-    if test-and-set-mark(p, vms) == 0 :
-      continue-marking(p, vms)
+    if test-and-set-mark(p, heap) == 0 :
+      continue-marking(p, heap)
   ;No meaningful return value
   return false
 
 ;Given the pointer p to an already-marked object,
 ;mark all the objects that it references and traverse the object graph.
 ;Marks as many objects as possible given the size of the marking stack.
-lostanza defn continue-marking (p:ptr<?>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn continue-marking (p:ptr<?>, heap:ptr<Heap>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    if test-mark(p, vms) == 0 : fatal("Marked object expected.")
+    if test-mark(p, heap) == 0 : fatal("Marked object expected.")
   ;Initialize the marking stack with p.
-  push-to-marking-stack(p, vms)
+  push-to-marking-stack(p, heap)
   ;Iteratively traverse and mark the object graph.
-  while marking-stack-not-empty(vms) :
-    iterate-references(pop-marking-stack(vms), addr(mark-and-push), vms)
+  while marking-stack-not-empty(heap) :
+    iterate-references(pop-marking-stack(heap), addr(mark-and-push), heap)
   ;No meaningful return value
   return false
 
 ;Recover from possible marking stack overflow by using marked objects from
 ;the range of incompletely marked objects as additional roots
-lostanza defn complete-marking (vms:ptr<VMState>) -> ref<False> :
+lostanza defn complete-marking (heap:ptr<Heap>) -> ref<False> :
   ;If the incomplete range is not empty,
-  while vms.heap.min-incomplete <= vms.heap.max-incomplete :
+  while heap.min-incomplete <= heap.max-incomplete :
     ;We add BYTES-IN-LONG to max-incomplete because max-incomplete is inclusive
     ;and 'iterate-marked' needs exclusive bounds.
-    val incomplete-start = vms.heap.min-incomplete
-    val incomplete-limit = vms.heap.max-incomplete + BYTES-IN-LONG
+    val incomplete-start = heap.min-incomplete
+    val incomplete-limit = heap.max-incomplete + BYTES-IN-LONG
 
     ;Call continue-marking on all marked pointers in the incomplete range.
     ;We reset the incomplete range before we do this so that if the marking
     ;stack overflows, the remaining pointers are stored in the incomplete range.
-    reset-incomplete-range(vms)
-    iterate-marked(incomplete-start, incomplete-limit, addr(continue-marking), vms)
+    reset-incomplete-range(heap)
+    iterate-marked(incomplete-start, incomplete-limit, addr(continue-marking), heap)
   ;No meaningful return value
   return false
 
 ;Call f on all root pointers.
-lostanza defn iterate-roots (f:ptr<((ptr<long>, ptr<VMState>) -> ref<False>)>,
-                             vms:ptr<VMState>) -> ref<False> :
-  ;Scan globals
-  val globals = vms.global-mem as ptr<long>
-  val roots = vms.global-root-table
-  val nroots = roots.length
-  for (var i:int = 0, i < nroots, i = i + 1) :
-    val r = roots.roots[i]
-    [f](addr(globals[r]), vms)
-
-  ;Scan const roots
-  val consts = vms.const-table
-  val nconsts = [vms.const-mem as ptr<int>]
-  for (var i:int = 0, i < nconsts, i = i + 1) :
-    [f](addr(consts[i]), vms)
-
+lostanza defn iterate-roots (f:ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>,
+                             heap:ptr<Heap>) -> ref<False> :
   ;Scan stack roots
   ;call-c clib/printf("scan stacks\n")
-  [f](addr(vms.heap.current-stack), vms)
-  [f](addr(vms.heap.system-stack), vms)
-  ;No meaningful return value
-  return false
+  [f](addr(heap.current-stack), heap)
+  [f](addr(heap.system-stack), heap)
+
+  ;Scan roots defined by the environment
+  return [heap.iterate-roots](f, heap)
 
 ;Call f on all references stored in the object pointed to by p.
-lostanza defn iterate-references (p:ptr<long>,
-                                  f:ptr<((ptr<long>, ptr<VMState>) -> ref<False>)>,
-                                  vms:ptr<VMState>) -> ref<False> :
-  val tag = get-tag(p)
-  val class-rec = vms.class-table[tag]
-  if class-rec.item-size == 0 :
-    val roots = addr(class-rec.roots)
-    val num-roots = class-rec.num-roots
-    val obj = p as ptr<ObjectLayout>
-    for (var i:int = 0, i < num-roots, i = i + 1) :
-      val r = roots[i]
-      [f](addr(obj.slots[r]), vms)
-  ;Array class
-  else :
-    val array-rec = class-rec as ptr<ArrayRecord>
-    val array = p as ptr<ObjectLayout>
+lostanza defn iterate-references (p:ptr<long>, f:ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>,
+                                  heap:ptr<Heap>) -> ref<False> :
+  return [heap.iterate-references](p, get-tag(p), f, heap)
 
-    val num-base-roots = array-rec.num-base-roots
-    val base-roots = addr(array-rec.roots)
-    for (var i:int = 0, i < num-base-roots, i = i + 1) :
-      val r = base-roots[i]
-      [f](addr(array.slots[r]), vms)
-
-    val num-item-roots = array-rec.num-item-roots
-    if num-item-roots > 0 :
-      var items:ptr<?> = addr(array.slots) + array-rec.base-size
-      val item-size = array-rec.item-size
-      val item-roots = addr(array-rec.roots[num-base-roots])
-      val len = array.slots[0]
-      for (var n:long = 0, n < len, n = n + 1) :
-        for (var i:int = 0, i < num-item-roots, i = i + 1) :
-          [f](items + item-roots[i], vms)
-        items = items + item-size
+lostanza defn iterate-references-in-stack-frames (stack:ptr<Stack>,
+                                                  f:ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>,
+                                                  heap:ptr<Heap>) -> ref<False> :
+  if stack != untag(heap.current-stack) :
+    val start-frame:ptr<StackFrame> = stack.frames
+    if start-frame != null :
+      val end-frame:ptr<StackFrame> = stack.stack-pointer
+      [heap.iterate-references-in-stack-frames](start-frame, end-frame, f, heap)
   ;No meaningful return value
   return false
-
-lostanza defn object-size-on-heap (sz:long) -> long :
-  return (8L + sz + 7L) & -8L
 
 ;Given p, a heap pointer pointing to the start of an object (i.e. at
 ;the header word), return the total size of the object. This
 ;function takes care of handling variable-sized arrays.
-lostanza defn allocation-size (p:ptr<long>, vms:ptr<VMState>) -> long :
-  ;Use the header word to retrieve the object's class record.
-  val tag = get-tag(p)
-  val class-rec = vms.class-table[tag]
-  ;Fixed-length objects have an item-size of 0.
-  if class-rec.item-size == 0 :
-    ;Use 'object-size-on-heap' to handle details of accounting
-    ;for the size of the header word and space for the forwarding pointer.
-    return object-size-on-heap(class-rec.size)
-  ;Otherwise, it's a variable-length array object.
-  else :
-    val array-rec = class-rec as ptr<ArrayRecord>
-    val base-size = array-rec.base-size
-    val item-size = array-rec.item-size
-    val array = p as ptr<ObjectLayout>
-    val len = array.slots[0]
-    ;Use 'object-size-on-heap' to handle details of accounting
-    ;for the size of the header word and space for the forwarding pointer.
-    return object-size-on-heap(base-size + item-size * len)
+lostanza defn allocation-size (p:ptr<long>, heap:ptr<Heap>) -> long :
+  return object-size-on-heap([heap.allocation-size](p, get-tag(p), heap))
+
+lostanza defn object-size-on-heap (sz:long) -> long :
+  return (sz + 15L) & -8L
+
+;Scan through current heap stacks list and update them. After this function finishes
+;current heap stacks list shall contain only Stacks that are still live.
+lostanza defn scan-stacks (heap:ptr<Heap>) -> ref<False> :
+  var live-stacks:ptr<Stack> = null
+  var previous-stacks:ptr<Stack> = heap.stacks
+  ;Some stacks were marked at previous iteration
+  while live-stacks != previous-stacks :
+    ;Remember current state of live-stacks list
+    previous-stacks = live-stacks
+    ;Complete previous marking before testing if the stacks are marked.
+    complete-marking(heap)
+    var p:ptr<ptr<Stack>> = addr(heap.stacks)
+    while [p] != null :
+      val stack = [p]
+      val stack-obj = stack as ptr<?> - sizeof(long)
+      if test-mark(stack-obj, heap) == 0 :
+        ;Proceed to next stack in stacks list
+        p = addr(stack.tail)
+      else :
+        ;Mark references in stack frames
+        iterate-references-in-stack-frames(stack, addr(mark-from-root), heap)
+        ;Remove stack from stacks list
+        [p] = stack.tail
+        ;Insert stack to live-stacks list
+        stack.tail = live-stacks
+        live-stacks = stack
+  ;Now stacks list contains unreachable stacks only. Dispose their frames.
+  free-stack-list(heap.stacks)
+  heap.stacks = live-stacks
+  ;No meaningful return value
+  return false
+
+lostanza defn relocate-stacks (heap:ptr<Heap>) -> ref<False> :
+  val compaction-start = heap.compaction-start
+  ;p is a pointer to the list being scanned.
+  var p:ptr<ptr<Stack>> = addr(heap.stacks)
+  while [p] != null :
+    val stack = [p]
+    if stack > compaction-start :
+      val stack-obj = (stack as ptr<long>) - sizeof(long)
+      [p] = stack + relocation-offset(stack-obj)
+    iterate-references-in-stack-frames(stack, addr(relocate-reference), heap)
+    ;Go to the next element in the list.
+    p = addr(stack.tail)
+  ;No meaningful return value
+  return false
 
 ;Mark all reachable objects.
-lostanza defn mark-reachable-objects (vms:ptr<VMState>) -> ref<False> :
+lostanza defn mark-reachable-objects (heap:ptr<Heap>) -> ref<False> :
   ;Reset the incomplete range and call mark-from-root
   ;on all roots.
-  reset-incomplete-range(vms)
-  iterate-roots(addr(mark-from-root), vms)
+  reset-incomplete-range(heap)
+  iterate-roots(addr(mark-from-root), heap)
   ;Iteratively call continue-marking on all pointers in the
   ;incomplete range until we're finished.
-  complete-marking(vms)
-  scan-stacks(vms)
+  complete-marking(heap)
+  scan-stacks(heap)
   ;No meaningful return value
   return false
 
 ;Scans the heap from given start to heap top until first unmarked object found.
 ;Clear the scanned objects marks. Returns address of the first unmarked object,
 ;or the heap top if it is not found.
-lostanza defn skip-live (start:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
+lostanza defn skip-live (start:ptr<long>, heap:ptr<Heap>) -> ptr<long> :
   ;Precondition: Ensure that given start is below heap-top.
-  val heap-top = vms.heap.top
+  val heap-top = heap.top
   #if-not-defined(OPTIMIZE) :
     if start > heap-top : fatal("Invalid range.")
 
   ;Start scan pointer from the given start, proceeding until we hit heap top.
-  for (var p:ptr<long> = start, p < heap-top, p = p + allocation-size(p, vms)) :
+  for (var p:ptr<long> = start, p < heap-top, p = p + allocation-size(p, heap)) :
     ;If the pointer points to an unmarked object
     ;then return that pointer immediately. Clears the
     ;mark at the same time.
-    if test-and-clear-mark(p, vms) == 0 : return p
+    if test-and-clear-mark(p, heap) == 0 : return p
 
   ;Return the heap-top to indicate no unmarked object found.
   return heap-top
@@ -1633,19 +1500,19 @@ lostanza defn skip-live (start:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
 ;Scans the heap from given start to heap top until first unmarked object found.
 ;Clear the scanned objects marks. Returns address of the first unmarked object,
 ;or the heap top if it is not found.
-lostanza defn update-and-skip-live (start:ptr<long>, offset:long, vms:ptr<VMState>) -> ptr<long> :
+lostanza defn update-and-skip-live (start:ptr<long>, offset:long, heap:ptr<Heap>) -> ptr<long> :
   ;Precondition: Ensure that given start is below heap-top.
-  val heap-top = vms.heap.top
+  val heap-top = heap.top
   #if-not-defined(OPTIMIZE) :
     if start > heap-top : fatal("Invalid range.")
 
   ;Start scan pointer from the given start, proceeding until we hit heap top.
-  for (var p:ptr<long> = start, p < heap-top, p = p + allocation-size(p, vms)) :
+  for (var p:ptr<long> = start, p < heap-top, p = p + allocation-size(p, heap)) :
     ;If the pointer points to an unmarked object
     ;then return that pointer immediately. Clears the
     ;mark at the same time.
-    if test-and-clear-mark(p, vms) == 0 : return p
-    update-references(p, offset, vms)
+    if test-and-clear-mark(p, heap) == 0 : return p
+    update-references(p, offset, heap)
 
   ;Return the heap-top to indicate no unmarked object found.
   return heap-top
@@ -1691,17 +1558,17 @@ lostanza defn lowest-one (bit-word:long) -> long :
 
 ;Scans the heap from given start to heap top until first marked object found.
 ;Returns address of the first unmarked object or the heap top if it is not found.
-lostanza defn skip-dead (start:ptr<long>, vms:ptr<VMState>) -> ptr<long> :
-  val heap-top = vms.heap.top
+lostanza defn skip-dead (start:ptr<long>, heap:ptr<Heap>) -> ptr<long> :
+  val heap-top = heap.top
   #if-not-defined(OPTIMIZE) :
     if start > heap-top : fatal("Invalid start.")
 
   ;Compute starting shift and ending mask.
   ;Supposing that end-bit-index is 9, then end-bit-mask contains 0000 0001 1111 1111.
-  val start-bit-index = bit-index(start, vms)
-  val end-bit-index = bit-index(heap-top - 1, vms)
-  val start-bit-address = bit-address(start-bit-index, vms)
-  val end-bit-address = bit-address(end-bit-index, vms)
+  val start-bit-index = bit-index(start, heap)
+  val end-bit-index = bit-index(heap-top - 1, heap)
+  val start-bit-address = bit-address(start-bit-index, heap)
+  val end-bit-address = bit-address(end-bit-index, heap)
   val start-bit-shift = bit-shift(start-bit-index)
   val end-bit-mask = (bit-mask(end-bit-index) << 1) - 1
 
@@ -1787,18 +1654,18 @@ lostanza defn read-live-range (location:ptr<long>) -> LiveRange :
 ;   at compaction-start.
 ;2) Relocation offset of each object will be recorded in spare bits of its header.
 ;3) References in compaction area will be relocated to object locations after compaction.
-;4) The compaction start address will be recorded in vms.
+;4) The compaction start address will be recorded in heap.
 ;5) The heap top will be updated.
-lostanza defn create-live-ranges (compaction-start:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn create-live-ranges (compaction-start:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   ;Record the compaction-start address.
-  vms.heap.compaction-start = compaction-start
+  heap.compaction-start = compaction-start
 
   ;- limit: the top of the heap
   ;- offset: the accumulated offset that all objects in the current live range
   ;  should be moved by. Guaranteed to be strictly negative because
   ;  objects can only move downwards during compaction phase.
   ;- current-dead: points to the next gap in the heap.
-  val limit = vms.heap.top
+  val limit = heap.top
   var offset:long = 0
   var current-dead:ptr<long> = compaction-start
   while current-dead < limit :
@@ -1806,16 +1673,16 @@ lostanza defn create-live-ranges (compaction-start:ptr<long>, vms:ptr<VMState>) 
     ;The live range starts at 'next-marked' and ends at 'next-unmarked'.
     ;If there are no more marked objects, then record current-unmarked
     ;as the top of the heap, and return immediately.
-    val next-live = skip-dead(current-dead, vms)
+    val next-live = skip-dead(current-dead, heap)
     if next-live == limit :
-      vms.heap.top = current-dead
+      heap.top = current-dead
       return false
 
     ;Compute the length of the current break, and update the
     ;accumulated offset.
     offset = offset - (next-live - current-dead)
 
-    val next-dead = update-and-skip-live(next-live, offset, vms)
+    val next-dead = update-and-skip-live(next-live, offset, heap)
     ;Store the live range information in the heap in the
     ;current break.
     write-live-range(current-dead, LiveRange{next-live, next-dead})
@@ -1841,13 +1708,13 @@ lostanza defn relocation-offset (p:ptr<long>) -> long :
       fatal("Invalid relocation offset.")
   return offset
 
-lostanza defn clear-relocation-offset (range:LiveRange, vms:ptr<VMState>) -> ref<False> :
-  for (var p:ptr<long> = range.live, p < range.dead, p = p + allocation-size(p, vms)) :
+lostanza defn clear-relocation-offset (range:LiveRange, heap:ptr<Heap>) -> ref<False> :
+  for (var p:ptr<long> = range.live, p < range.dead, p = p + allocation-size(p, heap)) :
     [p] = [p] & TAG-MASK-IN-HEADER
   ;No meaningful return value.
   return false
 
-lostanza defn update-references (p:ptr<long>, offset:long, vms:ptr<VMState>) -> ref<False> :
+lostanza defn update-references (p:ptr<long>, offset:long, heap:ptr<Heap>) -> ref<False> :
   var ref:ptr<long> = [p] as ptr<long>
   val limit = TAG-MASK-IN-HEADER as ptr<long>
   val new-value = p as long + offset + 1L ;For a tag
@@ -1856,12 +1723,12 @@ lostanza defn update-references (p:ptr<long>, offset:long, vms:ptr<VMState>) -> 
     [ref] = new-value
     ref = next
   [p] = ref as long | (offset << TAG-BITS-IN-HEADER)
-  iterate-references(p, addr(relocate-or-reverse-reference), vms)
+  iterate-references(p, addr(relocate-or-reverse-reference), heap)
   ;No meaningful return value.
   return false
 
 ;Given a pointer to an object reference, write its new value after compaction in-place.
-lostanza defn relocate-reference (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn relocate-reference (ref:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   ;Retrieve the value at the given heap pointer.
   val v = [ref]
   ;Is this a reference to a Stanza heap object?
@@ -1870,12 +1737,12 @@ lostanza defn relocate-reference (ref:ptr<long>, vms:ptr<VMState>) -> ref<False>
     ;Remove the tag bits to retrieve the object pointer.
     val p = (v - 1) as ptr<long>
     ;Only pointers to objects in the compaction area are relocated.
-    if p > vms.heap.compaction-start :
+    if p > heap.compaction-start :
       [ref] = v + relocation-offset(p)
   ;No meaningful return value
   return false
 
-lostanza defn relocate-or-reverse-reference (ref:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn relocate-or-reverse-reference (ref:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   ;Retrieve the value at the given heap pointer.
   val v = [ref]
   ;Is this a reference to a Stanza heap object?
@@ -1884,7 +1751,7 @@ lostanza defn relocate-or-reverse-reference (ref:ptr<long>, vms:ptr<VMState>) ->
     ;Remove the tag bits to retrieve the object pointer.
     val p = (v - 1) as ptr<long>
     ;Only pointers to objects in the compaction area are relocated.
-    if p > vms.heap.compaction-start :
+    if p > heap.compaction-start :
       ;The heap is scanned from the start to the top. Objects above the reference
       ;are not scanned yet, so their relocation offsets are not yet computed.
       if p > ref :
@@ -1898,24 +1765,24 @@ lostanza defn relocate-or-reverse-reference (ref:ptr<long>, vms:ptr<VMState>) ->
   ;No meaningful return value
   return false
 
-lostanza defn relocate-solid-prefix-references (vms:ptr<VMState>) -> ref<False> :
-  val limit = vms.heap.compaction-start
-  for (var p:ptr<long> = vms.heap.start, p < limit, p = p + allocation-size(p, vms)) :
-    iterate-references(p, addr(relocate-reference), vms)
+lostanza defn relocate-solid-prefix-references (heap:ptr<Heap>) -> ref<False> :
+  val limit = heap.compaction-start
+  for (var p:ptr<long> = heap.start, p < limit, p = p + allocation-size(p, heap)) :
+    iterate-references(p, addr(relocate-reference), heap)
   ;No meaningful return value
   return false
 
 ;Move objects in heap to lower memory as part of compaction.
-lostanza defn compact (vms:ptr<VMState>) -> ref<False> :
+lostanza defn compact (heap:ptr<Heap>) -> ref<False> :
   ;offset holds the amount that objects need to be
   ;shifted by to reach their new location.
   var offset:long = 0
-  val top = vms.heap.top
-  var dead:ptr<long> = vms.heap.compaction-start
+  val top = heap.top
+  var dead:ptr<long> = heap.compaction-start
   while dead < top :
     ;Read the live range annotated in the current break.
     val next = read-live-range(dead)
-    clear-relocation-offset(next, vms)
+    clear-relocation-offset(next, heap)
     ;The span of dead objects spans from dead (the end of the previous
     ;live range) to next.live (the start of the next live range).
     offset = offset - (next.live - dead)
@@ -1924,26 +1791,26 @@ lostanza defn compact (vms:ptr<VMState>) -> ref<False> :
     ;Advance to the next break.
     dead = next.dead
   ;Record the new heap top.
-  vms.heap.top = top + offset
+  heap.top = top + offset
   ;No meaningful return value
   return false
 
 ;Used as callback to iterate-marked. GC is incorrect if ever called.
-lostanza defn fatal-object-marked! (p:ptr<long>, vms:ptr<VMState>) -> ref<False> :
+lostanza defn fatal-object-marked! (p:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   fatal("Unexpected marked object.")
   ;No meaningful return value
   return false
 
 ;Calls fatal if any object in the heap is marked.
-lostanza defn ensure-no-marks-in-collection-area! (vms:ptr<VMState>) -> ref<False> :
+lostanza defn ensure-no-marks-in-collection-area! (heap:ptr<Heap>) -> ref<False> :
   #if-not-defined(OPTIMIZE) :
-    iterate-marked(vms.heap.start, vms.heap.top, addr(fatal-object-marked!), vms)
+    iterate-marked(heap.start, heap.top, addr(fatal-object-marked!), heap)
   ;No meaningful return value
   return false
 
-lostanza defn collect-garbage (vms:ptr<VMState>) -> ref<False> :
+lostanza defn collect-garbage (heap:ptr<Heap>) -> ref<False> :
   ;Precondition: No objects should be marked.
-  ensure-no-marks-in-collection-area!(vms)
+  ensure-no-marks-in-collection-area!(heap)
 
   ;Four phases:
   ;1) Mark
@@ -1952,35 +1819,226 @@ lostanza defn collect-garbage (vms:ptr<VMState>) -> ref<False> :
   ;4) Compact
 
   ;Phase 1. Mark
-  mark-reachable-objects(vms)
-  scan-liveness-trackers(vms)
+  mark-reachable-objects(heap)
+  scan-liveness-trackers(heap)
 
   ;Find the first unmarked object. If there is one, then this is where
   ;compaction begins.
-  val compaction-start = skip-live(vms.heap.start, vms)
-  if compaction-start < vms.heap.top :
+  val compaction-start = skip-live(heap.start, heap)
+  if compaction-start < heap.top :
     ;Phase 2. Construct live ranges, compute relocation offsets,
     ;update references in relocation area
-    create-live-ranges(compaction-start, vms)
+    create-live-ranges(compaction-start, heap)
     ;Phase 3. Relocate references
     ;Relocate all GC roots.
-    iterate-roots(addr(relocate-reference), vms)
+    iterate-roots(addr(relocate-reference), heap)
     ;Relocate solid prefix separately because it is not in compaction area.
-    relocate-solid-prefix-references(vms)
+    relocate-solid-prefix-references(heap)
     ;Relocate liveness trackers separately because their
     ;references are not typed as references.
-    relocate-liveness-trackers(vms)
+    relocate-liveness-trackers(heap)
     ;Relocate stacks separately because their list is not typed as references
     ;and their frames are allocated off-heap.
-    relocate-stacks(vms)
+    relocate-stacks(heap)
     ;Phase 4. Compact
-    compact(vms)
+    compact(heap)
 
   ;Post condition: All marks should be cleared.
-  ensure-no-marks-in-collection-area!(vms)
+  ensure-no-marks-in-collection-area!(heap)
 
   ;No meaningful return value
   return false
+
+;Runs the garbage collector in the heap.
+;- size: the number of bytes that we desire from the heap. This is
+;  used to compute whether or not to grow the heap.
+lostanza defn collect-garbage (size:long, heap:ptr<Heap>) -> ref<False> :
+  ;First run the garbage collector,
+  collect-garbage(heap)
+
+  ;Compute the new desired size of the heap.
+  val available-space = heap.limit - heap.start
+  var desired-space:long = heap.top + size - heap.start
+  ;Increase the desired space if it is insufficient
+  ;to satisfy the requested size.
+  if available-space < desired-space :
+    ;Double the desired space until it is sufficient.
+    val requested-space = desired-space
+    desired-space = available-space * 2
+    while desired-space < requested-space :
+      desired-space = desired-space * 2
+  ;Increase the desired space if the usage ratio is too high.
+  else :
+    val usage-ratio = (desired-space as float) / (available-space as float)
+    if usage-ratio > 0.5f :
+      desired-space = available-space * 2
+  ;Ensure that the desired space
+  desired-space = min(desired-space, MAXIMUM-HEAP-SIZE)
+  expand-heap(desired-space, heap)
+
+  val available-after-collection = heap.limit - heap.top
+  if available-after-collection < size : fatal!("Out of memory.")
+
+  ;No meaningful return value
+  return false
+
+lostanza defn tag (x:ptr<?>) -> long :
+  return (x + 1) as long
+
+lostanza defn untag (x:long) -> ptr<?> :
+  val tagbits = x & 7L
+  if tagbits != 1 : fatal("Not a heap-allocated object!")
+  return (x - 1 + 8) as ptr<?>
+
+;============================================================
+;================== GC Notifiers ============================
+;============================================================
+
+var GC-NOTIFIERS:Vector<(() -> ?)>
+
+lostanza defn initialize-gc-notifiers () -> ref<False> :
+  GC-NOTIFIERS = Vector<(() -> ?)>()
+  initialized-gc-notifiers? = 1L
+  return false
+
+defn run-gc-notifiers () :
+  for f in GC-NOTIFIERS do :
+    f()
+
+public defn add-gc-notifier (f: () -> ?) :
+   add(GC-NOTIFIERS, f)
+
+
+lostanza defn initialize-heap () -> ref<False> :
+  val vms:ptr<VMState> = call-prim flush-vm()
+  val heap:ptr<Heap> = addr(vms.heap)
+  heap.env = vms
+  heap.allocation-size = addr(core-allocation-size)
+  heap.iterate-roots = addr(core-iterate-roots)
+  heap.iterate-references = addr(core-iterate-references)
+  heap.iterate-references-in-stack-frames = addr(core-iterate-references-in-stack-frames)
+  heap.liveness-trackers = null
+
+  val entry-stack:ptr<Stack> = untag(heap.current-stack)
+  val entry-system-stack:ptr<Stack> = untag(heap.system-stack)
+  entry-stack.tail = entry-system-stack
+  heap.stacks = entry-stack
+  ;call-c clib/printf("Entry stack frames %p\n", entry-stack.frames)
+  ;call-c clib/printf("Entry system stack frames %p\n", entry-system-stack.frames)
+
+  ;No meaningful return value.
+  return false
+
+lostanza defn extend-stack (size:long) -> ref<False> :
+  val vms:ptr<VMState> = call-prim flush-vm()
+  return extend-stack(size, addr(vms.heap))
+
+;============================================================
+;============= Garbage Collector with Resizing ==============
+;============================================================
+
+;Uses virtual memory system to allocate more pages.
+;- space is a pointer to a virtual address region created using mmap.
+;- current-size is the current number of bytes that has been concretely allocated.
+;- desired-size is the new number of bytes that we want to be concretely allocated.
+public lostanza defn stz-memory-resize (space:ptr<long>, current-size:long, desired-size:long) -> ptr<long> :
+  call-c clib/stz_memory_resize(space, current-size, desired-size)
+  return space + desired-size
+
+;This function is called by the "call-prim collect-garbage" primitive.
+;It runs the garbage collector, and returns the new number of bytes
+;remaining after the garbage collector runs.
+;- size: the number of bytes that we desire from the heap. This is
+;  used to compute whether or not to grow the heap.
+lostanza defn collect-garbage (size:long) -> ref<False> :
+  ;Retrieve state
+  val vms:ptr<VMState> = call-prim flush-vm()
+  return collect-garbage(size, addr(vms.heap))
+
+;============================================================
+;================== New Garbage Collector ===================
+;============================================================
+
+;Sets the first 'size' bytes in the address range starting from 'start' to 0.
+;Returns 'start'.
+public lostanza defn clear (start:ptr<?>, size:long) -> ptr<?> :
+  return call-c clib/memset(start, 0, size)
+
+;Call f on all root pointers.
+lostanza defn core-iterate-roots (f:ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>,
+                                  heap:ptr<Heap>) -> ref<False> :
+  val vms:ptr<VMState> = heap.env
+  ;Scan globals
+  val globals = vms.global-mem as ptr<long>
+  val roots = vms.global-root-table
+  val nroots = roots.length
+  for (var i:int = 0, i < nroots, i = i + 1) :
+    val r = roots.roots[i]
+    [f](addr(globals[r]), heap)
+
+  ;Scan const roots
+  val consts = vms.const-table
+  val nconsts = [vms.const-mem as ptr<int>]
+  for (var i:int = 0, i < nconsts, i = i + 1) :
+    [f](addr(consts[i]), heap)
+  ;No meaningful return value
+  return false
+
+;Call f on all references stored in the object pointed to by p.
+lostanza defn core-iterate-references (p:ptr<long>, tag:long,
+                                       f:ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>,
+                                       heap:ptr<Heap>) -> ref<False> :
+  val vms:ptr<VMState> = heap.env
+  val class-rec = vms.class-table[tag]
+  if class-rec.item-size == 0 :
+    val roots = addr(class-rec.roots)
+    val num-roots = class-rec.num-roots
+    val obj = p as ptr<ObjectLayout>
+    for (var i:int = 0, i < num-roots, i = i + 1) :
+      val r = roots[i]
+      [f](addr(obj.slots[r]), heap)
+  ;Array class
+  else :
+    val array-rec = class-rec as ptr<ArrayRecord>
+    val array = p as ptr<ObjectLayout>
+
+    val num-base-roots = array-rec.num-base-roots
+    val base-roots = addr(array-rec.roots)
+    for (var i:int = 0, i < num-base-roots, i = i + 1) :
+      val r = base-roots[i]
+      [f](addr(array.slots[r]), heap)
+
+    val num-item-roots = array-rec.num-item-roots
+    if num-item-roots > 0 :
+      var items:ptr<?> = addr(array.slots) + array-rec.base-size
+      val item-size = array-rec.item-size
+      val item-roots = addr(array-rec.roots[num-base-roots])
+      val len = array.slots[0]
+      for (var n:long = 0, n < len, n = n + 1) :
+        for (var i:int = 0, i < num-item-roots, i = i + 1) :
+          [f](items + item-roots[i], heap)
+        items = items + item-size
+  ;No meaningful return value
+  return false
+
+;Given p, a heap pointer pointing to the start of an object (i.e. at
+;the header word), return the total size of the object. This
+;function takes care of handling variable-sized arrays.
+lostanza defn core-allocation-size (p:ptr<long>, tag:long, heap:ptr<Heap>) -> long :
+  ;Use the tag to retrieve the object's class record.
+  val vms:ptr<VMState> = heap.env
+  val class-rec = vms.class-table[tag]
+  ;Fixed-length objects have an item-size of 0.
+  if class-rec.item-size == 0 :
+    return class-rec.size
+  ;Otherwise, it's a variable-length array object.
+  else :
+    val array-rec = class-rec as ptr<ArrayRecord>
+    val base-size = array-rec.base-size
+    val item-size = array-rec.item-size
+    val array = p as ptr<ObjectLayout>
+    val len = array.slots[0]
+    return base-size + item-size * len
 
 ;============================================================
 ;==================== LivenessTracker =======================
@@ -2000,43 +2058,42 @@ public lostanza deftype LivenessTracker :
   var value: long
   var tail: ptr<LivenessTracker>
 
-lostanza defn initialize-liveness-trackers ()  -> ref<False> :
-  val vms:ptr<VMState> = call-prim flush-vm()
-  vms.heap.liveness-trackers = null
-  ;No meaningful return value
-  return false
-
 ;Create a new LivenessTracker, wrapped around the given Unique object,
 ;and add it to vms.heap.liveness-trackers list.
 public lostanza defn LivenessTracker (value:ref<Unique>) -> ref<LivenessTracker> :
   val vms:ptr<VMState> = call-prim flush-vm()
-  ;vms.heap.liveness-trackers cannot be passed as an argument to new LivenessTracker{...}.
-  ;vms.heap.liveness-trackers is a ptr<>. new LivenessTracker{...} can cause a GC.
-  ;GC is aware of vms.heap.liveness-trackers and so can update it.
-  ;But local copy of vms.heap.liveness-trackers passed as an argument keeps the old value.
-  val tracker = new LivenessTracker{0L, null}
-  tracker.value = value as long
-  tracker.tail = vms.heap.liveness-trackers
-  vms.heap.liveness-trackers = addr!([tracker])
-  return tracker
+  return LivenessTracker(value, addr(vms.heap))
 
 ;Retrieve the wrapped Unique object within a liveness tracker.
 ;Returns false if the object is no longer live.
 public lostanza defn value (t:ref<LivenessTracker>) -> ref<False|Unique> :
   return t.value as ref<False|Unique>
 
+;Create a new LivenessTracker, wrapped around the given Unique object,
+;and add it to heap.liveness-trackers list.
+lostanza defn LivenessTracker (value:ref<Unique>, heap:ptr<Heap>) -> ref<LivenessTracker> :
+  ;heap.liveness-trackers cannot be passed as an argument to new LivenessTracker{...}.
+  ;heap.liveness-trackers is a ptr<>. new LivenessTracker{...} can cause a GC.
+  ;GC is aware of heap.liveness-trackers and so can update it.
+  ;But local copy of heap.liveness-trackers passed as an argument keeps the old value.
+  val tracker = new LivenessTracker{0L, null}
+  tracker.value = value as long
+  tracker.tail = heap.liveness-trackers
+  heap.liveness-trackers = addr!([tracker])
+  return tracker
+
 lostanza val false-marker:long = tagof(False) << 3L + 2
 
-;Scan through vms.heap.liveness-trackers and update them.
+;Scan through heap.liveness-trackers and update them.
 ;After this function finishes:
-;1) All vms.heap.liveness-trackers will have their 'value' field appropriately updated.
+;1) All heap.liveness-trackers will have their 'value' field appropriately updated.
 ;   The 'value' field will be set to false, if the object they are referencing is
 ;   no longer live.
-;2) The vms.heap.liveness-trackers list will contain only LivenessTrackers that are still live,
+;2) The heap.liveness-trackers list will contain only LivenessTrackers that are still live,
 ;   that hold references to Unique objects that are still live.
-lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
+lostanza defn scan-liveness-trackers (heap:ptr<Heap>) -> ref<False> :
   ;p is a pointer to the list being scanned.
-  var p:ptr<ptr<LivenessTracker>> = addr(vms.heap.liveness-trackers)
+  var p:ptr<ptr<LivenessTracker>> = addr(heap.liveness-trackers)
   ;Scan until we reach the end of the list (represented using null pointer).
   ;TODO: In generational GC scan the list while [p] >= collection-area-start
   while [p] != null :
@@ -2049,7 +2106,7 @@ lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
     val tracker-obj = (tracker as ptr<?>) - sizeof(long)
 
     ;Test whether the tracker is marked (and therefore still live).
-    if test-mark(tracker-obj, vms) == 0 :
+    if test-mark(tracker-obj, heap) == 0 :
       ;The tracker is no longer live, so unlink the tracker
       ;from the list.
       [p] = tracker.tail
@@ -2057,9 +2114,9 @@ lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
       ;Set the value field on the tracker to false if it
       ;no longer refers to a live Unique object. We can assume that
       ;value currently holds a pointer into the heap otherwise it
-      ;wouldn't be in the vms.heap.liveness-trackers list.
+      ;wouldn't be in the heap.liveness-trackers list.
       val value-obj = (tracker.value - 1) as ptr<?>
-      if test-mark(value-obj, vms) == 0 :
+      if test-mark(value-obj, heap) == 0 :
         ;The Unique is no longer live so replace the value with
         ;false-marker.
         tracker.value = false-marker
@@ -2073,12 +2130,12 @@ lostanza defn scan-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
   ;No meaningful return value
   return false
 
-;Relocate the referenced objects in vms.heap.liveness-trackers list
+;Relocate the referenced objects in heap.liveness-trackers list
 ;as part of compaction.
-lostanza defn relocate-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
-  val compaction-start = vms.heap.compaction-start
+lostanza defn relocate-liveness-trackers (heap:ptr<Heap>) -> ref<False> :
+  val compaction-start = heap.compaction-start
   ;p is a pointer to the list being scanned.
-  var p:ptr<ptr<LivenessTracker>> = addr(vms.heap.liveness-trackers)
+  var p:ptr<ptr<LivenessTracker>> = addr(heap.liveness-trackers)
   ;GC preserves the allocation order, so:
   ;  1) Tracker value is always below the tracker.
   ;  2) Later trackers in the list are below earlier trackers.
@@ -2089,7 +2146,7 @@ lostanza defn relocate-liveness-trackers (vms:ptr<VMState>) -> ref<False> :
     ;Relocate the pointer to the tracker
     [p] = tracker + relocation-offset(tracker-obj)
     ;Relocate the tracker value
-    relocate-reference(addr(tracker.value), vms)
+    relocate-reference(addr(tracker.value), heap)
     ;Go to the next element in the list.
     p = addr(tracker.tail)
   ;No meaningful return value
@@ -2110,14 +2167,6 @@ public lostanza defn min (x:long, y:long) -> long :
 lostanza deftype ObjectLayout :
   tag: long
   var slots: long ...
-
-lostanza defn tag (x:ptr<?>) -> long :
-  return (x + 1) as long
-
-lostanza defn untag (x:long) -> ptr<?> :
-  val tagbits = x & 7L
-  if tagbits != 1 : fatal("Not a heap-allocated object!")
-  return (x - 1 + 8) as ptr<?>
 
 lostanza defn dump-heap (vms:ptr<VMState>) -> int :
   return dump-heap(vms.heap.start, vms.heap.top, vms)
@@ -2991,9 +3040,10 @@ lostanza defn initialize-coroutines () -> ref<False> :
 
 public lostanza defn RawCoroutine (enter:ref<((RawCoroutine, ?) -> ?)>) -> ref<RawCoroutine> :
   val vms:ptr<VMState> = call-prim flush-vm()
-  val stk = allocate-stack(vms)
+  val heap:ptr<Heap> = addr(vms.heap)
+  val stk = allocate-stack(heap)
   stk.pc = addr(setup-coroutine) as long
-  val current-stack = vms.heap.current-stack as ref<Stack>
+  val current-stack = heap.current-stack as ref<Stack>
   return call-prim enter-stack(stk, current-stack, enter)
 
 lostanza defn parent (c:ref<RawCoroutine>) -> ref<False|RawCoroutine> :
@@ -3298,8 +3348,7 @@ protected val uninitialized = new Uninitialized
 
 initialize-error-handler()
 initialize-command-launcher()
-initialize-stack-pool()
-initialize-liveness-trackers()
+initialize-heap()
 initialize-winders()
 initialize-coroutines()
 initialize-gc-notifiers()
