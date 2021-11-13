@@ -316,6 +316,10 @@ public lostanza defn print-stack-trace () -> ref<False> :
         (p:ref<False>) : ()
   return false
 
+public lostanza defn collect-stack-trace () -> ref<StackTrace> :
+  call-prim flush-vm()
+  return collect-stack-trace(current-coroutine.stack)
+
 var EXECUTION-HALT:() -> Void
 
 defn halt () -> Void :
@@ -354,9 +358,58 @@ protected lostanza defn resize-ptr (p:ptr<?>, oldsize:long, newsize:long) -> ptr
 ;===================== Stack Trace ==========================
 ;============================================================
 
+;Representation of a packed StackTrace
+public lostanza deftype StackTrace :
+  data:ptr<PackedStackTrace>
+
+;Represents a single item in the stack trace
+public defstruct StackTraceEntry :
+  package:Symbol
+  signature:String|False
+  info:FileInfo|False
+
+lostanza defn get (trace:ref<StackTrace>, i:ref<Int>) -> ref<StackTraceEntry> :
+  return entry(trace.data, i.value)
+
 lostanza defn print-stack-trace (stack:ref<Stack>) -> ref<False> :
   val vms:ptr<VMState> = call-prim flush-vm()
 
+  ;Discover return addresses
+  val buffer = stack-trace-return-addresses(vms,stack)
+
+  ;Print buffer
+  for (var i:long = buffer.length - 1, i >= 0, i = i - 1) :
+    val entry = stack-trace-record(buffer.items[i], vms.stack-trace-table)
+    if entry != null :
+      print-record(entry)
+
+  ;Free the buffer
+  free(buffer)
+  return false
+
+lostanza defn collect-stack-trace (stack:ref<Stack>) -> ref<StackTrace> :
+  val vms:ptr<VMState> = call-prim flush-vm()
+
+  ;Discover return addresses
+  val buffer = stack-trace-return-addresses(vms,stack)
+
+  ;Build stack trace
+  val builder = StackTraceBuilder()
+  for (var i:long = buffer.length - 1, i >= 0, i = i - 1) :
+    val entry = stack-trace-record(buffer.items[i], vms.stack-trace-table)
+    if entry != null :
+      add-entry(builder, entry)
+
+  ;Pack stack trace into stable memory
+  val trace = new StackTrace{pack(builder)}
+
+  ;Free the buffer
+  free(buffer)
+
+  ;Return the packed trace.
+  return trace
+  
+lostanza defn stack-trace-return-addresses (vms:ptr<VMState>, stack:ref<Stack>) -> ptr<LSLongVector> :
   ;Discover return addresses
   val buffer = LSLongVector()
 
@@ -373,15 +426,9 @@ lostanza defn print-stack-trace (stack:ref<Stack>) -> ref<False> :
         val stackmap = vms.stackmap-table[map-index]
         goto loop(sp + stackmap.size)
 
-  ;Print buffer
-  for (var i:long = buffer.length - 1, i >= 0, i = i - 1) :
-    val entry = stack-trace-record(buffer.items[i], vms.stack-trace-table)
-    if entry != null :
-      print-record(entry)
-
-  ;Free the buffer
-  free(buffer)
-  return false
+  ;Return the buffer
+  return buffer
+  
 
 lostanza defn stack-trace-record (ret:long, trace-table:ptr<StackTraceTable>) -> ptr<StackTraceRecord> :
   for (var i:int = 0, i < trace-table.length, i = i + 1) :
@@ -398,7 +445,154 @@ lostanza defn print-record (record:ptr<StackTraceRecord>) -> ref<False> :
   call-c clib/fprintf(current-err, "\n")
   if record.file != null :
     call-c clib/fprintf(current-err, "    at %s:%d.%d\n", record.file, record.line, record.column)
+  return false  
+
+;============================================================
+;=================== Stack Trace Builder ====================
+;============================================================
+
+;Builder utility for constructing packed stack traces.
+deftype StackTraceBuilder
+defmulti add-entry (b:StackTraceBuilder, entry:Int) -> False
+defmulti record-index? (b:StackTraceBuilder, record:Long) -> Int|False
+defmulti add-record (b:StackTraceBuilder, record:Long, package:Int, signature:Int, file:Int, line:Int, column:Int) -> Int
+defmulti string-index? (b:StackTraceBuilder, str:Long) -> Int|False
+defmulti add-string (b:StackTraceBuilder, address:Long, str:String) -> Int
+defmulti pack-buffer (b:StackTraceBuilder) -> ByteBuffer
+
+defn StackTraceBuilder () -> StackTraceBuilder :
+  val entries = Vector<Int>()
+  val record-buffer = ByteBuffer()
+  val string-buffer = ByteBuffer()
+  val record-table = HashTable<Long,Int>()
+  val string-table = HashTable<Long,Int>()
+  new StackTraceBuilder :
+    defmethod add-entry (this, entry:Int) :
+      add(entries, entry)
+    defmethod record-index? (this, record:Long) :
+      get?(record-table, record)
+    defmethod add-record (this, record:Long, package:Int, signature:Int, file:Int, line:Int, column:Int) :
+      val index = length(record-table)
+      record-table[record] = index
+      put(record-buffer, package)
+      put(record-buffer, signature)
+      put(record-buffer, file)
+      put(record-buffer, line)
+      put(record-buffer, column)
+      index
+    defmethod string-index? (this, str:Long) :
+      get?(string-table, str)
+    defmethod add-string (this, address:Long, str:String) :
+      ;Get the index
+      val index = length(string-buffer) >> 3
+      string-table[address] = index
+      ;Put the characters and 0 ending.
+      print(string-buffer, str)
+      put(string-buffer, 0Y)
+      ;Pad up to 8-bytes
+      val remaining = (8 - (length(string-buffer) & 7)) & 7
+      for i in 0 to remaining do : put(string-buffer, 0Y)
+      ;Return the index
+      index
+    defmethod pack-buffer (this) :
+      val buffer = ByteBuffer()
+      put(buffer, length(entries))
+      put(buffer, length(record-table))
+      put(buffer, length(string-buffer) >> 3)
+      do(put{buffer, _}, entries)
+      do(put{buffer, _}, record-buffer)
+      do(put{buffer, _}, string-buffer)
+      buffer
+
+;Pack into a stable array.
+lostanza defn pack (b:ref<StackTraceBuilder>) -> ptr<PackedStackTrace> :
+  val buffer = pack-buffer(b)
+  val array = backing-array(buffer)
+  val len = length(buffer).value
+  val mem:ptr<PackedStackTrace> = call-c clib/malloc(len)
+  call-c clib/memcpy(mem, addr!(array.data), len)
+  return mem
+
+;Packed representation of a single stack trace record.
+lostanza deftype PackedStackTraceRecord :
+  package:int
+  signature:int
+  file:int
+  line:int
+  column:int
+
+;Packed representation of a stack trace.
+lostanza deftype PackedStackTrace :
+  num-entries:int
+  num-records:int
+  num-char-words:int
+  data:? ...
+
+;Return the address at which the entries start.
+lostanza defn entries (trace:ptr<PackedStackTrace>) -> ptr<int> :
+  return addr(trace.data)
+
+;Return the address at which the records start.
+lostanza defn records (trace:ptr<PackedStackTrace>) -> ptr<PackedStackTraceRecord> :
+  return addr(entries(trace)[trace.num-entries]) as ptr<PackedStackTraceRecord>
+
+;Return the address at which the characters start.
+lostanza defn char-words (trace:ptr<PackedStackTrace>) -> ptr<long> :
+  return addr(records(trace)[trace.num-records]) as ptr<long>
+
+;Return the string at index i. Returns false if i is negative.
+lostanza defn unpack-string (trace:ptr<PackedStackTrace>, i:int) -> ref<String|False> :
+  if i < 0 : return false
+  val chars = char-words(trace)[i] as ptr<byte>
+  return String(chars)
+
+;Unpack the given record at the given index.
+lostanza defn record (trace:ptr<PackedStackTrace>, i:int) -> ref<StackTraceEntry> :
+  ;Retrieve the i'th record.
+  val r = records(trace)[i]
+  val package = unpack-string(trace, r.package) as ref<String>
+  val signature = unpack-string(trace, r.signature)
+  val file = unpack-string(trace, r.file)
+  var info:ref<FileInfo|False> = false
+  if file != false :
+    info = FileInfo(file as ref<String>,
+                    new Int{r.line}, new Int{r.column})
+  return StackTraceEntry(to-symbol(package), signature, info)
+
+;Unpack the given entry at the given index.
+lostanza defn entry (trace:ptr<PackedStackTrace>, i:int) -> ref<StackTraceEntry> :
+  ;Get the index of the record that forms this entry.
+  val record-index = entries(trace)[i]
+  return record(trace, record-index)
+
+;Add the given record as an entry in the stack trace.
+lostanza defn add-entry (b:ref<StackTraceBuilder>, e:ptr<StackTraceRecord>) -> ref<False> :
+  add-entry(b, add-record?(b, e))
   return false
+
+;Add the given StackTraceRecord to the StackTraceBuilder and return the index at which
+;it is written. If this address has been added before then return the previous index.
+lostanza defn add-record? (b:ref<StackTraceBuilder>, e:ptr<StackTraceRecord>) -> ref<Int> :
+  val index = record-index?(b, new Long{e as long})
+  if index == false :
+    return add-record(b,
+                      new Long{e as long},
+                      add-string?(b, e.package),
+                      add-string?(b, e.signature),
+                      add-string?(b, e.file),
+                      new Int{e.line}
+                      new Int{e.column})
+  else :
+    return index as ref<Int>
+
+;Add the given string to the StackTraceBuilder and return the index at which
+;it is written. If that address has been added before then return the previous index.
+;Returns -1 if the given address is null.
+lostanza defn add-string? (b:ref<StackTraceBuilder>, s:ptr<byte>) -> ref<Int> :
+  if s == null : return new Int{-1}
+  val index = string-index?(b, new Long{s as long})
+  if index == false : return add-string(b, new Long{s as long}, String(s))
+  else : return index as ref<Int>
 
 ;============================================================
 ;====================== LS Long Vector ======================
