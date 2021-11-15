@@ -192,6 +192,7 @@
 #define GC_OPCODE 185
 #define CLASS_NAME_OPCODE 241
 #define PRINT_STACK_TRACE_OPCODE 186
+#define COLLECT_STACK_TRACE_OPCODE 187
 #define FLUSH_VM_OPCODE 188
 #define C_RSP_OPCODE 243
 #define JUMP_INT_LT_OPCODE 192
@@ -439,6 +440,7 @@ typedef struct{
 
 int call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
+void* call_collect_stack_trace (VMState* vms, uint64_t stack);
 char* retrieve_class_name (VMState* vms, uint64_t id);
 void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
 
@@ -1628,7 +1630,14 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_B_UNSIGNED();
       uint64_t stack = LOCAL(value);
       call_print_stack_trace(vms, stack);
-      SET_REG(x, 0);
+      SET_LOCAL(x, 0);
+      continue;
+    }
+    case COLLECT_STACK_TRACE_OPCODE : {
+      DECODE_B_UNSIGNED();
+      uint64_t stack = LOCAL(value);
+      void* packed_trace = call_collect_stack_trace(vms, stack);
+      SET_LOCAL(x, (uint64_t)packed_trace);
       continue;
     }
     case FLUSH_VM_OPCODE : {
