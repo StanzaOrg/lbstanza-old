@@ -345,14 +345,14 @@
   stack_pointer = (StackFrame*)((char*)stack_pointer - sizeof(StackFrame) - (num_locals) * 8);
 
 #define SAVE_STATE() \
-  vms->heap_top = heap_top; \
-  vms->current_stack = current_stack; \
+  vms->heap.top = heap_top; \
+  vms->heap.current_stack = current_stack; \
   stk->stack_pointer = stack_pointer;
 
 #define RESTORE_STATE() \
-  heap_top = vms->heap_top; \
-  heap_limit = vms->heap_limit; \
-  current_stack = vms->current_stack; \
+  heap_top = vms->heap.top; \
+  heap_limit = vms->heap.limit; \
+  current_stack = vms->heap.current_stack; \
   stk = untag_stack(current_stack); \
   stack_pointer = stk->stack_pointer; \
   stack_limit = (char*)(stk->frames) + stk->size;
@@ -388,6 +388,28 @@
 //==================== Machine Types =========================
 //============================================================
 
+typedef struct{
+  uint64_t current_stack;
+  uint64_t system_stack;
+  char* top;
+  char* limit;
+  char* start;
+  uint64_t* bitset;
+  uint64_t size;
+  char* compaction_start;
+  uint64_t* marking_stack_start;
+  uint64_t* marking_stack_bottom;
+  uint64_t* marking_stack_top;
+  char* min_incomplete;
+  char* max_incomplete;
+  struct Stack* stacks;
+  void* liveness_trackers;
+  void* allocation_size;
+  void* iterate_roots;
+  void* iterate_references;
+  void* iterate_references_in_stack_frames;
+} Heap;
+
 //The first fields in VMState are used by the core library
 //in both compiled and interpreted mode. The last fields
 //are used only in interpreted mode.
@@ -403,13 +425,7 @@ typedef struct{
   uint32_t* code_offsets;     //(Permanent State)
   uint64_t* registers;        //(Permanent State)
   uint64_t* system_registers; //(Permanent State)
-  uint64_t current_stack;     //(Variable State)
-  uint64_t system_stack;      //(Variable State)
-  char* heap;                 //(Variable State)
-  char* heap_top;             //(Variable State)
-  char* heap_limit;           //(Variable State)
-  char* free;                 //(Variable State)
-  char* free_limit;           //(Variable State)
+  Heap heap;                  //(Variable State)
   char* instructions;         //(Permanent State)
   void** trie_table;          //(Permanent State)
 } VMState;
@@ -431,6 +447,7 @@ typedef struct{
   StackFrame* frames;
   StackFrame* stack_pointer;
   uint64_t pc;
+  struct Stack* tail;
 } Stack;
 
 //============================================================
@@ -491,9 +508,9 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
   uint32_t* code_offsets = vms->code_offsets;
   //Variable State
   //Changes in_between each boundary change
-  char* heap_top = vms->heap_top;
-  char* heap_limit = vms->heap_limit;
-  uint64_t current_stack = vms->current_stack;
+  char* heap_top = vms->heap.top;
+  char* heap_limit = vms->heap.limit;
+  uint64_t current_stack = vms->heap.current_stack;
   Stack* stk = untag_stack(current_stack);
   StackFrame* stack_pointer = stk->stack_pointer;
   char* stack_limit = (char*)(stk->frames) + stk->size;
@@ -738,12 +755,12 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         //System stack no longer needed
         stk->stack_pointer = 0;
         //Swap stack and registers
-        vms->current_stack = vms->system_stack;
-        vms->system_stack = current_stack;
+        vms->heap.current_stack = vms->heap.system_stack;
+        vms->heap.system_stack = current_stack;
         vms->registers = vms->system_registers;
         vms->system_registers = registers;
         //Restore stack state
-        current_stack = vms->current_stack;
+        current_stack = vms->heap.current_stack;
         stk = untag_stack(current_stack);
         stack_pointer = stk->stack_pointer;
         stack_limit = (char*)(stk->frames) + stk->size;
@@ -1874,12 +1891,12 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         stk->stack_pointer = stack_pointer;
         stk->pc = pc - instructions;
         //Swap stack and registers
-        vms->current_stack = vms->system_stack;
-        vms->system_stack = current_stack;
+        vms->heap.current_stack = vms->heap.system_stack;
+        vms->heap.system_stack = current_stack;
         vms->registers = vms->system_registers;
         vms->system_registers = registers;
         //Restore stack state
-        current_stack = vms->current_stack;
+        current_stack = vms->heap.current_stack;
         stk = untag_stack(current_stack);
         stack_pointer = stk->stack_pointer;
         stack_limit = (char*)(stk->frames) + stk->size;
