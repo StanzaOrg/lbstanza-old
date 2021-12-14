@@ -389,13 +389,25 @@
 //============================================================
 
 typedef struct{
-  uint64_t current_stack;      //(Variable State)
-  uint64_t system_stack;       //(Variable State)
-  char* top;                   //(Variable State)
-  char* limit;                 //(Variable State)
-  char* start;                 //(Variable State)
-  char* free;                  //(Variable State)
-  char* free_limit;            //(Variable State)
+  uint64_t current_stack;
+  uint64_t system_stack;
+  char* top;
+  char* limit;
+  char* start;
+  uint64_t* bitset;
+  uint64_t size;
+  char* compaction_start;
+  uint64_t* marking_stack_start;
+  uint64_t* marking_stack_bottom;
+  uint64_t* marking_stack_top;
+  char* min_incomplete;
+  char* max_incomplete;
+  struct Stack* stacks;
+  void* liveness_trackers;
+  void* allocation_size;
+  void* iterate_roots;
+  void* iterate_references;
+  void* iterate_references_in_stack_frames;
 } Heap;
 
 //The first fields in VMState are used by the core library
