@@ -20,9 +20,9 @@ $STANZA compile-test build-stanza.proj tests/stanza.proj stz/stanza-postcompile-
 build/stanza-postcompile-tests
 
 # Run all the tests in stz/stanza-postcompile-compiler-only-tests in the VM
-$STANZA compile-test build-stanza.proj tests/stanza.proj stz/stanza-postcompile-compiler-only-tests -o build/stanza-postcompile-compiler-only-tests
+$STANZA compile-test build-stanza.proj tests/stanza.proj stz/stanza-postcompile-compiler-only-tests -o build/stanza-postcompile-compiler-only-tests -ccfiles tests/extern_c_callbacks.c
 build/stanza-postcompile-compiler-only-tests
 
 # Compile and run the tests in stz/stanza-postcompile-compiler-only-tests using a specially bootstrapped compiler
-$STANZA extend tests/stanza.proj -supported-vm-packages stz/test-externs -o build/stanzatest
+$STANZA extend tests/stanza.proj -supported-vm-packages stz/test-externs -o build/stanzatest -ccfiles tests/extern_c_callbacks.c
 build/stanzatest run-test build-stanza.proj tests/stanza.proj stz/stanza-postcompile-compiler-only-tests
