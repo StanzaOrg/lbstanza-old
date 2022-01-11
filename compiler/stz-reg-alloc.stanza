@@ -345,10 +345,17 @@ public defstruct Branch <: Ins :
   xs: List<Imm>
   killed?: False|List<Int> with: (default => false, as-method => true)
 
+;Represents a Match instruction.
+;- dispatch?: True if this is a dispatch-ordered match (topological ordering) or false if it
+;  is a normal match statement.
+;- type-lists: The matching types for each branch for this match instruction.
+;- xs: The arguments to match upon.
+;- killed?: The list of killed variables if calculated, false if not yet calculated.
+;- ns?: If calculated, the list of block ids that this statement dispatches to. False if not yet calculated.
 public defstruct Match <: Ins :
   dispatch?: True|False
   type-lists: List<List<TypeSet>>
-  xs: List<Imm>
+  xs: List<Imm> with: (ensure => same-lengths!(type-lists))
   killed?: False|List<Int> with: (default => false, as-method => true)
   ns?: False|List<Int> with: (default => false)
 
@@ -399,6 +406,16 @@ public defstruct Break <: Ins :
 defmethod killed? (i:Save|Load|Unload|NextUsed|Xchg|
                      ShuffleReg|ShuffleFReg|Label|Goto|Break) :
   false
+
+;------------------------------------------------------------
+;------------------- Preconditions --------------------------
+;------------------------------------------------------------
+defn same-lengths! (xss:List<List>) :
+  fn (description:String, ys:List) :
+    for xs in xss do :
+      if length(ys) != length(xs) :
+        fatal("Mismatched lengths. The list assigned to %_ has length %_, \
+        but the type list contains a list with length %_." % [description, length(ys), length(xs)])
 
 ;==========================
 ;==== Function Context ====
@@ -1375,6 +1392,15 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
     do(mark-unloaded, loaded-vars())
     clear(dirty-loaded)
 
+  ;Print the register state. For debugging.
+  defn print-register-state () :
+    println("Register State:")
+    println("  Loaded Variables:")
+    for v in loaded-vars() do :
+      println("    Variable %_:%_" % [v, VAR-TYPES[v]])
+    println("  Number of free integer registers: %_" % [num-free-reg])
+    println("  Number of free float registers: %_" % [num-free-freg])
+
   ;========================
   ;==== Usage Tracking ====
   ;========================
@@ -1457,6 +1483,10 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
           ensure-loaded(n(x), buffer)
         ;Emit instruction
         add(buffer, e)
+        ;Reserve scratch registers
+        val num-scratch = num-scratch-registers(e)
+        while num-free-reg < num-scratch :
+          spill-reg(true, instructions)
         ;Unload registers
         if crosses-boundary?(e) : mark-all-unloaded()
         else : do(mark-unloaded, killed(e))
@@ -1464,10 +1494,6 @@ defn allocate-classes (blk:Block, b:Int, backend:Backend) :
         for x in e do-defined :
           ensure-reg-for-var(n(x), instructions)
           mark-defined(n(x))
-        ;Reserve scratch registers
-        val num-scratch = num-scratch-registers(e)
-        while num-free-reg < num-scratch :
-          spill-reg(true, instructions)
         ;Flush buffer instructions
         add-all(instructions, buffer)
         clear(buffer)
@@ -1539,18 +1565,31 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
   val reg-list = FreeList(num-regs(backend))
   val freg-list = FreeList(num-fregs(backend))
 
-  ;Set and retrieve variable occupying a register      
-  defn free-slot (r:Reg|FReg) :
+  ;Print the current register state.
+  defn print-register-state () -> False :
+    println("Register State:")
+    println("  Variable Locations:")
+    for (r in var-locs, v in 0 to false) do :
+      println("    Variable %_ stored in %_" % [v, r]) when r is-not False
+    println("  Occupied integer registers: %," % [reg-list])
+    println("  Occupied float registers: %," % [freg-list])
+    println("  Free integer registers: %," % [free(reg-list)])
+    println("  Free float registers: %," % [free(freg-list)])
+
+  ;Remove any variables that are assigned to the given register.
+  defn free-slot (r:Reg|FReg) -> False :
     match(r) :
       (r:Reg) : (reg-slots[n(r)] = false, remove(reg-list, n(r)))
       (r:FReg) : (freg-slots[n(r)] = false, remove(freg-list, n(r)))
-
-  defn assign-slot (r:Reg|FReg, x:Int) :
+  ;Assign variable 'x' to the register 'r'.
+  defn assign-slot (r:Reg|FReg, x:Int) -> False :
     match(r) :
       (r:Reg) : (reg-slots[n(r)] = x, add(reg-list, n(r)))
       (r:FReg) : (freg-slots[n(r)] = x, add(freg-list, n(r)))
+    false
 
-  defn slot (r:Reg|FReg) :
+  ;Return the variable that is currently stored in register r.
+  defn slot (r:Reg|FReg) -> Int|False :
     match(r) :
       (r:Reg) : reg-slots[n(r)]
       (r:FReg) : freg-slots[n(r)]
@@ -1561,7 +1600,7 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
     else : seq(FReg, cat(free(freg-list), freg-list))
 
   ;Free the variable x from its register, if it is in one
-  defn free-var (x:Int) :
+  defn free-var (x:Int) -> False :
     match(var-locs[x]) :
       (reg:Reg|FReg) :
         free-slot(reg)
@@ -1570,7 +1609,7 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
         false
 
   ;Free the contents of a register
-  defn free-reg (r:Reg|FReg) :
+  defn free-reg (r:Reg|FReg) -> False :
     match(slot(r)) :
       (v:Int) :
         free-slot(r)
@@ -1591,15 +1630,17 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
     clear(reg-list)
     clear(freg-list)
 
-  ;Find an available register (assumes that one is available).
-  defn free-reg? (t:VMType) :
+  ;Find an available register for the given type.
+  ;Returns either the register or false if none is available.
+  defn free-reg? (t:VMType) -> Reg|FReg|False :
     match(t) :
       (t:VMType&IntegerT) :
         val rs = free(reg-list)
         Reg(next(rs)) when not empty?(rs)
       (t:VMType&RealT) :
         val rs = free(freg-list)
-        FReg(next(rs)) when not empty?(rs)    
+        FReg(next(rs)) when not empty?(rs)
+        
   defn available-reg? (t:VMType, pref:List<Int>) :
     val pref-regs = seq(XReg{t, _}, pref)
     val r = find({slot(_) is False}, pref-regs)
@@ -1668,13 +1709,17 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
 
   ;Ensure that regs will be available once xs are freed
   defn ensure-available (regs:List<Reg|FReg>, xs:List<Int>) :
-    ;Will be available
-    defn available? (r:Reg|FReg) :
+    ;Returns true if register 'r' will be available after
+    ;xs is freed.
+    defn available? (r:Reg|FReg) -> True|False :
       match(slot(r)) :
         (x:Int) : contains?(xs,x)
         (x:False) : true
-    ;Swap candidates
-    defn safe-swap? (r:Reg|FReg) :
+        
+    ;Returns true if the given register is a safe register to store something.
+    ;Since our goal is to make 'regs' available, it should not be one of these registers
+    ;and it should be available.
+    defn safe-swap? (r:Reg|FReg) -> True|False :
       available?(r) and not contains?(regs, r)
 
     ;Compute swap registers
@@ -1684,9 +1729,12 @@ defn register-assignment (blk:Block, b:Int, backend:Backend) :
     ;Swap out registers
     for r in regs do :
       if not available?(r) :
-        swap-reg{r, next(_)} $
-          match(r:Reg) : swaps()
-          else : fswaps()
+        ;Compute a safe register to store contents of r.
+        val safe-reg = next $ match(r) :
+          (r:Reg) : swaps()
+          (r:FReg) : fswaps()
+        ;Free register r by storing contents of r in safe-reg.
+        swap-reg(r, safe-reg)
 
   ;Ensure that value x is in register r
   defn ensure-location (x:Int, reg:Reg|FReg) :
