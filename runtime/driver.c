@@ -201,6 +201,9 @@ stz_long file_write_block (FILE* f, char* data, stz_long len) {
     LPSTR ret = stz_malloc(sizeof(CHAR) * MAX_PATH);
     int numchars = GetFinalPathNameByHandle(hFile, ret, MAX_PATH, FILE_NAME_OPENED);
 
+    // Close handle now that we no longer need it (important to do so!)
+    CloseHandle(hFile);
+
     // Return null if GetFinalPath fails.
     if(numchars == 0){
       stz_free(ret);
