@@ -1,6 +1,5 @@
 { pkgs ? import <nixpkgs> { } }:
 let
-  lbstanza-bin = with pkgs; callPackage ./nix/lbstanza-bin { };
-  lbstanza = with pkgs; callPackage ./nix/lbstanza { inherit lbstanza-bin; };
+  myNix = import ./nix { inherit pkgs; };
 in
-  lbstanza
+myNix.lbstanza

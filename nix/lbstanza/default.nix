@@ -33,9 +33,10 @@ stdenv.mkDerivation rec {
 
   installPhase = ''
     runHook preInstall
-    mkdir "$out"
+    mkdir -p "$out/bin"
     cp -r * "$out"
     mv "$out/lpkgs" "$out/pkgs"
+    mv "$out/lstanza" "$out/bin/stanza"
     runHook postInstall
   '';
 
