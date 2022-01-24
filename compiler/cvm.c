@@ -243,6 +243,7 @@
 #define DISPATCH_METHOD_OPCODE 237
 #define JUMP_REG_OPCODE 238
 #define FNENTRY_OPCODE 239
+#define LOWEST_ZERO_BIT_COUNT_OPCODE_LONG 244
 
 //============================================================
 //===================== READ MACROS ==========================
@@ -460,6 +461,7 @@ void call_print_stack_trace (VMState* vms, uint64_t stack);
 void* call_collect_stack_trace (VMState* vms, uint64_t stack);
 char* retrieve_class_name (VMState* vms, uint64_t id);
 void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
+uint64_t lowest_zero_bit_count (uint64_t x);
 
 //============================================================
 //=================== Forward Declarations ===================
@@ -1878,10 +1880,8 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       int offset = value * 4;
       if(registers[reg] == arity){
         pc = pc0 + offset;
-        continue;
-      }else{
-        continue;
       }
+      continue;
     }
     case FNENTRY_OPCODE : {
       DECODE_A_UNSIGNED();
@@ -1911,8 +1911,12 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         //Jump to stack extender
         uint64_t fpos = (uint64_t)(code_offsets[EXTEND_STACK_FN]) * 4;
         pc = instructions + fpos;
-        continue;
       }
+      continue;
+    }
+    case LOWEST_ZERO_BIT_COUNT_OPCODE_LONG : {
+      DECODE_B_UNSIGNED();
+      SET_LOCAL(x, lowest_zero_bit_count((uint64_t)LOCAL(value)));
       continue;
     }
     }
