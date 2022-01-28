@@ -396,6 +396,7 @@ typedef struct{
   char* limit;
   char* start;
   uint64_t* bitset;
+  uint64_t* bitset_base;
   uint64_t size;
   char* compaction_start;
   uint64_t* marking_stack_start;
