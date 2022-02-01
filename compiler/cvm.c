@@ -244,6 +244,7 @@
 #define JUMP_REG_OPCODE 238
 #define FNENTRY_OPCODE 239
 #define LOWEST_ZERO_BIT_COUNT_OPCODE_LONG 244
+#define TEST_BIT_OPCODE 245
 
 //============================================================
 //===================== READ MACROS ==========================
@@ -452,6 +453,30 @@ typedef struct{
   uint64_t pc;
   struct Stack* tail;
 } Stack;
+
+enum {
+  LOG_BITS_IN_BYTE = 3,
+  LOG_BYTES_IN_LONG = 3,
+  LOG_BITS_IN_LONG = LOG_BYTES_IN_LONG + LOG_BITS_IN_BYTE,
+  BYTES_IN_LONG  = 1 << LOG_BYTES_IN_LONG,
+  BITS_IN_LONG = 1 << LOG_BITS_IN_LONG
+};
+
+static inline uint64_t bit_index (const void* p) {
+  return ((uint64_t)p) >> LOG_BYTES_IN_LONG;
+}
+static inline uint64_t bit_shift (const void* p) {
+  return bit_index(p) & (BITS_IN_LONG - 1);
+}
+static inline uint64_t bit_mask (const void* p) {
+  return 1L << bit_shift(p);
+}
+static inline uint64_t* bit_address (const void* p, uint64_t* bitset_base) {
+  return bitset_base + (bit_index(p) >> LOG_BITS_IN_LONG);
+}
+static inline uint64_t test_mark (const void* p, uint64_t* bitset_base) {
+  return (*bit_address(p, bitset_base) >> bit_shift(p)) & 1L;
+}
 
 //============================================================
 //========================= TRAPS ============================
@@ -1918,6 +1943,11 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     case LOWEST_ZERO_BIT_COUNT_OPCODE_LONG : {
       DECODE_B_UNSIGNED();
       SET_LOCAL(x, lowest_zero_bit_count((uint64_t)LOCAL(value)));
+      continue;
+    }
+    case TEST_BIT_OPCODE : {
+      DECODE_C();
+      SET_LOCAL(x, test_mark((const void*)LOCAL(y), (uint64_t*)LOCAL(value)));
       continue;
     }
     }
