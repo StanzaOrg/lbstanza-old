@@ -245,6 +245,10 @@
 #define FNENTRY_OPCODE 239
 #define LOWEST_ZERO_BIT_COUNT_OPCODE_LONG 244
 #define TEST_BIT_OPCODE 245
+#define SET_BIT_OPCODE 246
+#define CLEAR_BIT_OPCODE 247
+#define TEST_AND_SET_BIT_OPCODE 248
+#define TEST_AND_CLEAR_BIT_OPCODE 249
 
 //============================================================
 //===================== READ MACROS ==========================
@@ -476,6 +480,28 @@ static inline uint64_t* bit_address (const void* p, uint64_t* bitset_base) {
 }
 static inline uint64_t test_mark (const void* p, uint64_t* bitset_base) {
   return (*bit_address(p, bitset_base) >> bit_shift(p)) & 1L;
+}
+static inline void set_mark (const void* p, uint64_t* bitset_base) {
+  *bit_address(p, bitset_base) |= bit_mask(p);
+}
+static inline void clear_mark (const void* p, uint64_t* bitset_base) {
+  *bit_address(p, bitset_base) &= ~bit_mask(p);
+}
+static inline uint64_t test_and_clear_mark (const void* p, uint64_t* bitset_base) {
+  uint64_t* address = bit_address(p, bitset_base);
+  const uint64_t mask = bit_mask(p);
+
+  const uint64_t old_value = *address;
+  *address = old_value & ~mask;
+  return old_value & mask;
+}
+static inline uint64_t test_and_set_mark (const void* p, uint64_t* bitset_base) {
+  uint64_t* address = bit_address(p, bitset_base);
+  const uint64_t mask = bit_mask(p);
+
+  const uint64_t old_value = *address;
+  *address = old_value | mask;
+  return old_value & mask;
 }
 
 //============================================================
@@ -1945,9 +1971,29 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       SET_LOCAL(x, lowest_zero_bit_count((uint64_t)LOCAL(value)));
       continue;
     }
+    case SET_BIT_OPCODE : {
+      DECODE_B_UNSIGNED();
+      set_mark((const void*)LOCAL(x), (uint64_t*)LOCAL(value));
+      continue;
+    }
+    case CLEAR_BIT_OPCODE : {
+      DECODE_B_UNSIGNED();
+      clear_mark((const void*)LOCAL(x), (uint64_t*)LOCAL(value));
+      continue;
+    }
     case TEST_BIT_OPCODE : {
       DECODE_C();
       SET_LOCAL(x, test_mark((const void*)LOCAL(y), (uint64_t*)LOCAL(value)));
+      continue;
+    }
+    case TEST_AND_SET_BIT_OPCODE : {
+      DECODE_C();
+      SET_LOCAL(x, test_and_set_mark((const void*)LOCAL(y), (uint64_t*)LOCAL(value)));
+      continue;
+    }
+    case TEST_AND_CLEAR_BIT_OPCODE : {
+      DECODE_C();
+      SET_LOCAL(x, test_and_clear_mark((const void*)LOCAL(y), (uint64_t*)LOCAL(value)));
       continue;
     }
     }
