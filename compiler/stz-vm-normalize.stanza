@@ -86,13 +86,13 @@ defn normalize (f0:VMFunction, databuffer:DataBuffer, backend:Backend, iotable:I
 
     ;Store crsp
     val old-crsp = make-local(buffer, VMLong())
-    load-instruction(CRSPIns(old-crsp))
-    load-instruction(StoreCRSPIns(c-rsp-arg))
+    load-instruction(LoadSpecialIns(old-crsp, CRSP))
+    load-instruction(StoreSpecialIns(CRSP, c-rsp-arg))
 
     ;Load instructions
     for i in ins(f) do :
       match(i:ReturnIns) :
-        load-instruction(StoreCRSPIns(old-crsp))
+        load-instruction(StoreSpecialIns(CRSP, old-crsp))
         val ret-rec = normalize(ret-extern-records(buffer, xs(i), c-rsp-arg, backend))
         emit(buffer, ReturnRecordIns(ret-rec, CCall(0)))
       else :
@@ -436,7 +436,7 @@ defn normalize (f0:VMFunction, databuffer:DataBuffer, backend:Backend, iotable:I
     val num-mem-args = length(mem-records)
     if num-mem-args > 0 :
       val crsp = make-local(buffer, VMLong())
-      emit(buffer, CRSPIns(crsp))
+      emit(buffer, LoadSpecialIns(crsp, CRSP))
       for r in mem-records do :
         val l = loc(r) as CallMemArg
         val a = arg(r) as VMImm
@@ -611,7 +611,7 @@ defn normalize (f0:VMFunction, databuffer:DataBuffer, backend:Backend, iotable:I
           emit(buffer, LabelIns(has-space-lbl))
           emit(buffer, AllocOnHeap(x, size-on-heap))
           emit(buffer, StoreIns(x, false, -1, Tag(type)))
-      (i:StoreIns) :
+      (i:StoreIns) :      
         ;Compute new offset after factoring in ref tag
         val offset* = (offset(i) + 8 - 1) when type(buffer,x(i)) is VMRef
                  else offset(i)
@@ -627,6 +627,129 @@ defn normalize (f0:VMFunction, databuffer:DataBuffer, backend:Backend, iotable:I
             val z* = ensure(small-immediate?,z(i))
             emit(buffer, Op2Ins(base, AddOp(), x*, y*))
             emit(buffer, StoreIns(base, false, offset*, z*, class(i)))
+      (i:StoreWithBarrierIns) :
+        ;x[y + offset] = z
+        ;  y is false to indicate that offset is constant and known.
+        ;  y is computed if we're assigning into an array.
+        fatal("Barrier instructions assume location is heap-object.") when type(buffer,x(i)) is-not VMRef
+
+        ;Compute new offset after factoring in ref tag
+        val offset* = offset(i) + 8 - 1
+
+        ;[TODO] Clean up 
+        ;Pseudocode:
+        ;Test whether the location is from the young generation.
+        ;If it is, then just store as normal.
+        ;  GOTO STORE_VALUE when x >= YOUNG_GEN_START
+        
+        ;Compute bit index
+        ;  BIT_INDEX = ((x + y + offset) - HEAP_START) >>> 3
+        ;Compute mark word address (bit index / 64 bits) * 8 bytes
+        ;  MARK_WORD_ADDR = REMEMBER_SET + (BIT_INDEX >>> 6) << 3
+        ;Compute marking mask 1 << (bit index % 64)
+        ;  MARK_MASK = 1 << (BIT_INDEX & 3F)
+
+        ;Test whether we're storing a proper pointer.
+        ;If it is, then clear the remembered bit.
+        ;  GOTO CLEAR_BIT when z & 7 != 1
+        
+        ;Test whether value is from the old generation.
+        ;If it is, then clear the remembered bit.
+        ;  GOTO CLEAR_BIT when z < YOUNG_GEN_START
+        
+        ;Now guaranteed that value is a pointer from young generation.
+        ;Set the remembered bit.
+        ;  [MARK_WORD_ADDR] |= MARK_MASK
+        ;  GOTO STORE_VALUE
+        ;Now guaranteed that value is from old generation
+        ;Clear the remembered bit.
+        ;CLEAR_BIT:
+        ;  [MARK_WORD_ADDR] &= ~MARK_MASK
+        ;STORE_VALUE:
+        ;Store as normal.
+
+        ;Create locals and labels
+        val bit-index = make-local(buffer, VMLong())
+        val base = make-local(buffer, VMLong())
+        val mark-word-addr = make-local(buffer, VMLong())
+        val mark-mask = make-local(buffer, VMLong())
+        val young-gen-start = make-local(buffer, VMLong())
+        val remembered-set = make-local(buffer, VMLong())
+        val heap-start = make-local(buffer, VMLong())
+        val mark-word = make-local(buffer, VMLong())
+        val value-is-normal-pointer = make-label(buffer)
+        val store-value = make-label(buffer)
+        val set-bit = make-label(buffer)
+        val clear-bit = make-label(buffer)
+        val compute-bit-index = make-label(buffer)
+        val store-mark-word = make-label(buffer)
+
+        ;Ensure things fit in x86.
+        val x* = ensure(storage-immediate?,x(i))
+        val z* = ensure(small-immediate?,z(i))
+        match(y(i)) :
+          (f:False) :
+            emit(buffer, Op2Ins(base, AddOp(), x*, NumConst(offset*)))
+          (y:VMImm) :
+            ;[TODO] Use lea instruction to squish two adds into one.
+            val y* = ensure(small-immediate?,y)                
+            emit(buffer, Op2Ins(base, AddOp(), x*, y*))
+            emit(buffer, Op2Ins(base, AddOp(), base, NumConst(offset*)))                
+
+        ;Test whether location is from young generation.
+        ;[TODO] We can use Branch2Ins directly on value in memory, so no need for LoadSpecial.
+        emit(buffer, LoadSpecialIns(young-gen-start, YoungGenStart))
+        emit(buffer, Branch2Ins(store-value, compute-bit-index, UgeOp(), x*, young-gen-start))
+
+        ;Compute bit index
+        emit(buffer, LabelIns(compute-bit-index))
+        ;[TODO] We can directly subtract value in memory, so no need for LoadSpecial.
+        emit(buffer, LoadSpecialIns(heap-start, HeapStart))
+        norm-noncomm-op(bit-index, SubOp(), base, heap-start)
+        norm-noncomm-op(bit-index, ShrOp(), bit-index, NumConst(3L))
+        ;Compute mark word address (bit index / 64 bits)
+        norm-noncomm-op(mark-word-addr, ShrOp(), bit-index, NumConst(6L))       ;Compute which word the bit is at.
+        norm-noncomm-op(mark-word-addr, ShlOp(), mark-word-addr, NumConst(3L))  ;Compute the byte address of that word.
+        emit(buffer, LoadSpecialIns(remembered-set, RememberedSetStart)) ;[TODO] Elide the special load.
+        emit(buffer, Op2Ins(mark-word-addr, AddOp(), mark-word-addr, remembered-set))
+        ;Compute marking mask: 1 << (bit index % 64)
+        emit(buffer, Op2Ins(bit-index, AndOp(), bit-index, NumConst(0x3FL)))
+        norm-noncomm-op(mark-mask, ShlOp(), NumConst(1L), bit-index)
+
+        ;Load the original mark word
+        emit(buffer, LoadIns(mark-word, mark-word-addr, false, 0))
+
+        ;Test whether storing proper pointer.
+        ;If it is not, then clear the bit.
+        val tmp = make-local(buffer, VMLong())
+        emit(buffer, Op2Ins(tmp, AndOp(), z*, NumConst(7L)))
+        emit(buffer, Branch2Ins(value-is-normal-pointer, clear-bit, EqOp(), tmp, NumConst(1L)))
+        emit(buffer, LabelIns(value-is-normal-pointer))
+
+        ;Test whether value is from the old generation.
+        ;If it is, then clear the bit. Otherwise set the bit.
+        emit(buffer, Branch2Ins(clear-bit, set-bit, UltOp(), z*, young-gen-start))
+
+        ;Clear the bit.
+        ;Compute the new mark word by clearing the remembered bit.
+        emit(buffer, LabelIns(clear-bit))
+        emit(buffer, Op1Ins(mark-mask, NotOp(), mark-mask))
+        emit(buffer, Op2Ins(mark-word, AndOp(), mark-word, mark-mask))
+        emit(buffer, GotoIns(store-mark-word))
+        
+        ;Set the bit.
+        ;Compute the new mark word by setting the remembered bit.
+        emit(buffer, LabelIns(set-bit))
+        emit(buffer, Op2Ins(mark-word, OrOp(), mark-word, mark-mask))
+
+        ;Store the mark word back into the remembered set.
+        emit(buffer, LabelIns(store-mark-word))
+        emit(buffer, StoreIns(mark-word-addr, false, 0, mark-word))        
+
+        ;Store as normal
+        emit(buffer, LabelIns(store-value))
+        emit(buffer, StoreIns(base, false, 0, z*, class(i)))            
+
       (i:LoadIns) :
         ;Compute new offset after factoring in ref tag
         val offset* = (offset(i) + 8 - 1) when type(buffer,y(i)) is VMRef
@@ -641,6 +764,12 @@ defn normalize (f0:VMFunction, databuffer:DataBuffer, backend:Backend, iotable:I
             val z* = ensure(small-immediate?, z)
             emit(buffer, Op2Ins(base, AddOp(), y*, z*))
             emit(buffer, LoadIns(x(i), base, false, offset*, class(i)))
+      (i:Op0Ins) :
+        match(op(i)) :
+          (op:CRSPOp) :
+            emit(buffer, LoadSpecialIns(x(i) as Local, CRSP))
+          (op) :
+            emit(buffer, i)
       (i:Op1Ins) :
         match(op(i)) :
           (op:VMOp&HiStanza) : lower(x(i) as Local, op, y(i))
@@ -773,13 +902,28 @@ public defstruct StoreCArgIns <: VMIns :
   num-mem-args: Int
 with: (printer => true)
 
-public defstruct CRSPIns <: VMIns :
+;Load an immediate from a special location.
+;- x: The location to store the immediate.
+;- value: The special value to load.
+public defstruct LoadSpecialIns <: VMIns :
   x: Local
+  value: SpecialValue
 with: (printer => true)
 
-public defstruct StoreCRSPIns <: VMIns :
+;Store an immediate to a special location.
+;- x: The special location to store to.
+;- y: The immediate to store.
+public defstruct StoreSpecialIns <: VMIns :
+  x: SpecialValue
   y: VMImm
 with: (printer => true)
+
+;Represents a special value understood by the compiler.
+public defenum SpecialValue :
+  CRSP
+  HeapStart
+  YoungGenStart
+  RememberedSetStart
 
 public defstruct LoadCArgIns <: VMIns :
   x: Local
@@ -1313,6 +1457,10 @@ defn ensure-normalized (f0:VMFunction, backend:Backend) :
         fatal("Variable offset remaining") when y(i) is VMImm
       (i:LoadIns) :
         fatal("Variable offset remaining") when z(i) is VMImm
+      (i:Op0Ins) :
+        match(op(i)) :
+          (op:CRSPOp) : fatal("Invalid CRSPOp remaining.")
+          (op) : false
       (i:Op1Ins) :
         match(op(i)) :
           (op:ConvOp|InterpretOp) : ensure-local(y(i))

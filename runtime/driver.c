@@ -77,31 +77,36 @@ static void exit_with_error_line_and_func (const char* file, int line){
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
-  stz_byte* heap_start;
-  stz_byte* heap_top;
-  stz_byte* heap_limit;
-  stz_byte* heap_bitset;
-  stz_long heap_size;
-  stz_byte* marking_stack_start;
-  stz_byte* marking_stack_bottom;
-  stz_byte* marking_stack_top;
-  stz_long current_stack;
-  stz_long system_stack;
-} VMInit;
-
-typedef struct{
   stz_long returnpc;
   stz_long liveness_map;
   stz_long slots[];
 } StackFrame;
 
-typedef struct{
+typedef struct Stack{
   stz_long size;
   StackFrame* frames;
   StackFrame* stack_pointer;
   stz_long pc;
   struct Stack* tail;
 } Stack;
+
+typedef struct{
+  stz_long current_stack;
+  stz_long system_stack;
+  stz_byte* heap_top;
+  stz_byte* heap_limit;
+  stz_byte* heap_start;
+  stz_byte* young_gen_start;
+  stz_byte* heap_bitset;
+  stz_byte* heap_bitset_base;
+  stz_long heap_size;
+  stz_long heap_max_size;
+  Stack* stacks;
+  void* trackers;
+  stz_byte* marking_stack_start;
+  stz_byte* marking_stack_bottom;
+  stz_byte* marking_stack_top;
+} VMInit;
 
 //     Macro Readers
 //     =============
@@ -1044,7 +1049,7 @@ static void* alloc (VMInit* init, long tag, long size){
   return ptr;
 }
 
-static uint64_t alloc_stack (VMInit* init){
+static Stack* alloc_stack (VMInit* init){
   Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
   stz_long initial_stack_size = 8 * 1024;
   StackFrame* frames = (StackFrame*)stz_malloc(initial_stack_size);
@@ -1052,7 +1057,13 @@ static uint64_t alloc_stack (VMInit* init){
   stack->frames = frames;
   stack->stack_pointer = NULL;
   stack->tail = NULL;
-  return (uint64_t)stack - 8 + 1;
+  return stack;
+}
+
+//Given a pointer to a struct allocated on the heap,
+//add the tag bits to the pointer. 
+uint64_t tag_as_ref (void* p){
+  return (uint64_t)p - 8 + 1;
 }
 
 enum {
@@ -1079,26 +1090,45 @@ STANZA_API_FUNC int main (int argc, char* argv[]) {
   VMInit init;
 
   //Allocate heap
-  const stz_long min_heap_size = ROUND_UP_TO_WHOLE_PAGES(2 * 1024 * 1024);
+  const stz_long min_heap_size = ROUND_UP_TO_WHOLE_PAGES(8 * 1024 * 1024);
   const stz_long max_heap_size = ROUND_UP_TO_WHOLE_PAGES(STZ_LONG(8) * 1024 * 1024 * 1024);
-  init.heap_size = max_heap_size;
   init.heap_start = (stz_byte*)stz_memory_map(min_heap_size, max_heap_size);
-  init.heap_limit = init.heap_start + min_heap_size;
+  init.heap_max_size = max_heap_size;
+  init.heap_size = min_heap_size;
+  stz_long young_gen_size = 2 * 1024 * 1024;
+  init.heap_limit = init.heap_start + young_gen_size;
   init.heap_top = init.heap_start;
+  init.young_gen_start = init.heap_start;
 
+  //Allocate bitset for heap
   const stz_long min_bitset_size = bitset_size(min_heap_size);
   const stz_long max_bitset_size = bitset_size(max_heap_size);
-  init.heap_bitset = (stz_byte*)stz_memory_map(min_bitset_size, max_bitset_size);
+  init.heap_bitset = (stz_byte*)stz_memory_map(min_bitset_size, max_bitset_size);  
+  init.heap_bitset_base = init.heap_bitset - ((uint64_t)init.heap_start >> 6);
   memset(init.heap_bitset, 0, min_bitset_size);
 
+  //For bitset_base computation to work: bitset must be aligned to 512-bytes boundary.
+  if((uint64_t)init.heap_bitset % 512 != 0){
+    fprintf(stderr, "Unaligned bitset: %p.\n", init.heap_bitset);
+    exit(-1);
+  }
+
+  //Allocate marking stack for heap
   const stz_long marking_stack_size = ROUND_UP_TO_WHOLE_PAGES((1024 * 1024L) << LOG_BYTES_IN_LONG);
   init.marking_stack_start = stz_memory_map(marking_stack_size, marking_stack_size);
   init.marking_stack_bottom = init.marking_stack_start + marking_stack_size;
   init.marking_stack_top = init.marking_stack_bottom;
 
   //Allocate stacks
-  init.current_stack = alloc_stack(&init);
-  init.system_stack = alloc_stack(&init);
+  Stack* entry_stack = alloc_stack(&init);
+  Stack* entry_system_stack = alloc_stack(&init);
+  entry_stack->tail = entry_system_stack;
+  init.current_stack = tag_as_ref(entry_stack);
+  init.system_stack = tag_as_ref(entry_system_stack);
+  init.stacks = entry_stack;
+
+  //Initialize trackers to empty list.
+  init.trackers = NULL;
 
   //Call Stanza entry
   stanza_entry(&init);
