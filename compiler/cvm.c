@@ -402,7 +402,7 @@ typedef struct{
   char* top;
   char* limit;
   char* start;
-  char* young_gen_start;
+  uint64_t* young_gen_start;
   uint64_t* bitset;
   uint64_t* bitset_base;
   uint64_t size;
@@ -528,33 +528,22 @@ int read_dispatch_table (VMState* vms, int format);
 //==================== Write Barrier =========================
 //============================================================
 
-//Either set or clear the remembered set bit for the given address,
-//depending upon the value;
-void update_remembered_set (VMState* vms, void* address, uint64_t value){
+//Store the value, update the remembered set accordingly.
+static inline void barriered_store (const VMState* vms, uint64_t* address, uint64_t value) {
+  // First store the value
+  *address = value;
   //Test whether the location is from the old generation.
   //Update the remembered set only if it is.
-  void* young_gen_start = vms->heap.young_gen_start;
-  if(address <= young_gen_start){
-    //Compute the bit index
-    void* heap_start = vms->heap.start;
-    uint64_t bit_index = ((uint64_t)address - (uint64_t)heap_start) >> 3;
-    //Compute the mark word address
-    uint64_t* mark_word_addr = (uint64_t*)((uint64_t)vms->heap.bitset + ((bit_index >> 6) << 3));
-    //Compute the marking mask
-    uint64_t mark_mask = 1L << (bit_index & 0x3F);
-
-    //Compute whether we should clear the bit
-    //or set the bit.
+  const uint64_t* young_gen_start = vms->heap.young_gen_start;
+  if (address <= young_gen_start) {
+    uint64_t* bitset_base = vms->heap.bitset_base;
+    //Compute whether we should set or clear the bit.
     //Set the bit only if we're storing a proper pointer,
     //and it's a pointer to the young_gen.
-    int proper_pointer = (value & 7) == 1;
-    int young_gen_pointer = value >= (uint64_t)young_gen_start;
-    if(proper_pointer && young_gen_pointer){
-      //Set the remembered bit.
-      *mark_word_addr |= mark_mask;
-    }else{
-      //Clear the remembered bit.
-      *mark_word_addr &= ~mark_mask;
+    if ((value & 7) == 1 && ((const uint64_t*)value) > young_gen_start) {
+      set_mark(address, bitset_base);
+    } else {
+      clear_mark(address, bitset_base);
     }
   }
 }
@@ -1627,28 +1616,18 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_E();
 
       //Retrieve address to store to and value to store.
-      void* address = (void*)(LOCAL(x) + value);
-      uint64_t storeval = (uint64_t)(LOCAL(z));
-
-      //Update the remembered set.
-      update_remembered_set(vms, address, storeval);
-      
-      //Perform store as normal.
-      *(uint64_t*)address = storeval;
+      uint64_t* address = (uint64_t*)(LOCAL(x) + value);
+      uint64_t val = (uint64_t)(LOCAL(z));
+      barriered_store(vms, address, val);
       continue;
     }
     case STORE_WITH_BARRIER_OPCODE_VAR_OFFSET : {
       DECODE_E();
       
       //Retrieve address to store to and value to store.
-      void* address = (void*)(LOCAL(x) + LOCAL(y) + value);
-      uint64_t storeval = (uint64_t)(LOCAL(z));
-
-      //Update the remembered set.
-      update_remembered_set(vms, address, storeval);
-      
-      //Perform store as normal.
-      *(uint64_t*)address = storeval;
+      uint64_t* address = (uint64_t*)(LOCAL(x) + LOCAL(y) + value);
+      uint64_t val = (uint64_t)(LOCAL(z));
+      barriered_store(vms, address, val);
       continue;
     }
     case LOAD_OPCODE_1 : {
