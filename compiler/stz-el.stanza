@@ -105,12 +105,8 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Box Unbox", box-unbox-fold, "box-unbox2", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code2", false)
     run-pass("Remove Boxes", remove-boxes, "remove-boxes2", false)
-    run-pass("Constant Fold", constant-fold, "constant-fold2", false)
-    ;Constant fold
-    run-pass("Beta Reduce", beta-reduce, "beta-reduce3", false)
-    run-pass("Constant Fold", constant-fold, "constant-fold3", false)
-    run-pass("Beta Reduce", beta-reduce, "beta-reduce4", false)
-    run-pass("Constant Fold", constant-fold, "constant-fold4", false)
+    ;Stabilize
+    run-pass("Constant Fold Beta Reduce", iterative-constant-fold-beta-reduce, "constant-fold-beta-reduce", false)
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code3", false)
     
     ;Finish by removing checks 
@@ -2083,7 +2079,12 @@ defn* classify-and-fold-conv (make-ins:ConstantValue -> EIns|False,
 ; to feed a large set of functions that run operations at compile time on
 ; values of these literals and produce new literal bindings as a result or
 ; in partial folding cases just create simplifications.
-defn constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
+; Returns false if no changes were made.
+defn try-constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage|False :
+  ;Record whether progress was made.
+  var progress?:True|False = false
+  defn record-progress () : progress? = true
+
   ;Perform constant folding on all instructions in the given body.
   ;Assumes that nested bodies are already folded.
   defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
@@ -2100,7 +2101,9 @@ defn constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
             EDef(x(i), value)
           ;Fold the arguments and store result in EDef instruction.
           match(fold-args(make-def, op(i), ys(i))) :
-            (ins:EIns) : ins
+            (ins:EIns) :
+              record-progress()
+              ins
             (f:False) : i
         (i:EConv) :
           ;Create EDef instruction out of ConstantValue.
@@ -2108,7 +2111,9 @@ defn constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
             EDef(x(i), ELSLiteral(v))
           val xtype = type(vt,n(x(i)))
           match(classify-and-fold-conv(make-def, xtype, y(i))) :
-            (ins:EIns) : ins
+            (ins:EIns) :
+              record-progress()
+              ins
             (f:False) : i
         (i:EIf) :
           ;Create EGoto instruction out of ConstantValue
@@ -2120,7 +2125,9 @@ defn constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
               (histanza?, v) : false
           ;Fold the arguments and create goto instruction.
           match(fold-args(make-goto, op(i), ys(i))) :
-            (ins:EIns) : ins
+            (ins:EIns) :
+              record-progress()
+              ins
             (f:False) : i
         (i) :
           i
@@ -2135,7 +2142,14 @@ defn constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
       (x) : x
 
   ;Launch!
-  map-with-var-table({fold-all-bodies(_, _) as ETExp}, gvt, epackage)
+  val result = map-with-var-table({fold-all-bodies(_, _) as ETExp}, gvt, epackage)
+  result when progress?
+
+;Return the original package if constant folding didn't do anything.
+defn constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
+  match(try-constant-fold(epackage, gvt)) :
+    (p:EPackage) : p
+    (f:False) : epackage
 
 ;============================================================
 ;================== Type Simplification =====================
@@ -2713,7 +2727,13 @@ defn resolve-methods-and-matches (epackage:EPackage, gvt:VarTable) -> EPackage :
 ;==================== Beta Reduction ========================
 ;============================================================
 
-defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
+;Attempt beta reduction on the epackage.
+;Returns false if no progress was made.
+defn try-beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage|False :
+  ;Record whether any progress was made.
+  var progress?:True|False = false
+  defn record-progress () : progress? = true
+
   ;If the given location is an immutable global value, then
   ;return its identifier, otherwise return false.
   defn immutable-global-value? (loc:ELoc) -> Int|False :
@@ -2831,8 +2851,12 @@ defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
     defn sub-imm? (e:EImm) -> EImm :
       match(e:EVar) :
         match(get?(local-subtable,n(e)), get?(global-subtable,n(e))) :
-          (x:EImm, y) : x
-          (x, y:EImm) : y
+          (x:EImm, y) :
+            record-progress()
+            x
+          (x, y:EImm) :
+            record-progress()
+            y
           (x, y) : e
       else : e
     ;Perform substitutions on all immediates in the instruction.
@@ -2872,7 +2896,39 @@ defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
 
   ;Launch!
   val global-subtable = compute-sub-table $ collect-global-initial-values()
-  map-with-var-table(beta-reduce-texp{_, global-subtable, _}, gvt, epackage)
+  val result = map-with-var-table(beta-reduce-texp{_, global-subtable, _}, gvt, epackage)  
+  result when progress?
+
+;Return the original EPackage if no progress was made.
+defn beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
+  match(try-beta-reduce(epackage, gvt)) :
+    (p:EPackage) : p
+    (f:False) : epackage
+
+;============================================================
+;============ Iterative Constant-Beta-Reduction =============
+;============================================================
+
+;Iteratively alternate between constant-folding and beta-reduction until
+;no more progress.
+defn iterative-constant-fold-beta-reduce (epackage:EPackage, gvt:VarTable) -> EPackage :
+  var result:EPackage = epackage
+  within progress = fixpoint() :
+    ;Try constant folding
+    match(try-constant-fold(result, gvt)) :
+      (p:EPackage) :
+        result = p
+        progress()
+      (f:False) :
+        false
+    ;Try beta reduction
+    match(try-beta-reduce(result, gvt)) :
+      (p:EPackage) :
+        result = p
+        progress()
+      (f:False) :
+        false
+  result
 
 ;============================================================
 ;================= Dead Code Elimination ====================
