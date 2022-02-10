@@ -106,6 +106,13 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code2", false)
     run-pass("Remove Boxes", remove-boxes, "remove-boxes2", false)
     run-pass("Constant Fold", constant-fold, "constant-fold2", false)
+    ;Constant fold
+    run-pass("Beta Reduce", beta-reduce, "beta-reduce3", false)
+    run-pass("Constant Fold", constant-fold, "constant-fold3", false)
+    run-pass("Beta Reduce", beta-reduce, "beta-reduce4", false)
+    run-pass("Constant Fold", constant-fold, "constant-fold4", false)
+    run-pass("Eliminate Dead Code", eliminate-dead-code, "dead-code3", false)
+    
     ;Finish by removing checks 
     run-pass("Force Remove Checks", force-remove-checks, "removed-checks", false)
   run-pass("Resolve Matches", resolve-matches, "resolved-matches", false)
@@ -1763,11 +1770,13 @@ defn zero (v:ConstantValue) -> ConstantValue :
 ;- fold-binary-op: Responsible for folding binary operations when both arguments are known constants.
 ;- fold-unary-op: Responsible for folding unary operations when argument is a known constant.
 ;- partial-fold-binary-op: Responsible for folding binary operations when one argument is a known constant.
+;- fold-conv: Responsible for folding conversion operations when one argument is a known constant.
 ;For each folding function, if we are able to successfully statically evaluate the operator,
 ;then f is called with the result, and the returned instruction by f is returned by the folder. Otherwise, we
 ;return false.
 defmulti fold-binary-op (op:EOp, f:ConstantValue -> EIns|False, a0:ConstantValue, a1:ConstantValue) -> False|EIns
 defmulti fold-unary-op (op:EOp, f:ConstantValue -> EIns|False, a0:ConstantValue) -> False|EIns
+defmulti fold-conv (f:ConstantValue -> EIns|False, xtype:EType, a0:ConstantValue) -> False|EIns
 defmulti partial-fold-binary-op (op:EOp, f:ConstantValue|EImm -> EIns|False, a0:ConstantValue|EImm, a1:ConstantValue|EImm) -> False|EIns
 
 ;------------------------------------------------------------
@@ -1903,6 +1912,19 @@ defmethod fold-unary-op (op:EOp, f:ConstantValue -> EIns|False, a0:ConstantValue
     (op:IntNegOp, a0:Int) : f(negate(a0))
     (op:NotOp, a0:Byte|Int|Long) : f(call(bit-not,a0))
     (op:NegOp, a0:Int|Long|Float|Double) : f(call(negate,a0))
+
+;------------------------------------------------------------
+;---------------------- Conv Folding ------------------------
+;------------------------------------------------------------
+
+defmethod fold-conv (f:ConstantValue -> EIns|False, xtype:EType, y:ConstantValue) -> False|EIns :
+  match(xtype, y) :
+    (xtype:EByte, y:Byte|Int|Long|Float|Double) : f(to-byte(y))
+    (xtype:EInt, y:Byte|Int|Long|Float|Double) : f(to-int(y))
+    (xtype:ELong, y:Byte|Int|Long|Float|Double) : f(to-long(y))
+    (xtype:EFloat, y:Byte|Int|Long|Float|Double) : f(to-float(y))
+    (xtype:EDouble, y:Byte|Int|Long|Float|Double) : f(to-double(y))
+    (xtype, y) : false
     
 ;------------------------------------------------------------
 ;-------------- Partial Folding Left Operand  ---------------
@@ -1999,8 +2021,12 @@ defn histanza? (op:EOp) -> True|False :
         IntOrOp|IntXorOp|IntNotOp|IntShlOp|IntShrOp|IntAshrOp|
         IntLtOp|IntGtOp|IntLeOp|IntGeOp|IntNegOp|RefEqOp|RefNeOp
 
+;------------------------------------------------------------
+;---------- Classify and Fold Over Primitive Op -------------
+;------------------------------------------------------------
+
 ;Classify the given arguments and fold them if appropriate.
-;Returns an EIns if both folding and creating instruction is sucessful.
+;Returns an EIns if both folding and creating instruction is successful.
 ;Otherwise returns false.
 ;- make-ins (histanza?, value): The function for creating the resulting instruction
 ;  after constant folding has been performed.
@@ -2030,6 +2056,25 @@ defn* fold-args (make-ins:(True|False, ConstantValue|EImm) -> EIns|False,
       false
 
 ;------------------------------------------------------------
+;-------------- Classify and Fold Over Conv -----------------
+;------------------------------------------------------------
+
+;Classify the given argument and fold the conv instruction.
+;Returns an EIns if both folding and creating instruction is successful.
+;Otherwise returns false.
+;- make-ins(value): The function for creating the resulting instruction
+;  after constant folding has been performed.
+defn* classify-and-fold-conv (make-ins:ConstantValue -> EIns|False,
+                              xtype:EType,
+                              y:EImm) -> EIns|False :
+  match(classify-eimm(y)) :
+    (c:ConstantEImm) :
+      ;Conv is not defined on HiStanza literals.
+      fold-conv(make-ins, xtype, value(c)) when not histanza?(c)        
+    (c:NonConstantEImm) :
+      false
+
+;------------------------------------------------------------
 ;---------------------- Driver ------------------------------
 ;------------------------------------------------------------
 
@@ -2038,11 +2083,10 @@ defn* fold-args (make-ins:(True|False, ConstantValue|EImm) -> EIns|False,
 ; to feed a large set of functions that run operations at compile time on
 ; values of these literals and produce new literal bindings as a result or
 ; in partial folding cases just create simplifications.
-defn constant-fold (epackage:EPackage) -> EPackage :
-
+defn constant-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
   ;Perform constant folding on all instructions in the given body.
   ;Assumes that nested bodies are already folded.
-  defn fold-in-body (e:EBody) -> EBody :
+  defn fold-in-body (e:EBody, vt:VarTable) -> EBody :
     ;Return the constant-folded version of the given instruction.
     defn fold (i:EIns) -> EIns :
       match(i) :
@@ -2056,6 +2100,14 @@ defn constant-fold (epackage:EPackage) -> EPackage :
             EDef(x(i), value)
           ;Fold the arguments and store result in EDef instruction.
           match(fold-args(make-def, op(i), ys(i))) :
+            (ins:EIns) : ins
+            (f:False) : i
+        (i:EConv) :
+          ;Create EDef instruction out of ConstantValue.
+          defn make-def (v:ConstantValue) -> EDef :
+            EDef(x(i), ELSLiteral(v))
+          val xtype = type(vt,n(x(i)))
+          match(classify-and-fold-conv(make-def, xtype, y(i))) :
             (ins:EIns) : ins
             (f:False) : i
         (i:EIf) :
@@ -2077,13 +2129,13 @@ defn constant-fold (epackage:EPackage) -> EPackage :
     sub-ins(e, ins*)
 
   ;Recursively perform constant folding on all bodies.
-  defn fold-all-bodies (x:ELBigItem) -> ELBigItem :
-    match(map(fold-all-bodies, x)) :
-      (x:EBody) : fold-in-body(x)
+  defn fold-all-bodies (x:ELBigItem, vt:VarTable) -> ELBigItem :
+    match(map(fold-all-bodies{_, vt}, x)) :
+      (x:EBody) : fold-in-body(x,vt)
       (x) : x
 
   ;Launch!
-  fold-all-bodies(epackage) as EPackage
+  map-with-var-table({fold-all-bodies(_, _) as ETExp}, gvt, epackage)
 
 ;============================================================
 ;================== Type Simplification =====================
