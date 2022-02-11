@@ -402,7 +402,7 @@ typedef struct{
   char* top;
   char* limit;
   char* start;
-  uint64_t* young_gen_start;
+  uint64_t* collection_start;
   uint64_t* bitset;
   uint64_t* bitset_base;
   uint64_t size;
@@ -534,13 +534,13 @@ static inline void barriered_store (const VMState* vms, uint64_t* address, uint6
   *address = value;
   //Test whether the location is from the old generation.
   //Update the remembered set only if it is.
-  const uint64_t* young_gen_start = vms->heap.young_gen_start;
-  if (address <= young_gen_start) {
+  const uint64_t* collection_start = vms->heap.collection_start;
+  if (address < collection_start) {
     uint64_t* bitset_base = vms->heap.bitset_base;
     //Compute whether we should set or clear the bit.
     //Set the bit only if we're storing a proper pointer,
     //and it's a pointer to the young_gen.
-    if ((value & 7) == 1 && ((const uint64_t*)value) > young_gen_start) {
+    if ((value & 7) == 1 && ((const uint64_t*)value) >= collection_start) {
       set_mark(address, bitset_base);
     } else {
       clear_mark(address, bitset_base);
