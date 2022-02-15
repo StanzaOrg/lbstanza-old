@@ -1077,9 +1077,6 @@ public lostanza defn finalize-heap (heap:ptr<Heap>) -> ref<False> :
 
 ;Ensure that the given heap is at least the given size.
 lostanza defn expand-heap (size:long, heap:ptr<Heap>) -> ref<False> :
-  ;TODO: Hardcoded young-gen-size
-  val young-gen-size = 2 * 1024 * 1024
-
   ;Precondition: Ensure that size is less than maximum allowed size.
   #if-not-defined(OPTIMIZE) :
     if heap.max-size < size :
@@ -2088,9 +2085,11 @@ lostanza defn young-gen-collection (heap:ptr<Heap>) -> ref<False> :
   mark-compact(heap)
   return false
 
+lostanza defn clear-remembered-set (heap:ptr<Heap>) -> ref<False> :
+  return clear-mark(heap.start, heap.collection-start, heap)
+
 lostanza defn force-full-collection (heap:ptr<Heap>) -> ref<False> :
-  ;Clear the remembered bits that was previously used for the write barrier.
-  clear-mark(heap.start, heap.collection-start, heap)
+  clear-remembered-set(heap)
   heap.collection-start = heap.start
   ;No meaningful return value
   return false
@@ -2102,14 +2101,42 @@ public lostanza defn full-heap-collection (heap:ptr<Heap>) -> ref<False> :
   heap.collection-start = heap.top
   return false
 
-;============================================================
-;============================================================
-;============================================================
+public lostanza defn collect-garbage (allocation-size:long, heap:ptr<Heap>) -> long :
+  if allocation-size < heap.max-size :
+    if heap.collection-start != heap.start :
+      val max-young-generation-size = heap-end(heap) - heap.collection-start
+      val young-generation-size = compute-young-generation-size(heap) + allocation-size
+      if young-generation-size <= max-young-generation-size :
+        mark-compact(heap)
+        if young-generation-size <= heap-end(heap) - heap.top :
+          val max-survivors-fraction = 5
+          val max-survivors = young-generation-size / max-survivors-fraction
+          val survivors = heap.top - heap.collection-start
+          if survivors > max-survivors :
+            clear-remembered-set(heap)
+            heap.collection-start = heap.top
+          heap.limit = heap.top + young-generation-size
+          return young-generation-size
+      force-full-collection(heap)
+    mark-compact(heap)
+    val young-generation-size = compute-young-generation-size(heap) + allocation-size
+    val used-heap = heap.top - heap.start + young-generation-size
+    val usage-ratio = used-heap as double / heap.size as double
+    if usage-ratio > 0.5 :
+      expand-heap(min(heap.max-size, used-heap * 2), heap)
+    heap.collection-start = heap.top
+    heap.limit = min(heap.top + young-generation-size, heap-end(heap))
+  ;Return the space remaining
+  return heap.limit - heap.top
 
 public lostanza defn ensure-heap-space (size:long, heap:ptr<Heap>) -> ref<False> :
   if collect-garbage(size, heap) < size : fatal!("Out of memory.")
   ;No meaningful return value
   return false
+
+;============================================================
+;============================================================
+;============================================================
 
 lostanza defn tag (x:ptr<?>) -> long :
   return (x + 1) as long
@@ -2121,227 +2148,6 @@ lostanza defn untag (x:long) -> ptr<?> :
   val tagbits = x & 7L
   if tagbits != 1 : fatal("Not a heap-allocated object!")
   return (x - 1 + 8) as ptr<?>
-
-;============================================================
-;=============== Throughput Algorithm =======================
-;============================================================
-;Prototype algorithm that sets young-gen to occupy the rest of the heap.
-;Rename to collect-garbage to set as active GC.
-
-public lostanza defn collect-garbage-throughput (allocation-size:long, heap:ptr<Heap>) -> long :
-  labels :
-    begin :
-      goto satisfy-allocation-request(YOUNG-GC)
-
-    satisfy-allocation-request (action:int) :
-      if action == YOUNG-GC :
-        young-gen-collection(heap)
-        val requested-top = heap.top + allocation-size
-        if requested-top > heap.limit :
-          goto satisfy-allocation-request(FULL-GC)
-        else :
-          goto promote-objects()
-      else if action == FULL-GC :
-        full-heap-collection(heap)
-        val requested-top = heap.top + allocation-size
-        if requested-top > heap.limit :
-          goto satisfy-allocation-request(EXPAND-HEAP)
-        else :
-          goto adjust-heap-size(EXPAND-HEAP)
-      else if action == EXPAND-HEAP :
-        val requested-top = heap.top + allocation-size
-        if requested-top > heap.start + heap.max-size :
-          fatal!("Out of memory.")
-        else :
-          expand-heap(requested-top - heap.start, heap)
-          goto adjust-heap-size(EXPAND-HEAP)
-      else :
-        fatal!("Invalid action.")
-
-    promote-objects () :
-      clear-mark(heap.start, heap.collection-start, heap)
-      heap.collection-start = heap.top
-      goto adjust-heap-size(FULL-GC)
-
-    adjust-heap-size (action:int) :
-      if heap.size < heap.max-size :
-        val used-heap = heap.top - heap.start
-        val usage-ratio = used-heap as double / heap.size as double
-        if action == FULL-GC :
-          if usage-ratio > 0.5 :
-            full-heap-collection(heap)
-            goto adjust-heap-size(EXPAND-HEAP)
-        else if action == EXPAND-HEAP :
-          if usage-ratio > 0.35 :
-            expand-heap(heap.size * 2, heap)
-        else :
-          fatal!("Invalid action.")
-
-  ;Return the space remaining
-  return heap.limit - heap.top
-
-
-;============================================================
-;=============== GC Controller Algorithm ====================
-;============================================================
-
-lostanza val YOUNG-GC:int = 0
-lostanza val FULL-GC:int = 1
-lostanza val EXPAND-HEAP:int = 2
-
-;Run the GC to ensure that there is enough space on the heap to
-;allocate an object with the given size. If there is not enough space
-;left on the heap, this function fatals with "Out of Memory".
-;Responsible for returning the new space left until limit is reached.
-public lostanza defn collect-garbage (allocation-size:long, heap:ptr<Heap>) -> long :
-  ;TODO: Hardcoded young-gen-size
-  val young-gen-size = 2 * 1024 * 1024
-
-  labels :
-    ;Begin by attempting to satisfy the allocation
-    ;request by running a young-gen collection.
-    begin :
-      goto satisfy-allocation-request(YOUNG-GC)
-
-    ;Attempt to satisfy the allocation request
-    ;by taking the given action.
-    ;There are only 3 actions: YOUNG-GC | FULL-GC | EXPAND-HEAP.
-    ;This block guarantees that heap-limit will be set such that
-    ;the requested object can be allocated.
-    satisfy-allocation-request (action:int) :
-      if action == YOUNG-GC :
-        ;Run the young-gen collector.
-        ;Assume that heap.top will be right past the last live object after.
-        young-gen-collection(heap)
-
-        ;3 possible situations at this point:
-        ;Case a) Requested object is past the full heap.
-        ;Case b) Requested object is past the young gen.
-        ;Case c) Requested object fits within young gen.
-        val requested-top = heap.top + allocation-size
-        if requested-top > heap-end(heap) :
-          ;Case a) Then try running a full gc.
-          goto satisfy-allocation-request(FULL-GC)
-        else if requested-top > heap.limit :
-          ;Case b) Then expand the young gen.
-          heap.limit = requested-top
-          goto adjust-young-gen(0)
-        else :
-          ;Case c) Then we're done.
-          goto adjust-young-gen(0)
-      else if action == FULL-GC :
-        ;Run the full collector.
-        ;Assume that heap.top will be right past the last live object after.
-        ;Assume heap.collection-start will be set to equal heap.top.
-        full-heap-collection(heap)
-
-        ;3 possible situations at this point:
-        ;Case a) Requested object is past the full heap.
-        ;Case b) Requested object fits within full heap.
-        val requested-top = heap.top + allocation-size
-        if requested-top > heap-end(heap) :
-          ;Case a) Then try expanding the full heap.
-          goto satisfy-allocation-request(EXPAND-HEAP)
-        else :
-          ;Case b) Set young gen to contain the requested object.
-          heap.limit = requested-top
-          goto adjust-young-gen(1)
-      else if action == EXPAND-HEAP :
-        val requested-top = heap.top + allocation-size
-        ;2 possible situations at this point:
-        ;Case a) Requested object is past the heap end.
-        ;Case b) Requested object fits within max heap.
-        if requested-top > heap.start + heap.max-size :
-          ;Case a) Nothing left to do. We're out of memory.
-          fatal!("Out of memory.")
-        else :
-          ;Case b) Expand the heap to fit object.
-          expand-heap(requested-top - heap.start, heap)
-          heap.limit = requested-top
-          goto adjust-young-gen(1)
-      else :
-        fatal!("Invalid action.")
-
-    ;Decide whether to promote the new objects.
-    ;Size the young gen appropriately.
-    ;- ran-fullgc?: If true, it means that a full GC has been ran.
-    adjust-young-gen (ran-fullgc?:int) :
-      ;Decide whether to promote young objects.
-      ;Promote all young objects to old generation if more than 25%
-      ;of young-gen is occupied.
-      val used-young-gen = heap.top - heap.collection-start
-      val total-young-gen = heap.limit - heap.collection-start
-      val usage-ratio = used-young-gen as double / total-young-gen as double
-      if usage-ratio > 0.25 :
-        ;Clear all the existing remembered bits in the old generation.
-        clear-mark(heap.start, heap.collection-start, heap)
-        ;And set the collection-start to start after the last live object.
-        heap.collection-start = heap.top
-
-      ;Size the young generation to be some constant size beyond
-      ;the requested allocated object.
-      ;3 possible cases:
-      ;Case a) The desired young generation is past the full heap,
-      ;        and we already ran a full GC.
-      ;Case b) The desired young generation is past the full heap,
-      ;        and we haven't yet ran a full GC.
-      ;Case c) The desired young generation is within the full heap.
-      val desired-limit = heap.top + allocation-size + compute-young-generation-size(heap)
-      val heap-end = heap.start + heap.size
-      if desired-limit > heap-end :
-        if ran-fullgc? :
-          ;Case a) Try expanding the full heap.
-          goto satisfy-young-gen-sizing(EXPAND-HEAP)
-        else :
-          ;Case b) Try running a full GC.
-          goto satisfy-young-gen-sizing(FULL-GC)
-      else :
-        ;Case c) Set the new heap limit.
-        heap.limit = desired-limit
-        ;Adjust the full heap size, if we ran a full GC.
-        if ran-fullgc? :
-          goto adjust-heap-size()
-
-    ;Attempt to satisfy the desired sizing for the young generation
-    ;by taking the given action.
-    ;There are 2 actions: FULL-GC | EXPAND-HEAP.
-    satisfy-young-gen-sizing (action:int) :
-      if action == FULL-GC :
-        full-heap-collection(heap)
-        ;2 possible cases at this point.
-        ;Case a) Young gen still doesn't fit within the full heap.
-        ;Case b) Young gen fits within the full heap.
-        val desired-limit = heap.top + allocation-size + compute-young-generation-size(heap)
-        if desired-limit > heap-end(heap) :
-          ;Case a) Try expanding the full heap.
-          goto satisfy-young-gen-sizing(EXPAND-HEAP)
-        else :
-          ;Case b) Set the new young generation size.
-          heap.limit = desired-limit
-          goto adjust-heap-size()
-      else if action == EXPAND-HEAP :
-        ;Expand the heap to accomodate the desired young gen size.
-        val desired-limit = heap.top + allocation-size + compute-young-generation-size(heap)
-        expand-heap(desired-limit - heap.start, heap)
-        ;Set the young generation size, ensuring it's still within the full heap.
-        val heap-end = heap.start + heap.size
-        heap.limit = min(heap-end, desired-limit)
-        goto adjust-heap-size()
-      else :
-        fatal!("Invalid action.")
-
-    ;Adjust the full heap size based upon the occupied ratio
-    ;of the heap. Uses heap-top as an indicator for how much
-    ;space is occupied, and thus can only be called if a full GC
-    ;has been ran.
-    adjust-heap-size () :
-      val used-heap = heap.top - heap.start
-      val usage-ratio = used-heap as double / heap.size as double
-      if usage-ratio > 0.5 :
-        expand-heap(heap.size * 2, heap)
-
-  ;Return the space remaining
-  return heap.limit - heap.top
 
 ;Return lower of two pointers.
 lostanza defn min (x:ptr<?>, y:ptr<?>) -> ptr<?> :
