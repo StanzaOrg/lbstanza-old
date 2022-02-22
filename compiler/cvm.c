@@ -532,18 +532,7 @@ int read_dispatch_table (VMState* vms, int format);
 static inline void barriered_store (const VMState* vms, uint64_t* address, uint64_t value) {
   // First store the value
   *address = value;
-  //Test whether the location is from the old generation.
-  //Update the remembered set only if it is.
-  const uint64_t* collection_start = vms->heap.collection_start;
-  if (address < collection_start) {
-    //Compute whether we should set or clear the bit.
-    //Set the bit only if we're storing a proper pointer,
-    //and it's a pointer to the young_gen.
-    if ((value & 7) == 1 && ((const uint64_t*)value) > collection_start) {
-      uint64_t* bitset_base = vms->heap.bitset_base;
-      set_mark(address, bitset_base);
-    }
-  }
+  set_mark(address, vms->heap.bitset_base);
 }
 
 //============================================================

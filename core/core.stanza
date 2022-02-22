@@ -1273,6 +1273,39 @@ lostanza defn clear-mark (start:ptr<?>, limit:ptr<?>, heap:ptr<Heap>) -> ref<Fal
   ;No meaningful return value.
   return false
 
+;Sets the mark for the given heap address range.
+lostanza defn set-mark (start:ptr<?>, limit:ptr<?>, heap:ptr<Heap>) -> ref<False> :
+  ensure-address-range-in-heap!(start, limit, heap)
+  if start < limit :
+    ;Compute start and ending masks.
+    ;Supposing that start-bit-index is 9, then
+    ;start-bit-mask is 0000 0000 1111 1111, which is used to zero-out all bits
+    ;after the start-bit-index (inclusive).
+    ;Supposing that end-bit-index is 9, then
+    ;end-bit-mask is 1111 1110 0000 0000, which is used to zero-out all its
+    ;before the end-bit-index (inclusive).
+    val bitset-base = heap.bitset-base
+    val start-bit-index = bit-index(start)
+    val end-bit-index = bit-index(limit - 1)
+    var start-bit-address:ptr<long> = bit-address(start-bit-index, bitset-base)
+    val end-bit-address = bit-address(end-bit-index, bitset-base)
+    val start-bit-mask = bit-mask(start-bit-index) - 1
+    val end-bit-mask = -1L << bit-shift(end-bit-index) << 1
+
+    ;Special case: the first bit word is the last bit word
+    if start-bit-address == end-bit-address :
+      ;Set all bits where both masks are ones.
+      [start-bit-address] = [start-bit-address] | (start-bit-mask & end-bit-mask)
+    else :
+      ;Set the bits in the start and end words.
+      [start-bit-address] = [start-bit-address] | start-bit-mask
+      [end-bit-address] = [end-bit-address] | end-bit-mask
+      ;Set all bits in the intervening words.
+      start-bit-address = start-bit-address + sizeof(long)
+      call-c clib/memset(start-bit-address, -1L, end-bit-address - start-bit-address)
+  ;No meaningful return value.
+  return false
+
 lostanza defn iterate-marked (start:ptr<?>, limit:ptr<?>,
                               f:ptr<((ptr<?>, ptr<Heap>) -> ref<False>)>,
                               heap:ptr<Heap>) -> ref<False> :
@@ -2101,132 +2134,41 @@ public lostanza defn refcpy (dst:ptr<?>, src:ptr<?>, nrefs:long) -> ref<False> :
   call-c clib/memcpy(dst, src, size)
 
   val vms:ptr<VMState> = call-prim flush-vm()
-  val collection-start = vms.heap.collection-start
-  val bitset-base = vms.heap.bitset-base
-  if dst < collection-start :
-    val limit = dst + size
-    ensure-address-range-in-heap!(dst, limit, addr(vms.heap))
-    for (var p:ptr<long> = dst, p < limit, p = p + sizeof(long)) :
-      val v = [p]
-      val tagbits = v & 7L
-      if tagbits == 1L :
-        ;(v - 1L) >= young-generation-start
-        if (v as ptr<?>) > collection-start :
-          set-mark(p, bitset-base)
+  if dst < vms.heap.collection-start :
+    set-mark(dst, dst + size, addr(vms.heap))
   ;No meaningful return value
   return false
 
 ;============================================================
 ;=========== Ensure Write Barrier Invariants ================
 ;============================================================
-;Globals used to simulate dynamic-scoping.
-;Used to pass arguments to callbacks.
-lostanza var SCANNING-OBJECT:ptr<?> = null
-lostanza var SCANNING-TAG:long = 0L
-lostanza var MARKED-POINTERS-LIST:ptr<LSLongVector> = null
-lostanza var MARKED-POINTERS-LIST-INDEX:long = 0L
 
-
-;Main function: Ensures that the write barrier invariants are satisfied
-;by the heap.
+;Ensures that the write barrier invariants are satisfied by the heap.
 lostanza defn ensure-write-barrier-invariants! (heap:ptr<Heap>) -> ref<False> :
-  ;For reentrancy purposes, save the current state of the global
-  ;variables used for passing arguments to callbacks.
-  val saved-marked-pointers-list = MARKED-POINTERS-LIST
-  val saved-marked-pointers-list-index = MARKED-POINTERS-LIST-INDEX
-  val saved-scanning-object = SCANNING-OBJECT
-  val saved-scanning-tag = SCANNING-TAG
-
   ;Scan through all objects in the old generation, and iterate through
   ;the references. Ensure that the following invariant holds:
   ;For each internal reference:
-  ;  Case Non-reference pointer: Ensure that the remembered bit is not set.
-  ;  Case pointer to old-gen: Ensure that the remembered bit is not set.
   ;  Case pointer to young-gen: Ensure that the remembered bit is set.
-  ;For each set bit in the remembered set:
-  ;  Ensure it corresponds to an old-gen-to-young-gen pointer.
-  MARKED-POINTERS-LIST = LSLongVector()
   val collection-start = heap.collection-start
-  labels:
-    begin: goto scan-object(heap.start)
-    scan-object (p:ptr<long>) :
-      if p < collection-start :
-        SCANNING-OBJECT = p
-        SCANNING-TAG = get-tag(p)
-        iterate-references(p, addr(check-write-barrier-invariants!), heap)
-        goto scan-object(p + allocation-size(p,heap))
-
-  ;Ensure that every single mark in the remembered set corresponds to an
-  ;old-gen to young-gen pointer.
-  MARKED-POINTERS-LIST-INDEX = 0
-  iterate-marked(heap.start, heap.top, addr!(ensure-in-reference-list!), heap)
-
-  ;Free buffer
-  free(MARKED-POINTERS-LIST)
-
-  ;For reentrancy purposes, restore the saved state of the global
-  ;variables used for passing arguments to callbacks.
-  MARKED-POINTERS-LIST = saved-marked-pointers-list
-  MARKED-POINTERS-LIST-INDEX = saved-marked-pointers-list-index
-  SCANNING-OBJECT = saved-scanning-object
-  SCANNING-TAG = saved-scanning-tag
-
-  ;Clear all the marks so that the current GC continues running normally.
+  for (var p:ptr<long> = heap.start, p < collection-start, p = p + allocation-size(p,heap)) :
+    iterate-references(p, addr(check-write-barrier-invariants!), heap)
   return false
 
 ;Callback to ensure that a single reference satisfies the write barrier invariants.
 lostanza defn check-write-barrier-invariants! (p:ptr<long>, heap:ptr<Heap>) -> ref<False> :
   ;Perform these checks:
-  ;Case Non-reference pointer: Ensure that the remembered bit is not set.
-  ;Case pointer to old-gen: Ensure that the remembered bit is not set.
   ;Case pointer to young-gen: Ensure that the remembered bit is set.
   val objref = [p]
   val tagbits = objref & 7L
   if tagbits == 1L :
     val objptr = (objref - 1L) as ptr<long>
-    ;Is the pointer pointing into the old-gen?
-    if objptr < heap.collection-start :
-      ;Error if the remembered bit is set.
-      if test-mark(p, heap) :
-        call-c clib/printf("Scanning object %p (tag = %lld)\n", SCANNING-OBJECT, SCANNING-TAG)
-        call-c clib/printf("Pointer %p into old-gen (%p) is marked in remembered set.\n", p, objptr)
-        fatal!("Write barrier invariants not satisfied.")
-    ;Otherwise the pointer is pointing into the young-gen.
-    else :
-      ;Record this old-to-young pointer.
-      add(MARKED-POINTERS-LIST, p as long)
+    ;Is the pointer pointing into the young gen?
+    if objptr >= heap.collection-start :
       ;Error if the remembered bit is not set.
       if test-mark(p, heap) == 0 :
-        call-c clib/printf("Scanning object %p (tag = %lld)\n", SCANNING-OBJECT, SCANNING-TAG)
         call-c clib/printf("Pointer %p into young-gen (%p) is not marked in remembered set.\n", p, objptr)
         fatal!("Write barrier invariants not satisfied.")
-  else :
-    ;Error if a non-reference is marked in remembered set.
-    if test-mark(p, heap) :
-      call-c clib/printf("Scanning object %p (tag = %lld)\n", SCANNING-OBJECT, SCANNING-TAG)
-      call-c clib/printf("Pointer %p to non-reference %p is marked in remembered set.\n", p, objref)
-      fatal!("Write barrier invariants not satisfied.")
   ;Meaningless return
-  return false
-
-;Callback to ensure that a single marked pointer in the remembered set
-;satisfies the write barrier invariants.
-lostanza defn ensure-in-reference-list! (p:ptr<long>, heap:ptr<Heap>) -> ref<False> :
-  ;Is the reference list empty?
-  if MARKED-POINTERS-LIST-INDEX >= MARKED-POINTERS-LIST.length :
-    call-c clib/printf("Pointer %p is marked in remembered set, but is not an old-to-young pointer.\n", p)
-    fatal!("Write barrier invariants not satisfied.")
-
-  ;Retrieve the next item in the reference list.
-  val p2 = MARKED-POINTERS-LIST.items[MARKED-POINTERS-LIST-INDEX] as ptr<long>
-  if p != p2 :
-    call-c clib/printf("Pointer %p is marked in remembered set, but is not an old-to-young pointer.\n", p)
-    fatal!("Write barrier invariants not satisfied.")
-
-  ;Increment to the next item in the reference list.
-  MARKED-POINTERS-LIST-INDEX = MARKED-POINTERS-LIST-INDEX + 1
-
-  ;Meaningless return value.
   return false
 
 ;============================================================
@@ -2248,8 +2190,7 @@ lostanza defn mark-compact (heap:ptr<Heap>) -> ref<False> :
     ;Ensure that write barriers properly record all writes to old generation.
     ensure-write-barrier-invariants!(heap)
 
-  ;Precondition: No objects should be marked.
-  ensure-no-marks-in-collection-area!(heap)
+  clear-mark(heap.collection-start, heap.top, heap)
 
   val start-time = now-time()
   ;Three major phases:
@@ -2315,8 +2256,6 @@ lostanza defn clear-remembered-set (heap:ptr<Heap>) -> ref<False> :
   return clear-mark(heap.start, heap.collection-start, heap)
 
 lostanza defn force-full-collection (heap:ptr<Heap>) -> ref<False> :
-  ;Clear the remembered bits that was previously used for the write barrier.
-  clear-remembered-set(heap)
   heap.collection-start = heap.start
   ;No meaningful return value
   return false
