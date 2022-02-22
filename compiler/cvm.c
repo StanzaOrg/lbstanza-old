@@ -410,7 +410,7 @@ typedef struct{
   uint64_t* marking_stack_start;
   uint64_t* marking_stack_bottom;
   uint64_t* marking_stack_top;
-  char* compaction_start;  
+  char* compaction_start;
   char* min_incomplete;
   char* max_incomplete;
   struct Stack* stacks;
@@ -536,14 +536,12 @@ static inline void barriered_store (const VMState* vms, uint64_t* address, uint6
   //Update the remembered set only if it is.
   const uint64_t* collection_start = vms->heap.collection_start;
   if (address < collection_start) {
-    uint64_t* bitset_base = vms->heap.bitset_base;
     //Compute whether we should set or clear the bit.
     //Set the bit only if we're storing a proper pointer,
     //and it's a pointer to the young_gen.
-    if ((value & 7) == 1 && ((const uint64_t*)value) >= collection_start) {
+    if ((value & 7) == 1 && ((const uint64_t*)value) > collection_start) {
+      uint64_t* bitset_base = vms->heap.bitset_base;
       set_mark(address, bitset_base);
-    } else {
-      clear_mark(address, bitset_base);
     }
   }
 }
@@ -1623,7 +1621,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case STORE_WITH_BARRIER_OPCODE_VAR_OFFSET : {
       DECODE_E();
-      
+
       //Retrieve address to store to and value to store.
       uint64_t* address = (uint64_t*)(LOCAL(x) + LOCAL(y) + value);
       uint64_t val = (uint64_t)(LOCAL(z));
