@@ -316,6 +316,10 @@ defn gen-defstruct (sname:Token|Symbol,
                 MainConstructor<targs{name}>(fields{local-name})
             }{}
           }
+          destruct?{
+            defmethod core/destruct-values (this) :
+              [ fields{ local-name } ]            
+          }{}
           printer?{
             defmethod print (o:OutputStream, this) :
               val print-items = [
@@ -430,6 +434,10 @@ defn gen-defstruct (sname:Token|Symbol,
                 Constructor<targs{name}>(fields{local-name})
             }{}
           }
+          destruct?{
+            defmethod core/destruct-values (this) :
+              [ fields{ local-name } ]            
+          }{}
           printer?{
             defmethod print (o:OutputStream, this) :
               val print-items = [
@@ -497,6 +505,7 @@ defn gen-defstruct (sname:Token|Symbol,
     `printer? => choice(printer?)
     `print-items => gensym(`print-items)
     `writer? => choice(writer?)
+    `destruct? => choice(true)
     `write-items => gensym(`write-items)])
 
   ; println(filled)
@@ -568,6 +577,119 @@ defn compile (def:EnumDef) :
     `OutputStream => `core/OutputStream
     `equal? => `core/equal?
     `hash => `core/hash])
+
+;============================================================
+;================== Destruct Compilation ====================
+;============================================================
+deftype Pat
+
+defstruct VarPat <: Pat :
+  name : ?
+  kind : False|TypePat
+with:
+  printer => true
+
+defstruct VarPats :
+  vars : List
+  repeated? : True|False
+
+defstruct TypePat <: Pat :
+  name : ?
+  elts : False|Tuple<VarPat> with: (default => false) ; fields
+  repeated? : True|False with: (default => false)     ; last field repeated?
+with:
+  printer => true
+
+defstruct DestructClause :
+  pat : AndPat
+  body : ?
+
+defstruct ExpPat <: Pat :
+  expr : ?
+with:
+  printer => true
+
+defstruct AndPat <: Pat :
+  binding : VarPat
+  exprs : Tuple<ExpPat>
+with:
+  printer => true
+
+defmulti gen-match (x, p:Pat)
+
+defmethod gen-match (x, v:VarPat) :
+  match(name(v),kind(v)) :
+    (n:False, k:False) :   let : (val dummy = gensym(`dummy), qquote(val ~ dummy = ~ x))
+    (n:False, k:TypePat) : gen-match(false, x, k)
+    (n,       k:TypePat) : gen-match(n,     x, k)
+    (n,       k:False) :   qquote(val ~ n = ~ x)
+
+defmethod gen-match (x, v:TypePat) :
+  gen-match(false, x, v)
+
+defmethod gen-match (x, v:ExpPat) :
+  val e = expr(v)
+  qquote((fail() when not ~ e))
+
+defmethod gen-match (x, v:AndPat) :
+  val b = gen-match(x, binding(v))
+  val ands = to-list $ for e in exprs(v) map :
+    gen-match(x, e)
+  qquote(~@ b ~@ ands)
+
+defn gen-match (v?, x, s:TypePat) :
+  val v = gensym(`v) when v? is False else v?
+  val type = name(s)
+  val vals = gensym(`vals)
+  val defval = qquote(val ~ v = ~ x as? ~ type)
+  match(elts(s)) :
+    (elts:Tuple<VarPat>) :
+      val defvalues = qquote(val ~ vals = core/destruct-values(~ x))
+      val vals-len = qquote(length(~ vals))
+      val elts-len = length(elts)
+      val [check, defelts] =
+        if repeated?(s) :
+          val start = length(elts) - 1
+          val requireds = for (elt in elts, i in 0 to start) seq-append :
+            gen-match(qquote(get(~ vals, ~ i)), elt)
+          val index = gensym(`i)
+          val elt = elts[start]
+          var res = gensym(`repeated)
+          val body = gen-match(qquote(get(~ vals, ~ index)), VarPat(res, kind(elt)))
+          val binder = match(name(elt)) :
+            (name:False) : `()
+            (name) : qquote(val ~ name =)
+          val elts-len-1 = elts-len - 1
+          val start-var = gensym(`start)
+          val repeateds =
+            qquote(val ~ start-var = ~ start ~@ binder to-tuple $ for ~ index in ~ start-var to length(~ vals) seq : ( ~@ body ~ res))
+          [qquote(fail() when (~ vals-len < ~ elts-len-1)) qquote(~@ requireds ~@ repeateds)]
+        else :
+          val check = qquote(fail() when (~ vals-len != ~ elts-len))
+          val defelts = for (elt in elts, i in 0 to false) seq-append :
+            gen-match(qquote(get(~ vals, ~ i)), elt)
+          [check defelts]
+      qquote(~@ defval ~@ defvalues ~@ check ~@ defelts)
+    (elts:False) :
+      defval
+      
+defn gen-branch (x, clause:DestructClause) :
+  val body = body(clause)
+  val elts = gen-match(x, pat(clause))
+  qquote(let : (~@ elts ~ body))
+
+defn gen-branches (x, clauses:List<DestructClause>) -> ? :
+  if empty?(clauses) :
+    qquote(core/fatal("no destruct match found"))
+  else :
+    val conseq = gen-branch(x, head(clauses))
+    val alt = gen-branches(x, tail(clauses))
+    qquote(attempt : ~ conseq else: ~ alt)
+
+defn gen-destruct (exp, clauses:List<DestructClause>) -> ? :
+  val x = gensym(`x)
+  val branches = gen-branches(x, clauses)
+  qquote(let : (val ~ x = ~ exp ~@ branches))
 
 ;============================================================
 ;================= Core Syntax Package ======================
@@ -2436,6 +2558,54 @@ defsyntax core :
    fail-if ls-stmt = (~ #if-not-defined) :
       CSE(closest-info(), "Incorrect syntax for #if-not-defined.")
 
+   ;                   Destruct
+   ;                   ========
+   val BAD-DESTRUCT-MSG = "Incorrect syntax for destruct expression. Is there an extra space between destruct and the argument?"
+
+   defrule exp4 = (destruct(?e:#exp!) #:! (?cs:#destruct-clause! ...)) :
+     val expansion = gen-destruct(e, cs)
+     ; println(expansion)
+     val res = parse-syntax[core / #exp](expansion)
+     ; println(res)
+     res
+   fail-if exp4 = (destruct (_)) :
+     CSE(closest-info(), BAD-DESTRUCT-MSG)
+   fail-if exp4 = (destruct) :
+     CSE(closest-info(), "Invalid syntax for destruct expression.")
+
+   defrule id != (destruct)
+
+   defproduction destruct-clause! : DestructClause
+   defrule destruct-clause! = ((?pat:#top-pat!) #:! ?body:#exp!) : DestructClause(pat, body)
+   fail-if destruct-clause! = () : CSE(closest-info(), "Expected destruct clause here")
+
+   defproduction top-pat! : AndPat
+   defrule top-pat! = (?v:#var-pat! ?ap:#and-pat) : AndPat(v, ap)
+   defrule top-pat! = (?v:#var-pat! ?something _ ...) : fatal("What's happening? %_" % [something])
+
+   defproduction and-pat : Tuple<ExpPat>
+   defrule and-pat = (and ?e:#exp) : [ ExpPat(e) ]
+   defrule and-pat = () : []
+
+   defproduction var-pat! : VarPat
+   defrule var-pat! = (?pat:#var-pat) : pat
+   fail-if var-pat! = () : CSE(closest-info(), "Expected a varpat here.")
+
+   defproduction var-pat : VarPat
+   defrule var-pat = (~ _) : VarPat(false, false)
+   defrule var-pat = ((~ @cap ?x:#id!) ~ : ?type:#type-pat!) : VarPat(x, type)
+   defrule var-pat = ((~ @cap ?x:#id!)) : VarPat(x, false)
+   defrule var-pat = (?type:#type-pat!) : VarPat(false, type)
+
+   defproduction type-pat! : TypePat
+   defrule type-pat! = ([ ?pats:#var-pats ]) : TypePat(`core/Tuple, to-tuple $ vars(pats), repeated?(pats))
+   defrule type-pat! = (?name:#type( ?pats:#var-pats )) : TypePat(name, to-tuple $ vars(pats), repeated?(pats))
+   defrule type-pat! = (?name:#type) : TypePat(name)
+
+   defproduction var-pats : VarPats
+   defrule var-pats = ( ?args:#var-pat ... ~ ... ) : VarPats(args, true)
+   defrule var-pats = ( ?args:#var-pat ... ) : VarPats(args, false)
+
    ;                   Literal
    ;                   =======
    public defproduction literal : Token|Char|String|Byte|Int|Long|Float|Double|True|False
@@ -2447,7 +2617,6 @@ defsyntax core :
    defrule id != (#stanza-tag)
    defrule id != (#lexer-tag)
    defrule id = (?x) when unwrap-token(x) is Symbol : x
-
 
 ;============== Error Messages ============================
 val BAD-ARGLIST-MSG = "Incorrect syntax for argument list. Did you forget to put a space between the function name and the argument list?"
