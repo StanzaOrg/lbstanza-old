@@ -268,27 +268,27 @@
 
 #define DECODE_A_UNSIGNED() \
   int32_t value = W1 >> 8; \
-  if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);
+  /*if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);*/
 
 #define DECODE_A_SIGNED() \
   int32_t value = (int32_t)W1 >> 8; \
-  if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);
+  /*if(iprint) printf("          %ld) [%d | %d]\n", icounter, opcode, value);*/
 
 #define DECODE_B_UNSIGNED() \
   int32_t x = (W1 >> 8) & 0x3FF; \
   int32_t value = W1 >> 18; \
-  if(iprint) printf("          %ld) [%d | %d | %d]\n", icounter, opcode, x, value);
+  /*if(iprint) printf("          %ld) [%d | %d | %d]\n", icounter, opcode, x, value);*/
 
 #define DECODE_C() \
   int32_t x = (W1 >> 8) & 0x3FF; \
   int32_t y = (W1 >> 22) & 0x3FF; \
   uint32_t value = PC_INT(); \
-  if(iprint) printf("          %ld) [%d | %d | %d | %d]\n", icounter, opcode, x, y, value);
+  /*if(iprint) printf("          %ld) [%d | %d | %d | %d]\n", icounter, opcode, x, y, value);*/
 
 #define DECODE_D() \
   uint32_t x = (W1 >> 22) & 0x3FF; \
   uint64_t value = PC_LONG(); \
-  if(iprint) printf("          %ld) [%d | _ | %d | %ld]\n", icounter, opcode, x, value);
+  /*if(iprint) printf("          %ld) [%d | _ | %d | %ld]\n", icounter, opcode, x, value);*/
 
 #define DECODE_E() \
   uint32_t W2 = PC_INT(); \
@@ -297,7 +297,7 @@
   int32_t y = (int32_t)(W12 >> 18) & 0x3FF; \
   int32_t z = (int32_t)(W12 >> 28) & 0x3FF; \
   int32_t value = (int32_t)((int64_t)W12 >> 38); \
-  if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, z, value);
+  /*if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, z, value);*/
 
 #define DECODE_F() \
   uint32_t W2 = PC_INT(); \
@@ -307,7 +307,7 @@
   int32_t _n1 = (int32_t)(W12 >> 14); /*Move first bit to 32-bit boundary*/ \
   int32_t n1 = (int32_t)(_n1 >> 14); /*Extend sign-bit*/ \
   int32_t n2 = (int32_t)((int32_t)W2 >> 14); /*Extend sign-bit of first word*/ \
-  if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, n1, n2);
+  /*if(iprint) printf("          %ld) [%d | %d | %d | %d | %d]\n", icounter, opcode, x, y, n1, n2);*/
 
 #define F_JUMP(condition) \
   if(condition){ \
@@ -437,7 +437,7 @@ typedef struct{
   uint64_t* registers;         //(Permanent State)
   uint64_t* system_registers;  //(Permanent State)
   Heap heap;
-  //uint64_t* class_table;       //(Permanent State)
+  uint64_t* class_table;       //(Permanent State)
   //Interpreted Mode Tables
   char* instructions;          //(Permanent State)
   void** trie_table;           //(Permanent State)
@@ -607,12 +607,12 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
   //uint64_t last_time;
 
   //Debug
-  init_iprint();
+  //init_iprint();
 
   //Repl Loop
   while(1){
-    icounter++;
-    int iprint = icounter >= iprint_start && icounter <= iprint_end && icounter % iprint_step == 0;
+    //icounter++;
+    //int iprint = icounter >= iprint_start && icounter <= iprint_end && icounter % iprint_step == 0;
 
     //Save pre-decode PC because jump offsets are relative to
     //pre-decode PC.
