@@ -3,11 +3,11 @@ rm -r pkgs/*
 unset STANZA_CONFIG
 
 # checkout the bootstrap branch and compile stanzaboot
-git checkout merge-new-gc-bootstrap
+git checkout debug-unify-class-table-bootstrap
 stanza compiler/stanza.proj stz/driver -o stanzaboot -optimize -verbose
 
 # checkout the merge-new-gc branch
-git checkout merge-new-gc
+git checkout debug-unify-class-table
 
 # set this folder as the current installation.
 mkdir tempinstall
