@@ -437,6 +437,7 @@ typedef struct{
   uint64_t* registers;         //(Permanent State)
   uint64_t* system_registers;  //(Permanent State)
   Heap heap;
+  uint64_t* class_table;       //(Permanent State)
   //Interpreted Mode Tables
   char* instructions;          //(Permanent State)
   void** trie_table;           //(Permanent State)
@@ -560,23 +561,23 @@ uint64_t ptr_to_ref (void* p){
   return (uint64_t)p + REF_TAG_BITS;
 }
 
-//long iprint_start;
-//long iprint_end;
-//long iprint_step;
-//long icounter;
-//int iprint_init = 0;
-//void init_iprint () {
-//  if(!iprint_init){
-//    iprint_init = 1;
-//    icounter = 0;
-//    FILE* file = fopen("iprint.txt", "r");
-//    int n = fscanf(file, "%ld %ld %ld", &iprint_start, &iprint_end, &iprint_step);
-//    if(n != 3){
-//      printf("Couldn't read iprint.txt.");
-//      exit(-1);
-//    }
-//  }
-//}
+long iprint_start;
+long iprint_end;
+long iprint_step;
+long icounter;
+int iprint_init = 0;
+void init_iprint () {
+  if(!iprint_init){
+    iprint_init = 1;
+    icounter = 0;
+    FILE* file = fopen("iprint.txt", "r");
+    int n = fscanf(file, "%ld %ld %ld", &iprint_start, &iprint_end, &iprint_step);
+    if(n != 3){
+      printf("Couldn't read iprint.txt.");
+      exit(-1);
+    }
+  }
+}
 
 void vmloop (VMState* vms, uint64_t stanza_crsp){
   //Pull out local cache
