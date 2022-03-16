@@ -190,7 +190,6 @@
 #define ALLOC_OPCODE_CONST 183
 #define ALLOC_OPCODE_LOCAL 184
 #define GC_OPCODE 185
-#define CLASS_NAME_OPCODE 241
 #define PRINT_STACK_TRACE_OPCODE 186
 #define COLLECT_STACK_TRACE_OPCODE 187
 #define FLUSH_VM_OPCODE 188
@@ -516,7 +515,6 @@ static inline uint64_t test_and_set_mark (const void* p, uint64_t* bitset_base) 
 int call_garbage_collector (VMState* vms, uint64_t total_size);
 void call_print_stack_trace (VMState* vms, uint64_t stack);
 void* call_collect_stack_trace (VMState* vms, uint64_t stack);
-char* retrieve_class_name (VMState* vms, uint64_t id);
 void c_trampoline (void* fptr, void* argbuffer, void* retbuffer);
 uint64_t lowest_zero_bit_count (uint64_t x);
 
@@ -1735,13 +1733,6 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       RESTORE_STATE();
       //Return heap remaining
       SET_LOCAL(x, remaining);
-      continue;
-    }
-    case CLASS_NAME_OPCODE : {
-      DECODE_B_UNSIGNED();
-      uint64_t id = (uint64_t)LOCAL(value);
-      char* name = retrieve_class_name(vms, id);
-      SET_LOCAL(x, (uint64_t)name);
       continue;
     }
     case PRINT_STACK_TRACE_OPCODE : {
