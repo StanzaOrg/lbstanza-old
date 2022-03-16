@@ -437,7 +437,7 @@ typedef struct{
   uint64_t* registers;         //(Permanent State)
   uint64_t* system_registers;  //(Permanent State)
   Heap heap;
-  uint64_t* class_table;       //(Permanent State)
+  //uint64_t* class_table;       //(Permanent State)
   //Interpreted Mode Tables
   char* instructions;          //(Permanent State)
   void** trie_table;           //(Permanent State)
