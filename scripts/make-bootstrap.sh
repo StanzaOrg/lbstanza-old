@@ -15,8 +15,8 @@ mkdir tempinstall
 export STANZA_CONFIG=$PWD/tempinstall
 
 # Use the bootstrap compiler to compile the new compiler and new pkgs
-./stanzaboot core/stanza.proj compiler/stanza.proj stz/driver -o newstanza -verbose -flags BOOTSTRAP
-./newstanza core/stanza.proj core collections -pkg pkgs
+./stanzaboot core/stanza.proj compiler/stanza.proj stz/driver -o stanza -verbose -flags BOOTSTRAP
+./stanza core/stanza.proj core collections -pkg pkgs
 
 # Display finish
-./newstanza version
+./stanza version
