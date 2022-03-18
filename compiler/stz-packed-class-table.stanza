@@ -46,18 +46,26 @@ public defmulti emit (p:StaticPacker, x:String) -> False
 ;============================================================
 
 public defn pack (records:Collection<ClassTableRecord>, packer:StaticPacker) -> False :
-  ;Generate labels
-  val labels = to-tuple(seq(make-label{packer}, records))
-  ;Emit dense labels
-  do(emit-pointer-to-label{packer, _}, labels)
-  ;Emit records
+  ;Sanity check.
   for (r in records, i in 0 to false) do :
-    ;Sanity check.
     if index(r) != i :
       fatal("Class %_ is supposed to be at index %_, but is actually at index %_." % [
             name(r), index(r), i])
+
+  ;Generate labels
+  val labels = to-tuple(seq(make-label{packer}, records))
+
+  ;Emit descriptors
+  for (r in records, i in 0 to false) do :
+    val descriptor = fast-layout-descriptor(r)
+    emit(packer, case(descriptor))
+    emit(packer, num-base-bytes(descriptor))
+    emit-pointer-to-label(packer, labels[i])
+  
+  ;Emit full layout records
+  for (r in records, i in 0 to false) do :
     ;Emit comment and pack!
-    emit-comment(packer, to-string("Class %_ (index %_)" % [name(r), index(r)]))
+    emit-comment(packer, to-string("Full Layout Record: Class %_ (index %_)" % [name(r), index(r)]))
     emit-label(packer, labels[i])
     pack(r, packer)
 
@@ -68,46 +76,68 @@ defmethod pack (p:StaticPacker, s:String) : emit(p, s)
 ;================= Overall Dynamic Packer ===================
 ;============================================================
 
+;Representation of class descriptor in class table.
+lostanza deftype ClassDescriptor :
+  case:int
+  num-base-bytes:int
+  full-layout:ptr<?>
+
+;Returns the number of class entries in the allocated byte array.
+lostanza defn num-class-entries (table:ref<StableByteArray>) -> ref<Int> :
+  return new Int{(table.length / sizeof(ClassDescriptor)) as int}
+
+;Returns the number of bytes required to hold the given maximum class index.
+lostanza defn num-bytes-required (max-class-index:ref<Int>) -> ref<Int> :
+  return new Int{((max-class-index.value + 1) * sizeof(ClassDescriptor)) as int}
+
 ;Pack the given records into the given class table.
-public defn pack (records:Collection<ClassTableRecord>, class-table:StableLongArray) -> StableLongArray :
+public defn pack (records:Collection<ClassTableRecord>, class-table:StableByteArray) -> StableByteArray :
   ;Delete all the existing records.
+  val current-num-class-entries = num-class-entries(class-table)
   for r in records do :
     val i = index(r)
-    if i < length(class-table) :
-      if class-table[i] != 0L :
-        delete-entry(class-table, i)
+    if i < current-num-class-entries :
+      ensure-class-entry-deleted(class-table, i)
   
   ;Enlarge the table if necessary.
-  val size-required = maximum(0, seq({index(_) + 1}, records))
+  val size-required = num-bytes-required(maximum(-1, seq(index, records)))
   val new-class-table = 
     if length(class-table) < size-required :
-      enlarge(class-table, size-required, 0L)
+      enlarge(class-table, size-required, 0Y)
     else :
       class-table
   
   ;Pack and store the records
   for r in records do :
     val i = index(r)
-    pack-and-store(new-class-table, i, pack(r))
+    pack-and-store(new-class-table, i, fast-layout-descriptor(r), pack(r))
 
   ;Return the potentially enlarged table.
   new-class-table
 
 ;Call free on the entry at index i in the given table.
 ;Set the entry to null.
-lostanza defn delete-entry (table:ref<StableLongArray>, index:ref<Int>) -> ref<False> :
+lostanza defn ensure-class-entry-deleted (table:ref<StableByteArray>, index:ref<Int>) -> ref<False> :
   val i = index.value
-  val p = table.data[i] as ptr<?>
-  call-c clib/free(p)
-  table.data[i] = 0L
-  return false      
+  val descriptors = table.data as ptr<ClassDescriptor>
+  val p = descriptors[i].full-layout
+  if p != null : call-c clib/free(p)
+  descriptors[i] = ClassDescriptor{0, 0, null}
+  return false
 
 ;Pack the given record into bytes, and then store the entry
 ;at the given index in the table. Assumes that the slot currently contains null.
-lostanza defn pack-and-store (table:ref<StableLongArray>, index:ref<Int>, record:ref<PackedClassRecord>) -> ref<False> :
+lostanza defn pack-and-store (table:ref<StableByteArray>,
+                              index:ref<Int>,
+                              descriptor:ref<FastLayoutDescriptor>,
+                              record:ref<PackedClassRecord>) -> ref<False> :
   val i = index.value
-  val p = pack(record)
-  table.data[i] = p as long
+  val data = table.data as ptr<ClassDescriptor>
+  val packed-rec = pack(record)
+  data[i] = ClassDescriptor{
+              case(descriptor).value,
+              num-base-bytes(descriptor).value,
+              packed-rec}
   return false
 
 ;============================================================
@@ -119,7 +149,50 @@ defmulti pack (p:Packer, x:Int) -> False
 defmulti pack (p:Packer, s:String) -> False
 
 ;============================================================
-;=================== Packing with Packer  ===================
+;================== Fast Layout Descriptor ==================
+;============================================================
+
+;Cases
+val CASE-BASE-WITH-NO-REFS = 0
+val CASE-BASE-WITH-REFS = 1
+val CASE-ARRAY-1-BYTE-TAIL = 2
+val CASE-ARRAY-4-BYTE-TAIL = 3
+val CASE-ARRAY-8-BYTE-TAIL = 4
+val CASE-ARRAY-REF-TAIL = 5
+val CASE-GENERAL = 6
+
+defstruct FastLayoutDescriptor :
+  case:Int
+  num-base-bytes:Int
+
+defn fast-layout-descriptor (r:ClassTableRecord) -> FastLayoutDescriptor :
+  match(r) :
+    (r:LeafClassRecord) :
+      val num-fields = (size(r) / 8) when size(r) % 8 == 0
+      val case =
+        if empty?(roots(r)) : CASE-BASE-WITH-NO-REFS
+        else if length(roots(r)) == num-fields : CASE-BASE-WITH-REFS
+        else : CASE-GENERAL
+      FastLayoutDescriptor(case, size(r))
+    (r:ArrayClassRecord) :
+      val case =
+        if empty?(base-roots(r)) :
+          switch(item-size(r)) :
+            1 :
+              CASE-ARRAY-1-BYTE-TAIL
+            4 :
+              CASE-ARRAY-4-BYTE-TAIL
+            8 :
+              if item-roots(r) == [0] : CASE-ARRAY-REF-TAIL
+              else : CASE-ARRAY-8-BYTE-TAIL
+            else :
+              CASE-GENERAL
+        else :
+          CASE-GENERAL
+      FastLayoutDescriptor(case, base-size(r))
+
+;============================================================
+;============== Packing Full Layout Descriptor  =============
 ;============================================================
 
 ;Leaf Class Definition:
