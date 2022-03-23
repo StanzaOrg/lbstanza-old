@@ -58,7 +58,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     within time-ms!(pass-name) :
       cur-package = f(cur-package)
       update-tables() when update-tables?
-    ;dump(cur-package, "logs", suffix)
+    ; dump(cur-package, "logs", suffix)
     #if-not-defined(OPTIMIZE) :
       ensure-unique-identifiers!(cur-package)
   defn run-pass (pass-name:String, f:(EPackage, VarTable) -> EPackage, suffix:String, update-tables?:True|False) :
@@ -79,7 +79,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
   run-pass("Box Mutables", box-mutables, "boxed", false)
   run-pass("Detect Loops", detect-loops, "looped", false)
   run-pass("Simple Inline", simple-inline, "inlined0", false)
-  run-pass("Within Package Inline", within-package-inline{_, true}, "wp-inlined0", false)
+  run-pass("Within Package Inline", within-package-inline{_, global-vt, true}, "wp-inlined0", false)
   run-pass("Cleanup Labels", cleanup-labels, "cleanup-labels", false)
   if optimize? :
     run-pass("Remove Reified Types", force-remove-types, "removed-types", true)
@@ -90,7 +90,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Resolve Methods And Matches", resolve-methods-and-matches, "resolved-methods", false)    
     ;Phase 1
     run-pass("Simple Inline", simple-inline, "inlined1", false)
-    run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined1", false)
+    run-pass("Within Package Inline", within-package-inline{_, global-vt, false}, "wp-inlined1", false)
     run-pass("Cleanup Labels", cleanup-labels, "cleanup-labels1", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce1", false)
     run-pass("Box Unbox", box-unbox-fold, "box-unbox1", false)
@@ -99,7 +99,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Constant Fold", constant-fold, "constant-fold1", false)
     ;Phase 2
     run-pass("Simple Inline", simple-inline, "inlined2", false)
-    run-pass("Within Package Inline", within-package-inline{_, false}, "wp-inlined2", false)
+    run-pass("Within Package Inline", within-package-inline{_, global-vt, false}, "wp-inlined2", false)
     run-pass("Cleanup Labels", cleanup-labels, "cleanup-labels2", false)
     run-pass("Beta Reduce", beta-reduce, "beta-reduce2", false)
     run-pass("Box Unbox", box-unbox-fold, "box-unbox2", false)
@@ -1439,17 +1439,17 @@ defn force-inline-core-functions (epackage:EPackage) -> Tuple<Int> :
 
 ;Helper function for within-package-inline with parameter to control
 ;whether to include core functions to force include.
-defn within-package-inline (epackage:EPackage, inline-from-core?:True|False) :
+defn within-package-inline (epackage:EPackage, vt:VarTable, inline-from-core?:True|False) :
   val ids = force-inline-core-functions(epackage) when inline-from-core?
        else []
-  within-package-inline(epackage, ids)
+  within-package-inline(epackage, vt, ids)
 
 ;Scans through the given package and performing function
 ;inlining. Only functions defined within the given
 ;package are considered for inlining.
 ;- force-inline contains the functions that are forced to
 ;  to always be inlined regardless of their size.
-defn within-package-inline (epackage:EPackage, force-inline:Tuple<Int>) :
+defn within-package-inline (epackage:EPackage, vt:VarTable, force-inline:Tuple<Int>) :
   ;Determine whether a function should be inlined.
   ;The current heuristic is to inline a function
   ;if it has no nested definitions and it is "short".
@@ -1458,15 +1458,41 @@ defn within-package-inline (epackage:EPackage, force-inline:Tuple<Int>) :
   ;otherwise it is short if it has less than 8 instructions.
   ;Variable-arity functions are inlined
   ;if *all* of their branches can be inlined.
-  defn inline? (f:EFunction) -> True|False :
-    match(f) :
-      (f:EMultifn) :
-        all?(inline?, funcs(f))
-      (f:EFn) :
-        if empty?(localfns(body(f))) and empty?(localobjs(body(f))) :
-          val leaf? = none?({_ is ECall|ETCall}, ins(body(f)))
+  val fn-id = n(iotable(vt), CORE-FN-ID)
+  defn inline? (ef:EFunction) -> True|False :
+    match(ef) :
+      (ef:EMultifn) :
+        all?(inline?, funcs(ef))
+      (ef:EFn) :
+        if empty?(localfns(body(ef))) and empty?(localobjs(body(ef))) :
+          defn function-type? (t:EType) -> True|False :
+            ; match(t:EOf) : n(t) == fn-id
+            match(t) :
+              (t:EOf) : n(t) == fn-id
+              (t:EPtrT) : true
+              (t) : false
+          val leaf? = none?({_ is ECall|ETCall}, ins(body(ef)))
           val limit = 12 when leaf? else 8
-          length(ins(body(f))) < limit
+          val higher-order? = 
+            if any?(function-type?, a1(ef)) :
+              defn only-called? (t:EType, a:Int) -> True|False :
+                var num-calls:Int = 0
+                defn uses-var? (i:EImm) -> True|False :
+                  match(i:EVar) : n(i) == a
+                val ok? = for i in ins(body(ef)) all? :
+                  match(i) :
+                    (i:ECall|ETCall) :
+                      val lo-ok?    = t is-not EPtrT or calltype(i) is CallPtr 
+                      val fun-use?  = uses-var?(f(i)) and lo-ok?
+                      (num-calls = num-calls + 1) when fun-use?
+                      val arg-uses? = any?(uses-var?, ys(i))
+                      not (fun-use? or arg-uses?) or (fun-use? and not arg-uses?)
+                    (i:ELive) : true
+                    (i:EIns) :  not any?(uses-var?, uses(i))
+                ok? and num-calls > 0
+              for (t in a1(ef), a in args(ef)) all? :
+                not function-type?(t) or only-called?(t, a)
+          higher-order? or length(ins(body(ef))) < limit
 
   ;Scans through the top-level definitions in the package,
   ;and collects the functions that are appropriate for
@@ -3110,13 +3136,13 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
   ;Compute binding table.
   ;Every entry in the binding table, x => e, indicates that
   ;x is defined exactly once by the EObject or ENewObject instruction.
-  defn binding-table (e:EBody) -> IntTable<EObject|ENewObject> :
-    val table = IntListTable<EObject|ENewObject>()
+  defn binding-table (e:EBody) -> IntTable<EObject|ENewObject|EPtr> :
+    val table = IntListTable<EObject|ENewObject|EPtr>()
     val remove-set = IntSet()
     for i in ins(e) do :
-      match(i:EObject|ENewObject) : add(table, n(x(i)), i)
+      match(i:EObject|ENewObject|EPtr) : add(table, n(x(i)), i)
       else : do(add{remove-set, n(_)}, varlocs(i))
-    to-inttable<EObject|ENewObject> $
+    to-inttable<EObject|ENewObject|EPtr> $
       for entry in table seq? :
         if remove-set[key(entry)] : None()
         else if length(value(entry)) == 1 : One(key(entry) => head(value(entry)))
@@ -3128,12 +3154,24 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
     match(value:EVar) : not mutable?(vt,n(value))
     else : true
 
+  ;If the given ECall expression with CallPtr type calls a function
+  ;that is an EPtr of something then returns var to function instead.
+  ;Calls fail() if not a match.
+  defn unbox-call-ptr (e:ECall,
+                       vt:VarTable,
+                       bindings:IntTable<EObject|ENewObject|EPtr>) -> EVar :
+    fail() when calltype(e) is-not CallPtr
+    val v = f(e) as? EVar
+    val p = get?(bindings, n(v)) as? EPtr
+    val l = loc(p) as? EVarLoc
+    EVar(n(l))
+
   ;If the given EObjectGet expression corresponds to retrieval
   ;of a known object field then return the destination and the
   ;field. Calls fail() if not a match.
   defn unbox-object-get (e:EObjectGet,
                          vt:VarTable,
-                         bindings:IntTable<EObject|ENewObject>) -> [EVarLoc, EImm] :
+                         bindings:IntTable<EObject|ENewObject|EPtr>) -> [EVarLoc, EImm] :
     val v = y(e) as? EVar
     val o = get?(bindings, n(v)) as? ENewObject
     
@@ -3154,7 +3192,7 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
   ;Calls fail() if not a match.
   defn unbox-load (e:ELoad,
                    vt:VarTable,
-                   bindings:IntTable<EObject|ENewObject>, ) -> [EVarLoc, EImm] :
+                   bindings:IntTable<EObject|ENewObject|EPtr>, ) -> [EVarLoc, EImm] :
     val field = loc(e) as? EField
     val v = y(loc(field) as? EDeref) as? EVar
     val o = get?(bindings, n(v)) as? EObject
@@ -3186,6 +3224,11 @@ defn box-unbox-fold (epackage:EPackage, gvt:VarTable) -> EPackage :
           attempt :
             val [x, v] = unbox-load(i, vt, bindings)
             EDef(x, v, false)
+          else : i
+        (i:ECall) :
+          attempt :
+            val f = unbox-call-ptr(i, vt, bindings)
+            sub-calltype(sub-f(i, f), CallC())
           else : i
         (i) : i
 
