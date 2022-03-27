@@ -780,6 +780,8 @@ lostanza val SYSTEM-PAGE-SIZE : long = 4096
 
 public lostanza defn round-up-to-whole-pages (x:long) -> long :
   return (x + (SYSTEM-PAGE-SIZE - 1)) & (~ (SYSTEM-PAGE-SIZE - 1));
+  
+;Round the given number up to the nearest 8-byte boundary.
 lostanza defn round-up-to-whole-longs (x:long) -> long :
   return (x + (sizeof(long) - 1)) & (~ (sizeof(long) - 1));
 
@@ -946,15 +948,18 @@ lostanza val BYTES-IN-LONG:long = 1 << LOG-BYTES-IN-LONG
 lostanza val BITS-IN-LONG:long = 1 << LOG-BITS-IN-LONG
 
 ;Structure for representing a Heap space.
-;- start is the starting address of the heap. It is aligned at page boundary.
 ;- top is the top address of the heap.
 ;- limit is equal to start + number of currently available bytes in the heap.
-;- size is the maximum size that the heap can be expanded to.
+;  GC is triggered when we attempt to allocate past this limit.
+;- start is the starting address of the heap. It is aligned at page boundary.
+;- collection-start is the start of the young generation heap.
 ;- bitset is the starting address of the marking bits for the heap.
 ;- bitset-base is a cached common subexpression for set-mark, clear-mark,
 ;    test-mark, test-and-set-mark, test-and-clear-mark intrinsics.
 ;  bitset-base = bit-address(bit-index(null))
 ;  bitset-base = bitset - (start >> LOG-BITS-IN-LONG)
+;- size is the current allocated size of the heap.
+;- max-size is the maximum size that the heap can be expanded to.
 ;- compaction-start is the lowest moving object in collection area.
 public lostanza deftype Heap :
   var current-stack: long
@@ -1003,6 +1008,8 @@ lostanza defn compute-bitset-base (heap:ptr<Heap>) -> ptr<long> :
 lostanza defn heap-end (heap:ptr<Heap>) -> ptr<long> :
   return heap.start + heap.size
 
+;Returns the desired size of the young generation.
+;Defined to be heap-size / young-generation-fraction. 
 lostanza defn compute-young-generation-size (heap:ptr<Heap>) -> long :
   val young-generation-fraction:long = 4
   return round-up-to-whole-longs(heap.size / young-generation-fraction)
@@ -2160,41 +2167,94 @@ lostanza defn mark-compact (vms:ptr<VMState>) -> ref<False> :
 ;============= YoungGen and FullHeap collections ============
 ;============================================================
 
+;The remembered set spans from heap.start to heap.collection-start.
+;Set all bits in the bitset for that range to zero.
 lostanza defn clear-remembered-set (heap:ptr<Heap>) -> ref<False> :
   return clear-mark(heap.start, heap.collection-start, heap)
 
+;Force the next call to mark-compact to be a full-heap collection.
+;Do this by setting heap.collection-start to heap.start.
 lostanza defn force-full-collection (vms:ptr<VMState>) -> ref<False> :
   vms.heap.collection-start = vms.heap.start
   ;No meaningful return value
   return false
 
+;Force a collection of the entire heap.
 public lostanza defn full-heap-collection (vms:ptr<VMState>) -> ref<False> :
+  ;High level algorithm:
+  ;1) Set heap.collection-start to heap.start to begin collecting
+  ;   from the start of the heap.
+  ;2) Run the mark-compact algorithm.
+  ;3) Promote all objects to old gen by setting heap.collection-start to
+  ;   heap.top.
   force-full-collection(vms)
   mark-compact(vms)
   vms.heap.collection-start = vms.heap.top
   return false
 
+;We need to allocate 'allocation-size' bytes from the heap, and we have detected
+;that this is past our heap limit (heap.limit).
+;Run the GC and try to create enough free space so that we can perform the allocation.
+;After GC, returns the number of bytes that are now free to be allocated from the heap.
 public lostanza defn collect-garbage (allocation-size:long, vms:ptr<VMState>) -> long :
+  ;High Level Algorithm:
+  ;1) Define our desired young-gen to have size:
+  ;    (young-gen-frac * heap-size) + allocation-size
+  ;2) First try using a partial GC to create space for the young-gen.
+  ;3) Then try using a full GC to create space for the young-gen.
+  ;4) Then try expanding the heap to both:
+  ;  - create space for the young-gen
+  ;  - ensure the desired heap occupancy.
+
+  ;If we're attempting to allocate a larger object than can ever
+  ;be held in the heap (even after expansion) then don't bother doing anything.
   val heap = addr(vms.heap)
   if allocation-size < heap.max-size :
+
+    ;Step 1. Defining the desired size of young-gen.
     val young-generation-size = compute-young-generation-size(heap) + allocation-size
+
+    ;Step 2. Try using a partial GC to create space.
+    ;Fail if we're explicitly requested to do a full GC.
     if heap.collection-start != heap.start :
+
+      ;Fail if we cannot possibly free enough space using a partial GC.
       val max-young-generation-size = heap-end(heap) - heap.collection-start
       if young-generation-size <= max-young-generation-size :
+      
+        ;Try the partial GC.
         mark-compact(vms)
+        
+        ;Fail if the partial GC didn't free up enough space
+        ;for our desired young gen.
         if young-generation-size <= heap-end(heap) - heap.top :
+
+          ;Success! The partial GC created enough space for young gen.
+          ;Now promote all existing objects, create the young gen, and return.
           clear-remembered-set(heap)
           heap.collection-start = heap.top
           heap.limit = heap.top + young-generation-size
           return young-generation-size
+
+      ;The previous steps were not successful in creating
+      ;the young gen. Force a full collection.
       force-full-collection(vms)
+
+    ;Step 3. Try using a full GC to create space.
     mark-compact(vms)
+
+    ;Step 4. Expand the heap.
     val used-heap = heap.top - heap.start + young-generation-size
     val usage-ratio = used-heap as double / heap.size as double
     if usage-ratio > 0.5 :
       expand-heap(min(heap.max-size, used-heap * 2), heap)
+
+    ;We've done what we can.
+    ;Promote all the old objects, and
+    ;create the young-generation that will fit.
     heap.collection-start = heap.top
     heap.limit = min(heap.top + young-generation-size, heap-end(heap))
+    
   ;Return the space remaining
   return heap.limit - heap.top
 
