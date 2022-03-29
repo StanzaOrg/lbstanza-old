@@ -96,7 +96,7 @@ typedef struct{
   stz_byte* heap_top;
   stz_byte* heap_limit;
   stz_byte* heap_start;
-  stz_byte* young_gen_start;
+  stz_byte* heap_old_objects_end;
   stz_byte* heap_bitset;
   stz_byte* heap_bitset_base;
   stz_long heap_size;
@@ -1061,7 +1061,7 @@ static Stack* alloc_stack (VMInit* init){
 }
 
 //Given a pointer to a struct allocated on the heap,
-//add the tag bits to the pointer. 
+//add the tag bits to the pointer.
 uint64_t tag_as_ref (void* p){
   return (uint64_t)p - 8 + 1;
 }
@@ -1098,12 +1098,12 @@ STANZA_API_FUNC int main (int argc, char* argv[]) {
   stz_long young_gen_size = 2 * 1024 * 1024;
   init.heap_limit = init.heap_start + young_gen_size;
   init.heap_top = init.heap_start;
-  init.young_gen_start = init.heap_start;
+  init.heap_old_objects_end = init.heap_start;
 
   //Allocate bitset for heap
   const stz_long min_bitset_size = bitset_size(min_heap_size);
   const stz_long max_bitset_size = bitset_size(max_heap_size);
-  init.heap_bitset = (stz_byte*)stz_memory_map(min_bitset_size, max_bitset_size);  
+  init.heap_bitset = (stz_byte*)stz_memory_map(min_bitset_size, max_bitset_size);
   init.heap_bitset_base = init.heap_bitset - ((uint64_t)init.heap_start >> 6);
   memset(init.heap_bitset, 0, min_bitset_size);
 
