@@ -480,30 +480,44 @@ static inline uint64_t bit_mask (const void* p) {
 static inline uint64_t* bit_address (const void* p, uint64_t* bitset_base) {
   return bitset_base + (bit_index(p) >> LOG_BITS_IN_LONG);
 }
-static inline uint64_t test_mark (const void* p, uint64_t* bitset_base) {
-  return (*bit_address(p, bitset_base) >> bit_shift(p)) & 1L;
-}
 static inline void set_mark (const void* p, uint64_t* bitset_base) {
   *bit_address(p, bitset_base) |= bit_mask(p);
 }
 static inline void clear_mark (const void* p, uint64_t* bitset_base) {
   *bit_address(p, bitset_base) &= ~bit_mask(p);
 }
-static inline uint64_t test_and_clear_mark (const void* p, uint64_t* bitset_base) {
-  uint64_t* address = bit_address(p, bitset_base);
-  const uint64_t mask = bit_mask(p);
-
-  const uint64_t old_value = *address;
-  *address = old_value & ~mask;
-  return old_value & mask;
+static inline void set_bit (uint64_t bit_index, uint64_t* bitset_base) {
+  int word_index = bit_index >> 6;
+  int word_bit_index = bit_index & 63;
+  uint64_t mask = 1L << word_bit_index;
+  bitset_base[word_index] |= mask;
 }
-static inline uint64_t test_and_set_mark (const void* p, uint64_t* bitset_base) {
-  uint64_t* address = bit_address(p, bitset_base);
-  const uint64_t mask = bit_mask(p);
-
-  const uint64_t old_value = *address;
-  *address = old_value | mask;
-  return old_value & mask;
+static inline void clear_bit (uint64_t bit_index, uint64_t* bitset_base) {
+  int word_index = bit_index >> 6;
+  int word_bit_index = bit_index & 63;
+  uint64_t mask = 1L << word_bit_index;
+  bitset_base[word_index] &= ~mask;
+}
+static inline uint64_t test_bit (uint64_t bit_index, uint64_t* bitset_base) {
+  int word_index = bit_index >> 6;
+  int word_bit_index = bit_index & 63;
+  return (bitset_base[word_index] >> word_bit_index) & 1L;
+}
+static inline uint64_t test_and_set_bit (uint64_t bit_index, uint64_t* bitset_base) {
+  int word_index = bit_index >> 6;
+  int word_bit_index = bit_index & 63;
+  uint64_t mask = 1L << word_bit_index;
+  uint64_t old_value = bitset_base[word_index];
+  bitset_base[word_index] = old_value | mask;
+  return (old_value >> word_bit_index) & 1L;
+}
+static inline uint64_t test_and_clear_bit (uint64_t bit_index, uint64_t* bitset_base) {
+  int word_index = bit_index >> 6;
+  int word_bit_index = bit_index & 63;
+  uint64_t mask = 1L << word_bit_index;
+  uint64_t old_value = bitset_base[word_index];
+  bitset_base[word_index] = old_value & ~mask;
+  return (old_value >> word_bit_index) & 1L;
 }
 
 //============================================================
@@ -1995,28 +2009,38 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       continue;
     }
     case SET_BIT_OPCODE : {
-      DECODE_B_UNSIGNED();
-      set_mark((const void*)LOCAL(x), (uint64_t*)LOCAL(value));
+      DECODE_C();
+      uint64_t bit_index = (uint64_t)LOCAL(y);
+      uint64_t* bitset_base = (uint64_t*)LOCAL(value);
+      set_bit(bit_index, bitset_base);
       continue;
     }
     case CLEAR_BIT_OPCODE : {
-      DECODE_B_UNSIGNED();
-      clear_mark((const void*)LOCAL(x), (uint64_t*)LOCAL(value));
+      DECODE_C();
+      uint64_t bit_index = (uint64_t)LOCAL(y);
+      uint64_t* bitset_base = (uint64_t*)LOCAL(value);
+      clear_bit(bit_index, bitset_base);
       continue;
     }
     case TEST_BIT_OPCODE : {
       DECODE_C();
-      SET_LOCAL(x, test_mark((const void*)LOCAL(y), (uint64_t*)LOCAL(value)));
+      uint64_t bit_index = (uint64_t)LOCAL(y);
+      uint64_t* bitset_base = (uint64_t*)LOCAL(value);
+      SET_LOCAL(x, test_bit(bit_index, bitset_base));
       continue;
     }
     case TEST_AND_SET_BIT_OPCODE : {
       DECODE_C();
-      SET_LOCAL(x, test_and_set_mark((const void*)LOCAL(y), (uint64_t*)LOCAL(value)));
+      uint64_t bit_index = (uint64_t)LOCAL(y);
+      uint64_t* bitset_base = (uint64_t*)LOCAL(value);
+      SET_LOCAL(x, test_and_set_bit(bit_index, bitset_base));
       continue;
     }
     case TEST_AND_CLEAR_BIT_OPCODE : {
       DECODE_C();
-      SET_LOCAL(x, test_and_clear_mark((const void*)LOCAL(y), (uint64_t*)LOCAL(value)));
+      uint64_t bit_index = (uint64_t)LOCAL(y);
+      uint64_t* bitset_base = (uint64_t*)LOCAL(value);
+      SET_LOCAL(x, test_and_clear_bit(bit_index, bitset_base));
       continue;
     }
     }
