@@ -13,6 +13,7 @@ defpackage stz/vm-table :
   import stz/branch-table
   import stz/dl-ir
   import core/stack-trace
+  import stz/packed-class-table
 
 extern memcpy : (ptr<?>, ptr<?>, long) -> int
 
@@ -31,7 +32,6 @@ public lostanza deftype VMTable :
 
   ;Classes
   class-table:ref<ClassTable>
-  class-name-table:ref<ClassNameTable>
 
   ;Constants
   consts:ref<Buffer>
@@ -72,7 +72,6 @@ public lostanza defn VMTable (class-table:ref<ClassTable>, branch-table:ref<Bran
 
     ;Classes
     class-table,
-    ClassNameTable(),
 
     ;Constants
     Buffer(),
@@ -102,7 +101,7 @@ public deftype ClassTable
 public defmulti class? (this, c:Int) -> True|False
 public defmulti instanceof? (t:ClassTable, child:Int, parent:TypeSet) -> True|False
 public defmulti unique? (t:ClassTable, n:Int) -> True|False
-public defmulti add (t:ClassTable, cs:Seqable<LoadedClass>) -> False
+public defmulti add (t:ClassTable, cs:Collection<LoadedClass>) -> False
 public defmulti add (t:ClassTable, l:TreeListener) -> False
 public defmulti get (t:ClassTable, c:Int) -> VMClass
 public defmulti loaded-class (t:ClassTable, c:Int) -> LoadedClass
@@ -110,28 +109,44 @@ public defmulti children (t:ClassTable, c:Int) -> Tuple<Int>
 public defmulti set-representation (t:ClassTable, c:Int) -> Tuple<Int>
 public defmulti abstract-classes (t:ClassTable) -> IntSet
 
+;Return the packed representation of the class table.
+;Used by the runtime (e.g. GC) to introspect upon object layouts.
+defmulti packed-table (t:ClassTable) -> StableByteArray
+
 public defn ClassTable () :
   val class-table = IntTable<LoadedClass>()
   val class-tree = DynTree()
+  var packed-table:StableByteArray = StableByteArray(0, 0Y)
 
   defn instanceof? (child:Int, t:TypeSet) :
-    let loop (t:TypeSet = t) :
-      match(t) :
-        (t:TopType) : true
-        (t:SingleType) : parent?(class-tree, child, type(t))
-        (t:AndType) : all?(loop, types(t))
-        (t:OrType) : any?(loop, types(t))
+    for p in t test-instanceof? :
+      parent?(class-tree, child, type(p))
     
   new ClassTable :
-    defmethod add (this, cs0:Seqable<LoadedClass>) :
-      val cs = to-tuple(cs0)
-      defn node-state (c:VMClass) :
+    defmethod add (this, cs:Collection<LoadedClass>) :
+      ;Add the classes to the class dynamic tree.
+      defn node-state (c:VMClass) -> NodeState :
         match(c) :
           (c:VMAbstractClass) : NodeState(id(c), parents(c), children(c), false)
           (c) : NodeState(id(c), parents(c), [], true)      
       add(class-tree, seq(node-state{class(_)}, cs))
+      
+      ;Add the classes to the packed class table.
+      defn record? (c:VMClass) -> Maybe<ClassTableRecord> :
+        match(c) :
+          (c:VMLeafClass) :
+            One(LeafClassRecord(id(c), name(c), size(c), roots(c)))
+          (c:VMArrayClass) :
+            One(ArrayClassRecord(id(c), name(c),
+                                 base-size(c), item-size(c), base-roots(c), item-roots(c)))
+          (c:VMAbstractClass) :
+            None()
+      val records = to-tuple(seq?(record?{class(_)}, cs))
+      packed-table = pack(records, packed-table)
+      
+      ;Add the classes to the class table.
       for c in cs do :
-        class-table[id(class(c))] = c
+        class-table[id(class(c))] = c        
     defmethod add (this, l:TreeListener) :
       add(class-tree, l)
     defmethod get (this, c:Int) :
@@ -141,7 +156,7 @@ public defn ClassTable () :
     defmethod class? (this, c:Int) :
       key?(class-table, c)
     defmethod unique? (this, n:Int) :
-      instanceof?(n, SingleType(UNIQUE-TYPE))
+      parent?(class-tree, n, UNIQUE-TYPE)      
     defmethod instanceof? (this, child:Int, parent:TypeSet) :
       instanceof?(child, parent)
     defmethod children (this, c:Int) :
@@ -149,44 +164,16 @@ public defn ClassTable () :
     defmethod set-representation (this, c:Int) :
       all-children(class-tree, c)
     defmethod abstract-classes (this) :
-      non-leaves(class-tree)
+      non-leaves(class-tree)      
+    defmethod packed-table (this) :
+      packed-table
+
+public lostanza defn packed-class-table (ct:ref<ClassTable>) -> ptr<?> :
+  return packed-table(ct).data
 
 public defn subtype? (ct:ClassTable, a:TypeSet, b:TypeSet) :
-  match(a) :
-    (a:TopType) :
-      let loop (t:TypeSet = b) :
-        match(t) :
-          (t:TopType) : true
-          (t:SingleType) : false
-          (t:AndType) : all?(loop, types(t))
-          (t:OrType) : any?(loop, types(t))
-    (a:SingleType) :
-      instanceof?(ct, type(a), b)
-    (a:AndType) :
-      any?(subtype?{ct, _, b}, types(a))
-    (a:OrType) :
-      all?(subtype?{ct, _, b}, types(a))
-
-;============================================================
-;================== Class Name Table ========================
-;============================================================
-
-public deftype ClassNameTable
-public defmulti add (t:ClassNameTable, names:Seqable<KeyValue<Int,String>>) -> False
-public defmulti get (t:ClassNameTable, c:Int) -> StableString
-
-public defn ClassNameTable () :
-  val names = IntTable<StableString>()
-  new ClassNameTable :
-    defmethod add (this, entries:Seqable<KeyValue<Int,String>>) :
-      for e in entries do :
-        names[key(e)] = StableString(value(e))
-    defmethod get (this, c:Int) :
-      names[c]
-
-public lostanza defn load-class-names (t:ref<VMTable>, names:ref<Seqable<KeyValue<Int,String>>>) -> ref<False> :
-  add(t.class-name-table, names)
-  return false
+  for (a1 in a, b1 in b) test-instanceof? :
+    instanceof?(ct, type(a1), b1)
 
 ;============================================================
 ;=================== Global Loading =========================
@@ -278,8 +265,10 @@ lostanza defn make-void (buffer:ref<Buffer>, i:ref<Int>) -> ref<False> :
 ;===================== Class Loading ========================
 ;============================================================
 
-public lostanza defn load-classes (vmt:ref<VMTable>, classes:ref<Seqable<LoadedClass>>) -> ref<False> :
-  add(vmt.class-table, classes)
+public lostanza defn load-classes (vmt:ref<VMTable>,
+                                   classes:ref<Collection<LoadedClass>>) -> ref<False> :
+  ;Add the classes to the class tree.
+  add(vmt.class-table, classes)  
   return false
 
 ;============================================================

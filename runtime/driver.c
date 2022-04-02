@@ -33,11 +33,6 @@
 //       Forward Declarations
 //       ====================
 
-//FMalloc Debugging
-#ifdef FMALLOC
-static void init_fmalloc ();
-#endif
-
 void* stz_malloc (stz_long size);
 void stz_free (void* ptr);
 
@@ -82,33 +77,36 @@ static void exit_with_error_line_and_func (const char* file, int line){
 //     Stanza Defined Entities
 //     =======================
 typedef struct{
-  stz_byte* heap;
-  stz_byte* heap_top;
-  stz_byte* heap_limit;
-  stz_byte* free;
-  stz_byte* free_limit;
-  stz_long current_stack;
-  stz_long system_stack;
-} VMInit;
-
-typedef struct{
   stz_long returnpc;
   stz_long liveness_map;
   stz_long slots[];
 } StackFrame;
 
-typedef struct{
-  stz_int pool_index;
-  stz_int mark;
-  StackFrame frames[];
-} StackFrameHeader;
-
-typedef struct{
+typedef struct Stack{
   stz_long size;
   StackFrame* frames;
   StackFrame* stack_pointer;
   stz_long pc;
+  struct Stack* tail;
 } Stack;
+
+typedef struct{
+  stz_long current_stack;
+  stz_long system_stack;
+  stz_byte* heap_top;
+  stz_byte* heap_limit;
+  stz_byte* heap_start;
+  stz_byte* heap_old_objects_end;
+  stz_byte* heap_bitset;
+  stz_byte* heap_bitset_base;
+  stz_long heap_size;
+  stz_long heap_max_size;
+  Stack* stacks;
+  void* trackers;
+  stz_byte* marking_stack_start;
+  stz_byte* marking_stack_bottom;
+  stz_byte* marking_stack_top;
+} VMInit;
 
 //     Macro Readers
 //     =============
@@ -164,7 +162,7 @@ stz_long file_write_block (FILE* f, char* data, stz_long len) {
 
 
 //     Path Resolution
-//     ===============  
+//     ===============
 #if defined(PLATFORM_LINUX) || defined(PLATFORM_OS_X)
   stz_byte* resolve_path (const stz_byte* filename){
     //Call the Linux realpath function.
@@ -250,7 +248,7 @@ stz_int symlink(const stz_byte* target, const stz_byte* linkpath) {
 
 //This function does not follow symbolic links. If we need
 //to follow symbolic links, the caller should call this
-//call this function with the result of resolve-path. 
+//call this function with the result of resolve-path.
 stz_int get_file_type (const stz_byte* filename0) {
   WIN32_FILE_ATTRIBUTE_DATA attributes;
   LPCSTR filename = C_CSTR(filename0);
@@ -364,127 +362,6 @@ stz_long file_time_modified (const stz_byte* filename){
   return 0;
 }
 
-#ifdef FMALLOC
-//============================================================
-//======================= Free List ==========================
-//============================================================
-
-typedef struct {
-  int capacity;
-  int size;
-  void** items;
-} FreeList;
-
-static FreeList make_freelist (int c){
-  void** items = (void**)malloc(c * sizeof(void*));
-  FreeList f = {c, 0, items};
-  return f;
-}
-
-static void ensure_capacity (FreeList* list, int c){
-  if(list->capacity < c){
-    int c2 = list->capacity;
-    while(c2 < c) c2 *= 2;
-    void** items2 = (void**)malloc(c2 * sizeof(void*));
-    memcpy(items2, list->items, list->capacity * sizeof(void*));
-    free(list->items);
-    list->items = items2;
-    list->capacity = c2;
-  }
-}
-
-static void delete_index (FreeList* list, int xi){
-  int yi = list->size - 1;
-  void* x = list->items[xi];
-  void* y = list->items[yi];
-  if(xi != yi){
-    list->items[xi] = y;
-    list->items[yi] = x;
-  }
-  list->size--;
-}
-
-static void add_item (FreeList* list, void* item){
-  int i = list->size;
-  ensure_capacity(list, i + 1);
-  list->items[i] = item;
-  list->size++;
-}
-
-//============================================================
-//================== Fixed Memory Allocator ==================
-//============================================================
-
-typedef struct {
-  long size;
-  char bytes[];
-} Chunk;
-
-char* mem_top;
-char* mem_limit;
-FreeList mem_chunks;
-
-static void init_fmalloc () {
-  mem_chunks = make_freelist(8);
-  long size = 8L * 1024L * 1024L * 1024L;
-  mem_top = (char*)0x700000000L;
-  mem_limit = mem_top + size;
-  void* result = mmap(mem_top,
-                      size,            
-                      PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
-                      0,
-                      0);
-  if(!result){
-    printf("Could not allocate fixed memory.\n");
-    exit(-1);
-  }  
-}
-
-static Chunk* alloc_chunk (long size){
-  long total_size = (size + sizeof(Chunk) + 7) & -8;
-  Chunk* chunk = (Chunk*)mem_top;
-  mem_top += total_size;
-  if(mem_top > mem_limit){
-    printf("Out of fixed memory.\n");
-    exit(-1);
-  }
-  chunk->size = size;
-  return chunk;
-}
-
-static Chunk* find_chunk (long size){
-  Chunk* best = 0;
-  int besti = 0;
-  for(int i=0; i<mem_chunks.size; i++){
-    Chunk* c = mem_chunks.items[i];
-    int is_best = 0;
-    if(c->size >= size){
-      if(best) is_best = c->size < best->size;
-      else is_best = 1;
-    }
-    if(is_best){
-      best = c;
-      besti = i;
-    }
-  }
-  if(best)
-    delete_index(&mem_chunks, besti);
-  return best;
-}
-
-static void* fmalloc (long size){
-  Chunk* c = find_chunk(size);
-  if(!c) c = alloc_chunk(size);
-  return c->bytes;
-}
-
-static void ffree (void* ptr){
-  Chunk* c = (Chunk*)((char*)ptr - sizeof(Chunk));
-  add_item(&mem_chunks, c);
-}
-#endif
-
 //============================================================
 //===================== String List ==========================
 //============================================================
@@ -538,7 +415,7 @@ StringList* list_dir (const stz_byte* filename){
   //Open directory
   DIR* dir = opendir(C_CSTR(filename));
   if(dir == NULL) return 0;
-  
+
   //Allocate memory for strings
   StringList* list = make_stringlist(10);
   //Loop through directory entries
@@ -573,19 +450,11 @@ stz_int sleep_us (stz_long us){
 //============================================================
 
 void* stz_malloc (stz_long size){
-  #if defined(FMALLOC)
-    return fmalloc(size);
-  #else
-    return malloc(size);
-  #endif
+  return malloc(size);
 }
 
 void stz_free (void* ptr){
-  #if defined(FMALLOC)
-    ffree(ptr);
-  #else
-    free(ptr);
-  #endif
+  free(ptr);
 }
 
 //============================================================
@@ -611,8 +480,8 @@ void* stz_memory_map (stz_long min_size, stz_long max_size) {
   return p;
 }
 
-//Unmaps the region of mememory. 
-//This function is called from within Stanza, and size is 
+//Unmaps the region of memory.
+//This function is called from within Stanza, and size is
 //assumed to be a multiple of the system page size.
 void stz_memory_unmap (void* p, stz_long size) {
   if (p && munmap(p, (size_t)size)) exit_with_error();
@@ -660,8 +529,8 @@ void* stz_memory_map (stz_long min_size, stz_long max_size) {
   return p;
 }
 
-//Unmaps the region of mememory. 
-//This function is called from within Stanza, and size is 
+//Unmaps given segment of memory.
+//This function is called from within Stanza, and size is
 //assumed to be a multiple of the system page size.
 void stz_memory_unmap (void* p, stz_long size) {
   // End doing nothing if p is null.
@@ -816,7 +685,7 @@ static stz_byte* read_string (FILE* f){
   stz_int n = read_int(f);
   if(n < 0)
     return NULL;
-  else{    
+  else{
     stz_byte* s = (stz_byte*)stz_malloc(n + 1);
     bread(s, 1, (int)n, f);
     s[n] = '\0';
@@ -866,7 +735,7 @@ static void free_earg (EvalArg* arg){
 static void get_process_state (stz_long pid, ProcessState* s, int wait_for_termination){
   int status;
   int ret = waitpid((pid_t)pid, &status, wait_for_termination? 0 : WNOHANG);
-  
+
   if(ret == 0)
     *s = (ProcessState){PROCESS_RUNNING, 0};
   else if(WIFEXITED(status))
@@ -922,12 +791,12 @@ static void launcher_main (FILE* lin, FILE* lout){
         close(exec_error[WRITE]);
         int exec_r = read(exec_error[READ], &exec_code, sizeof(int));
         close(exec_error[READ]);
-        
+
         if(exec_r == 0){
           //Exec evaluated successfully
           //Return new process id
           write_long(lout, pid);
-          fflush(lout);          
+          fflush(lout);
         }
         else if(exec_r == sizeof(int)){
           //Exec evaluated unsuccessfully
@@ -943,7 +812,7 @@ static void launcher_main (FILE* lin, FILE* lout){
         //Close exec pipe read, and close write end on successful exec
         close(exec_error[READ]);
         fcntl(exec_error[WRITE], F_SETFD, FD_CLOEXEC);
-        
+
         //Open named pipes
         if(earg->in_pipe != NULL){
           int fd = open_pipe(C_CSTR(earg->pipe), C_CSTR(earg->in_pipe), O_RDONLY);
@@ -968,8 +837,8 @@ static void launcher_main (FILE* lin, FILE* lout){
             write_error_and_exit(exec_error[WRITE]);
           }
         }
-        
-        //Launch child process      
+
+        //Launch child process
         execvp(C_CSTR(earg->file), (char**)earg->argvs);
 
         //Unsuccessful exec, write error number
@@ -998,7 +867,7 @@ static stz_long launcher_pid = -1;
 static FILE* launcher_in = NULL;
 static FILE* launcher_out = NULL;
 void initialize_launcher_process (){
-  if(launcher_pid < 0){    
+  if(launcher_pid < 0){
     //Create pipes
     int READ = 0;
     int WRITE = 1;
@@ -1067,7 +936,7 @@ stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
                        stz_byte* working_dir, Process* process) {
   //Initialize launcher if necessary
   initialize_launcher_process();
-  
+
   //Figure out unique pipe name
   char pipe_name[80];
   make_pipe_name(pipe_name, (int)pipeid);
@@ -1079,7 +948,7 @@ stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
   pipe_sources[input] = 0;
   pipe_sources[output] = 1;
   pipe_sources[error] = 2;
-  
+
   //Create pipes to child
   if(pipe_sources[PROCESS_IN] >= 0)
     RETURN_NEG(make_pipe(pipe_name, "_in"))
@@ -1087,7 +956,7 @@ stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
     RETURN_NEG(make_pipe(pipe_name, "_out"))
   if(pipe_sources[PROCESS_ERR] >= 0)
     RETURN_NEG(make_pipe(pipe_name, "_err"))
-  
+
   //Write in command and evaluation arguments
   EvalArg earg = {STZ_STR(pipe_name), NULL, NULL, NULL, file, working_dir, argvs};
   if(input == PROCESS_IN) earg.in_pipe = STZ_STR("_in");
@@ -1122,14 +991,14 @@ stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
     ferr = fdopen(fd, "r");
     if(ferr == NULL) return -1;
   }
-  
+
   //Read back process id, and set errno if failed
   stz_long pid = read_long(launcher_out);
   if(pid < 0){
     errno = (int)(- pid);
     return -1;
-  } 
-  
+  }
+
   //Return process structure
   process->pid = pid;
   process->in = fin;
@@ -1144,7 +1013,7 @@ void retrieve_process_state (stz_long pid, ProcessState* s, stz_int wait_for_ter
     fprintf(stderr, "Launcher not initialized.\n");
     exit(-1);
   }
-    
+
   //Send command
   int r = fputc(wait_for_termination? WAIT_COMMAND : STATE_COMMAND, launcher_in);
   if(r == EOF) exit_with_error();
@@ -1173,49 +1042,93 @@ stz_int input_argv_needs_free;
 
 //     Main Driver
 //     ===========
-static void* alloc (VMInit* init, long type, long size){
+static void* alloc (VMInit* init, long tag, long size){
   void* ptr = init->heap_top + 8;
-  *(long*)(init->heap_top) = type;
+  *(long*)(init->heap_top) = tag;
   init->heap_top += 8 + size;
-  return ptr;  
+  return ptr;
 }
 
-static uint64_t alloc_stack (VMInit* init){
+static Stack* alloc_stack (VMInit* init){
   Stack* stack = alloc(init, STACK_TYPE, sizeof(Stack));
-  int initial_stack_size = 4 * 1024;
-  long size = initial_stack_size + sizeof(StackFrameHeader);
-  StackFrameHeader* frameheader = (StackFrameHeader*)stz_malloc(size);
-  frameheader->pool_index = -1;
-  frameheader->mark = 0;
+  stz_long initial_stack_size = 8 * 1024;
+  StackFrame* frames = (StackFrame*)stz_malloc(initial_stack_size);
   stack->size = initial_stack_size;
-  stack->frames = frameheader->frames;
+  stack->frames = frames;
   stack->stack_pointer = NULL;
-  return (uint64_t)stack - 8 + 1;  
+  stack->tail = NULL;
+  return stack;
+}
+
+//Given a pointer to a struct allocated on the heap,
+//add the tag bits to the pointer.
+uint64_t tag_as_ref (void* p){
+  return (uint64_t)p - 8 + 1;
+}
+
+enum {
+  LOG_BITS_IN_BYTE = 3,
+  LOG_BYTES_IN_LONG = 3,
+  LOG_BITS_IN_LONG = LOG_BYTES_IN_LONG + LOG_BITS_IN_BYTE,
+  BYTES_IN_LONG = 1 << LOG_BYTES_IN_LONG,
+  BITS_IN_LONG = 1 << LOG_BITS_IN_LONG
+};
+
+#define SYSTEM_PAGE_SIZE 4096UL
+#define ROUND_UP_TO_WHOLE_PAGES(x) (((x) + (SYSTEM_PAGE_SIZE - 1)) & ~(SYSTEM_PAGE_SIZE - 1))
+
+static stz_long bitset_size (stz_long heap_size) {
+  long heap_size_in_longs = (heap_size + (BYTES_IN_LONG - 1)) >> LOG_BYTES_IN_LONG;
+  long bitset_size_in_longs = (heap_size_in_longs + (BITS_IN_LONG - 1)) >> LOG_BITS_IN_LONG;
+  return ROUND_UP_TO_WHOLE_PAGES(bitset_size_in_longs << LOG_BYTES_IN_LONG);
 }
 
 STANZA_API_FUNC int main (int argc, char* argv[]) {
-  #if defined(FMALLOC)
-    init_fmalloc();
-  #endif
-
   input_argc = (stz_int)argc;
   input_argv = (stz_byte **)argv;
   input_argv_needs_free = 0;
   VMInit init;
 
-  //Allocate heap and freespace
-  const stz_long initial_heap_size = 1024 * 1024;
-  const stz_long maximum_heap_size = STZ_LONG(4) * 1024 * 1024 * 1024;
+  //Allocate heap
+  const stz_long min_heap_size = ROUND_UP_TO_WHOLE_PAGES(8 * 1024 * 1024);
+  const stz_long max_heap_size = ROUND_UP_TO_WHOLE_PAGES(STZ_LONG(8) * 1024 * 1024 * 1024);
+  init.heap_start = (stz_byte*)stz_memory_map(min_heap_size, max_heap_size);
+  init.heap_max_size = max_heap_size;
+  init.heap_size = min_heap_size;
+  stz_long young_gen_size = 2 * 1024 * 1024;
+  init.heap_limit = init.heap_start + young_gen_size;
+  init.heap_top = init.heap_start;
+  init.heap_old_objects_end = init.heap_start;
 
-  init.heap = (stz_byte*)stz_memory_map(initial_heap_size, maximum_heap_size);
-  init.heap_limit = init.heap + initial_heap_size;
-  init.heap_top = init.heap;
-  init.free = (stz_byte*)stz_memory_map(initial_heap_size, maximum_heap_size);
-  init.free_limit = init.free + initial_heap_size;
+  //Allocate bitset for heap
+  const stz_long min_bitset_size = bitset_size(min_heap_size);
+  const stz_long max_bitset_size = bitset_size(max_heap_size);
+  init.heap_bitset = (stz_byte*)stz_memory_map(min_bitset_size, max_bitset_size);
+  init.heap_bitset_base = init.heap_bitset - ((uint64_t)init.heap_start >> 6);
+  memset(init.heap_bitset, 0, min_bitset_size);
+
+  //For bitset_base computation to work: bitset must be aligned to 512-bytes boundary.
+  if((uint64_t)init.heap_bitset % 512 != 0){
+    fprintf(stderr, "Unaligned bitset: %p.\n", init.heap_bitset);
+    exit(-1);
+  }
+
+  //Allocate marking stack for heap
+  const stz_long marking_stack_size = ROUND_UP_TO_WHOLE_PAGES((1024 * 1024L) << LOG_BYTES_IN_LONG);
+  init.marking_stack_start = stz_memory_map(marking_stack_size, marking_stack_size);
+  init.marking_stack_bottom = init.marking_stack_start + marking_stack_size;
+  init.marking_stack_top = init.marking_stack_bottom;
 
   //Allocate stacks
-  init.current_stack = alloc_stack(&init);
-  init.system_stack = alloc_stack(&init);
+  Stack* entry_stack = alloc_stack(&init);
+  Stack* entry_system_stack = alloc_stack(&init);
+  entry_stack->tail = entry_system_stack;
+  init.current_stack = tag_as_ref(entry_stack);
+  init.system_stack = tag_as_ref(entry_system_stack);
+  init.stacks = entry_stack;
+
+  //Initialize trackers to empty list.
+  init.trackers = NULL;
 
   //Call Stanza entry
   stanza_entry(&init);
