@@ -1074,12 +1074,12 @@ enum {
   BITS_IN_LONG = 1 << LOG_BITS_IN_LONG
 };
 
-#define SYSTEM_PAGE_SIZE 4096UL
+#define SYSTEM_PAGE_SIZE 4096ULL
 #define ROUND_UP_TO_WHOLE_PAGES(x) (((x) + (SYSTEM_PAGE_SIZE - 1)) & ~(SYSTEM_PAGE_SIZE - 1))
 
 static stz_long bitset_size (stz_long heap_size) {
-  long heap_size_in_longs = (heap_size + (BYTES_IN_LONG - 1)) >> LOG_BYTES_IN_LONG;
-  long bitset_size_in_longs = (heap_size_in_longs + (BITS_IN_LONG - 1)) >> LOG_BITS_IN_LONG;
+  uint64_t heap_size_in_longs = (heap_size + (BYTES_IN_LONG - 1)) >> LOG_BYTES_IN_LONG;
+  uint64_t bitset_size_in_longs = (heap_size_in_longs + (BITS_IN_LONG - 1)) >> LOG_BITS_IN_LONG;
   return ROUND_UP_TO_WHOLE_PAGES(bitset_size_in_longs << LOG_BYTES_IN_LONG);
 }
 
