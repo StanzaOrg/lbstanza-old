@@ -251,6 +251,252 @@
 #define STORE_WITH_BARRIER_OPCODE 250
 #define STORE_WITH_BARRIER_OPCODE_VAR_OFFSET 251
 
+char* opcode_names[256];
+void init_opcode_names () {
+  opcode_names[SET_OPCODE_LOCAL] = "SET_OPCODE_LOCAL";
+  opcode_names[SET_OPCODE_UNSIGNED] = "SET_OPCODE_UNSIGNED";
+  opcode_names[SET_OPCODE_SIGNED] = "SET_OPCODE_SIGNED";
+  opcode_names[SET_OPCODE_CODE] = "SET_OPCODE_CODE";
+  opcode_names[SET_OPCODE_GLOBAL] = "SET_OPCODE_GLOBAL";
+  opcode_names[SET_OPCODE_DATA] = "SET_OPCODE_DATA";
+  opcode_names[SET_OPCODE_CONST] = "SET_OPCODE_CONST";
+  opcode_names[SET_OPCODE_WIDE] = "SET_OPCODE_WIDE";
+  opcode_names[SET_REG_OPCODE_LOCAL] = "SET_REG_OPCODE_LOCAL";
+  opcode_names[SET_REG_OPCODE_UNSIGNED] = "SET_REG_OPCODE_UNSIGNED";
+  opcode_names[SET_REG_OPCODE_SIGNED] = "SET_REG_OPCODE_SIGNED";
+  opcode_names[SET_REG_OPCODE_CODE] = "SET_REG_OPCODE_CODE";
+  opcode_names[SET_REG_OPCODE_GLOBAL] = "SET_REG_OPCODE_GLOBAL";
+  opcode_names[SET_REG_OPCODE_DATA] = "SET_REG_OPCODE_DATA";
+  opcode_names[SET_REG_OPCODE_CONST] = "SET_REG_OPCODE_CONST";
+  opcode_names[SET_REG_OPCODE_WIDE] = "SET_REG_OPCODE_WIDE";
+  opcode_names[GET_REG_OPCODE] = "GET_REG_OPCODE";
+  opcode_names[CALL_OPCODE_LOCAL] = "CALL_OPCODE_LOCAL";
+  opcode_names[CALL_OPCODE_CODE] = "CALL_OPCODE_CODE";
+  opcode_names[CALL_CLOSURE_OPCODE] = "CALL_CLOSURE_OPCODE";
+  opcode_names[TCALL_OPCODE_LOCAL] = "TCALL_OPCODE_LOCAL";
+  opcode_names[TCALL_OPCODE_CODE] = "TCALL_OPCODE_CODE";
+  opcode_names[TCALL_CLOSURE_OPCODE] = "TCALL_CLOSURE_OPCODE";
+  opcode_names[CALLC_OPCODE_LOCAL] = "CALLC_OPCODE_LOCAL";
+  opcode_names[CALLC_OPCODE_WIDE] = "CALLC_OPCODE_WIDE";
+  opcode_names[POP_FRAME_OPCODE] = "POP_FRAME_OPCODE";
+  opcode_names[LIVE_OPCODE] = "LIVE_OPCODE";
+  opcode_names[YIELD_OPCODE] = "YIELD_OPCODE";
+  opcode_names[RETURN_OPCODE] = "RETURN_OPCODE";
+  opcode_names[DUMP_OPCODE] = "DUMP_OPCODE";
+  opcode_names[INT_ADD_OPCODE] = "INT_ADD_OPCODE";
+  opcode_names[INT_SUB_OPCODE] = "INT_SUB_OPCODE";
+  opcode_names[INT_MUL_OPCODE] = "INT_MUL_OPCODE";
+  opcode_names[INT_DIV_OPCODE] = "INT_DIV_OPCODE";
+  opcode_names[INT_MOD_OPCODE] = "INT_MOD_OPCODE";
+  opcode_names[INT_AND_OPCODE] = "INT_AND_OPCODE";
+  opcode_names[INT_OR_OPCODE] = "INT_OR_OPCODE";
+  opcode_names[INT_XOR_OPCODE] = "INT_XOR_OPCODE";
+  opcode_names[INT_SHL_OPCODE] = "INT_SHL_OPCODE";
+  opcode_names[INT_SHR_OPCODE] = "INT_SHR_OPCODE";
+  opcode_names[INT_ASHR_OPCODE] = "INT_ASHR_OPCODE";
+  opcode_names[INT_LT_OPCODE] = "INT_LT_OPCODE";
+  opcode_names[INT_GT_OPCODE] = "INT_GT_OPCODE";
+  opcode_names[INT_LE_OPCODE] = "INT_LE_OPCODE";
+  opcode_names[INT_GE_OPCODE] = "INT_GE_OPCODE";
+  opcode_names[REF_EQ_OPCODE] = "REF_EQ_OPCODE";
+  opcode_names[EQ_OPCODE_REF] = "EQ_OPCODE_REF";
+  opcode_names[EQ_OPCODE_BYTE] = "EQ_OPCODE_BYTE";
+  opcode_names[EQ_OPCODE_INT] = "EQ_OPCODE_INT";
+  opcode_names[EQ_OPCODE_LONG] = "EQ_OPCODE_LONG";
+  opcode_names[EQ_OPCODE_FLOAT] = "EQ_OPCODE_FLOAT";
+  opcode_names[EQ_OPCODE_DOUBLE] = "EQ_OPCODE_DOUBLE";
+  opcode_names[REF_NE_OPCODE] = "REF_NE_OPCODE";
+  opcode_names[NE_OPCODE_REF] = "NE_OPCODE_REF";
+  opcode_names[NE_OPCODE_BYTE] = "NE_OPCODE_BYTE";
+  opcode_names[NE_OPCODE_INT] = "NE_OPCODE_INT";
+  opcode_names[NE_OPCODE_LONG] = "NE_OPCODE_LONG";
+  opcode_names[NE_OPCODE_FLOAT] = "NE_OPCODE_FLOAT";
+  opcode_names[NE_OPCODE_DOUBLE] = "NE_OPCODE_DOUBLE";
+  opcode_names[ADD_OPCODE_BYTE] = "ADD_OPCODE_BYTE";
+  opcode_names[ADD_OPCODE_INT] = "ADD_OPCODE_INT";
+  opcode_names[ADD_OPCODE_LONG] = "ADD_OPCODE_LONG";
+  opcode_names[ADD_OPCODE_FLOAT] = "ADD_OPCODE_FLOAT";
+  opcode_names[ADD_OPCODE_DOUBLE] = "ADD_OPCODE_DOUBLE";
+  opcode_names[SUB_OPCODE_BYTE] = "SUB_OPCODE_BYTE";
+  opcode_names[SUB_OPCODE_INT] = "SUB_OPCODE_INT";
+  opcode_names[SUB_OPCODE_LONG] = "SUB_OPCODE_LONG";
+  opcode_names[SUB_OPCODE_FLOAT] = "SUB_OPCODE_FLOAT";
+  opcode_names[SUB_OPCODE_DOUBLE] = "SUB_OPCODE_DOUBLE";
+  opcode_names[MUL_OPCODE_BYTE] = "MUL_OPCODE_BYTE";
+  opcode_names[MUL_OPCODE_INT] = "MUL_OPCODE_INT";
+  opcode_names[MUL_OPCODE_LONG] = "MUL_OPCODE_LONG";
+  opcode_names[MUL_OPCODE_FLOAT] = "MUL_OPCODE_FLOAT";
+  opcode_names[MUL_OPCODE_DOUBLE] = "MUL_OPCODE_DOUBLE";
+  opcode_names[DIV_OPCODE_BYTE] = "DIV_OPCODE_BYTE";
+  opcode_names[DIV_OPCODE_INT] = "DIV_OPCODE_INT";
+  opcode_names[DIV_OPCODE_LONG] = "DIV_OPCODE_LONG";
+  opcode_names[DIV_OPCODE_FLOAT] = "DIV_OPCODE_FLOAT";
+  opcode_names[DIV_OPCODE_DOUBLE] = "DIV_OPCODE_DOUBLE";
+  opcode_names[MOD_OPCODE_BYTE] = "MOD_OPCODE_BYTE";
+  opcode_names[MOD_OPCODE_INT] = "MOD_OPCODE_INT";
+  opcode_names[MOD_OPCODE_LONG] = "MOD_OPCODE_LONG";
+  opcode_names[AND_OPCODE_BYTE] = "AND_OPCODE_BYTE";
+  opcode_names[AND_OPCODE_INT] = "AND_OPCODE_INT";
+  opcode_names[AND_OPCODE_LONG] = "AND_OPCODE_LONG";
+  opcode_names[OR_OPCODE_BYTE] = "OR_OPCODE_BYTE";
+  opcode_names[OR_OPCODE_INT] = "OR_OPCODE_INT";
+  opcode_names[OR_OPCODE_LONG] = "OR_OPCODE_LONG";
+  opcode_names[XOR_OPCODE_BYTE] = "XOR_OPCODE_BYTE";
+  opcode_names[XOR_OPCODE_INT] = "XOR_OPCODE_INT";
+  opcode_names[XOR_OPCODE_LONG] = "XOR_OPCODE_LONG";
+  opcode_names[SHL_OPCODE_BYTE] = "SHL_OPCODE_BYTE";
+  opcode_names[SHL_OPCODE_INT] = "SHL_OPCODE_INT";
+  opcode_names[SHL_OPCODE_LONG] = "SHL_OPCODE_LONG";
+  opcode_names[SHR_OPCODE_BYTE] = "SHR_OPCODE_BYTE";
+  opcode_names[SHR_OPCODE_INT] = "SHR_OPCODE_INT";
+  opcode_names[SHR_OPCODE_LONG] = "SHR_OPCODE_LONG";
+  opcode_names[ASHR_OPCODE_INT] = "ASHR_OPCODE_INT";
+  opcode_names[ASHR_OPCODE_LONG] = "ASHR_OPCODE_LONG";
+  opcode_names[LT_OPCODE_INT] = "LT_OPCODE_INT";
+  opcode_names[LT_OPCODE_LONG] = "LT_OPCODE_LONG";
+  opcode_names[LT_OPCODE_FLOAT] = "LT_OPCODE_FLOAT";
+  opcode_names[LT_OPCODE_DOUBLE] = "LT_OPCODE_DOUBLE";
+  opcode_names[GT_OPCODE_INT] = "GT_OPCODE_INT";
+  opcode_names[GT_OPCODE_LONG] = "GT_OPCODE_LONG";
+  opcode_names[GT_OPCODE_FLOAT] = "GT_OPCODE_FLOAT";
+  opcode_names[GT_OPCODE_DOUBLE] = "GT_OPCODE_DOUBLE";
+  opcode_names[LE_OPCODE_INT] = "LE_OPCODE_INT";
+  opcode_names[LE_OPCODE_LONG] = "LE_OPCODE_LONG";
+  opcode_names[LE_OPCODE_FLOAT] = "LE_OPCODE_FLOAT";
+  opcode_names[LE_OPCODE_DOUBLE] = "LE_OPCODE_DOUBLE";
+  opcode_names[GE_OPCODE_INT] = "GE_OPCODE_INT";
+  opcode_names[GE_OPCODE_LONG] = "GE_OPCODE_LONG";
+  opcode_names[GE_OPCODE_FLOAT] = "GE_OPCODE_FLOAT";
+  opcode_names[GE_OPCODE_DOUBLE] = "GE_OPCODE_DOUBLE";
+  opcode_names[ULE_OPCODE_BYTE] = "ULE_OPCODE_BYTE";
+  opcode_names[ULE_OPCODE_INT] = "ULE_OPCODE_INT";
+  opcode_names[ULE_OPCODE_LONG] = "ULE_OPCODE_LONG";
+  opcode_names[ULT_OPCODE_BYTE] = "ULT_OPCODE_BYTE";
+  opcode_names[ULT_OPCODE_INT] = "ULT_OPCODE_INT";
+  opcode_names[ULT_OPCODE_LONG] = "ULT_OPCODE_LONG";
+  opcode_names[UGT_OPCODE_BYTE] = "UGT_OPCODE_BYTE";
+  opcode_names[UGT_OPCODE_INT] = "UGT_OPCODE_INT";
+  opcode_names[UGT_OPCODE_LONG] = "UGT_OPCODE_LONG";
+  opcode_names[UGE_OPCODE_BYTE] = "UGE_OPCODE_BYTE";
+  opcode_names[UGE_OPCODE_INT] = "UGE_OPCODE_INT";
+  opcode_names[UGE_OPCODE_LONG] = "UGE_OPCODE_LONG";
+  opcode_names[INT_NOT_OPCODE] = "INT_NOT_OPCODE";
+  opcode_names[INT_NEG_OPCODE] = "INT_NEG_OPCODE";
+  opcode_names[NOT_OPCODE_BYTE] = "NOT_OPCODE_BYTE";
+  opcode_names[NOT_OPCODE_INT] = "NOT_OPCODE_INT";
+  opcode_names[NOT_OPCODE_LONG] = "NOT_OPCODE_LONG";
+  opcode_names[NEG_OPCODE_INT] = "NEG_OPCODE_INT";
+  opcode_names[NEG_OPCODE_LONG] = "NEG_OPCODE_LONG";
+  opcode_names[NEG_OPCODE_FLOAT] = "NEG_OPCODE_FLOAT";
+  opcode_names[NEG_OPCODE_DOUBLE] = "NEG_OPCODE_DOUBLE";
+  opcode_names[DEREF_OPCODE] = "DEREF_OPCODE";
+  opcode_names[TYPEOF_OPCODE] = "TYPEOF_OPCODE";
+  opcode_names[JUMP_SET_OPCODE] = "JUMP_SET_OPCODE";
+  opcode_names[JUMP_TAGBITS_OPCODE] = "JUMP_TAGBITS_OPCODE";
+  opcode_names[JUMP_TAGWORD_OPCODE] = "JUMP_TAGWORD_OPCODE";
+  opcode_names[GOTO_OPCODE] = "GOTO_OPCODE";
+  opcode_names[CONV_OPCODE_BYTE_FLOAT] = "CONV_OPCODE_BYTE_FLOAT";
+  opcode_names[CONV_OPCODE_BYTE_DOUBLE] = "CONV_OPCODE_BYTE_DOUBLE";
+  opcode_names[CONV_OPCODE_INT_BYTE] = "CONV_OPCODE_INT_BYTE";
+  opcode_names[CONV_OPCODE_INT_FLOAT] = "CONV_OPCODE_INT_FLOAT";
+  opcode_names[CONV_OPCODE_INT_DOUBLE] = "CONV_OPCODE_INT_DOUBLE";
+  opcode_names[CONV_OPCODE_LONG_BYTE] = "CONV_OPCODE_LONG_BYTE";
+  opcode_names[CONV_OPCODE_LONG_INT] = "CONV_OPCODE_LONG_INT";
+  opcode_names[CONV_OPCODE_LONG_FLOAT] = "CONV_OPCODE_LONG_FLOAT";
+  opcode_names[CONV_OPCODE_LONG_DOUBLE] = "CONV_OPCODE_LONG_DOUBLE";
+  opcode_names[CONV_OPCODE_FLOAT_BYTE] = "CONV_OPCODE_FLOAT_BYTE";
+  opcode_names[CONV_OPCODE_FLOAT_INT] = "CONV_OPCODE_FLOAT_INT";
+  opcode_names[CONV_OPCODE_FLOAT_LONG] = "CONV_OPCODE_FLOAT_LONG";
+  opcode_names[CONV_OPCODE_FLOAT_DOUBLE] = "CONV_OPCODE_FLOAT_DOUBLE";
+  opcode_names[CONV_OPCODE_DOUBLE_BYTE] = "CONV_OPCODE_DOUBLE_BYTE";
+  opcode_names[CONV_OPCODE_DOUBLE_INT] = "CONV_OPCODE_DOUBLE_INT";
+  opcode_names[CONV_OPCODE_DOUBLE_LONG] = "CONV_OPCODE_DOUBLE_LONG";
+  opcode_names[CONV_OPCODE_DOUBLE_FLOAT] = "CONV_OPCODE_DOUBLE_FLOAT";
+  opcode_names[DETAG_OPCODE] = "DETAG_OPCODE";
+  opcode_names[TAG_OPCODE_BYTE] = "TAG_OPCODE_BYTE";
+  opcode_names[TAG_OPCODE_CHAR] = "TAG_OPCODE_CHAR";
+  opcode_names[TAG_OPCODE_INT] = "TAG_OPCODE_INT";
+  opcode_names[TAG_OPCODE_FLOAT] = "TAG_OPCODE_FLOAT";
+  opcode_names[STORE_OPCODE_1] = "STORE_OPCODE_1";
+  opcode_names[STORE_OPCODE_4] = "STORE_OPCODE_4";
+  opcode_names[STORE_OPCODE_8] = "STORE_OPCODE_8";
+  opcode_names[STORE_OPCODE_1_VAR_OFFSET] = "STORE_OPCODE_1_VAR_OFFSET";
+  opcode_names[STORE_OPCODE_4_VAR_OFFSET] = "STORE_OPCODE_4_VAR_OFFSET";
+  opcode_names[STORE_OPCODE_8_VAR_OFFSET] = "STORE_OPCODE_8_VAR_OFFSET";
+  opcode_names[LOAD_OPCODE_1] = "LOAD_OPCODE_1";
+  opcode_names[LOAD_OPCODE_4] = "LOAD_OPCODE_4";
+  opcode_names[LOAD_OPCODE_8] = "LOAD_OPCODE_8";
+  opcode_names[LOAD_OPCODE_1_VAR_OFFSET] = "LOAD_OPCODE_1_VAR_OFFSET";
+  opcode_names[LOAD_OPCODE_4_VAR_OFFSET] = "LOAD_OPCODE_4_VAR_OFFSET";
+  opcode_names[LOAD_OPCODE_8_VAR_OFFSET] = "LOAD_OPCODE_8_VAR_OFFSET";
+  opcode_names[RESERVE_OPCODE_LOCAL] = "RESERVE_OPCODE_LOCAL";
+  opcode_names[RESERVE_OPCODE_CONST] = "RESERVE_OPCODE_CONST";
+  opcode_names[ENTER_STACK_OPCODE] = "ENTER_STACK_OPCODE";
+  opcode_names[ALLOC_OPCODE_CONST] = "ALLOC_OPCODE_CONST";
+  opcode_names[ALLOC_OPCODE_LOCAL] = "ALLOC_OPCODE_LOCAL";
+  opcode_names[GC_OPCODE] = "GC_OPCODE";
+  opcode_names[PRINT_STACK_TRACE_OPCODE] = "PRINT_STACK_TRACE_OPCODE";
+  opcode_names[COLLECT_STACK_TRACE_OPCODE] = "COLLECT_STACK_TRACE_OPCODE";
+  opcode_names[FLUSH_VM_OPCODE] = "FLUSH_VM_OPCODE";
+  opcode_names[C_RSP_OPCODE] = "C_RSP_OPCODE";
+  opcode_names[JUMP_INT_LT_OPCODE] = "JUMP_INT_LT_OPCODE";
+  opcode_names[JUMP_INT_GT_OPCODE] = "JUMP_INT_GT_OPCODE";
+  opcode_names[JUMP_INT_LE_OPCODE] = "JUMP_INT_LE_OPCODE";
+  opcode_names[JUMP_INT_GE_OPCODE] = "JUMP_INT_GE_OPCODE";
+  opcode_names[JUMP_EQ_OPCODE_REF] = "JUMP_EQ_OPCODE_REF";
+  opcode_names[JUMP_EQ_OPCODE_BYTE] = "JUMP_EQ_OPCODE_BYTE";
+  opcode_names[JUMP_EQ_OPCODE_INT] = "JUMP_EQ_OPCODE_INT";
+  opcode_names[JUMP_EQ_OPCODE_LONG] = "JUMP_EQ_OPCODE_LONG";
+  opcode_names[JUMP_EQ_OPCODE_FLOAT] = "JUMP_EQ_OPCODE_FLOAT";
+  opcode_names[JUMP_EQ_OPCODE_DOUBLE] = "JUMP_EQ_OPCODE_DOUBLE";
+  opcode_names[JUMP_NE_OPCODE_REF] = "JUMP_NE_OPCODE_REF";
+  opcode_names[JUMP_NE_OPCODE_BYTE] = "JUMP_NE_OPCODE_BYTE";
+  opcode_names[JUMP_NE_OPCODE_INT] = "JUMP_NE_OPCODE_INT";
+  opcode_names[JUMP_NE_OPCODE_LONG] = "JUMP_NE_OPCODE_LONG";
+  opcode_names[JUMP_NE_OPCODE_FLOAT] = "JUMP_NE_OPCODE_FLOAT";
+  opcode_names[JUMP_NE_OPCODE_DOUBLE] = "JUMP_NE_OPCODE_DOUBLE";
+  opcode_names[JUMP_LT_OPCODE_INT] = "JUMP_LT_OPCODE_INT";
+  opcode_names[JUMP_LT_OPCODE_LONG] = "JUMP_LT_OPCODE_LONG";
+  opcode_names[JUMP_LT_OPCODE_FLOAT] = "JUMP_LT_OPCODE_FLOAT";
+  opcode_names[JUMP_LT_OPCODE_DOUBLE] = "JUMP_LT_OPCODE_DOUBLE";
+  opcode_names[JUMP_GT_OPCODE_INT] = "JUMP_GT_OPCODE_INT";
+  opcode_names[JUMP_GT_OPCODE_LONG] = "JUMP_GT_OPCODE_LONG";
+  opcode_names[JUMP_GT_OPCODE_FLOAT] = "JUMP_GT_OPCODE_FLOAT";
+  opcode_names[JUMP_GT_OPCODE_DOUBLE] = "JUMP_GT_OPCODE_DOUBLE";
+  opcode_names[JUMP_LE_OPCODE_INT] = "JUMP_LE_OPCODE_INT";
+  opcode_names[JUMP_LE_OPCODE_LONG] = "JUMP_LE_OPCODE_LONG";
+  opcode_names[JUMP_LE_OPCODE_FLOAT] = "JUMP_LE_OPCODE_FLOAT";
+  opcode_names[JUMP_LE_OPCODE_DOUBLE] = "JUMP_LE_OPCODE_DOUBLE";
+  opcode_names[JUMP_GE_OPCODE_INT] = "JUMP_GE_OPCODE_INT";
+  opcode_names[JUMP_GE_OPCODE_LONG] = "JUMP_GE_OPCODE_LONG";
+  opcode_names[JUMP_GE_OPCODE_FLOAT] = "JUMP_GE_OPCODE_FLOAT";
+  opcode_names[JUMP_GE_OPCODE_DOUBLE] = "JUMP_GE_OPCODE_DOUBLE";
+  opcode_names[JUMP_ULE_OPCODE_BYTE] = "JUMP_ULE_OPCODE_BYTE";
+  opcode_names[JUMP_ULE_OPCODE_INT] = "JUMP_ULE_OPCODE_INT";
+  opcode_names[JUMP_ULE_OPCODE_LONG] = "JUMP_ULE_OPCODE_LONG";
+  opcode_names[JUMP_ULT_OPCODE_BYTE] = "JUMP_ULT_OPCODE_BYTE";
+  opcode_names[JUMP_ULT_OPCODE_INT] = "JUMP_ULT_OPCODE_INT";
+  opcode_names[JUMP_ULT_OPCODE_LONG] = "JUMP_ULT_OPCODE_LONG";
+  opcode_names[JUMP_UGT_OPCODE_BYTE] = "JUMP_UGT_OPCODE_BYTE";
+  opcode_names[JUMP_UGT_OPCODE_INT] = "JUMP_UGT_OPCODE_INT";
+  opcode_names[JUMP_UGT_OPCODE_LONG] = "JUMP_UGT_OPCODE_LONG";
+  opcode_names[JUMP_UGE_OPCODE_BYTE] = "JUMP_UGE_OPCODE_BYTE";
+  opcode_names[JUMP_UGE_OPCODE_INT] = "JUMP_UGE_OPCODE_INT";
+  opcode_names[JUMP_UGE_OPCODE_LONG] = "JUMP_UGE_OPCODE_LONG";
+  opcode_names[DISPATCH_OPCODE] = "DISPATCH_OPCODE";
+  opcode_names[DISPATCH_METHOD_OPCODE] = "DISPATCH_METHOD_OPCODE";
+  opcode_names[JUMP_REG_OPCODE] = "JUMP_REG_OPCODE";
+  opcode_names[FNENTRY_OPCODE] = "FNENTRY_OPCODE";
+  opcode_names[LOWEST_ZERO_BIT_COUNT_OPCODE_LONG] = "LOWEST_ZERO_BIT_COUNT_OPCODE_LONG";
+  opcode_names[TEST_BIT_OPCODE] = "TEST_BIT_OPCODE";
+  opcode_names[SET_BIT_OPCODE] = "SET_BIT_OPCODE";
+  opcode_names[CLEAR_BIT_OPCODE] = "CLEAR_BIT_OPCODE";
+  opcode_names[TEST_AND_SET_BIT_OPCODE] = "TEST_AND_SET_BIT_OPCODE";
+  opcode_names[TEST_AND_CLEAR_BIT_OPCODE] = "TEST_AND_CLEAR_BIT_OPCODE";
+  opcode_names[STORE_WITH_BARRIER_OPCODE] = "STORE_WITH_BARRIER_OPCODE";
+  opcode_names[STORE_WITH_BARRIER_OPCODE_VAR_OFFSET] = "STORE_WITH_BARRIER_OPCODE_VAR_OFFSET";
+}
+
 //============================================================
 //===================== READ MACROS ==========================
 //============================================================
@@ -432,7 +678,7 @@ typedef struct{
   char* const_mem;             //(Permanent State)
   uint32_t* data_offsets;      //(Permanent State)
   char* data_mem;              //(Permanent State)
-  uint32_t* code_offsets;      //(Permanent State)
+  uint64_t* code_offsets;      //(Permanent State)
   uint64_t* registers;         //(Permanent State)
   uint64_t* system_registers;  //(Permanent State)
   Heap heap;
@@ -578,7 +824,7 @@ uint64_t ptr_to_ref (void* p){
 //  }
 //}
 
-void vmloop (VMState* vms, uint64_t stanza_crsp){
+void vmloop (VMState* vms, uint64_t stanza_crsp, int64_t starting_fid){
   //Pull out local cache
   char* instructions = vms->instructions;
   uint64_t* registers = vms->registers;
@@ -588,7 +834,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
   char* const_mem = vms->const_mem;
   uint32_t* data_offsets = vms->data_offsets;
   char* data_mem = vms->data_mem;
-  uint32_t* code_offsets = vms->code_offsets;
+  uint64_t* code_offsets = vms->code_offsets;
   //Variable State
   //Changes in_between each boundary change
   char* heap_top = vms->heap.top;
@@ -597,7 +843,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
   Stack* stk = untag_stack(current_stack);
   StackFrame* stack_pointer = stk->stack_pointer;
   char* stack_limit = (char*)(stk->frames) + stk->size;
-  char* pc = instructions + stk->pc;
+  char* pc = instructions + code_offsets[starting_fid];
 
   //Timing
   //uint64_t* timings = (uint64_t*)malloc(255 * sizeof(uint64_t));
@@ -719,7 +965,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       int num_locals = y;
       uint64_t fid = LOCAL(value);
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      uint64_t fpos = code_offsets[fid];
       PUSH_FRAME(num_locals);
       pc = instructions + fpos;
       continue;
@@ -728,7 +974,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       int num_locals = y;
       uint64_t fid = value;
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      uint64_t fpos = code_offsets[fid];
       PUSH_FRAME(num_locals);
       pc = instructions + fpos;
       continue;
@@ -738,7 +984,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       int num_locals = y;
       Function* clo = (Function*)(LOCAL(value) - REF_TAG_BITS + 8);
       uint64_t fid = clo->code;
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      uint64_t fpos = code_offsets[fid];
       PUSH_FRAME(num_locals);
       pc = instructions + fpos;
       continue;
@@ -747,7 +993,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       int num_locals = y;
       uint64_t fid = LOCAL(value);
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      uint64_t fpos = code_offsets[fid];
       pc = instructions + fpos;
       continue;
     }
@@ -755,7 +1001,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       int num_locals = y;
       uint64_t fid = value;
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      uint64_t fpos = code_offsets[fid];
       pc = instructions + fpos;
       continue;
     }
@@ -763,7 +1009,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_A_UNSIGNED();
       Function* clo = (Function*)(LOCAL(value) - REF_TAG_BITS + 8);
       uint64_t fid = clo->code;
-      uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+      uint64_t fpos = code_offsets[fid];
       pc = instructions + fpos;
       continue;
     }
@@ -814,7 +1060,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       stack_limit = (char*)(stk->frames) + stk->size;
       //Load starting address
       uint64_t fid = stk->pc;
-      uint64_t stk_pc = code_offsets[fid] * 4;
+      uint64_t stk_pc = code_offsets[fid];
       pc = instructions + stk_pc;
       continue;
     }
@@ -1679,7 +1925,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1ULL);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
+        uint64_t fpos = code_offsets[EXTEND_HEAP_FN];
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1697,7 +1943,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         SET_REG(0, BOOLREF(0));
         SET_REG(1, 1ULL);
         SET_REG(2, size);
-        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
+        uint64_t fpos = code_offsets[EXTEND_HEAP_FN];
         PUSH_FRAME(num_locals);
         pc = instructions + fpos;
         continue;
@@ -1959,7 +2205,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         continue;
       }else{
         int fid = index - 2;
-        uint64_t fpos = (uint64_t)(code_offsets[fid]) * 4;
+        uint64_t fpos = code_offsets[fid];
         pc = instructions + fpos;
         continue;
       }
@@ -2000,7 +2246,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         stack_pointer = stk->frames;
         stack_pointer->returnpc = SYSTEM_RETURN_STUB;
         //Jump to stack extender
-        uint64_t fpos = (uint64_t)(code_offsets[EXTEND_STACK_FN]) * 4;
+        uint64_t fpos = code_offsets[EXTEND_STACK_FN];
         pc = instructions + fpos;
       }
       continue;

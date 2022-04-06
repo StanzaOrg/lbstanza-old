@@ -9,12 +9,16 @@ defpackage stz/vm :
   import stz/vm-ids
   import stz/dl-ir
   import stz/basic-ops
-  import stz/vm-encoder
   import stz/stable-arrays
   import stz/branch-table
   import stz/backend
   import stz/utils
   import stz/extern-intrinsics
+  import stz/code-table
+  import stz/cvm-code-table
+  import stz/jit-code-table
+  import stz/vm-structures
+  import stz/params
 
 ;<doc>=======================================================
 ;================= Virtual Machine Interface ================
@@ -265,41 +269,6 @@ public lostanza deftype VirtualMachine :
   vmstate: ptr<VMState>
   var core-loaded?: ref<True|False>
 
-;The first fields in VMState are used by the core library
-;in both compiled and interpreted mode. The last fields
-;are used only in interpreted mode.
-;Permanent state changes in-between each code load.
-;Variable state changes in-between each boundary change.
-public lostanza deftype VMState :
-  ;Compiled and Interpreted Mode
-  var global-offsets: ptr<long>    ;(Permanent State)
-  var global-mem: ptr<byte>        ;(Permanent State)
-  var const-table: ptr<long>       ;(Permanent State)
-  var const-mem: ptr<byte>         ;(Permanent State)
-  var data-offsets: ptr<int>       ;(Permanent State)
-  var data-mem: ptr<byte>          ;(Permanent State)
-  var code-offsets: ptr<int>       ;(Permanent State)
-  var registers: ptr<long>         ;(Permanent State)
-  var system-registers: ptr<long>  ;(Permanent State)
-  heap: core/Heap                  ;(Variable State)
-  var class-table: ptr<?>          ;(Permanent State)
-  ;Interpreted Mode Tables
-  var instructions: ptr<byte>      ;(Permanent State)
-  var trie-table: ptr<ptr<int>>    ;(Permanent State)
-
-lostanza deftype StackFrameHeader :
-  var pool-index:int
-  var mark:int
-  var frames:StackFrame ...
-
-lostanza deftype Function :
-  var num-slots: long
-  var code: long
-  slots: long ...
-
-lostanza val SIZEOF-FRAME:ref<Int> = new Int{sizeof(StackFrame) as int}
-lostanza val SIZEOF-STACK:ref<Int> = new Int{sizeof(Stack) as int}
-
 lostanza defn linker (vm:ref<VirtualMachine>) -> ref<Linker> :
   return vm.linker
 
@@ -321,7 +290,7 @@ lostanza defn live-map-table (vm:ref<VirtualMachine>) -> ref<LiveMapTable> :
 lostanza defn update-vmstate (vm:ref<VirtualMachine>) -> ref<False> :
   val vms = vm.vmstate
   val vmt = vmtable(vm)
-  vms.instructions = vmt.bytecode.mem
+  vms.instructions = instructions(vmt.code-table).value as ptr<byte>
   vms.global-offsets = vmt.global-offsets.data
   vms.global-mem = vmt.globals.mem
   vms.const-table = vmt.consts.mem
@@ -362,11 +331,19 @@ public lostanza defn VirtualMachine (backend:ref<Backend>) -> ref<VirtualMachine
   val vm-ids = VMIds()
   val class-table = ClassTable()
   val branch-table = BranchTable(class-table)
-  val vmtable = VMTable(class-table, branch-table)
   val linker = Linker(branch-table)
+  val resolver = EncodingResolver(class-table, branch-table, live-map-table(linker))
+  val code-table = make-code-table(resolver, backend)
+  val vmtable = VMTable(class-table, branch-table, code-table)
   val vm = new VirtualMachine{backend, vmtable, vm-ids, linker, vmstate, false}
   update-vmstate(vm)
   return vm
+
+;Make an appropriate CodeTable depending on whether the user has
+;enabled the JIT. 
+defn make-code-table (resolver:EncodingResolver, backend:Backend) -> CodeTable :
+  if contains?(EXPERIMENTAL-FEATURES, `jit) : JITCodeTable(resolver, backend)
+  else : CVMCodeTable()
 
 lostanza defn vm-iterate-roots (f:ptr<((ptr<long>, ptr<core/VMState>) -> ref<False>)>,
                                 vms:ptr<core/VMState>) -> ref<False> :
@@ -407,8 +384,6 @@ lostanza defn vm-iterate-references-in-stack-frames (stack:ptr<Stack>,
 ;================= Bytecode Loop ============================
 ;============================================================
 
-extern vmloop: (ptr<VMState>, long) -> int   ;void return
-
 extern defn call_garbage_collector (vms:ptr<VMState>, size:long) -> long :
   return extend-heap(current-vm(), size)
 
@@ -440,8 +415,7 @@ public lostanza defn run-bytecode (vm:ref<VirtualMachine>, start-func:ref<Int>) 
   VIRTUAL-MACHINE = vm
   register-array = vm.vmstate.registers
   initialize-stack-pointer(vm)
-  set-starting-func(vm, start-func)
-  call-c vmloop(vm.vmstate, call-prim crsp() as long)
+  launch(new Long{vm.vmstate as long}, vm.vmtable.code-table, start-func)
   null-stack-pointer(vm)
   VIRTUAL-MACHINE = false
   return false
@@ -460,9 +434,8 @@ public lostanza defn call-extern (extern-index:int) -> int :
     val sp = stk.stack-pointer
     saved-ret = sp.return
     sp.return = -1
-  ;Set starting function and execute
-  set-starting-func(vm, fid)
-  call-c vmloop(vm.vmstate, call-prim crsp() as long)
+  ;Execute from startin function
+  launch(new Long{vm.vmstate as long}, vm.vmtable.code-table, fid)
   ;Restore the returnpc and return
   let :
     val stk:ptr<Stack> = current-stack(vm)
@@ -486,14 +459,6 @@ lostanza defn initialize-stack-pointer (vm:ref<VirtualMachine>) -> ref<False> :
 lostanza defn null-stack-pointer (vm:ref<VirtualMachine>) -> ref<False> :
   val stk:ptr<Stack> = current-stack(vm)
   stk.stack-pointer = null
-  return false
-
-;Set the starting pc of the virtual machine to fid. The virtual machine
-;will start executing from the given function.
-lostanza defn set-starting-func (vm:ref<VirtualMachine>, fid:ref<Int>) -> ref<False> :
-  val pc = get(vmtable(vm).function-addresses,fid).value
-  val stk:ptr<Stack> = current-stack(vm)
-  stk.pc = pc * 4
   return false
 
 ;============================================================
@@ -571,7 +536,7 @@ lostanza defn collect-stack-trace-entries (stack:ptr<Stack>,
     loop (sp:ptr<StackFrame>) :
       ;Store in return buffer
       ;if it exists in the file info table
-      val ret = new Int{(sp.return / 4L) as int}
+      val ret = new Long{sp.return}
       match(get?(vmtable.trace-table, ret)) :
         (info:ref<StackTraceEntry>) : add(buffer, info)
         (info) : ()
@@ -792,7 +757,7 @@ lostanza defn print-tag (ref:long) -> int :
     call-c clib/printf("Unrecognized tag bits.\n")
   return 0
 
-lostanza defn function-addresses (vmt:ref<VMTable>) -> ref<StableIntArray> :
+lostanza defn function-addresses (vmt:ref<VMTable>) -> ref<StableLongArray> :
   return vmt.function-addresses
 
 ;============================================================
@@ -807,8 +772,6 @@ defn EncodingResolver (class-table:ClassTable, branch-table:BranchTable, live-ma
       8
     defmethod object-size-on-heap (this, sz:Int) :
       object-size-on-heap(sz) - 8
-    defmethod stack-size (this) :
-      SIZEOF-STACK
     defmethod dispatch-format (this, branches:Tuple<Tuple<TypeSet>>) :
       add(branch-table, DispatchFormat(branches))
     defmethod match-format (this, branches:Tuple<Tuple<TypeSet>>) :
@@ -859,8 +822,8 @@ public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>, keep-existing-g
     ;Load functions
     val encoding-resolver = EncodingResolver(class-table(vm), branch-table(vm), live-map-table(linker(vm)))
     for f in funcs(load-unit) do :
-      val ef = encode(func(f), encoding-resolver, backend(vm))
-      load-function(vmt, id(f), ef)
+      load-function(vmt, f, encoding-resolver, backend(vm))
+      
     ;Load datas and consts
     load-datas(vmt, datas(load-unit))
     load-consts(vmt, consts(load-unit))
@@ -901,11 +864,32 @@ public defn init-package (vm:VirtualMachine, package:Symbol) -> True|False :
       set-core-loaded?(vm, true)
       true
     else :
-      launch-init(vm, f, trace?)
+      launch-init(vm, f)
   else :
     true
 
-lostanza defn launch-init (vm:ref<VirtualMachine>, fid:ref<Int>, trace?:ref<True|False>) -> ref<True|False> :
+public lostanza defn clear-globals (vm:ref<VirtualMachine>) -> ref<False> :
+  ;Scan global roots
+  val vmtable = vmtable(vm)
+  val globals:ptr<long> = vmtable.globals.mem
+  val roots = to-seq(roots(vmtable.global-table))
+  while empty?(roots) == false :
+    val i = next(roots).value
+    globals[i] = void-marker()
+  return false
+
+;============================================================
+;========= Launching the Initialization Function ============
+;============================================================
+;This function is the standard way of launching some code to execute
+;in the JIT. It calls `core/execute-toplevel-command()` with the given
+;function passed as a closure. All fatals/exceptions are intercepted
+;by execute-toplevel-command, and thus it is guaranteed to return
+;normally. launch-init() returns the boolean that is returned by
+;execute-toplevel-command().
+;- fid: The identifier of the VMFunction to execute.
+
+lostanza defn launch-init (vm:ref<VirtualMachine>, fid:ref<Int>) -> ref<True|False> :
   ;Create the closure representing the initialization function
   val closure-size = 8 + 8
   ensure-heap-space(vm, closure-size)
@@ -924,30 +908,20 @@ lostanza defn launch-init (vm:ref<VirtualMachine>, fid:ref<Int>, trace?:ref<True
   else if ret == true-marker() : return true
   else : return fatal("Invalid return value from execute-toplevel-command.")
 
-public lostanza defn clear-globals (vm:ref<VirtualMachine>) -> ref<False> :
-  ;Scan global roots
-  val vmtable = vmtable(vm)
-  val globals:ptr<long> = vmtable.globals.mem
-  val roots = to-seq(roots(vmtable.global-table))
-  while empty?(roots) == false :
-    val i = next(roots).value
-    globals[i] = void-marker()
+;============================================================
+;================= Releasing Resources ======================
+;============================================================
+
+public defn shutdown (vm:VirtualMachine) :  
+  free-code-table(vm)
+
+lostanza defn free-code-table (vm:ref<VirtualMachine>) -> ref<False> :
+  free(vm.vmtable.code-table)
   return false
 
 ;============================================================
 ;==================== Utilities =============================
 ;============================================================
-lostanza defn float-to-bits (x:float) -> int :
-  return ($ls-prim bits x)
-
-lostanza defn double-to-bits (x:double) -> long :
-  return ($ls-prim bits x)
-
-lostanza defn bits-to-float (x:int) -> float :
-  return ($ls-prim fnum x)
-
-lostanza defn bits-to-double (x:long) -> double :
-  return ($ls-prim fnum x)
 
 var delay : (() -> ?) -> False =
   fn (f) : fatal("Not within delay-actions block.")
