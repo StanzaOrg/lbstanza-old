@@ -1076,6 +1076,7 @@ enum {
 
 #define SYSTEM_PAGE_SIZE 4096ULL
 #define ROUND_UP_TO_WHOLE_PAGES(x) (((x) + (SYSTEM_PAGE_SIZE - 1)) & ~(SYSTEM_PAGE_SIZE - 1))
+#define ROUND_UP_TO_WHOLE_LONGS(x) (((x) + (sizeof(stz_long) - 1)) & ~(sizeof(long) - 1))
 
 static stz_long bitset_size (stz_long heap_size) {
   uint64_t heap_size_in_longs = (heap_size + (BYTES_IN_LONG - 1)) >> LOG_BYTES_IN_LONG;
@@ -1095,10 +1096,13 @@ STANZA_API_FUNC int main (int argc, char* argv[]) {
   init.heap_start = (stz_byte*)stz_memory_map(min_heap_size, max_heap_size);
   init.heap_max_size = max_heap_size;
   init.heap_size = min_heap_size;
-  stz_long young_gen_size = 2 * 1024 * 1024;
-  init.heap_limit = init.heap_start + young_gen_size;
-  init.heap_top = init.heap_start;
+
+  //Setup the nursery
+  const stz_long nursery_fraction = 8; // Must match the value in core.stanza
+  const stz_long nursery_size = ROUND_UP_TO_WHOLE_LONGS(min_heap_size / nursery_fraction / 2);
   init.heap_old_objects_end = init.heap_start;
+  init.heap_top = init.heap_old_objects_end + nursery_size;
+  init.heap_limit = init.heap_top + nursery_size;
 
   //Allocate bitset for heap
   const stz_long min_bitset_size = bitset_size(min_heap_size);
