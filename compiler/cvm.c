@@ -487,33 +487,33 @@ static inline void clear_mark (const void* p, uint64_t* bitset_base) {
   *bit_address(p, bitset_base) &= ~bit_mask(p);
 }
 static inline void set_bit (uint64_t bit_index, uint64_t* bitset_base) {
-  int word_index = bit_index >> 6;
-  int word_bit_index = bit_index & 63;
+  uint64_t word_index = bit_index >> 6;
+  uint64_t word_bit_index = bit_index & 63;
   uint64_t mask = 1L << word_bit_index;
   bitset_base[word_index] |= mask;
 }
 static inline void clear_bit (uint64_t bit_index, uint64_t* bitset_base) {
-  int word_index = bit_index >> 6;
-  int word_bit_index = bit_index & 63;
+  uint64_t word_index = bit_index >> 6;
+  uint64_t word_bit_index = bit_index & 63;
   uint64_t mask = 1L << word_bit_index;
   bitset_base[word_index] &= ~mask;
 }
 static inline uint64_t test_bit (uint64_t bit_index, uint64_t* bitset_base) {
-  int word_index = bit_index >> 6;
-  int word_bit_index = bit_index & 63;
+  uint64_t word_index = bit_index >> 6;
+  uint64_t word_bit_index = bit_index & 63;
   return (bitset_base[word_index] >> word_bit_index) & 1L;
 }
 static inline uint64_t test_and_set_bit (uint64_t bit_index, uint64_t* bitset_base) {
-  int word_index = bit_index >> 6;
-  int word_bit_index = bit_index & 63;
+  uint64_t word_index = bit_index >> 6;
+  uint64_t word_bit_index = bit_index & 63;
   uint64_t mask = 1L << word_bit_index;
   uint64_t old_value = bitset_base[word_index];
   bitset_base[word_index] = old_value | mask;
   return (old_value >> word_bit_index) & 1L;
 }
 static inline uint64_t test_and_clear_bit (uint64_t bit_index, uint64_t* bitset_base) {
-  int word_index = bit_index >> 6;
-  int word_bit_index = bit_index & 63;
+  uint64_t word_index = bit_index >> 6;
+  uint64_t word_bit_index = bit_index & 63;
   uint64_t mask = 1L << word_bit_index;
   uint64_t old_value = bitset_base[word_index];
   bitset_base[word_index] = old_value & ~mask;
