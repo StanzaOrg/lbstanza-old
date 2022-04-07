@@ -405,6 +405,7 @@ typedef struct{
   uint64_t* bitset;
   uint64_t* bitset_base;
   uint64_t size;
+  uint64_t size_limit;
   uint64_t max_size;
   uint64_t* marking_stack_start;
   uint64_t* marking_stack_bottom;
