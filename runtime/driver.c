@@ -100,6 +100,7 @@ typedef struct{
   stz_byte* heap_bitset;
   stz_byte* heap_bitset_base;
   stz_long heap_size;
+  stz_long heap_size_limit;
   stz_long heap_max_size;
   Stack* stacks;
   void* trackers;
@@ -1095,6 +1096,7 @@ STANZA_API_FUNC int main (int argc, char* argv[]) {
   const stz_long max_heap_size = ROUND_UP_TO_WHOLE_PAGES(STZ_LONG(8) * 1024 * 1024 * 1024);
   init.heap_start = (stz_byte*)stz_memory_map(min_heap_size, max_heap_size);
   init.heap_max_size = max_heap_size;
+  init.heap_size_limit = max_heap_size;
   init.heap_size = min_heap_size;
 
   //Setup the nursery
