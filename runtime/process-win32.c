@@ -44,34 +44,28 @@ static FILE* file_from_handle(HANDLE handle, FileType type) {
   return file;
 }
 
-void retrieve_process_state (stz_long pid, ProcessState* s, stz_int wait_for_termination) {
+int retrieve_process_state (Process* process, ProcessState* s, stz_int wait_for_termination) {
   ProcessState state;
-  HANDLE process;
   DWORD exit_code;
 
   state = (ProcessState){PROCESS_RUNNING, 0};
 
-  process = OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, (DWORD)pid);
-  if (process == NULL) {
-    goto END;
-  }
-
   if (wait_for_termination == 1) {
-    if (WaitForSingleObject(process, INFINITE) == WAIT_FAILED) {
-      goto END;
+    if (WaitForSingleObject(process->handle, INFINITE) == WAIT_FAILED) {
+      return -1;
     }
   }
 
-  if (!GetExitCodeProcess(process, &exit_code)) {
-    goto END;
+  if (!GetExitCodeProcess(process->handle, &exit_code)) {
+    return -1;
   }
 
   if (exit_code != STILL_ACTIVE) {
     state = (ProcessState){PROCESS_DONE, (stz_int)exit_code};
   }
-
-END:
+  
   *s = state;
+  return 0;
 }
 
 typedef enum {
@@ -252,6 +246,7 @@ stz_int launch_process(stz_byte* command_line,
     // Populate process with the relevant info
     process->pid = (stz_long)proc_info.dwProcessId;
     process->pipeid = -1; // -1 signals we didn't create named pipes for this process
+    process->handle = (void*)proc_info.hProcess;
     process->in  = file_from_handle(stdin_write, FT_WRITE);
     process->out = file_from_handle(stdout_read, FT_READ);
     process->err = file_from_handle(stderr_read, FT_READ);

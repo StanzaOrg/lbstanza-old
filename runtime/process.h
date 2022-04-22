@@ -8,6 +8,7 @@
 typedef struct {
   stz_long pid;
   stz_int pipeid;
+  void* handle;
   FILE* in;
   FILE* out;
   FILE* err;

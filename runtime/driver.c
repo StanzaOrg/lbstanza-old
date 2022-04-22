@@ -1008,7 +1008,9 @@ stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
   return 0;
 }
 
-void retrieve_process_state (stz_long pid, ProcessState* s, stz_int wait_for_termination){
+int retrieve_process_state (Process* process, ProcessState* s, stz_int wait_for_termination){
+  stz_int pid = process->pid;
+  
   //Check whether launcher has been initialized
   if(launcher_pid < 0){
     fprintf(stderr, "Launcher not initialized.\n");
@@ -1023,6 +1025,7 @@ void retrieve_process_state (stz_long pid, ProcessState* s, stz_int wait_for_ter
 
   //Read back process state
   read_process_state(launcher_out, s);
+  return 0;
 }
 #else
 #include "process-win32.c"
