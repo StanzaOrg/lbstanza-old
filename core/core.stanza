@@ -827,43 +827,51 @@ lostanza defn collect-garbage (size:long) -> long :
 ;============================================================
 
 lostanza val INITIAL-STACK-SIZE:long = 4L * 1024L
-lostanza val STACKS-IN-BLOCK:long = 64L
-lostanza val STACK-BLOCK-SIZE:long = INITIAL-STACK-SIZE * STACKS-IN-BLOCK
-lostanza var FREE-STACK-LIST:ptr<long> = null
 
-lostanza defn allocate-stack-frames (size:long) -> ptr<StackFrame> :
+lostanza defn allocate-stack-frames-for-freelist (heap:ptr<Heap>) -> ref<False> :
+  ;Parameters
+  val stacks-in-block = 64L
+  val stack-block-size = INITIAL-STACK-SIZE * stacks-in-block
+
+  ;Allocate all the memory for the block
+  var block:ptr<long> = call-c clib/malloc(stack-block-size)
+  if block == null : fatal!("Cannot allocate stack block")
+
+  ;Put stack frames on freelist.
+  val block-end:ptr<?> = block + stack-block-size
+  while block < block-end :
+    [block] = heap.free-stacks as long
+    heap.free-stacks = block
+    block = block + INITIAL-STACK-SIZE
+  return false
+
+lostanza defn allocate-stack-frames (size:long, heap:ptr<Heap>) -> ptr<StackFrame> :
   if size == INITIAL-STACK-SIZE :
-    if FREE-STACK-LIST == null :
-      var block:ptr<long> = call-c clib/malloc(STACK-BLOCK-SIZE)
-      if block == null : fatal!("Cannot allocate stack block")
-      val block-end:ptr<?> = block + STACK-BLOCK-SIZE
-      while block < block-end :
-        [block] = FREE-STACK-LIST as long
-        FREE-STACK-LIST = block
-        block = block + INITIAL-STACK-SIZE
-    val frames = FREE-STACK-LIST
-    FREE-STACK-LIST = [frames] as ptr<long>
+    if heap.free-stacks == null :
+      allocate-stack-frames-for-freelist(heap)
+    val frames = heap.free-stacks
+    heap.free-stacks = [frames] as ptr<long>
     return frames as ptr<StackFrame>
   else :
     val frames:ptr<StackFrame> = call-c clib/malloc(size)
     if frames == null : fatal!("Cannot allocate stack frames")
     return frames
 
-lostanza defn free-stack-frames (frames:ptr<StackFrame>, size:long) -> ref<False> :
+lostanza defn free-stack-frames (frames:ptr<StackFrame>, size:long, heap:ptr<Heap>) -> ref<False> :
   if frames == null : return false
   if size == INITIAL-STACK-SIZE :
-    [frames as ptr<long>] = FREE-STACK-LIST as long
-    FREE-STACK-LIST = frames as ptr<long>
+    [frames as ptr<long>] = heap.free-stacks as long
+    heap.free-stacks = frames as ptr<long>
   else :
     call-c clib/free(frames)
   return false
 
-lostanza defn extend-stack-frames (frames:ptr<StackFrame>, size:long, new-size:long) -> ptr<StackFrame> :
+lostanza defn extend-stack-frames (frames:ptr<StackFrame>, size:long, new-size:long, heap:ptr<Heap>) -> ptr<StackFrame> :
   if size == INITIAL-STACK-SIZE or new-size == INITIAL-STACK-SIZE :
     ;Allocate new frames and copy over old frames
-    val new-frames = allocate-stack-frames(new-size)
+    val new-frames = allocate-stack-frames(new-size, heap)
     call-c clib/memcpy(new-frames, frames, size)
-    free-stack-frames(frames, size)
+    free-stack-frames(frames, size, heap)
     return new-frames
   else :
     return realloc(frames, new-size)
@@ -876,7 +884,7 @@ lostanza defn allocate-stack () -> ref<Stack> :
 
 lostanza defn initialize-stack (stack:ptr<Stack>, heap:ptr<Heap>) -> ref<False> :
   val size = INITIAL-STACK-SIZE
-  val frames = allocate-stack-frames(size)
+  val frames = allocate-stack-frames(size, heap)
   frames.return = -1L
   frames.liveness-map = 0L
   stack.frames = frames
@@ -888,16 +896,17 @@ lostanza defn initialize-stack (stack:ptr<Stack>, heap:ptr<Heap>) -> ref<False> 
   ;No meaningful return value
   return false
 
-lostanza defn free (s:ref<Stack>) -> ref<False> :
-  free-stack-frames(s.frames, s.size)
-  s.frames = null
-  s.stack-pointer = null
+lostanza defn free-stack-list (list:ptr<Stack>, heap:ptr<Heap>) -> ref<False> :
+  for (var stack:ptr<Stack> = list, stack != null, stack = stack.tail) :
+    free-stack-frames(stack.frames, stack.size, heap)
+  ;No meaningful return value
   return false
 
-lostanza defn free-stack-list (list:ptr<Stack>) -> ref<False> :
-  for (var stack:ptr<Stack> = list, stack != null, stack = stack.tail) :
-    free-stack-frames(stack.frames, stack.size)
-  ;No meaningful return value
+lostanza defn free (s:ref<Stack>) -> ref<False> :
+  val vms:ptr<VMState> = call-prim flush-vm()
+  free-stack-frames(s.frames, s.size, addr(vms.heap))
+  s.frames = null
+  s.stack-pointer = null
   return false
 
 ;<doc>=======================================================
@@ -930,7 +939,7 @@ lostanza defn extend-stack (size:long, heap:ptr<Heap>) -> ref<False> :
   if new-size < desired-size : fatal!("Stack overflow")
 
   val old-frames = s.frames
-  val new-frames = extend-stack-frames(old-frames, s.size, new-size)
+  val new-frames = extend-stack-frames(old-frames, s.size, new-size, heap)
   ;Swap in new frames
   s.stack-pointer = s.stack-pointer + (new-frames - old-frames)
   s.size = new-size
@@ -979,6 +988,9 @@ protected lostanza deftype Heap :
   ;List of live Stacks in this heap.
   ;New Stacks are added to this list when they are created.
   var stacks:ptr<Stack>
+
+  ;Free list for stackframes.
+  var free-stacks:ptr<long>
 
   ;List of live LivenessTrackers in this heap.
   ;New liveness trackers are added to this list when they are created.
@@ -1077,6 +1089,7 @@ public lostanza defn initialize-heap (heap:ptr<Heap>,
   heap.stack-top = heap.stack-bottom
   ;Initialize stack list
   heap.stacks = null
+  heap.free-stacks = null
   heap.current-stack = tag-as-ref(allocate-initial-stack(heap))
   heap.system-stack = tag-as-ref(allocate-initial-stack(heap))
   ;Initialize trackers
@@ -1087,7 +1100,7 @@ public lostanza defn initialize-heap (heap:ptr<Heap>,
 ;Remove all associated memory reserved for the current heap structure.
 public lostanza defn finalize-heap (heap:ptr<Heap>) -> ref<False> :
   ;Dispose stack frames
-  free-stack-list(heap.stacks)
+  free-stack-list(heap.stacks, heap)
 
   ;Compute the current size of the heap and it's bitset.
   val current-bitset-size = bitset-size(heap.size)
@@ -1661,7 +1674,7 @@ lostanza defn scan-stacks (vms:ptr<VMState>) -> ref<False> :
         ;Proceed to next stack in heap.stacks list
         p = addr(stack.tail)
   ;Now heap.stacks list contains unreachable stacks only. Dispose their frames.
-  free-stack-list(vms.heap.stacks)
+  free-stack-list(vms.heap.stacks, addr(vms.heap))
   vms.heap.stacks = live-stacks
   ;No meaningful return value
   return false
@@ -2245,7 +2258,7 @@ lostanza defn copy-stacks (vms:ptr<VMState>) -> ref<False> :
         ;Proceed to next stack in heap.stacks list
         p = addr(stack.tail)
   ;Now heap.stacks list contains unreachable new stacks only. Dispose their frames.
-  free-stack-list(vms.heap.stacks)
+  free-stack-list(vms.heap.stacks, addr(vms.heap))
   ;Update the list
   vms.heap.stacks = live-stacks
   ;No meaningful return value
