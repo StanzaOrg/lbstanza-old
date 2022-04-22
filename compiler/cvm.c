@@ -414,6 +414,7 @@ typedef struct{
   char* min_incomplete;
   char* max_incomplete;
   struct Stack* stacks;
+  uint64_t* free_stacks;
   void* liveness_trackers;
   void* iterate_roots;
   void* iterate_references_in_stack_frames;
