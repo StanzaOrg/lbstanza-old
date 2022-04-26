@@ -477,7 +477,7 @@ static inline uint64_t bit_shift (const void* p) {
   return bit_index(p) & (BITS_IN_LONG - 1);
 }
 static inline uint64_t bit_mask (const void* p) {
-  return 1L << bit_shift(p);
+  return 1ULL << bit_shift(p);
 }
 static inline uint64_t* bit_address (const void* p, uint64_t* bitset_base) {
   return bitset_base + (bit_index(p) >> LOG_BITS_IN_LONG);
@@ -491,35 +491,35 @@ static inline void clear_mark (const void* p, uint64_t* bitset_base) {
 static inline void set_bit (uint64_t bit_index, uint64_t* bitset_base) {
   uint64_t word_index = bit_index >> 6;
   uint64_t word_bit_index = bit_index & 63;
-  uint64_t mask = 1L << word_bit_index;
+  uint64_t mask = 1ULL << word_bit_index;
   bitset_base[word_index] |= mask;
 }
 static inline void clear_bit (uint64_t bit_index, uint64_t* bitset_base) {
   uint64_t word_index = bit_index >> 6;
   uint64_t word_bit_index = bit_index & 63;
-  uint64_t mask = 1L << word_bit_index;
+  uint64_t mask = 1ULL << word_bit_index;
   bitset_base[word_index] &= ~mask;
 }
 static inline uint64_t test_bit (uint64_t bit_index, uint64_t* bitset_base) {
   uint64_t word_index = bit_index >> 6;
   uint64_t word_bit_index = bit_index & 63;
-  return (bitset_base[word_index] >> word_bit_index) & 1L;
+  return (bitset_base[word_index] >> word_bit_index) & 1ULL;
 }
 static inline uint64_t test_and_set_bit (uint64_t bit_index, uint64_t* bitset_base) {
   uint64_t word_index = bit_index >> 6;
   uint64_t word_bit_index = bit_index & 63;
-  uint64_t mask = 1L << word_bit_index;
+  uint64_t mask = 1ULL << word_bit_index;
   uint64_t old_value = bitset_base[word_index];
   bitset_base[word_index] = old_value | mask;
-  return (old_value >> word_bit_index) & 1L;
+  return (old_value >> word_bit_index) & 1ULL;
 }
 static inline uint64_t test_and_clear_bit (uint64_t bit_index, uint64_t* bitset_base) {
   uint64_t word_index = bit_index >> 6;
   uint64_t word_bit_index = bit_index & 63;
-  uint64_t mask = 1L << word_bit_index;
+  uint64_t mask = 1ULL << word_bit_index;
   uint64_t old_value = bitset_base[word_index];
   bitset_base[word_index] = old_value & ~mask;
-  return (old_value >> word_bit_index) & 1L;
+  return (old_value >> word_bit_index) & 1ULL;
 }
 
 //============================================================
@@ -889,14 +889,14 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case INT_MUL_OPCODE : {
       DECODE_C();
-      SET_LOCAL(x, ((int64_t)(LOCAL(y)) >> 32L) * (int64_t)(LOCAL(value)));
+      SET_LOCAL(x, ((int64_t)(LOCAL(y)) >> 32LL) * (int64_t)(LOCAL(value)));
       continue;
     }
     case INT_DIV_OPCODE : {
       DECODE_C();
       int64_t sy = (int64_t)LOCAL(y);
       int64_t sz = (int64_t)LOCAL(value);
-      SET_LOCAL(x, (sy / sz) << 32L);
+      SET_LOCAL(x, (sy / sz) << 32LL);
       continue;
     }
     case INT_MOD_OPCODE : {
@@ -923,23 +923,23 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
       DECODE_C();
       int64_t sy = (int64_t)LOCAL(y);
       int64_t sz = (int64_t)LOCAL(value);
-      SET_LOCAL(x, sy << (sz >> 32L));
+      SET_LOCAL(x, sy << (sz >> 32LL));
       continue;
     }
     case INT_SHR_OPCODE : {
       DECODE_C();
       uint64_t uy = LOCAL(y);
       int64_t sz = (int64_t)LOCAL(value);
-      uint64_t r = uy >> (sz >> 32L);
-      SET_LOCAL(x, (r >> 32L) << 32L);
+      uint64_t r = uy >> (sz >> 32LL);
+      SET_LOCAL(x, (r >> 32LL) << 32LL);
       continue;
     }
     case INT_ASHR_OPCODE : {
       DECODE_C();
       int64_t sy = (int64_t)LOCAL(y);
       int64_t sz = (int64_t)LOCAL(value);
-      uint64_t r = sy >> (sz >> 32L);
-      SET_LOCAL(x, (r >> 32L) << 32L);
+      uint64_t r = sy >> (sz >> 32LL);
+      SET_LOCAL(x, (r >> 32LL) << 32LL);
       continue;
     }
     case INT_LT_OPCODE : {
@@ -1376,7 +1376,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     case INT_NOT_OPCODE : {
       DECODE_B_UNSIGNED();
       uint64_t y = LOCAL(value);
-      SET_LOCAL(x, ((~ y) >> 32L) << 32L);
+      SET_LOCAL(x, ((~ y) >> 32LL) << 32LL);
       continue;
     }
     case INT_NEG_OPCODE : {
@@ -1547,27 +1547,27 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
     }
     case DETAG_OPCODE : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL(x, LOCAL(value) >> 32L);
+      SET_LOCAL(x, LOCAL(value) >> 32LL);
       continue;
     }
     case TAG_OPCODE_BYTE : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL(x, ((uint64_t)(uint8_t)(LOCAL(value)) << 32L) + BYTE_TAG_BITS);
+      SET_LOCAL(x, ((uint64_t)(uint8_t)(LOCAL(value)) << 32LL) + BYTE_TAG_BITS);
       continue;
     }
     case TAG_OPCODE_CHAR : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL(x, ((uint64_t)(uint8_t)(LOCAL(value)) << 32L) + CHAR_TAG_BITS);
+      SET_LOCAL(x, ((uint64_t)(uint8_t)(LOCAL(value)) << 32LL) + CHAR_TAG_BITS);
       continue;
     }
     case TAG_OPCODE_INT : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL(x, ((uint64_t)LOCAL(value) << 32L) + INT_TAG_BITS);
+      SET_LOCAL(x, ((uint64_t)LOCAL(value) << 32LL) + INT_TAG_BITS);
       continue;
     }
     case TAG_OPCODE_FLOAT : {
       DECODE_B_UNSIGNED();
-      SET_LOCAL(x, ((uint64_t)LOCAL(value) << 32L) + FLOAT_TAG_BITS);
+      SET_LOCAL(x, ((uint64_t)LOCAL(value) << 32LL) + FLOAT_TAG_BITS);
       continue;
     }
     case STORE_OPCODE_1 : {
@@ -1677,7 +1677,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         continue;
       }else{
         SET_REG(0, BOOLREF(0));
-        SET_REG(1, 1L);
+        SET_REG(1, 1ULL);
         SET_REG(2, size);
         uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
         PUSH_FRAME(num_locals);
@@ -1695,7 +1695,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         continue;
       }else{
         SET_REG(0, BOOLREF(0));
-        SET_REG(1, 1L);
+        SET_REG(1, 1ULL);
         SET_REG(2, size);
         uint64_t fpos = (uint64_t)(code_offsets[EXTEND_HEAP_FN]) * 4;
         PUSH_FRAME(num_locals);
@@ -1995,7 +1995,7 @@ void vmloop (VMState* vms, uint64_t stanza_crsp){
         registers = vms->registers;
         //Set arguments
         SET_REG(0, BOOLREF(0));
-        SET_REG(1, 1L);
+        SET_REG(1, 1ULL);
         SET_REG(2, size_required);
         stack_pointer = stk->frames;
         stack_pointer->returnpc = SYSTEM_RETURN_STUB;
