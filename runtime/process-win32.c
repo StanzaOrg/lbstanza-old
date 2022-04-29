@@ -44,34 +44,52 @@ static FILE* file_from_handle(HANDLE handle, FileType type) {
   return file;
 }
 
-void retrieve_process_state (stz_long pid, ProcessState* s, stz_int wait_for_termination) {
-  ProcessState state;
-  HANDLE process;
-  DWORD exit_code;
-
+// Polls a running `process` returning the `ProcessState`, optionally blocking until it has terminated.
+int retrieve_process_state (const Process* process, ProcessState* s, stz_int wait_for_termination) {
+  ProcessState state;  // the returned state. 
+  DWORD exit_code;     // the exit code of the process
+  HANDLE handle;       // the handle to the process 
+  
+  // By default, assume the process is still running.
   state = (ProcessState){PROCESS_RUNNING, 0};
 
-  process = OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE, FALSE, (DWORD)pid);
-  if (process == NULL) {
-    goto END;
-  }
+  // First, attempt to open a handle to the process to query its state by process ID.
+  // This is required to check a currently running process, as we do not have the permissions
+  // associated with the original handle created by launch_process (??? TODO: verify the cause)
+  handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, process->pid);
 
-  if (wait_for_termination == 1) {
-    if (WaitForSingleObject(process, INFINITE) == WAIT_FAILED) {
-      goto END;
+  // If the wait_for_termination argument has been passed, and the handle is valid, we 
+  // call WaitForSingleObject until the process exits. Requires a valid handle.
+  if (wait_for_termination && handle) {
+    // if WaitForSingleObject fails, return an error. The caller must retrieve the
+    // platform error message and raise an exception.
+    if (WaitForSingleObject(handle, INFINITE) == WAIT_FAILED) {
+      return -1;
     }
   }
 
-  if (!GetExitCodeProcess(process, &exit_code)) {
-    goto END;
+  // If the returned handle is invalid, it means that the process has failed and we need
+  // to query the return code using original handle to the process.
+  if (!handle) {
+    handle = process->handle;
   }
 
+  // Attempt to get the exit code from the handle. If this fails, return an error. The
+  // caller must retrieve the platform error message and return an exception.
+  if (!GetExitCodeProcess(handle, &exit_code)) {
+    return -1;
+  }
+
+  // If the exit code is not STILL_ACTIVE, then process is done.
   if (exit_code != STILL_ACTIVE) {
     state = (ProcessState){PROCESS_DONE, (stz_int)exit_code};
+    // Make sure we close the handle after we're done with it.
+    CloseHandle(handle);
   }
-
-END:
+  
+  // Write the returned state and return success.
   *s = state;
+  return 0;
 }
 
 typedef enum {
@@ -242,7 +260,7 @@ stz_int launch_process(stz_byte* command_line,
       /* lpProcessAttributes  */ NULL,
       /* lpThreadAttributes   */ NULL,
       /* bInheritHandles      */ TRUE,
-      /* dwCreationFlags      */ 0,
+      /* dwCreationFlags      */ CREATE_NO_WINDOW,
       /* lpEnvironment        */ NULL,
       /* lpCurrentDirectory   */ (LPSTR)working_dir,
       /* lpStartupInfo        */ &start_info,
@@ -252,6 +270,7 @@ stz_int launch_process(stz_byte* command_line,
     // Populate process with the relevant info
     process->pid = (stz_long)proc_info.dwProcessId;
     process->pipeid = -1; // -1 signals we didn't create named pipes for this process
+    process->handle = (void*)proc_info.hProcess;
     process->in  = file_from_handle(stdin_write, FT_WRITE);
     process->out = file_from_handle(stdout_read, FT_READ);
     process->err = file_from_handle(stderr_read, FT_READ);
