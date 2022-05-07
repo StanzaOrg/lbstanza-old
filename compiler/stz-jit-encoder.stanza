@@ -570,7 +570,10 @@ defn AsmGen (code:CodeHolder,
 
   ;=========================================================
   ;========= Switching Contexts and Cache Registers ========
-  ;=========================================================  
+  ;=========================================================
+  ;See note about Caching Strategy to understand why
+  ;which quantities are saved under which context switches.
+  ;
   ;Go from Stanza into JIT code. (Used by launcher, callc.)
   defn switch-context-stanza-to-jit (dir:EnterExit, has-locals?:True|False) :
     switch(dir) :
@@ -1278,6 +1281,96 @@ defn AsmGen (code:CodeHolder,
           and-op(a, reg(Tmp2), -8)
     ;Save new heap-top
     set-vmstate-heap-top(reg(Tmp2))
+
+  ;=========================================================
+  ;================= C Calling Convention ==================
+  ;=========================================================
+  defn emit-callc (f:VMImm, xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) :
+    ;Compute the c-calling record layout for the given arguments and return.
+    ;- xs: The return locals/types.
+    ;- ys: The argument immediates.
+    defn compute-callc-records (xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) -> CallCRecords :
+      ;Convert a VMType into an ArgType for call-record analysis
+      defn to-arg-type (t:VMType) :
+        match(t) :
+          (t:VMFloat|VMDouble) : RealArg()
+          (t) : IntArg()
+      ;Compute C calling convention.
+      callc-records(ytypes, xtype, backend) where :
+        val ytypes = map(to-arg-type, map(imm-type, ys))
+        val xtypes = map(to-arg-type, map(imm-type, xs))
+        val xtype = IntArg() when empty?(xtypes) else xtypes[0]
+
+    ;Emit instructions for writing the CallC calling record to vmstate.registers
+    ;using the convention required by the c_trampoline stub.
+    defn write-records-to-registers (records:CallCRecords, ys:Tuple<VMImm>) :
+      ;Compute register locations
+      ;[NUM-STACK-ARGS | STACK-ARGS ... |
+      ; NUM-FLOAT-ARGS | FLOAT-ARGS ... |
+      ; NUM-INT-ARGS | INT-ARGS ... |
+      ; NUM-FLOATS-IN-CALL]
+      val layout-counter = Counter(0)
+      val num-stack-args-index = next(layout-counter, 1)
+      val stack-args-index = next(layout-counter, num-mem-args(records))
+      val num-float-args-index = next(layout-counter, 1)
+      val float-args-index = next(layout-counter, num-real-args(records))
+      val num-int-args-index = next(layout-counter, 1)
+      val int-args-index = next(layout-counter, num-int-args(records))
+      val num-floats-in-call-index = next(layout-counter,1)
+      
+      ;Given the location that the argument should be stored,
+      ;return the index in the register buffer that we should
+      ;store the argument that is desired by the trampoline code.
+      defn register-index (l:CallLoc) -> Int :
+        match(l) :
+          (l:RegLoc) : num-floats-in-call-index - 1 - index(l)
+          (l:FRegLoc) : num-int-args-index - 1 - index(l)
+          (l:MemLoc) : num-float-args-index - 1 - index(l)
+          
+      ;Assign registers
+      for arg in args(records) do :
+        val r = register-index(loc(arg))
+        val v = value(arg) as StdArg|ShadowArg
+        val y = ys[index(v)]
+        set-reg(r, y)
+        
+      ;Set number of arguments
+      set-reg(num-stack-args-index, NumConst(num-mem-args(records)))
+      set-reg(num-float-args-index, NumConst(num-real-args(records)))
+      set-reg(num-int-args-index, NumConst(num-int-args(records) + 1))
+      set-reg(num-floats-in-call-index, NumConst(num-real-args(records)))              
+
+    ;Emit instructions for calling the C function f.
+    defn call-c-trampoline (f:VMImm) :
+      ;Compute the address of the function to call, and ensure it is
+      ;stored in a register.
+      ;Use Tmp1 is a register is needed.
+      val faddr = match(f) :
+        (f:Local) :
+          local(slot(f), reg(Tmp1))
+        (f:ExternId) :
+          mov(a, reg(Tmp1), extern-address(id(f)))
+          reg(Tmp1)
+      ;Call the C trampoline in a new stack frame.
+      simple-call-c-in-new-frame-from-jit-context(
+        false,
+        c-trampoline-addr(),
+        [faddr, reg(RegistersReg), reg(RegistersReg)])
+
+    ;Emit instructions for moving the return value to the
+    ;appropriate local.
+    defn move-return-to-local (records:CallCRecords, xs:Tuple<Local|VMType>) :
+      if not empty?(xs) :
+        val reg-index = match(return(records)) :
+          (l:RegLoc) : 0   ;c_trampoline puts integer return register in register[0]
+          (l:FRegLoc) : 1  ;c_trampoline puts float return register in register[1]
+        get-reg(xs[0], reg-index)
+
+    ;Driver
+    val records = compute-callc-records(xs, ys)
+    write-records-to-registers(records, ys)
+    call-c-trampoline(f)
+    move-return-to-local(records, xs)    
 
   ;=========================================================
   ;================ 1-Operand Primitive ====================
@@ -2158,91 +2251,7 @@ defn AsmGen (code:CodeHolder,
         record-trace-entry(ret, trace-entry(ins))            
 
       (ins:CallCIns) :
-        ;Compute the c-calling record layout for the given arguments and return.
-        ;- xs: The return locals/types.
-        ;- ys: The argument immediates.
-        defn compute-callc-records (xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) -> CallCRecords :
-          ;Convert a VMType into an ArgType for call-record analysis
-          defn to-arg-type (t:VMType) :
-            match(t) :
-              (t:VMFloat|VMDouble) : RealArg()
-              (t) : IntArg()
-          ;Compute C calling convention.
-          callc-records(ytypes, xtype, backend) where :
-            val ytypes = map(to-arg-type, map(imm-type, ys))
-            val xtypes = map(to-arg-type, map(imm-type, xs))
-            val xtype = IntArg() when empty?(xtypes) else xtypes[0]
-
-        ;Emit instructions for writing the CallC calling record to vmstate.registers
-        ;using the convention required by the c_trampoline stub.
-        defn write-records-to-registers (records:CallCRecords, ys:Tuple<VMImm>) :
-          ;Compute register locations
-          ;[NUM-STACK-ARGS | STACK-ARGS ... |
-          ; NUM-FLOAT-ARGS | FLOAT-ARGS ... |
-          ; NUM-INT-ARGS | INT-ARGS ... |
-          ; NUM-FLOATS-IN-CALL]
-          val layout-counter = Counter(0)
-          val num-stack-args-index = next(layout-counter, 1)
-          val stack-args-index = next(layout-counter, num-mem-args(records))
-          val num-float-args-index = next(layout-counter, 1)
-          val float-args-index = next(layout-counter, num-real-args(records))
-          val num-int-args-index = next(layout-counter, 1)
-          val int-args-index = next(layout-counter, num-int-args(records))
-          val num-floats-in-call-index = next(layout-counter,1)
-          
-          ;Given the location that the argument should be stored,
-          ;return the index in the register buffer that we should
-          ;store the argument that is desired by the trampoline code.
-          defn register-index (l:CallLoc) -> Int :
-            match(l) :
-              (l:RegLoc) : num-floats-in-call-index - 1 - index(l)
-              (l:FRegLoc) : num-int-args-index - 1 - index(l)
-              (l:MemLoc) : num-float-args-index - 1 - index(l)
-              
-          ;Assign registers
-          for arg in args(records) do :
-            val r = register-index(loc(arg))
-            val v = value(arg) as StdArg|ShadowArg
-            val y = ys[index(v)]
-            set-reg(r, y)
-            
-          ;Set number of arguments
-          set-reg(num-stack-args-index, NumConst(num-mem-args(records)))
-          set-reg(num-float-args-index, NumConst(num-real-args(records)))
-          set-reg(num-int-args-index, NumConst(num-int-args(records) + 1))
-          set-reg(num-floats-in-call-index, NumConst(num-real-args(records)))              
-
-        ;Emit instructions for calling the C function f.
-        defn call-c-trampoline (f:VMImm) :
-          ;Compute the address of the function to call, and ensure it is
-          ;stored in a register.
-          ;Use Tmp1 is a register is needed.
-          val faddr = match(f) :
-            (f:Local) :
-              local(slot(f), reg(Tmp1))
-            (f:ExternId) :
-              mov(a, reg(Tmp1), extern-address(id(f)))
-              reg(Tmp1)
-          ;Call the C trampoline in a new stack frame.
-          simple-call-c-in-new-frame-from-jit-context(
-            false,
-            c-trampoline-addr(),
-            [faddr, reg(RegistersReg), reg(RegistersReg)])
-
-        ;Emit instructions for moving the return value to the
-        ;appropriate local.
-        defn move-return-to-local (records:CallCRecords, xs:Tuple<Local|VMType>) :
-          if not empty?(xs) :
-            val reg-index = match(return(records)) :
-              (l:RegLoc) : 0   ;c_trampoline puts integer return register in register[0]
-              (l:FRegLoc) : 1  ;c_trampoline puts float return register in register[1]
-            get-reg(xs[0], reg-index)
-
-        ;Driver
-        val records = compute-callc-records(xs(ins), ys(ins))
-        write-records-to-registers(records, ys(ins))
-        call-c-trampoline(f(ins))
-        move-return-to-local(records, xs(ins))
+        emit-callc(f(ins), xs(ins), ys(ins))
         
       (ins:YieldIns) :
         ;current-stack.pc = after-yield.
