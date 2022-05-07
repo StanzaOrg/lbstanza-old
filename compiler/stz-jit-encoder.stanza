@@ -1,0 +1,2651 @@
+defpackage stz/jit-encoder :
+  import core
+  import collections
+  import stz/vm-ir
+  import stz/typeset
+  import stz/vm-ids
+  import stz/basic-ops
+  import stz/call-records
+  import stz/backend
+  import stz/utils
+  import stz/set-utils
+  import stz/conversion-utils
+  import stz/dispatch-dag
+  import stz/asmjit
+  import core/stack-trace
+  import stz/vm-structures
+  import stz/vm-opcodes
+  import stz/code-table
+  import stz/jit-code-table
+
+;============================================================
+;===================== JIT Encoder ==========================
+;============================================================
+;This is a version of stz-vm-encoder.stanza that replaces only the
+;last step of encoding instructions for the VM with AsmJITing those
+;instructions into the x86 assembly code that implements the CVM
+;instruction defined in cvm.c.
+;
+;In particular it uses exactly the same vmstate structures with the
+;following minor differences:
+;- caches fewer fields in registers to conserve x86 registers
+;- caches first 2 VM registers and 3 locals in x86 registers
+;- uses ASMJit labels instead of buffer positions
+;- uses ASMJit Funcs for functions instead of buffer positions
+
+;============================================================
+;=================== Encoded Functions ======================
+;============================================================
+
+;Represents a single encoded VMFunction.
+public defstruct EncodedFunction :
+  func: Func
+  trace-entries: Vector<TraceTableEntry>
+
+;============================================================
+;=================== Configuration ==========================
+;============================================================
+
+val USE-REGS-FOR-LOCALS? = true  ;Use x86 registers for first few vm locals?
+val USE-REGS-FOR-VM-REGS? = true ;Use x86 registers for first few vm registers?
+
+;============================================================
+;=================== External Routines ======================
+;============================================================
+
+extern read_dispatch_table: (ptr<?>, int) -> int
+extern c_trampoline: (ptr<?>, ptr<?>, ptr<?>) -> int
+extern call_garbage_collector: (ptr<?>, long) -> int
+extern call_print_stack_trace: (ptr<?>, long) -> int
+extern call_collect_stack_trace: (ptr<?>, long) -> int
+
+lostanza defn c-trampoline-addr () -> ref<Long> :
+  return new Long{addr!(c_trampoline) as long}
+
+lostanza defn read-dispatch-table-addr () -> ref<Long> :
+  return new Long{addr!(read_dispatch_table) as long}
+
+lostanza defn call-garbage-collector-addr () -> ref<Long> :
+  return new Long{addr!(call_garbage_collector) as long}
+
+lostanza defn call-print-stack-trace-addr () -> ref<Long> :
+  return new Long{addr!(call_print_stack_trace) as long}
+
+lostanza defn call-collect-stack-trace-addr () -> ref<Long> :
+  return new Long{addr!(call_collect_stack_trace) as long}
+
+;============================================================
+;================== Register Conventions ====================
+;============================================================
+;Decide on which x86 registers to use for all our virtual machine
+;quantities. This is backend-specific. 
+;
+;# Notes about Assignment #
+;- X86 div and shl instructions uses RAX, RDX, RCX as special registers.
+;  If we assign these registers to be temporary registers, then they don't
+;  need to be saved/restored after using those instructions.
+;- compute-op2-with-rax-rdx assumes Tmp2 is not RAX/RDX
+;- compute-with-rcx assumes Tmp1 is not RCX
+
+deftype Registers
+
+;Return the x86 register selected for the given quantity.
+defmulti reg (r:Registers, reg-item:VMRegItem) -> Gp
+
+;Return the argument and return registers for C calling convention.
+defmulti callc-regs (r:Registers) -> Tuple<Gp>
+defmulti callc-return (r:Registers) -> Gp
+
+;The list of quantities that are held directly in
+;x86 registers.
+defenum VMRegItem :
+  VMStateReg       ;Holds vmstate
+  RegistersReg     ;Holds vmstate.registers
+  StackReg         ;Holds addr([vmstate.current-stack])
+  StackPointerReg  ;Holds vmstate.current-stack.stack-pointer
+  FunctionsReg     ;Holds vmstate.functions
+  Tmp1             ;Temporary register for instructions
+  Tmp2             ;Temporary register for instructions
+  Tmp3             ;Temporary register for instructions
+  Local1           ;Holds current-stack.stack-frame.slots[0]
+  Local2           ;Holds current-stack.stack-frame.slots[1]
+  Local3           ;Holds current-stack.stack-frame.slots[2]
+  VMReg1           ;Holds vmstate.registers[0]
+  VMReg2           ;Holds vmstate.registers[1]
+  VMReg3           ;Holds vmstate.registers[2]
+
+;Gather all the locals and vmregs that are in use.
+val LOCAL-ITEMS = [Local1, Local2, Local3] when USE-REGS-FOR-LOCALS? else []
+val VMREG-ITEMS = [VMReg1, VMReg2, VMReg3] when USE-REGS-FOR-VM-REGS? else []
+
+defn Registers (backend:Backend) -> Registers :
+  ;List registers in same order as stz-backend.stanza.
+  ;Must match stz-asm-emitter.stanza.
+  val reg-by-number = [rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15]
+
+  ;Declare assignments for each platform.
+  val reg-assignments = match(backend) :
+    (backend:W64Backend) :
+      [VMStateReg => r8
+       RegistersReg => r9
+       StackReg => r11
+       StackPointerReg => r10
+       FunctionsReg => r12
+       Tmp1 => rax
+       Tmp2 => rcx
+       Tmp3 => rdx
+       Local1 => r13
+       Local2 => r14
+       Local3 => r15
+       VMReg1 => rsi
+       VMReg2 => rdi
+       VMReg3 => rbx]
+    (backend:Backend) :
+      [VMStateReg => r8
+       RegistersReg => r9
+       StackReg => r11
+       StackPointerReg => r10
+       FunctionsReg => r12
+       Tmp1 => rax
+       Tmp2 => rcx
+       Tmp3 => rdx
+       Local1 => r13
+       Local2 => r14
+       Local3 => r15
+       VMReg1 => rsi
+       VMReg2 => rdi
+       VMReg3 => rbx]
+
+  ;C argument parameters
+  val callc-regs = for i in callc-regs(backend) map : reg-by-number[i]
+  val callc-return = reg-by-number[callc-ret(backend)]
+
+  ;Assign registers
+  val reg-assignments-map = Array<Gp>(VMRegItem-length)
+  for entry in reg-assignments do :
+    val i = to-int(key(entry))
+    reg-assignments-map[i] = value(entry)
+  defn reg (item:VMRegItem) -> Gp :
+    reg-assignments-map[to-int(item)]
+
+  ;Ensure that registers satisfy the invariants we need them to.
+  let :
+    ;Ensure that tmp2 is not rax/rdx.
+    if reg(Tmp2) == rax or reg(Tmp2) == rdx :
+      fatal("Tmp2 cannot be rax/rdx.")
+    ;Ensure that tmp1 is not rcx.
+    if reg(Tmp1) == rcx :
+      fatal("Tmp1 cannot be rcx.")    
+
+  ;Return structure
+  new Registers :
+    defmethod reg (this, item:VMRegItem) :
+      reg(item)
+    defmethod callc-regs (this) :
+      callc-regs
+    defmethod callc-return (this) :
+      callc-return  
+
+;============================================================
+;================ Small Utilities ===========================
+;============================================================
+;Collection of small non-code-generation utilities that are
+;reused later in the algorithm.
+
+;Retrieve the address of the EncodedFunction.
+public defn value (ef:EncodedFunction) -> Long :
+  value(func(ef) as Func)
+
+;Split a tuple of VMBranch into typesets and destinations
+defn split-types-and-dests (bs:Tuple<VMBranch>) -> [Tuple<Tuple<TypeSet>>, Tuple<Int>] :
+  val types = map(types, bs)
+  val targets = map(n, bs)
+  [types, targets]
+
+;Check whether type is final.
+;If the function returns true, it means that the type cannot be redefined.
+defn type-is-final? (resolver:EncodingResolver, t:TypeSet) :
+  match(t) :
+    (t:SingleType) : type-is-final?(resolver, type(t))
+    (t:OrType) : all?(type-is-final?{resolver, _}, types(t))
+    (t:AndType) : any?(type-is-final?{resolver, _}, types(t))
+    (t:TopType) : true
+
+;Check whether all types in branch are final.
+defn branch-is-final? (resolver:EncodingResolver, b:VMBranch) :
+  all?(type-is-final?{resolver, _}, types(b))
+
+;============================================================
+;============== Assembly Generation Utilities ===============
+;============================================================
+;The AsmGen utility handles all code generation when given the
+;context of the code:
+;- The information about the locals in the stack frame.
+;- The number of used locals.
+;- The identifiers of all used labels.
+;It does not handle the details of how to create this context.
+;It is used by the 'encode' function to encode a full VMFunction.
+;
+;## Notes on Representations of Locals ##
+;
+;A local is 64-bits.
+;
+;These 64-bits are used to represent the following types:
+;- byte
+;- int
+;- long
+;- ptr
+;- ref
+;- float
+;- double
+;
+;Floats are represented as [32-bits IGNORED, 32-bits IEEE float]
+;Doubles are represented as [64-bits IEEE double]
+;Ptrs/Refs are represented as [64-bit address]
+;Longs are represented as [64-bit number]
+;Int is represented as [32-bit integer sign-extended to 64-bits]
+;Byte is represented as [8-bit integer zero-extended to 64-bits]
+;
+;The conventions on the sign-extension/zero-extension for ints and
+;bytes are important because the primitive operations (e.g. less-than)
+;rely upon those representations.
+;
+;## Notes on Caching Strategy ##
+;
+;- All quantities maintain source-of-truth in in-memory structures.
+;- Small subsets of these structures are cached in registers for fast access.
+;
+;Individual Caching Strategy:
+;
+;- vmstate: VMStateReg
+;  JIT code assumes never modified.
+;  Needs to be loaded when entering JIT context.
+;
+;- vmstate.registers: RegistersReg
+;  JIT code assumes never modified.
+;  Swapped during extend-stack, and save/restore responsibility
+;  is delegated to those stubs.
+;
+;- vmstate.functions: FunctionsReg
+;  Modified by driver before launch.
+;  JIT code assumes never modified during execution.
+;
+;- vmstate.current_stack.stack_pointer: StackPointerReg
+;  JIT code assumes cached in register.
+;  Responsibility of JIT code to write to in-memory structure when leaving JIT context.
+;
+;- addr([vmstate.current_stack]): StackReg
+;  JIT code assumes cached in register.
+;  Needs to be loaded when entering JIT context.
+;  Never needs to be written to in-memory structure because vmstate.current_stack is not cached.
+;
+;- vmstate.current_stack.stack_pointer.locals[0 to n]: Locali
+;  JIT code for single function assumes cached in register.
+;  Needs to be written to in-memory structure when current stack frame changes. 
+;
+;- vmstate.registers[0 to n]: VMRegi
+;  JIT code assumes cached in register.
+;  Needs to be loaded/stored when entering JIT context.
+;  Swapped during extend-stack, and save/restore responsibility
+;  is delegated to those stubs.
+
+;Wrap all the assembly generation utilities here.
+deftype AsmGen
+defmulti emit-jit-launch (gen:AsmGen) -> False
+defmulti emit-extend-stack (gen:AsmGen) -> False
+defmulti emit-function-prelude (gen:AsmGen, args:Tuple<Local|VMType>, extend-stack:Func) -> False
+defmulti emit-multi-arity-dispatch (emit-arity-code:Int|False -> False, gen:AsmGen, arity-arg:Int, arities:Tuple<Int>) -> False
+defmulti emit-ins (gen:AsmGen, ins:VMIns) -> False
+defenum EnterExit: (Enter, Exit)
+
+;The information about a function's local frame.
+defstruct FuncInfo :
+  deftable:IntTable<VMDef>
+  used-labels:IntSet
+  max-local:Int
+  num-locals:Int
+
+defn AsmGen (code:CodeHolder,
+             a:Assembler,
+             resolver:EncodingResolver,
+             func-info:FuncInfo|False,
+             trace-entry-table:Vector<TraceTableEntry>|False,
+             backend:Backend) :
+
+  ;=========================================================
+  ;================ Registers ==============================
+  ;=========================================================
+  val registers = Registers(backend)
+  defn reg (item:VMRegItem) : /reg(registers, item)
+  defn callc-reg (i:Int) : callc-regs(registers)[i]
+  defn callc-ret () : callc-return(registers)
+
+  ;=========================================================
+  ;============== Function Stack Frame =====================
+  ;=========================================================
+  ;Force retrieve the input FuncInfo.
+  defn func-info! () -> FuncInfo :
+    if func-info is False :
+      fatal("No function information is given.")
+    func-info as FuncInfo
+
+  ;Retrieve the stack frame slot that the local is
+  ;stored in.
+  defn slot (l:Local) -> Int :
+    /local(deftable(func-info!())[index(l)])
+
+  ;Call slot if x is a Local otherwise return dummy value 0.
+  ;The dummy value is fine because in this case the instruction
+  ;doesn't have a return value anyway. 
+  defn slot? (x:Local|False) -> Int :
+    match(x:Local) : slot(x)
+    else : 0
+
+  ;Call slot if x is a Local otherwise return dummy value 0.
+  defn slot! (x:Local|False) -> Int :
+    match(x:Local) : slot(x)
+    else : fatal("x is expected to be a Local.")
+
+  ;Returns the number of locals in the current function frame.
+  defn num-locals () -> Int :
+    /num-locals(func-info!())
+
+  ;Returns the stack frame size in bytes given the number of locals
+  ;stored in it.
+  defn current-frame-size () -> Int :
+    SIZEOF-STACK-FRAME + num-locals() * SIZEOF-LONG
+
+  ;Return a temporary local slot.
+  defn temp-local (i:Int) -> Int :
+    fatal("Temporary local out of range.") when i > 2
+    max-local(func-info!()) + 1 + i
+
+  ;Retrieve type of immediate
+  defn imm-type (x:VMImm) :
+    match(x:Local) :
+      val deftable = deftable(func-info!())
+      type(deftable[index(x)])
+    else : type(x)
+  defn imm-type (x:VMType) :
+    x
+
+  ;Return the type of x if it is an immediate or false otherwise.
+  defn imm-type? (x:VMImm|False) -> VMType|False :
+    match(x:VMImm) : imm-type(x)
+
+  ;=========================================================
+  ;==================== Labels =============================
+  ;=========================================================
+  val label-table = IntTable<Label>()
+  val label-counter = to-seq(0 to false)
+  
+  ;Return the AsmJIT Label corresponding to the VM label
+  ;with the given identifier.
+  defn get-label (n:Int) -> Label :
+    if not key?(label-table, n) :
+      label-table[n] = new-label(a)
+    label-table[n]
+
+  ;Return each AsmJIT label corresponding to the given
+  ;identifiers.
+  defn get-labels (ns:Seqable<Int>) -> Tuple<Label> :
+    to-tuple(seq(get-label, ns))
+
+  ;Generate new unique label.
+  defn* gen-label () -> Int :
+    val l = next(label-counter)
+    val used-labels = used-labels(func-info!())
+    gen-label() when used-labels[l] else l  
+
+  ;=========================================================
+  ;================= Stack Trace Table =====================
+  ;=========================================================
+  ;Add the given instruction location to the stack trace table.
+  defn record-trace-entry (pos:Label, entry:StackTraceEntry|False) :
+    fatal("No trace table given.") when trace-entry-table is False
+    val table = trace-entry-table as Vector<TraceTableEntry>
+    match(entry:StackTraceEntry) :
+      val offset = label-offset(code, pos)      
+      add(table, TraceTableEntry(offset, entry))
+
+  ;=========================================================
+  ;================ Structure Accessors ====================
+  ;=========================================================
+
+  ;Set and Get all the structure fields. 
+  defn struct-get (base:VMRegItem, offset:Int, dst:Gp) -> Gp :
+    mov(a, dst, MemPtr(reg(base), offset))
+  defn struct-set (base:VMRegItem, offset:Int, value:Gp) :
+    mov(a, MemPtr(reg(base), offset), value)
+
+  #for (get-field in [get-vmstate-registers
+                      get-vmstate-global-offsets
+                      get-vmstate-global-mem
+                      get-vmstate-const-table
+                      get-vmstate-const-mem
+                      get-vmstate-data-offsets
+                      get-vmstate-data-mem
+                      get-vmstate-functions
+                      get-vmstate-heap
+                      get-vmstate-heap-top
+                      get-vmstate-heap-limit
+                      get-vmstate-heap-bitset-base
+                      get-vmstate-current-stack
+                      get-vmstate-system-stack
+                      get-vmstate-system-registers
+                      get-return
+                      get-liveness-map
+                      get-stack-size
+                      get-stack-frames
+                      get-stack-pointer
+                      get-stack-pc]
+        set-field in [set-vmstate-registers
+                      set-vmstate-global-offsets
+                      set-vmstate-global-mem
+                      set-vmstate-const-table
+                      set-vmstate-const-mem
+                      set-vmstate-data-offsets
+                      set-vmstate-data-mem
+                      set-vmstate-functions
+                      set-vmstate-heap
+                      set-vmstate-heap-top
+                      set-vmstate-heap-limit
+                      set-vmstate-heap-bitset-base
+                      set-vmstate-current-stack
+                      set-vmstate-system-stack
+                      set-vmstate-system-registers
+                      set-return
+                      set-liveness-map
+                      set-stack-size
+                      set-stack-frames
+                      set-stack-pointer
+                      set-stack-pc]
+        BaseReg in [VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    VMStateReg
+                    StackPointerReg
+                    StackPointerReg
+                    StackReg
+                    StackReg
+                    StackReg
+                    StackReg]
+        OFFSET in [VMSTATE-REGISTERS-OFFSET
+                   VMSTATE-GLOBAL-OFFSETS-OFFSET
+                   VMSTATE-GLOBAL-MEM-OFFSET
+                   VMSTATE-CONST-TABLE-OFFSET
+                   VMSTATE-CONST-MEM-OFFSET
+                   VMSTATE-DATA-OFFSETS-OFFSET
+                   VMSTATE-DATA-MEM-OFFSET
+                   VMSTATE-CODE-OFFSETS-OFFSET
+                   VMSTATE-HEAP-START-OFFSET
+                   VMSTATE-HEAP-TOP-OFFSET
+                   VMSTATE-HEAP-LIMIT-OFFSET
+                   VMSTATE-HEAP-BITSET-BASE-OFFSET
+                   VMSTATE-CURRENT-STACK-OFFSET
+                   VMSTATE-SYSTEM-STACK-OFFSET
+                   VMSTATE-SYSTEM-REGISTERS-OFFSET
+                   STACK-FRAME-RETURN-OFFSET
+                   STACK-FRAME-LIVENESS-MAP-OFFSET
+                   STACK-SIZE-OFFSET
+                   STACK-FRAMES-OFFSET
+                   STACK-STACK-POINTER-OFFSET
+                   STACK-PC-OFFSET]) :
+    defn get-field (dst:Gp) :
+      struct-get(BaseReg, OFFSET, dst)
+    defn set-field (value:Gp) :
+      struct-set(BaseReg, OFFSET, value)
+
+  ;Returns the location of the i'th local stored in the
+  ;current stack frame. 
+  defn stack-local (i:Int) -> Gp|MemPtr :
+    if i < length(LOCAL-ITEMS) : reg(LOCAL-ITEMS[i])
+    else : stack-local-mem(i)
+  defn stack-local-mem (i:Int) -> MemPtr :
+    MemPtr(reg(StackPointerReg), i * SIZEOF-LONG + STACK-FRAME-SLOTS-OFFSET)
+
+  ;Returns the stack-local in a register.
+  ;Use the given temporary register if necessary.
+  defn stack-local (i:Int, tmp:Gp) -> Gp :
+    match(stack-local(i)) :
+      (r:Gp) :
+        r
+      (m:MemPtr) :
+        mov(a, tmp, m)
+        tmp
+
+  ;Retrieve the i'th cached local and interpret it as a floating point value.
+  ;Uses int-temp as a temporary register that is used if the local is not
+  ;cached already in an x86 register. The result is stored in the given
+  ;Xmm register.
+  defn stack-local-float (i:Int, xmm:Xmm, size:Int) -> Xmm :
+    switch(size) :
+      4 : movss(a, xmm, stack-local(i))
+      8 : movsd(a, xmm, stack-local(i))
+    xmm
+
+  ;Retrieve the location of the i'th vm register.
+  defn vm-register (i:Int) -> Gp|MemPtr :
+    if i < length(VMREG-ITEMS) : reg(VMREG-ITEMS[i])
+    else : vm-register-mem(i)
+  defn vm-register-mem (i:Int) -> MemPtr :
+    MemPtr(reg(RegistersReg), i * SIZEOF-LONG)
+
+  ;Retrieve the location of the i'th vm register.
+  ;Use the given temporary register if necessary.
+  defn vm-register (i:Int, tmp:Gp) -> Gp :
+    match(vm-register(i)) :
+      (r:Gp) :
+        r
+      (m:MemPtr) :
+        mov(a, tmp, m)
+        tmp
+
+  ;Return the location of the function with given id 'base + delta'.
+  ;- delta is used for method dispatch.
+  defn vm-function (fid:Gp|Int, delta:Int) -> MemPtr :
+    match(fid) :
+      (fid:Gp) : MemPtr(reg(FunctionsReg), fid, 3, delta * SIZEOF-LONG)
+      (fid:Int) : MemPtr(reg(FunctionsReg), (fid + delta) * SIZEOF-LONG)
+
+  ;------------------------------------------------------------
+  ;----------- Saved in Launcher's Stack Frame ----------------
+  ;------------------------------------------------------------
+  ;The launcher stores:
+  ;  VMState at RSP[8]
+  ;  CRSP at RSP[0]
+  defn saved-vmstate () : MemPtr(rsp, 8)
+  defn saved-crsp () : MemPtr(rsp, 0)
+
+  ;=========================================================
+  ;========= Switching Contexts and Cache Registers ========
+  ;=========================================================
+  ;See note about Caching Strategy to understand why
+  ;which quantities are saved under which context switches.
+  ;
+  ;Go from Stanza into JIT code. (Used by launcher, callc.)
+  defn switch-context-stanza-to-jit (dir:EnterExit, has-locals?:True|False) :
+    switch(dir) :
+      Enter :
+        do(restore-reg, [VMStateReg, RegistersReg, FunctionsReg, StackReg, StackPointerReg])
+        restore-vm-registers-cache()
+        restore-locals-cache() when has-locals?
+      Exit :
+        save-locals-cache() when has-locals?
+        save-vm-registers-cache()
+        save-reg(StackPointerReg)
+
+  ;Switch from Standard JIT code to the system stack.
+  ;Uses Tmp1, Tmp2 internally.
+  defn switch-context-jit-to-system (dir:EnterExit) :
+    switch(dir) :
+      Enter :
+        ;Save the current state.
+        save-vm-registers-cache()
+        save-reg(StackPointerReg)
+        ;Swap stack and registers.
+        swap-stack-and-registers()
+        ;Load the state.
+        do(restore-reg, [RegistersReg, StackReg])
+        get-stack-frames(reg(StackPointerReg))
+      Exit :
+        ;Stack pointer no longer needed.
+        mov(a, reg(StackPointerReg), 0L)
+        save-reg(StackPointerReg)
+        ;Swap stack and registers
+        swap-stack-and-registers()
+        ;Load the state.
+        do(restore-reg, [RegistersReg, StackReg, StackPointerReg])
+        restore-vm-registers-cache()
+
+  ;Go from the current stack frame into another stack frame.
+  ;E.g. when calling a function.
+  defn switch-context-new-frame (dir:EnterExit) :
+    switch(dir) :
+      Enter : save-locals-cache()
+      Exit : restore-locals-cache()
+
+  ;Go from the current stack to another stack.
+  ;- newly-created-stack?: True to indicate that the stack was freshly created,
+  ;  and thus stack.stack-pointer is null.
+  defn switch-context-new-stack (dir:EnterExit, newly-created-stack?:True|False) :
+    switch(dir) :
+      Enter :
+        save-locals-cache()
+        save-reg(StackPointerReg)
+      Exit :
+        restore-reg(StackReg)
+        if newly-created-stack? : get-stack-frames(reg(StackPointerReg))
+        else : restore-reg(StackPointerReg)
+        restore-locals-cache()
+
+  ;Swap the current stack and registers with the system stack and registers.
+  ;Uses Tmp1 and Tmp2 internally.
+  defn swap-stack-and-registers () :
+    ;Swap the stack
+    get-vmstate-current-stack(reg(Tmp1))
+    get-vmstate-system-stack(reg(Tmp2))
+    set-vmstate-current-stack(reg(Tmp2))
+    set-vmstate-system-stack(reg(Tmp1))
+    ;Swap the registers
+    get-vmstate-registers(reg(Tmp1))
+    get-vmstate-system-registers(reg(Tmp2))
+    set-vmstate-registers(reg(Tmp2))
+    set-vmstate-system-registers(reg(Tmp1))
+
+  defn restore-locals-cache () :
+    for i in 0 to length(LOCAL-ITEMS) do :
+      mov(a, stack-local(i) as Gp, stack-local-mem(i))
+
+  defn save-locals-cache () :
+    for i in 0 to length(LOCAL-ITEMS) do :
+      mov(a, stack-local-mem(i), stack-local(i) as Gp)
+
+  defn restore-vm-registers-cache () :
+    for i in 0 to length(VMREG-ITEMS) do :
+      mov(a, vm-register(i) as Gp, vm-register-mem(i))
+
+  defn save-vm-registers-cache () :
+    for i in 0 to length(VMREG-ITEMS) do :
+      mov(a, vm-register-mem(i), vm-register(i) as Gp)
+
+  defn restore-reg (item:VMRegItem) :
+    switch(item) :
+      VMStateReg :
+        mov(a, reg(item), saved-vmstate())
+      RegistersReg :
+        get-vmstate-registers(reg(item))
+      FunctionsReg :
+        get-vmstate-functions(reg(item))
+      StackReg :
+        get-vmstate-current-stack(reg(item))
+        untag-ref-to-struct-pointer(reg(item))
+      StackPointerReg :
+        get-stack-pointer(reg(item))
+
+  defn save-reg (item:VMRegItem) :
+    switch(item) :
+      RegistersReg :
+        set-vmstate-registers(reg(item))
+      StackPointerReg :
+        set-stack-pointer(reg(item))
+
+  ;=========================================================
+  ;================ Small Assembly Utilities ===============
+  ;=========================================================
+  ;These are small utilities that generate short assembly
+  ;snippets that are called from multiple places.
+  ;Does not rely upon logic for VMImm.
+
+  ;Compute the current stack limit.
+  ;Uses TMP1-REG internally.
+  defn compute-stack-limit (dst:Gp) -> Gp :
+    get-stack-frames(dst)
+    get-stack-size(reg(Tmp1))
+    add(a, dst, reg(Tmp1))
+    dst
+
+  ;Emit code to move from location y into location x.
+  ;If both x and y are memory locations then perform the move by
+  ;temporarily loading into the given temporary register.
+  defn mov-using-tmp (x:Gp|MemPtr, y:Gp|MemPtr|Long, tmp:Gp) :
+    match(x, y) :
+      (x:MemPtr, y:MemPtr|Long) :
+        mov(a, tmp, y)
+        mov(a, x, tmp)
+      (x, y) :
+        mov(a, x, y)
+
+  ;Given that value is a tagged reference to a heap object: ref<MyObject>.
+  ;This value will be tagged with the 1 tagbit.
+  ;Retrieve a pointer to the struct: ptr<MyObject>.
+  ;This is done by removing the tagbit and then incrementing past the header
+  ;word of the object.
+  defn untag-ref-to-struct-pointer (dst:Gp) -> False :
+    add(a, dst, object-header-size(resolver) - ref-offset(resolver))
+    false
+
+  ;Emit instructions to add the given tagbits to the
+  ;LoStanza value held in x.
+  defn add-tag (x:Gp, tag:Int) :
+    shl(a, x, 32)
+    add(a, x, tag) when tag != 0
+
+  ;Jump to function with id 'func-id + add-to-id'.
+  ;- add-to-id: Meant to be used by method dispatch.
+  ;Uses Tmp1 internally.
+  defn goto-function (func-id:Gp|Int, add-to-id:Int) :
+    mov(a, reg(Tmp1), vm-function(func-id, add-to-id))
+    jmp(a, reg(Tmp1))
+
+  ;Perform a simple C call.
+  ;Call faddr with arguments 'args'.
+  ;Put return result in given register.
+  defn simple-c-call (ret:Gp|False, faddr:Long, args:Tuple<Gp>) :
+    ;Ensure we can handle this case.
+    if length(args) > length(callc-regs(registers)) :
+      fatal("Too many arguments for simple C calling convention.")
+      
+    ;Ensure 1-by-1 moves are enough to implement parallel-move semantics.
+    for i in 1 to length(args) do :
+      val argi = args[i]
+      for j in 0 to i do :
+        if callc-regs(registers)[j] == argi :
+          fatal("Argument %_ in register %_ has already been overwritten by \
+                 argument %_." % [i, argi, j])
+
+    ;We will store the function address in the return register
+    ;to call it. So make sure the return register is not one
+    ;of the argument registers.
+    if contains?(callc-regs(registers), callc-return(registers)) :
+      fatal("The return register was not expected to be one of the \
+             calling registers.")
+                 
+    ;Move the arguments into their proper locations.
+    for (param in callc-regs(registers), arg in args) do :
+      mov(a, param, arg)
+      
+    ;Call the function
+    if c-num-spill-slots(backend) > 0 :
+      sub(a, rsp, c-num-spill-slots(backend) * 8)
+    mov(a, callc-return(registers), faddr)
+    call(a, callc-return(registers))
+    if c-num-spill-slots(backend) > 0 :
+      add(a, rsp, c-num-spill-slots(backend) * 8)
+    
+    ;Move the result to the desired register
+    match(ret:Gp) :
+      if ret != callc-return(registers) :
+        mov(a, ret, callc-return(registers))
+
+  ;Assume that we are in the standard JIT context, emit code to
+  ;call faddr with args. If ret is provided, then store result in ret afterwards.  
+  defn simple-call-c-from-jit-context (ret:Gp|False, faddr:Long, args:Tuple<Gp>) :
+    switch-context-stanza-to-jit(Exit, true)
+    simple-c-call(ret, faddr, args)
+    switch-context-stanza-to-jit(Enter, true)
+
+  ;Assume that we are in a standard JIT context, emit code to call
+  ;faddr with args. If ret is provided, then store result in ret afterwards.
+  ;This call will close the current stack frame and perform the call in a new stack frame.
+  defn simple-call-c-in-new-frame-from-jit-context (ret:Gp|False, faddr:Long, args:Tuple<Gp>) :
+    switch-context-new-frame(Enter)
+    add(a, reg(StackPointerReg), current-frame-size())
+    switch-context-stanza-to-jit(Exit, false)
+    simple-c-call(ret, faddr, args)
+    switch-context-stanza-to-jit(Enter, false)
+    sub(a, reg(StackPointerReg), current-frame-size())
+    switch-context-new-frame(Exit)
+
+  ;Emit code to call faddr.
+  ;Uses Tmp1 internally, so fid cannot be in Tmp1.
+  ;Returns the return address that is pushed to the stack for this
+  ;call.
+  defn call-from-jit-context (fid:Gp|Int) -> Label :
+    fatal("Tmp1 is already used internally.") when fid == reg(Tmp1)
+    val after-call-label = new-label(a)
+    switch-context-new-frame(Enter)
+    add(a, reg(StackPointerReg), current-frame-size())
+    lea(a, reg(Tmp1), MemPtr(after-call-label))
+    set-return(reg(Tmp1))
+    goto-function(fid, 0)
+    bind(a, after-call-label)
+    sub(a, reg(StackPointerReg), current-frame-size())
+    switch-context-new-frame(Exit)
+    after-call-label
+
+  ;Returns the stack-local in a register.
+  ;Use the given temporary register if necessary.
+  defn local (i:Int, tmp:Gp) -> Gp :
+    match(stack-local(i)) :
+      (r:Gp) :
+        r
+      (m:MemPtr) :
+        mov(a, tmp, m)
+        tmp
+
+  ;Retrieve the i'th cached local and interpret it as a floating point value.
+  ;Uses int-temp as a temporary register that is used if the local is not
+  ;cached already in an x86 register. The result is stored in the given
+  ;Xmm register.
+  defn local-float (i:Int, xmm:Xmm, size:Int) -> Xmm :
+    switch(size) :
+      4 : movss(a, xmm, stack-local(i))
+      8 : movsd(a, xmm, stack-local(i))
+    xmm
+
+  ;Apply zero-padding or sign-extension to obey the bitwidth of the result.
+  defn ensure-width (r:Gp, size:Int) :
+    switch(size) :
+      1 : and-op(a, r, 0xFF)
+      4 : movsxd(a, r, r)
+      8 : false
+
+  ;Set the local in given slot to the given value.
+  ;Uses sign-extension or zero-padding to represent
+  ;value in 64-bits.
+  ;For convenience, slot may be False, in which case
+  ;nothing is done.
+  defn set-local (slot:Int|False, v:Gp, size:Int) -> False :
+    match(slot:Int) :
+      ensure-width(v, size)
+      mov(a, stack-local(slot), v)
+      false
+
+  ;Update the i'th stack local.
+  ;- f: The operation for storing into the local register.
+  ;If the local is cached in x86 register, then f is called to update
+  ;the value in that register.
+  ;If the local is in memory, then f is called and requested to store
+  ;its result in a temporary register. The temporary register is then
+  ;stored back into memory.
+  defn update-local (f:Gp -> ?, i:Int, temp:Gp, size:Int) -> False :
+    match(stack-local(i)) :
+      (r:Gp) :
+        f(r)
+        ensure-width(r,size)
+      (mem:MemPtr) :
+        f(temp)
+        ensure-width(temp,size)
+        mov(a, mem, temp)
+    false
+
+  ;Set the local in given slot to the given value.
+  ;Uses sign-extension or zero-padding to represent
+  ;value in 64-bits.
+  defn set-local-using-tmp (slot:Int, v:MemPtr|Long, size:Int, tmp:Gp) -> False :
+    match(stack-local(slot)) :
+      (r:Gp) :
+        set-local(slot, r, size)
+      (r:MemPtr) :
+        mov(a, tmp, v)
+        set-local(slot, tmp, size)
+
+  ;Set the local in given slot to the given value.
+  ;Uses sign-extension or zero-padding to represent
+  ;value in 64-bits.
+  defn set-local-float (slot:Int, v:Xmm, size:Int) -> False :
+    switch(size) :
+      4 : movss(a, stack-local(slot), v)
+      8 : movsd(a, stack-local(slot), v)
+    false        
+
+  ;Put y, z, locals into registers, and chooses a result register to
+  ;store x, and calls f with the resulting registers.
+  ;Guarantees that the xregister is not the same as the y or z registers.
+  ;The given size indicates that size of the result, and it is padded or sign-extended to fit
+  ;the 64-bit local.
+  ;- f(xreg, yreg, zreg): The callback accepting the registers for x, y, and z.
+  defn compute-op2-with-temp-regs (f:(Gp, Gp, Gp) -> ?, x:Int, y:Int, z:Int, size:Int) :
+    ;Retrieve y and z as registers.
+    val yloc = stack-local(y,reg(Tmp2))
+    val zloc = stack-local(z,reg(Tmp3))
+    
+    ;Put x into reg(Tmp1), and then store reg(Tmp1) into memory.
+    defn compute-with-x-in-tmp1 () :
+      f(reg(Tmp1), yloc, zloc)
+      ensure-width(reg(Tmp1), size)
+      mov(a, stack-local(x), reg(Tmp1))
+
+    ;x is cached in a register, so provide this register to f directly.
+    defn compute-with-x-directly (xreg:Gp) :
+      f(xreg, yloc, zloc)
+      ensure-width(xreg, size)
+
+    ;Check whether x is cached in a register.
+    match(stack-local(x)) :
+      (xreg:Gp) :
+        ;Check whether x is in the same register as either y or z.
+        if xreg == yloc or xreg == zloc : compute-with-x-in-tmp1()
+        else : compute-with-x-directly(xreg)
+      (xmem:MemPtr) :
+        compute-with-x-in-tmp1()
+
+  ;Put x and y locals into registers, and call f.
+  defn compute-branch-with-temp-regs (f:(Gp,Gp) -> ?, x:Int, y:Int) :
+    f(stack-local(x, reg(Tmp1)),
+      stack-local(y, reg(Tmp2)))
+
+  ;Put y and z into floating-point registers with 'size-of-args' bytes, and calls f with the chosen registers.
+  ;The result of f is assumed to be result of the floating-point computation, and this register is then
+  ;stored back into the x local.
+  ;'size-of-result' indicates the number of bytes of the result.
+  ;Usually, 'size-of-args' is equal to 'size-of-result'. An example of
+  ;an exception is for comparison operators for floats. The arguments are floats and therefore 4-bytes,
+  ;but the result is a long and therefore 8-bytes.
+  defn compute-op2-with-temp-fregs (f:(Xmm, Xmm) -> Xmm, x:Int, y:Int, z:Int, size-of-args:Int, size-of-result:Int) :
+    val yloc = local-float(y,xmm0,size-of-args)
+    val zloc = local-float(z,xmm1,size-of-args)
+    val result = f(yloc, zloc)
+    set-local-float(x, result, size-of-result)
+
+  ;Put y and z into floating-point registers with 'size-of-args' bytes, and chooses a result register to store x, and
+  ;calls f with the chosen registers.
+  ;'size-of-result' indicates the number of bytes of the result.
+  ;Usually, 'size-of-args' is equal to 'size-of-result'. An example of
+  ;an exception is for comparison operators for floats. The arguments are floats and therefore 4-bytes,
+  ;but the result is a long and therefore 8-bytes.
+  defn compute-op2-with-temp-fregs (f:(Gp, Xmm, Xmm) -> ?, x:Int, y:Int, z:Int, size-of-args:Int, size-of-result:Int) :
+    val yloc = local-float(y,xmm0,size-of-args)
+    val zloc = local-float(z,xmm1,size-of-args)
+    within xreg = update-local(x, reg(Tmp1), size-of-result) :
+      f(xreg, yloc, zloc)
+
+  ;Reserves RAX and RDX for use by f, and provides one additional tempory register to f.
+  ;f must return the register holding the result.
+  ;This result is stored back into the x local.
+  defn compute-with-rax-rdx (f:Gp -> Gp, x:Int, size:Int) :
+    ;Tmp2 is not rax or rdx. 
+    set-local(x, f(reg(Tmp2)), size)
+
+  ;Reserves RCX for use by f, and chooses a result register for x.
+  ;f is given the result register for x and must store its result into it.
+  defn compute-with-rcx (f:Gp -> ?, x:Int, size:Int) :
+    ;Tmp1 is not rcx
+    update-local(f, x, reg(Tmp1), size)
+
+  ;Create a register with the given size and base register.
+  defn gp (reg:Gp, size:Int) -> Gp :
+    switch(size) :
+      SIZEOF-BYTE : gp8(reg)
+      SIZEOF-INT  : gp32(reg)
+      SIZEOF-LONG : gp64(reg)
+
+  ;Emit instructions for:
+  ;  x = x to ref<True|False>
+  ;Where x is either 1 or 0.
+  defn bit-to-boolref (x:Gp) -> False :
+    shl(a, x, 3)
+    add(a, x, marker(resolver,0))
+    false
+
+  ;Emit instructions for:
+  ;  z = cmp x y
+  ;z is ref<True> if comparison returns true or ref<False> otherwise.
+  ;set-bit is expected to be: set-e, set-le, set-g, set-be, etc.
+  defn boolref-cmp-set (x:Gp, y:Gp, z:Gp, set-bit:(Assembler, Gp) -> False) -> False :
+    cmp(a, x, y)
+    mov(a, z, 0)
+    set-bit(a, gp8(z))
+    bit-to-boolref(z)
+
+  ;Emit instructions for:
+  ;  z = cmp x y
+  ;set-bit is expected to be: set-e, set-le, set-g, set-be, etc.
+  ;size is the bitwidth of x and y.
+  defn cmp-set (x:Gp, y:Gp, z:Gp, set-bit:(Assembler, Gp) -> False, size:Int) -> False :
+    cmp(a, gp(x,size), gp(y,size))
+    mov(a, z, 0)
+    set-bit(a, gp8(z))
+
+  ;Emit instructions for:
+  ;  z = cmpf x y
+  ;set-bit is expected to be: set-e, set-le, set-g, set-be, etc.
+  ;size is the bitwidth of x and y.
+  defn cmpf-set (x:Xmm, y:Xmm, z:Gp, set-bit:(Assembler, Gp) -> False, size:Int) -> False :
+    switch(size) :
+      4 : ucomiss(a, x, y)
+      8 : ucomisd(a, x, y)
+    mov(a, z, 0)
+    set-bit(a, gp8(z))
+
+  ;=========================================================
+  ;=================== Immediates ==========================
+  ;=========================================================
+  ;Assign the given location to the immediate v.
+  defn set-imm (x:Gp|MemPtr, v:VMImm) :
+    ;Move value into x
+    defn mov-to-x (v:Gp|MemPtr|Int|Long, signed?:True|False) :
+      match(v, signed?) :
+        (v:Int, signed?:False) : mov-to-x(to-long(v) & 0xFFFFFFFFL, false)
+        (v:Int, signed?:True) : mov-to-x(to-long(v), false)
+        (v:Gp|MemPtr|Long, signed?) : mov-using-tmp(x, v, reg(Tmp1))
+    ;Dispatch based upon type of value.
+    match(v) :
+      ;Immediates that don't require temporary registers to
+      ;retrieve. 
+      (v:Local) :
+        mov-to-x(stack-local(slot(v)), false)
+      (v:NumConst) :
+        match(value(v)) :
+          (v:Char) : mov-to-x(to-int(v), false)
+          (v:Byte) : mov-to-x(to-int(v), false)
+          (v:Int) : mov-to-x(v, true)
+          (v:Long) : mov-to-x(v, true)
+          (v:Float) : mov-to-x(bits(v), false)
+          (v:Double) : mov-to-x(bits(v), false)
+      (v:Marker) : mov-to-x(marker(resolver, typeid(v)), false)
+      (v:Tag) : mov-to-x(typeid(v), false)
+      (v:VoidMarker) : mov-to-x(void-marker(resolver), true)
+      (v:CodeId) : mov-to-x(id(v), false)
+      (v:ExternId) : mov-to-x(extern-address(id(v)), false)
+      
+      ;Immediates that require temporary registers to retrieve.
+      ;Uses Tmp1 and Tmp2
+      (v:GlobalId) :
+        ;TMP1:int = global-offset[v]        
+        get-vmstate-global-offsets(reg(Tmp2))
+        mov(a, reg(Tmp1), MemPtr(reg(Tmp2), id(v) * SIZEOF-LONG, SIZEOF-LONG))
+        ;x = addr(global-mem[TMP1])
+        get-vmstate-global-mem(reg(Tmp2))
+        lea(a, reg(Tmp2), MemPtr(reg(Tmp2), reg(Tmp1), 0, 0))
+        mov-to-x(reg(Tmp2), false)
+      (v:DataId) :
+        ;TMP1:int = data-offsets[v]
+        get-vmstate-data-offsets(reg(Tmp2))
+        mov(a, gp32(reg(Tmp1)), MemPtr(reg(Tmp2), id(v) * SIZEOF-INT, SIZEOF-INT))
+        ;x = addr(data-mem[TMP1])
+        get-vmstate-data-mem(reg(Tmp2))
+        lea(a, reg(Tmp2), MemPtr(reg(Tmp2), gp32(reg(Tmp1)), 3, 0))
+        mov-to-x(reg(Tmp2), false)
+      (v:ConstId) : 
+        get-vmstate-const-table(reg(Tmp2))
+        mov-to-x(MemPtr(reg(Tmp2), id(v) * SIZEOF-LONG, SIZEOF-LONG), false)
+
+  ;Set the i'th register.
+  defn set-reg (i:Int, v:VMImm) :
+    set-imm(vm-register(i), v)
+
+  ;Set the registers sequentially.
+  defn set-regs (vs:Seqable<VMImm>) :
+    do(set-reg, 0 to false, vs)
+
+  ;Retrieve value in register i and put in given local x (if not VMType).
+  ;Uses Tmp1 as temporary register.
+  defn get-reg (x:Local|VMType, i:Int) :
+    match(x:Local) :
+      mov-using-tmp(stack-local(slot(x)), vm-register(i), reg(Tmp1))
+      
+  ;Retrieve value in register 0 to n and put in given locals xs (if not VMType).
+  defn get-regs (xs:Seqable<Local|VMType>) :
+    do(get-reg, xs, 0 to false)
+
+  ;Set the i'th local.
+  defn set-local (slot:Int, x:VMImm) :
+    set-imm(stack-local(slot), x)
+
+  ;Put immediate in temporary local if it is not already a local.
+  ;Returns the slot that the immediate is in.
+  ;- num: An integer in [0 through 2] that indicates which
+  ;  temporary local to use.
+  defn to-local (x:VMImm, num:Int) -> Int :
+    match(x:Local) :
+      slot(x)
+    else : 
+      val index = temp-local(num)
+      set-local(index, x)
+      index
+
+  ;=========================================================
+  ;============= Automatic Stack Extension Stub ============
+  ;=========================================================
+  ;This stub function is used to automatically extend the stack.
+  ;It switches the current stack and registers with the system stack and registers and calls
+  ;'extend-stack'.
+  ;The stub expects the following inputs:
+  ;- return (TMP2-REG): The address to return to after stack extension is completed.
+  ;- size-required (TMP3-REG): The number of additional bytes required from the stack.
+  defn make-extend-stack-stub () : 
+    ;Save the return address in current-stack.pc.
+    set-stack-pc(reg(Tmp2))
+
+    ;Switch to system context.
+    switch-context-jit-to-system(Enter)
+
+    ;Set return address
+    val return-from-stack-extension = new-label(a)
+    lea(a, reg(Tmp1), MemPtr(return-from-stack-extension))
+    set-return(reg(Tmp1))
+
+    ;Jump to EXTEND-STACK-FN.
+    ;Set Regs = [false, 1, size-required].
+    mov-using-tmp(vm-register(0), to-long(false-marker(resolver)), reg(Tmp1))
+    mov-using-tmp(vm-register(1), 1L, reg(Tmp1))
+    mov(a, vm-register(2), reg(Tmp3))
+    mov(a, reg(Tmp1), vm-function(EXTEND-STACK-FN, 0))
+    jmp(a, reg(Tmp1))
+
+    ;Return from extension function.
+    bind(a, return-from-stack-extension)
+
+    ;Switch back to standard JIT context.
+    switch-context-jit-to-system(Exit)
+
+    ;Return to instructions
+    get-stack-pc(reg(Tmp1))
+    jmp(a, reg(Tmp1))
+
+  ;============================================================
+  ;================ Launcher Stub Function ====================
+  ;============================================================
+  ;This launcher stub will be called using the C-calling convention with
+  ;three arguments:
+  ;- VMSTATE: The address of the VMState structure.
+  ;- CRSP: The current value of the C stack register as saved by Stanza.
+  ;  This is retrieved by the CRSPOp() instruction.
+  ;- FID: The identifier of the VM function to execute.
+  ;Arguments:
+  ;- vms: The address of the VMState structure.
+
+  ;Note about alignment:
+  ;1) On entry into the launcher, according to the System-V convention,
+  ;   RSP will be 0x???????8, because RSP is guaranteed to be 16-byte aligned
+  ;   before the CALL instruction.
+  ;2) Therefore we need to push an odd number of items onto the stack to
+  ;   ensure that our own CALL instructions are 16-byte aligned.
+  defn make-jit-launch-stub () :
+    ;Save incoming arguments
+    push(a, reg(Tmp1))                 ;Save Dummy for 16-byte stack alignment.
+    push(a, callc-reg(0))              ;Save VMState (Arg0)
+    push(a, callc-reg(1))              ;Save CRSP (Arg1) for access from crsp instruction.
+    mov(a, reg(Tmp3), callc-reg(2))    ;Save FID (Arg2) in Tmp3
+
+    ;Enter the standard JIT context
+    switch-context-stanza-to-jit(Enter, false)
+
+    ;Write the return address before jumping to the
+    ;function enter point.
+    val return-to-stanza-label = new-label(a)            ;stackframe.returnpc = return-to-stanza-label
+    lea(a, reg(Tmp1), MemPtr(return-to-stanza-label))
+    set-return(reg(Tmp1))
+    
+    ;Jump to the entry point of the initial function.
+    mov(a, reg(Tmp1), vm-function(reg(Tmp3), 0))
+    jmp(a, reg(Tmp1))                           
+
+    ;Return from the initial function.
+    bind(a, return-to-stanza-label)
+
+    ;Exit the JIT context and return to Stanza
+    switch-context-stanza-to-jit(Exit, false)
+
+    ;Pop all information we pushed onto the stack.
+    pop(a, reg(Tmp1)) ;POP CRSP (Unused).
+    pop(a, reg(Tmp1)) ;POP VMState (Unused).
+    pop(a, reg(Tmp1)) ;POP Dummy
+    
+    ;Return from to NonJITContext.
+    ret(a)
+
+  ;=========================================================
+  ;=================== Dispatch ============================
+  ;=========================================================
+  ;Emit instructions for reading the dispatch table with the current
+  ;values in the vmstate.registers array.
+  ;Uses Tmp1 internally.
+  defn read-dispatch-table (dst:Gp, format:Int) -> False :
+    mov(a, reg(Tmp1), format)
+    val args = [reg(VMStateReg), reg(Tmp1)]
+    simple-call-c-from-jit-context(dst, read-dispatch-table-addr(), args)
+
+  ;Emit instructions for performing a dispatch according to the given format
+  ;to the set of given labels.
+  defn emit-dispatch (format:Int, ys:Tuple<VMImm>, labels:Tuple<Label>) -> False :
+    ;Put dispatch arguments into registers.
+    set-regs(ys)
+    
+    ;Emit idx (Tmp1) = read-dispatch-table(format)
+    read-dispatch-table(reg(Tmp1), format)
+
+    ;Emit jmp target[idx (TMP1-REG)]
+    val targets = new-label(a)
+    lea(a, reg(Tmp2), MemPtr(targets, 0))
+    mov(a, reg(Tmp2), MemPtr(reg(Tmp2), reg(Tmp1), 3, 0))
+    jmp(a, reg(Tmp2))
+
+    ;Embedded labels for targets.
+    ;TODO: Should be aligned?
+    bind(a, targets)
+    do(embed{a, _}, labels)
+
+  ;=========================================================
+  ;=============== Reserve and Alloc =======================
+  ;=========================================================
+  ;Emit instructions for reserving bytes on the heap.
+  ;- size: If size is a Long, then it is assumed 8-byte padded already.
+  ;  If size is a Gp, then 8-byte padding needs to be computed dynamically.
+  ;  size does not include space required for the header word.
+  ;Returns the return address that is pushed to the stack for this call.
+  ;Uses Tmp1, Tmp2, Tmp3.
+  ;size is allowed to be in any of the temporary registers.
+  defn emit-reserve (size:Gp|Long) -> Label :
+    ;Label for end of reservation stub.
+    val end-label = new-label(a)
+    
+    ;Let Tmp1 = num-bytes on heap.
+    val header-size = object-header-size(resolver)
+    match(size) :
+      (size:Gp) :
+        mov(a, reg(Tmp1), size)
+        add(a, reg(Tmp1), header-size + 7)
+        and-op(a, reg(Tmp1), -8)
+      (size:Long) :
+        mov(a, reg(Tmp1), size + to-long(header-size))
+        
+    ;Let Tmp2 = heap-top + num-bytes
+    get-vmstate-heap-top(reg(Tmp2))
+    add(a, reg(Tmp2), reg(Tmp1))
+    
+    ;Let Tmp3 = heap-limit
+    ;Goto end when heap-top + num-bytes <= heap-limit
+    get-vmstate-heap-limit(reg(Tmp3))
+    cmp(a, reg(Tmp2), reg(Tmp3))
+    jbe(a, end-label)
+    
+    ;Call reserve function
+    mov-using-tmp(vm-register(0), to-long(false-marker(resolver)), reg(Tmp2))
+    mov-using-tmp(vm-register(1), 1L, reg(Tmp2))
+    mov-using-tmp(vm-register(2), reg(Tmp1), reg(Tmp2))
+    val ret = call-from-jit-context(EXTEND-HEAP-FN)
+
+    ;End of reservation
+    bind(a, end-label)
+    
+    ;Return return label of call.
+    ret
+
+  ;Emit instructions for performing object allocations .
+  ;Uses Tmp1, Tmp2 internally.
+  ;sizes do not include header word.
+  defn emit-alloc (slots:Tuple<Int>, sizes:Tuple<Gp|Long>, types:Tuple<Int>) :
+    ;Let Tmp2 = heap-top
+    get-vmstate-heap-top(reg(Tmp2))
+    ;For each object, save their pointer to the heap, and write their header word.
+    for (slot in slots, size in sizes, type in types) do :
+      ;Write the header word
+      mov(a, reg(Tmp1), to-long(type))
+      mov(a, MemPtr(reg(Tmp2),0), reg(Tmp1))
+      ;Let Tmp1 = heap-top + ref-tag-bits
+      lea(a, reg(Tmp1), MemPtr(reg(Tmp2), ref-offset(resolver)))
+      set-local(slot, reg(Tmp1), 8)
+      ;Tmp2 = Tmp2 + size
+      val header-size = object-header-size(resolver)
+      match(size) :
+        (size:Long) :
+          mov(a, reg(Tmp1), size + to-long(header-size))
+          add(a, reg(Tmp2), reg(Tmp1))
+        (size:Gp) :
+          add(a, reg(Tmp2), size)
+          add(a, reg(Tmp2), header-size + 7)
+          and-op(a, reg(Tmp2), -8)
+    ;Save new heap-top
+    set-vmstate-heap-top(reg(Tmp2))
+
+  ;=========================================================
+  ;================= C Calling Convention ==================
+  ;=========================================================
+  defn emit-callc (f:VMImm, xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) :
+    ;Compute the c-calling record layout for the given arguments and return.
+    ;- xs: The return locals/types.
+    ;- ys: The argument immediates.
+    defn compute-callc-records (xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) -> CallCRecords :
+      ;Convert a VMType into an ArgType for call-record analysis
+      defn to-arg-type (t:VMType) :
+        match(t) :
+          (t:VMFloat|VMDouble) : RealArg()
+          (t) : IntArg()
+      ;Compute C calling convention.
+      callc-records(ytypes, xtype, backend) where :
+        val ytypes = map(to-arg-type, map(imm-type, ys))
+        val xtypes = map(to-arg-type, map(imm-type, xs))
+        val xtype = IntArg() when empty?(xtypes) else xtypes[0]
+
+    ;Emit instructions for writing the CallC calling record to vmstate.registers
+    ;using the convention required by the c_trampoline stub.
+    defn write-records-to-registers (records:CallCRecords, ys:Tuple<VMImm>) :
+      ;Compute register locations
+      ;[NUM-STACK-ARGS | STACK-ARGS ... |
+      ; NUM-FLOAT-ARGS | FLOAT-ARGS ... |
+      ; NUM-INT-ARGS | INT-ARGS ... |
+      ; NUM-FLOATS-IN-CALL]
+      val layout-counter = Counter(0)
+      val num-stack-args-index = next(layout-counter, 1)
+      val stack-args-index = next(layout-counter, num-mem-args(records))
+      val num-float-args-index = next(layout-counter, 1)
+      val float-args-index = next(layout-counter, num-real-args(records))
+      val num-int-args-index = next(layout-counter, 1)
+      val int-args-index = next(layout-counter, num-int-args(records))
+      val num-floats-in-call-index = next(layout-counter,1)
+      
+      ;Given the location that the argument should be stored,
+      ;return the index in the register buffer that we should
+      ;store the argument that is desired by the trampoline code.
+      defn register-index (l:CallLoc) -> Int :
+        match(l) :
+          (l:RegLoc) : num-floats-in-call-index - 1 - index(l)
+          (l:FRegLoc) : num-int-args-index - 1 - index(l)
+          (l:MemLoc) : num-float-args-index - 1 - index(l)
+          
+      ;Assign registers
+      for arg in args(records) do :
+        val r = register-index(loc(arg))
+        val v = value(arg) as StdArg|ShadowArg
+        val y = ys[index(v)]
+        set-reg(r, y)
+        
+      ;Set number of arguments
+      set-reg(num-stack-args-index, NumConst(num-mem-args(records)))
+      set-reg(num-float-args-index, NumConst(num-real-args(records)))
+      set-reg(num-int-args-index, NumConst(num-int-args(records) + 1))
+      set-reg(num-floats-in-call-index, NumConst(num-real-args(records)))              
+
+    ;Emit instructions for calling the C function f.
+    defn call-c-trampoline (f:VMImm) :
+      ;Compute the address of the function to call, and ensure it is
+      ;stored in a register.
+      ;Use Tmp1 is a register is needed.
+      val faddr = match(f) :
+        (f:Local) :
+          local(slot(f), reg(Tmp1))
+        (f:ExternId) :
+          mov(a, reg(Tmp1), extern-address(id(f)))
+          reg(Tmp1)
+      ;Call the C trampoline in a new stack frame.
+      simple-call-c-in-new-frame-from-jit-context(
+        false,
+        c-trampoline-addr(),
+        [faddr, reg(RegistersReg), reg(RegistersReg)])
+
+    ;Emit instructions for moving the return value to the
+    ;appropriate local.
+    defn move-return-to-local (records:CallCRecords, xs:Tuple<Local|VMType>) :
+      if not empty?(xs) :
+        val reg-index = match(return(records)) :
+          (l:RegLoc) : 0   ;c_trampoline puts integer return register in register[0]
+          (l:FRegLoc) : 1  ;c_trampoline puts float return register in register[1]
+        get-reg(xs[0], reg-index)
+
+    ;Driver
+    val records = compute-callc-records(xs, ys)
+    write-records-to-registers(records, ys)
+    call-c-trampoline(f)
+    move-return-to-local(records, xs)    
+
+  ;=========================================================
+  ;================ 1-Operand Primitive ====================
+  ;=========================================================
+  ;Emit instructions for 1-operand basic op: x = opcode y
+  defn emit-op1 (a:Assembler, opcode:Int, x:Int, y:VMImm) :
+    switch(opcode) :
+      INT-NOT-OPCODE :
+        set-imm(reg(Tmp1), y)
+        not-op(a, reg(Tmp1))
+        shr(a, reg(Tmp1), 32)
+        shl(a, reg(Tmp1), 32)
+        set-local(x, reg(Tmp1), 8)
+      INT-NEG-OPCODE :
+        set-imm(reg(Tmp1), y)
+        neg(a, reg(Tmp1))
+        set-local(x, reg(Tmp1), 8)
+      NOT-OPCODE-BYTE :
+        set-imm(reg(Tmp1), y)
+        not-op(a, reg(Tmp1))
+        set-local(x, reg(Tmp1), 1)
+      NOT-OPCODE-INT :
+        set-imm(reg(Tmp1), y)
+        not-op(a, reg(Tmp1))
+        set-local(x, reg(Tmp1), 4)
+      NOT-OPCODE-LONG :
+        set-imm(reg(Tmp1), y)
+        not-op(a, reg(Tmp1))
+        set-local(x, reg(Tmp1), 8)
+      NEG-OPCODE-INT :
+        set-imm(reg(Tmp1), y)
+        neg(a, gp32(reg(Tmp1)))
+        set-local(x, reg(Tmp1), 4)
+      NEG-OPCODE-LONG :
+        set-imm(reg(Tmp1), y)
+        neg(a, reg(Tmp1))
+        set-local(x, reg(Tmp1), 8)
+      NEG-OPCODE-FLOAT :
+        ;Xmm0 = 0.0f
+        xor-op(a, reg(Tmp1), reg(Tmp1))
+        cvtsi2ss(a, xmm0, reg(Tmp1))
+        ;Xmm1 = y        
+        set-imm(reg(Tmp1), y)
+        movss(a, xmm1, reg(Tmp1))
+        ;xmm0 = xmm0 - y
+        subss(a, xmm0, xmm1)
+        ;x = xmm0
+        set-local-float(x, xmm0, 4)
+      NEG-OPCODE-DOUBLE :
+        ;Xmm0 = 0.0f
+        xor-op(a, reg(Tmp1), reg(Tmp1))
+        cvtsi2sd(a, xmm0, reg(Tmp1))
+        ;Xmm1 = y        
+        set-imm(reg(Tmp1), y)
+        movsd(a, xmm1, reg(Tmp1))
+        ;xmm0 = xmm0 - y
+        subsd(a, xmm0, xmm1)
+        ;x = xmm0
+        set-local-float(x, xmm0, 8)
+      CONV-OPCODE-BYTE-FLOAT :
+        ;Xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movss(a, xmm0, reg(Tmp1))
+        ;reg(Tmp1) = xmm0 as int
+        cvtss2si(a, reg(Tmp1), xmm0)
+        ;Store as byte
+        set-local(x, reg(Tmp1), 1)
+      CONV-OPCODE-INT-FLOAT :
+        ;Xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movss(a, xmm0, reg(Tmp1))
+        ;reg(Tmp1) = xmm0 as int
+        cvtss2si(a, reg(Tmp1), xmm0)
+        ;Store as int
+        set-local(x, reg(Tmp1), 4)
+      CONV-OPCODE-LONG-FLOAT :
+        ;Xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movss(a, xmm0, reg(Tmp1))
+        ;reg(Tmp1) = xmm0 as int
+        cvtss2si(a, reg(Tmp1), xmm0)
+        ;Store as long
+        set-local(x, reg(Tmp1), 8)
+      CONV-OPCODE-BYTE-DOUBLE :
+        ;Xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movsd(a, xmm0, reg(Tmp1))
+        ;reg(Tmp1) = xmm0 as int
+        cvtsd2si(a, reg(Tmp1), xmm0)
+        ;Store as byte
+        set-local(x, reg(Tmp1), 1)
+      CONV-OPCODE-INT-DOUBLE :
+        ;Xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movsd(a, xmm0, reg(Tmp1))
+        ;reg(Tmp1) = xmm0 as int
+        cvtsd2si(a, reg(Tmp1), xmm0)
+        ;Store as int
+        set-local(x, reg(Tmp1), 4)
+      CONV-OPCODE-LONG-DOUBLE :
+        ;Xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movsd(a, xmm0, reg(Tmp1))
+        ;reg(Tmp1) = xmm0 as int
+        cvtsd2si(a, reg(Tmp1), xmm0)
+        ;Store as long
+        set-local(x, reg(Tmp1), 8)
+      CONV-OPCODE-INT-BYTE :
+        xor-op(a, reg(Tmp1), reg(Tmp1))
+        set-imm(reg(Tmp1), y)
+        set-local(x, reg(Tmp1), 4)
+      CONV-OPCODE-LONG-BYTE :
+        xor-op(a, reg(Tmp1), reg(Tmp1))
+        set-imm(reg(Tmp1), y)
+        set-local(x, reg(Tmp1), 8)
+      CONV-OPCODE-LONG-INT :
+        set-imm(reg(Tmp1), y)
+        movsxd(a, reg(Tmp1), reg(Tmp1))
+        set-local(x, reg(Tmp1), 8)
+      CONV-OPCODE-FLOAT-BYTE :
+        set-imm(reg(Tmp1), y)
+        cvtsi2ss(a, xmm0, reg(Tmp1))
+        set-local-float(x, xmm0, 4)
+      CONV-OPCODE-FLOAT-INT :
+        set-imm(reg(Tmp1), y)
+        cvtsi2ss(a, xmm0, reg(Tmp1))
+        set-local-float(x, xmm0, 4)
+      CONV-OPCODE-FLOAT-LONG :
+        set-imm(reg(Tmp1), y)
+        cvtsi2ss(a, xmm0, reg(Tmp1))
+        set-local-float(x, xmm0, 4)
+      CONV-OPCODE-DOUBLE-BYTE :
+        set-imm(reg(Tmp1), y)
+        cvtsi2sd(a, xmm0, reg(Tmp1))
+        set-local-float(x, xmm0, 8)
+      CONV-OPCODE-DOUBLE-INT :
+        set-imm(reg(Tmp1), y)
+        cvtsi2sd(a, xmm0, reg(Tmp1))
+        set-local-float(x, xmm0, 8)
+      CONV-OPCODE-DOUBLE-LONG :
+        set-imm(reg(Tmp1), y)
+        cvtsi2sd(a, xmm0, reg(Tmp1))
+        set-local-float(x, xmm0, 8)
+      CONV-OPCODE-FLOAT-DOUBLE :
+        ;xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movsd(a, xmm0, reg(Tmp1))
+        ;xmm0 = xmm0 as float
+        cvtsd2ss(a, xmm0, xmm0)
+        ;x = xmm0
+        set-local-float(x, xmm0, 4)
+      CONV-OPCODE-DOUBLE-FLOAT :
+        ;xmm0 = y
+        set-imm(reg(Tmp1), y)
+        movss(a, xmm0, reg(Tmp1))
+        ;xmm0 = xmm0 as double
+        cvtss2sd(a, xmm0, xmm0)
+        ;x = xmm0
+        set-local-float(x, xmm0, 8)
+      TAG-OPCODE-BYTE :
+        set-imm(reg(Tmp1), y)
+        add-tag(reg(Tmp1), tagbits(resolver,BYTE-TYPE))
+        set-local(x, reg(Tmp1), 8)
+      TAG-OPCODE-CHAR :
+        set-imm(reg(Tmp1), y)
+        add-tag(reg(Tmp1), tagbits(resolver,CHAR-TYPE))
+        set-local(x, reg(Tmp1), 8)
+      TAG-OPCODE-INT :
+        set-imm(reg(Tmp1), y)
+        add-tag(reg(Tmp1), tagbits(resolver,INT-TYPE))
+        set-local(x, reg(Tmp1), 8)
+      TAG-OPCODE-FLOAT :
+        set-imm(reg(Tmp1), y)
+        add-tag(reg(Tmp1), tagbits(resolver,FLOAT-TYPE))
+        set-local(x, reg(Tmp1), 8)
+      DETAG-OPCODE :
+        set-imm(reg(Tmp1), y)
+        ashr(a, reg(Tmp1), 32)
+        set-local(x, reg(Tmp1), 8)
+      DEREF-OPCODE :
+        set-imm(reg(Tmp1), y)
+        add(a, reg(Tmp1), object-header-size(resolver) - ref-offset(resolver))
+        set-local(x, reg(Tmp1), 8)
+      GC-OPCODE :
+        ;Let reg(Tmp1) = size
+        set-imm(reg(Tmp1), y)
+        simple-call-c-from-jit-context(reg(Tmp1), call-garbage-collector-addr(), [reg(VMStateReg), reg(Tmp1)])
+        ;Returns number of bytes remaining in heap.
+        set-local(x, reg(Tmp1), 8)
+      PRINT-STACK-TRACE-OPCODE :
+        ;Let reg(Tmp1) = stack
+        set-imm(reg(Tmp1), y)
+        simple-call-c-from-jit-context(false, call-print-stack-trace-addr(), [reg(VMStateReg), reg(Tmp1)])
+        set-local-using-tmp(x, 0L, 8, reg(Tmp1)) 
+      COLLECT-STACK-TRACE-OPCODE :
+        ;Let reg(Tmp1) = stack
+        set-imm(reg(Tmp1), y)
+        simple-call-c-from-jit-context(reg(Tmp1), call-collect-stack-trace-addr(), [reg(VMStateReg), reg(Tmp1)])
+        set-local(x, reg(Tmp1), 8)
+      LOWEST-ZERO-BIT-COUNT-OPCODE-LONG :
+        set-imm(reg(Tmp1), y)
+        tzcnt(a, reg(Tmp1), reg(Tmp1))
+        set-local(x, reg(Tmp1), 8)
+      else :
+        fatal("Unhandled opcode %_." % [opcode])     
+
+  ;=========================================================
+  ;================ 2-Operand Primitive ====================
+  ;=========================================================
+  ;Emit instructions for 2-operand basic op: x = y opcode z
+  defn emit-op2 (a:Assembler, opcode:Int, x:Int, y:Int, z:Int) -> False :    
+    switch(opcode) :
+      INT-ADD-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          add(a, xreg, zreg)
+      INT-SUB-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          sub(a, xreg, zreg)
+      INT-MUL-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          shr(a, xreg, 32)
+          imul(a, xreg, zreg)          
+      INT-AND-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          and-op(a, xreg, zreg)
+      INT-OR-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          or-op(a, xreg, zreg)
+      INT-XOR-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          xor-op(a, xreg, zreg)
+      INT-SHL-OPCODE :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 8) :
+          ;RCX = z >> 32
+          mov(a, rcx, stack-local(z))
+          shr(a, rcx, 32)
+          ;Perform shift
+          mov(a, xreg, stack-local(y))
+          shl(a, xreg, rcx)
+          ;Zero-out bottom 32 bits
+          shr(a, xreg, 32)
+          shl(a, xreg, 32)
+      INT-SHR-OPCODE :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 8) :
+          ;RCX = z >> 32
+          mov(a, rcx, stack-local(z))
+          shr(a, rcx, 32)
+          ;Perform shift
+          mov(a, xreg, stack-local(y))
+          shr(a, xreg, rcx)
+          ;Zero-out bottom 32 bits
+          shr(a, xreg, 32)
+          shl(a, xreg, 32)
+      INT-ASHR-OPCODE :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 8) :
+          ;RCX = z >> 32
+          mov(a, rcx, stack-local(z))
+          shr(a, rcx, 32)
+          ;Perform shift
+          mov(a, xreg, stack-local(y))
+          ashr(a, xreg, rcx)
+          ;Zero-out bottom 32 bits
+          shr(a, xreg, 32)
+          shl(a, xreg, 32)
+      INT-DIV-OPCODE :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 8) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          shl(a, rax, 32)
+          rax
+      INT-MOD-OPCODE :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 8) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          rdx
+      INT-LT-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          boolref-cmp-set(yreg, zreg, xreg, set-l)
+      INT-GT-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          boolref-cmp-set(yreg, zreg, xreg, set-g)
+      INT-LE-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          boolref-cmp-set(yreg, zreg, xreg, set-le)
+      INT-GE-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          boolref-cmp-set(yreg, zreg, xreg, set-ge)
+      REF-EQ-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          boolref-cmp-set(yreg, zreg, xreg, set-e)
+      REF-NE-OPCODE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          boolref-cmp-set(yreg, zreg, xreg, set-ne)          
+      EQ-OPCODE-REF :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-e, 8)
+      EQ-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-e, 1)
+      EQ-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-e, 4)
+      EQ-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-e, 8)
+      EQ-OPCODE-FLOAT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 8) :
+          cmpf-set(yreg, zreg, xreg, set-e, 4)
+      EQ-OPCODE-DOUBLE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          cmpf-set(yreg, zreg, xreg, set-e, 8)          
+      NE-OPCODE-REF :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ne, 8)
+      NE-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ne, 1)
+      NE-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ne, 4)
+      NE-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ne, 8)
+      NE-OPCODE-FLOAT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 8) :
+          cmpf-set(yreg, zreg, xreg, set-ne, 4)
+      NE-OPCODE-DOUBLE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          cmpf-set(yreg, zreg, xreg, set-ne, 8)          
+      LT-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-l, 4)
+      LT-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-l, 8)
+      LT-OPCODE-FLOAT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 8) :
+          cmpf-set(yreg, zreg, xreg, set-b, 4)
+      LT-OPCODE-DOUBLE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          cmpf-set(yreg, zreg, xreg, set-b, 8)          
+      GT-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-g, 4)
+      GT-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-g, 8)
+      GT-OPCODE-FLOAT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 8) :
+          cmpf-set(yreg, zreg, xreg, set-a, 4)
+      GT-OPCODE-DOUBLE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          cmpf-set(yreg, zreg, xreg, set-a, 8)
+      LE-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-le, 4)
+      LE-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-le, 8)
+      LE-OPCODE-FLOAT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 8) :
+          cmpf-set(yreg, zreg, xreg, set-be, 4)
+      LE-OPCODE-DOUBLE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          cmpf-set(yreg, zreg, xreg, set-be, 8)
+      GE-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ge, 4)
+      GE-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ge, 8)
+      GE-OPCODE-FLOAT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 8) :
+          cmpf-set(yreg, zreg, xreg, set-ae, 4)
+      GE-OPCODE-DOUBLE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          cmpf-set(yreg, zreg, xreg, set-ae, 8)
+      ULT-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-b, 1)
+      ULT-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-b, 4)
+      ULT-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-b, 8)
+      ULE-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-be, 1)
+      ULE-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-be, 4)
+      ULE-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-be, 8)
+      UGT-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-a, 1)
+      UGT-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-a, 4)
+      UGT-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-a, 8)
+      UGE-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ae, 1)
+      UGE-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ae, 4)
+      UGE-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          cmp-set(yreg, zreg, xreg, set-ae, 8)
+      ADD-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 1) :
+          mov(a, xreg, yreg)
+          add(a, xreg, zreg)
+      ADD-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 4) :
+          mov(a, xreg, yreg)
+          add(a, xreg, zreg)
+      ADD-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          add(a, xreg, zreg)
+      ADD-OPCODE-FLOAT :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 4) :
+          addss(a, yreg, zreg)
+          yreg
+      ADD-OPCODE-DOUBLE :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          addsd(a, yreg, zreg)
+          yreg
+      SUB-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 1) :
+          mov(a, xreg, yreg)
+          sub(a, xreg, zreg)
+      SUB-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 4) :
+          mov(a, xreg, yreg)
+          sub(a, xreg, zreg)
+      SUB-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          sub(a, xreg, zreg)
+      SUB-OPCODE-FLOAT :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 4) :
+          subss(a, yreg, zreg)
+          yreg
+      SUB-OPCODE-DOUBLE :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          subsd(a, yreg, zreg)
+          yreg
+      MUL-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 1) :
+          mov(a, xreg, yreg)
+          imul(a, xreg, zreg)
+      MUL-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 4) :
+          mov(a, xreg, yreg)
+          imul(a, xreg, zreg)
+      MUL-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          imul(a, xreg, zreg)
+      MUL-OPCODE-FLOAT :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 4) :
+          mulss(a, yreg, zreg)
+          yreg
+      MUL-OPCODE-DOUBLE :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          mulsd(a, yreg, zreg)
+          yreg
+      DIV-OPCODE-BYTE :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 1) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          rax
+      DIV-OPCODE-INT :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 4) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          rax
+      DIV-OPCODE-LONG :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 8) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          rax
+      DIV-OPCODE-FLOAT :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 4, 4) :
+          divss(a, yreg, zreg)
+          yreg
+      DIV-OPCODE-DOUBLE :
+        within (yreg, zreg) = compute-op2-with-temp-fregs(x, y, z, 8, 8) :
+          divsd(a, yreg, zreg)
+          yreg
+      MOD-OPCODE-BYTE :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 1) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          rdx
+      MOD-OPCODE-INT :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 4) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          rdx
+      MOD-OPCODE-LONG :
+        ;x86 uses RAX:RDX as operands for div.
+        ;So they need to be saved and restored.
+        within tmp = compute-with-rax-rdx(x, 8) :
+          xor-op(a, rdx, rdx)
+          mov(a, rax, stack-local(y))
+          div(a, stack-local(z,tmp))
+          rdx
+      AND-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 1) :
+          mov(a, xreg, yreg)
+          and-op(a, xreg, zreg)
+      AND-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 4) :
+          mov(a, xreg, yreg)
+          and-op(a, xreg, zreg)
+      AND-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          and-op(a, xreg, zreg)
+      OR-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 1) :
+          mov(a, xreg, yreg)
+          or-op(a, xreg, zreg)
+      OR-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 4) :
+          mov(a, xreg, yreg)
+          or-op(a, xreg, zreg)
+      OR-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          or-op(a, xreg, zreg)
+      XOR-OPCODE-BYTE :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 1) :
+          mov(a, xreg, yreg)
+          xor-op(a, xreg, zreg)
+      XOR-OPCODE-INT :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 4) :
+          mov(a, xreg, yreg)
+          xor-op(a, xreg, zreg)
+      XOR-OPCODE-LONG :
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          mov(a, xreg, yreg)
+          xor-op(a, xreg, zreg)
+      SHL-OPCODE-BYTE :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 1) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          shl(a, xreg, rcx)
+      SHL-OPCODE-INT :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 4) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          shl(a, xreg, rcx)
+      SHL-OPCODE-LONG :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 8) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          shl(a, xreg, rcx)
+      SHR-OPCODE-BYTE :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 1) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          shr(a, xreg, rcx)
+      SHR-OPCODE-INT :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 4) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          shr(a, xreg, rcx)
+      SHR-OPCODE-LONG :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 8) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          shr(a, xreg, rcx)
+      ASHR-OPCODE-INT :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 4) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          ashr(a, xreg, rcx)
+      ASHR-OPCODE-LONG :
+        ;x86 requires the shift register to be in RCX.
+        ;So it needs to be saved and restored.
+        within xreg = compute-with-rcx(x, 8) :
+          mov(a, rcx, stack-local(z))
+          mov(a, xreg, stack-local(y))
+          ashr(a, xreg, rcx)
+      TEST-BIT-OPCODE :
+        ;x = test bit yreg at address zreg.
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          bt(a, MemPtr(zreg,0), yreg)
+          mov(a, xreg, 0)
+          set-c(a, gp8(xreg))          
+      TEST-AND-SET-BIT-OPCODE :
+        ;x = test and set bit yreg at address zreg.
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          bts(a, MemPtr(zreg,0), yreg)
+          mov(a, xreg, 0)
+          set-c(a, gp8(xreg))
+      TEST-AND-CLEAR-BIT-OPCODE :
+        ;x = test and set bit yreg at address zreg.
+        within (xreg, yreg, zreg) = compute-op2-with-temp-regs(x, y, z, 8) :
+          btr(a, MemPtr(zreg,0), yreg)
+          mov(a, xreg, 0)
+          set-c(a, gp8(xreg))
+      SET-BIT-OPCODE :
+        val yreg = stack-local(y, reg(Tmp2))
+        val zreg = stack-local(z, reg(Tmp3))
+        bts(a, MemPtr(zreg,0), yreg)
+      CLEAR-BIT-OPCODE :
+        val yreg = stack-local(y, reg(Tmp2))
+        val zreg = stack-local(z, reg(Tmp3))
+        btr(a, MemPtr(zreg,0), yreg)
+      else :
+        fatal("Unimplemented opcode %_" % [opcode])     
+    false
+
+  ;=========================================================
+  ;================== Emit Branch ==========================
+  ;=========================================================
+  ;Emit instructions for 2-operand compare and branch. goto n1 when x opcode y else goto n2.
+  defn emit-branch (opcode:Int, x:Int, y:Int, n1:Label, n2:Label) -> False :
+    defn cmp-and-jmp (jmp-cond:(Assembler,Label) -> False) :
+      val xreg = local(x,reg(Tmp1))
+      val yreg = local(y,reg(Tmp2))
+      cmp(a, xreg, yreg)
+      jmp-cond(a,n1)
+      jmp(a,n2)
+
+    defn cmpf-and-jmp (jmp-cond:(Assembler,Label) -> False, size:Int) :
+      local-float(x,xmm0,size)
+      local-float(y,xmm1,size)
+      switch(size) :
+        4 : ucomiss(a,xmm0,xmm1)
+        8 : ucomisd(a,xmm0,xmm1)
+      jmp-cond(a,n1)
+      jmp(a,n2)
+
+    switch(opcode) :
+      JUMP-INT-LT-OPCODE : cmp-and-jmp(jl)
+      JUMP-INT-GT-OPCODE : cmp-and-jmp(jg)
+      JUMP-INT-LE-OPCODE : cmp-and-jmp(jle)
+      JUMP-INT-GE-OPCODE : cmp-and-jmp(jge)
+      JUMP-EQ-OPCODE-REF : cmp-and-jmp(je)
+      JUMP-EQ-OPCODE-BYTE : cmp-and-jmp(je)
+      JUMP-EQ-OPCODE-INT : cmp-and-jmp(je)
+      JUMP-EQ-OPCODE-LONG : cmp-and-jmp(je)
+      JUMP-EQ-OPCODE-FLOAT : cmpf-and-jmp(je,4)
+      JUMP-EQ-OPCODE-DOUBLE : cmpf-and-jmp(je,8)
+      JUMP-NE-OPCODE-REF : cmp-and-jmp(jne)
+      JUMP-NE-OPCODE-BYTE : cmp-and-jmp(jne)
+      JUMP-NE-OPCODE-INT : cmp-and-jmp(jne)
+      JUMP-NE-OPCODE-LONG : cmp-and-jmp(jne)
+      JUMP-NE-OPCODE-FLOAT : cmpf-and-jmp(jne,4)
+      JUMP-NE-OPCODE-DOUBLE : cmpf-and-jmp(jne,8)
+      JUMP-LT-OPCODE-INT : cmp-and-jmp(jl)
+      JUMP-LT-OPCODE-LONG : cmp-and-jmp(jl)
+      JUMP-LT-OPCODE-FLOAT : cmpf-and-jmp(jb,4)
+      JUMP-LT-OPCODE-DOUBLE : cmpf-and-jmp(jb,8)
+      JUMP-GT-OPCODE-INT : cmp-and-jmp(jg)
+      JUMP-GT-OPCODE-LONG : cmp-and-jmp(jg)
+      JUMP-GT-OPCODE-FLOAT : cmpf-and-jmp(ja,4)
+      JUMP-GT-OPCODE-DOUBLE : cmpf-and-jmp(ja,8)
+      JUMP-LE-OPCODE-INT : cmp-and-jmp(jle)
+      JUMP-LE-OPCODE-LONG : cmp-and-jmp(jle)
+      JUMP-LE-OPCODE-FLOAT : cmpf-and-jmp(jbe,4)
+      JUMP-LE-OPCODE-DOUBLE : cmpf-and-jmp(jbe,8)
+      JUMP-GE-OPCODE-INT : cmp-and-jmp(jge)
+      JUMP-GE-OPCODE-LONG : cmp-and-jmp(jge)
+      JUMP-GE-OPCODE-FLOAT : cmpf-and-jmp(jae,4)
+      JUMP-GE-OPCODE-DOUBLE : cmpf-and-jmp(jae,8)
+      JUMP-ULT-OPCODE-BYTE : cmp-and-jmp(jb)
+      JUMP-ULT-OPCODE-INT : cmp-and-jmp(jb)
+      JUMP-ULT-OPCODE-LONG : cmp-and-jmp(jb)
+      JUMP-ULE-OPCODE-BYTE : cmp-and-jmp(jbe)
+      JUMP-ULE-OPCODE-INT : cmp-and-jmp(jbe)
+      JUMP-ULE-OPCODE-LONG : cmp-and-jmp(jbe)
+      JUMP-UGT-OPCODE-BYTE : cmp-and-jmp(ja)
+      JUMP-UGT-OPCODE-INT : cmp-and-jmp(ja)
+      JUMP-UGT-OPCODE-LONG : cmp-and-jmp(ja)
+      JUMP-UGE-OPCODE-BYTE : cmp-and-jmp(jae)
+      JUMP-UGE-OPCODE-INT : cmp-and-jmp(jae)
+      JUMP-UGE-OPCODE-LONG : cmp-and-jmp(jae)
+
+  ;=========================================================
+  ;================== Emit Final Match =====================
+  ;=========================================================
+  ;Encode a match statement that cannot be redefined later.
+  defn emit-final-match (ys:Tuple<VMImm>, bs:Tuple<VMBranch>, default-label:Int) :
+    defn compute-dag () :
+      val branch-table = BranchTable(to-branches(seq(types,bs), {[_]}))
+      compute-dispatch-dag(branch-table, false)
+
+    defn emit-dag (dag:Dag) :
+      ;Create labels for all entries
+      val labels = map(gen-label{}, entries(dag))
+      ;Convert a value into a label
+      defn to-label (x:Int|Soln) :
+        match(x) :
+          (x:Int) : labels[x]
+          (x:UniqueSoln) : n(bs[index(x)])
+          (x:NoSoln) : default-label
+      ;Compile a given entry
+      defn emit-entry (e:DagEntry) :
+        if empty?(entries(e)) :
+          emit-ins(GotoIns(to-label(default(e))))
+        else :
+          within (entry, last?) = expanded-entries(e) :
+            val n1 = to-label(value(entry))
+            val n2 = to-label(default(e)) when last? else gen-label()
+            emit-ins(Branch1Ins(n1, n2, InstanceofOp(SingleType(key(entry))), ys[depth(e)]))
+            emit-ins(LabelIns(n2)) when not last?
+      ;Compile all entries
+      for (e in entries(dag), l in labels) do :
+        emit-ins(LabelIns(l))
+        emit-entry(e)
+
+    ;Expand the given entries and compute whether it is the last entry
+    defn expanded-entries (f:(KeyValue<Int,Int|Soln>, True|False) -> ?, e:DagEntry) :
+      val es = for e in entries(e) seq-cat :
+        for v in values(key(e)) seq :
+          v => value(e)
+      let loop () :
+        val e = next(es)
+        f(e, empty?(es))
+        loop() when not empty?(es)
+
+    ;Launch
+    emit-dag(compute-dag())
+
+  ;============================================================
+  ;================= Emit Fast Instanceof =====================
+  ;============================================================
+  ;Emit a fast instanceof operation where the type is known
+  ;to be a SingleType and cannot be redeclared.
+  defn emit-fast-instanceof (n1:Int, n2:Int, x:VMImm, type:SingleType) :
+    fatal("Illegal type") when not type-is-final?(resolver,type)
+    defn driver () :
+      val tag = /type(type as SingleType)
+      switch(tag) :
+        BYTE-TYPE : compare-tag-bits(BYTE-TYPE)
+        CHAR-TYPE : compare-tag-bits(CHAR-TYPE)
+        INT-TYPE : compare-tag-bits(INT-TYPE)
+        FLOAT-TYPE :  compare-tag-bits(FLOAT-TYPE)
+        else :
+          if marker?(resolver, tag) : compare-marker(tag)
+          else : compare-tag-word(tag)
+    defn compare-tag-bits (typeid:Int) :
+      ;Let Tmp1 = x & 0x7
+      set-imm(reg(Tmp1), x)
+      and-op(a, reg(Tmp1), 0x7)
+      ;goto n1 when Tmp1 == tagbits(typeid) else goto n2
+      cmp(a, reg(Tmp1), tagbits(resolver,typeid))
+      je(a, get-label(n1))
+      jmp(a, get-label(n2))
+    defn compare-marker (typeid:Int) :
+      emit-ins(Branch2Ins(n1, n2, EqOp(), x, Marker(typeid)))
+    defn compare-tag-word (typeid:Int) :
+      ;Get the labels for n1 and n2
+      val n1-label = get-label(n1)
+      val n2-label = get-label(n2)
+      ;Let Tmp1 = x
+      ;Let Tmp2 = x & 0x7
+      set-imm(reg(Tmp1), x)
+      mov(a, reg(Tmp2), reg(Tmp1))
+      and-op(a, reg(Tmp2), 0x7)
+      ;Goto n2 when Tmp2 != 1
+      cmp(a, reg(Tmp2), 1)
+      jne(a, n2-label)
+      ;Tmp1 = [x - 1] (Read the header word)
+      mov(a, reg(Tmp1), MemPtr(reg(Tmp1), (- ref-offset(resolver)), SIZEOF-LONG))
+      ;Goto n1 when Tmp1 == typeid else goto n2
+      cmp(a, reg(Tmp1), typeid)
+      je(a, n1-label)
+      jmp(a, n2-label)
+    ;Start
+    driver()    
+
+  ;=========================================================
+  ;============== Emit General Instanceof ==================
+  ;=========================================================
+  defn emit-instanceof (n1:Int, n2:Int, x:VMImm, type:TypeSet) :
+    if type is SingleType and type-is-final?(resolver,type) :
+      emit-fast-instanceof(n1, n2, x, type as SingleType)
+    else :
+      val format = match-format(resolver, [[type]])
+      emit-dispatch(format, [x], get-labels([n2, n1]))
+
+  ;=========================================================
+  ;=============== Emit Instructions =======================
+  ;=========================================================
+  defn emit-ins (ins:VMIns) -> False :
+    match(ins) :
+      (ins:LabelIns) :
+        bind(a, get-label(n(ins)))
+
+      (ins:UnreachableIns) :
+        false
+
+      (ins:TCallIns) :
+        set-regs(ys(ins))
+        set-imm(reg(Tmp2), f(ins))
+        goto-function(reg(Tmp2), 0)            
+
+      (ins:TCallClosureIns) :
+        set-regs(ys(ins))
+        ;Load Tmp2 = func.code
+        set-imm(reg(Tmp2), f(ins))
+        mov(a, reg(Tmp2), MemPtr(reg(Tmp2), object-header-size(resolver) + FUNCTION-CODE-OFFSET - ref-offset(resolver)))
+        goto-function(reg(Tmp2), 0)            
+
+      (ins:CallIns) :
+        set-regs(ys(ins))
+        set-imm(reg(Tmp2), f(ins))
+        val ret = call-from-jit-context(reg(Tmp2))
+        get-regs(xs(ins))
+        record-trace-entry(ret, trace-entry(ins))            
+
+      (ins:CallClosureIns) :
+        set-regs(ys(ins))
+        ;Load Tmp2 = func.code
+        set-imm(reg(Tmp2), f(ins))
+        mov(a, reg(Tmp2), MemPtr(reg(Tmp2), object-header-size(resolver) + FUNCTION-CODE-OFFSET - ref-offset(resolver)))
+        val ret = call-from-jit-context(reg(Tmp2))
+        get-regs(xs(ins))
+        record-trace-entry(ret, trace-entry(ins))            
+
+      (ins:CallCIns) :
+        emit-callc(f(ins), xs(ins), ys(ins))
+        
+      (ins:YieldIns) :
+        ;current-stack.pc = after-yield.
+        val after-yield = new-label(a)
+        lea(a, reg(Tmp1), MemPtr(after-yield, 0))
+        set-stack-pc(reg(Tmp1))
+
+        ;Set the registers
+        set-regs(ys(ins))
+
+        ;Save what is necessary for the current context.
+        switch-context-new-stack(Enter, enter?(ins))
+
+        ;Let stk:TMP1 = the stack to enter
+        set-imm(reg(Tmp1), f(ins))
+        set-vmstate-current-stack(reg(Tmp1))
+
+        ;Restore what is necessary for the context.
+        switch-context-new-stack(Exit, enter?(ins))
+
+        ;If we are entering a fresh stack, then jump to the entry function.
+        if enter?(ins) :
+          get-stack-pc(reg(Tmp1)) ;Starting Fid = current-stack.pc
+          goto-function(reg(Tmp1), 0)
+        ;Otherwise, jump to whatever pc is stored in the stack.
+        else :
+          get-stack-pc(reg(Tmp1))
+          jmp(a, reg(Tmp1))
+
+        ;After yield
+        bind(a, after-yield)
+        record-trace-entry(after-yield, trace-entry(ins))
+
+        ;Retrieve the registers
+        get-regs(xs(ins))                        
+
+      (ins:ReturnIns) :
+        set-regs(xs(ins))
+        get-return(reg(Tmp1))
+        jmp(a, reg(Tmp1))          
+
+      (ins:DumpIns) :
+        false
+
+      (ins:RecordLiveIns) :
+        val live-map = liveness-map(resolver, map(slot, live(ins)), num-locals())
+        mov(a, reg(Tmp1), live-map)
+        set-liveness-map(reg(Tmp1))
+
+      (ins:StoreIns) :
+        ;Compute the offset from x depending upon whether x is a Ref or a pointer.
+        val offset* = match(imm-type(x(ins))) :
+          (xt:VMRef) : offset(ins) - ref-offset(resolver) + object-header-size(resolver)
+          (xt) : offset(ins)
+        ;Determine whether we have a variable-offset.
+        match(y(ins)) :
+          ;y is the variable offset.
+          (y:VMImm) :
+            val x* = to-local(x(ins), 0)
+            val y* = to-local(y, 1)
+            val z* = to-local(z(ins), 2)
+            val xreg = local(x*, reg(Tmp1))
+            val yreg = local(y*, reg(Tmp2))
+            val zreg = local(z*, reg(Tmp3))
+            val size = size(imm-type(z(ins)))                
+            mov(a, MemPtr(xreg, yreg, 0, offset*, size), gp(zreg,size))
+          ;No variable offset
+          (y:False) :
+            val x* = to-local(x(ins), 0)
+            val z* = to-local(z(ins), 2)
+            val xreg = local(x*, reg(Tmp1))
+            val zreg = local(z*, reg(Tmp3))
+            val size = size(imm-type(z(ins)))
+            mov(a, MemPtr(xreg, offset*, size), gp(zreg,size))
+
+      (ins:StoreWithBarrierIns) :
+        ;Compute the offset from x depending upon whether x is a Ref or a pointer.
+        val offset* = offset(ins) - ref-offset(resolver) + object-header-size(resolver)
+        
+        ;Store z into a local so we can retrieve it without using additional registers.
+        val z* = to-local(z(ins), 2)
+        
+        ;Compute the address to store to. Put it in Tmp1.
+        ;Determine whether we have a variable-offset.
+        match(y(ins)) :
+          ;y is the variable offset.
+          (y:VMImm) :
+            val x* = to-local(x(ins), 0)
+            val y* = to-local(y, 1)
+            val xreg = local(x*, reg(Tmp1))
+            val yreg = local(y*, reg(Tmp2))
+            lea(a, reg(Tmp1), MemPtr(xreg, yreg, 0, offset*, 8))
+          ;No variable offset
+          (y:False) :
+            val x* = to-local(x(ins), 0)
+            val xreg = local(x*, reg(Tmp1))
+            lea(a, reg(Tmp1), MemPtr(xreg, offset*, 8))
+            
+        ;Store the value into the address        
+        val zreg = local(z*, reg(Tmp2))
+        mov(a, MemPtr(reg(Tmp1),0), zreg)
+
+        ;Set remembered-bit for write barrier.
+        shr(a, reg(Tmp1), 3)                     ;Convert base to bit index.
+        get-vmstate-heap-bitset-base(reg(Tmp2))  ;Retrieve bitset-base.
+        bts(a, MemPtr(reg(Tmp2),0), reg(Tmp1))   ;Set bit        
+
+      (ins:LoadIns) :
+        ;Compute the offset from y depending upon whether y is a Ref or a pointer.
+        val offset* = match(imm-type(y(ins))) :
+          (yt:VMRef) : offset(ins) - ref-offset(resolver) + object-header-size(resolver)
+          (yt) : offset(ins)
+        ;Determine whether we have a variable-offset.
+        match(z(ins)) :
+          ;z is the variable offset.
+          (z:VMImm) :
+            val y* = to-local(y(ins), 0)
+            val z* = to-local(z, 1)
+            val yreg = local(y*, reg(Tmp2))
+            val zreg = local(z*, reg(Tmp3))
+            val size = size(imm-type(x(ins)))
+            within xreg = update-local(slot(x(ins)), reg(Tmp1), size) :
+              mov(a, gp(xreg,size), MemPtr(yreg, zreg, 0, offset*, size))
+          ;No variable offset.
+          (z:False) :
+            val y* = to-local(y(ins), 0)
+            val yreg = local(y*, reg(Tmp2))
+            val size = size(imm-type(x(ins)))
+            within xreg = update-local(slot(x(ins)), reg(Tmp1), size) :
+              mov(a, gp(xreg,size), MemPtr(yreg, offset*, size))
+              
+      (ins:Op0Ins) :
+        match(op(ins)) :
+          (op:FlushVMOp) :
+            switch-context-stanza-to-jit(Exit, true)
+            set-local(slot?(x(ins)), reg(VMStateReg), 8)
+          (op:CRSPOp) :
+            mov(a, reg(Tmp1), saved-crsp())
+            set-local(slot?(x(ins)), reg(Tmp1), 8)                
+
+      (ins:Op1Ins) :
+        match(op(ins)) :
+          (op:InstanceofOp) :
+            ;Retrieve the format.
+            val format = match-format(resolver, [[type(op)]])
+            
+            ;Push argument into register
+            set-reg(0, y(ins))
+
+            ;Read the dispatch table
+            read-dispatch-table(reg(Tmp1), format)
+
+            ;Store the result into the local
+            set-local(slot?(x(ins)), reg(Tmp1), 8)
+          (op) :
+            val opcode = op1-opcode(op, imm-type?(x(ins)), imm-type(y(ins)))
+            match(opcode:Int) :
+              emit-op1(a, opcode, slot?(x(ins)), y(ins))
+            else :
+              set-local(slot!(x(ins)), y(ins))
+
+      (ins:Op2Ins) :
+        val opcode = op2-opcode(op(ins), imm-type?(x(ins)), imm-type(y(ins)))
+        val x* = slot?(x(ins))
+        val y* = to-local(y(ins), 0)
+        val z* = to-local(z(ins), 1)
+        emit-op2(a, opcode, x*, y*, z*)
+
+      (ins:GotoIns) :
+        jmp(a, get-label(n(ins)))
+
+      (ins:Branch1Ins) :
+        match(op(ins)) :
+          (op:InstanceofOp) :
+            emit-instanceof(n1(ins), n2(ins), x(ins), type(op))
+          (op:False) :
+            set-imm(reg(Tmp1), x(ins))
+            cmp(a, reg(Tmp1), 0)
+            jne(a, get-label(n1(ins)))
+            jmp(a, get-label(n2(ins)))
+
+      (ins:Branch2Ins) :
+        val code = branch2-opcode(op(ins), imm-type(x(ins)))
+        val x* = to-local(x(ins), 0)
+        val y* = to-local(y(ins), 1)
+        emit-branch(code, x*, y*, get-label(n1(ins)), get-label(n2(ins)))
+        
+      (ins:AllocIns) :
+        defn alloc-multiple-objects () :
+          ;Compute total number of bytes on heap.
+          val num-obj = length(sizes(ins))
+          val obj-sizes = for s in sizes(ins) map :
+            object-size-on-heap(resolver, value(s as NumConst) as Int)
+          val sum-of-sizes = num-obj * object-header-size(resolver) + sum(obj-sizes)
+          ;Reserve bytes
+          val ret = emit-reserve(to-long(sum-of-sizes))
+          record-trace-entry(ret, trace-entry(ins))
+          ;Allocate each object
+          val xs-slots = map(slot, xs(ins))
+          emit-alloc(xs-slots, map(to-long,obj-sizes), types(ins))
+          
+        defn alloc-single-object () :
+          ;Sanity check.
+          fatal("Multiple variable-sized allocations.") when length(sizes(ins)) > 1
+          ;Store the size into reg(Tmp1).
+          set-imm(reg(Tmp1), sizes(ins)[0])
+          
+          ;Reserve bytes
+          val ret = emit-reserve(reg(Tmp1))
+          record-trace-entry(ret, trace-entry(ins))
+          
+          ;Allocate the object
+          val x = xs(ins)[0]
+          set-imm(reg(Tmp3), sizes(ins)[0])
+          emit-alloc([slot(x)], [reg(Tmp3)], [types(ins)[0]])              
+
+        ;Dispatch
+        if all?({_ is NumConst}, sizes(ins)) : alloc-multiple-objects()
+        else : alloc-single-object()
+        
+      (ins:DispatchIns) :
+        ;Retrieve the dispatch format.
+        val [types, dests] = split-types-and-dests(branches(ins))
+        val format = dispatch-format(resolver, types)
+
+        ;Perform dispatch
+        ;Branch 0 is the default branch.
+        ;Branch 1 is the ambiguous branch.
+        ;Branch 2+ are the destination branches.
+        emit-dispatch(format, ys(ins), get-labels(cat([default(ins), amb(ins)], dests)))
+
+      (ins:MatchIns) :
+        if all?(branch-is-final?{resolver, _}, branches(ins)) :
+          emit-final-match(ys(ins), branches(ins), default(ins))
+        else :
+          ;Retrieve the format index of this match statement.
+          val [types, dests] = split-types-and-dests(branches(ins))
+          val format = match-format(resolver, types)
+
+          ;Perform Dispatch. First branch is the default branch.
+          emit-dispatch(format, ys(ins), get-labels(cat([default(ins)], dests)))
+          
+      (ins:MethodDispatchIns) :
+        ;Retrieve format
+        val format = method-format(resolver, multi(ins), length(ys(ins)), length(zs(ins)))
+
+        ;Push arguments onto registers
+        set-regs(cat(ys(ins), zs(ins)))
+
+        ;Emit idx (Tmp1) = read-dispatch-table(format)
+        read-dispatch-table(reg(Tmp1), format)
+
+        ;For a method-format, read-dispatch-table returns 0
+        ;to indicate default branch, 1 to indicate amb branch, otherwise
+        ;returns the (2 + id of the function) to dispatch to.
+        val code-label = new-label(a)
+        cmp(a, reg(Tmp1), 2)
+        jge(a, code-label)            
+        cmp(a, reg(Tmp1), 0)
+        je(a, get-label(default(ins)))
+        jmp(a, get-label(amb(ins)))
+
+        ;Goto the function entry.
+        bind(a, code-label)
+        goto-function(reg(Tmp1), -2)
+
+      (ins:SetIns) :
+        set-local(slot(x(ins)), y(ins))
+
+    ;Meaningless return value
+    false
+
+  ;=========================================================
+  ;================= Function Prelude ======================
+  ;=========================================================
+  ;Prelude for a single-arity function.
+  defn emit-function-prelude (args:Tuple<Local|VMType>, extend-stack:Func) :
+    ;Label after stack extension
+    val after-stack-extension = new-label(a)
+    
+    ;Check whether we need to extend the stack.
+    val size-required = current-frame-size() + SIZEOF-STACK-FRAME
+    lea(a, reg(Tmp3), MemPtr(reg(StackPointerReg), size-required))
+    val limit = compute-stack-limit(reg(Tmp2))
+    cmp(a, reg(Tmp3), limit)
+    jbe(a, after-stack-extension)
+    
+    ;Call extend-stack
+    lea(a, reg(Tmp2), MemPtr(after-stack-extension))
+    mov(a, reg(Tmp3), size-required)
+    mov(a, reg(Tmp1), value(extend-stack))
+    jmp(a, reg(Tmp1))
+
+    ;Return from stack extension
+    bind(a, after-stack-extension)
+
+    ;Retrieve arguments
+    get-regs(args)
+
+  ;=========================================================
+  ;================ Multi-Arity Dispatch ===================
+  ;=========================================================
+  ;Multiple-arity dispatch.
+  ;- emit-arity-code(index):
+  ;  If arity is Int, then generate the code corresponding to the
+  ;  entry at index 'index'.
+  ;  If arity is False, then generate the code corresponding to
+  ;  the default case.
+  defn emit-multi-arity-dispatch (emit-arity-code: Int|False -> False,
+                                  arity-arg:Int,
+                                  arities:Tuple<Int>) :
+    ;Retrieve the number of arguments that the function was called with.
+    val arity-reg = vm-register(arity-arg, reg(Tmp1))
+    ;Emit each of the arities
+    for (arity in arities, index in 0 to false) do :
+      val after-func-label = new-label(a)
+      cmp(a, arity-reg, arity)        
+      jne(a, after-func-label)
+      emit-arity-code(index)        
+      bind(a, after-func-label)
+    ;Default branch
+    emit-arity-code(false)
+
+  ;=========================================================
+  ;============= Return Asm Generation Utilities ===========
+  ;=========================================================
+  new AsmGen :
+    defmethod emit-jit-launch (this) :
+      make-jit-launch-stub()
+    defmethod emit-extend-stack (this) :
+      make-extend-stack-stub()
+    defmethod emit-function-prelude (this, args:Tuple<Local|VMType>, extend-stack:Func) :
+      emit-function-prelude(args, extend-stack)
+    defmethod emit-multi-arity-dispatch (emit-arity-code:Int|False -> False, this, arity-arg:Int, arities:Tuple<Int>) :
+      emit-multi-arity-dispatch(emit-arity-code, arity-arg, arities)
+    defmethod emit-ins (this, ins:VMIns) :
+      emit-ins(ins)
+
+;============================================================
+;================= Compile Stubs ============================
+;============================================================
+
+public defn make-jit-stubs (rt:JitRuntime, resolver:EncodingResolver, backend:Backend) -> JITStubs :
+  ;Make a Func given an emitter function.
+  defn make-stub-func (emit-code:AsmGen -> ?) -> Func :
+    within (code, assembler) = gen-code(rt) :
+      emit-code(AsmGen(code, assembler, resolver, false, false, backend))
+  ;Compile all stubs    
+  JITStubs(
+    make-stub-func(emit-jit-launch)
+    make-stub-func(emit-extend-stack))
+
+;============================================================
+;================= Compile Function =========================
+;============================================================
+
+public defn encode (func:VMFunction, stubs:JITStubs, rt:JitRuntime, resolver:EncodingResolver, backend:Backend) -> EncodedFunction :
+                  
+  ;Retrieve the FuncInfo for the function.                
+  defn func-info (f:VMFunc) -> FuncInfo :
+    ;Compute number of locals in function.
+    ;Extra 3 locals for temporary moving.
+    val max-local = maximum(-1, seq(local, defs(f)))
+    val num-locals = max-local + 1 + 3          
+
+    ;Definitions
+    val deftable = to-inttable(id, defs(f))
+
+    ;Labels
+    val used-labels = to-intset(seq(n, filter-by<LabelIns>(ins(f))))
+
+    ;Function Info
+    FuncInfo(deftable, used-labels, max-local, num-locals)    
+
+  ;Generate code for multifn
+  defn emit-multifn (code:CodeHolder, assembler:Assembler, trace-entry-table:Vector<TraceTableEntry>, f:VMMultifn) :
+    val gen = AsmGen(code, assembler, resolver, false, trace-entry-table, backend)
+    within func-index = emit-multi-arity-dispatch(gen, arg(f), map(key,funcs(f))) :
+      match(func-index:Int) :
+        val entry = funcs(f)[func-index]
+        emit-fn(code, assembler, trace-entry-table, value(entry))
+      else :
+        emit-fn(code, assembler, trace-entry-table, default(f))
+
+  ;Generate code for single fn
+  defn emit-fn (code:CodeHolder, assembler:Assembler, trace-entry-table:Vector<TraceTableEntry>, f:VMFunc) :
+    val gen = AsmGen(code, assembler, resolver, func-info(f), trace-entry-table, backend)
+    emit-function-prelude(gen, args(f), extend-stack(stubs))
+    do(emit-ins{gen, _}, ins(f))    
+
+  ;Launch!
+  val trace-entry-table = Vector<TraceTableEntry>()
+  val jit-func = within (code, assembler) = gen-code(rt) :
+    match(func) :
+      (func:VMMultifn) : emit-multifn(code, assembler, trace-entry-table, func)
+      (func:VMFunc) : emit-fn(code, assembler, trace-entry-table, func)
+  EncodedFunction(jit-func, trace-entry-table)
