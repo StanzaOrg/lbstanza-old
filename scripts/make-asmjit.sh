@@ -14,6 +14,8 @@ case "$OPTION" in
     os-x)
         FILENAME="libasmjit-os-x.a" ;;
     linux)
+        # gcc needs explicit flag for position-independent code.
+        export CXXFLAGS="-fPIC"  
         FILENAME="libasmjit-linux.a" ;;
     current)
         FILENAME="libasmjit.a" ;;
