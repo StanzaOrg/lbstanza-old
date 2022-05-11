@@ -17,6 +17,7 @@ defpackage stz/jit-encoder :
   import stz/vm-opcodes
   import stz/code-table
   import stz/jit-code-table
+  import stz/shuffle
 
 ;============================================================
 ;===================== JIT Encoder ==========================
@@ -48,6 +49,7 @@ public defstruct EncodedFunction :
 
 val USE-REGS-FOR-LOCALS? = true  ;Use x86 registers for first few vm locals?
 val USE-REGS-FOR-VM-REGS? = true ;Use x86 registers for first few vm registers?
+val USE-DIRECT-C-CALLS? = true   ;Use direct c calls instead of c_trampoline?
 
 ;============================================================
 ;=================== External Routines ======================
@@ -87,6 +89,16 @@ lostanza defn call-collect-stack-trace-addr () -> ref<Long> :
 ;- compute-op2-with-rax-rdx assumes Tmp2 is not RAX/RDX
 ;- compute-with-rcx assumes Tmp1 is not RCX
 
+;# Notes about Calling Convention #
+;- The C calling convention reads input from the following memory locations:
+;    The local memory
+;    The vmregister memory
+; So these base pointers (StackPointerReg, RegistersReg) must be kept
+; separate from the register shuffling algorithm. They cannot be
+; either the destination registers (C input args, rax, cfuncreg), or
+; the source registers (Locals).
+;- The c-func-reg cannot be one of the C input registers.
+
 deftype Registers
 
 ;Return the x86 register selected for the given quantity.
@@ -94,7 +106,9 @@ defmulti reg (r:Registers, reg-item:VMRegItem) -> Gp
 
 ;Return the argument and return registers for C calling convention.
 defmulti callc-regs (r:Registers) -> Tuple<Gp>
+defmulti callc-fregs (r:Registers) -> Tuple<Xmm>
 defmulti callc-return (r:Registers) -> Gp
+defmulti callc-freturn (r:Registers) -> Xmm
 
 ;The list of quantities that are held directly in
 ;x86 registers.
@@ -113,6 +127,7 @@ defenum VMRegItem :
   VMReg1           ;Holds vmstate.registers[0]
   VMReg2           ;Holds vmstate.registers[1]
   VMReg3           ;Holds vmstate.registers[2]
+  CFuncReg         ;Holds the function address, which is used during C calls.
 
 ;Gather all the locals and vmregs that are in use.
 val LOCAL-ITEMS = [Local1, Local2, Local3] when USE-REGS-FOR-LOCALS? else []
@@ -122,13 +137,14 @@ defn Registers (backend:Backend) -> Registers :
   ;List registers in same order as stz-backend.stanza.
   ;Must match stz-asm-emitter.stanza.
   val reg-by-number = [rax, rbx, rcx, rdx, rsi, rdi, rbp, r8, r9, r10, r11, r12, r13, r14, r15]
+  val freg-by-number = [xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7, xmm8, xmm9, xmm10, xmm11, xmm12, xmm13, xmm14, xmm15]
 
   ;Declare assignments for each platform.
   val reg-assignments = match(backend) :
     (backend:W64Backend) :
       [VMStateReg => r8
-       RegistersReg => r9
-       StackReg => r11
+       RegistersReg => rbp
+       StackReg => r9
        StackPointerReg => r10
        FunctionsReg => r12
        Tmp1 => rax
@@ -139,11 +155,12 @@ defn Registers (backend:Backend) -> Registers :
        Local3 => r15
        VMReg1 => rsi
        VMReg2 => rdi
-       VMReg3 => rbx]
+       VMReg3 => rbx
+       CFuncReg => r11]
     (backend:Backend) :
       [VMStateReg => r8
-       RegistersReg => r9
-       StackReg => r11
+       RegistersReg => rbp
+       StackReg => r9
        StackPointerReg => r10
        FunctionsReg => r12
        Tmp1 => rax
@@ -154,11 +171,14 @@ defn Registers (backend:Backend) -> Registers :
        Local3 => r15
        VMReg1 => rsi
        VMReg2 => rdi
-       VMReg3 => rbx]
+       VMReg3 => rbx
+       CFuncReg => r11]
 
   ;C argument parameters
   val callc-regs = for i in callc-regs(backend) map : reg-by-number[i]
+  val callc-fregs = for i in callc-fregs(backend) map : freg-by-number[i]
   val callc-return = reg-by-number[callc-ret(backend)]
+  val callc-freturn = freg-by-number[callc-fret(backend)]
 
   ;Assign registers
   val reg-assignments-map = Array<Gp>(VMRegItem-length)
@@ -170,12 +190,28 @@ defn Registers (backend:Backend) -> Registers :
 
   ;Ensure that registers satisfy the invariants we need them to.
   let :
+    ;Ensure that the given item is in an acceptable register.
+    defn ensure-not! (item:VMRegItem, loc:VMRegItem|Gp) :
+      val loc-reg = match(loc) :
+        (loc:VMRegItem) : reg(loc)
+        (loc:Gp) : loc
+      if reg(item) == loc-reg :
+        fatal("%_ cannot be assigned to %_." % [item, loc-reg])
+
     ;Ensure that tmp2 is not rax/rdx.
-    if reg(Tmp2) == rax or reg(Tmp2) == rdx :
-      fatal("Tmp2 cannot be rax/rdx.")
+    ensure-not!(Tmp2, rax)
+    ensure-not!(Tmp2, rdx)
     ;Ensure that tmp1 is not rcx.
-    if reg(Tmp1) == rcx :
-      fatal("Tmp1 cannot be rcx.")    
+    ensure-not!(Tmp1, rcx)
+    ;Ensure that CFuncReg is in an acceptable place.
+    do(ensure-not!{CFuncReg, _}, callc-regs)
+    ensure-not!(CFuncReg, rax)
+    ;Ensure that StackPointerReg, RegistersReg are in an acceptable places.
+    for r in [RegistersReg, StackPointerReg] do :
+      do(ensure-not!{r, _}, LOCAL-ITEMS)
+      do(ensure-not!{r, _}, callc-regs)
+      ensure-not!(r, rax)
+      ensure-not!(r, CFuncReg)
 
   ;Return structure
   new Registers :
@@ -183,8 +219,12 @@ defn Registers (backend:Backend) -> Registers :
       reg(item)
     defmethod callc-regs (this) :
       callc-regs
+    defmethod callc-fregs (this) :
+      callc-fregs
     defmethod callc-return (this) :
-      callc-return  
+      callc-return
+    defmethod callc-freturn (this) :
+      callc-freturn
 
 ;============================================================
 ;================ Small Utilities ===========================
@@ -305,6 +345,13 @@ defstruct FuncInfo :
   max-local:Int
   num-locals:Int
 
+;C Calling Convention Move
+defstruct SetCArg :
+  src:Gp|MemPtr|Int|VMImm
+  dst:Gp|Xmm|MemPtr
+with:
+  printer => true
+
 defn AsmGen (code:CodeHolder,
              a:Assembler,
              resolver:EncodingResolver,
@@ -318,7 +365,9 @@ defn AsmGen (code:CodeHolder,
   val registers = Registers(backend)
   defn reg (item:VMRegItem) : /reg(registers, item)
   defn callc-reg (i:Int) : callc-regs(registers)[i]
+  defn callc-freg (i:Int) : callc-fregs(registers)[i]
   defn callc-ret () : callc-return(registers)
+  defn callc-fret () : callc-freturn(registers)
 
   ;=========================================================
   ;============== Function Stack Frame =====================
@@ -575,16 +624,26 @@ defn AsmGen (code:CodeHolder,
   ;which quantities are saved under which context switches.
   ;
   ;Go from Stanza into JIT code. (Used by launcher, callc.)
-  defn switch-context-stanza-to-jit (dir:EnterExit, has-locals?:True|False) :
+  ;- if close-frame is true, then the saved stack pointer is after the current frame, otherwise
+  ;  it is the current frame.
+  defn switch-context-stanza-to-jit (dir:EnterExit, has-locals?:True|False, close-frame?:True|False) :
     switch(dir) :
       Enter :
         do(restore-reg, [VMStateReg, RegistersReg, FunctionsReg, StackReg, StackPointerReg])
+        if close-frame? :
+          sub(a, reg(StackPointerReg), current-frame-size())
         restore-vm-registers-cache()
         restore-locals-cache() when has-locals?
       Exit :
         save-locals-cache() when has-locals?
         save-vm-registers-cache()
-        save-reg(StackPointerReg)
+        if close-frame? :
+          add(a, reg(StackPointerReg), current-frame-size())
+          save-reg(StackPointerReg)
+          sub(a, reg(StackPointerReg), current-frame-size())
+        else :
+          save-reg(StackPointerReg)
+    false      
 
   ;Switch from Standard JIT code to the system stack.
   ;Uses Tmp1, Tmp2 internally.
@@ -772,21 +831,17 @@ defn AsmGen (code:CodeHolder,
   ;Assume that we are in the standard JIT context, emit code to
   ;call faddr with args. If ret is provided, then store result in ret afterwards.  
   defn simple-call-c-from-jit-context (ret:Gp|False, faddr:Long, args:Tuple<Gp>) :
-    switch-context-stanza-to-jit(Exit, true)
+    switch-context-stanza-to-jit(Exit, true, false)
     simple-c-call(ret, faddr, args)
-    switch-context-stanza-to-jit(Enter, true)
+    switch-context-stanza-to-jit(Enter, true, false)
 
   ;Assume that we are in a standard JIT context, emit code to call
   ;faddr with args. If ret is provided, then store result in ret afterwards.
   ;This call will close the current stack frame and perform the call in a new stack frame.
   defn simple-call-c-in-new-frame-from-jit-context (ret:Gp|False, faddr:Long, args:Tuple<Gp>) :
-    switch-context-new-frame(Enter)
-    add(a, reg(StackPointerReg), current-frame-size())
-    switch-context-stanza-to-jit(Exit, false)
+    switch-context-stanza-to-jit(Exit, true, true)
     simple-c-call(ret, faddr, args)
-    switch-context-stanza-to-jit(Enter, false)
-    sub(a, reg(StackPointerReg), current-frame-size())
-    switch-context-new-frame(Exit)
+    switch-context-stanza-to-jit(Enter, true, true)
 
   ;Emit code to call faddr.
   ;Uses Tmp1 internally, so fid cannot be in Tmp1.
@@ -1152,7 +1207,7 @@ defn AsmGen (code:CodeHolder,
     mov(a, reg(Tmp3), callc-reg(2))    ;Save FID (Arg2) in Tmp3
 
     ;Enter the standard JIT context
-    switch-context-stanza-to-jit(Enter, false)
+    switch-context-stanza-to-jit(Enter, false, false)
 
     ;Write the return address before jumping to the
     ;function enter point.
@@ -1168,7 +1223,7 @@ defn AsmGen (code:CodeHolder,
     bind(a, return-to-stanza-label)
 
     ;Exit the JIT context and return to Stanza
-    switch-context-stanza-to-jit(Exit, false)
+    switch-context-stanza-to-jit(Exit, false, false)
 
     ;Pop all information we pushed onto the stack.
     pop(a, reg(Tmp1)) ;POP CRSP (Unused).
@@ -1285,22 +1340,196 @@ defn AsmGen (code:CodeHolder,
   ;=========================================================
   ;================= C Calling Convention ==================
   ;=========================================================
-  defn emit-callc (f:VMImm, xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) :
-    ;Compute the c-calling record layout for the given arguments and return.
-    ;- xs: The return locals/types.
-    ;- ys: The argument immediates.
-    defn compute-callc-records (xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) -> CallCRecords :
-      ;Convert a VMType into an ArgType for call-record analysis
-      defn to-arg-type (t:VMType) :
-        match(t) :
-          (t:VMFloat|VMDouble) : RealArg()
-          (t) : IntArg()
-      ;Compute C calling convention.
-      callc-records(ytypes, xtype, backend) where :
-        val ytypes = map(to-arg-type, map(imm-type, ys))
-        val xtypes = map(to-arg-type, map(imm-type, xs))
-        val xtype = IntArg() when empty?(xtypes) else xtypes[0]
+  ;Compute the c-calling record layout for the given arguments and return.
+  ;- xs: The return locals/types.
+  ;- ys: The argument immediates.
+  defn compute-callc-records (xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) -> CallCRecords :
+    ;Convert a VMType into an ArgType for call-record analysis
+    defn to-arg-type (t:VMType) :
+      match(t) :
+        (t:VMFloat|VMDouble) : RealArg()
+        (t) : IntArg()
+    ;Compute C calling convention.
+    callc-records(ytypes, xtype, backend) where :
+      val ytypes = map(to-arg-type, map(imm-type, ys))
+      val xtypes = map(to-arg-type, map(imm-type, xs))
+      val xtype = IntArg() when empty?(xtypes) else xtypes[0]
 
+  ;Call directly using the C-calling convention.
+  defn emit-fast-callc (f:VMImm, xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) :
+    ;This is added to CRSP before the call.
+    defn crsp-offset (records:CallCRecords) -> Int :
+      val num-slots = num-mem-args(records) + c-num-spill-slots(backend)
+      (8 * num-slots + 7) & -8
+
+    ;Compute all the SetCArg to implement the given calling records.
+    defn compute-set-c-args (records:CallCRecords) -> Tuple<SetCArg> :
+      ;Convert a CallLoc (an abstract representation of where the
+      ;C argument should be stored) into either a real register
+      ;or memory location to store the argument.
+      defn to-dst (loc:CallLoc) -> Gp|Xmm|MemPtr :
+        match(loc) :
+          (loc:RegLoc) :
+            callc-reg(index(loc))
+          (loc:FRegLoc) :
+            callc-freg(index(loc))
+          (loc:MemLoc) :
+            val stack-offset = 8 * (c-num-spill-slots(backend) + index(loc)) - crsp-offset(records)
+            MemPtr(rsp, stack-offset)
+
+      ;Retrieve arg i in an appropriate representation.
+      ;An appropriate representation can be stored into a register
+      ;without requiring any temporary registers.
+      val preloaded-args = IntSet()
+      defn get-arg-value (i:Int) -> Gp|MemPtr|VMImm :
+        match(ys[i]) :
+          ;These immediates require an additional temporary register to load.
+          ;So preload them into one of the VMRegister slots.
+          (y:GlobalId|DataId|ConstId) :
+            val mem = vm-register-mem(i)
+            
+            ;Emit instructions to preload the argument if we haven't done
+            ;it already.
+            set-imm(mem, y) when add(preloaded-args, i)
+            
+            mem
+            
+          ;Locals are either stored in a register or in the current stack frame.
+          (y:Local) :
+            stack-local(slot(y))
+            
+          ;The rest of the immediates do not currently occupy a register,
+          ;and they can be loaded directly into a register without using any temporaries.
+          (y:VMImm) :
+            y
+
+      ;Create the SetCArg records.
+      val accum = Vector<SetCArg>()
+      for arg in args(records) do :
+        ;Both Shadow and Regular args are treated the same way because
+        ;the values are never currently held in an xmm register.
+        val v = value(arg) as StdArg|ShadowArg
+        add(accum, SetCArg(get-arg-value(index(v)), to-dst(loc(arg))))
+        
+      ;Set the num-float register
+      add(accum, SetCArg(num-real-args(records), rax))
+
+      ;Set the function register
+      add(accum, SetCArg(f as Local|ExternId, reg(CFuncReg)))
+
+      ;Return the accumulated C args.
+      to-tuple(accum)
+
+    ;Write all the CArgs.
+    defn write-cargs-to-registers (cargs:Tuple<SetCArg>) :
+      ;These registers are used to access memory, and therefore
+      ;cannot be used as swap registers.
+      val blocked-regs = [reg(RegistersReg),
+                          reg(StackPointerReg),
+                          rsp]
+                          
+      ;Create the list of available registers.
+      val available-regs = to-tuple $
+        for r in gp64s seq? :
+          if contains?(blocked-regs, r) : None()
+          else : One(Reg(id(r)))
+          
+      ;Create the ShuffleProblem representing the transfer
+      ;of values to registers.
+      val prob = ShuffleProblem(available-regs, map(to-mov,cargs)) where :
+        defn to-mov (carg:SetCArg) -> Move :
+          Move(carg, to-loc(src(carg)), to-loc(dst(carg)))
+        defn to-loc (x:Gp|Xmm|MemPtr|Int|VMImm) -> Loc :
+          match(x:Gp) : Reg(id(x))
+          else : Mem()
+
+      ;Convert a shuffling engine Reg into a Gp.
+      defn to-gp (r:Reg) -> Gp :
+        gp-by-index(index(r))
+
+      ;If the new-loc is a Reg, then the shuffling engine might
+      ;have chosen a different register, so use the one from the shuffling engine,
+      ;otherwise use the original loc.
+      defn updated-loc (old-loc:Gp|Xmm|MemPtr|Int|VMImm, new-loc:Loc) -> Gp|Xmm|MemPtr|Int|VMImm :
+        match(new-loc:Reg) : to-gp(new-loc)
+        else : old-loc
+
+      ;Emit the instructions necessary to conduct the shuffle.
+      for ins in shuffle(prob) do :
+        match(ins) :
+          ;A Mem-to-Reg, Reg-to-Reg, or Reg-to-Mem move.
+          (ins:Move) :
+            ;Is it an in-place move?
+            val in-place? = match(src(ins), dst(ins)) :
+              (src:Reg, dst:Reg) : index(src) == index(dst)
+              (src, dst) : false
+            if not in-place? :
+              match(id(ins)) :
+                ;Move.
+                (set-carg:SetCArg) :
+                  ;Retrieve the potentially updated locations.
+                  val src-loc = updated-loc(src(set-carg), src(ins))
+                  val dst-loc = updated-loc(dst(set-carg), dst(ins)) as Gp|Xmm|MemPtr
+                  ;Perform the move
+                  match(src-loc, dst-loc) :
+                    ;Direct moves into a register.
+                    (src-loc:Gp|MemPtr|Int, dst-loc:Gp) : mov(a, dst-loc, src-loc)
+                    (src-loc:VMImm, dst-loc:Gp) : set-imm(dst-loc, src-loc)
+                    (src-loc:Gp, dst-loc:Xmm) : movsd(a, dst-loc, src-loc)
+                    (src-loc:Gp, dst-loc:MemPtr) : mov(a, dst-loc, src-loc)                
+                ;Reg-to-Reg shuffling moving.
+                (f:False) :
+                  val src-reg = to-gp(src(ins) as Reg)
+                  val dst-reg = to-gp(dst(ins) as Reg)
+                  mov(a, dst-reg, src-reg)
+                  
+          ;A Mem-to-mem move.
+          (ins:MoveUsingTmp) :
+            val set-carg = id(ins) as SetCArg
+            val tmp-reg = to-gp(/reg(ins))
+            ;Move from the source to the temp register.            
+            match(src(set-carg)) :
+              (src:Gp|MemPtr|Int) : mov(a, tmp-reg, src)
+              (src:VMImm) : set-imm(tmp-reg, src)
+            ;Move from the temp register to the destination.
+            match(dst(set-carg)) :
+              (dst:Gp|MemPtr) : mov(a, dst, tmp-reg)
+              (dst:Xmm) : movsd(a, dst, tmp-reg)
+          
+          ;Swap registers should not be necessary.
+          (ins:SaveSwap|RestoreSwap) :
+            fatal("Save/Restore swap registers not expected.")
+
+    ;Call the function in the function register.
+    defn call-f (records:CallCRecords) :
+      val offset = crsp-offset(records)
+      sub(a, rsp, offset)
+      call(a, reg(CFuncReg))
+      add(a, rsp, offset)
+      mov(a, reg(Tmp1), callc-ret())
+      movsd(a, reg(Tmp2), callc-fret())
+
+    ;Emit instructions for moving the return value to the
+    ;appropriate local.
+    defn move-return-to-local (records:CallCRecords, xs:Tuple<Local|VMType>) :
+      if not empty?(xs) :
+        val x = xs[0]
+        match(x:Local) :
+          match(return(records)) :
+            (l:RegLoc) : set-local(slot(x), reg(Tmp1), 8)
+            (l:FRegLoc) : set-local(slot(x), reg(Tmp2), 8)
+
+    ;Driver
+    switch-context-stanza-to-jit(Exit, true, true)
+    val records = compute-callc-records(xs, ys)
+    val set-cargs = compute-set-c-args(records)
+    write-cargs-to-registers(set-cargs)
+    call-f(records)
+    switch-context-stanza-to-jit(Enter, true, true)    
+    move-return-to-local(records, xs)
+
+  ;Call using the C trampoline.
+  defn emit-callc (f:VMImm, xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) :
     ;Emit instructions for writing the CallC calling record to vmstate.registers
     ;using the convention required by the c_trampoline stub.
     defn write-records-to-registers (records:CallCRecords, ys:Tuple<VMImm>) :
@@ -2251,7 +2480,10 @@ defn AsmGen (code:CodeHolder,
         record-trace-entry(ret, trace-entry(ins))            
 
       (ins:CallCIns) :
-        emit-callc(f(ins), xs(ins), ys(ins))
+        if USE-DIRECT-C-CALLS? : 
+          emit-fast-callc(f(ins), xs(ins), ys(ins))
+        else :
+          emit-callc(f(ins), xs(ins), ys(ins))
         
       (ins:YieldIns) :
         ;current-stack.pc = after-yield.
@@ -2386,7 +2618,7 @@ defn AsmGen (code:CodeHolder,
       (ins:Op0Ins) :
         match(op(ins)) :
           (op:FlushVMOp) :
-            switch-context-stanza-to-jit(Exit, true)
+            switch-context-stanza-to-jit(Exit, true, false)
             set-local(slot?(x(ins)), reg(VMStateReg), 8)
           (op:CRSPOp) :
             mov(a, reg(Tmp1), saved-crsp())
