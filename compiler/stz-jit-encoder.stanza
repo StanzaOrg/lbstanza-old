@@ -89,9 +89,15 @@ lostanza defn call-collect-stack-trace-addr () -> ref<Long> :
 ;  need to be saved/restored after using those instructions.
 ;- compute-op2-with-rax-rdx assumes Tmp2 is not RAX/RDX
 ;- compute-with-rcx assumes Tmp1 is not RCX
-;- The c-stack-pointer-reg cannot be one of the Local registers, the
-;  stack pointer, or one of the C calling convention input registers
-;  (args or num-real-args).
+
+;# Notes about Calling Convention #
+;- The C calling convention reads input from the following memory locations:
+;    The local memory
+;    The vmregister memory
+; So these base pointers (StackPointerReg, RegistersReg) must be kept
+; separate from the register shuffling algorithm. They cannot be
+; either the destination registers (C input args, rax, cfuncreg), or
+; the source registers (Locals).
 ;- The c-func-reg cannot be one of the C input registers.
 
 deftype Registers
@@ -122,7 +128,6 @@ defenum VMRegItem :
   VMReg1           ;Holds vmstate.registers[0]
   VMReg2           ;Holds vmstate.registers[1]
   VMReg3           ;Holds vmstate.registers[2]
-  CStackPointerReg ;Holds CRSP, which is used during C calls.
   CFuncReg         ;Holds the function address, which is used during C calls.
 
 ;Gather all the locals and vmregs that are in use.
@@ -139,8 +144,8 @@ defn Registers (backend:Backend) -> Registers :
   val reg-assignments = match(backend) :
     (backend:W64Backend) :
       [VMStateReg => r8
-       RegistersReg => r9
-       StackReg => r11
+       RegistersReg => rbp
+       StackReg => r9
        StackPointerReg => r10
        FunctionsReg => r12
        Tmp1 => rax
@@ -152,12 +157,11 @@ defn Registers (backend:Backend) -> Registers :
        VMReg1 => rsi
        VMReg2 => rdi
        VMReg3 => rbx
-       CStackPointerReg => rbx
        CFuncReg => r11]
     (backend:Backend) :
       [VMStateReg => r8
-       RegistersReg => r9
-       StackReg => r11
+       RegistersReg => rbp
+       StackReg => r9
        StackPointerReg => r10
        FunctionsReg => r12
        Tmp1 => rax
@@ -169,7 +173,6 @@ defn Registers (backend:Backend) -> Registers :
        VMReg1 => rsi
        VMReg2 => rdi
        VMReg3 => rbx
-       CStackPointerReg => rbx
        CFuncReg => r11]
 
   ;C argument parameters
@@ -188,7 +191,7 @@ defn Registers (backend:Backend) -> Registers :
 
   ;Ensure that registers satisfy the invariants we need them to.
   let :
-    ;Ensure that CStackPointerReg is in an acceptable place.
+    ;Ensure that the given item is in an acceptable register.
     defn ensure-not! (item:VMRegItem, loc:VMRegItem|Gp) :
       val loc-reg = match(loc) :
         (loc:VMRegItem) : reg(loc)
@@ -201,16 +204,15 @@ defn Registers (backend:Backend) -> Registers :
     ensure-not!(Tmp2, rdx)
     ;Ensure that tmp1 is not rcx.
     ensure-not!(Tmp1, rcx)
-    ;Ensure that CStackPointerReg is in an acceptable place.
-    do(ensure-not!{CStackPointerReg, _}, LOCAL-ITEMS)
-    ensure-not!(CStackPointerReg, RegistersReg)
-    ensure-not!(CStackPointerReg, StackPointerReg)
-    ensure-not!(CStackPointerReg, rsp)
-    ensure-not!(CStackPointerReg, rax)
     ;Ensure that CFuncReg is in an acceptable place.
     do(ensure-not!{CFuncReg, _}, callc-regs)
-    ensure-not!(CFuncReg, RegistersReg)
     ensure-not!(CFuncReg, rax)
+    ;Ensure that StackPointerReg, RegistersReg are in an acceptable places.
+    for r in [RegistersReg, StackPointerReg] do :
+      do(ensure-not!{r, _}, LOCAL-ITEMS)
+      do(ensure-not!{r, _}, callc-regs)
+      ensure-not!(r, rax)
+      ensure-not!(r, CFuncReg)
 
   ;Return structure
   new Registers :
@@ -562,14 +564,6 @@ defn AsmGen (code:CodeHolder,
     else : stack-local-mem(i)
   defn stack-local-mem (i:Int) -> MemPtr :
     MemPtr(reg(StackPointerReg), i * SIZEOF-LONG + STACK-FRAME-SLOTS-OFFSET)
-
-  ;Returns the location of the i'th local stored in the
-  ;current stack frame. 
-  defn prev-stack-local (i:Int) -> Gp|MemPtr :
-    if i < length(LOCAL-ITEMS) : reg(LOCAL-ITEMS[i])
-    else : prev-stack-local-mem(i)
-  defn prev-stack-local-mem (i:Int) -> MemPtr :
-    MemPtr(reg(StackPointerReg), i * SIZEOF-LONG + STACK-FRAME-SLOTS-OFFSET - current-frame-size())
 
   ;Returns the stack-local in a register.
   ;Use the given temporary register if necessary.
@@ -1362,6 +1356,7 @@ defn AsmGen (code:CodeHolder,
       val xtypes = map(to-arg-type, map(imm-type, xs))
       val xtype = IntArg() when empty?(xtypes) else xtypes[0]
 
+  ;Call directly using the C-calling convention.
   defn emit-fast-callc (f:VMImm, xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) :
     ;This is added to CRSP before the call.
     defn crsp-offset (records:CallCRecords) -> Int :
@@ -1402,7 +1397,7 @@ defn AsmGen (code:CodeHolder,
             
           ;Locals are either stored in a register or in the current stack frame.
           (y:Local) :
-            prev-stack-local(slot(y))
+            stack-local(slot(y))
             
           ;The rest of the immediates do not currently occupy a register,
           ;and they can be loaded directly into a register without using any temporaries.
@@ -1430,7 +1425,7 @@ defn AsmGen (code:CodeHolder,
     defn write-cargs-to-registers (cargs:Tuple<SetCArg>) :
       ;These registers are used to access memory, and therefore
       ;cannot be used as swap registers.
-      val blocked-regs = [reg(CStackPointerReg),
+      val blocked-regs = [reg(RegistersReg),
                           reg(StackPointerReg),
                           rsp]
                           
@@ -1461,17 +1456,10 @@ defn AsmGen (code:CodeHolder,
         else : old-loc
 
       ;Emit the instructions necessary to conduct the shuffle.
-      val result = shuffle(prob)
-      println("Input SetCArg:")
-      within indented() :
-        do(println, cargs)
-      println(prob)
-      do(println,result)
-      for ins in result do :
+      for ins in shuffle(prob) do :
         match(ins) :
           ;A Mem-to-Reg, Reg-to-Reg, or Reg-to-Mem move.
           (ins:Move) :
-            println("IMPLEMENT %_" % [ins])
             ;Is it an in-place move?
             val in-place? = match(src(ins), dst(ins)) :
               (src:Reg, dst:Reg) : index(src) == index(dst)
@@ -1486,49 +1474,30 @@ defn AsmGen (code:CodeHolder,
                   ;Perform the move
                   match(src-loc, dst-loc) :
                     ;Direct moves into a register.
-                    (src-loc:Gp|MemPtr|Int, dst-loc:Gp) :
-                      println("mov %_ = %_" % [dst-loc, src-loc])
-                      mov(a, dst-loc, src-loc)
-                    (src-loc:VMImm, dst-loc:Gp) :
-                      println("set-imm %_ = %_" % [dst-loc, src-loc])
-                      set-imm(dst-loc, src-loc)
-                    ;Moves into an xmm register.
-                    (src-loc:Gp, dst-loc:Xmm) :
-                      println("movsd %_ = %_" % [dst-loc, src-loc])
-                      movsd(a, dst-loc, src-loc)
-                    ;Moves into memory.
-                    (src-loc:Gp, dst-loc:MemPtr) :
-                      println("mov %_ = %_" % [dst-loc, src-loc])
-                      mov(a, dst-loc, src-loc)                
+                    (src-loc:Gp|MemPtr|Int, dst-loc:Gp) : mov(a, dst-loc, src-loc)
+                    (src-loc:VMImm, dst-loc:Gp) : set-imm(dst-loc, src-loc)
+                    (src-loc:Gp, dst-loc:Xmm) : movsd(a, dst-loc, src-loc)
+                    (src-loc:Gp, dst-loc:MemPtr) : mov(a, dst-loc, src-loc)                
                 ;Reg-to-Reg shuffling moving.
                 (f:False) :
                   val src-reg = to-gp(src(ins) as Reg)
                   val dst-reg = to-gp(dst(ins) as Reg)
-                  println("mov %_ = %_" % [dst-reg, src-reg])
                   mov(a, dst-reg, src-reg)
                   
           ;A Mem-to-mem move.
           (ins:MoveUsingTmp) :
-            println("IMPLEMENT %_" % [ins])
             val set-carg = id(ins) as SetCArg
             val tmp-reg = to-gp(/reg(ins))
             ;Move from the source to the temp register.            
             match(src(set-carg)) :
-              (src:Gp|MemPtr|Int) :
-                println("  mov %_ = %_" % [tmp-reg, src])
-                mov(a, tmp-reg, src)
-              (src:VMImm) :
-                println("  setimm %_ = %_" % [tmp-reg, src])
-                set-imm(tmp-reg, src)
+              (src:Gp|MemPtr|Int) : mov(a, tmp-reg, src)
+              (src:VMImm) : set-imm(tmp-reg, src)
             ;Move from the temp register to the destination.
             match(dst(set-carg)) :
-              (dst:Gp|MemPtr) :
-                println("  mov %_ = %_" % [dst, tmp-reg])
-                mov(a, dst, tmp-reg)
-              (dst:Xmm) :
-                println("  movsd %_ = %_" % [dst, tmp-reg])
-                movsd(a, dst, tmp-reg)
+              (dst:Gp|MemPtr) : mov(a, dst, tmp-reg)
+              (dst:Xmm) : movsd(a, dst, tmp-reg)
           
+          ;Swap registers should not be necessary.
           (ins:SaveSwap|RestoreSwap) :
             fatal("Save/Restore swap registers not expected.")
 
@@ -1538,10 +1507,6 @@ defn AsmGen (code:CodeHolder,
       sub(a, rsp, offset)
       call(a, reg(CFuncReg))
       add(a, rsp, offset)
-
-    ;Emit instructions for moving the return value to the
-    ;appropriate local.
-    defn move-return-to-tmps (records:CallCRecords) :
       mov(a, reg(Tmp1), callc-ret())
       movsd(a, reg(Tmp2), callc-fret())
 
@@ -1552,33 +1517,19 @@ defn AsmGen (code:CodeHolder,
         val x = xs[0]
         match(x:Local) :
           match(return(records)) :
-            (l:RegLoc) : mov(a, stack-local(slot(x)), reg(Tmp1))
-            (l:FRegLoc) : mov(a, stack-local(slot(x)), reg(Tmp2))
+            (l:RegLoc) : set-local(slot(x), reg(Tmp1), 8)
+            (l:FRegLoc) : set-local(slot(x), reg(Tmp2), 8)
 
     ;Driver
-    val temp = new-label(a)
-    bind(a, temp)
-    println("Generating C call at %_" % [label-offset(code,temp)])
-
-    switch-context-new-frame(Enter)
-    add(a, reg(StackPointerReg), current-frame-size())
-    switch-context-stanza-to-jit(Exit, false, false)
-
+    switch-context-stanza-to-jit(Exit, true, true)
     val records = compute-callc-records(xs, ys)
     val set-cargs = compute-set-c-args(records)
-    ;mov(a, reg(CStackPointerReg), saved-crsp())
     write-cargs-to-registers(set-cargs)
     call-f(records)
-    move-return-to-tmps(records)
-    
-
-
-    switch-context-stanza-to-jit(Enter, false, false)
-    sub(a, reg(StackPointerReg), current-frame-size())
-    switch-context-new-frame(Exit)
-    
+    switch-context-stanza-to-jit(Enter, true, true)    
     move-return-to-local(records, xs)
-    
+
+  ;Call using the C trampoline.
   defn emit-callc (f:VMImm, xs:Tuple<Local|VMType>, ys:Tuple<VMImm>) :
     ;Emit instructions for writing the CallC calling record to vmstate.registers
     ;using the convention required by the c_trampoline stub.
