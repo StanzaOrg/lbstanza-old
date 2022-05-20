@@ -7,14 +7,19 @@
 #ifdef PLATFORM_WINDOWS
   #include <fcntl.h>
   #include <io.h>
+  #include <windows.h>
 #else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
   #include <unistd.h>
+  typedef int SOCKET;
 #endif
 
 static FILE* debug_adapter_log;
 static const char* debug_adapter_path;
 
 static inline char* get_absolute_path(const char* s) {
+  // Use GetFullPathName on Windows
   return realpath(s, NULL);
 }
 static inline void free_path(const char* s) {
@@ -138,6 +143,55 @@ static inline void launch_target_in_terminal(const char* comm_file, const int ar
   exit(EXIT_FAILURE);
 }
 
+// Accept a socket connection from any host on given port.
+static inline SOCKET accept_connection(const int port) {
+  SOCKET newsock = -1;
+  struct sockaddr_in serv_addr, cli_addr;
+  SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+#if 0
+  if (sockfd < 0) {
+    if (g_vsc.log)
+      *g_vsc.log << "error: opening socket (" << strerror(errno) << ")"
+                 << std::endl;
+  } else {
+    memset((char *)&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    // serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    serv_addr.sin_port = htons(portno);
+    if (bind(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+      if (g_vsc.log)
+        *g_vsc.log << "error: binding socket (" << strerror(errno) << ")"
+                   << std::endl;
+    } else {
+      listen(sockfd, 5);
+      socklen_t clilen = sizeof(cli_addr);
+      newsockfd =
+          llvm::sys::RetryAfterSignal(static_cast<SOCKET>(-1), accept, sockfd,
+                                      (struct sockaddr *)&cli_addr, &clilen);
+      if (newsockfd < 0)
+        if (g_vsc.log)
+          *g_vsc.log << "error: accept (" << strerror(errno) << ")"
+                     << std::endl;
+    }
+#if defined(_WIN32)
+    closesocket(sockfd);
+#else
+    close(sockfd);
+#endif
+  }
+#endif
+  return newsock;
+}
+
+
+static inline int debug(const int port) {
+  // redirect_output(stdout, STDOUT);
+  // redirect_output(stderr, STDERR);
+  // main loop
+  return EXIT_SUCCESS;
+}
+
 int main(int argc, char* argv[]) {
   // setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
 
@@ -158,14 +212,76 @@ int main(int argc, char* argv[]) {
     launch_target_in_terminal(comm_path, launch_target_argc, launch_target_argv);
   }
 
-  redirect_output(stdout, STDOUT);
-//  redirect_output(stderr, STDERR);
+  int port = -1;
+  const int port_pos = find_last_arg_with_value("port", argc, argv);
+  if (port_pos) {
+    const char* port_arg = argv[port_pos + 1];
+    char* remainder;
+    port = strtoul(port_arg, &remainder, 0); // Ordinary C notation
+    if (*remainder) {
+      fprintf(stderr, "'%s' is not a valid port number.\n", port_arg);
+      return EXIT_FAILURE;
+    }
+  }
 
-  for (int i = 0; i < 1000; i++)
-    printf("abc %d\n", i);
+#ifndef PLATFORM_WINDOWS
+  if (find_last_arg("wait-for-debugger", argc, argv)) {
+    printf("Paused waiting for debugger to attach (pid = %i)...\n", getpid());
+    pause();
+  }
+#endif
 
-  fflush(stdout);
-  sleep(1);
+  if (port != -1) {
+    printf("Listening on port %i...\n", port);
+    SOCKET tmpsock = socket(AF_INET, SOCK_STREAM, 0);
+    if (tmpsock < 0) {
+      if (debug_adapter_log)
+        fprintf(debug_adapter_log, "error: opening socket (%s)\n", strerror(errno));
+      return EXIT_FAILURE;
+    }
+
+    {
+      struct sockaddr_in serv_addr;
+      memset(&serv_addr, 0, sizeof serv_addr);
+      serv_addr.sin_family = AF_INET;
+      serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      serv_addr.sin_port = htons(port);
+      if (bind(tmpsock, (struct sockaddr*)&serv_addr, sizeof serv_addr) < 0) {
+        if (debug_adapter_log)
+          fprintf(debug_adapter_log, "error: binding socket (%s)\n", strerror(errno));
+        return EXIT_FAILURE;
+      }
+    }
+    listen(tmpsock, 5);
+
+    SOCKET sock;
+    for(struct sockaddr_in cli_addr;;) {
+      socklen_t cli_addr_len = sizeof cli_addr;
+      sock = accept(tmpsock, (struct sockaddr*)&cli_addr, &cli_addr_len);
+      if (sock < 0 && errno != EINTR) {
+        if (debug_adapter_log)
+          fprintf(debug_adapter_log, "error: accepting socket (%s)\n", strerror(errno));
+        return EXIT_FAILURE;
+      }
+    }
+    // g_vsc.input.descriptor = StreamDescriptor::from_socket(sock, true);
+    // g_vsc.output.descriptor = StreamDescriptor::from_socket(sock, false);
+  } else {
+    // g_vsc.input.descriptor = StreamDescriptor::from_file(fileno(stdin), false);
+    // g_vsc.output.descriptor = StreamDescriptor::from_file(fileno(stdout), false);
+  }
+
+
+  // Initialize debugger
+  const int ret_code = debug(port);
+  // Terminate debugger
+
+  if (port != -1) {
+    //Close socket
+  }
+
+ // fflush(stdout);
+ // sleep(1);
   free_path(debug_adapter_path);
-  return EXIT_SUCCESS;
+  return ret_code;
 }
