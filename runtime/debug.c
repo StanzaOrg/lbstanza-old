@@ -260,7 +260,7 @@ static void JSBuilder_send_and_destroy(JSBuilder* builder) {
   write_full(data, length);
 
   if (debug_adapter_log) {
-    fprintf(debug_adapter_log, "<--\nContent-Length: %llu\n\n", (unsigned long long)length);
+    fprintf(debug_adapter_log, "\n<--\nContent-Length: %llu\n\n", (unsigned long long)length);
     fwrite(data, length, 1, debug_adapter_log);
     fprintf(debug_adapter_log, "\n");
   }
@@ -557,15 +557,10 @@ static inline void launch_target_in_terminal(const char* comm_file, const int ar
   exit(EXIT_FAILURE);
 }
 
-static inline int debug(void) {
-  // redirect_output(stdout, STDOUT);
-  // redirect_output(stderr, STDERR);
-  // main loop
-  return EXIT_SUCCESS;
-}
-
 int main(int argc, char* argv[]) {
-  // setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+  // Set line buffering mode to stdout and stderr
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
 
   // Allocate and compute absolute path to the adapter
   debug_adapter_path = get_absolute_path(argv[0]);
@@ -582,6 +577,20 @@ int main(int argc, char* argv[]) {
     char* const* launch_target_argv = argv + launch_target_pos;
     const int launch_target_argc = argc - launch_target_pos;
     launch_target_in_terminal(comm_path, launch_target_argc, launch_target_argv);
+  }
+
+  const int log_pos = find_last_arg_with_value("log", argc, argv);
+  if (log_pos) {
+    const char* log_path = argv[log_pos + 1];
+    debug_adapter_log = fopen(log_path, "wt");
+    if (!debug_adapter_log) {
+      fprintf(stderr, "error opening log file \"%s\" (%s)\n", log_path, strerror(errno));
+      return EXIT_FAILURE;
+    }
+    if (setvbuf(debug_adapter_log, NULL, _IOLBF, BUFSIZ)) {
+      fprintf(stderr, "error setting line buffering mode for log file (%s)\n", strerror(errno));
+      return EXIT_FAILURE;
+    }
   }
 
 #ifndef PLATFORM_WINDOWS
@@ -639,7 +648,7 @@ int main(int argc, char* argv[]) {
     debug_adapter_write = &write_to_socket;
   } else {
     debug_adapter_input_fd = fileno(stdin);
-    debug_adapter_output_fd = fileno(stdout);
+    debug_adapter_output_fd = fileno(stderr); // TODO: change to stdout
     debug_adapter_read = &read_from_file;
     debug_adapter_write = &write_to_file;
   }
@@ -651,11 +660,17 @@ int main(int argc, char* argv[]) {
   }
 
   // Initialize debugger
-  const int ret_code = debug();
+
+  redirect_output(stdout, STDOUT);
+  // redirect_output(stderr, STDERR);
+
+  for (int i = 0; i < 1000; i++) {
+    printf("!!! %d\n", i);
+  }
   // Terminate debugger
 
- // fflush(stdout);
- // sleep(1);
-  free_path(debug_adapter_path);
-  return ret_code;
+  sleep(1);
+
+  // free_path(debug_adapter_path); // OS will release the process memory
+  return EXIT_SUCCESS;
 }
