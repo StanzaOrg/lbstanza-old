@@ -17,6 +17,7 @@
 #endif
 
 static FILE* debug_adapter_log;
+static pthread_mutex_t send_lock;
 static const char* debug_adapter_path;
 
 static inline char* get_absolute_path(const char* s) {
@@ -249,6 +250,8 @@ static inline void JSBuilder_destroy(JSBuilder* builder) {
   free(builder->data);
 }
 static void JSBuilder_send_and_destroy(JSBuilder* builder) {
+  pthread_mutex_lock(&send_lock);
+
   char* data = builder->data;
   const ssize_t length = builder->length;
   write_string("Content-Length: ");
@@ -261,6 +264,8 @@ static void JSBuilder_send_and_destroy(JSBuilder* builder) {
     fwrite(data, length, 1, debug_adapter_log);
     fprintf(debug_adapter_log, "\n");
   }
+
+  pthread_mutex_unlock(&send_lock);
   free(data);
 }
 
@@ -637,6 +642,12 @@ int main(int argc, char* argv[]) {
     debug_adapter_output_fd = fileno(stdout);
     debug_adapter_read = &read_from_file;
     debug_adapter_write = &write_to_file;
+  }
+
+  if (pthread_mutex_init(&send_lock, NULL)) {
+    if (debug_adapter_log)
+      fprintf(debug_adapter_log, "error: initializing mutex (%s)\n", strerror(errno));
+    return EXIT_FAILURE;
   }
 
   // Initialize debugger
