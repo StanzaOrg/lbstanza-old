@@ -441,8 +441,15 @@ StringList* list_dir (const stz_byte* filename){
 
 stz_int sleep_us (stz_long us){
   struct timespec t1, t2;
-  t1.tv_sec = 0;
-  t1.tv_nsec = us * 1000L;
+  t1.tv_sec = us / 1000000L;
+  t1.tv_nsec = (us % 1000000L) * 1000L;
+  return (stz_int)nanosleep(&t1, &t2);
+}
+
+stz_int sleep_ms (stz_long ms){
+  struct timespec t1, t2;
+  t1.tv_sec = ms / 1000L;
+  t1.tv_nsec = (ms % 1000L) * 1000000L;
   return (stz_int)nanosleep(&t1, &t2);
 }
 

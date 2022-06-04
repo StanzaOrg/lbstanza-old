@@ -78,6 +78,7 @@ protected extern stz_memory_resize: (ptr<?>, long, long) -> int
 ;Process libraries
 #if-defined(PLATFORM-WINDOWS):
   protected extern launch_process: (ptr<byte>, int, int, int, ptr<byte>, ptr<?>) -> int
+  protected extern close_process_handle: (ptr<byte>) -> int
 #else:
   protected extern launch_process: (ptr<byte>, ptr<ptr<byte>>, int, int, int, int, ptr<byte>, ptr<?>) -> int
   protected extern delete_process_pipes: (ptr<?>, ptr<?>, ptr<?>, int) -> int
@@ -9083,8 +9084,15 @@ public defn rand (r:Range) : next-int(RANDOM, r)
 ;============================================================
 
 extern sleep_us : long -> int
+extern sleep_ms : long -> int
+
 public lostanza defn sleep-us (us:ref<Long>) -> ref<False> :
   val res = call-c sleep_us(us.value)
+  if res < 0 : throw(SystemCallException(linux-error-msg()))
+  return false
+
+public lostanza defn sleep-ms (ms:ref<Long>) -> ref<False> :
+  val res = call-c sleep_ms(ms.value)
   if res < 0 : throw(SystemCallException(linux-error-msg()))
   return false
 
@@ -9116,9 +9124,14 @@ public val CURRENT-PLATFORM:Platform =
 ;                   Process Structure
 ;                   =================
 
-val PIPE-ID-GENERATOR = Random()
-
-public lostanza deftype Process :
+;- done-state: If the last call to state() indicates that the
+;  process has finished, then this state is saved here. This is
+;  necessary because we are not allowed to check the state
+;  of an already-exited process more than once.
+;  If this field is false, it means that either we haven't
+;  called state() yet, or the previous call to state() indicates
+;  that the process is still running.
+public lostanza deftype Process <: Unique :
   var pid: long
   var handle: ptr<?>
   var pipeid: int
@@ -9128,6 +9141,7 @@ public lostanza deftype Process :
   var input-stream: ref<False|FileOutputStream>
   var output-stream: ref<False|FileInputStream>
   var error-stream: ref<False|FileInputStream>
+  var done-state: ref<ProcessState|False>
 
 ;                 Process State Structure
 ;                 =======================
@@ -9193,7 +9207,7 @@ defn SystemCallException (msg:String) :
                                 error:ref<StreamSpecifier>,
                                 working-dir:ref<String|False>) -> ref<Process> :
     ensure-valid-stream-specifiers(input, output, error)
-    val proc = new Process{0, null, -1, null, null, null, false, false, false}
+    val proc = new Process{0, null, -1, null, null, null, false, false, false, false}
 
     ; Create a command line from the given filename and args (discarding the first argument).
     ; This is necessary because Windows' process API expects a command line (not a list of arguments).
@@ -9218,9 +9232,26 @@ defn SystemCallException (msg:String) :
     ;Throw an exception if launch failed.
     if launch_success != 0 :
       throw(SystemCallException(windows-error-msg()))
+
+    ;If the process was created successfully, then create a finalizer
+    ;to close the process handle.
+    add-finalizer(new ProcessFinalizer{proc.handle}, proc)
+
     ;Return the newly created process.
     return proc
+
+  ;Finalizer for closing the process handle.
+  lostanza deftype ProcessFinalizer <: Finalizer :
+    handle:ptr<?>
+
+  ;Call close process handle when the process is collected.
+  lostanza defmethod run (f:ref<ProcessFinalizer>) -> ref<False> :
+    call-c clib/close_process_handle(f.handle)
+    return false
+
 #else:
+  val PIPE-ID-GENERATOR = Random()
+  
   public lostanza defn Process (filename:ref<String>,
                                 args0:ref<Seqable<String>>,
                                 input:ref<StreamSpecifier>,
@@ -9230,7 +9261,7 @@ defn SystemCallException (msg:String) :
     ensure-valid-stream-specifiers(input, output, error)
     val args = to-tuple(args0)
     val pipe-id = next-int(PIPE-ID-GENERATOR).value
-    val proc = new Process{0, null, pipe-id, null, null, null, false, false, false}
+    val proc = new Process{0, null, pipe-id, null, null, null, false, false, false, false}
     val input_v = value(input).value
     val output_v = value(output).value
     val error_v = value(error).value
@@ -9330,8 +9361,28 @@ lostanza defn retrieve-state (p:ref<Process>, wait-for-termination?:ref<True|Fal
   else :
     return fatal(String("Unreachable"))
 
-public defn state (p:Process) :
-  retrieve-state(p, false)
+public lostanza defn state (p:ref<Process>) -> ref<ProcessState> :
+  ;Check what is saved in the done-state field.
+  match(p.done-state) :
+    ;If nothing is saved, then call retrieve-state
+    ;to request the current state of the process.
+    (f:ref<False>) :
+      ;Retrieve the state and determine whether
+      ;the process is still running.
+      match(retrieve-state(p, false)) :
+        ;If the process is still running, then just return
+        ;ProcessRunning.
+        (s:ref<ProcessRunning>) :
+          return s
+        ;If the process has finished, then save its terminating
+        ;state before returning it.
+        (s:ref<ProcessState>) :
+          p.done-state = s
+          return s
+    ;The process has already finished, and its
+    ;state is saved, so just return it.
+    (s:ref<ProcessState>) :
+      return s
 
 public defn* wait (p:Process) :
   val s = retrieve-state(p, true)
