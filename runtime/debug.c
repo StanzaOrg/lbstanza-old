@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -300,6 +301,14 @@ static void JSBuilder_append_text(JSBuilder* builder, const char* data, ssize_t 
 static void JSBuilder_append_string(JSBuilder* builder, const char* s) {
   JSBuilder_append_text(builder, s, strlen(s));
 }
+static void JSBuilder_append_unsigned(JSBuilder* builder, uint64_t v) {
+  char buffer[22];
+  snprintf(buffer, sizeof buffer, PRIu64, v);
+  JSBuilder_append_string(builder, buffer);
+}
+static inline void JSBuilder_append_bool(JSBuilder* builder, bool v) {
+  JSBuilder_append_string(builder, v ? "true" : "false");
+}
 
 static void JSBuilder_append_quotes(JSBuilder* builder) {
   JSBuilder_append_char(builder, '\"');
@@ -377,6 +386,14 @@ static void JSBuilder_write_raw_string_field(JSBuilder* builder, bool* next, con
   JSBuilder_write_field(builder, next, name);
   JSBuilder_write_quoted_raw_string(builder, value);
 }
+static void JSBuilder_write_unsigned_field(JSBuilder* builder, bool* next, const char* name, uint64_t value) {
+  JSBuilder_write_field(builder, next, name);
+  JSBuilder_append_unsigned(builder, value);
+}
+static void JSBuilder_write_bool_field(JSBuilder* builder, bool* next, const char* name, bool value) {
+  JSBuilder_write_field(builder, next, name);
+  JSBuilder_append_bool(builder, value);
+}
 
 static inline void JSBuilder_structure_begin(JSBuilder* builder, char brace) {
   JSBuilder_append_char(builder, brace);
@@ -414,6 +431,99 @@ static void JSBuilder_send_and_destroy_event(JSBuilder* builder) {
   JSBuilder_object_end(builder); // event
   JSBuilder_object_end(builder); // body
   JSBuilder_send_and_destroy(builder);
+}
+
+// "StoppedEvent": {
+//   "allOf": [ { "$ref": "#/definitions/Event" }, {
+//     "type": "object",
+//     "description": "Event message for 'stopped' event type. The event
+//                     indicates that the execution of the debuggee has stopped
+//                     due to some condition. This can be caused by a break
+//                     point previously set, a stepping action has completed,
+//                     by executing a debugger statement etc.",
+//     "properties": {
+//       "event": {
+//         "type": "string",
+//         "enum": [ "stopped" ]
+//       },
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "reason": {
+//             "type": "string",
+//             "description": "The reason for the event. For backward
+//                             compatibility this string is shown in the UI if
+//                             the 'description' attribute is missing (but it
+//                             must not be translated).",
+//             "_enum": [ "step", "breakpoint", "exception", "pause", "entry" ]
+//           },
+//           "description": {
+//             "type": "string",
+//             "description": "The full reason for the event, e.g. 'Paused
+//                             on exception'. This string is shown in the UI
+//                             as is."
+//           },
+//           "threadId": {
+//             "type": "integer",
+//             "description": "The thread which was stopped."
+//           },
+//           "text": {
+//             "type": "string",
+//             "description": "Additional information. E.g. if reason is
+//                             'exception', text contains the exception name.
+//                             This string is shown in the UI."
+//           },
+//           "allThreadsStopped": {
+//             "type": "boolean",
+//             "description": "If allThreadsStopped is true, a debug adapter
+//                             can announce that all threads have stopped.
+//                             The client should use this information to
+//                             enable that all threads can be expanded to
+//                             access their stacktraces. If the attribute
+//                             is missing or false, only the thread with the
+//                             given threadId can be expanded."
+//           }
+//         },
+//         "required": [ "reason" ]
+//       }
+//     },
+//     "required": [ "event", "body" ]
+//   }]
+// }
+typedef enum { // Extendable - please add custom stop reasons as necessary.
+  STOP_REASON_STEP,
+  STOP_REASON_BREAKPOINT,
+  STOP_REASON_EXCEPTION,
+  STOP_REASON_PAUSE,
+  STOP_REASON_ENTRY
+} StopReason;
+
+static inline const char* stop_reason(const StopReason kind) {
+  static const char* const names[] = {
+    "step",
+    "breakpoint",
+    "exception",
+    "pause",
+    "entry"
+  };
+  return names[kind];
+}
+
+static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description) {
+  JSBuilder builder;
+  JSBuilder_initialize_event(&builder, "stopped");
+  bool next = false;
+  JSBuilder_write_raw_string_field(&builder, &next, "reason", stop_reason(reason));
+  if (description)
+    JSBuilder_write_raw_string_field(&builder, &next, "description", description);
+  JSBuilder_write_unsigned_field(&builder, &next, "threadId", thread_id);
+  JSBuilder_write_bool_field(&builder, &next, "allThreadsStopped", true);
+  JSBuilder_send_and_destroy_event(&builder);
+}
+static void send_thread_stopped_at_breakpoint(int64_t thread_id, uint64_t breakpoint_id, uint64_t location_id) {
+  char description[64];
+  snprintf(description, sizeof description, "breakpoint %" PRIu64 ".%" PRIu64, breakpoint_id, location_id);
+  send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description);
 }
 
 // "OutputEvent": {
