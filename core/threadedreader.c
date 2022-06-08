@@ -43,7 +43,6 @@ typedef struct {
 //by the reader.
 
 void free_threaded_reader_resources (ThreadedReader* reader){
-  printf("Cleaning up threaded reader resources\n");
   pthread_mutex_destroy(&reader->mutex);
   free(reader->buffer);
   free(reader);  
