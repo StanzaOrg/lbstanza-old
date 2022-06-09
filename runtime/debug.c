@@ -18,6 +18,7 @@
 #endif
 
 static FILE* debug_adapter_log;
+static bool sent_terminated_event;
 static pthread_mutex_t send_lock;
 static const char* debug_adapter_path;
 
@@ -532,6 +533,15 @@ static void send_process_exited(uint64_t exit_code) {
   bool next = false;
   JSBuilder_write_unsigned_field(&builder, &next, "exitCode", exit_code);
   JSBuilder_send_and_destroy_event(&builder);
+}
+
+static void send_terminated(void) {
+  if (!sent_terminated_event) {
+    sent_terminated_event = true;
+    JSBuilder builder;
+    JSBuilder_initialize_event(&builder, "terminated");
+    JSBuilder_send_and_destroy_event(&builder);
+  }
 }
 
 // "OutputEvent": {
