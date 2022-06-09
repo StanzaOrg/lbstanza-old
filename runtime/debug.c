@@ -526,6 +526,14 @@ static void send_thread_stopped_at_breakpoint(int64_t thread_id, uint64_t breakp
   send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description);
 }
 
+static void send_process_exited(uint64_t exit_code) {
+  JSBuilder builder;
+  JSBuilder_initialize_event(&builder, "exited");
+  bool next = false;
+  JSBuilder_write_unsigned_field(&builder, &next, "exitCode", exit_code);
+  JSBuilder_send_and_destroy_event(&builder);
+}
+
 // "OutputEvent": {
 //   "allOf": [ { "$ref": "#/definitions/Event" }, {
 //     "type": "object",
