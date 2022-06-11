@@ -1,11 +1,12 @@
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <pthread.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #ifdef PLATFORM_WINDOWS
   #include <fcntl.h>
   #include <io.h>
@@ -18,6 +19,20 @@
 #endif
 
 static FILE* debug_adapter_log;
+static pthread_mutex_t log_lock;
+static void log_printf(const char* fmt, ...) {
+  if (debug_adapter_log) {
+    pthread_mutex_lock(&log_lock);
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf (debug_adapter_log, fmt, args);
+    va_end(args);
+
+    pthread_mutex_unlock(&log_lock);
+  }
+}
+
 static bool sent_terminated_event;
 static pthread_mutex_t send_lock;
 static const char* debug_adapter_path;
@@ -101,8 +116,7 @@ static void write_full(const char* data, ssize_t length) {
     if (bytes_written < 0) {
       if (errno == EINTR || errno == EAGAIN)
         continue;
-      if (debug_adapter_log)
-        fprintf(debug_adapter_log, "Error writing data\n");
+      log_printf("Error writing data\n");
       return;
     }
     assert(((unsigned)bytes_written) <= ((unsigned)length));
@@ -115,15 +129,13 @@ static bool read_full(char* data, ssize_t length) {
   while (length) {
     const ssize_t bytes_read = (*debug_adapter_read)(data, length);
     if (bytes_read == 0) {
-      if (debug_adapter_log)
-        fprintf(debug_adapter_log, "End of file (EOF) reading from input file\n");
+      log_printf("End of file (EOF) reading from input file\n");
       return false;
     }
     if (bytes_read < 0) {
       if (errno == EINTR || errno == EAGAIN)
         continue;
-      if (debug_adapter_log)
-        fprintf(debug_adapter_log, "Error reading data\n");
+      log_printf("Error reading data\n");
       return false;
     }
 
@@ -674,8 +686,7 @@ static const char* redirect_fd(int fd, const OutputType out) {
 static void redirect_output(FILE* file, const OutputType out) {
   const char* error = redirect_fd(fileno(file), out);
   if (error) {
-    if (debug_adapter_log)
-      fprintf(debug_adapter_log, "%s\n", error);
+    log_printf("%s\n", error);
     send_output(STDERR, error, strlen(error));
   }
 }
@@ -719,6 +730,10 @@ int main(int argc, char* argv[]) {
       fprintf(stderr, "error setting line buffering mode for log file (%s)\n", strerror(errno));
       return EXIT_FAILURE;
     }
+    if (pthread_mutex_init(&log_lock, NULL)) {
+      fprintf(debug_adapter_log, "error: initializing log mutex (%s)\n", strerror(errno));
+      return EXIT_FAILURE;
+    }
   }
 
 #ifndef PLATFORM_WINDOWS
@@ -741,8 +756,7 @@ int main(int argc, char* argv[]) {
     printf("Listening on port %i...\n", port);
     SOCKET tmpsock = socket(AF_INET, SOCK_STREAM, 0);
     if (tmpsock < 0) {
-      if (debug_adapter_log)
-        fprintf(debug_adapter_log, "error: opening socket (%s)\n", strerror(errno));
+      log_printf("error: opening socket (%s)\n", strerror(errno));
       return EXIT_FAILURE;
     }
 
@@ -753,8 +767,7 @@ int main(int argc, char* argv[]) {
       serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
       serv_addr.sin_port = htons(port);
       if (bind(tmpsock, (struct sockaddr*)&serv_addr, sizeof serv_addr) < 0) {
-        if (debug_adapter_log)
-          fprintf(debug_adapter_log, "error: binding socket (%s)\n", strerror(errno));
+        log_printf("error: binding socket (%s)\n", strerror(errno));
         return EXIT_FAILURE;
       }
     }
@@ -767,8 +780,7 @@ int main(int argc, char* argv[]) {
       sock = accept(tmpsock, (struct sockaddr*)&cli_addr, &cli_addr_len);
     } while (sock < 0 && errno == EINTR);
     if (sock < 0) {
-      if (debug_adapter_log)
-        fprintf(debug_adapter_log, "error: accepting socket (%s)\n", strerror(errno));
+      log_printf("error: accepting socket (%s)\n", strerror(errno));
       return EXIT_FAILURE;
     }
     debug_adapter_socket = sock;
@@ -782,8 +794,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (pthread_mutex_init(&send_lock, NULL)) {
-    if (debug_adapter_log)
-      fprintf(debug_adapter_log, "error: initializing mutex (%s)\n", strerror(errno));
+    log_printf("error: initializing send mutex (%s)\n", strerror(errno));
     return EXIT_FAILURE;
   }
 
