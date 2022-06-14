@@ -316,7 +316,7 @@ static void JSBuilder_append_string(JSBuilder* builder, const char* s) {
 }
 static void JSBuilder_append_unsigned(JSBuilder* builder, uint64_t v) {
   char buffer[22];
-  snprintf(buffer, sizeof buffer, PRIu64, v);
+  snprintf(buffer, sizeof buffer, "%" PRIu64, v);
   JSBuilder_append_string(builder, buffer);
 }
 static inline void JSBuilder_append_bool(JSBuilder* builder, bool v) {
