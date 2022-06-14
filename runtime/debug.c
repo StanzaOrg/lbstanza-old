@@ -366,6 +366,9 @@ static void JSBuilder_write_quoted_text(JSBuilder* builder, const char* data, ss
   }
   JSBuilder_append_quotes(builder);
 }
+static void JSBuilder_write_quoted_string(JSBuilder* builder, const char* s) {
+  JSBuilder_write_quoted_text(builder, s, strlen(s));
+}
 
 enum { JSIndentStep = 2 };
 static inline void JSBuilder_indent(JSBuilder* builder) {
@@ -398,6 +401,10 @@ static void JSBuilder_write_field(JSBuilder* builder, bool* next, const char* na
 static void JSBuilder_write_raw_string_field(JSBuilder* builder, bool* next, const char* name, const char* value) {
   JSBuilder_write_field(builder, next, name);
   JSBuilder_write_quoted_raw_string(builder, value);
+}
+static void JSBuilder_write_string_field(JSBuilder* builder, bool* next, const char* name, const char* value) {
+  JSBuilder_write_field(builder, next, name);
+  JSBuilder_write_quoted_string(builder, value);
 }
 static void JSBuilder_write_unsigned_field(JSBuilder* builder, bool* next, const char* name, uint64_t value) {
   JSBuilder_write_field(builder, next, name);
@@ -554,6 +561,88 @@ static void send_terminated(void) {
     JSBuilder_initialize_event(&builder, "terminated");
     JSBuilder_send_and_destroy_event(&builder);
   }
+}
+
+// "Breakpoint": {
+//   "type": "object",
+//   "description": "Information about a Breakpoint created in setBreakpoints
+//                   or setFunctionBreakpoints.",
+//   "properties": {
+//     "id": {
+//       "type": "integer",
+//       "description": "An optional unique identifier for the breakpoint."
+//     },
+//     "verified": {
+//       "type": "boolean",
+//       "description": "If true breakpoint could be set (but not necessarily
+//                       at the desired location)."
+//     },
+//     "message": {
+//       "type": "string",
+//       "description": "An optional message about the state of the breakpoint.
+//                       This is shown to the user and can be used to explain
+//                       why a breakpoint could not be verified."
+//     },
+//     "source": {
+//       "$ref": "#/definitions/Source",
+//       "description": "The source where the breakpoint is located."
+//     },
+//     "line": {
+//       "type": "integer",
+//       "description": "The start line of the actual range covered by the
+//                       breakpoint."
+//     },
+//     "column": {
+//       "type": "integer",
+//       "description": "An optional start column of the actual range covered
+//                       by the breakpoint."
+//     },
+//     "endLine": {
+//       "type": "integer",
+//       "description": "An optional end line of the actual range covered by
+//                       the breakpoint."
+//     },
+//     "endColumn": {
+//       "type": "integer",
+//       "description": "An optional end column of the actual range covered by
+//                       the breakpoint. If no end line is given, then the end
+//                       column is assumed to be in the start line."
+//     }
+//   },
+//   "required": [ "verified" ]
+// }
+
+// 'verified' means the breakpoint can be set, though its location can be different from the desired.
+// If 'file' == null the breakpoint source location is omitted.
+// If 'path' == null the source path is omitted.
+// If 'line' is negative it is omitted.
+static void JSBuilder_write_breakpoint(JSBuilder* builder, int id, bool verified, const char* file, const char* path, int line) {
+  JSBuilder_object_begin(builder);
+  bool next = false;
+  JSBuilder_write_unsigned_field(builder, &next, "id", id);
+  JSBuilder_write_bool_field(builder, &next, "verified", verified);
+  if (file) {
+    JSBuilder_write_field(builder, &next, "source");
+    bool source_next = false;
+    JSBuilder_object_begin(builder);
+    JSBuilder_write_string_field(builder, &source_next, "name", file);
+    if (path)
+      JSBuilder_write_string_field(builder, &source_next, "path", path);
+    JSBuilder_object_end(builder);
+    if (line > 0)
+      JSBuilder_write_unsigned_field(builder, &next, "line", line);
+  }
+  JSBuilder_object_end(builder);
+}
+static void send_breakpoint_changed(int id, bool verified) {
+  JSBuilder builder;
+  JSBuilder_initialize_event(&builder, "breakpoint");
+  bool next = false;
+  JSBuilder_write_field(&builder, &next, "breakpoint");
+  // Emit brief breakpoint info without source location
+  JSBuilder_write_breakpoint(&builder, id, verified, NULL, NULL, -1);
+  JSBuilder_write_raw_string_field(&builder, &next, "reason", "changed");
+  JSBuilder_send_and_destroy_event(&builder);
 }
 
 // "OutputEvent": {
