@@ -156,6 +156,7 @@ static bool read_full(char* data, ssize_t length) {
   }
   return true;
 }
+
 static void write_string(const char* s) {
   write_full(s, strlen(s));
 }
@@ -175,6 +176,59 @@ static inline void write_packet(const char* data, const ssize_t length) {
   log_packet("<--", data, length);
 
   pthread_mutex_unlock(&send_lock);
+}
+
+static bool read_expected(const char* expected) {
+  char buffer[32];
+  ssize_t length = strlen(expected);
+  return read_full(buffer, length) && memcmp(buffer, expected, length) == 0;
+}
+static inline ssize_t read_unsigned(void) {
+  char buffer[32];
+  int count = 0;
+  char c;
+  do {
+    if (!read_full(&c, sizeof c)) return 0;
+    if (count < sizeof buffer)
+      buffer[count++] = c;
+  } while (c != '\r');
+
+  if (!read_full(&c, sizeof c)) return 0;
+  if (c == '\n') {
+    if (count > sizeof buffer) return 0;
+    char* remainder;
+    unsigned long value = strtoul(buffer, &remainder, 10); // Decimal only
+    if (*remainder == '\r') return value;
+  }
+  return 0;
+}
+
+static inline ssize_t read_packet(char** p_data) {
+  *p_data = NULL;
+  if (!read_expected("Content-Length: ")) {
+    log_printf("Content-Length not found\n");
+    return 0;
+  }
+  ssize_t length = read_unsigned();
+  if (!read_expected("\r\n")) return 0;
+  if (!length) {
+    log_printf("Zero-length content\n");
+    return 0;
+  }
+
+  char* data = malloc(length);
+  *p_data = data;
+  if (!data) {
+    log_printf("Cannot allocate %ld-byte content\n", (long) length);
+    return 0;
+  }
+  if (!read_full(data, length)) {
+    log_printf("Failed to read %ld-byte content\n", (long) length);
+    return 0;
+  }
+
+  log_packet("-->", data, length);
+  return length;
 }
 
 enum {
@@ -902,6 +956,14 @@ int main(int argc, char* argv[]) {
   for (int i = 0; i < 1000; i++) {
     printf("!!! %d\n", i);
   }
+
+  for (char* data; !sent_terminated_event; free(data)) {
+    const ssize_t length = read_packet(&data);
+    if (!length) continue;
+
+    sent_terminated_event = true;
+  }
+
   // Terminate debugger
 
   sleep(1);
