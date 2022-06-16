@@ -32,6 +32,17 @@ static void log_printf(const char* fmt, ...) {
     pthread_mutex_unlock(&log_lock);
   }
 }
+static void log_packet(const char* prefix, const char* data, ssize_t length) {
+  if (debug_adapter_log) {
+    pthread_mutex_lock(&log_lock);
+
+    fprintf(debug_adapter_log, "\n%s\nContent-Length: %" PRIu64 "\n\n", prefix, (uint64_t)length);
+    fwrite(data, length, 1, debug_adapter_log);
+    fprintf(debug_adapter_log, "\n");
+
+    pthread_mutex_unlock(&log_lock);
+  }
+}
 
 static bool sent_terminated_event;
 static pthread_mutex_t send_lock;
@@ -145,7 +156,6 @@ static bool read_full(char* data, ssize_t length) {
   }
   return true;
 }
-
 static void write_string(const char* s) {
   write_full(s, strlen(s));
 }
@@ -153,6 +163,18 @@ static inline void write_unsigned(const unsigned long long v) {
   char buffer[22];
   snprintf(buffer, sizeof buffer, "%llu", v);
   write_string(buffer);
+}
+static inline void write_packet(const char* data, const ssize_t length) {
+  pthread_mutex_lock(&send_lock);
+
+  write_string("Content-Length: ");
+  write_unsigned(length);
+  write_string("\r\n\r\n");
+  write_full(data, length);
+
+  log_packet("<--", data, length);
+
+  pthread_mutex_unlock(&send_lock);
 }
 
 enum {
@@ -263,24 +285,9 @@ static inline void JSBuilder_initialize(JSBuilder* builder) {
 static inline void JSBuilder_destroy(JSBuilder* builder) {
   free(builder->data);
 }
-static void JSBuilder_send_and_destroy(JSBuilder* builder) {
-  pthread_mutex_lock(&send_lock);
-
-  char* data = builder->data;
-  const ssize_t length = builder->length;
-  write_string("Content-Length: ");
-  write_unsigned(length);
-  write_string("\r\n\r\n");
-  write_full(data, length);
-
-  if (debug_adapter_log) {
-    fprintf(debug_adapter_log, "\n<--\nContent-Length: %llu\n\n", (unsigned long long)length);
-    fwrite(data, length, 1, debug_adapter_log);
-    fprintf(debug_adapter_log, "\n");
-  }
-
-  pthread_mutex_unlock(&send_lock);
-  free(data);
+static inline void JSBuilder_send_and_destroy(JSBuilder* builder) {
+  write_packet(builder->data, builder->length);
+  JSBuilder_destroy(builder);
 }
 
 static void JSBuilder_ensure_capacity(JSBuilder* builder, ssize_t size) {
