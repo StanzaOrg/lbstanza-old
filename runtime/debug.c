@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -216,7 +217,7 @@ static inline ssize_t read_packet(char** p_data) {
     return 0;
   }
 
-  char* data = malloc(length);
+  char* data = malloc(length + 1); // For extra `\0' at the end
   *p_data = data;
   if (!data) {
     log_printf("Cannot allocate %ld-byte content\n", (long) length);
@@ -226,101 +227,307 @@ static inline ssize_t read_packet(char** p_data) {
     log_printf("Failed to read %ld-byte content\n", (long) length);
     return 0;
   }
-
+  data[length] = 0;
   log_packet("-->", data, length);
   return length;
 }
 
-enum {
-  #define DEF(name) JSON_FIELD_##name,
-  #include "jsonfields.inc"
-  JSON_FIELDS_COUNT
-};
-static const char* const JSON_field_names[] = {
-  #define DEF(name) #name,
-  #include "jsonfields.inc"
-  NULL
-};
-static inline const char* JSON_field_name(const unsigned field_id) {
-  assert(field_id < JSON_FIELDS_COUNT);
-  return JSON_field_names[field_id];
-}
-static inline int JSON_field_id(const char* name) {
-  for (const char* const* p = JSON_field_names; *p; p++)
-    if (strcmp(*p, name) == 0)
-      return p - JSON_field_names;
-  return -1;
-}
-
 typedef enum {
-  JSON_Integer,
-  JSON_Object,
-  JSON_String
-} JSON_FIELD_TYPE;
+  JS_NULL,
+  JS_BOOLEAN,
+  JS_INTEGER,
+  JS_DOUBLE,
+  JS_STRING,
+  JS_OBJECT,
+  JS_ARRAY
+} JSValueKind;
 
-typedef struct JSON_FIELD {
-  struct JSON_FIELD* next;
-  int key;
-  JSON_FIELD_TYPE type;
-  ssize_t size;
-  char value[];
-} JSON_Field;
+typedef struct {
+  struct JS_FIELD* fields;
+} JSObject;
 
-static inline JSON_Field* allocate_key_value_pair(JSON_FIELD_TYPE type, const void* value, ssize_t size) {
-  JSON_Field* field = malloc(sizeof(JSON_Field) + size);
+typedef struct {
+  ssize_t length;
+  ssize_t capacity;
+  struct JS_VALUE* data;
+} JSArray;
+
+typedef struct JS_VALUE {
+  JSValueKind kind;
+  union {
+    bool b;
+    int64_t i;
+    double d;
+    const char* s;
+    JSObject o;
+    JSArray a;
+  } u;
+} JSValue;
+
+// Initialize the value as JS_NULL. Later it can be safely
+// re-initialized as any other kind.
+static inline JSValue* JSValue_initialize(JSValue* value) {
+  value->kind = JS_NULL;
+  return value;
+}
+static void JSValue_destroy(JSValue* value);
+
+static inline void JSValue_make_boolean(JSValue* value, bool b) {
+  value->kind = JS_BOOLEAN;
+  value->u.b = b;
+}
+static inline void JSValue_make_integer(JSValue* value, int64_t i) {
+  value->kind = JS_INTEGER;
+  value->u.i = i;
+}
+static inline void JSValue_make_double(JSValue* value, double d) {
+  value->kind = JS_DOUBLE;
+  value->u.d = d;
+}
+// Strings are zero-terminated. Consider (data, length) pairs if strings need to contain `\0's.
+// JSValue is not resposible for string deallocation.
+static inline void JSValue_make_string(JSValue* value, const char* s) {
+  value->kind = JS_STRING;
+  value->u.s = s;
+}
+
+static inline JSArray* JSArray_initialize(JSArray* array) {
+  array->length = 0;
+  array->capacity = 16; // Initial array size
+  array->data = malloc(array->capacity * sizeof(JSValue));
   //TODO: handle possible OOME
-  field->type = type;
-  field->size = size;
-  memcpy(field->value, value, size);
+  return array;
+}
+static inline void JSArray_destroy(JSArray* array) {
+  JSValue* data = array->data;
+  const JSValue* limit = data + array->length;
+  JSValue* p = data;
+  for (JSValue* p = data; p < limit; p++)
+    JSValue_destroy(p);
+  free(data);
+}
+static inline JSArray* JSValue_make_array(JSValue* value) {
+  value->kind = JS_ARRAY;
+  return JSArray_initialize(&value->u.a);
+}
+static inline JSValue* JSArray_append(JSArray* array) {
+  if (array->length == array->capacity) {
+    array->capacity <<= 1;
+    array->data = realloc(array->data, array->capacity * sizeof(JSValue));
+    //TODO: handle possible OOM
+  }
+  // Only initialized values can be destroyed.
+  return JSValue_initialize(array->data + array->length++);
+}
+
+typedef struct JS_FIELD {
+  struct JS_FIELD* next;
+  const char* name;
+  JSValue value;
+} JSField;
+static JSField* JSField_find(JSObject* object, const char* name) {
+  JSField* field;
+  for (field = object->fields; field && strcmp(field->name, name); field = field->next);
   return field;
 }
-static JSON_Field* allocate_key_integer_pair(const int64_t value) {
-  return allocate_key_value_pair(JSON_Integer, &value, sizeof value);
+static inline JSField* JSField_create(JSObject* object, const char* name) {
+  JSField* field = JSField_find(object, name);
+  if (field) {
+    JSValue_destroy(&field->value);
+  } else {
+    field = malloc(sizeof *field);
+    //TODO: handle possible OOM
+    field->name = name;
+    field->next = object->fields;
+    object->fields = field;
+  }
+  JSValue_initialize(&field->value);
+  return field;
 }
-static JSON_Field* allocate_key_object_pair(const void* value) {
-  return allocate_key_value_pair(JSON_Object, &value, sizeof value);
+static inline JSField* JSField_destroy(JSField* field) {
+  JSField* next = field->next;
+  JSValue_destroy(&field->value);
+  free(field);
+  return next;
 }
-static JSON_Field* allocate_key_text_pair(const char* value, ssize_t length) {
-  //TODO: handle UTF8 value
-  return allocate_key_value_pair(JSON_String, value, length);
+
+static inline JSObject* JSObject_initialize(JSObject* object) {
+  object->fields = NULL;
+  return object;
+}
+static inline void JSObject_destroy(JSObject* object) {
+  for (JSField* field = object->fields; field; field = JSField_destroy(field));
+}
+static inline JSObject* JSValue_make_object(JSValue* value) {
+  value->kind = JS_OBJECT;
+  return JSObject_initialize(&value->u.o);
+}
+
+static void JSValue_destroy(JSValue* value) {
+  switch (value->kind) {
+    case JS_OBJECT: JSObject_destroy(&value->u.o); break;
+    case JS_ARRAY: JSArray_destroy(&value->u.a); break;
+  }
 }
 
 typedef struct {
-  JSON_Field* fields;
-} JSON;
-static void inline JSON_initialize(JSON* object) {
-  object->fields = NULL;
+  const char* start;
+  const char* limit;
+  const char* p;
+  char error[256];
+} JSParser;
+
+static inline void JSParser_initialize(JSParser* parser, const char* data, ssize_t length) {
+  parser->start = data;
+  parser->p = data;
+  parser->limit = data + length;
+  parser->error[0] = '\0';
 }
-static void JSON_destroy(JSON* object) {
-  for (JSON_Field* p = object->fields; p;) {
-    JSON_Field* next = p->next;
-    free(p);
-    p = next;
-  }
+
+// Returns false for convenience.
+static bool JSParser_error(JSParser* parser, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(parser->error, sizeof(parser->error), fmt, args);
+  va_end(args);
+  return false;
 }
-static inline const JSON_Field* JSON_find_field(const JSON* object, int key) {
-  const JSON_Field* p = object->fields;
-  while (p && p->key != key)
-    p = p->next;
+
+static const char* JSParser_skip_spaces(JSParser* parser) {
+  const char* p = parser->p;
+  while (isspace(*p)) p++;
+  parser->p = p;
   return p;
 }
-static inline void JSON_insert_field(JSON* object, int key, JSON_Field* field) {
-  assert(!JSON_find_field(object, key));
-  field->key = key;
-  field->next = object->fields;
-  object->fields = field;
+
+static char JSParser_next(JSParser* parser) {
+  if (parser->p < parser->limit)
+    return *parser->p++;
+  return '\0';
 }
-static void JSON_set_integer_field(JSON* object, int key, const int64_t value) {
-  JSON_insert_field(object, key, allocate_key_integer_pair(value));
+
+static bool JSParser_expect(JSParser* parser, const char* s) {
+  ssize_t length = strlen(s) - 1; // First character has already matched
+  if (!memcmp(parser->p, s + 1, length)) { // Parser text buffer is zero-terminated
+    parser->p += length;
+    return true;
+  }
+  return JSParser_error(parser, "Invalid JSON value (%s?)", s);
 }
-static void JSON_set_text_field(JSON* object, int key, const char* text, ssize_t length) {
-  JSON_insert_field(object, key, allocate_key_text_pair(text, length));
+
+static bool JSParser_at_end(JSParser* parser) {
+  return JSParser_skip_spaces(parser) == parser->limit;
 }
-static inline void JSON_set_string_field(JSON* object, int key, const char* value) {
-  JSON_set_text_field(object, key, value, strlen(value));
+
+static bool is_numeric(char c) {
+  return isdigit(c) || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E';
 }
-static const char* JSON_set_object_field(JSON* object, int key, const JSON* value) {
-  JSON_insert_field(object, key, allocate_key_object_pair(value));
+
+static bool JSParser_parse_value(JSParser* parser, JSValue* value) {
+  if (JSParser_at_end(parser))
+    return JSParser_error(parser, "Unexpected end-of-file");
+
+  const char c = JSParser_next(parser);
+  switch (c) {
+    case 'n': // null
+      return JSParser_expect(parser, "null");
+    case 't': // true
+      JSValue_make_boolean(value, true);
+      return JSParser_expect(parser, "true");
+    case 'f': // false
+      JSValue_make_boolean(value, false);
+      return JSParser_expect(parser, "false");
+    case '"': { // string
+      JSValue_make_string(value, parser->p);
+      // Zero-terminated string is always shorter than its external representation
+      // therefore it can be created in the parser buffer.
+      char* p = (char*) parser->p;
+      for (unsigned char c; (c = JSParser_next(parser)) != '"'; *p++ = c) {
+        if (c < ' ')
+          return JSParser_error(parser, parser->p == parser->limit ? "Unterminated string" : "Unescaped control character in string");
+        if (c != '\\') continue;
+        c = JSParser_next(parser);
+        switch (c) {
+          case '"':
+          case '\\':
+          case '/': continue;
+          case 'b': c = '\b'; continue;
+          case 'f': c = '\f'; continue;
+          case 'n': c = '\n'; continue;
+          case 'r': c = '\r'; continue;
+          case 't': c = '\t'; continue;
+        }
+        return JSParser_error(parser, "Hex and unicode escape sequences are not yet supported");
+      }
+      *p = '\0';
+      return true;
+    }
+    case '{': // object
+      for (JSObject* object = JSValue_make_object(value); *JSParser_skip_spaces(parser) != '}';) {
+        if (object->fields && *parser->p++ != ',')
+          return JSParser_error(parser, "Expected , or } after object property");
+        if (*JSParser_skip_spaces(parser) != '"')
+          return JSParser_error(parser, "Expected object key");
+        parser->p++; // Skip '"'
+        const char* name = parser->p;
+        for (char c; (c = JSParser_next(parser)) != '"';)
+          if (!c) return JSParser_error(parser, "Unterminated key");
+        *(char*)(parser->p - 1) = '\0';
+        if (*JSParser_skip_spaces(parser) != ':')
+          return JSParser_error(parser, "Expected : after object key");
+        parser->p++; // Skip ':'
+        JSParser_parse_value(parser, &JSField_create(object, name)->value);
+      }
+      parser->p++; // Skip '}'
+      return true;
+    case '[': // array
+      for (JSArray* array = JSValue_make_array(value); *JSParser_skip_spaces(parser) != ']';) {
+        if (array->length && *parser->p++ != ',')
+          return JSParser_error(parser, "Expected , or ] after array element");
+        JSParser_parse_value(parser, JSArray_append(array));
+      }
+      parser->p++; // Skip ']'
+      return true;
+    default:
+      if (is_numeric(c)) {
+        const char* start = parser->p - 1;
+        const char* p = start;
+        while (is_numeric(*++p)); // Skip the number
+        parser->p = p;
+
+        char* end;
+        int64_t i = strtoll(start, &end, 10);
+        // On overflow strtoll caps the result by INT64_MIN and INT64_MAX
+        if (end == p && i > INT64_MIN && i < INT64_MAX) {
+          JSValue_make_integer(value, i);
+          return true;
+        }
+        double d = strtod(start, &end);
+        if (end == p) {
+          JSValue_make_double(value, d);
+          return true;
+        }
+      }
+      JSParser_error(parser, "Invalid JSON value");
+      return false;
+  }
+  return false;
+}
+
+static inline bool js_parse(JSValue* value, const char* data, ssize_t length) {
+  JSParser parser;
+  JSParser_initialize(&parser, data, length);
+  if (JSParser_parse_value(&parser, value) && JSParser_skip_spaces(&parser) != parser.limit)
+    JSParser_error(&parser, "Extra text after the object end");
+  if (parser.error[0]) {
+    log_printf("error: failed to parse JSON: %s\n", parser.error);
+    return false;
+  }
+  if (value->kind != JS_OBJECT) {
+    log_printf("error: received JSON is not an object\n");
+    return false;
+  }
+  return true;
 }
 
 typedef struct {
@@ -415,6 +622,7 @@ static void JSBuilder_write_quoted_text(JSBuilder* builder, const char* data, ss
     switch (c) {
       case '\"': *s = '\"'; break;
       case '\\': *s = '\\'; break;
+      case '\b': *s = 'b'; break;
       case '\t': *s = 't'; break;
       case '\n': *s = 'n'; break;
       case '\r': *s = 'r'; break;
@@ -959,9 +1167,13 @@ int main(int argc, char* argv[]) {
 
   for (char* data; !sent_terminated_event; free(data)) {
     const ssize_t length = read_packet(&data);
-    if (!length) continue;
+    if (!length) break;
 
-    sent_terminated_event = true;
+    JSValue received;
+    if (!js_parse(&received, data, length)) break;
+
+    // TODO: Handle the received object here
+    JSValue_destroy(&received);
   }
 
   // Terminate debugger
