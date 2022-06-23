@@ -1,5 +1,6 @@
 #include "../asmjit/asmjit.h"
 #include "stz-asmjit.h"
+#include <inttypes.h>
 #include <stdio.h>
 
 using namespace asmjit;
@@ -10,7 +11,7 @@ JitRuntime* jit_runtime_new(void) {
   return new JitRuntime(&params);
 }
 void jit_runtime_delete(JitRuntime* rt) {
-  
+
   delete rt;
 }
 void* jit_runtime_add(JitRuntime* rt, CodeHolder *c) {
@@ -183,7 +184,7 @@ void assembler_push(Assembler *a, Gp *reg) {
 }
 void assembler_pop(Assembler *a, Gp *reg) {
   a->pop(*reg);
-}  
+}
 void assembler_call_label(Assembler *a, Label *f) {
   a->call(*f);
 }
@@ -594,36 +595,36 @@ void assembler_embed_label(Assembler *a, Label *label) {
 
 void dump_registers (void) {
   uint64_t rax;
-  asm("\t movq %%rax,%0" : "=r"(rax));  
-  printf("RAX = %llx\n", rax);
+  asm("\t movq %%rax,%0" : "=r"(rax));
+  printf("RAX = %" PRIx64 "\n", rax);
   uint64_t rcx;
-  asm("\t movq %%rcx,%0" : "=r"(rcx));  
-  printf("RCX = %llx\n", rcx);
+  asm("\t movq %%rcx,%0" : "=r"(rcx));
+  printf("RCX = %" PRIx64 "\n", rcx);
   uint64_t rdx;
-  asm("\t movq %%rdx,%0" : "=r"(rdx));  
-  printf("RDX = %llx\n", rdx);
+  asm("\t movq %%rdx,%0" : "=r"(rdx));
+  printf("RDX = %" PRIx64 "\n", rdx);
   uint64_t rbx;
-  asm("\t movq %%rbx,%0" : "=r"(rbx));  
-  printf("RBX = %llx\n", rbx);
+  asm("\t movq %%rbx,%0" : "=r"(rbx));
+  printf("RBX = %" PRIx64 "\n", rbx);
   uint64_t r8;
-  asm("\t movq %%r8,%0" : "=r"(r8));  
-  printf("R8 = %llx\n", r8);
+  asm("\t movq %%r8,%0" : "=r"(r8));
+  printf("R8 = %" PRIx64 "\n", r8);
   uint64_t r9;
-  asm("\t movq %%r9,%0" : "=r"(r9));  
-  printf("R9 = %llx\n", r9);
+  asm("\t movq %%r9,%0" : "=r"(r9));
+  printf("R9 = %" PRIx64 "\n", r9);
   uint64_t xmm0;
-  asm("\t movd %%xmm0,%0" : "=r"(rax));  
-  asm("\t movq %%rax,%0" : "=r"(xmm0));  
-  printf("XMM0 = %llx\n", xmm0);
+  asm("\t movd %%xmm0,%0" : "=r"(rax));
+  asm("\t movq %%rax,%0" : "=r"(xmm0));
+  printf("XMM0 = %" PRIx64 "\n", xmm0);
   uint64_t xmm1;
-  asm("\t movd %%xmm1,%0" : "=r"(rax));  
-  asm("\t movq %%rax,%0" : "=r"(xmm1));  
-  printf("XMM1 = %llx\n", xmm1);
+  asm("\t movd %%xmm1,%0" : "=r"(rax));
+  asm("\t movq %%rax,%0" : "=r"(xmm1));
+  printf("XMM1 = %" PRIx64 "\n", xmm1);
 }
 void dump_memory_64 (uint64_t* start, uint64_t n) {
   uint64_t i = 0;
   for (uint64_t* ptr = start; i < n; ptr += 1, i += 1) {
-    printf("%p: %llx\n", ptr, *ptr);
+    printf("%p: %" PRIx64 "\n", ptr, *ptr);
   }
 }
 void dump_memory_32 (uint32_t* start, uint64_t n) {
@@ -638,4 +639,3 @@ void dump_memory_8 (uint8_t* start, uint64_t n) {
     printf("%p: %x\n", ptr, *ptr);
   }
 }
-
