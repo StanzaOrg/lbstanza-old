@@ -131,6 +131,12 @@ void assembler_mod_reg(Assembler *a, const Gp *divisor) {
   // TODO: FIX
   a->idiv(*divisor);
 }
+void assembler_cqo_reg(Assembler *a){
+  a->cqo();
+}
+void assembler_cdq_reg(Assembler *a){
+  a->cdq();
+}
 void assembler_add_int(Assembler *a, const Gp *dst, int src) {
   a->add(*dst, src);
 }
