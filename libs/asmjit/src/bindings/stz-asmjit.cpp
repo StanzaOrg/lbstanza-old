@@ -1,6 +1,6 @@
 #include "../asmjit/asmjit.h"
 #include "stz-asmjit.h"
-#include <inttypes.h>
+#include <cinttypes>
 #include <stdio.h>
 
 using namespace asmjit;
