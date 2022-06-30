@@ -45,6 +45,40 @@ static void log_packet(const char* prefix, const char* data, ssize_t length) {
   }
 }
 
+typedef struct {
+  ssize_t length;
+  ssize_t capacity;
+  char** data;
+} StringVector;
+static void StringVector_initialize(StringVector* vector) {
+  vector->length = 0;
+  vector->capacity = 16;
+  vector->data = malloc(vector->capacity * sizeof(char*));
+  //TODO: handle possible OOM
+}
+static void StringVector_destroy(StringVector* vector) {
+  char** data = vector->data;
+  int length = vector->length;
+  for (int i = 0; i < length; i++)
+    free(data[i]);
+  free(data);
+}
+static inline void StringVector_reset(StringVector* vector) {
+  vector->length = 0;
+}
+static void StringVector_append(StringVector* vector, const char* s) {
+  if (vector->length == vector->capacity) {
+    vector->capacity <<= 1;
+    vector->data = realloc(vector->data, vector->capacity * sizeof(char*));
+    //TODO: handle possible OOM
+  }
+  vector->data[vector->length++] = strdup(s);
+  //TODO: handle possible OOM
+}
+
+// Has the debugger attached to the process or launched it?
+static bool attached_to_process;
+static bool stop_at_entry;
 static bool sent_terminated_event;
 static pthread_mutex_t send_lock;
 static const char* debug_adapter_path;
@@ -350,6 +384,30 @@ static inline JSField* JSField_destroy(JSField* field) {
   free(field);
   return next;
 }
+static const JSField* JSObject_get_field(const JSObject* object, const char* name, const JSValueKind kind) {
+  if (object) {
+    const JSField* field = JSField_find((JSObject*)object, name);
+    if (field && field->value.kind == kind)
+      return field;
+  }
+  return NULL;
+}
+static const char* JSObject_get_string_field(const JSObject* object, const char* name) {
+  const JSField* field = JSObject_get_field(object, name, JS_STRING);
+  return field ? field->value.u.s : NULL;
+}
+static const JSObject* JSObject_get_object_field(const JSObject* object, const char* name) {
+  const JSField* field = JSObject_get_field(object, name, JS_OBJECT);
+  return field ? &field->value.u.o : NULL;
+}
+static int64_t JSObject_get_integer_field(const JSObject* object, const char* name, int64_t default_value) {
+  const JSField* field = JSObject_get_field(object, name, JS_INTEGER);
+  return field ? field->value.u.i : default_value;
+}
+static int64_t JSObject_get_boolean_field(const JSObject* object, const char* name, bool default_value) {
+  const JSField* field = JSObject_get_field(object, name, JS_BOOLEAN);
+  return field ? field->value.u.b : default_value;
+}
 
 static inline JSObject* JSObject_initialize(JSObject* object) {
   object->fields = NULL;
@@ -508,26 +566,9 @@ static bool JSParser_parse_value(JSParser* parser, JSValue* value) {
           return true;
         }
       }
-      JSParser_error(parser, "Invalid JSON value");
-      return false;
+      return JSParser_error(parser, "Invalid JSON value");
   }
   return false;
-}
-
-static inline bool js_parse(JSValue* value, const char* data, ssize_t length) {
-  JSParser parser;
-  JSParser_initialize(&parser, data, length);
-  if (JSParser_parse_value(&parser, value) && JSParser_skip_spaces(&parser) != parser.limit)
-    JSParser_error(&parser, "Extra text after the object end");
-  if (parser.error[0]) {
-    log_printf("error: failed to parse JSON: %s\n", parser.error);
-    return false;
-  }
-  if (value->kind != JS_OBJECT) {
-    log_printf("error: received JSON is not an object\n");
-    return false;
-  }
-  return true;
 }
 
 typedef struct {
@@ -706,20 +747,27 @@ static void JSBuilder_array_end(JSBuilder* builder) {
   JSBuilder_structure_end(builder, ']');
 }
 
+static void JSBuilder_send_and_destroy_object(JSBuilder* builder) {
+  JSBuilder_object_end(builder);
+  JSBuilder_send_and_destroy(builder);
+}
+
+static void JSBuilder_write_seq_0(JSBuilder* builder, bool* next) {
+  JSBuilder_write_field(builder, next, "seq"); JSBuilder_append_char(builder, '0');
+}
 static void JSBuilder_initialize_event(JSBuilder* builder, const char* name) {
   JSBuilder_initialize(builder);
   JSBuilder_object_begin(builder);
   bool next = false;
-  JSBuilder_write_field(builder, &next, "seq"); JSBuilder_append_char(builder, '0');
+  JSBuilder_write_seq_0(builder, &next);
   JSBuilder_write_raw_string_field(builder, &next, "type", "event");
   JSBuilder_write_raw_string_field(builder, &next, "event", name);
   JSBuilder_write_field(builder, &next, "body");
   JSBuilder_object_begin(builder);
 }
 static void JSBuilder_send_and_destroy_event(JSBuilder* builder) {
-  JSBuilder_object_end(builder); // event
   JSBuilder_object_end(builder); // body
-  JSBuilder_send_and_destroy(builder);
+  JSBuilder_send_and_destroy_object(builder);
 }
 
 // "StoppedEvent": {
@@ -1054,6 +1102,415 @@ static inline void launch_target_in_terminal(const char* comm_file, const int ar
   exit(EXIT_FAILURE);
 }
 
+static void JSBuilder_initialize_response(JSBuilder* builder, const JSObject* request, const char* message) {
+  const char* command = JSObject_get_string_field(request, "command");
+  const uint64_t request_seq = JSObject_get_integer_field(request, "seq", 0);
+
+  JSBuilder_initialize(builder);
+  JSBuilder_object_begin(builder);
+  bool next = false;
+  JSBuilder_write_seq_0(builder, &next);
+  JSBuilder_write_raw_string_field(builder, &next, "type", "response");
+  JSBuilder_write_raw_string_field(builder, &next, "command", command);
+  JSBuilder_write_unsigned_field(builder, &next, "request_seq", request_seq);
+  JSBuilder_write_bool_field(builder, &next, "success", message == NULL);
+  if (message)
+    JSBuilder_write_string_field(builder, &next, "message", message);
+}
+static inline void JSBuilder_send_and_destroy_response(JSBuilder* builder) {
+  JSBuilder_send_and_destroy_object(builder);
+}
+static void respond_to_request(const JSObject* request, const char* message) {
+  JSBuilder builder;
+  JSBuilder_initialize_response(&builder, request, message);
+  JSBuilder_send_and_destroy_response(&builder);
+}
+
+// "InitializeRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Initialize request; value of command field is
+//                     'initialize'.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "initialize" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/InitializeRequestArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments" ]
+//   }]
+// },
+// "InitializeRequestArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'initialize' request.",
+//   "properties": {
+//     "clientID": {
+//       "type": "string",
+//       "description": "The ID of the (frontend) client using this adapter."
+//     },
+//     "adapterID": {
+//       "type": "string",
+//       "description": "The ID of the debug adapter."
+//     },
+//     "locale": {
+//       "type": "string",
+//       "description": "The ISO-639 locale of the (frontend) client using
+//                       this adapter, e.g. en-US or de-CH."
+//     },
+//     "linesStartAt1": {
+//       "type": "boolean",
+//       "description": "If true all line numbers are 1-based (default)."
+//     },
+//     "columnsStartAt1": {
+//       "type": "boolean",
+//       "description": "If true all column numbers are 1-based (default)."
+//     },
+//     "pathFormat": {
+//       "type": "string",
+//       "_enum": [ "path", "uri" ],
+//       "description": "Determines in what format paths are specified. The
+//                       default is 'path', which is the native format."
+//     },
+//     "supportsVariableType": {
+//       "type": "boolean",
+//       "description": "Client supports the optional type attribute for
+//                       variables."
+//     },
+//     "supportsVariablePaging": {
+//       "type": "boolean",
+//       "description": "Client supports the paging of variables."
+//     },
+//     "supportsRunInTerminalRequest": {
+//       "type": "boolean",
+//       "description": "Client supports the runInTerminal request."
+//     }
+//   },
+//   "required": [ "adapterID" ]
+// },
+// "InitializeResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'initialize' request.",
+//     "properties": {
+//       "body": {
+//         "$ref": "#/definitions/Capabilities",
+//         "description": "The capabilities of this debug adapter."
+//       }
+//     }
+//   }]
+// }
+
+// "LaunchRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Launch request; value of command field is 'launch'.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "launch" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/LaunchRequestArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "LaunchRequestArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'launch' request.",
+//   "properties": {
+//     "noDebug": {
+//       "type": "boolean",
+//       "description": "If noDebug is true the launch request should launch
+//                       the program without enabling debugging."
+//     }
+//   }
+// },
+// "LaunchResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'launch' request. This is just an
+//                     acknowledgement, so no body field is required."
+//   }]
+// }
+static inline void define_capabilities(JSBuilder* builder) {
+  typedef struct { const char* name; bool value; } capability;
+  static const capability capabilities[] = {
+    {"supportsConfigurationDoneRequest", false},
+    {"supportsFunctionBreakpoints", false},
+    {"supportsConditionalBreakpoints", false},
+    // TODO: Supports breakpoints that break execution after a specified number of hits.
+    {"supportsHitConditionalBreakpoints", false},
+    // TODO: Supports a (side effect free) evaluate request for data hovers.
+    {"supportsEvaluateForHovers", false},
+    // TODO: Supports launching a debugee in intergrated VSCode terminal.
+    {"supportsRunInTerminalRequest", false},
+    // TODO: Supports stepping back via the stepBack and reverseContinue requests.
+    {"supportsStepBack", false},
+    // TODO: The debug adapter supports setting a variable to a value.
+    {"supportsSetVariable", false},
+    {"supportsRestartFrame", false},
+    {"supportsGotoTargetsRequest", false},
+    {"supportsStepInTargetsRequest", false},
+    // See the note on inherent inefficiency of completions in LLDB implementation.
+    {"supportsCompletionsRequest", false},
+    {"supportsModulesRequest", false},
+    // The set of additional module information exposed by the debug adapter.
+    //   body.try_emplace("additionalModuleColumns"] = ColumnDescriptor
+    // Checksum algorithms supported by the debug adapter.
+    //   body.try_emplace("supportedChecksumAlgorithms"] = ChecksumAlgorithm
+    // The debugger does not support the RestartRequest. The client must implement
+    // 'restart' by terminating and relaunching the adapter.
+    {"supportsRestartRequest", false},
+    // TODO: support 'exceptionOptions' on the setExceptionBreakpoints request.
+    {"supportsExceptionOptions", false},
+    // TODO: Support a 'format' attribute on the stackTraceRequest, variablesRequest, and evaluateRequest.
+    {"supportsValueFormattingOptions", false},
+    // TODO: support the exceptionInfo request.
+    {"supportsExceptionInfoRequest", false},
+    // TODO: support the 'terminateDebuggee' attribute on the 'disconnect' request.
+    {"supportTerminateDebuggee", false},
+    // The debugger does not support the delayed loading of parts of the stack,
+    // which would require support for 'startFrame' and 'levels' arguments and the
+    // 'totalFrames' result of the 'StackTrace' request.
+    {"supportsDelayedStackTraceLoading", false},
+    // TODO: support the 'loadedSources' request.
+    {"supportsLoadedSourcesRequest", false},
+    // Do we need this?
+    {"supportsProgressReporting", false},
+    {NULL, false} // Convenient NULL termunation.
+  };
+  bool next = false;
+  for (const capability* p = capabilities; p->name; p++)
+    JSBuilder_write_bool_field(builder, &next, p->name, p->value);
+
+  #if 0
+    // TODO:
+    // Available filters or options for the setExceptionBreakpoints request.
+    llvm::json::Array filters;
+    for (const auto &exc_bp : g_vsc.exception_breakpoints) {
+      filters.emplace_back(CreateExceptionBreakpointFilter(exc_bp));
+    }
+    body.try_emplace("exceptionBreakpointFilters", std::move(filters));
+  #endif
+}
+
+static bool request_initialize(const JSObject* request) {
+  // TODO: initialize debugger here.
+  JSBuilder builder;
+  JSBuilder_initialize_response(&builder, request, NULL);
+  bool next = true;
+  JSBuilder_write_field(&builder, &next, "body");
+  JSBuilder_object_begin(&builder);
+  define_capabilities(&builder);
+  JSBuilder_object_end(&builder); // body
+  JSBuilder_send_and_destroy_response(&builder);
+  return true;
+}
+
+#if 0
+void request_launch(const llvm::json::Object &request) {
+  g_vsc.is_attach = false;
+  llvm::json::Object response;
+  lldb::SBError error;
+  FillResponse(request, response);
+  auto arguments = request.getObject("arguments");
+  g_vsc.init_commands = GetStrings(arguments, "initCommands");
+  g_vsc.pre_run_commands = GetStrings(arguments, "preRunCommands");
+  g_vsc.stop_commands = GetStrings(arguments, "stopCommands");
+  g_vsc.exit_commands = GetStrings(arguments, "exitCommands");
+  g_vsc.terminate_commands = GetStrings(arguments, "terminateCommands");
+  auto launchCommands = GetStrings(arguments, "launchCommands");
+  std::vector<std::string> postRunCommands =
+      GetStrings(arguments, "postRunCommands");
+  g_vsc.stop_at_entry = GetBoolean(arguments, "stopOnEntry", false);
+  const llvm::StringRef debuggerRoot = GetString(arguments, "debuggerRoot");
+  const uint64_t timeout_seconds = GetUnsigned(arguments, "timeout", 30);
+
+  // This is a hack for loading DWARF in .o files on Mac where the .o files
+  // in the debug map of the main executable have relative paths which require
+  // the lldb-vscode binary to have its working directory set to that relative
+  // root for the .o files in order to be able to load debug info.
+  if (!debuggerRoot.empty())
+    llvm::sys::fs::set_current_path(debuggerRoot);
+
+  // Run any initialize LLDB commands the user specified in the launch.json.
+  // This is run before target is created, so commands can't do anything with
+  // the targets - preRunCommands are run with the target.
+  g_vsc.RunInitCommands();
+
+  SetSourceMapFromArguments(*arguments);
+
+  lldb::SBError status;
+  g_vsc.SetTarget(g_vsc.CreateTargetFromArguments(*arguments, status));
+  if (status.Fail()) {
+    response["success"] = llvm::json::Value(false);
+    EmplaceSafeString(response, "message", status.GetCString());
+    g_vsc.SendJSON(llvm::json::Value(std::move(response)));
+    return;
+  }
+
+  // Instantiate a launch info instance for the target.
+  auto launch_info = g_vsc.target.GetLaunchInfo();
+
+  // Grab the current working directory if there is one and set it in the
+  // launch info.
+  const auto cwd = GetString(arguments, "cwd");
+  if (!cwd.empty())
+    launch_info.SetWorkingDirectory(cwd.data());
+
+  // Extract any extra arguments and append them to our program arguments for
+  // when we launch
+  auto args = GetStrings(arguments, "args");
+  if (!args.empty())
+    launch_info.SetArguments(MakeArgv(args).data(), true);
+
+  // Pass any environment variables along that the user specified.
+  auto envs = GetStrings(arguments, "env");
+  if (!envs.empty())
+    launch_info.SetEnvironmentEntries(MakeArgv(envs).data(), true);
+
+  auto flags = launch_info.GetLaunchFlags();
+
+  if (GetBoolean(arguments, "disableASLR", true))
+    flags |= lldb::eLaunchFlagDisableASLR;
+  if (GetBoolean(arguments, "disableSTDIO", false))
+    flags |= lldb::eLaunchFlagDisableSTDIO;
+  if (GetBoolean(arguments, "shellExpandArguments", false))
+    flags |= lldb::eLaunchFlagShellExpandArguments;
+  const bool detatchOnError = GetBoolean(arguments, "detachOnError", false);
+  launch_info.SetDetachOnError(detatchOnError);
+  launch_info.SetLaunchFlags(flags | lldb::eLaunchFlagDebug |
+                             lldb::eLaunchFlagStopAtEntry);
+
+  // Run any pre run LLDB commands the user specified in the launch.json
+  g_vsc.RunPreRunCommands();
+
+  if (GetBoolean(arguments, "runInTerminal", false)) {
+    if (llvm::Error err = request_runInTerminal(request))
+      error.SetErrorString(llvm::toString(std::move(err)).c_str());
+  } else if (launchCommands.empty()) {
+    // Disable async events so the launch will be successful when we return from
+    // the launch call and the launch will happen synchronously
+    g_vsc.debugger.SetAsync(false);
+    g_vsc.target.Launch(launch_info, error);
+    g_vsc.debugger.SetAsync(true);
+  } else {
+    g_vsc.RunLLDBCommands("Running launchCommands:", launchCommands);
+    // The custom commands might have created a new target so we should use the
+    // selected target after these commands are run.
+    g_vsc.target = g_vsc.debugger.GetSelectedTarget();
+    // Make sure the process is launched and stopped at the entry point before
+    // proceeding as the the launch commands are not run using the synchronous
+    // mode.
+    error = g_vsc.WaitForProcessToStop(timeout_seconds);
+  }
+
+  if (error.Fail()) {
+    response["success"] = llvm::json::Value(false);
+    EmplaceSafeString(response, "message", std::string(error.GetCString()));
+  } else {
+    g_vsc.RunLLDBCommands("Running postRunCommands:", postRunCommands);
+  }
+
+  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
+
+  if (g_vsc.is_attach)
+    SendProcessEvent(Attach); // this happens when doing runInTerminal
+  else
+    SendProcessEvent(Launch);
+  g_vsc.SendJSON(llvm::json::Value(CreateEventObject("initialized")));
+}
+#endif
+
+static bool request_launch(const JSObject* request) {
+  attached_to_process = false;
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  //TODO: Do we really need built-in debugger commands interpreter?
+  // init_commands = GetStrings(arguments, "initCommands");
+  // pre_run_commands = GetStrings(arguments, "preRunCommands");
+  // stop_commands = GetStrings(arguments, "stopCommands");
+  // exit_commands = GetStrings(arguments, "exitCommands");
+  // terminate_commands = GetStrings(arguments, "terminateCommands");
+  // auto launchCommands = GetStrings(arguments, "launchCommands");
+  // std::vector<std::string> postRunCommands = GetStrings(arguments, "postRunCommands");
+  stop_at_entry = JSObject_get_boolean_field(arguments, "stopOnEntry", false);
+  // TODO: Do we really need debuggerRoot?
+  // const char* debugger_root = JSObject_get_string_field(arguments, "debuggerRoot");
+  const uint64_t timeout_seconds = JSObject_get_integer_field(arguments, "timeout", 30);
+
+  // This is a hack for loading DWARF in .o files on Mac where the .o files
+  // in the debug map of the main executable have relative paths which require
+  // the lldb-vscode binary to have its working directory set to that relative
+  // root for the .o files in order to be able to load debug info.
+  // if (!debuggerRoot.empty())
+  //  llvm::sys::fs::set_current_path(debuggerRoot);
+
+  // Run any initialize LLDB commands the user specified in the launch.json.
+  // This is run before target is created, so commands can't do anything with
+  // the targets - preRunCommands are run with the target.
+  // RunInitCommands();
+
+  //TODO: Do we really need sourcePath or sourceMap?
+  // LLDB supports only sourceMap and ignores sourcePath.
+  // SetSourceMapFromArguments(*arguments);
+  return true;
+}
+
+#define FOR_EACH_REQUEST(def) \
+  def(initialize)             \
+  def(launch)
+
+static const char* const request_names[] = {
+  #define DEFINE_REQUEST_NAME(name) #name,
+    FOR_EACH_REQUEST(DEFINE_REQUEST_NAME)
+  #undef DEFINE_REQUEST_NAME
+  NULL
+};
+// Request handler log the error and returns false for a malformed request.
+static bool (*request_handlers[])(const JSObject*) = {
+  #define DEFINE_REQUEST_HANDLER(name) request_##name,
+    FOR_EACH_REQUEST(DEFINE_REQUEST_HANDLER)
+  #undef DEFINE_REQUEST_HANDLER
+};
+#undef FOR_EACH_REQUEST
+
+static inline bool parse_request(JSValue* value, const char* data, ssize_t length) {
+  JSParser parser;
+  JSParser_initialize(&parser, data, length);
+  if (JSParser_parse_value(&parser, value) && JSParser_skip_spaces(&parser) != parser.limit)
+    JSParser_error(&parser, "Extra text after the object end");
+  if (parser.error[0]) {
+    log_printf("error: failed to parse JSON: %s\n", parser.error);
+    return false;
+  }
+  if (value->kind != JS_OBJECT) {
+    log_printf("error: received JSON is not an object\n");
+    return false;
+  }
+  JSObject* object = &value->u.o;
+  const char* type = JSObject_get_string_field(object, "type");
+  if (!type || strcmp(type, "request")) {
+    log_printf("error: received JSON 'type' field is not 'request'\n");
+    return false;
+  }
+  const char* command = JSObject_get_string_field(object, "command");
+  if (!command) {
+    log_printf("error: 'command' field of 'string' type expected\n");
+    return false;
+  }
+  for (const char* const* p = request_names; *p; p++)
+    if (!strcmp(*p, command))                             // request name matches the command?
+      return request_handlers[p - request_names](object); // call the request handler, return the result
+  log_printf("error: unhandled command '%s'\n");
+  return false;
+}
+
+
 int main(int argc, char* argv[]) {
   // Set line buffering mode to stdout and stderr
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -1161,16 +1618,12 @@ int main(int argc, char* argv[]) {
   redirect_output(stdout, STDOUT);
   // redirect_output(stderr, STDERR);
 
-  for (int i = 0; i < 1000; i++) {
-    printf("!!! %d\n", i);
-  }
-
   for (char* data; !sent_terminated_event; free(data)) {
     const ssize_t length = read_packet(&data);
     if (!length) break;
 
     JSValue received;
-    if (!js_parse(&received, data, length)) break;
+    if (!parse_request(&received, data, length)) break;
 
     // TODO: Handle the received object here
     JSValue_destroy(&received);
