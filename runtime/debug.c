@@ -1602,8 +1602,8 @@ int main(int argc, char* argv[]) {
     debug_adapter_read = &read_from_socket;
     debug_adapter_write = &write_to_socket;
   } else {
-    debug_adapter_input_fd = fileno(stdin);
-    debug_adapter_output_fd = fileno(stderr); // TODO: change to stdout
+    debug_adapter_input_fd = dup(fileno(stdin));
+    debug_adapter_output_fd = dup(fileno(stdout));
     debug_adapter_read = &read_from_file;
     debug_adapter_write = &write_to_file;
   }
@@ -1616,7 +1616,7 @@ int main(int argc, char* argv[]) {
   // Initialize debugger
 
   redirect_output(stdout, STDOUT);
-  // redirect_output(stderr, STDERR);
+  //redirect_output(stderr, STDERR);
 
   for (char* data; !sent_terminated_event; free(data)) {
     const ssize_t length = read_packet(&data);
