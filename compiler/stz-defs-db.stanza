@@ -11,19 +11,28 @@ defpackage stz/defs-db :
   import stz/vm-ir
   import stz/algorithms
   import stz/proj-manager
+  import stz/defs-db-ir
   import stz/defs-db-serializer
   import stz/proj
   import stz/params
   import stz/config
+  import stz/utils
+  import stz/package-stamps
 
 ;============================================================
-;=================== Driver Arguments =======================
+;===================== Main Driver ==========================
 ;============================================================
+
+;Represents the input arguments to creating the definitions database.
+;- merge-db?: If given, this is the filename of a previously
+;  existing database, that we want to merge our current entries
+;  with.
 public defstruct DefsDbInput :
   proj-files: Tuple<String>
   platform: Symbol
   flags: Tuple<Symbol>
   optimize?: True|False
+  merge-db?: String|False
 with : 
   printer => true
 
@@ -31,14 +40,39 @@ with :
 ; compile to IL-IR, create the definitions database, and serialize it 
 ; to the output file.
 public defn defs-db (input:DefsDbInput, filename:String) :
-  ; Compile the input 
-  val [namemap, packages] = compile-input(input)
+  ;First analyze the input.
+  val deps = analyze-input(input)
 
-  ;Call generation of definitions database
-  gen-defs-db(filename, namemap, packages)
+  ;Generate the definitions database.
+  val db = gen-defs-db(deps)
 
-; Helper function to compile the input data into IL-IR.
-protected defn compile-input (input:DefsDbInput) -> [NameMap, Seqable<IPackage|Pkg>] :
+  ;Attempt to read in the previous merging database, if given.
+  val merge-db = match(merge-db?(input):String) :
+    try :
+      val stream = FileInputStream(merge-db?(input) as String)
+      try : read-definitions-database(stream)
+      finally : close(stream)
+    catch (e) : false
+
+  ;If a previous database exists, then merge the
+  ;previous database against the new database.
+  val new-db =
+    match(merge-db:DefinitionsDatabase) : merge(merge-db, db)
+    else : db
+
+  ;Serialize the new database back out to disk.
+  val ostream = FileOutputStream(filename)
+  try : serialize(ostream, new-db)
+  finally : close(ostream)
+
+;============================================================
+;============== Compiler Analyis Stage ======================
+;============================================================
+;This stage calls the first stage of the compiler until
+;it passes the resolver and returns the DependencyResult
+;object summarizing the results.
+
+protected-when(TESTING) defn analyze-input (input:DefsDbInput) -> DependencyResult :
   ;Read all listed packages from given project files
   val proj-file = read-proj-files(proj-files(input), platform(input))
   val input-packages = all-packages(proj-file)
@@ -60,45 +94,88 @@ protected defn compile-input (input:DefsDbInput) -> [NameMap, Seqable<IPackage|P
     flags(input))                           ;flags
     
   ;Compute dependencies (compiles to IL-IR)
-  val deps = dependencies(build-settings, true)
+  dependencies(build-settings, true)
 
-  ; return namemap and list of packages
-  [namemap(deps), packages(deps)]
+;============================================================
+;============= Building the Database ========================
+;============================================================
+;This stage builds the DefinitionsDatabase object
+;from the DependencyResult analysis.
 
-;==============================================================================
-;========================= Main Indexing Algorithm ============================
-;==============================================================================
-; The `Indexed` struct is a helper that contains extracted metadata from IL-IR.
-; before being associated with a package. 
-;
-;- kind:       The kind of originating expression (see SrcDefinitionKind)
-;- visibility: The visibility of the expression (public|private|protected)
-;- name:       The extracted name of the indexed expression
-;- info:       The associated file info of the expression.
-protected defstruct Indexed <: Equalable : 
-  kind:SrcDefinitionKind
-  visibility:Visibility
-  name:Symbol
-  info:FileInfo
-  annotation?:False|DefinitionAnnotation
-with : 
-  printer => true
+protected-when(TESTING) defn gen-defs-db (deps:DependencyResult) -> DefinitionsDatabase :
+  ;Build the package stamp table.
+  val package-stamp-table = to-hashtable<Symbol,PackageStamp> $
+    for stamp in pkgstamps(deps) seq :
+      package(location(stamp)) => stamp
 
-; An Indexable is an IExp that can be meaningfully indexed in the DefinitionsDatabase 
-; structure. Currently supported are functions, multis, methods, types, and children
-; in both Hi and Lo stanza.
-deftype Indexable :  
-  VarN         <: Indexable
-  IDef         <: Indexable
-  IDefn        <: Indexable
-  IDefmulti    <: Indexable
-  IDefmethod   <: Indexable
-  IDefType     <: Indexable
-  IDefChild    <: Indexable
-  ILSDef       <: Indexable
-  ILSDefn      <: Indexable
-  ILSDefmethod <: Indexable
-  ILSDefType   <: Indexable
+  ;Build the PackageDefinitions corresponding to each package.
+  val package-defs = for pkg in packages(deps) map :
+    val stamp = package-stamp-table[name(pkg)]
+    build-package-defs(pkg, stamp, namemap(deps))
+
+  ;Build the database.
+  DefinitionsDatabase(STANZA-RESERVED-WORDS, package-defs)
+
+;------------------------------------------------------------
+;---------- PackageDefinitions for Pkg ----------------------
+;------------------------------------------------------------
+; Collect the deifnitions from DL-IR pulled out of .pkg and .fpkg files.
+defn build-package-defs (pkg:Pkg, stamp:PackageStamp, nm:NameMap) -> PackageDefinitions :
+  ;Retrieve the PackageIO in the .pkg file.
+  val packageio = match(pkg) :
+    (pkg:FastPkg) : packageio(pkg)
+    (pkg:StdPkg) : packageio(vmp(pkg))
+
+  ;Inspect the exports that have FileInfo information.
+  val exports-with-infos = filter({info(_) is-not False}, exports(packageio))
+
+  ;Convert each of the exports into the database Definition objects.
+  val definitions = to-tuple $     
+    for e in exports-with-infos seq :
+      Definition(name, info, kind, visibility, annotation?) where :
+        val name = name(id(rec(e)))
+        val info = info(e) as FileInfo
+        val visibility = visibility(e)
+        val kind = kindof(rec(e))
+        val annotation? = annotate?(e, nm)
+
+  ;Bundle the results in the PackageDefinitions datastructure.
+  PackageDefinitions(name(pkg),
+                     stamp,
+                     PkgDefinition,
+                     [],
+                     definitions)
+
+;------------------------------------------------------------
+;---------- PackageDefinitions for IPackage -----------------
+;------------------------------------------------------------
+; Index a package from source code. First index the expressions, then convert to a `Definition`
+; object that can be serialized.
+protected-when(TESTING) defn build-package-defs (ipackage:IPackage, stamp:PackageStamp, nm:NameMap) -> PackageDefinitions :
+  ;Convert the IImport expression into a PackageImport.
+  defn to-package-import (iimport:IImport) -> PackageImport :
+    val prefixes = for iprefix in prefix(iimport) map : 
+      PackageImportPrefix(names(iprefix), prefix(iprefix))
+    PackageImport(package(iimport), prefixes)
+
+  ;Index the expressions in the package to assemble the definitions.
+  val indexed-exps = index-expressions(exps(ipackage), nm)
+  val definitions = to-tuple $
+    for indexed in indexed-exps seq :  
+      Definition(name, info, kind, visibility, annotation) where : 
+        val name = name(indexed)
+        val info = info(indexed)
+        val kind = kind(indexed)
+        val visibility = visibility(indexed)
+        val annotation = annotation?(indexed)
+
+  ;Bundle results in PackageDefinitions structure.
+  PackageDefinitions(name(ipackage),
+                     stamp,
+                     SrcDefinition,
+                     map(to-package-import, imports(ipackage)),
+                     definitions)
+
 
 ; Depth first walk of the IL-IR to flatten into a sequence of `Indexed`, or 
 ; IExp nodes that have a meaningful name and FileInfo
@@ -115,8 +192,7 @@ deftype Indexable :
 ; - If an expression is not `Indexable`, it is skipped
 ; - If an `Indexable` does not have an `info`, it is skipped
 ; - If an `Indexable`'s name cannot be found, it is skipped 
-;
-protected defn index-expressions (exps:Seqable<IExp>, nm:NameMap) -> Seq<Indexed> :
+protected-when(TESTING) defn index-expressions (exps:Seqable<IExp>, nm:NameMap) -> Seq<Indexed> :
   generate<Indexed> : 
     defn loop (e:IExp, current-visibility:Visibility) :
       match(e) : 
@@ -144,35 +220,29 @@ protected defn index-expressions (exps:Seqable<IExp>, nm:NameMap) -> Seq<Indexed
     ; launch!
     do(loop{_, Private}, exps)
 
-; Helper to extract definitions from DL-IR pulled out of .pkg and .fpkg files.
-defn collect-definitions (packageio:PackageIO, nm:NameMap) -> Seq<Definition> :
-  for e in filter({info(_) is-not False}, exports(packageio)) seq :
-    Definition(name, info, kind, source, package, visibility, annotation?) where :
-      val name        = name(id(rec(e)))
-      val info        = info(e) as FileInfo
-      val package     = package(packageio)
-      val visibility  = visibility(e)
-      val source      = PkgDefinition
-      val kind        = kindof(rec(e))
-      val annotation? = annotate?(e, nm)
+;------------------------------------------------------------
+;------------- Computing Definition Annotations -------------
+;------------------------------------------------------------
 
-; Helper multi to create an annotation for an indexable expression, if necessary.
-defmulti annotate? (exp, nm:NameMap) -> False|DefinitionAnnotation : 
-  false
-
-defmethod annotate? (idefn:IDefn|IDefmethod|ILSDefn|ILSDefmethod, nm:NameMap) -> False|DefinitionAnnotation : 
-  DefnAnnotation(targs, args, return-type?) where :  
-    val return-type? = stringify?(a2(idefn), nm)
-    val targs = to-tuple $ 
-      for arg in targs(idefn) seq : 
-        stringify?(arg, nm) as Symbol
-    val args = to-tuple $ 
-      for (arg in args(idefn), type in a1(idefn)) seq : 
-        val arg-name = stringify?(arg, nm)
-        val type-name = stringify?(type, nm)
-        FnArgAnnotation(arg-name, type-name)
+;Create an annotation for a top-level expression.
+defn annotate? (iexp:IExp, nm:NameMap) -> False|DefinitionAnnotation :
+  match(iexp) :
+    (idefn:IDefn|IDefmethod|ILSDefn|ILSDefmethod) :
+      DefnAnnotation(targs, args, return-type?) where :  
+        val return-type? = stringify?(a2(idefn), nm)
+        val targs = to-tuple $ 
+          for arg in targs(idefn) seq : 
+            stringify?(arg, nm) as Symbol
+        val args = to-tuple $ 
+          for (arg in args(idefn), type in a1(idefn)) seq : 
+            val arg-name = stringify?(arg, nm)
+            val type-name = stringify?(type, nm)
+            FnArgAnnotation(arg-name, type-name)
+    (iexp) :
+      false
     
-defmethod annotate? (export:Export, nm:NameMap) : 
+;Create an annotation for a PackageIO Export expression.
+defn annotate? (export:Export, nm:NameMap) -> False|DefinitionAnnotation : 
   match(rec(export)) :
     (rec:FnRec|MultiRec) : 
       DefnAnnotation(targs, args, return-type?) where : 
@@ -190,49 +260,12 @@ defmethod annotate? (export:Export, nm:NameMap) :
     (r:?) :
       false
 
-; A helper multi to handle the following cases : 
-; - Indexing of source code
-; - Indexing of .pkg files
-; - Indexing of .fpkg files
-protected defmulti index-definitions (pkg, nm:NameMap) -> Seq<Definition>
-
-; Index a package from source code. First index the expressions, then convert to a `Definition`
-; object that can be serialized.
-defmethod index-definitions (ipackage:IPackage, nm:NameMap) -> Seq<Definition> :
-  val indexed-exps = index-expressions(exps(ipackage), nm)
-  for indexed in indexed-exps seq :  
-    Definition(name, info, kind, source, package, visibility, annotation) where : 
-      val package    = name(ipackage)
-      val name       = name(indexed)
-      val info       = info(indexed)
-      val kind       = kind(indexed)
-      val source     = SrcDefinition
-      val visibility = visibility(indexed)
-      val annotation = annotation?(indexed)
-
-; Index a package from a .fpkg file.
-defmethod index-definitions (pkg:FastPkg, nm:NameMap) -> Seq<Definition> :
-  collect-definitions(packageio(pkg), nm)
-
-; Index a package from a .pkg file.
-defmethod index-definitions (pkg:StdPkg, nm:NameMap) -> Seq<Definition> :
-  collect-definitions(packageio(vmp(pkg)), nm)
-
-; Index a PackageDefinition from an IPackage node.  
-protected defn index-package (ipackage:IPackage) -> PackageDefinition : 
-  PackageDefinition(name, file-name, imports) where : 
-    val name      = name(ipackage)
-    val file-name = if-false?("NoFile", call?(filename, info(ipackage)))
-    val imports   =
-      for iimport in imports(ipackage) map :
-        PackageImport(name, prefixes) where : 
-          val name = package(iimport)
-          val prefixes = 
-            for iprefix in prefix(iimport) map : 
-              PackageImportPrefix(names(iprefix), prefix(iprefix))
+;------------------------------------------------------------
+;------------------- Reserved Words -------------------------
+;------------------------------------------------------------
 
 ; A list of keywords in stanza.
-val stanza-reserved-words = [
+val STANZA-RESERVED-WORDS = [
   "package" "import" "prefix-of" "prefix" "public" "protected" "private" "doc" "deftype" "defchild" "def"
   "defpackage" "defvar" "defn" "defn*" "defmulti" "defmethod" "defmethod*" "fn" "fn*"
   "multi" "begin" "let" "match" "branch" "new" "as" "as?" "set" "do"
@@ -242,64 +275,84 @@ val stanza-reserved-words = [
   "letexp" "and" "or" "set" "label" "labels" "block" "goto" "return"
   "let" "if" "match" "branch" "func" "def" "defvar" "deftype" "deffield"
   "extern" "extern-fn" "byte" "int" "long" "float" "double"
-  "?" "of" "ptr" "ref"
-  ]
+  "?" "of" "ptr" "ref"]
 
-; Create the definitions database by indexing definitions and packages
-protected defn create-defs-db (name-map:NameMap, packages:Seqable<IPackage|Pkg|FastPkg>) -> DefinitionsDatabase : 
-  val all-definitions = HashTable<Symbol, List<Definition>>(List())
-  val all-packages = Vector<PackageDefinition>()
-  
-  for package in packages do :
-    match(package:IPackage) : 
-      add(all-packages, index-package(package))
+;------------------------------------------------------------
+;------------------- Definition Kinds -----------------------
+;------------------------------------------------------------
 
-    val definitions = index-definitions(package, name-map)
-    for def in definitions do : 
-      val name = name(def)
-      update(all-definitions, cons{def, _}, name)
-  
-  DefinitionsDatabase(reserved-words, definitions, packages) where : 
-    val reserved-words = stanza-reserved-words
-    val definitions = all-definitions
-    val packages = to-tuple(all-packages)
-
-public defn gen-defs-db (out-path:String, 
-                         name-map:NameMap,
-                         packages:Seqable<IPackage|Pkg>) :
-  val ostream = FileOutputStream(out-path)
-  val defs = create-defs-db(name-map, packages)
-  serialize(ostream, defs)
-  close(ostream)
-
-;==============================================================================
-;================================ Helpers =====================================
-;==============================================================================
-; Report the "kind" of an IExp 
-public defn kindof (e:IExp) : 
+; Report the "kind" of an IExp.
+public defn kindof (e:IExp) -> SrcDefinitionKind : 
   match(e) : 
-    (e:IDefmulti) : 
-      SrcDefMulti
-    (e:IDefmethod|ILSDefmethod) : 
-      SrcDefMethod
-    (e:IDefn|ILSDefn) : 
-      SrcDefFunction
-    (e:IDefType|ILSDefType) : 
-      SrcDefType
-    (e:?) : 
-      SrcDefUnknown
+    (e:IDefmulti) : SrcDefMulti
+    (e:IDefmethod|ILSDefmethod) : SrcDefMethod
+    (e:IDefn|ILSDefn) : SrcDefFunction
+    (e:IDefType|ILSDefType) : SrcDefType
+    (e) : SrcDefUnknown
 
-public defn kindof (r:Rec) : 
+; Returns the "kind" of an Rec.
+public defn kindof (r:Rec) -> SrcDefinitionKind : 
   match(r) : 
-    (v:ValRec|ExternRec)   : SrcDefVariable
-    (f:FnRec|ExternFnRec)  : SrcDefFunction
-    (m:MultiRec)           : SrcDefMulti
+    (v:ValRec|ExternRec) : SrcDefVariable
+    (f:FnRec|ExternFnRec) : SrcDefFunction
+    (m:MultiRec) : SrcDefMulti
     (t:TypeRec|TypeDecl|StructRec) : SrcDefType
-    (r:?) : SrcDefUnknown
+    (r) : SrcDefUnknown
+
+;------------------------------------------------------------
+;------------------ Indexable Type --------------------------
+;------------------------------------------------------------
+
+; An Indexable is an IExp that can be meaningfully indexed in the DefinitionsDatabase 
+; structure. Currently supported are functions, multis, methods, types, and children
+; in both Hi and Lo stanza.
+deftype Indexable :  
+  VarN         <: Indexable
+  IDef         <: Indexable
+  IDefn        <: Indexable
+  IDefmulti    <: Indexable
+  IDefmethod   <: Indexable
+  IDefType     <: Indexable
+  IDefChild    <: Indexable
+  ILSDef       <: Indexable
+  ILSDefn      <: Indexable
+  ILSDefmethod <: Indexable
+  ILSDefType   <: Indexable
+
+;------------------------------------------------------------
+;----------------- Indexed Type -----------------------------
+;------------------------------------------------------------
+
+; The `Indexed` struct is a helper that contains extracted metadata from IL-IR.
+; before being associated with a package. 
+;
+;- kind:       The kind of originating expression (see SrcDefinitionKind)
+;- visibility: The visibility of the expression (public|private|protected)
+;- name:       The extracted name of the indexed expression
+;- info:       The associated file info of the expression.
+protected defstruct Indexed <: Equalable : 
+  kind:SrcDefinitionKind
+  visibility:Visibility
+  name:Symbol
+  info:FileInfo
+  annotation?:False|DefinitionAnnotation
+with : 
+  printer => true
+
+; Index entries are `Equalable` for testing.
+defmethod equal? (l:Indexed, r:Indexed) :
+  kind(l) == kind(r) and 
+  visibility(l) == visibility(r) and 
+  name(l) == name(r) and 
+  info(l) == info(r)
+
+;============================================================
+;================= Human-Readable Names =====================
+;============================================================
 
 ; A helper multi that converts some IR that represents a named
 ; "thing" (type, identifier, etc) into human readable text.
-defmulti stringify? (i, nm:NameMap) -> False|Symbol : 
+defmulti stringify? (i:DType|IExp, nm:NameMap) -> False|Symbol : 
   false
 
 ; Stringify types from lostanza types in pkg/fpkg files
@@ -313,14 +366,17 @@ defmethod stringify? (dtype:DUnknown, nm:NameMap)  : `?
 defmethod stringify? (dptr:DPtrT, nm:NameMap) : 
   to-symbol $ "ptr<%_>" % [stringify?(type(dptr), nm)]
 
-defmethod stringify? (dfn:DFnT, nm:NameMap) : 
-  to-symbol $ 
-    match(r(dfn)) : 
-      (f:False) : "fn (%,)" % [seq(stringify?{_, nm}, a(dfn))]
-      (d:DType) : "fn (&,) -> %_" % [seq(stringify?{_, nm}, a(dfn)), r(dfn)]
-
-defmethod stringify? (typeid:TypeId, nm:NameMap) :
-  name(typeid)
+defmethod stringify? (dfn:DFnT, nm:NameMap) :
+  val a = map(stringify?{_, nm}, a(dfn))
+  val b = stringify?(b(dfn), nm)
+  if all?({_ is Symbol}, a) and b is Symbol :
+    match(r(dfn)) :
+      (f:False) :
+        to-symbol("fn (%,) -> %_" % [a, b])
+      (r:DType) :
+        val rstr = stringify?(r, nm)
+        if rstr is Symbol :
+          to-symbol("fn (%, ...) -> %_" % [cat(a,[rstr]), b])
 
 defmethod stringify? (dtype:DOf, nm:NameMap) : 
   if empty?(targs(dtype)) : 
@@ -341,10 +397,10 @@ defmethod stringify? (dtype:DOr, nm:NameMap) :
   to-symbol $ string-join(seq(stringify?{_, nm}, types(dtype)), "|")
 
 defmethod stringify? (dtype:DTop, nm:NameMap) : 
-  `top
+  `?
 
 defmethod stringify? (dtype:DBot, nm:NameMap) : 
-  `bot
+  `Void
 
 defmethod stringify? (dtype:DTuple, nm:NameMap) : 
   to-symbol $ "[%,]" % [seq(stringify?{_, nm}, types(dtype))]
@@ -352,8 +408,7 @@ defmethod stringify? (dtype:DTuple, nm:NameMap) :
 defmethod stringify? (dtype:DArrow, nm:NameMap) : 
   to-symbol $ "(%,) -> %_" % [
     seq(stringify?{_, nm}, a1(dtype)), 
-    stringify?(a2(dtype), nm)
-  ]
+    stringify?(a2(dtype), nm)]
 
 defmethod stringify? (e:VarN, nm:NameMap) : 
   if key?(nm, n(e)) : 
@@ -361,9 +416,6 @@ defmethod stringify? (e:VarN, nm:NameMap) :
 
 defmethod stringify? (r:Raw, nm:NameMap) : 
   stringify?(class(r), nm)
-
-defmethod stringify? (l:List, nm:NameMap) : 
-  to-symbol("(%,)" % [seq(stringify?{_, nm}, l)])
 
 defmethod stringify? (iof:IOf, nm:NameMap) : 
   to-symbol("%_<%,>" % [stringify?(class(iof), nm),  seq(stringify?{_, nm}, args(iof))])
@@ -387,10 +439,10 @@ defmethod stringify? (inone:INone, nm:NameMap) :
   false
 
 defmethod stringify? (iarrow:IArrow, nm:NameMap) : 
-  val l = stringify?(a1(iarrow), nm)
+  val l = map(stringify?{_, nm}, a1(iarrow))
   val r = stringify?(a2(iarrow), nm)
-  match(l:Symbol, r:Symbol) :
-    to-symbol("%_ -> %_" % [l, r])
+  if all?({_ is Symbol}, l) and r is Symbol :
+    to-symbol("(%,) -> %_" % [l, r])
 
 defmethod stringify? (ivoid:IVoid, nm:NameMap) :
   `Void
@@ -420,25 +472,49 @@ defn name? (i:Indexable&IExp, nm:NameMap) -> False|Symbol :
           name
   stringify?(exp-name, nm)
 
-; call `f` if `x` is False, otherwise return false
-defn call?<?T, ?U> (f: T -> ?U, x:?T|False) -> U|False : 
-  false when x is False else f(x as T)
+;============================================================
+;================= Merging Algorithm ========================
+;============================================================
 
-; return `value` if x is false, else return x
-defn if-false?<?T> (value:?T, x:?T|False) -> T : 
-  value when x is False else x as T
+;Given an old definitions database, and a new definitions database.
+;Merge the two into a new definitions database which keeps entries
+;from the old database if the contents used to create them has not
+;changed.
+defn merge (old-db:DefinitionsDatabase, new-db:DefinitionsDatabase) -> DefinitionsDatabase :
+  ;Convert a tuple of package definitions into a table.
+  defn to-table (defs:Tuple<PackageDefinitions>) :
+    to-hashtable<Symbol,PackageDefinitions> $
+      for def in defs seq : name(def) => def  
+  val old-package-table = to-table(packages(old-db))    
+  val new-package-table = to-table(packages(new-db))
 
-; Index entries are `Equalable` for testing.
-defmethod equal? (l:Indexed, r:Indexed) :
-  kind(l) == kind(r) and 
-  visibility(l) == visibility(r) and 
-  name(l) == name(r) and 
-  info(l) == info(r)
+  ;Compute the set of packages that appear on either table.
+  val all-package-names = unique(cat(keys(old-package-table), keys(new-package-table)))
+
+  ;Scan through the packages and create merged entries.
+  val merged-packages = to-tuple $
+    for package-name in all-package-names seq? :
+      match(get?(old-package-table, package-name), get?(new-package-table, package-name)) :
+        ;If there is an updated version of the package, then
+        ;use the new package.
+        (old-defs, new-defs:PackageDefinitions) :
+          One(new-defs)
+        ;If unable to calculate an updated version, then
+        ;keep the old package if its source contents have not changed.
+        (old-defs:PackageDefinitions, new-defs:False) :
+          if up-to-date?(stamp(old-defs)) : One(old-defs)
+          else : None()
+
+  ;Create the merged database.
+  DefinitionsDatabase(
+    reserved-words(new-db),
+    merged-packages)
 
 ;============================================================
-;============= Retrieve All Packages in Proj File ===========
+;================= Small Utilities ==========================
 ;============================================================
+
+;Retrieve all packages in Proj File.
 defn all-packages (proj-file:ProjFile) -> Tuple<Symbol> :
   val defined = filter-by<DefinedInStmt>(stmts(proj-file))
-  to-tuple(seq(package, defined))
- 
+  to-tuple(unique(seq(package, defined)))

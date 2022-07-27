@@ -58,8 +58,10 @@ extern "C" {
   void assembler_mov_ptr_gp(Assembler *a, const MemPtr* mem, Gp *reg);
   void assembler_add_reg(Assembler *a, const Gp *dst, const Gp *src);
   void assembler_imul_reg(Assembler *a, const Gp *dst, const Gp *src);
-  void assembler_div_reg(Assembler *a, const Gp *divisor);
+  void assembler_div_reg(Assembler *a, const Gp *divisor);  
   void assembler_mod_reg(Assembler *a, const Gp *divisor);
+  void assembler_cqo_reg(Assembler *a);
+  void assembler_cdq_reg(Assembler *a);  
   void assembler_add_int(Assembler *a, const Gp *dst, int);
   void assembler_sub_int(Assembler *a, const Gp *dst, int);
   void assembler_sub_reg(Assembler *a, const Gp *dst, const Gp *src);
@@ -124,7 +126,7 @@ extern "C" {
   void assembler_maxss(Assembler *a, const Xmm *dst, const Xmm *src);
   void assembler_maxsd(Assembler *a, const Xmm *dst, const Xmm *src);
   void assembler_sqrtss(Assembler *a, const Xmm *dst, const Xmm *src);
-  void assembler_sqrtsd(Assembler *a, const Xmm *dst, const Xmm *src);
+  void assembler_sqrtsd(Assembler *a, const Xmm *dst, const Xmm *src);  
 
   typedef uint64_t (*Func)(void);
   uint64_t func_call(Func f);

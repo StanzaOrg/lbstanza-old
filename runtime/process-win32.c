@@ -46,50 +46,52 @@ static FILE* file_from_handle(HANDLE handle, FileType type) {
 
 // Polls a running `process` returning the `ProcessState`, optionally blocking until it has terminated.
 int retrieve_process_state (const Process* process, ProcessState* s, stz_int wait_for_termination) {
-  ProcessState state;  // the returned state. 
-  DWORD exit_code;     // the exit code of the process
-  HANDLE handle;       // the handle to the process 
-  
-  // By default, assume the process is still running.
-  state = (ProcessState){PROCESS_RUNNING, 0};
-
-  // First, attempt to open a handle to the process to query its state by process ID.
-  // This is required to check a currently running process, as we do not have the permissions
-  // associated with the original handle created by launch_process (??? TODO: verify the cause)
-  handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, process->pid);
-
-  // If the wait_for_termination argument has been passed, and the handle is valid, we 
-  // call WaitForSingleObject until the process exits. Requires a valid handle.
-  if (wait_for_termination && handle) {
+  // If the wait_for_termination argument has been passed, we 
+  // call WaitForSingleObject until the process exits.
+  if (wait_for_termination) {
     // if WaitForSingleObject fails, return an error. The caller must retrieve the
     // platform error message and raise an exception.
-    if (WaitForSingleObject(handle, INFINITE) == WAIT_FAILED) {
+    if (WaitForSingleObject(process->handle, INFINITE) == WAIT_FAILED) {
       return -1;
     }
   }
 
-  // If the returned handle is invalid, it means that the process has failed and we need
-  // to query the return code using original handle to the process.
-  if (!handle) {
-    handle = process->handle;
-  }
-
   // Attempt to get the exit code from the handle. If this fails, return an error. The
   // caller must retrieve the platform error message and return an exception.
-  if (!GetExitCodeProcess(handle, &exit_code)) {
+  DWORD exit_code;
+  if (!GetExitCodeProcess(process->handle, &exit_code)) {
     return -1;
   }
 
-  // If the exit code is not STILL_ACTIVE, then process is done.
-  if (exit_code != STILL_ACTIVE) {
-    state = (ProcessState){PROCESS_DONE, (stz_int)exit_code};
-    // Make sure we close the handle after we're done with it.
-    CloseHandle(handle);
+  // If exit code is STILL_ACTIVE, then process might still be running.
+  if (exit_code == STILL_ACTIVE){
+    //Now we have to check whether the process is actually still running,
+    //or whether it finished, but happened to finish with STILL_ACTIVE as
+    //its exit code. (This is bad manners, but programs are still allowed to do it.)
+
+    //Call WaitForSingleObject with timeout = 0.
+    DWORD wait_result = WaitForSingleObject(process->handle, 0);
+    
+    //If wait timed out, then the process is indeed still running.
+    if(wait_result == WAIT_TIMEOUT){
+      s->state = PROCESS_RUNNING;
+      s->code = 0;
+      return 0;
+    }
+    //Otherwise, the process happened to finish. And STILL_ACTIVE is
+    //its exit code.
+    else{
+      s->state = PROCESS_DONE;
+      s->code = exit_code;
+      return 0;
+    }
   }
-  
-  // Write the returned state and return success.
-  *s = state;
-  return 0;
+  // The exit code is not STILL_ACTIVE, so the process is DONE.
+  else {
+    s->state = PROCESS_DONE;
+    s->code = exit_code;
+    return 0;
+  }
 }
 
 typedef enum {
@@ -149,6 +151,9 @@ static HANDLE duplicate_handle(HANDLE handle) {
 // different streams (for example when both STDOUT/STDERR are redirected to
 // PROCESS-OUT or to PROCESS-ERR). This is not strictly invalid, but would
 // cause an error when closing these handles after launching the process.
+// - input, output, error: Enums that indicate where the process communication streams
+//   should be directed. Will be: STANDARD_IN | STANDARD_OUT | PROCESS_IN | PROCESS_OUT |
+//   STANDARD_ERR | PROCESS_ERR.
 static void setup_file_handles(
     stz_int input, stz_int output, stz_int error,
     PHANDLE process_stdin_read, PHANDLE process_stdin_write,
@@ -228,22 +233,17 @@ static void setup_file_handles(
 stz_int launch_process(stz_byte* command_line,
                        stz_int input, stz_int output, stz_int error,
                        stz_byte* working_dir, Process* process) {
-
-  PROCESS_INFORMATION proc_info;
-  STARTUPINFO start_info;
+  // Set up our STDIN, STDOUT, and STDERR  
   HANDLE stdin_read, stdin_write,
          stdout_read, stdout_write,
          stderr_read, stderr_write;
-  BOOL success;
-
-  // Set up our STDIN, STDOUT, and STDERR
   setup_file_handles(input, output, error,
       &stdin_read, &stdin_write,
       &stdout_read, &stdout_write,
-      &stderr_read, &stderr_write
-  );
+      &stderr_read, &stderr_write);
 
   // Now that we have our handles, set up STARTUPINFO so that the child process will use them
+  STARTUPINFO start_info;
   ZeroMemory(&start_info, sizeof(STARTUPINFO));
   start_info.cb = sizeof(STARTUPINFO);
   start_info.hStdInput  = stdin_read;
@@ -253,8 +253,9 @@ stz_int launch_process(stz_byte* command_line,
 
   // Zero out our process information in ancipication of CreateProcess
   // populating it, and then launch our process.
+  PROCESS_INFORMATION proc_info;
   ZeroMemory(&proc_info, sizeof(PROCESS_INFORMATION));
-  success = CreateProcess(
+  BOOL success = CreateProcess(
       /* lpApplicationName    */ NULL,
       /* lpCommandLine        */ (LPSTR)command_line,
       /* lpProcessAttributes  */ NULL,
@@ -281,9 +282,15 @@ stz_int launch_process(stz_byte* command_line,
     if (stderr_write != NULL) CloseHandle(stderr_write);
 
     // Close these left-over handles to the process
-    CloseHandle(proc_info.hThread);
-    CloseHandle(proc_info.hProcess);
+    // Leave the process handle (proc_info.hProcess) open, so that we
+    // can use it for retrieve_state. It will be closed from the Stanza side.
+    CloseHandle(proc_info.hThread);    
   }
 
   return success ? 0 : -1;
+}
+
+//C function to close the handle. Called by Stanza.
+void close_process_handle (void* handle) {
+  CloseHandle(handle);
 }
