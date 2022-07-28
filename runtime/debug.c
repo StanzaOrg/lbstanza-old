@@ -19,6 +19,10 @@
   typedef int SOCKET;
 #endif
 
+static const char* current_error(void) {
+  return strerror(errno);
+}
+
 static FILE* debug_adapter_log;
 static pthread_mutex_t log_lock;
 static void log_printf(const char* fmt, ...) {
@@ -76,9 +80,8 @@ static void StringVector_append(StringVector* vector, const char* s) {
   //TODO: handle possible OOM
 }
 
-// Has the debugger attached to the process or launched it?
-static bool attached_to_process;
-static bool stop_at_entry;
+static char* program_path;
+static pid_t program_pid;
 static bool sent_terminated_event;
 static pthread_mutex_t send_lock;
 static const char* debug_adapter_path;
@@ -400,6 +403,10 @@ static const JSObject* JSObject_get_object_field(const JSObject* object, const c
   const JSField* field = JSObject_get_field(object, name, JS_OBJECT);
   return field ? &field->value.u.o : NULL;
 }
+static const JSArray* JSObject_get_array_field(const JSObject* object, const char* name) {
+  const JSField* field = JSObject_get_field(object, name, JS_ARRAY);
+  return field ? &field->value.u.a : NULL;
+}
 static int64_t JSObject_get_integer_field(const JSObject* object, const char* name, int64_t default_value) {
   const JSField* field = JSObject_get_field(object, name, JS_INTEGER);
   return field ? field->value.u.i : default_value;
@@ -427,6 +434,7 @@ static void JSValue_destroy(JSValue* value) {
     case JS_ARRAY: JSArray_destroy(&value->u.a); break;
   }
 }
+
 
 typedef struct {
   const char* start;
@@ -755,19 +763,32 @@ static void JSBuilder_send_and_destroy_object(JSBuilder* builder) {
 static void JSBuilder_write_seq_0(JSBuilder* builder, bool* next) {
   JSBuilder_write_field(builder, next, "seq"); JSBuilder_append_char(builder, '0');
 }
-static void JSBuilder_initialize_event(JSBuilder* builder, const char* name) {
+static void JSBuilder_initialize_simple_event(JSBuilder* builder, const char* name) {
   JSBuilder_initialize(builder);
   JSBuilder_object_begin(builder);
   bool next = false;
   JSBuilder_write_seq_0(builder, &next);
   JSBuilder_write_raw_string_field(builder, &next, "type", "event");
   JSBuilder_write_raw_string_field(builder, &next, "event", name);
+}
+static inline void JSBuilder_send_and_destroy_simple_event(JSBuilder* builder) {
+  JSBuilder_send_and_destroy_object(builder);
+}
+static void send_simple_event(const char* name) {
+  JSBuilder builder;
+  JSBuilder_initialize_simple_event(&builder, name);
+  JSBuilder_send_and_destroy_simple_event(&builder);
+}
+
+static void JSBuilder_initialize_event(JSBuilder* builder, const char* name) {
+  JSBuilder_initialize_simple_event(builder, name);
+  bool next = true;
   JSBuilder_write_field(builder, &next, "body");
   JSBuilder_object_begin(builder);
 }
 static void JSBuilder_send_and_destroy_event(JSBuilder* builder) {
   JSBuilder_object_end(builder); // body
-  JSBuilder_send_and_destroy_object(builder);
+  JSBuilder_send_and_destroy_simple_event(builder);
 }
 
 // "StoppedEvent": {
@@ -874,10 +895,73 @@ static void send_process_exited(uint64_t exit_code) {
 static void send_terminated(void) {
   if (!sent_terminated_event) {
     sent_terminated_event = true;
-    JSBuilder builder;
-    JSBuilder_initialize_event(&builder, "terminated");
-    JSBuilder_send_and_destroy_event(&builder);
+    send_simple_event("terminated");
   }
+}
+
+// "ProcessEvent": {
+//   "allOf": [
+//     { "$ref": "#/definitions/Event" },
+//     {
+//       "type": "object",
+//       "description": "Event message for 'process' event type. The event
+//                       indicates that the debugger has begun debugging a
+//                       new process. Either one that it has launched, or one
+//                       that it has attached to.",
+//       "properties": {
+//         "event": {
+//           "type": "string",
+//           "enum": [ "process" ]
+//         },
+//         "body": {
+//           "type": "object",
+//           "properties": {
+//             "name": {
+//               "type": "string",
+//               "description": "The logical name of the process. This is
+//                               usually the full path to process's executable
+//                               file. Example: /home/myproj/program.js."
+//             },
+//             "systemProcessId": {
+//               "type": "integer",
+//               "description": "The system process id of the debugged process.
+//                               This property will be missing for non-system
+//                               processes."
+//             },
+//             "isLocalProcess": {
+//               "type": "boolean",
+//               "description": "If true, the process is running on the same
+//                               computer as the debug adapter."
+//             },
+//             "startMethod": {
+//               "type": "string",
+//               "enum": [ "launch", "attach", "attachForSuspendedLaunch" ],
+//               "description": "Describes how the debug engine started
+//                               debugging this process.",
+//               "enumDescriptions": [
+//                 "Process was launched under the debugger.",
+//                 "Debugger attached to an existing process.",
+//                 "A project launcher component has launched a new process in
+//                  a suspended state and then asked the debugger to attach."
+//               ]
+//             }
+//           },
+//           "required": [ "name" ]
+//         }
+//       },
+//       "required": [ "event", "body" ]
+//     }
+//   ]
+// }
+static inline void send_process_launched(void) {
+  JSBuilder builder;
+  JSBuilder_initialize_event(&builder, "process");
+  bool next = false;
+  JSBuilder_write_string_field(&builder, &next, "name", program_path);
+  JSBuilder_write_unsigned_field(&builder, &next, "systemProcessId", program_pid);
+  JSBuilder_write_bool_field(&builder, &next, "isLocalProcess", true);
+  JSBuilder_write_raw_string_field(&builder, &next, "startMethod", "launch");
+  JSBuilder_send_and_destroy_event(&builder);
 }
 
 // "Breakpoint": {
@@ -1202,41 +1286,6 @@ static void respond_to_request(const JSObject* request, const char* message) {
 //     }
 //   }]
 // }
-
-// "LaunchRequest": {
-//   "allOf": [ { "$ref": "#/definitions/Request" }, {
-//     "type": "object",
-//     "description": "Launch request; value of command field is 'launch'.",
-//     "properties": {
-//       "command": {
-//         "type": "string",
-//         "enum": [ "launch" ]
-//       },
-//       "arguments": {
-//         "$ref": "#/definitions/LaunchRequestArguments"
-//       }
-//     },
-//     "required": [ "command", "arguments"  ]
-//   }]
-// },
-// "LaunchRequestArguments": {
-//   "type": "object",
-//   "description": "Arguments for 'launch' request.",
-//   "properties": {
-//     "noDebug": {
-//       "type": "boolean",
-//       "description": "If noDebug is true the launch request should launch
-//                       the program without enabling debugging."
-//     }
-//   }
-// },
-// "LaunchResponse": {
-//   "allOf": [ { "$ref": "#/definitions/Response" }, {
-//     "type": "object",
-//     "description": "Response to 'launch' request. This is just an
-//                     acknowledgement, so no body field is required."
-//   }]
-// }
 static inline void define_capabilities(JSBuilder* builder) {
   typedef struct { const char* name; bool value; } capability;
   static const capability capabilities[] = {
@@ -1298,7 +1347,6 @@ static inline void define_capabilities(JSBuilder* builder) {
     body.try_emplace("exceptionBreakpointFilters", std::move(filters));
   #endif
 }
-
 static bool request_initialize(const JSObject* request) {
   // TODO: initialize debugger here.
   JSBuilder builder;
@@ -1312,123 +1360,88 @@ static bool request_initialize(const JSObject* request) {
   return true;
 }
 
-#if 0
-void request_launch(const llvm::json::Object &request) {
-  g_vsc.is_attach = false;
-  llvm::json::Object response;
-  lldb::SBError error;
-  FillResponse(request, response);
-  auto arguments = request.getObject("arguments");
-  g_vsc.init_commands = GetStrings(arguments, "initCommands");
-  g_vsc.pre_run_commands = GetStrings(arguments, "preRunCommands");
-  g_vsc.stop_commands = GetStrings(arguments, "stopCommands");
-  g_vsc.exit_commands = GetStrings(arguments, "exitCommands");
-  g_vsc.terminate_commands = GetStrings(arguments, "terminateCommands");
-  auto launchCommands = GetStrings(arguments, "launchCommands");
-  std::vector<std::string> postRunCommands =
-      GetStrings(arguments, "postRunCommands");
-  g_vsc.stop_at_entry = GetBoolean(arguments, "stopOnEntry", false);
-  const llvm::StringRef debuggerRoot = GetString(arguments, "debuggerRoot");
-  const uint64_t timeout_seconds = GetUnsigned(arguments, "timeout", 30);
-
-  // This is a hack for loading DWARF in .o files on Mac where the .o files
-  // in the debug map of the main executable have relative paths which require
-  // the lldb-vscode binary to have its working directory set to that relative
-  // root for the .o files in order to be able to load debug info.
-  if (!debuggerRoot.empty())
-    llvm::sys::fs::set_current_path(debuggerRoot);
-
-  // Run any initialize LLDB commands the user specified in the launch.json.
-  // This is run before target is created, so commands can't do anything with
-  // the targets - preRunCommands are run with the target.
-  g_vsc.RunInitCommands();
-
-  SetSourceMapFromArguments(*arguments);
-
-  lldb::SBError status;
-  g_vsc.SetTarget(g_vsc.CreateTargetFromArguments(*arguments, status));
-  if (status.Fail()) {
-    response["success"] = llvm::json::Value(false);
-    EmplaceSafeString(response, "message", status.GetCString());
-    g_vsc.SendJSON(llvm::json::Value(std::move(response)));
-    return;
+// "LaunchRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Launch request; value of command field is 'launch'.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "launch" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/LaunchRequestArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "LaunchRequestArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'launch' request.",
+//   "properties": {
+//     "noDebug": {
+//       "type": "boolean",
+//       "description": "If noDebug is true the launch request should launch
+//                       the program without enabling debugging."
+//     }
+//   }
+// },
+// "LaunchResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'launch' request. This is just an
+//                     acknowledgement, so no body field is required."
+//   }]
+// }
+static const char* get_string_array(const JSObject* object, const char* name, const char*** out) {
+  const JSField* field = JSObject_get_field(object, name, JS_ARRAY);
+  const int length = field ? field->value.u.a.length : 0;
+  const char** q = (const char**) malloc((length + 1) * sizeof(char*));
+  *out = q;
+  if (length) {
+    for (const JSValue *p = field->value.u.a.data, *limit = p + length; p < limit; p++) {
+      if (p->kind != JS_STRING) {
+        static char message[64];
+        // TODO: Print detailed message here with the index and value. maybe try to convert the value to string first.
+        // It looks like we only need JS arrays of strings. JSParser can be modified to store a pointer to source representation in a field.
+        snprintf(message, sizeof message, "%s: array of strings expected", name);
+        return message;
+      }
+      *q++ = p->u.s;
+    }
   }
-
-  // Instantiate a launch info instance for the target.
-  auto launch_info = g_vsc.target.GetLaunchInfo();
-
-  // Grab the current working directory if there is one and set it in the
-  // launch info.
-  const auto cwd = GetString(arguments, "cwd");
-  if (!cwd.empty())
-    launch_info.SetWorkingDirectory(cwd.data());
-
-  // Extract any extra arguments and append them to our program arguments for
-  // when we launch
-  auto args = GetStrings(arguments, "args");
-  if (!args.empty())
-    launch_info.SetArguments(MakeArgv(args).data(), true);
-
-  // Pass any environment variables along that the user specified.
-  auto envs = GetStrings(arguments, "env");
-  if (!envs.empty())
-    launch_info.SetEnvironmentEntries(MakeArgv(envs).data(), true);
-
-  auto flags = launch_info.GetLaunchFlags();
-
-  if (GetBoolean(arguments, "disableASLR", true))
-    flags |= lldb::eLaunchFlagDisableASLR;
-  if (GetBoolean(arguments, "disableSTDIO", false))
-    flags |= lldb::eLaunchFlagDisableSTDIO;
-  if (GetBoolean(arguments, "shellExpandArguments", false))
-    flags |= lldb::eLaunchFlagShellExpandArguments;
-  const bool detatchOnError = GetBoolean(arguments, "detachOnError", false);
-  launch_info.SetDetachOnError(detatchOnError);
-  launch_info.SetLaunchFlags(flags | lldb::eLaunchFlagDebug |
-                             lldb::eLaunchFlagStopAtEntry);
-
-  // Run any pre run LLDB commands the user specified in the launch.json
-  g_vsc.RunPreRunCommands();
-
-  if (GetBoolean(arguments, "runInTerminal", false)) {
-    if (llvm::Error err = request_runInTerminal(request))
-      error.SetErrorString(llvm::toString(std::move(err)).c_str());
-  } else if (launchCommands.empty()) {
-    // Disable async events so the launch will be successful when we return from
-    // the launch call and the launch will happen synchronously
-    g_vsc.debugger.SetAsync(false);
-    g_vsc.target.Launch(launch_info, error);
-    g_vsc.debugger.SetAsync(true);
-  } else {
-    g_vsc.RunLLDBCommands("Running launchCommands:", launchCommands);
-    // The custom commands might have created a new target so we should use the
-    // selected target after these commands are run.
-    g_vsc.target = g_vsc.debugger.GetSelectedTarget();
-    // Make sure the process is launched and stopped at the entry point before
-    // proceeding as the the launch commands are not run using the synchronous
-    // mode.
-    error = g_vsc.WaitForProcessToStop(timeout_seconds);
-  }
-
-  if (error.Fail()) {
-    response["success"] = llvm::json::Value(false);
-    EmplaceSafeString(response, "message", std::string(error.GetCString()));
-  } else {
-    g_vsc.RunLLDBCommands("Running postRunCommands:", postRunCommands);
-  }
-
-  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
-
-  if (g_vsc.is_attach)
-    SendProcessEvent(Attach); // this happens when doing runInTerminal
-  else
-    SendProcessEvent(Launch);
-  g_vsc.SendJSON(llvm::json::Value(CreateEventObject("initialized")));
+  *q = NULL;
+  return NULL;
 }
-#endif
+static inline const char* launch_program(const JSObject* request_arguments) {
+  const char* cwd = JSObject_get_string_field(request_arguments, "cwd");
+  if (cwd && chdir(cwd)) return current_error();
 
+  const bool stop_at_entry = JSObject_get_boolean_field(request_arguments, "stopOnEntry", false);
+  // O.P.: Do we need this?
+  // const bool runInTerminal = JSObject_get_boolean_field(request_arguments, "runInTerminal", false);
+
+  const char* program = JSObject_get_string_field(request_arguments, "program");
+  if (!program) return "no program specified";
+
+  const char** args = NULL;
+  const char* error = get_string_array(request_arguments, "args", &args);
+  if (!error) {
+    const char** env = NULL;
+    error = get_string_array(request_arguments, "env", &env);
+    if (!error) {
+      free_path(program_path);
+      program_path = get_absolute_path(program);
+      // TODO: launch the program here, remember program_pid
+      program_pid = getpid();
+    }
+    free(env);
+  }
+  free(args);
+  return error;
+}
 static bool request_launch(const JSObject* request) {
-  attached_to_process = false;
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   //TODO: Do we really need built-in debugger commands interpreter?
   // init_commands = GetStrings(arguments, "initCommands");
@@ -1438,10 +1451,10 @@ static bool request_launch(const JSObject* request) {
   // terminate_commands = GetStrings(arguments, "terminateCommands");
   // auto launchCommands = GetStrings(arguments, "launchCommands");
   // std::vector<std::string> postRunCommands = GetStrings(arguments, "postRunCommands");
-  stop_at_entry = JSObject_get_boolean_field(arguments, "stopOnEntry", false);
+
   // TODO: Do we really need debuggerRoot?
   // const char* debugger_root = JSObject_get_string_field(arguments, "debuggerRoot");
-  const uint64_t timeout_seconds = JSObject_get_integer_field(arguments, "timeout", 30);
+  // const uint64_t timeout_seconds = JSObject_get_integer_field(arguments, "timeout", 30);
 
   // This is a hack for loading DWARF in .o files on Mac where the .o files
   // in the debug map of the main executable have relative paths which require
@@ -1458,6 +1471,13 @@ static bool request_launch(const JSObject* request) {
   //TODO: Do we really need sourcePath or sourceMap?
   // LLDB supports only sourceMap and ignores sourcePath.
   // SetSourceMapFromArguments(*arguments);
+  const char* error = launch_program(arguments);
+  respond_to_request(request, error);
+  if (error)
+    log_printf("launch_request error: %s\n", error);
+  else
+    send_process_launched();
+  send_simple_event("initialized");
   return true;
 }
 
@@ -1538,15 +1558,15 @@ int main(int argc, char* argv[]) {
     const char* log_path = argv[log_pos + 1];
     debug_adapter_log = fopen(log_path, "wt");
     if (!debug_adapter_log) {
-      fprintf(stderr, "error opening log file \"%s\" (%s)\n", log_path, strerror(errno));
+      fprintf(stderr, "error opening log file \"%s\" (%s)\n", log_path, current_error());
       return EXIT_FAILURE;
     }
     if (setvbuf(debug_adapter_log, NULL, _IOLBF, BUFSIZ)) {
-      fprintf(stderr, "error setting line buffering mode for log file (%s)\n", strerror(errno));
+      fprintf(stderr, "error setting line buffering mode for log file (%s)\n", current_error());
       return EXIT_FAILURE;
     }
     if (pthread_mutex_init(&log_lock, NULL)) {
-      fprintf(debug_adapter_log, "error: initializing log mutex (%s)\n", strerror(errno));
+      fprintf(debug_adapter_log, "error: initializing log mutex (%s)\n", current_error());
       return EXIT_FAILURE;
     }
   }
@@ -1571,7 +1591,7 @@ int main(int argc, char* argv[]) {
     printf("Listening on port %i...\n", port);
     SOCKET tmpsock = socket(AF_INET, SOCK_STREAM, 0);
     if (tmpsock < 0) {
-      log_printf("error: opening socket (%s)\n", strerror(errno));
+      log_printf("error: opening socket (%s)\n", current_error());
       return EXIT_FAILURE;
     }
 
@@ -1582,7 +1602,7 @@ int main(int argc, char* argv[]) {
       serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
       serv_addr.sin_port = htons(port);
       if (bind(tmpsock, (struct sockaddr*)&serv_addr, sizeof serv_addr) < 0) {
-        log_printf("error: binding socket (%s)\n", strerror(errno));
+        log_printf("error: binding socket (%s)\n", current_error());
         return EXIT_FAILURE;
       }
     }
@@ -1595,7 +1615,7 @@ int main(int argc, char* argv[]) {
       sock = accept(tmpsock, (struct sockaddr*)&cli_addr, &cli_addr_len);
     } while (sock < 0 && errno == EINTR);
     if (sock < 0) {
-      log_printf("error: accepting socket (%s)\n", strerror(errno));
+      log_printf("error: accepting socket (%s)\n", current_error());
       return EXIT_FAILURE;
     }
     debug_adapter_socket = sock;
@@ -1609,7 +1629,7 @@ int main(int argc, char* argv[]) {
   }
 
   if (pthread_mutex_init(&send_lock, NULL)) {
-    log_printf("error: initializing send mutex (%s)\n", strerror(errno));
+    log_printf("error: initializing send mutex (%s)\n", current_error());
     return EXIT_FAILURE;
   }
 
