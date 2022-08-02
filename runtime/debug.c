@@ -1749,11 +1749,73 @@ static bool request_setExceptionBreakpoints(const JSObject* request) {
   return true;
 }
 
+// "ThreadsRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Thread request; value of command field is 'threads'. The
+//     request retrieves a list of all threads.", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "threads" ]
+//       }
+//     },
+//     "required": [ "command" ]
+//   }]
+// },
+// "ThreadsResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'threads' request.",
+//     "properties": {
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "threads": {
+//             "type": "array",
+//             "items": {
+//               "$ref": "#/definitions/Thread"
+//             },
+//             "description": "All threads."
+//           }
+//         },
+//         "required": [ "threads" ]
+//       }
+//     },
+//     "required": [ "body" ]
+//   }]
+// }
+static bool request_threads(const JSObject* request) {
+  JSBuilder builder;
+  // TODO: If no active stack exists, pass an error message instaed of NULL here.
+  JSBuilder_initialize_response(&builder, request, NULL);
+  JSBuilder_write_field(&builder, "body");
+  JSBuilder_object_begin(&builder);
+  {
+    // TODO: Should we list coroutines here?
+    JSBuilder_write_field(&builder, "threads");
+    JSBuilder_array_begin(&builder);
+    {
+      JSBuilder_next(&builder);
+      JSBuilder_object_begin(&builder);
+      {
+        JSBuilder_write_unsigned_field(&builder, "id", 12345678);
+        JSBuilder_write_raw_string_field(&builder, "name", "main");
+      }
+      JSBuilder_object_end(&builder); // an individual thread
+    }
+    JSBuilder_array_end(&builder); // threads
+  }
+  JSBuilder_object_end(&builder); // body
+  JSBuilder_send_and_destroy_response(&builder);
+  return true;
+}
+
 #define FOR_EACH_REQUEST(def) \
   def(initialize)             \
   def(launch)                 \
   def(setBreakpoints)         \
-  def(setExceptionBreakpoints)
+  def(setExceptionBreakpoints)\
+  def(threads)
 
 static const char* const request_names[] = {
   #define DEFINE_REQUEST_NAME(name) #name,
