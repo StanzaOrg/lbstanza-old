@@ -1601,69 +1601,6 @@ static bool request_launch(const JSObject* request) {
 //   },
 //   "required": [ "line" ]
 // }
-#if 0
-void request_setBreakpoints(const llvm::json::Object &request) {
-  llvm::json::Object response;
-  lldb::SBError error;
-  FillResponse(request, response);
-  auto arguments = request.getObject("arguments");
-  auto source = arguments->getObject("source");
-  const auto path = GetString(source, "path");
-  auto breakpoints = arguments->getArray("breakpoints");
-  llvm::json::Array response_breakpoints;
-
-  // Decode the source breakpoint infos for this "setBreakpoints" request
-  SourceBreakpointMap request_bps;
-  // "breakpoints" may be unset, in which case we treat it the same as being set
-  // to an empty array.
-  if (breakpoints) {
-    for (const auto &bp : *breakpoints) {
-      auto bp_obj = bp.getAsObject();
-      if (bp_obj) {
-        SourceBreakpoint src_bp(*bp_obj);
-        request_bps[src_bp.line] = src_bp;
-
-        // We check if this breakpoint already exists to update it
-        auto existing_source_bps = g_vsc.source_breakpoints.find(path);
-        if (existing_source_bps != g_vsc.source_breakpoints.end()) {
-          const auto &existing_bp =
-              existing_source_bps->second.find(src_bp.line);
-          if (existing_bp != existing_source_bps->second.end()) {
-            existing_bp->second.UpdateBreakpoint(src_bp);
-            AppendBreakpoint(existing_bp->second.bp, response_breakpoints, path,
-                             src_bp.line);
-            continue;
-          }
-        }
-        // At this point the breakpoint is new
-        src_bp.SetBreakpoint(path.data());
-        AppendBreakpoint(src_bp.bp, response_breakpoints, path, src_bp.line);
-        g_vsc.source_breakpoints[path][src_bp.line] = std::move(src_bp);
-      }
-    }
-  }
-
-  // Delete any breakpoints in this source file that aren't in the
-  // request_bps set. There is no call to remove breakpoints other than
-  // calling this function with a smaller or empty "breakpoints" list.
-  auto old_src_bp_pos = g_vsc.source_breakpoints.find(path);
-  if (old_src_bp_pos != g_vsc.source_breakpoints.end()) {
-    for (auto &old_bp : old_src_bp_pos->second) {
-      auto request_pos = request_bps.find(old_bp.first);
-      if (request_pos == request_bps.end()) {
-        // This breakpoint no longer exists in this source file, delete it
-        g_vsc.target.BreakpointDelete(old_bp.second.bp.GetID());
-        old_src_bp_pos->second.erase(old_bp.first);
-      }
-    }
-  }
-
-  llvm::json::Object body;
-  body.try_emplace("breakpoints", std::move(response_breakpoints));
-  response.try_emplace("body", std::move(body));
-  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
-}
-#endif
 
 // File path is specified separately.
 typedef struct {
@@ -1692,16 +1629,6 @@ static SourceBreakpoint* SourceBreakpointVector_allocate(SourceBreakpointVector*
     //TODO: handle possible OOM
   }
   return vector->data + vector->length++;
-}
-static inline void write_source_breakpoints(const SourceBreakpointVector* breakpoints, JSBuilder* builder) {
-  for (const SourceBreakpoint *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
-    JSBuilder_next(builder);
-    JSBuilder_object_begin(builder);
-    JSBuilder_write_unsigned_field(builder, "line", p->line);
-    if (p->column)
-      JSBuilder_write_unsigned_field(builder, "column", p->column);
-    JSBuilder_object_end(builder);
-  }
 }
 static bool request_setBreakpoints(const JSObject* request) {
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
