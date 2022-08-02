@@ -584,9 +584,11 @@ typedef struct {
   ssize_t capacity;
   char* data;
   int indent;
+  uint64_t nexts;  // Stack of bit nexts of nested lists
 } JSBuilder;
 static inline void JSBuilder_initialize(JSBuilder* builder) {
   builder->indent = 0;
+  builder->nexts = 0;
   builder->length = 0;
   builder->capacity = 16*1024; // Initial buffer size
   builder->data = malloc(builder->capacity);
@@ -598,6 +600,20 @@ static inline void JSBuilder_destroy(JSBuilder* builder) {
 static inline void JSBuilder_send_and_destroy(JSBuilder* builder) {
   write_packet(builder->data, builder->length);
   JSBuilder_destroy(builder);
+}
+
+// Bit stack manipulations.
+static inline uint64_t JSBuilder_set_next(JSBuilder* builder) {
+  const uint64_t nexts = builder->nexts;
+  builder->nexts |= 1;
+  return nexts & 1;
+}
+static inline void JSBuilder_push_nexts(JSBuilder* builder) {
+  assert(((int64_t)builder->nexts) >= 0);
+  builder->nexts <<= 1;
+}
+static inline void JSBuilder_pop_nexts(JSBuilder* builder) {
+  builder->nexts >>= 1;
 }
 
 static void JSBuilder_ensure_capacity(JSBuilder* builder, ssize_t size) {
@@ -691,10 +707,12 @@ static void JSBuilder_write_quoted_string(JSBuilder* builder, const char* s) {
 enum { JSIndentStep = 2 };
 static inline void JSBuilder_indent(JSBuilder* builder) {
   builder->indent += JSIndentStep;
+  JSBuilder_push_nexts(builder);
 }
 static inline void JSBuilder_unindent(JSBuilder* builder) {
   builder->indent -= JSIndentStep;
   assert(builder->indent >= 0);
+  JSBuilder_pop_nexts(builder);
 }
 static void JSBuilder_newline(JSBuilder* builder) {
   int chars_to_append = builder->indent + 1;
@@ -704,38 +722,38 @@ static void JSBuilder_newline(JSBuilder* builder) {
     *data++ = ' ';
 }
 
-static inline void JSBuilder_next(JSBuilder* builder, bool* next) {
-  if (*next)
+static inline void JSBuilder_next(JSBuilder* builder) {
+  if (JSBuilder_set_next(builder))
     JSBuilder_append_char(builder, ',');
-  *next = true;
   JSBuilder_newline(builder);
 }
 
-static void JSBuilder_write_field(JSBuilder* builder, bool* next, const char* name) {
-  JSBuilder_next(builder, next);
+static void JSBuilder_write_field(JSBuilder* builder, const char* name) {
+  JSBuilder_next(builder);
   JSBuilder_write_quoted_raw_string(builder, name);
   JSBuilder_append_string(builder, ": ");
 }
-static void JSBuilder_write_raw_string_field(JSBuilder* builder, bool* next, const char* name, const char* value) {
-  JSBuilder_write_field(builder, next, name);
+static void JSBuilder_write_raw_string_field(JSBuilder* builder, const char* name, const char* value) {
+  JSBuilder_write_field(builder, name);
   JSBuilder_write_quoted_raw_string(builder, value);
 }
-static void JSBuilder_write_string_field(JSBuilder* builder, bool* next, const char* name, const char* value) {
-  JSBuilder_write_field(builder, next, name);
+static void JSBuilder_write_string_field(JSBuilder* builder, const char* name, const char* value) {
+  JSBuilder_write_field(builder, name);
   JSBuilder_write_quoted_string(builder, value);
 }
-static void JSBuilder_write_unsigned_field(JSBuilder* builder, bool* next, const char* name, uint64_t value) {
-  JSBuilder_write_field(builder, next, name);
+static void JSBuilder_write_unsigned_field(JSBuilder* builder, const char* name, uint64_t value) {
+  JSBuilder_write_field(builder, name);
   JSBuilder_append_unsigned(builder, value);
 }
-static void JSBuilder_write_bool_field(JSBuilder* builder, bool* next, const char* name, bool value) {
-  JSBuilder_write_field(builder, next, name);
+static void JSBuilder_write_bool_field(JSBuilder* builder, const char* name, bool value) {
+  JSBuilder_write_field(builder, name);
   JSBuilder_append_bool(builder, value);
 }
 
 static inline void JSBuilder_structure_begin(JSBuilder* builder, char brace) {
   JSBuilder_append_char(builder, brace);
   JSBuilder_indent(builder);
+
 }
 static inline void JSBuilder_structure_end(JSBuilder* builder, char brace) {
   JSBuilder_unindent(builder);
@@ -760,16 +778,15 @@ static void JSBuilder_send_and_destroy_object(JSBuilder* builder) {
   JSBuilder_send_and_destroy(builder);
 }
 
-static void JSBuilder_write_seq_0(JSBuilder* builder, bool* next) {
-  JSBuilder_write_field(builder, next, "seq"); JSBuilder_append_char(builder, '0');
+static void JSBuilder_write_seq_0(JSBuilder* builder) {
+  JSBuilder_write_field(builder, "seq"); JSBuilder_append_char(builder, '0');
 }
 static void JSBuilder_initialize_simple_event(JSBuilder* builder, const char* name) {
   JSBuilder_initialize(builder);
   JSBuilder_object_begin(builder);
-  bool next = false;
-  JSBuilder_write_seq_0(builder, &next);
-  JSBuilder_write_raw_string_field(builder, &next, "type", "event");
-  JSBuilder_write_raw_string_field(builder, &next, "event", name);
+  JSBuilder_write_seq_0(builder);
+  JSBuilder_write_raw_string_field(builder, "type", "event");
+  JSBuilder_write_raw_string_field(builder, "event", name);
 }
 static inline void JSBuilder_send_and_destroy_simple_event(JSBuilder* builder) {
   JSBuilder_send_and_destroy_object(builder);
@@ -782,8 +799,7 @@ static void send_simple_event(const char* name) {
 
 static void JSBuilder_initialize_event(JSBuilder* builder, const char* name) {
   JSBuilder_initialize_simple_event(builder, name);
-  bool next = true;
-  JSBuilder_write_field(builder, &next, "body");
+  JSBuilder_write_field(builder, "body");
   JSBuilder_object_begin(builder);
 }
 static void JSBuilder_send_and_destroy_event(JSBuilder* builder) {
@@ -870,12 +886,11 @@ static inline const char* stop_reason(const StopReason kind) {
 static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description) {
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "stopped");
-  bool next = false;
-  JSBuilder_write_raw_string_field(&builder, &next, "reason", stop_reason(reason));
+  JSBuilder_write_raw_string_field(&builder, "reason", stop_reason(reason));
   if (description)
-    JSBuilder_write_raw_string_field(&builder, &next, "description", description);
-  JSBuilder_write_unsigned_field(&builder, &next, "threadId", thread_id);
-  JSBuilder_write_bool_field(&builder, &next, "allThreadsStopped", true);
+    JSBuilder_write_raw_string_field(&builder, "description", description);
+  JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
+  JSBuilder_write_bool_field(&builder, "allThreadsStopped", true);
   JSBuilder_send_and_destroy_event(&builder);
 }
 static void send_thread_stopped_at_breakpoint(int64_t thread_id, uint64_t breakpoint_id, uint64_t location_id) {
@@ -887,8 +902,7 @@ static void send_thread_stopped_at_breakpoint(int64_t thread_id, uint64_t breakp
 static void send_process_exited(uint64_t exit_code) {
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "exited");
-  bool next = false;
-  JSBuilder_write_unsigned_field(&builder, &next, "exitCode", exit_code);
+  JSBuilder_write_unsigned_field(&builder, "exitCode", exit_code);
   JSBuilder_send_and_destroy_event(&builder);
 }
 
@@ -956,11 +970,10 @@ static void send_terminated(void) {
 static inline void send_process_launched(void) {
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "process");
-  bool next = false;
-  JSBuilder_write_string_field(&builder, &next, "name", program_path);
-  JSBuilder_write_unsigned_field(&builder, &next, "systemProcessId", program_pid);
-  JSBuilder_write_bool_field(&builder, &next, "isLocalProcess", true);
-  JSBuilder_write_raw_string_field(&builder, &next, "startMethod", "launch");
+  JSBuilder_write_string_field(&builder, "name", program_path);
+  JSBuilder_write_unsigned_field(&builder, "systemProcessId", program_pid);
+  JSBuilder_write_bool_field(&builder, "isLocalProcess", true);
+  JSBuilder_write_raw_string_field(&builder, "startMethod", "launch");
   JSBuilder_send_and_destroy_event(&builder);
 }
 
@@ -1019,30 +1032,27 @@ static inline void send_process_launched(void) {
 // If 'line' is negative it is omitted.
 static void JSBuilder_write_breakpoint(JSBuilder* builder, int id, bool verified, const char* file, const char* path, int line) {
   JSBuilder_object_begin(builder);
-  bool next = false;
-  JSBuilder_write_unsigned_field(builder, &next, "id", id);
-  JSBuilder_write_bool_field(builder, &next, "verified", verified);
+  JSBuilder_write_unsigned_field(builder, "id", id);
+  JSBuilder_write_bool_field(builder, "verified", verified);
   if (file) {
-    JSBuilder_write_field(builder, &next, "source");
-    bool source_next = false;
+    JSBuilder_write_field(builder, "source");
     JSBuilder_object_begin(builder);
-    JSBuilder_write_string_field(builder, &source_next, "name", file);
+    JSBuilder_write_string_field(builder, "name", file);
     if (path)
-      JSBuilder_write_string_field(builder, &source_next, "path", path);
+      JSBuilder_write_string_field(builder, "path", path);
     JSBuilder_object_end(builder);
     if (line > 0)
-      JSBuilder_write_unsigned_field(builder, &next, "line", line);
+      JSBuilder_write_unsigned_field(builder, "line", line);
   }
   JSBuilder_object_end(builder);
 }
 static void send_breakpoint_changed(int id, bool verified) {
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "breakpoint");
-  bool next = false;
-  JSBuilder_write_field(&builder, &next, "breakpoint");
+  JSBuilder_write_field(&builder, "breakpoint");
   // Emit brief breakpoint info without source location
   JSBuilder_write_breakpoint(&builder, id, verified, NULL, NULL, -1);
-  JSBuilder_write_raw_string_field(&builder, &next, "reason", "changed");
+  JSBuilder_write_raw_string_field(&builder, "reason", "changed");
   JSBuilder_send_and_destroy_event(&builder);
 }
 
@@ -1127,10 +1137,9 @@ static void send_output(const OutputType out, const char* data, ssize_t length) 
   assert(length > 0);
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "output");
-  bool next = false;
-  JSBuilder_write_field(&builder, &next, "output");
+  JSBuilder_write_field(&builder, "output");
   JSBuilder_write_quoted_text(&builder, data, length);
-  JSBuilder_write_raw_string_field(&builder, &next, "category", output_category(out));
+  JSBuilder_write_raw_string_field(&builder, "category", output_category(out));
   JSBuilder_send_and_destroy_event(&builder);
 }
 
@@ -1192,14 +1201,13 @@ static void JSBuilder_initialize_response(JSBuilder* builder, const JSObject* re
 
   JSBuilder_initialize(builder);
   JSBuilder_object_begin(builder);
-  bool next = false;
-  JSBuilder_write_seq_0(builder, &next);
-  JSBuilder_write_raw_string_field(builder, &next, "type", "response");
-  JSBuilder_write_raw_string_field(builder, &next, "command", command);
-  JSBuilder_write_unsigned_field(builder, &next, "request_seq", request_seq);
-  JSBuilder_write_bool_field(builder, &next, "success", message == NULL);
+  JSBuilder_write_seq_0(builder);
+  JSBuilder_write_raw_string_field(builder, "type", "response");
+  JSBuilder_write_raw_string_field(builder, "command", command);
+  JSBuilder_write_unsigned_field(builder, "request_seq", request_seq);
+  JSBuilder_write_bool_field(builder, "success", message == NULL);
   if (message)
-    JSBuilder_write_string_field(builder, &next, "message", message);
+    JSBuilder_write_string_field(builder, "message", message);
 }
 static inline void JSBuilder_send_and_destroy_response(JSBuilder* builder) {
   JSBuilder_send_and_destroy_object(builder);
@@ -1333,9 +1341,8 @@ static inline void define_capabilities(JSBuilder* builder) {
     {"supportsProgressReporting", false},
     {NULL, false} // Convenient NULL termunation.
   };
-  bool next = false;
   for (const capability* p = capabilities; p->name; p++)
-    JSBuilder_write_bool_field(builder, &next, p->name, p->value);
+    JSBuilder_write_bool_field(builder, p->name, p->value);
 
   #if 0
     // TODO:
@@ -1351,8 +1358,7 @@ static bool request_initialize(const JSObject* request) {
   // TODO: initialize debugger here.
   JSBuilder builder;
   JSBuilder_initialize_response(&builder, request, NULL);
-  bool next = true;
-  JSBuilder_write_field(&builder, &next, "body");
+  JSBuilder_write_field(&builder, "body");
   JSBuilder_object_begin(&builder);
   define_capabilities(&builder);
   JSBuilder_object_end(&builder); // body
@@ -1688,16 +1694,12 @@ static SourceBreakpoint* SourceBreakpointVector_allocate(SourceBreakpointVector*
   return vector->data + vector->length++;
 }
 static inline void write_source_breakpoints(const SourceBreakpointVector* breakpoints, JSBuilder* builder) {
-  bool next = false;
   for (const SourceBreakpoint *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
-    JSBuilder_next(builder, &next);
+    JSBuilder_next(builder);
     JSBuilder_object_begin(builder);
-    {
-      bool next = false;
-      JSBuilder_write_unsigned_field(builder, &next, "line", p->line);
-      if (p->column)
-        JSBuilder_write_unsigned_field(builder, &next, "column", p->column);
-    }
+    JSBuilder_write_unsigned_field(builder, "line", p->line);
+    if (p->column)
+      JSBuilder_write_unsigned_field(builder, "column", p->column);
     JSBuilder_object_end(builder);
   }
 }
@@ -1731,14 +1733,24 @@ static bool request_setBreakpoints(const JSObject* request) {
   JSBuilder builder;
   JSBuilder_initialize_response(&builder, request, NULL);
   if (path) {
-    bool next = true;
-    JSBuilder_write_field(&builder, &next, "body");
+    JSBuilder_write_field(&builder, "body");
     JSBuilder_object_begin(&builder);
     {
-      bool next = false;
-      JSBuilder_write_field(&builder, &next, "breakpoints");
+      JSBuilder_write_field(&builder, "breakpoints");
       JSBuilder_array_begin(&builder);
-      write_source_breakpoints(&in_breakpoints, &builder);
+      {
+        // TODO: Replace in_breakpoints with out_breakpoints here.
+        for (const SourceBreakpoint *p = in_breakpoints.data, *const limit = p + in_breakpoints.length; p < limit; p++) {
+          JSBuilder_next(&builder);
+          JSBuilder_object_begin(&builder);
+          {
+            JSBuilder_write_unsigned_field(&builder, "line", p->line);
+            if (p->column)
+              JSBuilder_write_unsigned_field(&builder, "column", p->column);
+          }
+          JSBuilder_object_end(&builder);
+        }
+      }
       JSBuilder_array_end(&builder); // breakpoints
     }
     JSBuilder_object_end(&builder); // body
