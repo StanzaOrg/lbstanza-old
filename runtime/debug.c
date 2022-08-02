@@ -1481,9 +1481,278 @@ static bool request_launch(const JSObject* request) {
   return true;
 }
 
+// VSCode issues separate setBreakpoints request for each source file
+// where some breakpoints are currently set or were set before.
+// The request lists all breakpoints in this file.
+// The debugger has to sync its breakpoints for this file with breakpoints in this list.
+// "SetBreakpointsRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "SetBreakpoints request; value of command field is
+//     'setBreakpoints'. Sets multiple breakpoints for a single source and
+//     clears all previous breakpoints in that source. To clear all breakpoint
+//     for a source, specify an empty array. When a breakpoint is hit, a
+//     StoppedEvent (event type 'breakpoint') is generated.", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "setBreakpoints" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/SetBreakpointsArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "SetBreakpointsArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'setBreakpoints' request.",
+//   "properties": {
+//     "source": {
+//       "$ref": "#/definitions/Source",
+//       "description": "The source location of the breakpoints; either
+//       source.path or source.reference must be specified."
+//     },
+//     "breakpoints": {
+//       "type": "array",
+//       "items": {
+//         "$ref": "#/definitions/SourceBreakpoint"
+//       },
+//       "description": "The code locations of the breakpoints."
+//     },
+//     "lines": {
+//       "type": "array",
+//       "items": {
+//         "type": "integer"
+//       },
+//       "description": "Deprecated: The code locations of the breakpoints."
+//     },
+//     "sourceModified": {
+//       "type": "boolean",
+//       "description": "A value of true indicates that the underlying source
+//       has been modified which results in new breakpoint locations."
+//     }
+//   },
+//   "required": [ "source" ]
+// },
+// "SetBreakpointsResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'setBreakpoints' request. Returned is
+//     information about each breakpoint created by this request. This includes
+//     the actual code location and whether the breakpoint could be verified.
+//     The breakpoints returned are in the same order as the elements of the
+//     'breakpoints' (or the deprecated 'lines') in the
+//     SetBreakpointsArguments.", "properties": {
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "breakpoints": {
+//             "type": "array",
+//             "items": {
+//               "$ref": "#/definitions/Breakpoint"
+//             },
+//             "description": "Information about the breakpoints. The array
+//             elements are in the same order as the elements of the
+//             'breakpoints' (or the deprecated 'lines') in the
+//             SetBreakpointsArguments."
+//           }
+//         },
+//         "required": [ "breakpoints" ]
+//       }
+//     },
+//     "required": [ "body" ]
+//   }]
+// },
+// "SourceBreakpoint": {
+//   "type": "object",
+//   "description": "Properties of a breakpoint or logpoint passed to the
+//   setBreakpoints request.", "properties": {
+//     "line": {
+//       "type": "integer",
+//       "description": "The source line of the breakpoint or logpoint."
+//     },
+//     "column": {
+//       "type": "integer",
+//       "description": "An optional source column of the breakpoint."
+//     },
+//     "condition": {
+//       "type": "string",
+//       "description": "An optional expression for conditional breakpoints."
+//     },
+//     "hitCondition": {
+//       "type": "string",
+//       "description": "An optional expression that controls how many hits of
+//       the breakpoint are ignored. The backend is expected to interpret the
+//       expression as needed."
+//     },
+//     "logMessage": {
+//       "type": "string",
+//       "description": "If this attribute exists and is non-empty, the backend
+//       must not 'break' (stop) but log the message instead. Expressions within
+//       {} are interpolated."
+//     }
+//   },
+//   "required": [ "line" ]
+// }
+#if 0
+void request_setBreakpoints(const llvm::json::Object &request) {
+  llvm::json::Object response;
+  lldb::SBError error;
+  FillResponse(request, response);
+  auto arguments = request.getObject("arguments");
+  auto source = arguments->getObject("source");
+  const auto path = GetString(source, "path");
+  auto breakpoints = arguments->getArray("breakpoints");
+  llvm::json::Array response_breakpoints;
+
+  // Decode the source breakpoint infos for this "setBreakpoints" request
+  SourceBreakpointMap request_bps;
+  // "breakpoints" may be unset, in which case we treat it the same as being set
+  // to an empty array.
+  if (breakpoints) {
+    for (const auto &bp : *breakpoints) {
+      auto bp_obj = bp.getAsObject();
+      if (bp_obj) {
+        SourceBreakpoint src_bp(*bp_obj);
+        request_bps[src_bp.line] = src_bp;
+
+        // We check if this breakpoint already exists to update it
+        auto existing_source_bps = g_vsc.source_breakpoints.find(path);
+        if (existing_source_bps != g_vsc.source_breakpoints.end()) {
+          const auto &existing_bp =
+              existing_source_bps->second.find(src_bp.line);
+          if (existing_bp != existing_source_bps->second.end()) {
+            existing_bp->second.UpdateBreakpoint(src_bp);
+            AppendBreakpoint(existing_bp->second.bp, response_breakpoints, path,
+                             src_bp.line);
+            continue;
+          }
+        }
+        // At this point the breakpoint is new
+        src_bp.SetBreakpoint(path.data());
+        AppendBreakpoint(src_bp.bp, response_breakpoints, path, src_bp.line);
+        g_vsc.source_breakpoints[path][src_bp.line] = std::move(src_bp);
+      }
+    }
+  }
+
+  // Delete any breakpoints in this source file that aren't in the
+  // request_bps set. There is no call to remove breakpoints other than
+  // calling this function with a smaller or empty "breakpoints" list.
+  auto old_src_bp_pos = g_vsc.source_breakpoints.find(path);
+  if (old_src_bp_pos != g_vsc.source_breakpoints.end()) {
+    for (auto &old_bp : old_src_bp_pos->second) {
+      auto request_pos = request_bps.find(old_bp.first);
+      if (request_pos == request_bps.end()) {
+        // This breakpoint no longer exists in this source file, delete it
+        g_vsc.target.BreakpointDelete(old_bp.second.bp.GetID());
+        old_src_bp_pos->second.erase(old_bp.first);
+      }
+    }
+  }
+
+  llvm::json::Object body;
+  body.try_emplace("breakpoints", std::move(response_breakpoints));
+  response.try_emplace("body", std::move(body));
+  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
+}
+#endif
+
+// File path is specified separately.
+typedef struct {
+  unsigned line;    // 1-based
+  unsigned column;  // 1-based, 0 denotes undefined column
+} SourceBreakpoint;
+
+typedef struct {
+  ssize_t length;
+  ssize_t capacity;
+  SourceBreakpoint* data;
+} SourceBreakpointVector;
+static void SourceBreakpointVector_initialize(SourceBreakpointVector* vector) {
+  vector->length = 0;
+  vector->capacity = 16; // Initial vector size
+  vector->data = malloc(vector->capacity * sizeof(SourceBreakpoint));
+  //TODO: handle possible OOME
+}
+static inline void SourceBreakpointVector_destroy(SourceBreakpointVector* vector) {
+  free(vector->data);
+}
+static SourceBreakpoint* SourceBreakpointVector_allocate(SourceBreakpointVector* vector) {
+  if (vector->length == vector->capacity) {
+    vector->capacity <<= 1;
+    vector->data = realloc(vector->data, vector->capacity * sizeof(SourceBreakpoint));
+    //TODO: handle possible OOM
+  }
+  return vector->data + vector->length++;
+}
+static inline void write_source_breakpoints(const SourceBreakpointVector* breakpoints, JSBuilder* builder) {
+  bool next = false;
+  for (const SourceBreakpoint *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
+    JSBuilder_next(builder, &next);
+    JSBuilder_object_begin(builder);
+    {
+      bool next = false;
+      JSBuilder_write_unsigned_field(builder, &next, "line", p->line);
+      if (p->column)
+        JSBuilder_write_unsigned_field(builder, &next, "column", p->column);
+    }
+    JSBuilder_object_end(builder);
+  }
+}
+static bool request_setBreakpoints(const JSObject* request) {
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  const JSObject* source = JSObject_get_object_field(arguments, "source");
+  const char* path = JSObject_get_string_field(source, "path");
+  const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
+
+  SourceBreakpointVector in_breakpoints;
+  SourceBreakpointVector_initialize(&in_breakpoints);
+  if (path) {
+    if (breakpoints) {
+      // Validate brakpoints and store in in_breakpoints.
+      for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
+        if (p->kind == JS_OBJECT) {
+          const JSObject* o = &p->u.o;
+          const int64_t line = JSObject_get_integer_field(o, "line", 0);
+          const int64_t column = JSObject_get_integer_field(o, "column", 0);
+          // TODO: get optional condition, hitCondition and logMessage fields.
+          if (line <= 0 || column < 0) continue;
+          SourceBreakpoint* bp = SourceBreakpointVector_allocate(&in_breakpoints);
+          bp->line = line;
+          bp->column = column;
+        }
+      }
+    }
+    // TODO: Pass in_breakponts (in_breakponts->data, in_breakponts->length) and path to the debugger core here.
+  }
+
+  JSBuilder builder;
+  JSBuilder_initialize_response(&builder, request, NULL);
+  if (path) {
+    bool next = true;
+    JSBuilder_write_field(&builder, &next, "body");
+    JSBuilder_object_begin(&builder);
+    {
+      bool next = false;
+      JSBuilder_write_field(&builder, &next, "breakpoints");
+      JSBuilder_array_begin(&builder);
+      write_source_breakpoints(&in_breakpoints, &builder);
+      JSBuilder_array_end(&builder); // breakpoints
+    }
+    JSBuilder_object_end(&builder); // body
+  }
+  JSBuilder_send_and_destroy_response(&builder);
+
+  SourceBreakpointVector_destroy(&in_breakpoints);
+  return true;
+}
+
 #define FOR_EACH_REQUEST(def) \
   def(initialize)             \
-  def(launch)
+  def(launch)                 \
+  def(setBreakpoints)
 
 static const char* const request_names[] = {
   #define DEFINE_REQUEST_NAME(name) #name,
