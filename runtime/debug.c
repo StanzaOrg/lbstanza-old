@@ -1491,6 +1491,7 @@ static bool request_launch(const JSObject* request) {
 // where some breakpoints are currently set or were set before.
 // The request lists all breakpoints in this file.
 // The debugger has to sync its breakpoints for this file with breakpoints in this list.
+//
 // "SetBreakpointsRequest": {
 //   "allOf": [ { "$ref": "#/definitions/Request" }, {
 //     "type": "object",
@@ -1688,10 +1689,71 @@ static bool request_setBreakpoints(const JSObject* request) {
   return true;
 }
 
+// "SetExceptionBreakpointsRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "SetExceptionBreakpoints request; value of command field
+//     is 'setExceptionBreakpoints'. The request configures the debuggers
+//     response to thrown exceptions. If an exception is configured to break, a
+//     StoppedEvent is fired (event type 'exception').", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "setExceptionBreakpoints" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/SetExceptionBreakpointsArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "SetExceptionBreakpointsArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'setExceptionBreakpoints' request.",
+//   "properties": {
+//     "filters": {
+//       "type": "array",
+//       "items": {
+//         "type": "string"
+//       },
+//       "description": "IDs of checked exception options. The set of IDs is
+//       returned via the 'exceptionBreakpointFilters' capability."
+//     },
+//     "exceptionOptions": {
+//       "type": "array",
+//       "items": {
+//         "$ref": "#/definitions/ExceptionOptions"
+//       },
+//       "description": "Configuration options for selected exceptions."
+//     }
+//   },
+//   "required": [ "filters" ]
+// },
+// "SetExceptionBreakpointsResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'setExceptionBreakpoints' request. This is
+//     just an acknowledgement, so no body field is required."
+//   }]
+// }
+static bool request_setExceptionBreakpoints(const JSObject* request) {
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  const JSArray* filters = JSObject_get_array_field(arguments, "filters");
+  // TODO: Cleanup all exception breakpoints in the debugger here.
+  // TODO: Set each exception breakpoint in the debugger:
+  // for (const JSValue *p = filters->data, *const limit = p + filters->length; p < limit; p++)
+  //  if (p->kind == JS_STRING)
+  //    TODO: set exception breakpoint in the debugger with p->u.s filter.
+
+  respond_to_request(request, NULL);
+  return true;
+}
+
 #define FOR_EACH_REQUEST(def) \
   def(initialize)             \
   def(launch)                 \
-  def(setBreakpoints)
+  def(setBreakpoints)         \
+  def(setExceptionBreakpoints)
 
 static const char* const request_names[] = {
   #define DEFINE_REQUEST_NAME(name) #name,
