@@ -183,7 +183,7 @@ void install_stanza_signal_interceptor () {
   //Instruct C to handle signals using
   //the separate signal handling stack.
   stack_t ss;
-  ss.ss_sp = stackmem;
+  ss.ss_sp = (void*)stackmem;
   ss.ss_size = SIGSTKSZ;
   ss.ss_flags = 0;
   if (sigaltstack(&ss, NULL) == -1){
