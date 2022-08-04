@@ -1631,6 +1631,7 @@ static SourceBreakpoint* SourceBreakpointVector_allocate(SourceBreakpointVector*
   }
   return vector->data + vector->length++;
 }
+static JSBuilder setBreakpoints_response_builder;
 static bool request_setBreakpoints(const JSObject* request) {
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   const JSObject* source = JSObject_get_object_field(arguments, "source");
@@ -1658,32 +1659,30 @@ static bool request_setBreakpoints(const JSObject* request) {
     // TODO: Pass in_breakponts (in_breakponts->data, in_breakponts->length) and path to the debugger core here.
   }
 
-  JSBuilder builder;
-  JSBuilder_initialize_response(&builder, request, NULL);
+  JSBuilder_initialize_response(&setBreakpoints_response_builder, request, NULL);
   if (path) {
-    JSBuilder_write_field(&builder, "body");
-    JSBuilder_object_begin(&builder);
+    JSBuilder_write_field(&setBreakpoints_response_builder, "body");
+    JSBuilder_object_begin(&setBreakpoints_response_builder);
     {
-      JSBuilder_write_field(&builder, "breakpoints");
-      JSBuilder_array_begin(&builder);
+      JSBuilder_write_field(&setBreakpoints_response_builder, "breakpoints");
+      JSBuilder_array_begin(&setBreakpoints_response_builder);
       {
         // TODO: Replace in_breakpoints with out_breakpoints here.
         for (const SourceBreakpoint *p = in_breakpoints.data, *const limit = p + in_breakpoints.length; p < limit; p++) {
-          JSBuilder_next(&builder);
-          JSBuilder_object_begin(&builder);
+          JSBuilder_next(&setBreakpoints_response_builder);
+          JSBuilder_object_begin(&setBreakpoints_response_builder);
           {
-            JSBuilder_write_unsigned_field(&builder, "line", p->line);
+            JSBuilder_write_unsigned_field(&setBreakpoints_response_builder, "line", p->line);
             if (p->column)
-              JSBuilder_write_unsigned_field(&builder, "column", p->column);
+              JSBuilder_write_unsigned_field(&setBreakpoints_response_builder, "column", p->column);
           }
-          JSBuilder_object_end(&builder);
+          JSBuilder_object_end(&setBreakpoints_response_builder);
         }
       }
-      JSBuilder_array_end(&builder); // breakpoints
+      JSBuilder_array_end(&setBreakpoints_response_builder); // breakpoints
     }
-    JSBuilder_object_end(&builder); // body
+    JSBuilder_object_end(&setBreakpoints_response_builder); // body
   }
-  JSBuilder_send_and_destroy_response(&builder);
 
   SourceBreakpointVector_destroy(&in_breakpoints);
   return true;
@@ -1745,6 +1744,7 @@ static bool request_setExceptionBreakpoints(const JSObject* request) {
   //  if (p->kind == JS_STRING)
   //    TODO: set exception breakpoint in the debugger with p->u.s filter.
 
+  JSBuilder_send_and_destroy_response(&setBreakpoints_response_builder);
   respond_to_request(request, NULL);
   return true;
 }
