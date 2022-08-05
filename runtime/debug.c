@@ -753,7 +753,6 @@ static void JSBuilder_write_bool_field(JSBuilder* builder, const char* name, boo
 static inline void JSBuilder_structure_begin(JSBuilder* builder, char brace) {
   JSBuilder_append_char(builder, brace);
   JSBuilder_indent(builder);
-
 }
 static inline void JSBuilder_structure_end(JSBuilder* builder, char brace) {
   JSBuilder_unindent(builder);
@@ -771,6 +770,20 @@ static void JSBuilder_array_begin(JSBuilder* builder) {
 }
 static void JSBuilder_array_end(JSBuilder* builder) {
   JSBuilder_structure_end(builder, ']');
+}
+static void JSBuilder_object_field_begin(JSBuilder* builder, const char* name) {
+  JSBuilder_write_field(builder, name);
+  JSBuilder_object_begin(builder);
+}
+static inline void JSBuilder_object_field_end(JSBuilder* builder) {
+  JSBuilder_object_end(builder);
+}
+static void JSBuilder_array_field_begin(JSBuilder* builder, const char* name) {
+  JSBuilder_write_field(builder, name);
+  JSBuilder_array_begin(builder);
+}
+static inline void JSBuilder_array_field_end(JSBuilder* builder) {
+  JSBuilder_array_end(builder);
 }
 
 static void JSBuilder_send_and_destroy_object(JSBuilder* builder) {
@@ -799,8 +812,7 @@ static void send_simple_event(const char* name) {
 
 static void JSBuilder_initialize_event(JSBuilder* builder, const char* name) {
   JSBuilder_initialize_simple_event(builder, name);
-  JSBuilder_write_field(builder, "body");
-  JSBuilder_object_begin(builder);
+  JSBuilder_object_field_begin(builder, "body");
 }
 static void JSBuilder_send_and_destroy_event(JSBuilder* builder) {
   JSBuilder_object_end(builder); // body
@@ -1358,10 +1370,11 @@ static bool request_initialize(const JSObject* request) {
   // TODO: initialize debugger here.
   JSBuilder builder;
   JSBuilder_initialize_response(&builder, request, NULL);
-  JSBuilder_write_field(&builder, "body");
-  JSBuilder_object_begin(&builder);
-  define_capabilities(&builder);
-  JSBuilder_object_end(&builder); // body
+  JSBuilder_object_field_begin(&builder, "body");
+  {
+    define_capabilities(&builder);
+  }
+  JSBuilder_object_field_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
   return true;
 }
@@ -1661,11 +1674,9 @@ static bool request_setBreakpoints(const JSObject* request) {
   JSBuilder builder;
   JSBuilder_initialize_response(&builder, request, NULL);
   if (path) {
-    JSBuilder_write_field(&builder, "body");
-    JSBuilder_object_begin(&builder);
+    JSBuilder_object_field_begin(&builder, "body");
     {
-      JSBuilder_write_field(&builder, "breakpoints");
-      JSBuilder_array_begin(&builder);
+      JSBuilder_array_field_begin(&builder, "breakpoints");
       {
         // TODO: Replace in_breakpoints with out_breakpoints here.
         for (const SourceBreakpoint *p = in_breakpoints.data, *const limit = p + in_breakpoints.length; p < limit; p++) {
@@ -1679,9 +1690,9 @@ static bool request_setBreakpoints(const JSObject* request) {
           JSBuilder_object_end(&builder);
         }
       }
-      JSBuilder_array_end(&builder); // breakpoints
+      JSBuilder_array_field_end(&builder); // breakpoints
     }
-    JSBuilder_object_end(&builder); // body
+    JSBuilder_object_field_end(&builder); // body
   }
   JSBuilder_send_and_destroy_response(&builder);
 
@@ -1786,14 +1797,12 @@ static bool request_setExceptionBreakpoints(const JSObject* request) {
 // }
 static bool request_threads(const JSObject* request) {
   JSBuilder builder;
-  // TODO: If no active stack exists, pass an error message instaed of NULL here.
+  // TODO: If no active stack exists, pass an error message instead of NULL here.
   JSBuilder_initialize_response(&builder, request, NULL);
-  JSBuilder_write_field(&builder, "body");
-  JSBuilder_object_begin(&builder);
+  JSBuilder_object_field_begin(&builder, "body");
   {
     // TODO: Should we list coroutines here?
-    JSBuilder_write_field(&builder, "threads");
-    JSBuilder_array_begin(&builder);
+    JSBuilder_array_field_begin(&builder, "threads");
     {
       JSBuilder_next(&builder);
       JSBuilder_object_begin(&builder);
@@ -1803,10 +1812,158 @@ static bool request_threads(const JSObject* request) {
       }
       JSBuilder_object_end(&builder); // an individual thread
     }
-    JSBuilder_array_end(&builder); // threads
+    JSBuilder_array_field_end(&builder); // threads
   }
   JSBuilder_object_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
+  return true;
+}
+
+// "StackTraceRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "StackTrace request; value of command field is
+//     'stackTrace'. The request returns a stacktrace from the current execution
+//     state.", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "stackTrace" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/StackTraceArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "StackTraceArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'stackTrace' request.",
+//   "properties": {
+//     "threadId": {
+//       "type": "integer",
+//       "description": "Retrieve the stacktrace for this thread."
+//     },
+//     "startFrame": {
+//       "type": "integer",
+//       "description": "The index of the first frame to return; if omitted
+//       frames start at 0."
+//     },
+//     "levels": {
+//       "type": "integer",
+//       "description": "The maximum number of frames to return. If levels is
+//       not specified or 0, all frames are returned."
+//     },
+//     "format": {
+//       "$ref": "#/definitions/StackFrameFormat",
+//       "description": "Specifies details on how to format the stack frames."
+//     }
+//  },
+//   "required": [ "threadId" ]
+// },
+// "StackTraceResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'stackTrace' request.",
+//     "properties": {
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "stackFrames": {
+//             "type": "array",
+//             "items": {
+//               "$ref": "#/definitions/StackFrame"
+//             },
+//             "description": "The frames of the stackframe. If the array has
+//             length zero, there are no stackframes available. This means that
+//             there is no location information available."
+//           },
+//           "totalFrames": {
+//             "type": "integer",
+//             "description": "The total number of frames available."
+//           }
+//         },
+//         "required": [ "stackFrames" ]
+//       }
+//     },
+//     "required": [ "body" ]
+//   }]
+// }
+
+enum { INVALID_THREAD_ID = -1 };
+
+typedef struct {
+  uint64_t id;  // Unique id that combines thread/coroutine id and frame id in the stack (i.e. offset from the bottom).
+  const char* source_path;    // Referenced here, owned by debugger
+  const char* function_name;  // Referenced here, owned by debugger
+  int64_t line;   // 1-based
+  int64_t column; // 1-based, 0 denotes unknown
+} StackTraceFrame;
+typedef struct {
+  ssize_t length;
+  ssize_t capacity;
+  StackTraceFrame* data;
+} StackTrace;
+static void StackTrace_initialize(StackTrace* st) {
+  st->length = 0;
+  st->capacity = 16; // Initial stack trace size
+  st->data = malloc(st->capacity * sizeof(StackTraceFrame));
+  //TODO: handle possible OOME
+}
+static inline void StackTrace_destroy(StackTrace* st) {
+  free(st->data);
+}
+static StackTraceFrame* StackTrace_allocate(StackTrace* st) {
+  if (st->length == st->capacity) {
+    st->capacity <<= 1;
+    st->data = realloc(st->data, st->capacity * sizeof(StackTraceFrame));
+    //TODO: handle possible OOM
+  }
+  return st->data + st->length++;
+}
+// Create stack trace for given thread_id starting at start level with no more than max_frames frames.
+// Frames not visible to the debugger can be skipped.
+// Returns total number of frames in thread_id stack or -1 when no thread with given therad_id thread_is found.
+static int64_t create_stack_trace(StackTrace* st, int64_t thread_id, int64_t start, int64_t max_frames) {
+  // TODO: Imlement this function in debugger core.
+  return 0;
+}
+bool request_stackTrace(const JSObject* request) {
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // Stanza implementatin is single-threaded. Interpret thread_id as coroutine_id?
+  const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+  const int64_t start_frame = JSObject_get_integer_field(arguments, "startFrame", 0);
+  const int64_t max_frames = JSObject_get_integer_field(arguments, "levels", INT64_MAX);
+
+  StackTrace st;
+  StackTrace_initialize(&st);
+  const int64_t total_frames = create_stack_trace(&st, thread_id, start_frame, max_frames);
+
+  JSBuilder builder;
+  JSBuilder_initialize_response(&builder, request, NULL);
+  JSBuilder_object_field_begin(&builder, "body");
+  if (total_frames >= 0) {
+    JSBuilder_write_unsigned_field(&builder, "totalFrames", total_frames);
+    JSBuilder_array_field_begin(&builder, "stackFrames");
+    for (const StackTraceFrame *p = st.data, *const limit = p + st.length; p < limit; p++) {
+      JSBuilder_next(&builder);
+      JSBuilder_object_begin(&builder);
+      {
+        JSBuilder_write_unsigned_field(&builder, "id", p->id);
+        JSBuilder_write_string_field(&builder, "name", p->function_name);
+        JSBuilder_write_string_field(&builder, "source", p->source_path);
+        JSBuilder_write_unsigned_field(&builder, "line", p->line);
+        if (p->column)
+          JSBuilder_write_unsigned_field(&builder, "column", p->column);
+      }
+      JSBuilder_object_end(&builder);
+    }
+    JSBuilder_array_field_end(&builder); // stackFrames
+  }
+  JSBuilder_object_field_end(&builder); // body
+  JSBuilder_send_and_destroy_response(&builder);
+
+  StackTrace_destroy(&st);
   return true;
 }
 
@@ -1815,6 +1972,7 @@ static bool request_threads(const JSObject* request) {
   def(launch)                 \
   def(setBreakpoints)         \
   def(setExceptionBreakpoints)\
+  def(stackTrace)             \
   def(threads)
 
 static const char* const request_names[] = {
