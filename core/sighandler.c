@@ -1,3 +1,9 @@
+//Platform-specific defines.
+#if defined(PLATFORM_LINUX)
+  //Needs to be defined to access REG_RIP.
+  #define _GNU_SOURCE
+#endif
+
 #include<ucontext.h>
 #include<signal.h>
 #include<stdint.h>
@@ -77,11 +83,8 @@ typedef struct{
 } Stack;
 
 //============================================================
+//============= Saved Signal Handler Context =================
 //============================================================
-//============================================================
-
-extern uint64_t stanza_saved_c_rsp;
-extern uint64_t stanza_stack_pointer;
 
 //Saved context for the sigaction_handler.
 struct sigaction_context{
@@ -91,6 +94,151 @@ struct sigaction_context{
   uint64_t regs[15];
   uint64_t fregs[16];
 };
+
+//------------------------------------------------------------
+//----------------- OS-X Implementation ----------------------
+//------------------------------------------------------------
+
+#if defined(PLATFORM_OS_X)
+
+//Helper: Retrieve the low 64 bits of the given xmm register.
+uint64_t xmm_low_bits (struct __darwin_xmm_reg* xmm){
+  uint64_t* p = (uint64_t*)xmm;
+  return p[1];
+}
+
+//Save the contents of 'context' to the location 'save_context'.
+void save_sigaction_context (struct sigaction_context* save_context,
+                             void* input_context,
+                             uint64_t stanza_crsp){
+  ucontext_t* context = (ucontext_t*)input_context;
+
+  save_context->rip = context->uc_mcontext->__ss.__rip;
+  save_context->rsp = context->uc_mcontext->__ss.__rsp;
+  save_context->crsp = stanza_crsp;
+  save_context->regs[0] = context->uc_mcontext->__ss.__rax;
+  save_context->regs[1] = context->uc_mcontext->__ss.__rbx;
+  save_context->regs[2] = context->uc_mcontext->__ss.__rcx;
+  save_context->regs[3] = context->uc_mcontext->__ss.__rdx;
+  save_context->regs[4] = context->uc_mcontext->__ss.__rsi;
+  save_context->regs[5] = context->uc_mcontext->__ss.__rdi;
+  save_context->regs[6] = context->uc_mcontext->__ss.__rbp;
+  save_context->regs[7] = context->uc_mcontext->__ss.__r8;
+  save_context->regs[8] = context->uc_mcontext->__ss.__r9;
+  save_context->regs[9] = context->uc_mcontext->__ss.__r10;
+  save_context->regs[10] = context->uc_mcontext->__ss.__r11;
+  save_context->regs[11] = context->uc_mcontext->__ss.__r12;
+  save_context->regs[12] = context->uc_mcontext->__ss.__r13;
+  save_context->regs[13] = context->uc_mcontext->__ss.__r14;
+  save_context->regs[14] = context->uc_mcontext->__ss.__r15;
+  save_context->fregs[0] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm0);
+  save_context->fregs[1] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm1);
+  save_context->fregs[2] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm2);
+  save_context->fregs[3] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm3);
+  save_context->fregs[4] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm4);
+  save_context->fregs[5] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm5);
+  save_context->fregs[6] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm6);
+  save_context->fregs[7] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm7);
+  save_context->fregs[8] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm8);
+  save_context->fregs[9] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm9);
+  save_context->fregs[10] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm10);
+  save_context->fregs[11] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm11);
+  save_context->fregs[12] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm12);
+  save_context->fregs[13] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm13);
+  save_context->fregs[14] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm14);
+  save_context->fregs[15] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm15);  
+}
+
+//Write the given attributes to the processor context.
+void load_sigaction_context (void* input_context,
+                             uint64_t stack_pointer,
+                             uint64_t arg0,
+                             uint64_t arg1,
+                             uint64_t instruction_pointer){
+  ucontext_t* context = (ucontext_t*)input_context;
+  context->uc_mcontext->__ss.__rsp = stack_pointer;
+  context->uc_mcontext->__ss.__rcx = arg0;
+  context->uc_mcontext->__ss.__rdx = arg1;
+  context->uc_mcontext->__ss.__rip = instruction_pointer;
+}
+
+//------------------------------------------------------------
+//----------------- Linux Implementation ---------------------
+//------------------------------------------------------------
+
+#elif defined(PLATFORM_LINUX)
+
+//Helper: Retrieve the low 64 bits of the given xmm register.
+uint64_t xmm_low_bits (struct _libc_xmmreg* xmm){
+  uint64_t* p = (uint64_t*)xmm;
+  return p[1];
+}
+
+//Save the contents of 'context' to the location 'save_context'.
+void save_sigaction_context (struct sigaction_context* save_context,
+                             void* input_context,
+                             uint64_t stanza_crsp){
+  ucontext_t* context = (ucontext_t*)input_context;
+
+  save_context->rip = context->uc_mcontext.gregs[REG_RIP];
+  save_context->rsp = context->uc_mcontext.gregs[REG_RSP];
+  save_context->crsp = stanza_crsp;
+  save_context->regs[0] = context->uc_mcontext.gregs[REG_RAX];
+  save_context->regs[1] = context->uc_mcontext.gregs[REG_RBX];
+  save_context->regs[2] = context->uc_mcontext.gregs[REG_RCX];
+  save_context->regs[3] = context->uc_mcontext.gregs[REG_RDX];
+  save_context->regs[4] = context->uc_mcontext.gregs[REG_RSI];
+  save_context->regs[5] = context->uc_mcontext.gregs[REG_RDI];
+  save_context->regs[6] = context->uc_mcontext.gregs[REG_RBP];
+  save_context->regs[7] = context->uc_mcontext.gregs[REG_R8];
+  save_context->regs[8] = context->uc_mcontext.gregs[REG_R9];
+  save_context->regs[9] = context->uc_mcontext.gregs[REG_R10];
+  save_context->regs[10] = context->uc_mcontext.gregs[REG_R11];
+  save_context->regs[11] = context->uc_mcontext.gregs[REG_R12];
+  save_context->regs[12] = context->uc_mcontext.gregs[REG_R13];
+  save_context->regs[13] = context->uc_mcontext.gregs[REG_R14];
+  save_context->regs[14] = context->uc_mcontext.gregs[REG_R15];
+  save_context->fregs[0] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[0]);
+  save_context->fregs[1] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[1]);
+  save_context->fregs[2] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[2]);
+  save_context->fregs[3] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[3]);
+  save_context->fregs[4] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[4]);
+  save_context->fregs[5] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[5]);
+  save_context->fregs[6] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[6]);
+  save_context->fregs[7] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[7]);
+  save_context->fregs[8] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[8]);
+  save_context->fregs[9] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[9]);
+  save_context->fregs[10] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[10]);
+  save_context->fregs[11] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[11]);
+  save_context->fregs[12] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[12]);
+  save_context->fregs[13] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[13]);
+  save_context->fregs[14] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[14]);
+  save_context->fregs[15] = xmm_low_bits(&context->uc_mcontext.fpregs->_xmm[15]);
+}
+
+//Write the given attributes to the processor context.
+void load_sigaction_context (void* input_context,
+                             uint64_t stack_pointer,
+                             uint64_t arg0,
+                             uint64_t arg1,
+                             uint64_t instruction_pointer){
+  ucontext_t* context = (ucontext_t*)input_context;
+  context->uc_mcontext.gregs[REG_RSP] = stack_pointer;
+  context->uc_mcontext.gregs[REG_RCX] = arg0;
+  context->uc_mcontext.gregs[REG_RDX] = arg1;
+  context->uc_mcontext.gregs[REG_RIP] = instruction_pointer;
+}
+
+#endif
+
+//============================================================
+//============================================================
+//============================================================
+
+extern uint64_t stanza_saved_c_rsp;
+extern uint64_t stanza_stack_pointer;
+
+//Global Stanza label where signal handler context is saved.
 extern struct sigaction_context stanza_sighandler_context;
 
 //Trampoline code for restoring execution context from
@@ -105,58 +253,14 @@ void* untag_ref (uint64_t ref){
   return (void*)(ref - 1 + 8);
 }
 
-uint64_t xmm_low_bits (struct __darwin_xmm_reg* xmm){
-  uint64_t* p = (uint64_t*)xmm;
-  return p[1];
-}
-
 //1) Set Stanza saved_c_rsp to point to Stanza signal handling stack.
 //2) Set RSP to top of Stanza's currently active stack.
 //3) Retrieve the current signal_handler and jump to it using the Stanza calling convention.
 void signal_handler (int signal, siginfo_t* info, void* input_context){
-  ucontext_t* context = (ucontext_t*)input_context;
-
-  //Save the signal handler
-  stanza_sighandler_context.rip = context->uc_mcontext->__ss.__rip;
-  stanza_sighandler_context.rsp = context->uc_mcontext->__ss.__rsp;
-  stanza_sighandler_context.crsp = stanza_saved_c_rsp;
-  stanza_sighandler_context.regs[0] = context->uc_mcontext->__ss.__rax;
-  stanza_sighandler_context.regs[1] = context->uc_mcontext->__ss.__rbx;
-  stanza_sighandler_context.regs[2] = context->uc_mcontext->__ss.__rcx;
-  stanza_sighandler_context.regs[3] = context->uc_mcontext->__ss.__rdx;
-  stanza_sighandler_context.regs[4] = context->uc_mcontext->__ss.__rsi;
-  stanza_sighandler_context.regs[5] = context->uc_mcontext->__ss.__rdi;
-  stanza_sighandler_context.regs[6] = context->uc_mcontext->__ss.__rbp;
-  stanza_sighandler_context.regs[7] = context->uc_mcontext->__ss.__r8;
-  stanza_sighandler_context.regs[8] = context->uc_mcontext->__ss.__r9;
-  stanza_sighandler_context.regs[9] = context->uc_mcontext->__ss.__r10;
-  stanza_sighandler_context.regs[10] = context->uc_mcontext->__ss.__r11;
-  stanza_sighandler_context.regs[11] = context->uc_mcontext->__ss.__r12;
-  stanza_sighandler_context.regs[12] = context->uc_mcontext->__ss.__r13;
-  stanza_sighandler_context.regs[13] = context->uc_mcontext->__ss.__r14;
-  stanza_sighandler_context.regs[14] = context->uc_mcontext->__ss.__r15;
-  stanza_sighandler_context.fregs[0] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm0);
-  stanza_sighandler_context.fregs[1] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm1);
-  stanza_sighandler_context.fregs[2] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm2);
-  stanza_sighandler_context.fregs[3] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm3);
-  stanza_sighandler_context.fregs[4] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm4);
-  stanza_sighandler_context.fregs[5] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm5);
-  stanza_sighandler_context.fregs[6] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm6);
-  stanza_sighandler_context.fregs[7] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm7);
-  stanza_sighandler_context.fregs[8] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm8);
-  stanza_sighandler_context.fregs[9] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm9);
-  stanza_sighandler_context.fregs[10] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm10);
-  stanza_sighandler_context.fregs[11] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm11);
-  stanza_sighandler_context.fregs[12] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm12);
-  stanza_sighandler_context.fregs[13] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm13);
-  stanza_sighandler_context.fregs[14] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm14);
-  stanza_sighandler_context.fregs[15] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm15);
-
-  //Set RSP to top of Stanza's currently active stack.
-  context->uc_mcontext->__ss.__rsp = stanza_stack_pointer;
-
+  save_sigaction_context(&stanza_sighandler_context, input_context, stanza_saved_c_rsp);
+  
   //Set the return address to be the restore_sighandler_trampoline.
-  *((uint64_t*)stanza_stack_pointer) = (uint64_t)stanza_sighandler_trampoline;
+  *((uint64_t*)stanza_stack_pointer) = (uint64_t)stanza_sighandler_trampoline;  
 
   //Set CRSP to point to signal handling stack.  
   stanza_saved_c_rsp = stanza_sighandler_trampoline_stack;
@@ -165,14 +269,16 @@ void signal_handler (int signal, siginfo_t* info, void* input_context){
   uint64_t closure_ref = stanza_vmstate.signal_handler;
   Function* sighandler = untag_ref(closure_ref);
 
-  //Write the arguments to the closure call.
-  //Arg0 (RCX) = closure
-  //Arg1 (RDX) = num arguments = 0
-  context->uc_mcontext->__ss.__rcx = closure_ref;
-  context->uc_mcontext->__ss.__rdx = 0;
-  
-  //Jump to the closure starting address.
-  context->uc_mcontext->__ss.__rip = sighandler->code;  
+  //Load the context for execution:
+  //- Set RSP to top of Stanza's currently active stack.
+  //- Set Arg0 to closure.
+  //- Set Arg1 to 0 (num arguments to closure).
+  //- Set instruction pointer to closure starting address.
+  load_sigaction_context(input_context,
+                         stanza_stack_pointer,
+                         closure_ref,
+                         0,
+                         sighandler->code);
 }
 
 void install_stanza_signal_interceptor () {
