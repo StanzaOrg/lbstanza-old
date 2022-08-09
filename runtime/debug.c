@@ -1889,7 +1889,6 @@ static bool request_threads(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
-
 enum { INVALID_THREAD_ID = -1 };
 
 typedef struct {
@@ -1928,7 +1927,7 @@ static int64_t create_stack_trace(StackTrace* st, int64_t thread_id, int64_t sta
   // TODO: Imlement this function in debugger core.
   return 0;
 }
-bool request_stackTrace(const JSObject* request) {
+static bool request_stackTrace(const JSObject* request) {
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // Stanza implementatin is single-threaded. Interpret thread_id as coroutine_id?
   const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
@@ -1967,7 +1966,83 @@ bool request_stackTrace(const JSObject* request) {
   return true;
 }
 
+// "ContinueRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Continue request; value of command field is 'continue'.
+//                     The request starts the debuggee to run again.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "continue" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/ContinueArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "ContinueArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'continue' request.",
+//   "properties": {
+//     "threadId": {
+//       "type": "integer",
+//       "description": "Continue execution for the specified thread (if
+//                       possible). If the backend cannot continue on a single
+//                       thread but will continue on all threads, it should
+//                       set the allThreadsContinued attribute in the response
+//                       to true."
+//     }
+//   },
+//   "required": [ "threadId" ]
+// },
+// "ContinueResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'continue' request.",
+//     "properties": {
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "allThreadsContinued": {
+//             "type": "boolean",
+//             "description": "If true, the continue request has ignored the
+//                             specified thread and continued all threads
+//                             instead. If this attribute is missing a value
+//                             of 'true' is assumed for backward
+//                             compatibility."
+//           }
+//         }
+//       }
+//     },
+//     "required": [ "body" ]
+//   }]
+// }
+static bool request_continue(const JSObject* request) {
+  // TODO: Do we really need this?
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+  // Remember the thread ID that caused the resume so we can set the
+  // "threadCausedFocus" boolean value in the "stopped" events.
+  // g_vsc.focus_tid = GetUnsigned(arguments, "threadId", LLDB_INVALID_THREAD_ID);
+
+  // TODO: Continue the execution.
+
+  JSBuilder builder;
+  JSBuilder_initialize_response(&builder, request, NULL);
+  JSBuilder_object_field_begin(&builder, "body");
+  {
+    JSBuilder_write_bool_field(&builder, "allThreadsContinued", true);
+  }
+  JSBuilder_object_field_end(&builder); // body
+  JSBuilder_send_and_destroy_response(&builder);
+  return true;
+}
+
 #define FOR_EACH_REQUEST(def) \
+  def(continue)               \
   def(initialize)             \
   def(launch)                 \
   def(setBreakpoints)         \
