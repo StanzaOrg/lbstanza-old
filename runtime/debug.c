@@ -2041,10 +2041,57 @@ static bool request_continue(const JSObject* request) {
   return true;
 }
 
+// "PauseRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Pause request; value of command field is 'pause'. The
+//     request suspenses the debuggee. The debug adapter first sends the
+//     PauseResponse and then a StoppedEvent (event type 'pause') after the
+//     thread has been paused successfully.", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "pause" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/PauseArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "PauseArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'pause' request.",
+//   "properties": {
+//     "threadId": {
+//       "type": "integer",
+//       "description": "Pause execution for this thread."
+//     }
+//   },
+//   "required": [ "threadId" ]
+// },
+// "PauseResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'pause' request. This is just an
+//     acknowledgement, so no body field is required."
+//   }]
+// }
+static bool request_pause(const JSObject* request) {
+  // TODO: Do we really need this?
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+
+  // TODO: Pause the execution at nearest breakpoint location.
+  respond_to_request(request, NULL);
+  return true;
+}
+
 #define FOR_EACH_REQUEST(def) \
   def(continue)               \
   def(initialize)             \
   def(launch)                 \
+  def(pause)                  \
   def(setBreakpoints)         \
   def(setExceptionBreakpoints)\
   def(stackTrace)             \
