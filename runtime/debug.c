@@ -1041,20 +1041,21 @@ static inline void send_process_launched(void) {
 // 'verified' means the breakpoint can be set, though its location can be different from the desired.
 // If 'file' == null the breakpoint source location is omitted.
 // If 'path' == null the source path is omitted.
-// If 'line' is negative it is omitted.
-static void JSBuilder_write_breakpoint(JSBuilder* builder, int id, bool verified, const char* file, const char* path, int line) {
+// If 'line' is zero it is omitted.
+static void JSBuilder_write_breakpoint(JSBuilder* builder, int id, bool verified, const char* path, unsigned line, unsigned column) {
   JSBuilder_object_begin(builder);
   JSBuilder_write_unsigned_field(builder, "id", id);
   JSBuilder_write_bool_field(builder, "verified", verified);
-  if (file) {
+  if (path) {
     JSBuilder_write_field(builder, "source");
     JSBuilder_object_begin(builder);
-    JSBuilder_write_string_field(builder, "name", file);
-    if (path)
-      JSBuilder_write_string_field(builder, "path", path);
+    JSBuilder_write_string_field(builder, "path", path);
+    // TODO: In addition to "path" LLDB sets "name" field to basename(path)
     JSBuilder_object_end(builder);
-    if (line > 0)
+    if (line)
       JSBuilder_write_unsigned_field(builder, "line", line);
+    if (column)
+      JSBuilder_write_unsigned_field(builder, "column", column);
   }
   JSBuilder_object_end(builder);
 }
@@ -1063,7 +1064,7 @@ static void send_breakpoint_changed(int id, bool verified) {
   JSBuilder_initialize_event(&builder, "breakpoint");
   JSBuilder_write_field(&builder, "breakpoint");
   // Emit brief breakpoint info without source location
-  JSBuilder_write_breakpoint(&builder, id, verified, NULL, NULL, -1);
+  JSBuilder_write_breakpoint(&builder, id, verified, NULL, 0, 0);
   JSBuilder_write_raw_string_field(&builder, "reason", "changed");
   JSBuilder_send_and_destroy_event(&builder);
 }
@@ -1644,6 +1645,37 @@ static SourceBreakpoint* SourceBreakpointVector_allocate(SourceBreakpointVector*
   }
   return vector->data + vector->length++;
 }
+
+typedef struct {
+  uint32_t id;
+  unsigned line;    // 1-based
+  unsigned column;  // 1-based, 0 denotes undefined column
+  bool verified;
+} Breakpoint;
+
+typedef struct {
+  ssize_t length;
+  ssize_t capacity;
+  Breakpoint* data;
+} BreakpointVector;
+static void BreakpointVector_initialize(BreakpointVector* vector) {
+  vector->length = 0;
+  vector->capacity = 16; // Initial vector size
+  vector->data = malloc(vector->capacity * sizeof(Breakpoint));
+  //TODO: handle possible OOME
+}
+static inline void BreakpointVector_destroy(BreakpointVector* vector) {
+  free(vector->data);
+}
+static Breakpoint* BreakpointVector_allocate(BreakpointVector* vector) {
+  if (vector->length == vector->capacity) {
+    vector->capacity <<= 1;
+    vector->data = realloc(vector->data, vector->capacity * sizeof(Breakpoint));
+    //TODO: handle possible OOM
+  }
+  return vector->data + vector->length++;
+}
+
 static bool request_setBreakpoints(const JSObject* request) {
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   const JSObject* source = JSObject_get_object_field(arguments, "source");
@@ -1652,6 +1684,10 @@ static bool request_setBreakpoints(const JSObject* request) {
 
   SourceBreakpointVector in_breakpoints;
   SourceBreakpointVector_initialize(&in_breakpoints);
+
+  BreakpointVector out_breakpoints;
+  BreakpointVector_initialize(&out_breakpoints);
+
   if (path) {
     if (breakpoints) {
       // Validate brakpoints and store in in_breakpoints.
@@ -1662,13 +1698,22 @@ static bool request_setBreakpoints(const JSObject* request) {
           const int64_t column = JSObject_get_integer_field(o, "column", 0);
           // TODO: get optional condition, hitCondition and logMessage fields.
           if (line <= 0 || column < 0) continue;
-          SourceBreakpoint* bp = SourceBreakpointVector_allocate(&in_breakpoints);
-          bp->line = line;
-          bp->column = column;
+          SourceBreakpoint* sbp = SourceBreakpointVector_allocate(&in_breakpoints);
+          sbp->line = line;
+          sbp->column = column;
         }
       }
     }
-    // TODO: Pass in_breakponts (in_breakponts->data, in_breakponts->length) and path to the debugger core here.
+    // TODO: Pass in_breakponts (in_breakponts.data, in_breakponts.length), path and &out_breakponts to the debugger core here.
+    // Copy in to out just to fake the effect
+    for (int id = 0, length = in_breakpoints.length; id < length; id++) {
+      const SourceBreakpoint* sbp = in_breakpoints.data + id;
+      Breakpoint* bp = BreakpointVector_allocate(&out_breakpoints);
+      bp->id = id;
+      bp->line = sbp->line;
+      bp->column = sbp->column;
+      bp->verified = false;
+    }
   }
 
   JSBuilder builder;
@@ -1679,15 +1724,9 @@ static bool request_setBreakpoints(const JSObject* request) {
       JSBuilder_array_field_begin(&builder, "breakpoints");
       {
         // TODO: Replace in_breakpoints with out_breakpoints here.
-        for (const SourceBreakpoint *p = in_breakpoints.data, *const limit = p + in_breakpoints.length; p < limit; p++) {
+        for (const Breakpoint *p = out_breakpoints.data, *const limit = p + out_breakpoints.length; p < limit; p++) {
           JSBuilder_next(&builder);
-          JSBuilder_object_begin(&builder);
-          {
-            JSBuilder_write_unsigned_field(&builder, "line", p->line);
-            if (p->column)
-              JSBuilder_write_unsigned_field(&builder, "column", p->column);
-          }
-          JSBuilder_object_end(&builder);
+          JSBuilder_write_breakpoint(&builder, p->id, p->verified, path, p->line, p->column);
         }
       }
       JSBuilder_array_field_end(&builder); // breakpoints
