@@ -411,7 +411,7 @@ static int64_t JSObject_get_integer_field(const JSObject* object, const char* na
   const JSField* field = JSObject_get_field(object, name, JS_INTEGER);
   return field ? field->value.u.i : default_value;
 }
-static int64_t JSObject_get_boolean_field(const JSObject* object, const char* name, bool default_value) {
+static int64_t JSObject_get_bool_field(const JSObject* object, const char* name, bool default_value) {
   const JSField* field = JSObject_get_field(object, name, JS_BOOLEAN);
   return field ? field->value.u.b : default_value;
 }
@@ -1437,7 +1437,7 @@ static inline const char* launch_program(const JSObject* request_arguments) {
   const char* cwd = JSObject_get_string_field(request_arguments, "cwd");
   if (cwd && chdir(cwd)) return current_error();
 
-  const bool stop_at_entry = JSObject_get_boolean_field(request_arguments, "stopOnEntry", false);
+  const bool stop_at_entry = JSObject_get_bool_field(request_arguments, "stopOnEntry", false);
   // O.P.: Do we need this?
   // const bool runInTerminal = JSObject_get_boolean_field(request_arguments, "runInTerminal", false);
 
@@ -2087,8 +2087,116 @@ static bool request_pause(const JSObject* request) {
   return true;
 }
 
+// "DisconnectRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Disconnect request; value of command field is
+//                     'disconnect'.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "disconnect" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/DisconnectArguments"
+//       }
+//     },
+//     "required": [ "command" ]
+//   }]
+// },
+// "DisconnectArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'disconnect' request.",
+//   "properties": {
+//     "terminateDebuggee": {
+//       "type": "boolean",
+//       "description": "Indicates whether the debuggee should be terminated
+//                       when the debugger is disconnected. If unspecified,
+//                       the debug adapter is free to do whatever it thinks
+//                       is best. A client can only rely on this attribute
+//                       being properly honored if a debug adapter returns
+//                       true for the 'supportTerminateDebuggee' capability."
+//     },
+//     "restart": {
+//       "type": "boolean",
+//       "description": "Indicates whether the debuggee should be restart
+//                       the process."
+//     }
+//   }
+// },
+// "DisconnectResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'disconnect' request. This is just an
+//                     acknowledgement, so no body field is required."
+//   }]
+// }
+#if 0
+void request_disconnect(const llvm::json::Object &request) {
+  llvm::json::Object response;
+  FillResponse(request, response);
+  auto arguments = request.getObject("arguments");
+
+  bool defaultTerminateDebuggee = g_vsc.is_attach ? false : true;
+  bool terminateDebuggee =
+      GetBoolean(arguments, "terminateDebuggee", defaultTerminateDebuggee);
+  lldb::SBProcess process = g_vsc.target.GetProcess();
+  auto state = process.GetState();
+  switch (state) {
+  case lldb::eStateInvalid:
+  case lldb::eStateUnloaded:
+  case lldb::eStateDetached:
+  case lldb::eStateExited:
+    break;
+  case lldb::eStateConnected:
+  case lldb::eStateAttaching:
+  case lldb::eStateLaunching:
+  case lldb::eStateStepping:
+  case lldb::eStateCrashed:
+  case lldb::eStateSuspended:
+  case lldb::eStateStopped:
+  case lldb::eStateRunning:
+    g_vsc.debugger.SetAsync(false);
+    lldb::SBError error = terminateDebuggee ? process.Kill() : process.Detach();
+    if (!error.Success())
+      response.try_emplace("error", error.GetCString());
+    g_vsc.debugger.SetAsync(true);
+    break;
+  }
+  SendTerminatedEvent();
+  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
+  if (g_vsc.event_thread.joinable()) {
+    g_vsc.broadcaster.BroadcastEventByType(eBroadcastBitStopEventThread);
+    g_vsc.event_thread.join();
+  }
+  if (g_vsc.progress_event_thread.joinable()) {
+    g_vsc.broadcaster.BroadcastEventByType(eBroadcastBitStopProgressThread);
+    g_vsc.progress_event_thread.join();
+  }
+}
+#endif
+static bool request_disconnect(const JSObject* request) {
+  // TODO: Do we really need this?
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // const bool terminate_debugee = JSObject_get_bool_field(arguments, "terminateDebugee", true);
+  // const bool restert = JSObject_get_bool_field(arguments, "restart", false);
+
+  // TDOD: Terminate the program, in case of failure set 'error' to error message.
+  const char* error = NULL;
+
+  JSBuilder builder;
+  JSBuilder_initialize_response(&builder, request, NULL);
+  if (error)
+    JSBuilder_write_string_field(&builder, "error", error);
+  JSBuilder_send_and_destroy_response(&builder);
+
+  if (!error) send_terminated();
+  return true;
+}
+
 #define FOR_EACH_REQUEST(def) \
   def(continue)               \
+  def(disconnect)             \
   def(initialize)             \
   def(launch)                 \
   def(pause)                  \
