@@ -94,41 +94,6 @@ static inline void free_path(const char* s) {
   free((char*)s);
 }
 
-// Check if i'th argument is followed by a value. The value must not start with "--".
-static inline bool has_arg_value(int i, const int argc, char* const argv[]) {
-  if (++i >= argc) return false;
-  const char* s = argv[i];
-  if (s[0] == '-' && s[1] == '-') return false;
-  return true;
-}
-
-// Report an error if i'th argument is not followed by a value. The value must not start with "--".
-static inline void expect_arg_value(int i, const int argc, char* const argv[]) {
-  if (!has_arg_value(i, argc, argv)) {
-    fprintf(stderr, "Argument %s must be followed by a value\n", argv[i]);
-    exit(EXIT_FAILURE);
-  }
-}
-
-// Search argv backwards for the option starting with --name.
-// Return the index of the option or 0 if the option is not found.
-// Note: argv[0] is the program path.
-static inline int find_last_arg(const char* name, int argc, char* const argv[]) {
-  while (--argc > 0) {
-    const char* s = argv[argc];
-    if (s[0] == '-' && s[1] == '-' && strcmp(s+2, name) == 0)
-      break;
-  }
-  return argc;
-}
-
-// Search for the arg by name. Verify that it is followed by a value.
-static int find_last_arg_with_value(const char* name, int argc, char* const argv[]) {
-  const int i = find_last_arg(name, argc, argv);
-  if (i) expect_arg_value(i, argc, argv);
-  return i;
-}
-
 // I/O interface and its implementation over files and sockets.
 // Note: I am not sure why is this necessary in LLDB.
 static ssize_t (*debug_adapter_read) (char* data, ssize_t length);
@@ -2289,15 +2254,49 @@ static inline bool parse_request(JSValue* value, const char* data, ssize_t lengt
   return false;
 }
 
+static char* get_arg_value(int argc, char* argv[]) {
+  if (argc) {
+    char* value = *argv;
+    if (value[0] != '-' && value[1] != '-')
+      return value;
+  }
+  fprintf(stderr, "Command-line parameter %s must be followed by a value\n", argv[0]);
+  exit(EXIT_FAILURE);
+  return NULL;
+}
 
-int main(int argc, char* argv[]) {
+int main(int argc, char** argv) {
   // Set line buffering mode to stdout and stderr
   setvbuf(stdout, NULL, _IONBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
 
   // Allocate and compute absolute path to the adapter
   debug_adapter_path = get_absolute_path(argv[0]);
+  --argc; ++argv; // Remove adapter from the args
 
+  const char* log_path = NULL;
+  char* port_arg = NULL;
+
+  while (argc > 0) {
+    const char* arg = *argv;
+    if (*arg++ == '-' && *arg++ == '-') {
+      if (!strcmp(arg, "log")) {
+        --argc; ++argv;
+        log_path = get_arg_value(argc, argv);
+        --argc; ++argv;
+        continue;
+      }
+      if (!strcmp(arg, "port")) {
+        --argc; ++argv;
+        port_arg = get_arg_value(argc, argv);
+        --argc; ++argv;
+        continue;
+      }
+    }
+    break;
+  }
+
+#if 0 // Unused
   int launch_target_pos = find_last_arg_with_value("launch-target", argc, argv);
   if (launch_target_pos) {
     const int comm_file_pos = find_last_arg_with_value("comm-file", launch_target_pos, argv);
@@ -2312,9 +2311,15 @@ int main(int argc, char* argv[]) {
     launch_target_in_terminal(comm_path, launch_target_argc, launch_target_argv);
   }
 
-  const int log_pos = find_last_arg_with_value("log", argc, argv);
-  if (log_pos) {
-    const char* log_path = argv[log_pos + 1];
+#ifndef PLATFORM_WINDOWS
+  if (find_last_arg("wait-for-debugger", argc, argv)) {
+    printf("Paused waiting for debugger to attach (pid = %i)...\n", getpid());
+    pause();
+  }
+#endif
+#endif
+
+  if (log_path) {
     debug_adapter_log = fopen(log_path, "wt");
     if (!debug_adapter_log) {
       fprintf(stderr, "error opening log file \"%s\" (%s)\n", log_path, current_error());
@@ -2330,16 +2335,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
-#ifndef PLATFORM_WINDOWS
-  if (find_last_arg("wait-for-debugger", argc, argv)) {
-    printf("Paused waiting for debugger to attach (pid = %i)...\n", getpid());
-    pause();
-  }
-#endif
-
-  const int port_pos = find_last_arg_with_value("port", argc, argv);
-  if (port_pos) {
-    const char* port_arg = argv[port_pos + 1];
+  if (port_arg) {
     char* remainder;
     int port = strtoul(port_arg, &remainder, 0); // Ordinary C notation
     if (*remainder) {
