@@ -1140,21 +1140,18 @@ static const char* redirect_fd(int fd, const OutputType out) {
 #else
   if (pipe(new_fd) == -1) {
 #endif
-    const int error = errno;
-    snprintf(error_buffer, sizeof error_buffer, "Couldn't create new pipe for fd %d. %s", fd, strerror(error));
+    snprintf(error_buffer, sizeof error_buffer, "Couldn't create new pipe for fd %d. %s", fd, current_error());
     return error_buffer;
   }
   if (dup2(new_fd[1], fd) == -1) {
-    const int error = errno;
-    snprintf(error_buffer, sizeof error_buffer, "Couldn't override the fd %d. %s", fd, strerror(error));
+    snprintf(error_buffer, sizeof error_buffer, "Couldn't override the fd %d. %s", fd, current_error());
     return error_buffer;
   }
 
   int args[2] = {new_fd[0], (int)out};
   pthread_t thread;
   if (pthread_create(&thread, NULL, &redirect_output_loop, &args)) {
-    const int error = errno;
-    snprintf(error_buffer, sizeof error_buffer, "Couldn't create the redirect thread for fd %d. %s", fd, strerror(error));
+    snprintf(error_buffer, sizeof error_buffer, "Couldn't create the redirect thread for fd %d. %s", fd, current_error());
     return error_buffer;
   }
   return NULL;
@@ -1171,6 +1168,71 @@ static void redirect_output(FILE* file, const OutputType out) {
 static inline void launch_target_in_terminal(const char* comm_file, const int argc, char* const argv[]) {
   fprintf(stderr, "launch_target_in_terminal is not implemented\n");
   exit(EXIT_FAILURE);
+}
+
+typedef struct DOUBLY_LINKED {
+  struct DOUBLY_LINKED* next;
+  struct DOUBLY_LINKED* prev;
+} DoublyLinked;
+
+typedef struct REQUEST {
+  DoublyLinked link;
+  void (*handle) (const struct REQUEST* req);
+  void (*print) (const struct REQUEST* req);
+  void (*destroy) (struct REQUEST* req);
+} Request;
+
+static DoublyLinked request_queue = {&request_queue, &request_queue};
+static pthread_mutex_t request_queue_lock;
+static inline bool request_queue_not_empty(void) {
+  return request_queue.next != &request_queue;
+}
+static inline void insert_to_request_queue(Request* req) {
+  pthread_mutex_lock(&request_queue_lock);
+
+  DoublyLinked* it = &req->link;
+  DoublyLinked* prev = request_queue.prev;
+  request_queue.prev = it; it->prev = prev;
+  prev->next = it; it->next = &request_queue;
+
+  pthread_mutex_unlock(&request_queue_lock);
+}
+static inline Request* remove_from_request_queue(void) {
+  assert(request_queue_not_empty());
+  pthread_mutex_lock(&request_queue_lock);
+
+  DoublyLinked* it = request_queue.next;
+  DoublyLinked* next = it->next;
+  request_queue.next = next;
+  next->prev = &request_queue;
+
+  pthread_mutex_unlock(&request_queue_lock);
+  return (Request*) it;
+}
+
+// TODO: call handle_pending_debug_requests() from Stanza debugger
+static void handle_pending_debug_requests(void) {
+  while (request_queue_not_empty()) {
+    Request* req = remove_from_request_queue();
+    req->handle(req);
+    req->destroy(req);
+  }
+}
+
+static inline unsigned request_queue_length(void) {
+  int count = 0;
+  for (const DoublyLinked* it = request_queue.next; it != &request_queue; it = it->next)
+    ++count;
+  return count;
+}
+
+// This function is not thread-safe. It is only intended for debuggung.
+static void print_request_queue(void) {
+  log_printf("Request queue (length: %u):\n", request_queue_length());
+  for (const DoublyLinked* it = request_queue.next; it != &request_queue; it = it->next) {
+    const Request* req = (const Request*) it;
+    req->print(req);
+  }
 }
 
 static void JSBuilder_initialize_response(JSBuilder* builder, const JSObject* request, const char* message) {
@@ -1379,11 +1441,12 @@ static bool request_initialize(const JSObject* request) {
 //                     acknowledgement, so no body field is required."
 //   }]
 // }
-static const char* get_string_array(const JSObject* object, const char* name, const char*** out) {
+static const char* get_string_array(const JSObject* object, const char* name, int reserve_at_start, const char*** out) {
   const JSField* field = JSObject_get_field(object, name, JS_ARRAY);
   const int length = field ? field->value.u.a.length : 0;
-  const char** q = (const char**) malloc((length + 1) * sizeof(char*));
+  const char** q = (const char**) malloc((length + reserve_at_start + 1) * sizeof(char*));
   *out = q;
+  q += reserve_at_start;
   if (length) {
     for (const JSValue *p = field->value.u.a.data, *limit = p + length; p < limit; p++) {
       if (p->kind != JS_STRING) {
@@ -1399,6 +1462,23 @@ static const char* get_string_array(const JSObject* object, const char* name, co
   *q = NULL;
   return NULL;
 }
+
+// Skeleton of Stanza debgger. It runs on a separate thread.
+// TODO: replace it woth LoStanza function.
+static void* handle_launch(void* args) {
+  char** argv = (char**) args;
+  // TODO: Replace the code below with the debugger run with 'argv'
+  log_printf("! Running stanza program %s with arguments:\n", argv[0]);
+  for (char* s; (s = *++argv) != NULL;)
+    log_printf("  %s\n", s);
+  for (int i = 0; i < 1000; i++) {
+    printf("Program iteration %d\n", i);
+    handle_pending_debug_requests();
+  }
+  send_process_exited(0);
+  return NULL;
+}
+
 static inline const char* launch_program(const JSObject* request_arguments) {
   const char* cwd = JSObject_get_string_field(request_arguments, "cwd");
   if (cwd && chdir(cwd)) return current_error();
@@ -1411,19 +1491,28 @@ static inline const char* launch_program(const JSObject* request_arguments) {
   if (!program) return "no program specified";
 
   const char** args = NULL;
-  const char* error = get_string_array(request_arguments, "args", &args);
+  const char* error = get_string_array(request_arguments, "args", 1, &args);
   if (!error) {
     const char** env = NULL;
-    error = get_string_array(request_arguments, "env", &env);
+    error = get_string_array(request_arguments, "env", 0, &env);
     if (!error) {
       free_path(program_path);
       program_path = get_absolute_path(program);
+      args[0] = program_path;
       // TODO: launch the program here, remember program_pid
+      // For now, lets just run stanza debugger in-process on a separate thread and ignore 'env'
+      pthread_t program_thread;
+      if (pthread_create(&program_thread, NULL, &handle_launch, args)) {
+        static char error_buffer[256];
+        snprintf(error_buffer, sizeof error_buffer, "Couldn't create stanza program thread. %s", current_error());
+        error = error_buffer;
+      }
       program_pid = getpid();
     }
     free(env);
   }
-  free(args);
+  // Yes, 'args' leaks memory as it can be used by program_thread. Please uncomment the line below when a program launched as a process.
+  // free(args);
   return error;
 }
 static bool request_launch(const JSObject* request) {
@@ -2254,15 +2343,37 @@ static inline bool parse_request(JSValue* value, const char* data, ssize_t lengt
   return false;
 }
 
-static char* get_arg_value(int argc, char* argv[]) {
-  if (argc) {
-    char* value = *argv;
-    if (value[0] != '-' && value[1] != '-')
-      return value;
+typedef struct {
+  int argc;
+  char** argv;
+} Args;
+static inline void next_arg(Args* args) {
+  args->argc--;
+  args->argv++;
+}
+static bool is_arg(const char* name, Args* args) {
+  const char* arg = args->argv[0];
+  if (*arg++ == '-' && *arg++ == '-' && !strcmp(arg, name)) {
+    next_arg(args);
+    return true;
   }
-  fprintf(stderr, "Command-line parameter %s must be followed by a value\n", argv[0]);
+  return false;
+}
+static char* get_arg_value(Args* args) {
+  if (args->argc) {
+    char* value = args->argv[0];
+    if (value[0] != '-' && value[1] != '-') {
+      next_arg(args);
+      return value;
+    }
+  }
+  fprintf(stderr, "Command-line parameter %s must be followed by a value\n", args->argv[0]);
   exit(EXIT_FAILURE);
   return NULL;
+}
+
+static inline void initialize_stanza_debugger(int argc, char** argv) {
+  // TODO: if necessary, call initialization of stanza debugger here. It runs on communication thread.
 }
 
 int main(int argc, char** argv) {
@@ -2272,31 +2383,25 @@ int main(int argc, char** argv) {
 
   // Allocate and compute absolute path to the adapter
   debug_adapter_path = get_absolute_path(argv[0]);
-  --argc; ++argv; // Remove adapter from the args
+  Args args = {argc, argv};
+  next_arg(&args);// Remove adapter from the args
 
   const char* log_path = NULL;
   char* port_arg = NULL;
 
-  while (argc > 0) {
-    const char* arg = *argv;
-    if (*arg++ == '-' && *arg++ == '-') {
-      if (!strcmp(arg, "log")) {
-        --argc; ++argv;
-        log_path = get_arg_value(argc, argv);
-        --argc; ++argv;
-        continue;
-      }
-      if (!strcmp(arg, "port")) {
-        --argc; ++argv;
-        port_arg = get_arg_value(argc, argv);
-        --argc; ++argv;
-        continue;
-      }
+  while (args.argc > 0) {
+    if (is_arg("log", &args)) {
+      log_path = get_arg_value(&args);
+      continue;
+    }
+    if (is_arg("port", &args)) {
+      port_arg = get_arg_value(&args);
+      continue;
     }
     break;
   }
 
-#if 0 // Unused
+#if 0 // Currently unused
   int launch_target_pos = find_last_arg_with_value("launch-target", argc, argv);
   if (launch_target_pos) {
     const int comm_file_pos = find_last_arg_with_value("comm-file", launch_target_pos, argv);
@@ -2387,8 +2492,13 @@ int main(int argc, char** argv) {
     log_printf("error: initializing send mutex (%s)\n", current_error());
     return EXIT_FAILURE;
   }
+  if (pthread_mutex_init(&request_queue_lock, NULL)) {
+    log_printf("error: initializing request queue mutex (%s)\n", current_error());
+    return EXIT_FAILURE;
+  }
 
-  // Initialize debugger
+  // Initialize debugger with filtered argc, argv
+  initialize_stanza_debugger(args.argc, args.argv);
 
   redirect_output(stdout, STDOUT);
   //redirect_output(stderr, STDERR);
