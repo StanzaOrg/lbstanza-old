@@ -90,6 +90,25 @@ package mypackageB defined-in "fileB.stanza"
 package mypackageC defined-in "{FILE_C_INSTALLATION}/fileC.stanza"
 ```
 
+## Packages Specified by Directory
+
+Stanza also provides the following shorthand for specifying the location of multiple Stanza packages as long as they obey the following naming convention.
+
+```
+packages mysystem/utils/* defined-in "src/utils"
+```
+
+The above statement indicates that all packages that begin with `mysystem/utils/` can be found within the directory `src/utils`.
+
+Here are some examples of how Stanza maps package names onto filenames:
+
+- The package `mysystem/utils/lists` will be expected to be in `src/utils/lists.stanza`.
+
+- The package `mysystem/utils/arrays` will be expected to be in `src/utils/arrays.stanza`.
+
+- The package `mysystem/utils/network/transfer` will be expected to be in `src/utils/network/transfer.stanza`.
+
+
 ## {.} and {WORKDIR}
 
 There are two special variables that are available to you in the `.proj` file called `.` and `WORKDIR`. 
