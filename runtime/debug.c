@@ -1179,7 +1179,7 @@ typedef struct REQUEST {
   DoublyLinked link;
   void (*handle) (const struct REQUEST* req);
   void (*print) (const struct REQUEST* req);
-  void (*destroy) (struct REQUEST* req);
+  void (*destroy) (const struct REQUEST* req);
 } Request;
 
 static DoublyLinked request_queue = {&request_queue, &request_queue};
@@ -1216,6 +1216,7 @@ static void handle_pending_debug_requests(void) {
     Request* req = remove_from_request_queue();
     req->handle(req);
     req->destroy(req);
+    free(req);
   }
 }
 
@@ -1225,7 +1226,6 @@ static inline unsigned request_queue_length(void) {
     ++count;
   return count;
 }
-
 // This function is not thread-safe. It is only intended for debuggung.
 static void print_request_queue(void) {
   log_printf("Request queue (length: %u):\n", request_queue_length());
@@ -1471,6 +1471,9 @@ static void* handle_launch(void* args) {
   log_printf("! Running stanza program %s with arguments:\n", argv[0]);
   for (char* s; (s = *++argv) != NULL;)
     log_printf("  %s\n", s);
+
+  send_thread_stopped(1234567, STOP_REASON_ENTRY, "Stopped at entry");
+
   for (int i = 0; i < 1000; i++) {
     printf("Program iteration %d\n", i);
     handle_pending_debug_requests();
@@ -2113,6 +2116,22 @@ static bool request_stackTrace(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
+typedef Request RequestContinue;
+static void RequestContinue_handle(const Request* req) {
+  // TODO: either implement this function in LoStanza or call LoStanza function here.
+  log_printf("! Handling continue request\n");
+}
+static void RequestContinue_destroy(const Request* req) {}
+static void RequestContinue_print(const Request* req) {
+  log_printf("continue\n");
+}
+static inline Request* RequestContinue_create(void) {
+  RequestContinue* req = malloc(sizeof(RequestContinue));
+  req->handle = &RequestContinue_handle;
+  req->destroy = &RequestContinue_destroy;
+  req->print = &RequestContinue_print;
+  return (Request*) req;
+}
 static bool request_continue(const JSObject* request) {
   // TODO: Do we really need this?
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
@@ -2121,7 +2140,7 @@ static bool request_continue(const JSObject* request) {
   // "threadCausedFocus" boolean value in the "stopped" events.
   // g_vsc.focus_tid = GetUnsigned(arguments, "threadId", LLDB_INVALID_THREAD_ID);
 
-  // TODO: Continue the execution.
+  insert_to_request_queue(RequestContinue_create());
 
   JSBuilder builder;
   JSBuilder_initialize_response(&builder, request, NULL);
