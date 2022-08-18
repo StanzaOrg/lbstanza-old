@@ -2260,22 +2260,27 @@ static bool request_pause(const JSObject* request) {
 //                     acknowledgement, so no body field is required."
 //   }]
 // }
-static bool request_disconnect(const JSObject* request) {
-  // TODO: Do we really need this?
-  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  // const bool terminate_debugee = JSObject_get_bool_field(arguments, "terminateDebugee", true);
-  // const bool restert = JSObject_get_bool_field(arguments, "restart", false);
-
-  // TDOD: Terminate the program, in case of failure set 'error' to error message.
+typedef DelayedRequest DelayedRequestDisconnect;
+static void DelayedRequestDisconnect_handle(const DelayedRequest* request) {
+  // TODO: call LoStanza function here.
   const char* error = NULL;
-
   JSBuilder builder;
-  JSBuilder_initialize_response(&builder, request, NULL);
+  JSBuilder_initialize_delayed_response(&builder, request, NULL);
   if (error)
     JSBuilder_write_string_field(&builder, "error", error);
   JSBuilder_send_and_destroy_response(&builder);
 
   if (!error) send_terminated();
+}
+static inline DelayedRequest* DelayedRequestDisconnect_create(const JSObject* request) {
+  return DelayedRequest_create(request, sizeof(DelayedRequestDisconnect), &DelayedRequestDisconnect_handle);
+}
+static bool request_disconnect(const JSObject* request) {
+  // TODO: Do we really need this?
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // const bool terminate_debugee = JSObject_get_bool_field(arguments, "terminateDebugee", true);
+  // const bool restert = JSObject_get_bool_field(arguments, "restart", false);
+  insert_to_request_queue(DelayedRequestDisconnect_create(request));
   return true;
 }
 
