@@ -1175,19 +1175,31 @@ typedef struct DOUBLY_LINKED {
   struct DOUBLY_LINKED* prev;
 } DoublyLinked;
 
-typedef struct REQUEST {
+typedef struct DELAYED_REQUEST {
   DoublyLinked link;
-  void (*handle) (const struct REQUEST* req);
-  void (*print) (const struct REQUEST* req);
-  void (*destroy) (const struct REQUEST* req);
-} Request;
+  const char* command;  // Not owned by Request
+  uint64_t request_seq;
+  void (*handle) (const struct DELAYED_REQUEST* req);
+  void (*destroy) (const struct DELAYED_REQUEST* req);
+} DelayedRequest;
+
+static void DelayedRequest_empty_destructor(const DelayedRequest* request) {}
+static const char* canonicalize_request_name(const char* name);
+static void* DelayedRequest_create(const JSObject* request, size_t size, void (*handle)(const DelayedRequest*)) {
+  DelayedRequest* req = malloc(size);
+  req->command = canonicalize_request_name(JSObject_get_string_field(request, "command"));
+  req->request_seq = JSObject_get_integer_field(request, "seq", 0);
+  req->handle = handle;
+  req->destroy = &DelayedRequest_empty_destructor;
+  return req;
+}
 
 static DoublyLinked request_queue = {&request_queue, &request_queue};
 static pthread_mutex_t request_queue_lock;
 static inline bool request_queue_not_empty(void) {
   return request_queue.next != &request_queue;
 }
-static inline void insert_to_request_queue(Request* req) {
+static inline void insert_to_request_queue(DelayedRequest* req) {
   pthread_mutex_lock(&request_queue_lock);
 
   DoublyLinked* it = &req->link;
@@ -1197,7 +1209,7 @@ static inline void insert_to_request_queue(Request* req) {
 
   pthread_mutex_unlock(&request_queue_lock);
 }
-static inline Request* remove_from_request_queue(void) {
+static inline DelayedRequest* remove_from_request_queue(void) {
   assert(request_queue_not_empty());
   pthread_mutex_lock(&request_queue_lock);
 
@@ -1207,13 +1219,13 @@ static inline Request* remove_from_request_queue(void) {
   next->prev = &request_queue;
 
   pthread_mutex_unlock(&request_queue_lock);
-  return (Request*) it;
+  return (DelayedRequest*) it;
 }
 
 // TODO: call handle_pending_debug_requests() from Stanza debugger
 static void handle_pending_debug_requests(void) {
   while (request_queue_not_empty()) {
-    Request* req = remove_from_request_queue();
+    DelayedRequest* req = remove_from_request_queue();
     req->handle(req);
     req->destroy(req);
     free(req);
@@ -1230,15 +1242,12 @@ static inline unsigned request_queue_length(void) {
 static void print_request_queue(void) {
   log_printf("Request queue (length: %u):\n", request_queue_length());
   for (const DoublyLinked* it = request_queue.next; it != &request_queue; it = it->next) {
-    const Request* req = (const Request*) it;
-    req->print(req);
+    const DelayedRequest* req = (const DelayedRequest*) it;
+    log_printf("  %s\n", req->command);
   }
 }
 
-static void JSBuilder_initialize_response(JSBuilder* builder, const JSObject* request, const char* message) {
-  const char* command = JSObject_get_string_field(request, "command");
-  const uint64_t request_seq = JSObject_get_integer_field(request, "seq", 0);
-
+static void JSBuilder_initialize_response_to_command(JSBuilder* builder, const char* command, uint64_t request_seq, const char* message) {
   JSBuilder_initialize(builder);
   JSBuilder_object_begin(builder);
   JSBuilder_write_seq_0(builder);
@@ -1249,12 +1258,25 @@ static void JSBuilder_initialize_response(JSBuilder* builder, const JSObject* re
   if (message)
     JSBuilder_write_string_field(builder, "message", message);
 }
+static void JSBuilder_initialize_response(JSBuilder* builder, const JSObject* request, const char* message) {
+  const char* command = JSObject_get_string_field(request, "command");
+  const uint64_t request_seq = JSObject_get_integer_field(request, "seq", 0);
+  JSBuilder_initialize_response_to_command(builder, command, request_seq, message);
+}
+static void JSBuilder_initialize_delayed_response(JSBuilder* builder, const DelayedRequest* request, const char* message) {
+  JSBuilder_initialize_response_to_command(builder, request->command, request->request_seq, message);
+}
 static inline void JSBuilder_send_and_destroy_response(JSBuilder* builder) {
   JSBuilder_send_and_destroy_object(builder);
 }
 static void respond_to_request(const JSObject* request, const char* message) {
   JSBuilder builder;
   JSBuilder_initialize_response(&builder, request, message);
+  JSBuilder_send_and_destroy_response(&builder);
+}
+static void respond_to_delayed_request(const DelayedRequest* request, const char* message) {
+  JSBuilder builder;
+  JSBuilder_initialize_delayed_response(&builder, request, message);
   JSBuilder_send_and_destroy_response(&builder);
 }
 
@@ -2116,21 +2138,20 @@ static bool request_stackTrace(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
-typedef Request RequestContinue;
-static void RequestContinue_handle(const Request* req) {
-  // TODO: either implement this function in LoStanza or call LoStanza function here.
-  log_printf("! Handling continue request\n");
+typedef DelayedRequest DelayedRequestContinue;
+static void DelayedRequestContinue_handle(const DelayedRequest* req) {
+  // TODO: call LoStanza function here.
+  JSBuilder builder;
+  JSBuilder_initialize_delayed_response(&builder, req, NULL);
+  JSBuilder_object_field_begin(&builder, "body");
+  {
+    JSBuilder_write_bool_field(&builder, "allThreadsContinued", true);
+  }
+  JSBuilder_object_field_end(&builder); // body
+  JSBuilder_send_and_destroy_response(&builder);
 }
-static void RequestContinue_destroy(const Request* req) {}
-static void RequestContinue_print(const Request* req) {
-  log_printf("continue\n");
-}
-static inline Request* RequestContinue_create(void) {
-  RequestContinue* req = malloc(sizeof(RequestContinue));
-  req->handle = &RequestContinue_handle;
-  req->destroy = &RequestContinue_destroy;
-  req->print = &RequestContinue_print;
-  return (Request*) req;
+static inline DelayedRequest* DelayedRequestContinue_create(const JSObject* request) {
+  return DelayedRequest_create(request, sizeof(DelayedRequestContinue), &DelayedRequestContinue_handle);
 }
 static bool request_continue(const JSObject* request) {
   // TODO: Do we really need this?
@@ -2139,17 +2160,7 @@ static bool request_continue(const JSObject* request) {
   // Remember the thread ID that caused the resume so we can set the
   // "threadCausedFocus" boolean value in the "stopped" events.
   // g_vsc.focus_tid = GetUnsigned(arguments, "threadId", LLDB_INVALID_THREAD_ID);
-
-  insert_to_request_queue(RequestContinue_create());
-
-  JSBuilder builder;
-  JSBuilder_initialize_response(&builder, request, NULL);
-  JSBuilder_object_field_begin(&builder, "body");
-  {
-    JSBuilder_write_bool_field(&builder, "allThreadsContinued", true);
-  }
-  JSBuilder_object_field_end(&builder); // body
-  JSBuilder_send_and_destroy_response(&builder);
+  insert_to_request_queue(DelayedRequestContinue_create(request));
   return true;
 }
 
@@ -2189,13 +2200,19 @@ static bool request_continue(const JSObject* request) {
 //     acknowledgement, so no body field is required."
 //   }]
 // }
+typedef DelayedRequest DelayedRequestPause;
+static void DelayedRequestPause_handle(const DelayedRequest* request) {
+  // TODO: call LoStanza function here.
+  respond_to_delayed_request(request, NULL);
+}
+static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
+  return DelayedRequest_create(request, sizeof(DelayedRequestPause), &DelayedRequestPause_handle);
+}
 static bool request_pause(const JSObject* request) {
   // TODO: Do we really need this?
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
-
-  // TODO: Pause the execution at nearest breakpoint location.
-  respond_to_request(request, NULL);
+  insert_to_request_queue(DelayedRequestPause_create(request));
   return true;
 }
 
@@ -2243,50 +2260,6 @@ static bool request_pause(const JSObject* request) {
 //                     acknowledgement, so no body field is required."
 //   }]
 // }
-#if 0
-void request_disconnect(const llvm::json::Object &request) {
-  llvm::json::Object response;
-  FillResponse(request, response);
-  auto arguments = request.getObject("arguments");
-
-  bool defaultTerminateDebuggee = g_vsc.is_attach ? false : true;
-  bool terminateDebuggee =
-      GetBoolean(arguments, "terminateDebuggee", defaultTerminateDebuggee);
-  lldb::SBProcess process = g_vsc.target.GetProcess();
-  auto state = process.GetState();
-  switch (state) {
-  case lldb::eStateInvalid:
-  case lldb::eStateUnloaded:
-  case lldb::eStateDetached:
-  case lldb::eStateExited:
-    break;
-  case lldb::eStateConnected:
-  case lldb::eStateAttaching:
-  case lldb::eStateLaunching:
-  case lldb::eStateStepping:
-  case lldb::eStateCrashed:
-  case lldb::eStateSuspended:
-  case lldb::eStateStopped:
-  case lldb::eStateRunning:
-    g_vsc.debugger.SetAsync(false);
-    lldb::SBError error = terminateDebuggee ? process.Kill() : process.Detach();
-    if (!error.Success())
-      response.try_emplace("error", error.GetCString());
-    g_vsc.debugger.SetAsync(true);
-    break;
-  }
-  SendTerminatedEvent();
-  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
-  if (g_vsc.event_thread.joinable()) {
-    g_vsc.broadcaster.BroadcastEventByType(eBroadcastBitStopEventThread);
-    g_vsc.event_thread.join();
-  }
-  if (g_vsc.progress_event_thread.joinable()) {
-    g_vsc.broadcaster.BroadcastEventByType(eBroadcastBitStopProgressThread);
-    g_vsc.progress_event_thread.join();
-  }
-}
-#endif
 static bool request_disconnect(const JSObject* request) {
   // TODO: Do we really need this?
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
@@ -2360,6 +2333,14 @@ static inline bool parse_request(JSValue* value, const char* data, ssize_t lengt
       return request_handlers[p - request_names](object); // call the request handler, return the result
   log_printf("error: unhandled command '%s'\n");
   return false;
+}
+
+static const char* canonicalize_request_name(const char* name) {
+  assert(name);
+  for (const char* const* p = request_names; *p; p++)
+    if (!strcmp(*p, name))
+      return *p;
+  return NULL;
 }
 
 typedef struct {
