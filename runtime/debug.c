@@ -82,7 +82,8 @@ static void StringVector_append(StringVector* vector, const char* s) {
 
 static char* program_path;
 static pid_t program_pid;
-static bool sent_terminated_event;
+static bool terminated_event_sent;
+static bool execution_paused;
 static pthread_mutex_t send_lock;
 static const char* debug_adapter_path;
 
@@ -884,8 +885,8 @@ static void send_process_exited(uint64_t exit_code) {
 }
 
 static void send_terminated(void) {
-  if (!sent_terminated_event) {
-    sent_terminated_event = true;
+  if (!terminated_event_sent) {
+    terminated_event_sent = true;
     send_simple_event("terminated");
   }
 }
@@ -1115,9 +1116,9 @@ static void send_output(const OutputType out, const char* data, ssize_t length) 
   assert(length > 0);
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "output");
+  JSBuilder_write_raw_string_field(&builder, "category", output_category(out));
   JSBuilder_write_field(&builder, "output");
   JSBuilder_write_quoted_text(&builder, data, length);
-  JSBuilder_write_raw_string_field(&builder, "category", output_category(out));
   JSBuilder_send_and_destroy_event(&builder);
 }
 
@@ -1197,7 +1198,7 @@ static inline bool request_queue_not_empty(void) {
   return request_queue.next != &request_queue;
 }
 static inline void insert_to_request_queue(DelayedRequest* req) {
-  if (sent_terminated_event) return;
+  if (terminated_event_sent) return;
 
   pthread_mutex_lock(&request_queue_lock);
 
@@ -1492,11 +1493,21 @@ static void* handle_launch(void* args) {
   for (char* s; (s = *++argv) != NULL;)
     log_printf("  %s\n", s);
 
+  execution_paused = true;
   send_thread_stopped(1234567, STOP_REASON_ENTRY, "Stopped at entry");
+  while (!request_queue_not_empty()) {
+    log_printf("! Simulating stop at entry");
+    sleep(1);
+  }
 
-  for (int i = 0; i < 1000; i++) {
+  for (int i = 0; i < 10000; i++) {
+    do {
+      sleep(1);
+      handle_pending_debug_requests();
+      if (terminated_event_sent) return NULL;
+    } while (execution_paused);
+
     printf("Program iteration %d\n", i);
-    handle_pending_debug_requests();
   }
   send_process_exited(0);
   return NULL;
@@ -1764,7 +1775,7 @@ static void DelayedRequestSetBreakpoints_handle(DelayedRequest* request) {
   BreakpointVector_initialize(&out_breakpoints);
 
   // TODO: pass breakponts to the debugger (in_breakponts.data, in_breakponts.length), source_path and &out_breakponts.
-  // For now, copy in to out just to fake the effect
+  // For now, copy in to out just to simulate the effect
   {
     const SourceBreakpointVector* in_breakpoints = &req->breakpoints;
     for (int id = 0, length = in_breakpoints->length; id < length; id++) {
@@ -2171,6 +2182,9 @@ static bool request_stackTrace(const JSObject* request) {
 typedef DelayedRequest DelayedRequestContinue;
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
   // TODO: call LoStanza function here.
+  // Just to simulate the effect:
+  execution_paused = false;
+
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, req, NULL);
   JSBuilder_object_field_begin(&builder, "body");
@@ -2229,10 +2243,12 @@ static bool request_continue(const JSObject* request) {
 //     "description": "Response to 'pause' request. This is just an
 //     acknowledgement, so no body field is required."
 //   }]
-// }
+// }s
 typedef DelayedRequest DelayedRequestPause;
 static void DelayedRequestPause_handle(DelayedRequest* request) {
   // TODO: call LoStanza function here.
+  // Just to simuate the effect:
+  execution_paused = true;
   respond_to_delayed_request(request, NULL);
 }
 static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
@@ -2538,7 +2554,7 @@ int main(int argc, char** argv) {
   redirect_output(stdout, STDOUT);
   //redirect_output(stderr, STDERR);
 
-  for (char* data; !sent_terminated_event; free(data)) {
+  for (char* data; !terminated_event_sent; free(data)) {
     const ssize_t length = read_packet(&data);
     if (!length) break;
 
