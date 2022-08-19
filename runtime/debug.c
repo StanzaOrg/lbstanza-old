@@ -1200,6 +1200,8 @@ static inline bool request_queue_not_empty(void) {
   return request_queue.next != &request_queue;
 }
 static inline void insert_to_request_queue(DelayedRequest* req) {
+  if (sent_terminated_event) return;
+
   pthread_mutex_lock(&request_queue_lock);
 
   DoublyLinked* it = &req->link;
@@ -1914,6 +1916,7 @@ static bool request_setExceptionBreakpoints(const JSObject* request) {
 //   }]
 // }
 static bool request_threads(const JSObject* request) {
+  // TODO: Maybe report coroutines instead of threads?
   JSBuilder builder;
   // TODO: If no active stack exists, pass an error message instead of NULL here.
   JSBuilder_initialize_response(&builder, request, NULL);
@@ -2038,26 +2041,29 @@ static StackTraceFrame* StackTrace_allocate(StackTrace* st) {
   }
   return st->data + st->length++;
 }
+
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
 // Frames not visible to the debugger can be skipped.
 // Returns total number of frames in thread_id stack or -1 when no thread with given therad_id thread_is found.
 static int64_t create_stack_trace(StackTrace* st, int64_t thread_id, int64_t start, int64_t max_frames) {
-  // TODO: Imlement this function in debugger core.
+  // TODO: Implement this function in debugger core.
   return 0;
 }
-static bool request_stackTrace(const JSObject* request) {
-  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  // Stanza implementatin is single-threaded. Interpret thread_id as coroutine_id?
-  const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
-  const int64_t start_frame = JSObject_get_integer_field(arguments, "startFrame", 0);
-  const int64_t max_frames = JSObject_get_integer_field(arguments, "levels", INT64_MAX);
 
+typedef struct {
+  DelayedRequest parent;
+  int64_t thread_id;
+  int64_t start_frame;
+  int64_t max_frames;
+} DelayedRequestStackTrace;
+static void DelayedRequestStackTrace_handle(const DelayedRequest* request) {
+  const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
   StackTrace st;
   StackTrace_initialize(&st);
-  const int64_t total_frames = create_stack_trace(&st, thread_id, start_frame, max_frames);
+  const int64_t total_frames = create_stack_trace(&st, req->thread_id, req->start_frame, req->max_frames);
 
   JSBuilder builder;
-  JSBuilder_initialize_response(&builder, request, NULL);
+  JSBuilder_initialize_delayed_response(&builder, request, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   if (total_frames >= 0) {
     JSBuilder_write_unsigned_field(&builder, "totalFrames", total_frames);
@@ -2081,6 +2087,18 @@ static bool request_stackTrace(const JSObject* request) {
   JSBuilder_send_and_destroy_response(&builder);
 
   StackTrace_destroy(&st);
+}
+static inline DelayedRequest* DelayedRequestStackTrace_create(const JSObject* request) {
+  DelayedRequestStackTrace* req = DelayedRequest_create(request, sizeof(DelayedRequestStackTrace), &DelayedRequestStackTrace_handle);
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // Stanza implementatin is single-threaded. Interpret thread_id as coroutine_id?
+  req->thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+  req->start_frame = JSObject_get_integer_field(arguments, "startFrame", 0);
+  req->max_frames = JSObject_get_integer_field(arguments, "levels", INT64_MAX);
+  return (DelayedRequest*) req;
+}
+static bool request_stackTrace(const JSObject* request) {
+  insert_to_request_queue(DelayedRequestStackTrace_create(request));
   return true;
 }
 
