@@ -1729,7 +1729,6 @@ typedef struct {
   unsigned column;  // 1-based, 0 denotes undefined column
   bool verified;
 } Breakpoint;
-
 typedef struct {
   ssize_t length;
   ssize_t capacity;
@@ -1753,38 +1752,23 @@ static Breakpoint* BreakpointVector_allocate(BreakpointVector* vector) {
   return vector->data + vector->length++;
 }
 
-static bool request_setBreakpoints(const JSObject* request) {
-  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  const JSObject* source = JSObject_get_object_field(arguments, "source");
-  const char* path = JSObject_get_string_field(source, "path");
-  const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
-
-  SourceBreakpointVector in_breakpoints;
-  SourceBreakpointVector_initialize(&in_breakpoints);
+typedef struct {
+  DelayedRequest parent;
+  char* source_path;  // Owned by this request
+  SourceBreakpointVector breakpoints;
+} DelayedRequestSetBreakpoints;
+static void DelayedRequestSetBreakpoints_handle(DelayedRequest* request) {
+  DelayedRequestSetBreakpoints* req = (DelayedRequestSetBreakpoints*)request;
 
   BreakpointVector out_breakpoints;
   BreakpointVector_initialize(&out_breakpoints);
 
-  if (path) {
-    if (breakpoints) {
-      // Validate brakpoints and store in in_breakpoints.
-      for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
-        if (p->kind == JS_OBJECT) {
-          const JSObject* o = &p->u.o;
-          const int64_t line = JSObject_get_integer_field(o, "line", 0);
-          const int64_t column = JSObject_get_integer_field(o, "column", 0);
-          // TODO: get optional condition, hitCondition and logMessage fields.
-          if (line <= 0 || column < 0) continue;
-          SourceBreakpoint* sbp = SourceBreakpointVector_allocate(&in_breakpoints);
-          sbp->line = line;
-          sbp->column = column;
-        }
-      }
-    }
-    // TODO: Pass in_breakponts (in_breakponts.data, in_breakponts.length), path and &out_breakponts to the debugger core here.
-    // Copy in to out just to fake the effect
-    for (int id = 0, length = in_breakpoints.length; id < length; id++) {
-      const SourceBreakpoint* sbp = in_breakpoints.data + id;
+  // TODO: pass breakponts to the debugger (in_breakponts.data, in_breakponts.length), source_path and &out_breakponts.
+  // For now, copy in to out just to fake the effect
+  {
+    const SourceBreakpointVector* in_breakpoints = &req->breakpoints;
+    for (int id = 0, length = in_breakpoints->length; id < length; id++) {
+      const SourceBreakpoint* sbp = in_breakpoints->data + id;
       Breakpoint* bp = BreakpointVector_allocate(&out_breakpoints);
       bp->id = id;
       bp->line = sbp->line;
@@ -1794,25 +1778,57 @@ static bool request_setBreakpoints(const JSObject* request) {
   }
 
   JSBuilder builder;
-  JSBuilder_initialize_response(&builder, request, NULL);
-  if (path) {
-    JSBuilder_object_field_begin(&builder, "body");
+  JSBuilder_initialize_delayed_response(&builder, request, NULL);
+  JSBuilder_object_field_begin(&builder, "body");
+  {
+    JSBuilder_array_field_begin(&builder, "breakpoints");
     {
-      JSBuilder_array_field_begin(&builder, "breakpoints");
-      {
-        // TODO: Replace in_breakpoints with out_breakpoints here.
-        for (const Breakpoint *p = out_breakpoints.data, *const limit = p + out_breakpoints.length; p < limit; p++) {
-          JSBuilder_next(&builder);
-          JSBuilder_write_breakpoint(&builder, p->id, p->verified, path, p->line, p->column);
-        }
+      const char* source_path = req->source_path;
+      for (const Breakpoint *p = out_breakpoints.data, *const limit = p + out_breakpoints.length; p < limit; p++) {
+        JSBuilder_next(&builder);
+        JSBuilder_write_breakpoint(&builder, p->id, p->verified, source_path, p->line, p->column);
       }
-      JSBuilder_array_field_end(&builder); // breakpoints
     }
-    JSBuilder_object_field_end(&builder); // body
+    JSBuilder_array_field_end(&builder); // breakpoints
   }
+  JSBuilder_object_field_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
 
-  SourceBreakpointVector_destroy(&in_breakpoints);
+  BreakpointVector_destroy(&out_breakpoints);
+
+  // Destroy 'req'
+  free(req->source_path);
+  SourceBreakpointVector_destroy(&req->breakpoints);
+}
+static inline DelayedRequest* DelayedRequestSetBreakpoints_create(const JSObject* request) {
+  DelayedRequestSetBreakpoints* req = DelayedRequest_create(request, sizeof(DelayedRequestSetBreakpoints), &DelayedRequestSetBreakpoints_handle);
+
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  const JSObject* source = JSObject_get_object_field(arguments, "source");
+  req->source_path = strdup(JSObject_get_string_field(source, "path")); // req owns source_path
+
+  SourceBreakpointVector* in_breakpoints = &req->breakpoints;
+  SourceBreakpointVector_initialize(in_breakpoints);
+  const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
+  if (breakpoints) {
+    // Validate brakpoints and store in in_breakpoints.
+    for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
+      if (p->kind == JS_OBJECT) {
+        const JSObject* o = &p->u.o;
+        const int64_t line = JSObject_get_integer_field(o, "line", 0);
+        const int64_t column = JSObject_get_integer_field(o, "column", 0);
+        // TODO: get optional condition, hitCondition and logMessage fields.
+        if (line <= 0 || column < 0) continue;
+        SourceBreakpoint* sbp = SourceBreakpointVector_allocate(in_breakpoints);
+        sbp->line = line;
+        sbp->column = column;
+      }
+    }
+  }
+  return (DelayedRequest*) req;
+}
+static bool request_setBreakpoints(const JSObject* request) {
+  insert_to_request_queue(DelayedRequestSetBreakpoints_create(request));
   return true;
 }
 
