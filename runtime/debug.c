@@ -1179,18 +1179,15 @@ typedef struct DELAYED_REQUEST {
   DoublyLinked link;
   const char* command;  // Not owned by Request
   uint64_t request_seq;
-  void (*handle) (const struct DELAYED_REQUEST* req);
-  void (*destroy) (const struct DELAYED_REQUEST* req);
+  void (*handle) (struct DELAYED_REQUEST* req);
 } DelayedRequest;
 
-static void DelayedRequest_empty_destructor(const DelayedRequest* request) {}
 static const char* canonicalize_request_name(const char* name);
-static void* DelayedRequest_create(const JSObject* request, size_t size, void (*handle)(const DelayedRequest*)) {
+static void* DelayedRequest_create(const JSObject* request, size_t size, void (*handle)(DelayedRequest*)) {
   DelayedRequest* req = malloc(size);
   req->command = canonicalize_request_name(JSObject_get_string_field(request, "command"));
   req->request_seq = JSObject_get_integer_field(request, "seq", 0);
   req->handle = handle;
-  req->destroy = &DelayedRequest_empty_destructor;
   return req;
 }
 
@@ -1229,7 +1226,6 @@ static void handle_pending_debug_requests(void) {
   while (request_queue_not_empty()) {
     DelayedRequest* req = remove_from_request_queue();
     req->handle(req);
-    req->destroy(req);
     free(req);
   }
 }
@@ -2056,7 +2052,7 @@ typedef struct {
   int64_t start_frame;
   int64_t max_frames;
 } DelayedRequestStackTrace;
-static void DelayedRequestStackTrace_handle(const DelayedRequest* request) {
+static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
   StackTrace st;
   StackTrace_initialize(&st);
@@ -2157,7 +2153,7 @@ static bool request_stackTrace(const JSObject* request) {
 //   }]
 // }
 typedef DelayedRequest DelayedRequestContinue;
-static void DelayedRequestContinue_handle(const DelayedRequest* req) {
+static void DelayedRequestContinue_handle(DelayedRequest* req) {
   // TODO: call LoStanza function here.
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, req, NULL);
@@ -2219,7 +2215,7 @@ static bool request_continue(const JSObject* request) {
 //   }]
 // }
 typedef DelayedRequest DelayedRequestPause;
-static void DelayedRequestPause_handle(const DelayedRequest* request) {
+static void DelayedRequestPause_handle(DelayedRequest* request) {
   // TODO: call LoStanza function here.
   respond_to_delayed_request(request, NULL);
 }
@@ -2279,7 +2275,7 @@ static bool request_pause(const JSObject* request) {
 //   }]
 // }
 typedef DelayedRequest DelayedRequestDisconnect;
-static void DelayedRequestDisconnect_handle(const DelayedRequest* request) {
+static void DelayedRequestDisconnect_handle(DelayedRequest* request) {
   // TODO: call LoStanza function here.
   const char* error = NULL;
   JSBuilder builder;
