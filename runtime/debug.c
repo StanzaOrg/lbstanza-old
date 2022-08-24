@@ -1484,31 +1484,38 @@ static const char* get_string_array(const JSObject* object, const char* name, in
   return NULL;
 }
 
-// Skeleton of Stanza debgger. It runs on a separate thread.
-// TODO: replace it woth LoStanza function.
-static void* handle_launch(void* args) {
-  char** argv = (char**) args;
-  // TODO: Replace the code below with the debugger run with 'argv'
-  log_printf("! Running stanza program %s with arguments:\n", argv[0]);
-  for (char* s; (s = *++argv) != NULL;)
-    log_printf("  %s\n", s);
+int stanza_main(int argc, char** argv);
 
+void stop_at_entry(void) {
   execution_paused = true;
   send_thread_stopped(1234567, STOP_REASON_ENTRY, "Stopped at entry");
   while (!request_queue_not_empty()) {
     log_printf("! Simulating stop at entry");
     sleep(1);
   }
+}
 
-  for (int i = 0; i < 10000; i++) {
-    do {
-      sleep(1);
-      handle_pending_debug_requests();
-      if (terminated_event_sent) return NULL;
-    } while (execution_paused);
+void next_debug_event(void) {
+  do {
+    sleep(1);
+    handle_pending_debug_requests();
+    if (terminated_event_sent) break;
+  } while (execution_paused);
+}
 
-    printf("Program iteration %d\n", i);
-  }
+// Skeleton of Stanza debgger. It runs on a separate thread.
+// TODO: replace it woth LoStanza function.
+static void* handle_launch(void* args) {
+  char** argv = (char**) args;
+  // TODO: Replace the code below with the debugger run with 'argv'
+  log_printf("! Running stanza program %s with arguments:\n", argv[0]);
+  for (char** p = argv; *++p != NULL;)
+    log_printf("  %s\n", *p);
+
+  int argc = 0;
+  for (char** p = argv; *p++; argc++);
+  stanza_main(argc, argv);
+
   send_process_exited(0);
   return NULL;
 }
@@ -1525,14 +1532,15 @@ static inline const char* launch_program(const JSObject* request_arguments) {
   if (!program) return "no program specified";
 
   const char** args = NULL;
-  const char* error = get_string_array(request_arguments, "args", 1, &args);
+  const char* error = get_string_array(request_arguments, "args", 2, &args);
   if (!error) {
     const char** env = NULL;
     error = get_string_array(request_arguments, "env", 0, &env);
     if (!error) {
       free_path(program_path);
       program_path = get_absolute_path(program);
-      args[0] = program_path;
+      args[1] = program_path;
+      args[0] = debug_adapter_path;
       // TODO: launch the program here, remember program_pid
       // For now, lets just run stanza debugger in-process on a separate thread and ignore 'env'
       pthread_t program_thread;
@@ -2180,10 +2188,12 @@ static bool request_stackTrace(const JSObject* request) {
 //   }]
 // }
 typedef DelayedRequest DelayedRequestContinue;
+int stanza_debugger_continue (void);
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
   // TODO: call LoStanza function here.
   // Just to simulate the effect:
   execution_paused = false;
+  stanza_debugger_continue();
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, req, NULL);
@@ -2245,11 +2255,14 @@ static bool request_continue(const JSObject* request) {
 //   }]
 // }s
 typedef DelayedRequest DelayedRequestPause;
+int stanza_debugger_pause(void);
 static void DelayedRequestPause_handle(DelayedRequest* request) {
   // TODO: call LoStanza function here.
   // Just to simuate the effect:
   execution_paused = true;
+  stanza_debugger_pause();
   respond_to_delayed_request(request, NULL);
+  send_thread_stopped(1234567, STOP_REASON_PAUSE, "Paused");
 }
 static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
   return DelayedRequest_create(request, sizeof(DelayedRequestPause), &DelayedRequestPause_handle);
