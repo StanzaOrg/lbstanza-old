@@ -871,10 +871,13 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
   JSBuilder_write_bool_field(&builder, "allThreadsStopped", true);
   JSBuilder_send_and_destroy_event(&builder);
 }
-static void send_thread_stopped_at_breakpoint(int64_t thread_id, uint64_t breakpoint_id, uint64_t location_id) {
+void send_thread_stopped_at_breakpoint(uint64_t breakpoint_id) {
   char description[64];
+  const uint64_t thread_id = 1234567;
+  const uint64_t location_id = 0;
   snprintf(description, sizeof description, "breakpoint %" PRIu64 ".%" PRIu64, breakpoint_id, location_id);
   send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description);
+  execution_paused = true;
 }
 
 static void send_process_exited(uint64_t exit_code) {
@@ -1486,21 +1489,18 @@ static const char* get_string_array(const JSObject* object, const char* name, in
 
 int stanza_main(int argc, char** argv);
 
-void stop_at_entry(void) {
-  execution_paused = true;
-  send_thread_stopped(1234567, STOP_REASON_ENTRY, "Stopped at entry");
-  while (!request_queue_not_empty()) {
-    log_printf("! Simulating stop at entry");
-    sleep(1);
-  }
-}
-
 void next_debug_event(void) {
   do {
     sleep(1);
     handle_pending_debug_requests();
     if (terminated_event_sent) break;
   } while (execution_paused);
+}
+
+void stop_at_entry(void) {
+  execution_paused = true;
+  send_thread_stopped(1234567, STOP_REASON_ENTRY, "Stopped at entry");
+  next_debug_event();
 }
 
 // Skeleton of Stanza debgger. It runs on a separate thread.
