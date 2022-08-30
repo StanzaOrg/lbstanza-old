@@ -2262,6 +2262,7 @@ static void DelayedRequestPause_handle(DelayedRequest* request) {
   execution_paused = true;
   stanza_debugger_pause();
   respond_to_delayed_request(request, NULL);
+  // TODO: must be sent from the actually paused stanza program.
   send_thread_stopped(1234567, STOP_REASON_PAUSE, "Paused");
 }
 static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
