@@ -1715,8 +1715,8 @@ static bool request_launch(const JSObject* request) {
 
 // File path is specified separately.
 typedef struct {
-  unsigned line;    // 1-based
-  unsigned column;  // 1-based, 0 denotes undefined column
+  uint64_t line;    // 1-based
+  uint64_t column;  // 1-based, 0 denotes undefined column
 } SourceBreakpoint;
 
 typedef struct {
@@ -1743,9 +1743,9 @@ static SourceBreakpoint* SourceBreakpointVector_allocate(SourceBreakpointVector*
 }
 
 typedef struct {
-  uint32_t id;
-  unsigned line;    // 1-based
-  unsigned column;  // 1-based, 0 denotes undefined column
+  uint64_t id;
+  uint64_t line;    // 1-based
+  uint64_t column;  // 1-based, 0 denotes undefined column
   bool verified;
 } Breakpoint;
 typedef struct {
@@ -1770,6 +1770,14 @@ static Breakpoint* BreakpointVector_allocate(BreakpointVector* vector) {
   }
   return vector->data + vector->length++;
 }
+void append_breakpoint(BreakpointVector* v, uint64_t id, uint64_t line, uint64_t column) {
+  Breakpoint* bp = BreakpointVector_allocate(v);
+  bp->id = id;
+  bp->line = line;
+  bp->column = column;
+  bp->verified = false; // TODO: may need to assign a meaningful value here.
+}
+void set_safepoints (const char* filename, SourceBreakpoint* sbp, long sbp_length, BreakpointVector* out);
 
 typedef struct {
   DelayedRequest parent;
@@ -1782,19 +1790,7 @@ static void DelayedRequestSetBreakpoints_handle(DelayedRequest* request) {
   BreakpointVector out_breakpoints;
   BreakpointVector_initialize(&out_breakpoints);
 
-  // TODO: pass breakponts to the debugger (in_breakponts.data, in_breakponts.length), source_path and &out_breakponts.
-  // For now, copy in to out just to simulate the effect
-  {
-    const SourceBreakpointVector* in_breakpoints = &req->breakpoints;
-    for (int id = 0, length = in_breakpoints->length; id < length; id++) {
-      const SourceBreakpoint* sbp = in_breakpoints->data + id;
-      Breakpoint* bp = BreakpointVector_allocate(&out_breakpoints);
-      bp->id = id;
-      bp->line = sbp->line;
-      bp->column = sbp->column;
-      bp->verified = false;
-    }
-  }
+  set_safepoints(req->source_path, req->breakpoints.data, req->breakpoints.length, &out_breakpoints);
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
@@ -2190,8 +2186,6 @@ static bool request_stackTrace(const JSObject* request) {
 typedef DelayedRequest DelayedRequestContinue;
 int stanza_debugger_continue (void);
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
-  // TODO: call LoStanza function here.
-  // Just to simulate the effect:
   execution_paused = false;
   stanza_debugger_continue();
 
@@ -2259,10 +2253,10 @@ int stanza_debugger_pause(void);
 static void DelayedRequestPause_handle(DelayedRequest* request) {
   // TODO: call LoStanza function here.
   // Just to simuate the effect:
-  execution_paused = true;
   stanza_debugger_pause();
   respond_to_delayed_request(request, NULL);
   // TODO: must be sent from the actually paused stanza program.
+  execution_paused = true;
   send_thread_stopped(1234567, STOP_REASON_PAUSE, "Paused");
 }
 static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
