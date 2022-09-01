@@ -861,23 +861,32 @@ static inline const char* stop_reason(const StopReason kind) {
   return names[kind];
 }
 
-static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description) {
+static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description, const void* breakpoint) {
+  execution_paused = true;
+
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "stopped");
   JSBuilder_write_raw_string_field(&builder, "reason", stop_reason(reason));
   if (description)
     JSBuilder_write_raw_string_field(&builder, "description", description);
+  if (breakpoint) {
+    JSBuilder_array_field_begin(&builder, "hitBreakpointIds");
+    JSBuilder_next(&builder);
+    JSBuilder_append_unsigned(&builder, (uint64_t) breakpoint);
+    JSBuilder_array_field_end(&builder);
+  }
   JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
   JSBuilder_write_bool_field(&builder, "allThreadsStopped", true);
+  JSBuilder_write_bool_field(&builder, "preserveFocusHint", false);
+  JSBuilder_write_bool_field(&builder, "threadCausedFocus", true);
   JSBuilder_send_and_destroy_event(&builder);
 }
-void send_thread_stopped_at_breakpoint(uint64_t breakpoint_id) {
+void send_thread_stopped_at_breakpoint(const void* breakpoint_id) {
   char description[64];
-  const uint64_t thread_id = 1234567;
-  const uint64_t location_id = 0;
-  snprintf(description, sizeof description, "breakpoint %" PRIu64 ".%" PRIu64, breakpoint_id, location_id);
-  send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description);
-  execution_paused = true;
+  const uint64_t thread_id = 12345678;
+  log_printf("Hit a breakpoint at %p\n", breakpoint_id);
+  snprintf(description, sizeof description, "breakpoint %p", breakpoint_id);
+  send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description, breakpoint_id);
 }
 
 static void send_process_exited(uint64_t exit_code) {
@@ -1011,7 +1020,7 @@ static inline void send_process_launched(void) {
 // If 'file' == null the breakpoint source location is omitted.
 // If 'path' == null the source path is omitted.
 // If 'line' is zero it is omitted.
-static void JSBuilder_write_breakpoint(JSBuilder* builder, int id, bool verified, const char* path, unsigned line, unsigned column) {
+static void JSBuilder_write_breakpoint(JSBuilder* builder, uint64_t id, bool verified, const char* path, uint64_t line, uint64_t column) {
   JSBuilder_object_begin(builder);
   JSBuilder_write_unsigned_field(builder, "id", id);
   JSBuilder_write_bool_field(builder, "verified", verified);
@@ -1028,7 +1037,7 @@ static void JSBuilder_write_breakpoint(JSBuilder* builder, int id, bool verified
   }
   JSBuilder_object_end(builder);
 }
-static void send_breakpoint_changed(int id, bool verified) {
+static void send_breakpoint_changed(uint64_t id, bool verified) {
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "breakpoint");
   JSBuilder_write_field(&builder, "breakpoint");
@@ -1498,8 +1507,7 @@ void next_debug_event(void) {
 }
 
 void stop_at_entry(void) {
-  execution_paused = true;
-  send_thread_stopped(1234567, STOP_REASON_ENTRY, "Stopped at entry");
+  send_thread_stopped(12345678, STOP_REASON_ENTRY, "Stopped at entry", NULL);
   next_debug_event();
 }
 
@@ -2256,8 +2264,7 @@ static void DelayedRequestPause_handle(DelayedRequest* request) {
   stanza_debugger_pause();
   respond_to_delayed_request(request, NULL);
   // TODO: must be sent from the actually paused stanza program.
-  execution_paused = true;
-  send_thread_stopped(1234567, STOP_REASON_PAUSE, "Paused");
+  send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", NULL);
 }
 static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
   return DelayedRequest_create(request, sizeof(DelayedRequestPause), &DelayedRequestPause_handle);

@@ -68,7 +68,7 @@ typedef struct{
   uint64_t slots[];
 } StackFrame;
 
-typedef struct{  
+typedef struct{
   uint64_t num_slots;
   uint64_t code;
   uint64_t slots[];
@@ -146,7 +146,7 @@ void save_sigaction_context (struct sigaction_context* save_context,
   save_context->fregs[12] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm12);
   save_context->fregs[13] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm13);
   save_context->fregs[14] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm14);
-  save_context->fregs[15] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm15);  
+  save_context->fregs[15] = xmm_low_bits(&context->uc_mcontext->__fs.__fpu_xmm15);
 }
 
 //Write the given attributes to the processor context.
@@ -253,16 +253,23 @@ void* untag_ref (uint64_t ref){
   return (void*)(ref - 1 + 8);
 }
 
+uint64_t get_signal_handler_ip (){
+  //The stored RIP is the address immediately after
+  //the INT3 instruction, which is guaranteed to be 1-byte.
+  //Therefore we subtract 1 to obtain the address of the breakpoint.
+  return stanza_sighandler_context.rip - 1;
+}
+
 //1) Set Stanza saved_c_rsp to point to Stanza signal handling stack.
 //2) Set RSP to top of Stanza's currently active stack.
 //3) Retrieve the current signal_handler and jump to it using the Stanza calling convention.
 void signal_handler (int signal, siginfo_t* info, void* input_context){
   save_sigaction_context(&stanza_sighandler_context, input_context, stanza_saved_c_rsp);
-  
-  //Set the return address to be the restore_sighandler_trampoline.
-  *((uint64_t*)stanza_stack_pointer) = (uint64_t)stanza_sighandler_trampoline;  
 
-  //Set CRSP to point to signal handling stack.  
+  //Set the return address to be the restore_sighandler_trampoline.
+  *((uint64_t*)stanza_stack_pointer) = (uint64_t)stanza_sighandler_trampoline;
+
+  //Set CRSP to point to signal handling stack.
   stanza_saved_c_rsp = stanza_sighandler_trampoline_stack;
 
   //Retrieve the sig-handler closure.
