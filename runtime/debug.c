@@ -877,11 +877,15 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
   }
   JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
   JSBuilder_write_bool_field(&builder, "allThreadsStopped", true);
-  JSBuilder_write_bool_field(&builder, "preserveFocusHint", false);
-  JSBuilder_write_bool_field(&builder, "threadCausedFocus", true);
+  //JSBuilder_write_bool_field(&builder, "preserveFocusHint", false);
+  //JSBuilder_write_bool_field(&builder, "threadCausedFocus", true);
   JSBuilder_send_and_destroy_event(&builder);
 }
+static int64_t current_line;
+int64_t stanza_debugger_current_line(const void*);
 void send_thread_stopped_at_breakpoint(const void* breakpoint_id) {
+  current_line = stanza_debugger_current_line(breakpoint_id);
+
   char description[64];
   const uint64_t thread_id = 12345678;
   log_printf("Hit a breakpoint at %p\n", breakpoint_id);
@@ -1783,10 +1787,12 @@ void append_breakpoint(BreakpointVector* v, uint64_t id, uint64_t line, uint64_t
   bp->id = id;
   bp->line = line;
   bp->column = column;
-  bp->verified = false; // TODO: may need to assign a meaningful value here.
+  bp->verified = true; // TODO: may need to assign a meaningful value here.
 }
 void set_safepoints (const char* filename, SourceBreakpoint* sbp, long sbp_length, BreakpointVector* out);
 
+//TODO: Remove me
+static const char* breakpoint_source_path;
 typedef struct {
   DelayedRequest parent;
   char* source_path;  // Owned by this request
@@ -1807,6 +1813,8 @@ static void DelayedRequestSetBreakpoints_handle(DelayedRequest* request) {
     JSBuilder_array_field_begin(&builder, "breakpoints");
     {
       const char* source_path = req->source_path;
+      //TODO: Remove me
+      if (!breakpoint_source_path) breakpoint_source_path = strdup(source_path);
       for (const Breakpoint *p = out_breakpoints.data, *const limit = p + out_breakpoints.length; p < limit; p++) {
         JSBuilder_next(&builder);
         JSBuilder_write_breakpoint(&builder, p->id, p->verified, source_path, p->line, p->column);
@@ -2077,12 +2085,22 @@ static StackTraceFrame* StackTrace_allocate(StackTrace* st) {
   return st->data + st->length++;
 }
 
+//TODO: Remove this temoorary function
+void fill_stack_frame_for_current_breakpoint(StackTraceFrame* frame);
+
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
 // Frames not visible to the debugger can be skipped.
 // Returns total number of frames in thread_id stack or -1 when no thread with given therad_id thread_is found.
 static int64_t create_stack_trace(StackTrace* st, int64_t thread_id, int64_t start, int64_t max_frames) {
   // TODO: Implement this function in debugger core.
-  return 0;
+  StackTraceFrame* frame = StackTrace_allocate(st);
+  frame->source_path = breakpoint_source_path;
+  frame->source_path =
+  frame->function_name = "main"; // Let's hardcode it for now.
+  frame->source_path = breakpoint_source_path;
+  frame->line = current_line;
+  frame->column = 0; // Undefined
+  return 1;
 }
 
 typedef struct {
@@ -2095,7 +2113,7 @@ static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
   StackTrace st;
   StackTrace_initialize(&st);
-  const int64_t total_frames = create_stack_trace(&st, req->thread_id, req->start_frame, req->max_frames);
+  const int64_t total_frames = (terminated_event_sent || !breakpoint_source_path) ? 0 : create_stack_trace(&st, req->thread_id, req->start_frame, req->max_frames);
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
@@ -2109,10 +2127,13 @@ static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
       {
         JSBuilder_write_unsigned_field(&builder, "id", p->id);
         JSBuilder_write_string_field(&builder, "name", p->function_name);
-        JSBuilder_write_string_field(&builder, "source", p->source_path);
+        JSBuilder_object_field_begin(&builder, "source");
+        {
+          JSBuilder_write_string_field(&builder, "path", p->source_path);
+        }
+        JSBuilder_object_field_end(&builder);
         JSBuilder_write_unsigned_field(&builder, "line", p->line);
-        if (p->column)
-          JSBuilder_write_unsigned_field(&builder, "column", p->column);
+        JSBuilder_write_unsigned_field(&builder, "column", p->column);  //Mandatory here
       }
       JSBuilder_object_end(&builder);
     }
@@ -2195,6 +2216,7 @@ typedef DelayedRequest DelayedRequestContinue;
 int stanza_debugger_continue (void);
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
   execution_paused = false;
+  current_line = 0;
   stanza_debugger_continue();
 
   JSBuilder builder;
