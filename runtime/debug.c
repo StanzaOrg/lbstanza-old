@@ -2053,7 +2053,10 @@ static bool request_threads(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
-enum { INVALID_THREAD_ID = -1 };
+enum {
+  INVALID_THREAD_ID = -1,
+  INVALID_FRAME_ID = -1
+};
 
 typedef struct {
   uint64_t id;  // Unique id that combines thread/coroutine id and frame id in the stack (i.e. offset from the bottom).
@@ -2094,8 +2097,6 @@ void fill_stack_frame_for_current_breakpoint(StackTraceFrame* frame);
 static int64_t create_stack_trace(StackTrace* st, int64_t thread_id, int64_t start, int64_t max_frames) {
   // TODO: Implement this function in debugger core.
   StackTraceFrame* frame = StackTrace_allocate(st);
-  frame->source_path = breakpoint_source_path;
-  frame->source_path =
   frame->function_name = "main"; // Let's hardcode it for now.
   frame->source_path = breakpoint_source_path;
   frame->line = current_line;
@@ -2155,6 +2156,103 @@ static inline DelayedRequest* DelayedRequestStackTrace_create(const JSObject* re
 }
 static bool request_stackTrace(const JSObject* request) {
   insert_to_request_queue(DelayedRequestStackTrace_create(request));
+  return true;
+}
+
+// "ScopesRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Scopes request; value of command field is 'scopes'. The
+//     request returns the variable scopes for a given stackframe ID.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "scopes" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/ScopesArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "ScopesArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'scopes' request.",
+//   "properties": {
+//     "frameId": {
+//       "type": "integer",
+//       "description": "Retrieve the scopes for this stackframe."
+//     }
+//   },
+//   "required": [ "frameId" ]
+// },
+// "ScopesResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'scopes' request.",
+//     "properties": {
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "scopes": {
+//             "type": "array",
+//             "items": {
+//               "$ref": "#/definitions/Scope"
+//             },
+//             "description": "The scopes of the stackframe. If the array has
+//             length zero, there are no scopes available."
+//           }
+//         },
+//         "required": [ "scopes" ]
+//       }
+//     },
+//     "required": [ "body" ]
+//   }]
+// }
+typedef struct {
+  DelayedRequest parent;
+  int64_t frame_id;
+} DelayedRequestScopes;
+static void DelayedRequestScopes_handle(DelayedRequest* request) {
+  const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
+  const int64_t frame_id = req->frame_id;
+
+  JSBuilder builder;
+  JSBuilder_initialize_delayed_response(&builder, request, NULL);
+  JSBuilder_object_field_begin(&builder, "body");
+  {
+    JSBuilder_array_field_begin(&builder, "scopes");
+    // TODO: call a function to fill locals and globals available in frame_id
+    JSBuilder_array_field_end(&builder);
+  }
+  JSBuilder_object_field_end(&builder); // body
+  JSBuilder_send_and_destroy_response(&builder);
+}
+static inline DelayedRequest* DelayedRequestScopes_create(const JSObject* request) {
+  DelayedRequestScopes* req = DelayedRequest_create(request, sizeof(DelayedRequestScopes), &DelayedRequestScopes_handle);
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  req->frame_id = JSObject_get_integer_field(arguments, "frameId", INVALID_FRAME_ID);
+  return (DelayedRequest*) req;
+}
+static bool request_scopes(const JSObject* request) {
+  // O.P.: Following comment is shamelessly borrowed from LLDB:
+  // As the user selects different stack frames in the GUI, a "scopes" request
+  // will be sent to the DAP. This is the only way we know that the user has
+  // selected a frame in a thread. There are no other notifications that are
+  // sent and VS code doesn't allow multiple frames to show variables
+  // concurrently. If we select the thread and frame as the "scopes" requests
+  // are sent, this allows users to type commands in the debugger console
+  // with a backtick character to run lldb commands and these lldb commands
+  // will now have the right context selected as they are run. If the user
+  // types "`bt" into the debugger console and we had another thread selected
+  // in the LLDB library, we would show the wrong thing to the user. If the
+  // users switches threads with a lldb command like "`thread select 14", the
+  // GUI will not update as there are no "event" notification packets that
+  // allow us to change the currently selected thread or frame in the GUI that
+  // I am aware of.
+
+  insert_to_request_queue(DelayedRequestScopes_create(request));
   return true;
 }
 
@@ -2373,6 +2471,7 @@ static bool request_disconnect(const JSObject* request) {
   def(initialize)             \
   def(launch)                 \
   def(pause)                  \
+  def(scopes)                 \
   def(setBreakpoints)         \
   def(setExceptionBreakpoints)\
   def(stackTrace)             \
