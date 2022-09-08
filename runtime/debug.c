@@ -1843,15 +1843,24 @@ static inline DelayedRequest* DelayedRequestSetBreakpoints_create(const JSObject
   const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
   if (breakpoints) {
     // Validate brakpoints and store in in_breakpoints.
+    int64_t previous_line = -1;
+    int64_t current_line = 0;
     for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
       if (p->kind == JS_OBJECT) {
         const JSObject* o = &p->u.o;
         const int64_t line = JSObject_get_integer_field(o, "line", 0);
         const int64_t column = JSObject_get_integer_field(o, "column", 0);
+        // Workaround VSCode bug: series of breakpoints at the same line instaed of breakpoints at subsequent lines.
+        if (line == previous_line) {
+          ++current_line;
+        } else {
+          previous_line = line;
+          current_line = line;
+        }
         // TODO: get optional condition, hitCondition and logMessage fields.
         if (line <= 0 || column < 0) continue;
         SourceBreakpoint* sbp = SourceBreakpointVector_allocate(in_breakpoints);
-        sbp->line = line;
+        sbp->line = current_line;
         sbp->column = column;
       }
     }
