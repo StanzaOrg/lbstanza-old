@@ -2219,25 +2219,106 @@ static bool request_stackTrace(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
+
+// The debugger must be aware of the scope ids
+#define VARIABLE_SCOPES(def)\
+  def(PARAMETERS, "Parameters", "parameters")\
+  def(LOCALS,     "Locals",     "locals"    )\
+  def(GLOBALS,    "Globals",    "globals"   )
+enum {
+  #define DEF_SCOPE_ID(id, name, hint) SCOPE_ID_##id,
+    VARIABLE_SCOPES(DEF_SCOPE_ID)
+  #undef DEF_SCOPE_ID
+  NUMBER_OF_SCOPES
+};
+
+typedef struct {
+  const char* name;     // Not owned by Variable
+  ssize_t fields_count;
+  ssize_t fields_start; // Index of first field in VariableStorage, or 0 if not yet known
+} Variable;
+static inline void Variable_initialize(Variable* var, const char* name) {
+  var->name = name;
+  var->fields_count = 0;
+  var->fields_start = 0;
+}
+static inline void Variable_destroy(Variable* var) {
+}
+
+typedef struct {
+  ssize_t length;
+  ssize_t capacity;
+  Variable* data;
+} Environment;
+static inline void Environment_initialize(Environment* env) {
+  env->length = 0;
+  env->capacity = 64;
+  env->data = malloc(env->capacity * sizeof(Variable));
+}
+static void Environment_destroy(Environment* env) {
+  // It is safe to destroy uninitialized Environment:
+  // by default all fields are zeroed
+  for (Variable *p = env->data, *limit = p + env->length; p < limit; p++)
+    Variable_destroy(p);
+  free(env->data);
+}
+static inline void Environment_reset(Environment* env) {
+  Environment_destroy(env);
+  Environment_initialize(env);
+}
+static inline Variable* Environment_allocate(Environment* env) {
+  if (env->length == env->capacity) {
+    env->capacity <<= 1;
+    env->data = realloc(env->data, env->capacity * sizeof(Variable));
+    //TODO: handle possible OOM
+  }
+  return env->data + env->length++;
+}
+
+static Environment current_frame_env;
+static int64_t current_frame_id;
+
 typedef struct {
   DelayedRequest parent;
   int64_t frame_id;
 } DelayedRequestScopes;
 static void DelayedRequestScopes_handle(DelayedRequest* request) {
   const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
-  const int64_t frame_id = req->frame_id;
+  current_frame_id = req->frame_id;
+  Environment_reset(&current_frame_env);
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   {
     JSBuilder_array_field_begin(&builder, "scopes");
-    // TODO: call a function to fill locals and globals available in frame_id
+    for (int scope_id = 0; scope_id < NUMBER_OF_SCOPES; scope_id++) {
+      JSBuilder_next(&builder);
+      JSBuilder_object_begin(&builder);
+      {
+        static const struct {const char* name; const char* hint; } scope_attributes[] = {
+          #define DEF_SCOPE_ATTRIBUTES(id, name, hint) {name, hint},
+            VARIABLE_SCOPES(DEF_SCOPE_ATTRIBUTES)
+          #undef DEF_SCOPE_ATTRIBUTES
+        };
+        Variable* var = Environment_allocate(&current_frame_env);
+        const char* scope_name = scope_attributes[scope_id].name;
+        const char* scope_hint = scope_attributes[scope_id].hint;
+        Variable_initialize(var, scope_name);
+        JSBuilder_write_raw_string_field(&builder, "name", scope_name);
+        JSBuilder_write_raw_string_field(&builder, "presentationHint", scope_hint);
+        JSBuilder_write_unsigned_field(&builder, "variablesReference", scope_id);
+        JSBuilder_write_bool_field(&builder, "expensive", false);
+      }
+      JSBuilder_object_end(&builder);
+    }
     JSBuilder_array_field_end(&builder);
   }
   JSBuilder_object_field_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
 }
+#undef VARIABLE_SCOPES
+
 static inline DelayedRequest* DelayedRequestScopes_create(const JSObject* request) {
   DelayedRequestScopes* req = DelayedRequest_create(request, sizeof(DelayedRequestScopes), &DelayedRequestScopes_handle);
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
@@ -2262,6 +2343,160 @@ static bool request_scopes(const JSObject* request) {
   // I am aware of.
 
   insert_to_request_queue(DelayedRequestScopes_create(request));
+  return true;
+}
+
+// "VariablesRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Variables request; value of command field is 'variables'.
+//     Retrieves all child variables for the given variable reference. An
+//     optional filter can be used to limit the fetched children to either named
+//     or indexed children.", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "variables" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/VariablesArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "VariablesArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'variables' request.",
+//   "properties": {
+//     "variablesReference": {
+//       "type": "integer",
+//       "description": "The Variable reference."
+//     },
+//     "filter": {
+//       "type": "string",
+//       "enum": [ "indexed", "named" ],
+//       "description": "Optional filter to limit the child variables to either
+//       named or indexed. If ommited, both types are fetched."
+//     },
+//     "start": {
+//       "type": "integer",
+//       "description": "The index of the first variable to return; if omitted
+//       children start at 0."
+//     },
+//     "count": {
+//       "type": "integer",
+//       "description": "The number of variables to return. If count is missing
+//       or 0, all variables are returned."
+//     },
+//     "format": {
+//       "$ref": "#/definitions/ValueFormat",
+//       "description": "Specifies details on how to format the Variable
+//       values."
+//     }
+//   },
+//   "required": [ "variablesReference" ]
+// },
+// "VariablesResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'variables' request.",
+//     "properties": {
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "variables": {
+//             "type": "array",
+//             "items": {
+//               "$ref": "#/definitions/Variable"
+//             },
+//             "description": "All (or a range) of variables for the given
+//             variable reference."
+//           }
+//         },
+//         "required": [ "variables" ]
+//       }
+//     },
+//     "required": [ "body" ]
+//   }]
+// }
+static bool request_variables(const JSObject* request) {
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  const uint64_t kind = JSObject_get_integer_field(arguments, "variablesReference", -1);
+  const int64_t start = JSObject_get_integer_field(arguments, "start", 0);
+  uint64_t count = JSObject_get_integer_field(arguments, "count", UINT64_MAX);
+  const JSObject* format = JSObject_get_object_field(arguments, "format");
+  const bool hex = JSObject_get_bool_field(format, "hex", false);
+#if 0
+  llvm::json::Object response;
+  FillResponse(request, response);
+  llvm::json::Array variables;
+  auto arguments = request.getObject("arguments");
+  const auto variablesReference =
+      GetUnsigned(arguments, "variablesReference", 0);
+
+  if (lldb::SBValueList *top_scope = GetTopLevelScope(variablesReference)) {
+    // variablesReference is one of our scopes, not an actual variable it is
+    // asking for the list of args, locals or globals.
+    int64_t start_idx = 0;
+    int64_t num_children = 0;
+
+    num_children = top_scope->GetSize();
+    const int64_t end_idx = start_idx + ((count == 0) ? num_children : count);
+
+    // We first find out which variable names are duplicated
+    std::map<std::string, int> variable_name_counts;
+    for (auto i = start_idx; i < end_idx; ++i) {
+      lldb::SBValue variable = top_scope->GetValueAtIndex(i);
+      if (!variable.IsValid())
+        break;
+      variable_name_counts[GetNonNullVariableName(variable)]++;
+    }
+
+    // Now we construct the result with unique display variable names
+    for (auto i = start_idx; i < end_idx; ++i) {
+      lldb::SBValue variable = top_scope->GetValueAtIndex(i);
+
+      if (!variable.IsValid())
+        break;
+
+      int64_t var_ref = 0;
+      if (variable.MightHaveChildren()) {
+        var_ref = g_vsc.variables.InsertExpandableVariable(
+            variable, /*is_permanent=*/false);
+      }
+      variables.emplace_back(CreateVariable(
+          variable, var_ref, var_ref != 0 ? var_ref : UINT64_MAX, hex,
+          variable_name_counts[GetNonNullVariableName(variable)] > 1));
+    }
+  } else {
+    // We are expanding a variable that has children, so we will return its
+    // children.
+    lldb::SBValue variable = g_vsc.variables.GetVariable(variablesReference);
+    if (variable.IsValid()) {
+      const auto num_children = variable.GetNumChildren();
+      const int64_t end_idx = start + ((count == 0) ? num_children : count);
+      for (auto i = start; i < end_idx; ++i) {
+        lldb::SBValue child = variable.GetChildAtIndex(i);
+        if (!child.IsValid())
+          break;
+        if (child.MightHaveChildren()) {
+          auto is_permanent =
+              g_vsc.variables.IsPermanentVariableReference(variablesReference);
+          auto childVariablesReferences =
+              g_vsc.variables.InsertExpandableVariable(child, is_permanent);
+          variables.emplace_back(CreateVariable(child, childVariablesReferences,
+                                                childVariablesReferences, hex));
+        } else {
+          variables.emplace_back(CreateVariable(child, 0, INT64_MAX, hex));
+        }
+      }
+    }
+  }
+  llvm::json::Object body;
+  body.try_emplace("variables", std::move(variables));
+  response.try_emplace("body", std::move(body));
+  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
+#endif
   return true;
 }
 
@@ -2484,7 +2719,8 @@ static bool request_disconnect(const JSObject* request) {
   def(setBreakpoints)         \
   def(setExceptionBreakpoints)\
   def(stackTrace)             \
-  def(threads)
+  def(threads)                \
+  def(variables)
 
 static const char* const request_names[] = {
   #define DEFINE_REQUEST_NAME(name) #name,
