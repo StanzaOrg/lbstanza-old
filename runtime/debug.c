@@ -622,6 +622,9 @@ static inline void JSBuilder_append_bool(JSBuilder* builder, bool v) {
   JSBuilder_append_string(builder, v ? "true" : "false");
 }
 
+static void JSBuilder_append_null(JSBuilder* builder) {
+  JSBuilder_append_string(builder, "null");
+}
 static void JSBuilder_append_quotes(JSBuilder* builder) {
   JSBuilder_append_char(builder, '\"');
 }
@@ -667,7 +670,10 @@ static void JSBuilder_write_quoted_text(JSBuilder* builder, const char* data, ss
   JSBuilder_append_quotes(builder);
 }
 static void JSBuilder_write_quoted_string(JSBuilder* builder, const char* s) {
-  JSBuilder_write_quoted_text(builder, s, strlen(s));
+  if (s)
+    JSBuilder_write_quoted_text(builder, s, strlen(s));
+  else
+    JSBuilder_append_null(builder);
 }
 
 enum { JSIndentStep = 2 };
@@ -703,13 +709,22 @@ static void JSBuilder_write_raw_string_field(JSBuilder* builder, const char* nam
   JSBuilder_write_field(builder, name);
   JSBuilder_write_quoted_raw_string(builder, value);
 }
+static void JSBuilder_write_optional_raw_string_field(JSBuilder* builder, const char* name, const char* value) {
+  if (value) JSBuilder_write_raw_string_field(builder, name, value);
+}
 static void JSBuilder_write_string_field(JSBuilder* builder, const char* name, const char* value) {
   JSBuilder_write_field(builder, name);
   JSBuilder_write_quoted_string(builder, value);
 }
+static void JSBuilder_write_optional_string_field(JSBuilder* builder, const char* name, const char* value) {
+  if (value) JSBuilder_write_string_field(builder, name, value);
+}
 static void JSBuilder_write_unsigned_field(JSBuilder* builder, const char* name, uint64_t value) {
   JSBuilder_write_field(builder, name);
   JSBuilder_append_unsigned(builder, value);
+}
+static void JSBuilder_write_optional_unsigned_field(JSBuilder* builder, const char* name, uint64_t value) {
+  if (value) JSBuilder_write_unsigned_field(builder, name, value);
 }
 static void JSBuilder_write_bool_field(JSBuilder* builder, const char* name, bool value) {
   JSBuilder_write_field(builder, name);
@@ -1034,10 +1049,8 @@ static void JSBuilder_write_breakpoint(JSBuilder* builder, uint64_t id, bool ver
     JSBuilder_write_string_field(builder, "path", path);
     // TODO: In addition to "path" LLDB sets "name" field to basename(path)
     JSBuilder_object_end(builder);
-    if (line)
-      JSBuilder_write_unsigned_field(builder, "line", line);
-    if (column)
-      JSBuilder_write_unsigned_field(builder, "column", column);
+    JSBuilder_write_optional_unsigned_field(builder, "line", line);
+    JSBuilder_write_optional_unsigned_field(builder, "column", column);
   }
   JSBuilder_object_end(builder);
 }
@@ -1270,8 +1283,7 @@ static void JSBuilder_initialize_response_to_command(JSBuilder* builder, const c
   JSBuilder_write_raw_string_field(builder, "command", command);
   JSBuilder_write_unsigned_field(builder, "request_seq", request_seq);
   JSBuilder_write_bool_field(builder, "success", message == NULL);
-  if (message)
-    JSBuilder_write_string_field(builder, "message", message);
+  JSBuilder_write_optional_string_field(builder, "message", message);
 }
 static void JSBuilder_initialize_response(JSBuilder* builder, const JSObject* request, const char* message) {
   const char* command = JSObject_get_string_field(request, "command");
@@ -2232,17 +2244,41 @@ enum {
   NUMBER_OF_SCOPES
 };
 
+// Varaiable attributes (must be knwn to the debugger)
+enum {
+  VARIABLE_PUBLIC = 1,
+  VARIABLE_PRIVATE = 2,
+  VARIABLE_PROTECTED = 3,
+  VARIABLE_VISIBILITY_MASK = 3,
+  VARIABLE_CONSTANT = 1 << 2
+};
+static inline const char* variable_visibility(const unsigned variable_attributes) {
+  static const char* const names[] = {
+    NULL,
+    "public",
+    "private",
+    "protected"
+  };
+  return names[variable_attributes & VARIABLE_VISIBILITY_MASK];
+}
+
 typedef struct {
   const char* name;     // Not owned by Variable
-  ssize_t fields_count;
-  ssize_t fields_start; // Index of first field in VariableStorage, or 0 if not yet known
+  const char* type;     // Not owned by Variable
+  char* value;          // Optional, owned by Variable
+  ssize_t named_fields_count;
+  ssize_t indexed_fields_count;
+  uint8_t attributes;
 } Variable;
 static inline void Variable_initialize(Variable* var, const char* name) {
   var->name = name;
-  var->fields_count = 0;
-  var->fields_start = 0;
+  var->type = NULL;
+  var->value = NULL;
+  var->named_fields_count = 0;
+  var->indexed_fields_count = 0;
 }
 static inline void Variable_destroy(Variable* var) {
+  free(var->value);
 }
 
 typedef struct {
@@ -2276,7 +2312,7 @@ static inline Variable* Environment_allocate(Environment* env) {
 }
 
 static Environment current_frame_env;
-static int64_t current_frame_id;
+static int64_t current_frame_id = INVALID_FRAME_ID;
 
 typedef struct {
   DelayedRequest parent;
@@ -2301,9 +2337,9 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
             VARIABLE_SCOPES(DEF_SCOPE_ATTRIBUTES)
           #undef DEF_SCOPE_ATTRIBUTES
         };
-        Variable* var = Environment_allocate(&current_frame_env);
         const char* scope_name = scope_attributes[scope_id].name;
         const char* scope_hint = scope_attributes[scope_id].hint;
+        Variable* var = Environment_allocate(&current_frame_env);
         Variable_initialize(var, scope_name);
         JSBuilder_write_raw_string_field(&builder, "name", scope_name);
         JSBuilder_write_raw_string_field(&builder, "presentationHint", scope_hint);
@@ -2419,84 +2455,71 @@ static bool request_scopes(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
-static bool request_variables(const JSObject* request) {
-  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  const uint64_t kind = JSObject_get_integer_field(arguments, "variablesReference", -1);
-  const int64_t start = JSObject_get_integer_field(arguments, "start", 0);
-  uint64_t count = JSObject_get_integer_field(arguments, "count", UINT64_MAX);
-  const JSObject* format = JSObject_get_object_field(arguments, "format");
-  const bool hex = JSObject_get_bool_field(format, "hex", false);
-#if 0
-  llvm::json::Object response;
-  FillResponse(request, response);
-  llvm::json::Array variables;
-  auto arguments = request.getObject("arguments");
-  const auto variablesReference =
-      GetUnsigned(arguments, "variablesReference", 0);
+typedef struct {
+  DelayedRequest parent;
+  uint64_t variable_id;
+  uint64_t start;
+  uint64_t count;
+  bool hex;
+} DelayedRequestVariables;
+static void DelayedRequestVariables_handle(DelayedRequest* request) {
+  const DelayedRequestVariables* req = (const DelayedRequestVariables*)request;
 
-  if (lldb::SBValueList *top_scope = GetTopLevelScope(variablesReference)) {
-    // variablesReference is one of our scopes, not an actual variable it is
-    // asking for the list of args, locals or globals.
-    int64_t start_idx = 0;
-    int64_t num_children = 0;
+  const uint64_t variable_id = req->variable_id;
+  const ssize_t start_index = current_frame_env.length;
+  if (variable_id < (uint64_t)start_index) {
+    // TODO: ask debugger to add `count` of variable at `variable_id` in `current_frame_id`,
+    // startung from `start` kid to current_frame_env, formatting their values according to `hex`
+  }
 
-    num_children = top_scope->GetSize();
-    const int64_t end_idx = start_idx + ((count == 0) ? num_children : count);
+  JSBuilder builder;
+  JSBuilder_initialize_delayed_response(&builder, request, NULL);
+  JSBuilder_object_field_begin(&builder, "body");
+  {
+    JSBuilder_array_field_begin(&builder, "variables");
+    const Variable* data = current_frame_env.data;
+    for (ssize_t var_id = start_index, limit = current_frame_env.length; var_id < limit; var_id++) {
+      JSBuilder_next(&builder);
+      JSBuilder_object_begin(&builder);
+      {
+        const Variable* var = data + var_id;
+        JSBuilder_write_unsigned_field(&builder, "variablesReference", var_id);
+        JSBuilder_write_raw_string_field(&builder, "name", var->name);
+        JSBuilder_write_optional_string_field(&builder, "type", var->type);
+        JSBuilder_write_string_field(&builder, "value", var->value);
+        JSBuilder_write_optional_unsigned_field(&builder, "namedVariables", var->named_fields_count);
+        JSBuilder_write_optional_unsigned_field(&builder, "indexedVariables", var->indexed_fields_count);
 
-    // We first find out which variable names are duplicated
-    std::map<std::string, int> variable_name_counts;
-    for (auto i = start_idx; i < end_idx; ++i) {
-      lldb::SBValue variable = top_scope->GetValueAtIndex(i);
-      if (!variable.IsValid())
-        break;
-      variable_name_counts[GetNonNullVariableName(variable)]++;
-    }
-
-    // Now we construct the result with unique display variable names
-    for (auto i = start_idx; i < end_idx; ++i) {
-      lldb::SBValue variable = top_scope->GetValueAtIndex(i);
-
-      if (!variable.IsValid())
-        break;
-
-      int64_t var_ref = 0;
-      if (variable.MightHaveChildren()) {
-        var_ref = g_vsc.variables.InsertExpandableVariable(
-            variable, /*is_permanent=*/false);
-      }
-      variables.emplace_back(CreateVariable(
-          variable, var_ref, var_ref != 0 ? var_ref : UINT64_MAX, hex,
-          variable_name_counts[GetNonNullVariableName(variable)] > 1));
-    }
-  } else {
-    // We are expanding a variable that has children, so we will return its
-    // children.
-    lldb::SBValue variable = g_vsc.variables.GetVariable(variablesReference);
-    if (variable.IsValid()) {
-      const auto num_children = variable.GetNumChildren();
-      const int64_t end_idx = start + ((count == 0) ? num_children : count);
-      for (auto i = start; i < end_idx; ++i) {
-        lldb::SBValue child = variable.GetChildAtIndex(i);
-        if (!child.IsValid())
-          break;
-        if (child.MightHaveChildren()) {
-          auto is_permanent =
-              g_vsc.variables.IsPermanentVariableReference(variablesReference);
-          auto childVariablesReferences =
-              g_vsc.variables.InsertExpandableVariable(child, is_permanent);
-          variables.emplace_back(CreateVariable(child, childVariablesReferences,
-                                                childVariablesReferences, hex));
-        } else {
-          variables.emplace_back(CreateVariable(child, 0, INT64_MAX, hex));
+        const unsigned attributes = var->attributes;
+        if (attributes) {
+          JSBuilder_object_field_begin(&builder, "presentationHint");
+          {
+            if (attributes & VARIABLE_CONSTANT)
+              JSBuilder_write_raw_string_field(&builder, "attributes", "constant");
+            JSBuilder_write_optional_raw_string_field(&builder, "visibility", variable_visibility(attributes));
+          }
+          JSBuilder_object_field_end(&builder);
         }
       }
+      JSBuilder_object_end(&builder);
     }
+    JSBuilder_array_field_end(&builder);
   }
-  llvm::json::Object body;
-  body.try_emplace("variables", std::move(variables));
-  response.try_emplace("body", std::move(body));
-  g_vsc.SendJSON(llvm::json::Value(std::move(response)));
-#endif
+  JSBuilder_object_field_end(&builder); // body
+  JSBuilder_send_and_destroy_response(&builder);
+}
+static inline DelayedRequest* DelayedRequestVariables_create(const JSObject* request) {
+  DelayedRequestVariables* req = DelayedRequest_create(request, sizeof(DelayedRequestVariables), &DelayedRequestVariables_handle);
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  req->variable_id = JSObject_get_integer_field(arguments, "variablesReference", -1);
+  req->start = JSObject_get_integer_field(arguments, "start", 0);
+  req->count = JSObject_get_integer_field(arguments, "count", UINT64_MAX);
+  const JSObject* format = JSObject_get_object_field(arguments, "format");
+  req->hex = JSObject_get_bool_field(format, "hex", false);
+  return (DelayedRequest*) req;
+}
+static bool request_variables(const JSObject* request) {
+  insert_to_request_queue(DelayedRequestVariables_create(request));
   return true;
 }
 
@@ -2691,8 +2714,7 @@ static void DelayedRequestDisconnect_handle(DelayedRequest* request) {
   const char* error = NULL;
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
-  if (error)
-    JSBuilder_write_string_field(&builder, "error", error);
+  JSBuilder_write_optional_string_field(&builder, "error", error);
   JSBuilder_send_and_destroy_response(&builder);
 
   if (!error) send_terminated();
