@@ -771,7 +771,16 @@ static void write_error_and_exit (int fd){
   exit(-1);
 }
 
+static void disable_ctrl_c () {
+  #ifdef PLATFORM_WINDOWS
+    SetConsoleCtrlHandler(NULL, TRUE);
+  #else
+    signal(SIGINT, SIG_IGN);
+  #endif
+}
+
 static void launcher_main (FILE* lin, FILE* lout){
+  disable_ctrl_c();
   while(1){
     //Read in command
     int comm = fgetc(lin);
