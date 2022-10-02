@@ -896,10 +896,12 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
   //JSBuilder_write_bool_field(&builder, "threadCausedFocus", true);
   JSBuilder_send_and_destroy_event(&builder);
 }
+
+static const char* current_file;
 static int64_t current_line;
-int64_t stanza_debugger_current_line(const void*);
+int64_t stanza_debugger_current_source_position(const void* p, const char** filename);
 void send_thread_stopped_at_breakpoint(const void* breakpoint_id) {
-  current_line = stanza_debugger_current_line(breakpoint_id);
+  current_line = stanza_debugger_current_source_position(breakpoint_id, &current_file);
 
   char description[64];
   const uint64_t thread_id = 12345678;
@@ -1804,7 +1806,6 @@ void append_breakpoint(BreakpointVector* v, uint64_t id, uint64_t line, uint64_t
 void set_safepoints (const char* filename, SourceBreakpoint* sbp, long sbp_length, BreakpointVector* out);
 
 //TODO: Remove me
-static const char* breakpoint_source_path;
 typedef struct {
   DelayedRequest parent;
   char* source_path;  // Owned by this request
@@ -1826,7 +1827,6 @@ static void DelayedRequestSetBreakpoints_handle(DelayedRequest* request) {
     {
       const char* source_path = req->source_path;
       //TODO: Remove me
-      if (!breakpoint_source_path) breakpoint_source_path = strdup(source_path);
       for (const Breakpoint *p = out_breakpoints.data, *const limit = p + out_breakpoints.length; p < limit; p++) {
         JSBuilder_next(&builder);
         JSBuilder_write_breakpoint(&builder, p->id, p->verified, source_path, p->line, p->column);
@@ -2119,7 +2119,7 @@ static int64_t create_stack_trace(StackTrace* st, int64_t thread_id, int64_t sta
   // TODO: Implement this function in debugger core.
   StackTraceFrame* frame = StackTrace_allocate(st);
   frame->function_name = "main"; // Let's hardcode it for now.
-  frame->source_path = breakpoint_source_path;
+  frame->source_path = current_file;
   frame->line = current_line;
   frame->column = 0; // Undefined
   return 1;
@@ -2135,7 +2135,7 @@ static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
   StackTrace st;
   StackTrace_initialize(&st);
-  const int64_t total_frames = (terminated_event_sent || !breakpoint_source_path) ? 0 : create_stack_trace(&st, req->thread_id, req->start_frame, req->max_frames);
+  const int64_t total_frames = (terminated_event_sent || !current_file) ? 0 : create_stack_trace(&st, req->thread_id, req->start_frame, req->max_frames);
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
@@ -2582,6 +2582,7 @@ int stanza_debugger_continue (void);
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
   execution_paused = false;
   current_line = 0;
+  current_file = NULL;
   stanza_debugger_continue();
 
   JSBuilder builder;
