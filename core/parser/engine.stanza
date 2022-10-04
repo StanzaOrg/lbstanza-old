@@ -1,0 +1,639 @@
+defpackage parser/engine :
+  import core with:
+    prefix(StackFrame) => core-
+  import collections
+  import parser/context
+  import parser/ops
+  import parser/lookahead-tokens
+  import parser/errors
+  import parser/engine-frames
+  import parser/engine-value-stack
+  import parser/eval-value
+  import parser/timers
+  import stz/timing-log-api
+
+;<doc>=======================================================
+;=================== Parsing Engine =========================
+;============================================================
+
+# Compilation of Actions #
+
+Productions compile to:
+
+  operations ... [Return]
+
+Normal actions compile to:
+
+  [Action] operations ... [ActionEnd]
+
+This results in an action value being pushed onto the value
+stack.
+
+Failure actions compile to:
+
+  [Action] operations ... [ActionEnd] [Fail]
+
+Guarded actions compile to:
+
+  [Action] operations ... [ActionEnd] [Guard]
+
+This results in the action value being ready on the value
+stack for the guard to examine.
+
+Guarded failure actions compile to:
+
+  [Action] operations ... [ActionEnd] [Guard] [Fail]
+
+This results in the guard having executed before the failure
+is executed.
+
+Not patterns compile to:
+
+  [InvBranch] operations ... [Commit]
+
+This results in [Commit] being executed if all the operations
+parse successfully. Otherwise, the parse fails and is handled
+by the InvBranchFrame.
+
+# Representation of Values on Value Stack #
+
+Normal values are stored as is on the stack.
+
+  42 "hello"
+
+Values necessary for evaluating an action are stored:
+
+  [ActionMarker] values ... [ActionEndMarker]
+
+List values created from loop operations are stored:
+
+  [ListMarker] values ... [ListEndMarker]
+
+
+;============================================================
+;=======================================================<doc>
+
+;============================================================
+;================ Public API ================================
+;============================================================
+
+public defn parse (form:List,
+                   package:OpPackage,
+                   prod:Int,
+                   repeat?:True|False) -> ? :
+  val state = MachineState(productions(package),
+                           ops(package), callbacks(package),
+                           [], [],
+                           lookahead-table(package))
+  val pc = address(productions(package)[prod])
+  run-until-end(form, pc, state, false, repeat?)
+
+public defn parse (form:List,
+                   package:OpPackage,
+                   opmatch:OpMatchPattern,
+                   match-actions:Tuple<(Context -> ?)>) :
+  val state = MachineState(productions(package),
+                           ops(package), callbacks(package),
+                           ops(opmatch), match-actions,
+                           lookahead-table(package))
+  run-until-end(form, 0, state, true, false)
+
+;============================================================
+;=============== Machine State Datastructure ================
+;============================================================
+
+defstruct MachineState :
+  productions:Tuple<ProductionOp>
+  opcodes:Tuple<Op>
+  actions:Tuple<(Context -> ?)>
+  overlay-opcodes:Tuple<Op>
+  overlay-actions:Tuple<(Context -> ?)>
+  lookahead-table:HashTable<[Int,LookaheadToken],Int>
+  stack:Vector<StackFrame> with:
+    init => Vector<StackFrame>()
+  value-stack:Vector with:
+    init => Vector<?>()
+  error-stack:Vector with:
+    init => Vector<?>()
+
+;============================================================
+;================== Main Driver =============================
+;============================================================
+
+;Execute the parsing engine. When finished, collect the
+;errors, and evaluate the result.
+defn run-until-end (input-form:List,
+                    initial-pc:Int,
+                    state:MachineState,
+                    overlay?:True|False,
+                    repeat?:True|False) -> ? :
+  val result = within log-time(PARSER-INTERPRET) :
+    interpret(input-form, initial-pc, state, overlay?, repeat?)
+  if not empty?(error-stack(state)) :
+    throw(evaluate-errors(state))
+  else if not finished?(result) :
+    throw(NoMatchError([]))
+  else if not empty?(form(result)) or not empty?(upform(result)) :
+    throw(NoMatchError([RemainingInput(info(result))]))
+  else :    
+    evaluate-result(state)
+
+;============================================================
+;==================== Main Engine ===========================
+;============================================================
+
+;Start executing the parsing engine.
+;- input-form: The form to parse.
+;- initial-pc: The address of the starting instruction.
+;- state: The machine state.
+;- start-in-overlay?: True if the starting instruction is
+;  in the overlay instructions. False if in the package
+;  instructions.
+defn interpret (input-form:List,
+                initial-pc:Int,
+                state:MachineState,
+                start-in-overlay?:True|False,
+                repeat?:True|False) -> InterpreterResult :
+
+  ;Sanity check: Repeat is not allowed in
+  ;overlay mode.
+  if repeat? and start-in-overlay? :
+    fatal("Repeat parsing is not supported in overlay mode.")
+
+  ;Track whether we are currently in the overlay instructions.
+  var overlay?:True|False
+
+  ;The current opcodes that are executing. This will switch
+  ;between the overlay instructions and the package instructions.
+  var opcodes:Tuple<Op>
+
+  ;Helper: Switch the overlay mode.
+  defn switch-overlay-mode (overlay-mode:True|False) :
+    overlay? = overlay-mode
+    opcodes = overlay-opcodes(state) when overlay? else /opcodes(state)
+
+  ;For convenience pull out the frame stack, the value stack, and
+  ;error stack from the state so that they are quickly accessible.
+  val stack = stack(state)
+  val value-stack = value-stack(state)
+  val error-stack = error-stack(state)
+
+  ;Helper functions for manipulating the stack.
+  ;--------------------------------------------
+
+  ;Push a stack frame to the stack.
+  defn push-frame (frame:StackFrame) :
+    add(stack, frame)
+
+  ;Pop a stack frame with an assumed type from the stack.
+  defn pop-frame () : pop(stack)
+  defn pop-frame<T> () : pop-frame() as T&StackFrame
+  
+  ;Push a value to the value stack.
+  defn push-value (v) : add(value-stack, v)
+
+  ;Push an error to the error stack.
+  defn push-error (e) : add(error-stack, e)
+
+  ;Main loop of interpreter
+  ;------------------------
+  
+  ;- form: The next list to parse.
+  ;- upform: The list to resume parsing when we encounter a
+  ;  right paren.
+  ;- pc: The next instruction to execute.
+
+  defn* loop (info:FileInfo|False, form:List, upform:List<List>, pc:Int) :
+;    println("%_) %_ (%_) (overlay = %_)" % [pc, opcodes[pc], next-token, overlay?]) where :
+;      val next-token =
+;        if empty?(form) : "DONE"
+;        else if unwrap-token(head(form)) is List : "LPAREN"
+;        else : head(form)
+;    println("STACK:\n%_" % [indented-items(stack)])    
+;    println("loop:")
+;    println("  pc = %_" % [pc])
+;    println("  opcode = %_" % [opcodes[pc]])
+;    println("  form = %_" % [form])
+;    println("  upform = %_" % [upform])
+;    println("  value stack: %_" % [value-stack])
+;    println("  stack:\n%_" % [indented-items(stack)])
+
+    match(opcodes[pc]) :
+      (op:Loop) :
+        ;First check whether the input is empty. If it
+        ;is, then don't start the loop. This is important to
+        ;skip nullable productions. Create the correct number
+        ;of empty lists.
+        if empty?(form) :
+
+          ;List out the correct number of empty lists.
+          for i in 0 to bind-arity(op) do :
+            push-value(List())        
+
+          ;Continue parsing from after loop.
+          loop(info, form, upform, end-address(op))
+
+        ;Push a ListMarker and a LoopFrame.
+        else :
+          ;Write out list start marker if appropriate.
+          val bind? = bind-arity(op) > 0
+          push-value(ListMarker(bind-arity(op))) when bind?
+
+          ;Add a loop frame so that we can return to the beginning.
+          push-frame $ LoopFrame(info, form, upform,
+                                 pc + 1, end-address(op),
+                                 length(value-stack), bind?)
+          ;Begin the first iteration of the loop.
+          loop(info, form, upform, pc + 1)
+
+      (op:LoopEnd) :
+        ;Check whether we've reached the end of input.
+        ;If it has, then we stop without parsing further.
+        ;This is important in case the loop pattern is nullable.
+        if empty?(form) :
+          val frame = pop-frame<LoopFrame>()
+
+          ;Mark the end of the list.
+          if bind?(frame) :
+            add(value-stack, ListEndMarker())
+
+          ;Continue execution from after the loop.
+          loop(info, form, upform, end(frame))
+
+        ;If we haven't reached the end of the input, then we need
+        ;to commit the most recent iteration.
+        else :
+          ;Record how much of the input we've parsed.
+          val frame = pop-frame<LoopFrame>()
+          push-frame $ LoopFrame(info, form, upform,
+                                 start(frame), end(frame),
+                                 length(value-stack), bind?(frame))
+
+          ;Go back to the beginning of the loop.
+          loop(info, form, upform, start(frame))
+
+      (op:Terminal) :
+        ;Compute whether it's a match.
+        val match? = not empty?(form)
+                 and match-terminal-value?(value(op), head(form))
+        if match? :
+          push-value(head(form)) when bind?(op)
+          val new-form = tail(form)
+          val new-info = new-info(info, new-form)
+          loop(new-info, new-form, upform, pc + 1)
+        else :
+          popframe-failure(info, form, upform)
+
+      (op:Rest) :
+        push-value(form) when bind?(op)
+        loop(info, List(), upform, pc + 1)
+      
+      (op:Any) :
+        if not empty?(form) :
+          push-value(head(form)) when bind?(op)
+          val new-form = tail(form)
+          val new-info = new-info(info, new-form)          
+          loop(new-info, new-form, upform, pc + 1)
+        else :
+          popframe-failure(info, form, upform)
+      
+      (op:NoMatch) :
+        popframe-failure(info, form, upform)
+
+      (op:Commit) :
+        match(pop-frame()) :
+          (frame:BranchFrame) :
+            loop(info, form, upform, conseq(frame))
+          (frame:InvBranchFrame) :
+            popframe-failure(info, form, upform)
+
+      (op:CommitNoMatch) :
+        val frame = pop-frame<BranchFrame>()
+        popframe-failure(info, form, upform)
+        
+      (op:Return) :
+        ;If there is nothing on the stack anymore
+        ;then the parse is finished.
+        if empty?(stack) :
+          end-parse(true, info, form, upform)
+          
+        else :
+          ;Retrieve the CallFrame on the top of the stack.        
+          val frame = pop-frame<CallFrame>()
+          
+          ;Throw away any values if the called production
+          ;is not bound.
+          if not bind?(frame) :
+            shorten(value-stack, num-values(frame))
+            
+          ;Return to using overlay opcodes if that's where
+          ;the call originated.
+          if from-overlay?(frame) :
+            switch-overlay-mode(true)
+            
+          ;Continue executing from the return address.
+          loop(info, form, upform, return(frame))
+
+      (op:Branch) :
+        val alt = head(alts(op))
+        val alt-tail = tail(alts(op))
+        push-frame $ BranchFrame(alt-tail, conseq(op),
+                                 info, form, upform, length(value-stack))
+        loop(info, form, upform, alt)
+
+      (op:Lookahead) :
+        val next-token =
+          if empty?(form) :
+            EndToken()
+          else :
+            match(unwrap-token(head(form))) :
+              (x:List) : ListToken()
+              (x) : TerminalToken(x)
+        val addr = get?(lookahead-table(state), [pc, next-token])
+        match(addr, alt(op)) :
+          (addr:Int, alt) : loop(info, form, upform, addr) 
+          (f:False, alt:Int) : loop(info, form, upform, alt)
+          (f:False, alt:False) : popframe-failure(info, form, upform)
+
+      (op:Goto) :
+        loop(info, form, upform, address(op))
+
+      (op:InvBranch) :
+        push-frame $ InvBranchFrame(info, form, upform, length(value-stack),
+                                    end-address(op))
+        loop(info, form, upform, pc + 1)
+
+      (op:Call) :
+        push-frame $ CallFrame(pc + 1, length(value-stack), bind?(op), false)
+        loop(info, form, upform, address(op))
+
+      (op:CallProduction) :
+        ;Retrieve the address of the production.
+        val prod-address = address(productions(state)[production(op)])
+        
+        ;Switch out of the overlay.
+        switch-overlay-mode(false)
+
+        ;Push the call frame, and mark it as coming from an
+        ;overlay call.
+        push-frame $ CallFrame(pc + 1, length(value-stack), bind?(op), true)
+
+        ;Goto the production address.
+        loop(info, form, upform, prod-address)
+
+      (op:Action) :
+        push-frame $ ActionFrame(length(value-stack), false)
+        push-value $ ActionMarker(info)
+        loop(info, form, upform, pc + 1)
+
+      (op:ActionEnd) :
+        val frame = pop-frame<ActionFrame>()
+        push-value $ ActionEndMarker(overlay?, num-values(frame), lazy?(op),
+                                     index(op), encountered-failure?(frame))
+        loop(info, form, upform, pc + 1)
+
+      (op:GuardCheck) :        
+        match(parse-last-value(value-stack)) :
+          ;Execute the guard action on the binder values
+          ;and no-match if the guard returns false.
+          (value:ActionResult) :
+            ;Retrieve the guard action.
+            val guard = overlay-actions(state)[index(op)] when overlay?
+                   else actions(state)[index(op)]
+            
+            ;Continue execution if the guard evaluates to true,
+            ;otherwise fail.
+            if evaluate-guard(guard, value) : loop(info, form, upform, pc + 1)
+            else : popframe-failure(info, form, upform)
+
+          ;If we've already encountered a failure, then continue
+          ;treating the guard like a fail.          
+          (value:FailedResult) :
+            popframe-recover(info, form, upform)
+
+      (op:LParen) :
+        val match? = not empty?(form)
+                 and unwrap-token(head(form)) is List
+        if match? :
+          push-value(unwrap-token(head(form))) when bind?(op)
+          val list = unwrap-token(head(form)) as List
+          val new-info = new-info(info, list)
+          val new-upform = cons(tail(form), upform)
+          push-frame $ ListFrame(new-upform, end-address(op), length(value-stack))
+          loop(new-info, list, new-upform, pc + 1)
+        else :
+          popframe-failure(info, form, upform)
+
+      (op:RParen) :
+        if empty?(form) :
+          pop-frame<ListFrame>()
+          val form = head(upform)
+          loop(info, form, tail(upform), pc + 1)
+        else :
+          popframe-failure(info, form, upform)
+
+      (op:Fail) :
+        ;If the value has already encountered a failure, then skip
+        ;creating this error object.
+        match(parse-last-value(value-stack)) :
+          (e:ActionResult) : push-error(e)
+          (f:FailedResult) : false
+
+        ;Attempt popping frames until recovery.
+        popframe-recover(info, form, upform)
+
+  ;The match has failed. Continue the parse by popping frames until we
+  ;reach the next resume point.
+  defn* popframe-failure (info:FileInfo|False, form:List, upform:List<List>) :
+    ;Pop frames until we reach a BranchFrame with an alternative, or a
+    ;LoopFrame, or an InvBranchFrame.
+    val frame = let loop () :
+      if not empty?(stack) :
+        match(pop-frame()) :
+          (frame:BranchFrame) :
+            if empty?(alts(frame)) : loop()
+            else : frame
+          (frame:LoopFrame|InvBranchFrame) :
+            frame
+          (frame:ListFrame|ActionFrame) :
+            loop()
+          (frame:CallFrame) :
+            ;Popping past a overlay call requires switching back
+            ;to using the overlay opcodes.
+            switch-overlay-mode(true) when from-overlay?(frame)
+            loop()
+
+    ;Handle the cases.
+    match(frame) :
+      ;No more frames to pop, so the parse has finished and no
+      ;match was found.
+      (frame:False) :
+        end-parse(false, info, form, upform)
+        
+      ;Try a different alternative.
+      (frame:BranchFrame) :
+        ;Restore the value stack.
+        shorten(value-stack, num-values(frame))
+
+        ;Record that we've used up one alternative.
+        val alt = head(alts(frame))
+        push-frame $ sub-alts(frame, tail(alts(frame)))
+
+        ;Go to the alternative.
+        loop(/info(frame), /form(frame), /upform(frame), alt)
+
+      ;The NotPattern has failed, which means that
+      ;we are free to go on.
+      (frame:InvBranchFrame) :
+        ;Restore the value stack.
+        shorten(value-stack, num-values(frame))
+        
+        ;Continue parsing.
+        loop(/info(frame), /form(frame), /upform(frame), end(frame))
+
+      ;The loop is now finished, so continue from
+      ;after the loop.
+      (frame:LoopFrame) :
+        ;Restore the value stack to before we started
+        ;this loop iteration.
+        shorten(value-stack, num-values(frame))
+
+        ;Write end of list marker.
+        push-value(ListEndMarker()) when bind?(frame)
+
+        ;Go on to after the loop.
+        loop(/info(frame), /form(frame), /upform(frame), end(frame))
+        
+  defn* popframe-recover (info:FileInfo|False, form:List, upform:List<List>) :
+    ;Pop frames until we reach a ListFrame, which is
+    ;something we can recover from.
+    val frame = let loop () :
+      if not empty?(stack) :
+        match(pop-frame()) :
+          (frame:ListFrame) :
+            frame
+          (frame:ActionFrame|LoopFrame|BranchFrame|InvBranchFrame) :
+            loop()
+          (frame:CallFrame) :
+            ;Popping past a overlay call requires switching back
+            ;to using the overlay opcodes.
+            switch-overlay-mode(true) when from-overlay?(frame)
+            loop()
+
+    ;Helper: To indicate that a failure has occurred, we commit the
+    ;following changes to our context:
+    ;- All actions being parsed are now flagged as having encountered
+    ;  a failure.
+    ;- We disallow any further alternative branches. The failure means
+    ;  that we've committed to a specific branch.
+    defn commit-failure-to-stack () :
+      for frame in stack map! :
+        match(frame) :
+          (frame:BranchFrame) : sub-alts(frame, List())
+          (frame:ActionFrame) : sub-encountered-failure?(frame, true)
+          (frame) : frame
+
+    ;Handle the cases.
+    match(frame) :
+      ;No more frames to pop. Couldn't recover.
+      (frame:False) :
+        end-parse(false, info, form, upform)
+      ;Found a ListFrame to recover with.
+      (frame:ListFrame) :
+        commit-failure-to-stack()
+        shorten(value-stack, num-values(frame))
+        val new-form = head(/upform(frame))
+        val new-info = new-info(info, new-form)
+        loop(new-info, new-form, tail(/upform(frame)), end(frame))
+
+  ;Finished one execution of the parsing program.
+  ;- finished?: True if we reached the end of the program successfully.
+  ;  False if we encountered unrecoverable Fail or NoMatch.
+  defn* end-parse (finished?:True|False,
+                   info:FileInfo|False,
+                   form:List,
+                   upform:List<List>) -> InterpreterResult :
+    ;Run the program again if it finished successfully,
+    ;repeat is requested, and there's more to parse.
+    val loop-again? =
+      finished? and repeat? and
+      (not empty?(form) or not empty?(upform))
+    if loop-again? :
+      loop(info, form, upform, initial-pc)
+    else :
+      InterpreterResult(finished?, info, form, upform)
+
+  ;Launch!
+  switch-overlay-mode(start-in-overlay?)
+  push-value(ListMarker(1)) when repeat?
+  val info = new-info(false, input-form)
+  val result = loop(info, input-form, List(), initial-pc)
+  push-value(ListEndMarker()) when repeat?
+  result
+
+;Representation of the result of running the interpreter.
+;- finished?: Whether the interpreter ran to the end of the
+;  parsing program successfully.
+;- form/upform: The remaining input to be parsed.
+defstruct InterpreterResult :
+  finished?:True|False
+  info:FileInfo|False
+  form:List
+  upform:List<List>
+
+;============================================================
+;============= Determine whether Terminal Matches ===========
+;============================================================
+
+;Return true if the given terminal matches the given form.
+defn* match-terminal-value? (terminal-value, form-value) -> True|False :
+  match(terminal-value, form-value) :
+    ;Handle tokens
+    (tv, fv:Token) :
+      match-terminal-value?(tv, item(fv))
+    ;Handle lists
+    (tv:List, fv:List) :
+      match(empty?(tv), empty?(fv)) :
+        (etv:True, efv:True) : true
+        (etv:False, efv:False) : match-terminal-value?(head(tv), head(fv)) and
+                                 match-terminal-value?(tail(tv), tail(fv))
+        (etc, efv) : false
+    ;Handle atoms
+    (tv, fv) :
+      tv == fv
+
+;============================================================
+;================ Evaluate Errors and Result ================
+;============================================================
+
+;Evaluate all the errors on the error stack.
+defn evaluate-errors (state:MachineState) -> NoMatchError :
+  NoMatchError $ for e in error-stack(state) seq :
+    evaluate-result(actions(state), overlay-actions(state), e) as Exception
+
+;Evaluates the result of the parse by evaluating the first
+;value on the value stack.
+defn evaluate-result (state:MachineState) -> ? :
+  if not empty?(value-stack(state)) :
+    val result = within log-time(PARSER-PARSE-VALUE-STACK) :
+      parse-first-value(value-stack(state))
+    within log-time(PARSER-EVAL) :
+      evaluate-result(actions(state), overlay-actions(state), result)
+
+;============================================================
+;====================== Misc ================================
+;============================================================
+
+;Given the previous file position 'old-info', and the form
+;that we are about to parse. Return the updated file position
+;if form contains a Token.
+defn new-info (old-info:FileInfo|False, form:List) -> FileInfo|False :
+  if empty?(form) :
+    old-info
+  else :
+    match(head(form)) :
+      (t:Token) : info(t)
+      (f) : old-info
+
+defn indented-items (xs:Seqable) :
+  Indented("%n" % [xs])

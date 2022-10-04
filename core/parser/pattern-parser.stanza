@@ -1,0 +1,181 @@
+defpackage parser/pattern-parser :
+  import core
+  import collections
+  import parser/patterns
+  import parser/errors
+  import macro-utils with :
+    prefix(Choice) => MU
+
+;============================================================
+;================= Pattern Parser ===========================
+;============================================================
+
+defn subsymbol (x:Symbol, n:Int) :
+   to-symbol(to-string(x)[n to false])
+
+defn ensure-cap-form (form) -> Symbol :
+   val f:List = unwrap-token(form)
+   if length(f) != 2 :
+      throw $ PatternError $
+      "Invalid binding form %~. Cap form should have form (@cap name)." % [form]
+   val name = unwrap-token(f[1])
+   if name is-not Symbol :
+      throw $ PatternError $
+      "Invalid binding form %~. Cap form should have form (@cap name)." % [form]
+   name
+
+defn ensure-escape-value (form:List) :
+   if empty?(form) :
+      throw $ PatternError $
+      "Expected escaped value, but reached end of list."
+
+defn ensure-splice-list (p:Pattern) :
+   match(p) :
+      (p:ListPat) :
+         pattern(p)
+      (p) :
+         throw $ PatternError $
+         "Splice repeat operator @... requires a list pattern, but found %~." % [p]
+
+public defn parse-pattern (form:List, binders-allowed?:True|False) -> Pattern :
+   ;Sequence of forms (without handling | operator)
+   defn pseq (f:List) -> [Pattern, List] :
+      ;End of sequence
+      if empty?(f) :
+         [Empty(), f]
+      ;Choice operator
+      else if tagged-list?(f, `|) :
+         [Empty(), f]
+      ;Binder
+      else if tagged-list?(head(f), `@cap) :
+         val name = ensure-cap-form(head(f))
+         val [p, rest] = pseq $
+            if tagged-list?(tail(f), `:) : tailn(f, 2)
+            else : cons(`_, tail(f))
+         val p* = match(p) :
+            (p:SeqPat) : SeqPat(Binder(name, a(p)), b(p))
+            (p) : Binder(name, p)
+         [p*, rest]
+      ;Escape
+      else if tagged-list?(f, `~) :
+         ensure-escape-value(tail(f))
+         val [p, rest] = pseq(tailn(f, 2))
+         [SeqPat(Terminal(unwrap-all(f[1])), p), rest]
+      ;Repeat Splice
+      else if tagged-list?(tail(f), `@...) :
+         val p1 = ensure-splice-list(pp(head(f)))
+         val [p2, rest] = pseq(tailn(f, 2))
+         [SeqPat(Repeat(p1), p2), rest]
+      ;Repeat
+      else if tagged-list?(tail(f), `...) :
+         val p1 = pp(head(f))
+         val [p2, rest] = pseq(tailn(f, 2))
+         [SeqPat(Repeat(p1), p2), rest]
+      ;Otherwise
+      else :
+         val p1 = pp(head(f))
+         val [p2, rest] = pseq(tail(f))
+         [SeqPat(p1, p2), rest]
+   ;Sequence of pseq forms (handles | operator)
+   defn pexp (f:List) :
+      val [p1, rest] = pseq(f)
+      if tagged-list?(rest, `|) :
+         val p2 = pexp(tail(rest))
+         Choice(p1, p2)
+      else :
+         fatal("Unhandled Pattern: %_" % [form]) when not empty?(rest)
+         p1
+   ;General Form (handles ! operator)
+   defn pform (f:List) :
+      if tagged-list?(f, `!) : NotPat(pexp(tail(f)))
+      else : pexp(f)
+
+   ;Single Pattern
+   defn pp (f) :
+      match(f) :
+         (f:Token) :
+            pp(item(f))
+         (f:List) :
+            match(pform(f)) :
+               (p:Choice|NotPat) : p
+               (p) : ListPat(p)
+         (f:Symbol) :
+            if f == `_ : Form()
+            else if prefix?(f, "#") : Production(subsymbol(f, 1))
+            else : Terminal(f)
+         (f) :
+            Terminal(f)
+
+   ;Driver
+   val parsed = pform(form)
+   if binders-allowed? : ensure-wellformed-binders(parsed)
+   else : ensure-no-binders(parsed)
+   parsed
+
+;============================================================
+;================== Pattern Prechecks =======================
+;============================================================
+
+defn ensure-wellformed-binders (p:Pattern) :
+   ;Errors on duplicate binders or unbalanced binders
+   defn ensure-no-duplicates (names:List<Symbol>) :
+      val seen = HashTable<Symbol,True>()
+      for name in names do :
+         if key?(seen, name) :
+            throw $ PatternError $
+            "Duplicate declaration of binder %_." % [name]
+         seen[name] = true
+         
+   defn same? (a:List<Symbol>, b:List<Symbol>) :
+      if length(a) == length(b) :
+         all?(contains?{b, _}, a)
+         
+   defn binders (p:Pattern) -> List<Symbol> :
+      match(p) :
+         (p:NotPat) :
+            ensure-no-binders(pattern(p))
+            List()
+         (p:Binder) :
+            cons(name(p), binders(pattern(p)))
+         (p:Choice) :
+            val ba = binders(a(p))
+            val bb = binders(b(p))
+            ensure-no-duplicates(ba)
+            ensure-no-duplicates(bb)
+            if not same?(ba, bb) :
+               val msg = "Choice pattern with unbalanced binders. Left side pattern has \
+                          binders %, and right side pattern has binders %,."
+               throw(PatternError(msg % [ba, bb]))
+            ba
+         (p) :
+            seq-append(binders, children(p))
+
+   ensure-no-duplicates(binders(p))
+
+defn ensure-no-binders (p:Pattern) :
+   match(p) :
+      (p:Binder) :
+         throw $ PatternError $
+         "Cannot have binder %_ in Not rule/pattern." % [name(p)]
+      (p) : do(ensure-no-binders, p)   
+
+defn ensure-no-productions (p:Pattern) :
+   match(p) :
+      (p:Production) :
+         throw $ PatternError $
+         "Construct match-syntax with no base syntax package cannot use production %_" % [name(p)]
+      (p) : do(ensure-no-productions, p)   
+
+;============================================================
+;=================== Resolvable Productions =================
+;============================================================
+
+public defn ensure-resolvable-productions (p:Pattern, productions:HashTable<Symbol,True>) :
+   defn loop (p:Pattern) :
+      match(p) :
+         (p:Production) : 
+            if not key?(productions, name(p)) :
+               throw $ PatternError $
+                  "Could not resolve production %_." % [name(p)]
+         (p) : do(loop, p)
+   loop(p)      
