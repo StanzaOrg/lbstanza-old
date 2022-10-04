@@ -12,6 +12,7 @@ defpackage stz/resolver :
    import stz/dl-ir
    import stz/ids
    import stz/visibility
+   import stz/timing-log-api
 
 ;<doc>=======================================================
 ;====================== Environment =========================
@@ -54,6 +55,29 @@ will allow higher priority definitions to shadow previous definitions.
 
 ;============================================================
 ;=======================================================<doc>
+
+;============================================================
+;======================= Timers =============================
+;============================================================
+
+val RESOLVER = TimerLabel("Resolver")
+val RESOLVER-SYMBOL-TABLES = TimerLabel("Resolver: symbol tables", RESOLVER)
+val RESOLVER-EXP = TimerLabel("Resolver: resolve exp", RESOLVER)
+var ACTIVE-RESOLVE-EXP:TimerLabel|False = false
+
+defn log-resolve-exp-time<?T> (body:() -> ?T, package-name:Symbol) :
+  let-var ACTIVE-RESOLVE-EXP = TimerLabel(RESOLVER-EXP, suffix(package-name)) :
+    log-time(body, ACTIVE-RESOLVE-EXP as TimerLabel)
+
+defn exclude-from-resolve-exp-time<?T> (body:() -> ?T) :
+  match(ACTIVE-RESOLVE-EXP:TimerLabel) :
+    exclude-log-time(body, ACTIVE-RESOLVE-EXP)
+  else :
+    body()
+
+;============================================================
+;================= Environment Callbacks ====================
+;============================================================
 
 public deftype Env
 public defmulti imported-package (e:Env, package:Symbol) -> IPackage|PackageExports|False
@@ -110,73 +134,72 @@ Resolution Algorithm:
 ;============================================================
 ;=======================================================<doc>
 
-
-
 public defn resolve-il (packages:Tuple<IPackage|PackageExports>, env:Env) -> ResolverResult :
-  ;Track all detected errors
-  val error-accum = Vector<ResolveError>()
+  within log-time(RESOLVER) :
+    ;Track all detected errors
+    val error-accum = Vector<ResolveError>()
 
-  ;Create base environments
-  val symtables = SymbolTables(packages, env, error-accum)
+    ;Create base environments
+    val symtables = SymbolTables(packages, env, error-accum)
 
-  ;Resolve individual packages
-  ;  Accumulate all resolved packages into ipackages*
-  ;  Track conditional dependencies in cond-dependencies
-  val ipackages* = Vector<IPackage>()
-  val import-lists* = Vector<ImportList>()
-  val cond-dependencies = Vector<Symbol>()
-  let resolve-ipackages () :
-    val ds = load-conditional-dependencies(symtables)
-    add-all(cond-dependencies, ds)
-    val ps = new-ipackages(symtables)
-    for p in ps do :
-      val p* = resolve-package(p, symtables, package-priority(env), error-accum)
-      match(p*:IPackage) :
-        add(import-lists*, ImportList(name(p), imports(p)))
-        add(ipackages*, p*)
-    resolve-ipackages() when not empty?(ps) or not empty?(ds)
+    ;Resolve individual packages
+    ;  Accumulate all resolved packages into ipackages*
+    ;  Track conditional dependencies in cond-dependencies
+    val ipackages* = Vector<IPackage>()
+    val import-lists* = Vector<ImportList>()
+    val cond-dependencies = Vector<Symbol>()
+    let resolve-ipackages () :
+      val ds = load-conditional-dependencies(symtables)
+      add-all(cond-dependencies, ds)
+      val ps = new-ipackages(symtables)
+      for p in ps do :
+        val p* = resolve-package(p, symtables, package-priority(env), error-accum)
+        match(p*:IPackage) :
+          add(import-lists*, ImportList(name(p), imports(p)))
+          add(ipackages*, p*)
+      resolve-ipackages() when not empty?(ps) or not empty?(ds)
 
-  ;Resolve type dependencies from pkgs
-  check-exported-types(symtables, ipackages*, package-exports(symtables), error-accum)
+    ;Resolve type dependencies from pkgs
+    check-exported-types(symtables, ipackages*, package-exports(symtables), error-accum)
 
-  ;Compute initialization order
-  defn init-order () :
-    ;Compute set of all successfully resolved packages
-    val resolved-set = HashSet<Symbol>()
-    add-all(resolved-set, seq(name, ipackages*))
-    add-all(resolved-set, seq(package, package-exports(symtables)))
+    ;Compute initialization order
+    defn init-order () :
+      ;Compute set of all successfully resolved packages
+      val resolved-set = HashSet<Symbol>()
+      add-all(resolved-set, seq(name, ipackages*))
+      add-all(resolved-set, seq(package, package-exports(symtables)))
 
-    ;Return sequence of all successfully resolved packages
-    defn resolved? (ps:Seqable<Symbol>) -> Seq<Symbol> :
-      filter({resolved-set[_]}, ps)
+      ;Return sequence of all successfully resolved packages
+      defn resolved? (ps:Seqable<Symbol>) -> Seq<Symbol> :
+        filter({resolved-set[_]}, ps)
 
-    ;First compute the dependency graph
-    val dependency-graph = HashTable<Symbol,List<Symbol>>()
-    for p in ipackages* do :
-      dependency-graph[name(p)] = to-list $ resolved? $
-        seq(package, imports(p))
-    for p in package-exports(symtables) do :
-      dependency-graph[package(p)] = to-list $ resolved? $
-        imported-packages(p)
-      
-    ;Compute the input order
-    defn get-name (p:IPackage) : name(p)
-    defn get-name (p:PackageExports) : package(p)
-    val input-package-names = resolved? $ seq(get-name, packages)
-    val input-order = to-tuple $ resolved? $ cat-all $ [
-      `(core)
-      in-reverse(cond-dependencies),
-      input-package-names]
-    ;Compute init order    
-    to-tuple(initialization-order(dependency-graph, input-order))
+      ;First compute the dependency graph
+      val dependency-graph = HashTable<Symbol,List<Symbol>>()
+      for p in ipackages* do :
+        dependency-graph[name(p)] = to-list $ resolved? $
+          seq(package, imports(p))
+      for p in package-exports(symtables) do :
+        dependency-graph[package(p)] = to-list $ resolved? $
+          imported-packages(p)
+        
+      ;Compute the input order
+      defn get-name (p:IPackage) : name(p)
+      defn get-name (p:PackageExports) : package(p)
+      val input-package-names = resolved? $ seq(get-name, packages)
+      val input-order = to-tuple $ resolved? $ cat-all $ [
+        `(core)
+        in-reverse(cond-dependencies),
+        input-package-names]
+      ;Compute init order    
+      to-tuple(initialization-order(dependency-graph, input-order))
 
-  ;Return result
-  val errors = if not empty?(error-accum) :
-    ResolveErrors(to-tuple(error-accum))
-  ResolverResult(to-tuple(ipackages*),
-                 to-tuple(import-lists*),
-                 init-order(),
-                 errors)
+    ;Return result
+    val errors = if not empty?(error-accum) :
+      ResolveErrors(to-tuple(error-accum))
+    ResolverResult(to-tuple(ipackages*),
+                   to-tuple(import-lists*),
+                   init-order(),
+                   errors)
 
 ;============================================================
 ;=================== Resolve a Single Package ===============
@@ -190,7 +213,8 @@ defn resolve-package (ipackage:IPackage,
   val num-errors = length(error-accum)
   val symtable = symtables[name(ipackage)] as SymbolTable
   val eng = Engine(symtable, symtables, priority, error-accum)
-  val exps* = map(resolve-exp{_, eng}, exps(ipackage))
+  val exps* = within log-resolve-exp-time(name(ipackage)) :
+    map(resolve-exp{_, eng}, exps(ipackage))
   val ipackage* = sub-exps(ipackage, exps*)
   if length(error-accum) == num-errors :
     add-qualified-imports(ipackage*, qualified-imports(eng))
@@ -671,7 +695,8 @@ defn SymbolTables (packages:Tuple<IPackage|PackageExports>, env:Env, errors:Vect
   ;already been loaded. Recursively load all of its dependencies as well.
   defn load-package (name:Symbol) -> IPackage|PackageExports|False :   
     if not key?(pkg-table, name) :
-      val p = imported-package(env, name)
+      val p = within exclude-from-resolve-exp-time() :
+        imported-package(env, name)
       pkg-table[name] = p
       match(p:IPackage) :
         add(new-ipackages, p)
@@ -726,7 +751,8 @@ defn SymbolTables (packages:Tuple<IPackage|PackageExports>, env:Env, errors:Vect
     
   ;Construct a symbol table from a .pkg file.        
   defn make-symtable (p:PackageExports) -> SymbolTable :
-    SymbolTable(package(p), exports(p))
+    within log-time(RESOLVER-SYMBOL-TABLES) :
+      SymbolTable(package(p), exports(p))
 
   ;Create cached symbol tables
   val symtables = within package-name = HashTable-init<Symbol,SymbolTable|False>() :
