@@ -83,6 +83,7 @@ static void StringVector_append(StringVector* vector, const char* s) {
 static char* program_path;
 static pid_t program_pid;
 static bool terminated_event_sent;
+static bool stack_trace_available; // Stack trace is not available until VMState initialized
 static bool execution_paused;
 static pthread_mutex_t send_lock;
 static const char* debug_adapter_path;
@@ -897,11 +898,10 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
   JSBuilder_send_and_destroy_event(&builder);
 }
 
-static const char* current_file;
-static int64_t current_line;
 int64_t stanza_debugger_current_source_position(const void* p, const char** filename);
 void send_thread_stopped_at_breakpoint(const void* breakpoint_id) {
-  current_line = stanza_debugger_current_source_position(breakpoint_id, &current_file);
+  const char* current_file = NULL;
+  const int64_t current_line = stanza_debugger_current_source_position(breakpoint_id, &current_file);
 
   char description[64];
   const uint64_t thread_id = 12345678;
@@ -2081,8 +2081,8 @@ enum {
 
 typedef struct {
   uint64_t id;  // Unique id that combines thread/coroutine id and frame id in the stack (i.e. offset from the bottom).
-  const char* source_path;    // Referenced here, owned by debugger
-  const char* function_name;  // Referenced here, owned by debugger
+  const char* function_name;  // Not owned by StackTraceFrame
+  const char* source_path;    // Not owned by StackTraceFrame
   int64_t line;   // 1-based
   int64_t column; // 1-based, 0 denotes unknown
 } StackTraceFrame;
@@ -2100,7 +2100,7 @@ static void StackTrace_initialize(StackTrace* st) {
 static inline void StackTrace_destroy(StackTrace* st) {
   free(st->data);
 }
-static StackTraceFrame* StackTrace_allocate(StackTrace* st) {
+static inline StackTraceFrame* StackTrace_allocate(StackTrace* st) {
   if (st->length == st->capacity) {
     st->capacity <<= 1;
     st->data = realloc(st->data, st->capacity * sizeof(StackTraceFrame));
@@ -2109,21 +2109,20 @@ static StackTraceFrame* StackTrace_allocate(StackTrace* st) {
   return st->data + st->length++;
 }
 
-//TODO: Remove this temoorary function
-void fill_stack_frame_for_current_breakpoint(StackTraceFrame* frame);
+void append_stack_frame(StackTrace* st, uint64_t frame_id, const char* function_name,
+                        const char* source_path, int64_t line, int64_t column) {
+  StackTraceFrame* frame = StackTrace_allocate(st);
+  frame->id = frame_id;
+  frame->function_name = function_name;
+  frame->source_path = source_path;
+  frame->line = line;
+  frame->column = column;
+}
 
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
 // Frames not visible to the debugger can be skipped.
 // Returns total number of frames in thread_id stack or -1 when no thread with given therad_id thread_is found.
-static int64_t create_stack_trace(StackTrace* st, int64_t thread_id, int64_t start, int64_t max_frames) {
-  // TODO: Implement this function in debugger core.
-  StackTraceFrame* frame = StackTrace_allocate(st);
-  frame->function_name = "main"; // Let's hardcode it for now.
-  frame->source_path = current_file;
-  frame->line = current_line;
-  frame->column = 0; // Undefined
-  return 1;
-}
+int32_t create_stack_trace(StackTrace* st) ;
 
 typedef struct {
   DelayedRequest parent;
@@ -2135,7 +2134,8 @@ static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
   StackTrace st;
   StackTrace_initialize(&st);
-  const int64_t total_frames = (terminated_event_sent || !current_file) ? 0 : create_stack_trace(&st, req->thread_id, req->start_frame, req->max_frames);
+  if (!terminated_event_sent && stack_trace_available) create_stack_trace(&st);
+  const int64_t total_frames = st.length;
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
@@ -2149,11 +2149,13 @@ static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
       {
         JSBuilder_write_unsigned_field(&builder, "id", p->id);
         JSBuilder_write_string_field(&builder, "name", p->function_name);
-        JSBuilder_object_field_begin(&builder, "source");
-        {
-          JSBuilder_write_string_field(&builder, "path", p->source_path);
+        if (p->source_path) {
+          JSBuilder_object_field_begin(&builder, "source");
+          {
+            JSBuilder_write_string_field(&builder, "path", p->source_path);
+          }
+          JSBuilder_object_field_end(&builder);
         }
-        JSBuilder_object_field_end(&builder);
         JSBuilder_write_unsigned_field(&builder, "line", p->line);
         JSBuilder_write_unsigned_field(&builder, "column", p->column);  //Mandatory here
       }
@@ -2581,8 +2583,7 @@ typedef DelayedRequest DelayedRequestContinue;
 int stanza_debugger_continue (void);
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
   execution_paused = false;
-  current_line = 0;
-  current_file = NULL;
+  stack_trace_available = true;
   stanza_debugger_continue();
 
   JSBuilder builder;
