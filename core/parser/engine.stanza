@@ -82,7 +82,7 @@ public defn parse (form:List,
                    repeat?:True|False) -> ? :
   val state = MachineState(productions(package),
                            ops(package), callbacks(package),
-                           [], [],
+                           [], [], [],
                            lookahead-table(package))
   val pc = address(productions(package)[prod])
   run-until-end(form, pc, state, false, repeat?)
@@ -93,7 +93,7 @@ public defn parse (form:List,
                    match-actions:Tuple<(? -> ?)>) :
   val state = MachineState(productions(package),
                            ops(package), callbacks(package),
-                           ops(opmatch), match-actions,
+                           ops(opmatch), params(opmatch), match-actions,
                            lookahead-table(package))
   run-until-end(form, 0, state, true, false)
 
@@ -104,8 +104,9 @@ public defn parse (form:List,
 defstruct MachineState :
   productions:Tuple<ProductionOp>
   opcodes:Tuple<Op>
-  actions:Tuple<(? -> ?)>
+  actions:Tuple<ActionCallback>
   overlay-opcodes:Tuple<Op>
+  overlay-params:Tuple<ActionParams>
   overlay-actions:Tuple<(? -> ?)>
   lookahead-table:HashTable<LookaheadKey,Int>
   stack:Vector<StackFrame> with:
@@ -178,6 +179,9 @@ defn interpret (input-form:List,
   val error-stack = error-stack(state)
   val lookahead-table = lookahead-table(state)
 
+  ;Parser for reading the value stack.
+  val value-stack-parser = value-stack-parser(state)
+
   ;Helper functions for manipulating the stack.
   ;--------------------------------------------
 
@@ -188,6 +192,7 @@ defn interpret (input-form:List,
   ;Pop a stack frame with an assumed type from the stack.
   defn pop-frame () : pop(stack)
   defn pop-frame<T> () : pop-frame() as T&StackFrame
+  defn peek-frame<T> () : peek(stack) as T&StackFrame
   
   ;Push a value to the value stack.
   defn push-value (v) : add(value-stack, v)
@@ -236,13 +241,13 @@ defn interpret (input-form:List,
         ;Push a ListMarker and a LoopFrame.
         else :
           ;Write out list start marker if appropriate.
-          val bind? = bind-arity(op) > 0
-          push-value(ListMarker(bind-arity(op))) when bind?
+          push-value(ListMarker()) when bind-arity(op) > 0            
 
           ;Add a loop frame so that we can return to the beginning.
           push-frame $ LoopFrame(info, form, upform,
                                  pc + 1, end-address(op),
-                                 length(value-stack), bind?)
+                                 length(value-stack), bind-arity(op))
+
           ;Begin the first iteration of the loop.
           loop(info, form, upform, pc + 1)
 
@@ -254,8 +259,8 @@ defn interpret (input-form:List,
           val frame = pop-frame<LoopFrame>()
 
           ;Mark the end of the list.
-          if bind?(frame) :
-            add(value-stack, ListEndMarker())
+          if bind-arity(frame) > 0 :
+            add(value-stack, ListEndMarker(bind-arity(frame)))
 
           ;Continue execution from after the loop.
           loop(info, form, upform, end(frame))
@@ -267,7 +272,7 @@ defn interpret (input-form:List,
           val frame = pop-frame<LoopFrame>()
           push-frame $ LoopFrame(info, form, upform,
                                  start(frame), end(frame),
-                                 length(value-stack), bind?(frame))
+                                 length(value-stack), bind-arity(frame))
 
           ;Go back to the beginning of the loop.
           loop(info, form, upform, start(frame))
@@ -382,53 +387,67 @@ defn interpret (input-form:List,
         loop(info, form, upform, prod-address)
 
       (op:Action) :
-        push-frame $ ActionFrame(length(value-stack), false)
-        push-value $ ActionMarker(info)
+        push-frame $ ActionFrame(info, length(value-stack), false)
         loop(info, form, upform, pc + 1)
 
-      (op:ActionEnd) :
+      (op:Succeed) :
         val frame = pop-frame<ActionFrame>()
-        push-value $ ActionEndMarker(overlay?, num-values(frame), lazy?(op),
-                                     index(op), encountered-failure?(frame))
+        push-value $ ActionEndMarker(overlay?, index(op), /info(frame))
         loop(info, form, upform, pc + 1)
+
+      (op:Fail) :
+        ;Retrieve the frame where the action began.
+        val frame = pop-frame<ActionFrame>()
+
+        ;If the value has not already encountered a failure, then
+        ;create the error object. 
+        if not encountered-failure?(frame) :
+          push-error(parse-last-value(value-stack-parser))
+
+        ;Attempt popping frames until recovery.
+        popframe-recover(info, form, upform)
+
+      (op:ImmediateGuardCheck) :               
+        ;Retrieve the immediate value from the value stack.
+        val value = get-last-evaluated-value(value-stack-parser)
+
+        ;Retrieve the guard action.
+        val guard = overlay-actions(state)[index(op)] when overlay?
+               else callback(actions(state)[index(op)])
+        
+        ;Continue execution if the guard evaluates to true,
+        ;otherwise fail.
+        if guard(value) :
+          loop(info, form, upform, pc + 1)
+        else :
+          popframe-failure(info, form, upform)
 
       (op:GuardCheck) :
-        if single-binder-guard?(op) :
+
+        ;Retrieve the frame where the action began.
+        val frame = peek-frame<ActionFrame>()
+
+        ;If we've already encountered a failure, then continue
+        ;treating the guard like a fail.
+        if encountered-failure?(frame) :
+          popframe-recover(info, form, upform)
+
+        ;Otherwise, execute the guard action on the binder
+        ;values and no-match if the guard returns false.        
+        else :
+          ;Retrieve the immediate values from the value stack.
+          val values = get-last-evaluated-values(value-stack-parser, overlay?, index(op))
+          
           ;Retrieve the guard action.
           val guard = overlay-actions(state)[index(op)] when overlay?
-                 else actions(state)[index(op)]
-          ;Last value
-          val value = parse-last-value(value-stack)
-          if value is UnevaluatedResult :
-            fatal("Unexpected unevaluated result in single binder guard check.")
-          
+                 else callback(actions(state)[index(op)])
+
           ;Continue execution if the guard evaluates to true,
-          ;otherwise fail.
-          if guard(value) :
+          ;otherwise fial.
+          if evaluate-guard(guard, values) :
             loop(info, form, upform, pc + 1)
           else :
             popframe-failure(info, form, upform)
-            
-        else :
-          match(parse-last-value(value-stack)) :
-            ;If we've already encountered a failure, then continue
-            ;treating the guard like a fail.          
-            (value:FailedResult) :
-              popframe-recover(info, form, upform)
-
-            ;Execute the guard action on the binder values
-            ;and no-match if the guard returns false.
-            (value:ActionResult) :
-              ;Retrieve the guard action.
-              val guard = overlay-actions(state)[index(op)] when overlay?
-                     else actions(state)[index(op)]
-              
-              ;Continue execution if the guard evaluates to true,
-              ;otherwise fail.
-              if evaluate-guard(guard, value) :
-                loop(info, form, upform, pc + 1)
-              else :
-                popframe-failure(info, form, upform)
 
       (op:LParen) :
         val match? = not empty?(form)
@@ -450,16 +469,6 @@ defn interpret (input-form:List,
           loop(info, form, tail(upform), pc + 1)
         else :
           popframe-failure(info, form, upform)
-
-      (op:Fail) :
-        ;If the value has already encountered a failure, then skip
-        ;creating this error object.
-        match(parse-last-value(value-stack)) :
-          (e:ActionResult) : push-error(e)
-          (f:FailedResult) : false
-
-        ;Attempt popping frames until recovery.
-        popframe-recover(info, form, upform)
 
   ;The match has failed. Continue the parse by popping frames until we
   ;reach the next resume point.
@@ -518,7 +527,8 @@ defn interpret (input-form:List,
         shorten(value-stack, num-values(frame))
 
         ;Write end of list marker.
-        push-value(ListEndMarker()) when bind?(frame)
+        match(bind-arity(frame):Int) :
+          push-value(ListEndMarker(bind-arity(frame) as Int))
 
         ;Go on to after the loop.
         loop(/info(frame), /form(frame), /upform(frame), end(frame))
@@ -591,10 +601,10 @@ defn interpret (input-form:List,
   ;Otherwise, start executing from the initial pc. 
   else :
     switch-overlay-mode(start-in-overlay?)
-    push-value(ListMarker(1)) when repeat?
+    push-value(ListMarker()) when repeat?
     val info = new-info(false, input-form)
     val result = loop(info, input-form, List(), initial-pc)
-    push-value(ListEndMarker()) when repeat?
+    push-value(ListEndMarker(1)) when repeat?
     result
 
 ;Representation of the result of running the interpreter.
@@ -629,22 +639,34 @@ defn* match-terminal-value? (terminal-value, form-value) -> True|False :
       tv == fv
 
 ;============================================================
+;================= Parsing the Value Stack ==================
+;============================================================
+
+;Create a parser for reading the value stack.
+defn value-stack-parser (state:MachineState) -> ValueStackParser :
+  val info = new ParsingInfo :
+    defmethod action-bind-arity (this, overlay?:True|False, index:Int) :
+      if overlay? : bind-arity(overlay-params(state)[index])
+      else : bind-arity(params(actions(state)[index]))
+  ValueStackParser(value-stack(state), info)
+
+;============================================================
 ;================ Evaluate Errors and Result ================
 ;============================================================
 
 ;Evaluate all the errors on the error stack.
 defn evaluate-errors (state:MachineState) -> NoMatchError :
   NoMatchError $ for e in error-stack(state) seq :
-    evaluate-result(actions(state), overlay-actions(state), e) as Exception
+    evaluate-result(actions(state), overlay-actions(state), overlay-params(state), e) as Exception
 
 ;Evaluates the result of the parse by evaluating the first
 ;value on the value stack.
 defn evaluate-result (state:MachineState) -> ? :
   if not empty?(value-stack(state)) :
     val result = within log-time(PARSER-PARSE-VALUE-STACK) :
-      parse-first-value(value-stack(state))
+      parse-only-value(value-stack-parser(state))
     within log-time(PARSER-EVAL) :
-      evaluate-result(actions(state), overlay-actions(state), result)
+      evaluate-result(actions(state), overlay-actions(state), overlay-params(state), result)
 
 ;============================================================
 ;====================== Misc ================================

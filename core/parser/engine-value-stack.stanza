@@ -10,37 +10,25 @@ defpackage parser/engine-value-stack :
 ;binders necessary for evaluating actions.
 public deftype ValueMarker
 
-;Represents the start of the bound values necessary for evaluating
-;an action.
-;- info: The file position at the time the action was started.
-public defstruct ActionMarker <: ValueMarker :
+;Represents the end of the bound values for evaluating an action.
+;- overlay?: True if it is an overlay action.
+;- index: The index of the callback to evaluate to create the result
+;  object.
+;- info: The file information of the action. 
+public defstruct ActionEndMarker <: ValueMarker :
+  overlay?:True|False
+  index:Int
   info:FileInfo|False
 with: (printer => true)
 
-;Represents the end of the bound values for evaluating an action.
-;- overlay?: True if it is an overlay action.
-;- start-index: The index on the value-stack of the corresponding
-;  ActionMarker. This allows us to traverse the value-stack in reverse
-;  order.
-;- encountered-failure?: True if a [Fail] was encountered
-;  during evaluation of the results, and the binders were not
-;  computed successfully.
-public defstruct ActionEndMarker <: ValueMarker :
-  overlay?:True|False
-  start-index:Int
-  lazy?:True|False
-  action-index:Int
-  encountered-failure?:True|False
-with: (printer => true)
-
 ;Represents the start of a list.
-;- arity: The number of binders in the list pattern.
-public defstruct ListMarker <: ValueMarker :
-  arity:Int
-with: (printer => true)
+public defstruct ListMarker <: ValueMarker
+with: (printer => true)  
 
 ;Represents the end of a list.
-public defstruct ListEndMarker <: ValueMarker
+;- arity: The number of binders in the list pattern.
+public defstruct ListEndMarker <: ValueMarker :
+  arity:Int
 with: (printer => true)
 
 ;============================================================
@@ -61,9 +49,8 @@ public deftype UnevaluatedResult
 public defstruct ActionResult <: UnevaluatedResult :
   overlay?:True|False  
   action-index:Int
-  lazy?:True|False
   info:FileInfo|False
-  args:Tuple
+  args:Array
 with:
   printer => true
 
@@ -71,100 +58,159 @@ with:
 public defstruct ListResult <: UnevaluatedResult :
   results:Vector
 
-;Represents an action result for which parsing
-;of one of the subbinders has already failed. Does not
-;appear in a successful parse.
-public defstruct FailedResult <: UnevaluatedResult
-
 ;============================================================
-;==================== Parsing API ===========================
+;===================== Parsing API ==========================
 ;============================================================
 
-;Parse the first value on the value stack.
-public defn parse-first-value (values:Vector) -> ? :
-  parse-value(values, 0)
+;Represents information that value-stack parser needs to have.
+public deftype ParsingInfo
 
-;Parse the last value on the value stack.
-public defn parse-last-value (values:Vector) -> ? :
-  match(peek(values)) :
-    (v:ActionEndMarker) :
-      if encountered-failure?(v) : FailedResult()
-      else : parse-value(values, start-index(v))
-    (v:ListEndMarker) :
-      fatal("Unexpected list end marker.")
-    (v) :
-      v
+;Return the binding arity of the action with the given index.
+public defmulti action-bind-arity (info:ParsingInfo, overlay?:True|False, index:Int) -> Int
+
+;API for the parser.
+public deftype ValueStackParser
+
+;Return the last value in the stack.
+;Ensure that it is an evaluated value.
+;Used for implementation of immediate guard checks.
+public defmulti get-last-evaluated-value (p:ValueStackParser) -> ?
+
+;Return the last n values in the stack, where n is the
+;binding arity of the given action.
+;Used for implementation of guards.
+public defmulti get-last-evaluated-values (p:ValueStackParser, overlay?:True|False, action-index:Int) -> Array
+
+;Return the last value on the value stack.
+public defmulti parse-last-value (p:ValueStackParser) -> ?
+
+;Return the only value on the value stack.
+public defmulti parse-only-value (p:ValueStackParser) -> ?
+
+;============================================================
+;=================== API Implementation =====================
+;============================================================
+
+;Create the value stack parser.
+public defn ValueStackParser (values:Vector, info:ParsingInfo) -> ValueStackParser :
+  new ValueStackParser :
+    ;Return the last value in the stack.
+    ;Ensure that it is an evaluated value.
+    ;Used for implementation of immediate guard checks.
+    defmethod get-last-evaluated-value (this) -> ? :
+      match(peek(values)) :
+        (v:UnevaluatedResult) :
+          fatal("Expected evaluated value but received %_." % [v])
+        (v) :
+          v
+          
+    ;Return the last n values in the stack, where n is the
+    ;binding arity of the given action.
+    ;Used for implementation of guards.
+    defmethod get-last-evaluated-values (this, overlay?:True|False, action-index:Int) -> Array :
+      val arity = action-bind-arity(info, overlay?, action-index)
+      val args = Array<?>(arity)
+      val indices = to-seq(reverse(0 to length(values)))
+      for i in reverse(0 to arity) do :
+        args[i] = parse-value(values, indices, info)
+      args
+
+    ;Return the last value on the value stack.
+    defmethod parse-last-value (this) -> ? :
+      val indices = to-seq(reverse(0 to length(values)))
+      parse-value(values, indices, info)
+  
+    ;Return the only value on the value stack.
+    defmethod parse-only-value (this) -> ? :
+      val indices = to-seq(reverse(0 to length(values)))
+      val result = parse-value(values, indices, info)
+      if not empty?(indices) :
+        fatal("Unexpected remaining items on the value stack.")
+      result      
 
 ;============================================================
 ;================= Parsing Algorithm ========================
 ;============================================================
 
-;Parse the value at the given index.
-defn parse-value (values:Vector, start:Int) -> ? :
+;Parse the value.
+;The given indices counter is used to count down the indices.
+defn parse-value (values:Vector, index-counter:Seq<Int>, parse-info:ParsingInfo) -> ? :
 
-  ;Parse a value starting from 'index' and push its
-  ;result into 'accum'.
-  ;Return the index after the parsed value.
-  defn store-in-accum (accum:Vector, index:Int) -> Int :
-    match(values[index]) :
+  ;Parse the next value(s) ending at peek(index-counter).
+  defn parse-next-value (return:? -> ?) -> False :
+    match(values[next(index-counter)]) :
       ;Case: It's an action value.
-      (v:ActionMarker) :
-        val args = Vector<?>()
-        let loop (index:Int = index + 1) :
-          match(values[index]) :
-            (end:ActionEndMarker) :
-              if encountered-failure?(end) :
-                add(accum, FailedResult())
-              else :
-                add(accum, ActionResult(overlay?(end),
-                                        action-index(end),
-                                        lazy?(end),
-                                        info(v),
-                                        to-tuple(args)))
-              index + 1
-            (v) :
-              loop(store-in-accum(args, index))
+      (v:ActionEndMarker) :
+        ;Hold the arguments to the function.
+        val args = Array<?>(action-bind-arity(parse-info, overlay?(v), index(v)))
+
+        ;Fill the arguments array
+        var i:Int = length(args) - 1
+        while i >= 0 :
+          within x = parse-next-value() :
+            args[i] = x
+            i = i - 1
+          
+        ;Return the result
+        return(ActionResult(overlay?(v), index(v), info(v), args))
 
       ;Case: It's a list value.
-      (v:ListMarker) :
+      (v:ListEndMarker) :
         ;If arity is 1, then parse it specially.
         ;A single vector is enough.
         if arity(v) == 1 :
           val args = Vector<?>()
-          let loop (index:Int = index + 1) :
-            if values[index] is ListEndMarker :
-              add(accum, ListResult(args))
-              index + 1
-            else :
-              loop(store-in-accum(args, index))
+          while values[peek(index-counter)] is-not ListMarker :
+            parse-next-value(add{args, _})
+            
+          ;Pop past the ListMarker
+          next(index-counter)
+          
+          ;Reverse the arguments so that they are sorted by insertion order.
+          reverse!(args)
+
+          ;Return the list result.
+          return(ListResult(args))
+
         ;Otherwise, we need to create N vectors,
         ;and add the items to each vector in turn.
         else :
+          ;Create N vectors.
           val args = to-tuple $
             for i in 0 to arity(v) seq : Vector<?>()
-          var index:Int = index + 1
-          let loop () :
-            if values[index] is ListEndMarker :
-              add-all(accum, seq(ListResult, args))
-              index + 1
-            else :
-              for i in 0 to arity(v) do :
-                index = store-in-accum(args[i], index)
-              loop()
+
+          ;Fill all the arguments vectors.
+          while values[peek(index-counter)] is-not ListMarker :
+            var i:Int = arity(v) - 1
+            while i >= 0 :
+              within x = parse-next-value() :
+                add(args[i], x)
+                i = i - 1
+
+          ;Pop past the ListMarker
+          next(index-counter)
+
+          ;Return list results
+          for i in reverse(0 to arity(v)) do :
+            ;Reverse the arguments so that they are sorted by insertion order.
+            reverse!(args[i])
+            
+            ;Return the list result.
+            return(ListResult(args[i]))
               
       ;Case: Unexpected marker.
-      (v:ListEndMarker) :
-        fatal("Unexpected list end marker.")
+      (v:ListMarker) :
+        fatal("Unexpected list marker.")
         
       ;Case: Simple binder.
       (v) :
-        add(accum, v)
-        index + 1
+        return(v)
 
-  ;Launch!
-  clear(BUFFER)
-  store-in-accum(BUFFER, start)
-  BUFFER[0]
+  ;Parse the last value.
+  var value:Maybe = None()
+  within x = parse-next-value() :
+    if not empty?(value) :
+      fatal("Received more than a single value!")
+    value = One(x)
+  value!(value)
 
-;Single element buffer for storing result of parse-value.
-val BUFFER = Vector<?>(1)

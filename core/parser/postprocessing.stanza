@@ -1,7 +1,8 @@
 defpackage parser/postprocessing :
   import core
   import collections
-  import parser/engine-lang
+  import parser/engine-lang with:
+    prefix(ActionParams) => Eng
   import parser/lookahead-tokens
   import parser/errors
   import parser/context
@@ -337,7 +338,6 @@ defstruct ActionParams :
   index:Int
   guard-index:Int|False
   fail?:True|False
-  lazy?:True|False
 
 defn non-empty! (description:String, value:Tuple) :
   if empty?(value) :
@@ -351,7 +351,7 @@ defn ProductionPattern (p:Pattern) -> ProductionPattern :
     else :
       [rule-pattern(false, p)]
   defn rule-pattern (abandon-on-match?:True|False, p:Pattern) -> RulePattern :
-    match(p:Action) : action-pattern(abandon-on-match?, ActionParams(index(p), guard-index(p), fail?(p), lazy?(p)), pattern(p))
+    match(p:Action) : action-pattern(abandon-on-match?, ActionParams(index(p), guard-index(p), fail?(p)), pattern(p))
     else : action-pattern(abandon-on-match?, false, p)
   defn action-pattern (abandon-on-match?:True|False, action:ActionParams|False, p:Pattern) -> RulePattern :
     match(p:Sequence) : RulePattern(abandon-on-match?, action, patterns(p))
@@ -363,7 +363,7 @@ defn to-pattern (p:ProductionPattern) -> Pattern :
     ChoiceBranch(abandon-on-match?(r), action-pattern(r))
   defn action-pattern (r:RulePattern) -> Pattern :
     match(action(r)) :
-      (action:ActionParams) : Action(index(action), guard-index(action), lazy?(action), fail?(action), Sequence?(patterns(r)))
+      (action:ActionParams) : Action(index(action), guard-index(action), fail?(action), Sequence?(patterns(r)))
       (f:False) : Sequence?(patterns(r))
   defn non-empty-rule? (r:RulePattern) :
     patterns(r)[0] is-not NoMatch
@@ -409,8 +409,8 @@ defn removable-left-recursion? (prod:Int, p:Pattern, null-set:NullableSet) -> Tr
 deftype PatternProcessor
 defmulti make-pattern (proc:PatternProcessor, name:Symbol, pat:Pattern) -> Int
 defmulti null-set (proc:PatternProcessor) -> NullableSet
-defmulti action (proc:PatternProcessor, index:Int) -> (Context -> ?)
-defmulti make-action (proc:PatternProcessor, action:Context -> ?) -> Int
+defmulti action (proc:PatternProcessor, index:Int) -> ActionCallback
+defmulti make-action (proc:PatternProcessor, callback:? -> ?, params:EngActionParams) -> Int
 
 ;------------------------------------------------------------
 ;---------------- Remove Left Recursion ---------------------
@@ -469,6 +469,12 @@ defn remove-left-recursion (prod:Int,
     else :
       suffix-c
 
+  ;Assume that 'rule' is the original left-recursive rule.
+  ;This returns the shifted params for the suffix pattern.
+  defn shift-params (rule:RulePattern, params:EngActionParams) -> EngActionParams :
+    if seed-is-bound?(rule) : EngActionParams(lazy?(params), bind-arity(params) - 1)
+    else : params
+
   ;Create the suffix pattern.
   defn suffix-subpattern (rule:RulePattern) -> RulePattern :
     ;If this rule is left-recursive, then it's part of the
@@ -495,34 +501,38 @@ defn remove-left-recursion (prod:Int,
         val old-action = action(processor, index(params))
         val new-action = 
           if fail?(params) :
-            make-action(processor,
+            make-action(
+              processor,
               fn (suffix-c:Context) -> Exception :
                 defn bad-access () : fatal("Cannot access seed production in failure rule \
                                            for left-recursive production.")
-                old-action(shift-context(rule, suffix-c, bad-access)))
+                callback(old-action)(shift-context(rule, suffix-c, bad-access))
+              shift-params(rule, /params(old-action)))
           else :
-            make-action(processor, 
+            make-action(
+              processor, 
               fn (suffix-c:Context) -> Suffix :
                 new Suffix :
                   defmethod fail? (this) :
-                    false
-                    
+                    false                    
                   defmethod eval-with-seed (this, seed:() -> ?) :
-                    old-action(shift-context(rule, suffix-c, seed)))        
+                    callback(old-action)(shift-context(rule, suffix-c, seed))
+              shift-params(rule, /params(old-action)))        
 
         ;Create the new guard for the rule.
         val new-guard = if guard-index(params) is Int :
           val old-guard = action(processor, guard-index(params) as Int)
-          make-action(processor, 
+          make-action(
+            processor, 
             fn (suffix-c:Context) -> True|False :
               defn bad-access () : fatal("Cannot access seed production in guard.")
-              old-guard(shift-context(rule, suffix-c, bad-access)))
+              callback(old-guard)(shift-context(rule, suffix-c, bad-access))
+            shift-params(rule, /params(old-guard)))
 
         ;Bundle together in new action parameters
         new-action-params = ActionParams(new-action,
                                          new-guard,
-                                         fail?(params),
-                                         lazy?(params))
+                                         fail?(params))
 
       ;Create the new rule
       RulePattern(abandon-on-match?(rule),
@@ -540,7 +550,8 @@ defn remove-left-recursion (prod:Int,
       Binder(Production(seed))
       Repeat(Binder(Production(suffix)))]
 
-    val action = make-action(processor,
+    val action = make-action(
+      processor,
       fn (c:Context) :
         defn* apply-suffix-ops (seed:() -> ?, suffixes:List<Suffix>) :
           if empty?(suffixes) :
@@ -550,9 +561,10 @@ defn remove-left-recursion (prod:Int,
             val rest = tail(suffixes)
             if fail?(suffix) : throw(eval-with-seed(suffix, seed))
             else : apply-suffix-ops(eval-with-seed{suffix, seed}, rest)
-        apply-suffix-ops({c[0]}, c[1] as List<Suffix>))
+        apply-suffix-ops({c[0]}, c[1] as List<Suffix>)
+      EngActionParams(true, 2))
 
-    Action(action, false, true, false, pattern)
+    Action(action, false, false, pattern)
 
   ;Launch!
   val prod-pat = ProductionPattern(p)
@@ -598,7 +610,7 @@ public defn remove-left-recursion (p:PatternPackage) -> PatternPackage :
 
   ;Construct new definitions.
   val new-defs = to-vector<DefProduction>(productions(p))
-  val new-actions = to-vector<(Context -> ?)>(actions(p))
+  val new-actions = to-vector<ActionCallback>(actions(p))
   defn make-processor (base-name:Symbol) :
     new PatternProcessor :
       defmethod make-pattern (this, name:Symbol, pat:Pattern) :
@@ -610,9 +622,9 @@ public defn remove-left-recursion (p:PatternPackage) -> PatternPackage :
         null-set
       defmethod action (this, index:Int) :
         new-actions[index]
-      defmethod make-action (this, f:Context -> ?) :
+      defmethod make-action (this, f:? -> ?, params:EngActionParams) :
         val id = length(new-actions)
-        add(new-actions, f)
+        add(new-actions, ActionCallback(f,params))
         id
 
   for cycle in cycles do :
