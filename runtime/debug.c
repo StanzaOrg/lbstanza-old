@@ -1943,6 +1943,69 @@ static bool request_setExceptionBreakpoints(const JSObject* request) {
   return true;
 }
 
+// "SourceRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Source request; value of command field is 'source'. The
+//     request retrieves the source code for a given source reference.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "source" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/SourceArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "SourceArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'source' request.",
+//   "properties": {
+//     "source": {
+//       "$ref": "#/definitions/Source",
+//       "description": "Specifies the source content to load. Either
+//       source.path or source.sourceReference must be specified."
+//     },
+//     "sourceReference": {
+//       "type": "integer",
+//       "description": "The reference to the source. This is the same as
+//       source.sourceReference. This is provided for backward compatibility
+//       since old backends do not understand the 'source' attribute."
+//     }
+//   },
+//   "required": [ "sourceReference" ]
+// },
+// "SourceResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'source' request.",
+//     "properties": {
+//       "body": {
+//         "type": "object",
+//         "properties": {
+//           "content": {
+//             "type": "string",
+//             "description": "Content of the source reference."
+//           },
+//           "mimeType": {
+//             "type": "string",
+//             "description": "Optional content type (mime type) of the source."
+//           }
+//         },
+//         "required": [ "content" ]
+//       }
+//     },
+//     "required": [ "body" ]
+//   }]
+// }
+static bool request_source(const JSObject* request) {
+  respond_to_request(request, "Source file not found");
+  return true;
+}
+
 // "ThreadsRequest": {
 //   "allOf": [ { "$ref": "#/definitions/Request" }, {
 //     "type": "object",
@@ -2741,6 +2804,7 @@ static bool request_disconnect(const JSObject* request) {
   def(scopes)                 \
   def(setBreakpoints)         \
   def(setExceptionBreakpoints)\
+  def(source)                 \
   def(stackTrace)             \
   def(threads)                \
   def(variables)
