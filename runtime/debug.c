@@ -899,10 +899,9 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
 }
 
 int64_t stanza_debugger_current_source_position(const void* p, const char** filename);
+//const char* current_file = NULL;
+//const int64_t current_line = stanza_debugger_current_source_position(breakpoint_id, &current_file);
 void send_thread_stopped_at_breakpoint(const void* breakpoint_id) {
-  const char* current_file = NULL;
-  const int64_t current_line = stanza_debugger_current_source_position(breakpoint_id, &current_file);
-
   char description[64];
   const uint64_t thread_id = 12345678;
   log_printf("Hit a breakpoint at %p\n", breakpoint_id);
