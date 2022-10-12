@@ -1,0 +1,648 @@
+defpackage parser/macro-compiler :
+  import core
+  import collections
+  import macro-utils
+  import parser/errors
+  import parser/pattern-parser
+  import parser/binding-analysis
+
+;============================================================
+;==================== Parse Structure =======================
+;============================================================
+
+;Represents the entire defsyntax language.
+;- name: The name of the syntax package.
+;- exps: All the expressions within the 'defsyntax'.
+public defstruct DefSyntaxRule :
+  name: Symbol|Token
+  exps: List<ExpRule>
+
+;Represents an expression nested within 'defsyntax'.
+public deftype ExpRule
+
+;Represents an arbitrary Stanza expression that needs
+;to be evaluated.
+public defstruct StanzaExpressionRule <: ExpRule :
+  form
+with:
+  printer => true
+  
+;Represents:
+;  import (myprod, exp) from core
+public defstruct ImportRule <: ExpRule :
+  names: List<Symbol|Token>
+  package: Symbol|Token
+with:
+  printer => true
+  
+;Represents:
+;  import exp4 rules as user-exp4
+public defstruct ImportRulesRule <: ExpRule :
+  name: Symbol|Token
+  new-name: Symbol|Token
+with:
+  printer => true
+  
+;Represents:
+;  public defproduction myprod: Int
+public defstruct DefProductionRule <: ExpRule :
+  name: Symbol|Token
+  type
+  public?: True|False
+with:
+  printer => true
+  
+;Represents:
+;  defrule myprod = (pattern ...) when guard with lazy-binders :
+;    body
+public defstruct DefActionRule <: ExpRule :
+  production: Symbol|Token
+  pattern: List
+  guard: Maybe
+  body: Maybe
+  lazy-binders?: True|False
+with:
+  printer => true
+  
+;Represents:
+;  defrule myprod != (pattern ...) when guard
+public defstruct DefNotRule <: ExpRule :
+  production: Symbol|Token
+  pattern: List
+  guard: Maybe
+with:
+  printer => true
+  
+;Represents:
+;  fail-if myprod = (pattern ...) when guard with lazy-binders :
+;    body
+public defstruct DefFailRule <: ExpRule :
+  production: Symbol|Token
+  pattern: List
+  guard: Maybe
+  body
+  lazy-binders?: True|False
+with:
+  printer => true
+  
+;Represents:
+;  defrule myprod = inline #exp
+public defstruct DefInlineRule <: ExpRule :
+  production: Symbol|Token
+  inlined-production: Symbol|Token
+with:
+  printer => true
+  
+;============================================================
+;============= ParseSyntax Parse Structures =================
+;============================================================
+
+;Represents:
+;  parse-syntax[core + jitx / #exp ...](form)
+public defstruct ParseSyntax :
+  base: Symbol|Token
+  overlays: List<Symbol|Token>
+  form
+  production: Symbol|Token
+  repeat?:True|False
+with:
+  printer => true
+
+;============================================================
+;============= MatchSyntax Parse Structures =================
+;============================================================
+
+;Represents:
+;  match-syntax[core + jitx](form) :
+;    (pattern1 ...) : body1
+;    (pattern2 ...) : body2
+;
+;Note that:
+;
+;  match-syntax(form) :
+;    (pattern1 ...) : body
+;
+;is represented with base == `empty.
+
+public defstruct MatchSyntaxRule :
+  info: FileInfo|False
+  base: Symbol|Token
+  overlays: List<Symbol|Token>
+  form
+  patterns: List<MatchPattern>
+
+public defstruct MatchPattern :
+  pattern: List
+  guard: Maybe
+  body
+with:
+  printer => true
+  
+;============================================================
+;==================== Printers ==============================
+;============================================================
+
+defmethod print (o:OutputStream, d:DefSyntaxRule) :
+  val items = "%n" % [exps(d)]
+  print(o, "DefSyntaxRule %_:\n%_" % [name(d), Indented(items)])
+
+defmethod print (o:OutputStream, p:ParseSyntax) :
+  val items = "%n" % [
+    "base: %_" % [base(p)]
+    "overlays: %_" % [overlays(p)]
+    "form: %_" % [form(p)]
+    "production: %_" % [production(p)]
+    "repeat?: %_" % [repeat?(p)]]
+  print(o, "ParseSyntax:\n%_" % [Indented("%n" % [items])])
+
+defmethod print (o:OutputStream, m:MatchSyntaxRule) :
+  val pattern-items = "%n" % [patterns(m)]
+  val items = [
+    "info: %_" % [info(m)]
+    "base: %_" % [base(m)]
+    "overlays: %_" % [overlays(m)]
+    "form: %_" % [form(m)]
+    "patterns:\n%_" % [Indented(pattern-items)]]
+  print(o, "MatchSyntaxRule:\n%_" % [Indented("%n" % [items])])
+
+;============================================================
+;================ Compilation of DefSyntax  =================
+;============================================================
+
+public defn compile (syntax-rule:DefSyntaxRule) -> ? :
+  try :
+    val props = analyze(syntax-rule)
+
+    ;Compile rules
+    defn compile (r:DefActionRule) :
+      ;Handle fast case where there is no body.
+      ;- guard must be None().
+      ;- lazy-binders? must be false.
+      ;- pattern must contain exactly one binder.
+      if empty?(body(r)) :
+        substitute(`(DefRule(`name, pat)), [
+          `name => production(r)
+          `pat => compile-guarded-pattern(pattern(r), guard(r))])
+      ;Handle general case where an arbitrary body is provided.
+      else :
+        substitute(`(DefRule(`name, Action(action, pat, lazy?))), [
+          `name => production(r)
+          `action => compile-action(props, production(r), pattern(r), value!(body(r)), lazy-binders?(r))
+          `pat => compile-guarded-pattern(pattern(r), guard(r))
+          `lazy? => lazy-binders?(r)])
+        
+    defn compile (r:DefNotRule) :
+      substitute(`(DefRule(`name, NotPat(pat))), [
+        `name => production(r)
+        `pat => compile-guarded-pattern(pattern(r), guard(r))])
+    defn compile (r:DefFailRule) :
+      substitute(`(DefRule(`name, FailPat(action, pat, lazy?))), [
+        `name => production(r)
+        `action => compile-fail(props, pattern(r), body(r), lazy-binders?(r))
+        `pat => compile-guarded-pattern(pattern(r), guard(r))
+        `lazy? => lazy-binders?(r)])
+    defn compile (r:DefInlineRule) :
+      substitute(`(DefRule(`name, Inlined(`iname))), [
+        `name => production(r)
+        `iname => subsymbol(unwrap-token(inlined-production(r)), 1)])
+
+    ;Compile productions
+    defn compile (r:DefProductionRule) :
+      substitute(`(DefProduction(`name, public?)), [
+        `name => name(r)
+        `public? => public?(r)])
+
+    ;Compile imports
+    defn compile (r:ImportRule) :
+      substitute(`(DefImport(`names, `package)), [
+        `names => names(r)
+        `package => package(r)])
+
+    ;Compile import rules
+    defn compile (r:ImportRulesRule) :
+      substitute(`(ImportRules(`name, `new-name)), [
+        `name => name(r)
+        `new-name => new-name(r)])      
+
+    ;Compile type-cast-functions
+    defn compile-imported-production-type-cast-function (r:ImportRule) :
+      for prod in names(r) map :
+        substitute(`(public defn name (x) : imported-name(x)), [
+          `name => production-type-cast-function(name(props), prod)
+          `imported-name => production-type-cast-function(package(r), prod)])   
+    defn compile-production-type-cast-function (r:DefProductionRule) :
+      substitute(`(public?{public}{} defn name (x) -> (() -> type) : x), [
+        `public? => choice(public?(r))
+        `name => production-type-cast-function(name(props), name(r))
+        `type => type(r)])
+    defn compile-return-type-cast-function (r:DefProductionRule) :
+      substitute(`(public?{public}{} defn name (x:type) : x), [
+        `public? => choice(public?(r))
+        `name => return-type-cast-function(name(props), name(r))
+        `type => type(r)])
+    defn compile-forwarded-production-type-cast-function (r:ImportRulesRule) :
+      substitute(`(defn name (x) : f(x)), [
+        `name => production-type-cast-function(name(props), new-name(r))
+        `f => production-type-cast-function(name(props), name(r))])         
+
+    ;Compile package
+    defn compile-all (r:DefSyntaxRule) :
+      val template = `((
+        imported-production-type-cast-functions
+        production-type-cast-functions
+        forwarded-production-type-cast-functions
+        return-type-cast-functions
+        let :
+          stanza-expressions
+          register-syntax-package(SyntaxPackage(
+            `name
+            to-list([imports])
+            to-list([prods])
+            to-list([import-rules])
+            to-list([rules])))))
+      val bindings = [
+        `imported-production-type-cast-functions => map(compile-imported-production-type-cast-function, imports(props))
+        `production-type-cast-functions => map(compile-production-type-cast-function, productions(props))
+        `forwarded-production-type-cast-functions => map(compile-forwarded-production-type-cast-function, import-rules(props))
+        `return-type-cast-functions => map(compile-return-type-cast-function, productions(props))
+        `stanza-expressions => splice(map(form, stanza-expressions(props)))
+        `name => name(r)
+        `imports => splice(map(compile, imports(props)))
+        `prods => splice(map(compile, productions(props)))
+        `import-rules => splice(map(compile, import-rules(props)))
+        `rules => splice(map(compile, rules(props)))
+        qualified(`parser/pattern-parser/parse-pattern)
+        qualified(`parser/patterns/Guard)
+        qualified(`parser/patterns/FailPat)
+        qualified(`parser/patterns/Action)
+        qualified(`parser/patterns/NotPat)
+        qualified(`parser/patterns/Inlined)
+        qualified(`parser/syntax-packages/DefRule)
+        qualified(`parser/syntax-packages/DefProduction)
+        qualified(`parser/syntax-packages/DefImport)
+        qualified(`parser/syntax-packages/ImportRules)
+        qualified(`parser/syntax-packages/SyntaxPackage)
+        qualified(`parser/syntax-package-registry/register-syntax-package)]
+      fill-template(template, bindings)
+
+    ;Driver
+    compile-all(syntax-rule)
+
+  catch (e:PatternError) :
+    throw(PatternErrorInPackage(name(syntax-rule), e))
+
+;============================================================
+;============= Compilation of ParseSyntax ===================
+;============================================================
+
+public defn compile (p:ParseSyntax) -> ? :
+  val template = `(
+    cast-result() where :
+      defn result () : syntax-parse(`base, `overlays, form, `prod, repeat?))
+  val result = gensym(`result)
+  val binding-type = production-binding-type(production(p), repeat?(p))
+  fill-template(template, [
+    `result => result
+    `base => base(p)
+    `overlays => overlays(p)
+    `form => form(p)
+    `prod => subsymbol(unwrap-token(production(p)), 1)
+    `repeat? => repeat?(p)
+    qualified(`parser/syntax-package-registry/syntax-parse)
+    `cast-result => compile-binding-type(base(p), binding-type, result)])
+
+defn production-binding-type (prod:Symbol|Token, repeat?:True|False) :
+  val prod-binding = ProductionBinding(subsymbol(unwrap-token(prod),1))
+  ListBinding(prod-binding) when repeat? else prod-binding
+
+;============================================================
+;================ Compilation of MatchSyntax  ===============
+;============================================================
+
+defstruct IndexedMatchPattern :
+  action-index:Int
+  guard-index:Maybe<Int>
+  pattern
+
+defstruct PatternAndBody :
+  pattern
+  body
+
+;Counter for generating unique usages of match-syntax.
+var MATCH-SYNTAX-ID-COUNTER:Long = 0L
+defn next-match-syntax-id () -> Long :
+  val id = MATCH-SYNTAX-ID-COUNTER
+  MATCH-SYNTAX-ID-COUNTER = MATCH-SYNTAX-ID-COUNTER + 1L
+  id
+
+public defn compile (d:MatchSyntaxRule) -> ? :
+
+  ;Assign an index to all actions and guards in the given patterns.
+  defn index-patterns (ps:List<MatchPattern>) -> [List<IndexedMatchPattern>, List<PatternAndBody>] :
+    val patterns = Vector<IndexedMatchPattern>()
+    val bodies = Vector<PatternAndBody>()
+    for p in ps do :
+      val action-index = length(bodies)
+      val guard-index = None() when empty?(guard(p)) else One(length(bodies) + 1)
+      add(patterns, IndexedMatchPattern(action-index, guard-index, pattern(p)))
+      add(bodies, PatternAndBody(pattern(p), body(p)))
+      if not empty?(guard(p)) :
+        add(bodies, PatternAndBody(pattern(p), value!(guard(p))))
+    [to-list(patterns), to-list(bodies)]    
+
+  ;Compile the patterns to a nested template.
+  defn compile-patterns (ps:List<IndexedMatchPattern>) -> Nested :
+    nested $ for p in ps map :
+      [`pattern => compile-indexed-pattern(pattern(p), action-index(p), guard-index(p))]
+      
+  ;Compile the actions to a nested template.
+  defn compile-actions (bodies:List<PatternAndBody>) -> Nested :
+    nested $ for b in bodies map :
+      val bindings = get-bindings(pattern(b))
+      [`action => compile-bindings(base(d), bindings, body(b), None(), EagerBinders)]
+
+  val template = `(
+    syntax-match(filename, id, `base, `overlays, form,
+                 fn () : Choice([match-patterns{pattern}])
+                 [match-actions{action}]))
+
+  val [indexed-patterns, bodies] = index-patterns(patterns(d))
+
+  val filename = match(info(d)) :
+    (i:FileInfo) : filename(i)
+    (f:False) : false
+    
+  fill-template(template, [
+    `filename => filename
+    `id => next-match-syntax-id()
+    `base => base(d)
+    `overlays => overlays(d)
+    `form => form(d)
+    `match-patterns => compile-patterns(indexed-patterns)
+    `match-actions => compile-actions(bodies)
+    qualified(`parser/syntax-package-registry/syntax-match)
+    qualified(`parser/patterns/Choice)
+    qualified(`parser/patterns/Action)
+    qualified(`parser/patterns/Guard)
+    qualified(`parser/pattern-parser/parse-pattern)])
+
+defn compile-indexed-pattern (pat:List, action-index:Int, guard:Maybe<Int>) -> ? :
+  defn compiled-pattern () :
+    substitute(`(parse-pattern(`pat, true)), [
+      `pat => pat])
+  defn guarded-pattern () :
+    if empty?(guard) :
+      compiled-pattern()
+    else :
+      substitute(`(Guard(guard, pat)), [
+        `guard => value!(guard)
+        `pat => compiled-pattern()])
+  defn action-pattern () :
+    substitute(`(Action(index, pat, false)), [
+      `index => action-index
+      `pat => guarded-pattern()])
+  action-pattern()
+
+;============================================================
+;=============== Names of Special Functions =================
+;============================================================
+
+;Returns the name of the "cast function" for production base/#prod. 
+defn production-type-cast-function (base, prod) -> Symbol :
+  to-symbol("%_-%_ production-type" % [base, prod])   
+
+;Returns the name of the "return type cast function" for production base/#prod.
+defn return-type-cast-function (base, prod) -> Symbol :
+  to-symbol("%_-%_ return-type" % [base, prod])   
+
+;============================================================
+;================== Single-Binder Guard =====================
+;============================================================
+
+;Single-binder guards are a common case, and compile to:
+;
+;  fn (token) -> True|False :
+;    body
+;
+;The token is eagerly provided directly, and there is no
+;indirection through the use of contexts.
+;
+;This compilation structure is understood by the engine, which ensures
+;that single-binder guards will be called appropriately.
+
+defn compile-single-binder-guard (binding:Binding,
+                                  body) -> ? :
+  val template = `(
+    fn (token:type) -> core/True|core/False :
+      body)
+  substitute(template, [
+    `token => name(binding),
+    `type => stanza-type-expression(type(binding)),
+    `body => body])
+
+;============================================================
+;================== Binding Compilation =====================
+;============================================================
+
+defenum BindingMode :
+  LazyBinders
+  EagerBinders
+  EagerIndividualBinders
+
+defn compile-bindings (base, bindings:List<Binding>, body, ret-type:Maybe, binding-mode:BindingMode) :
+  val template = `(
+    fn (#ctxt) ret{-> R}{} :
+      defn closest-info () : parser/context/info(#ctxt)
+      defn closest-info (form) : parser/context/info(#ctxt, form)
+      separate-binders?{
+        bindings{
+          defn #x () : parser/context/get(#ctxt, i)
+          val x = lazy-binders?{cast-x}{cast-x()}
+        }        
+      }{
+        val #bindings:core/Tuple = parser/context/get-all(#ctxt)
+        bindings{
+          defn #x () : #bindings[i]
+          val x = cast-x()
+        }
+      }
+      body)
+  substitute(template, [
+    `#ctxt => gensym(`bindings)
+    `#bindings => gensym(`result)
+    `separate-binders? => choice(binding-mode is LazyBinders|EagerIndividualBinders)
+    `lazy-binders? => choice(binding-mode is LazyBinders)
+    `bindings => nested $
+      for binding in bindings map :
+        val #x = gensym(name(binding))
+        [`#x => #x
+         `i => index(binding)
+         `x => name(binding)
+         `cast-x => compile-binding-type(base, type(binding), #x)]
+    `ret => choice(not empty?(ret-type))
+    `R => value?(ret-type)
+    `body => body])
+
+defn compile-binding-type (base, t:BindingType, temp:Symbol) :
+  defn loop (t:BindingType) :
+    match(t) :
+      (t:TerminalBinding) :
+        substitute(`(temp as () -> T), [
+          `temp => temp
+          `T => name(t)])
+      (t:ProductionBinding) :
+        substitute(`(name(temp)), [
+          `temp => temp
+          `name => production-type-cast-function(base, name(t))])
+      (t:UnionBinding) :
+        substitute(`(union-type(a, b)), [
+          `a => loop(a(t))
+          `b => loop(b(t))])
+      (t:ListBinding) :
+        substitute(`(list-type(x)), [
+          `x => loop(type(t))])
+  fill-template(`x, [
+    `x => loop(t)
+    qualified(`parser/macro-runtime/union-type)
+    qualified(`parser/macro-runtime/list-type)])
+
+defn compile-action (pkg:SyntaxProperties, production:Symbol|Token, pat:List, body, lazy-binders?:True|False) :
+  val bindings = get-bindings(pat)
+  val body* = substitute(`(cast(let : body)), [
+    `cast => return-type-cast-function(base(pkg, production), production)
+    `body => body])
+  val mode = LazyBinders when lazy-binders? else EagerBinders
+  compile-bindings(name(pkg), bindings, body*, None(), mode)
+
+defn compile-fail (pkg:SyntaxProperties, pat:List, body, lazy-binders?:True|False) :
+  compile-fail(name(pkg), pat, body, lazy-binders?)
+
+defn compile-fail (base:Symbol|Token, pat:List, body, lazy-binders?:True|False) :
+  val bindings = get-bindings(pat)
+  val mode = LazyBinders when lazy-binders? else EagerBinders
+  compile-bindings(base, bindings, body, One(`core/Exception), mode)
+
+;Compile the guard function for the given body and guard pattern.
+defn compile-guard-function (pat:List, body) -> ? :
+  ;Retrieve the simple bindings from the pattern.
+  val bindings = get-simple-bindings(pat)
+  ;If it is a single-binder guard, then compile it specially.
+  if length(bindings) == 1 :
+    compile-single-binder-guard(head(bindings), body)
+  ;Otherwise compile the general base.
+  else :
+    compile-bindings(base, bindings, body, One(`(core/True|core/False)), EagerIndividualBinders)
+
+;Compile the given pattern which may have an optional guard.
+defn compile-guarded-pattern (pat:List, guard:Maybe) -> ? :
+  var form = substitute(`(parse-pattern(`pat, true)), [
+    `pat => pat])
+  if not empty?(guard) :
+    form = substitute(`(Guard(guard, pat)), [
+      `guard => compile-guard-function(pat, value!(guard))
+      `pat => form])
+  form
+
+;============================================================
+;================== SyntaxProperties Utility ================
+;============================================================
+
+deftype SyntaxProperties
+defmulti name (p:SyntaxProperties) -> Symbol|Token
+defmulti base (p:SyntaxProperties, prod:Symbol|Token) -> Symbol|Token
+defmulti imports (p:SyntaxProperties) -> List<ImportRule>
+defmulti stanza-expressions (p:SyntaxProperties) -> List<StanzaExpressionRule>
+defmulti productions (p:SyntaxProperties) -> List<DefProductionRule>
+defmulti rules (p:SyntaxProperties) -> List<DefActionRule|DefNotRule|DefFailRule|DefInlineRule>
+defmulti import-rules (p:SyntaxProperties) -> List<ImportRulesRule>
+
+defn analyze (r:DefSyntaxRule) -> SyntaxProperties :
+   ;Categorize expressions
+   val imports = {to-list(_) as List<ImportRule>} $
+      filter({_ is ImportRule}, exps(r))
+   val productions = {to-list(_) as List<DefProductionRule>} $
+      filter({_ is DefProductionRule}, exps(r))
+   val import-rules = {to-list(_) as List<ImportRulesRule>} $
+      filter({_ is ImportRulesRule}, exps(r))
+   val stanza-expressions = {to-list(_) as List<StanzaExpressionRule>} $
+      filter({_ is StanzaExpressionRule}, exps(r))
+   val rules = {to-list(_) as List<DefActionRule|DefNotRule|DefFailRule|DefInlineRule>} $
+      filter({_ is DefActionRule|DefNotRule|DefFailRule|DefInlineRule}, exps(r))      
+
+   ;Discover all productions and check for duplicates
+   val all-productions = HashTable<Symbol,True>()
+   val all-names = seq{unwrap-token, cat-all(_)} $ [
+      seq(name, productions)
+      seq-cat(names, imports)
+      seq(new-name, import-rules)]
+   for name in all-names do :   
+      if key?(all-productions, name) :
+         throw(PatternError("Duplicate definition of production %_." % [name]))
+      all-productions[name] = true
+         
+   defn ensure-declared-pattern (name) :
+      if not key?(all-productions, unwrap-token(name)) :
+         throw $ PatternError $
+            "Could not resolve production %_." % [name]
+
+   ;Ensure parsable
+   ;defn ensure-parsable (pat) :
+   ;   parse-pattern(unwrap-token(pat))
+
+   ;Pattern prechecks
+   for rule in import-rules do :
+      ensure-declared-pattern(name(rule))
+   for rule in rules do :
+      ;Verify that production exists
+      ensure-declared-pattern(production(rule))         
+      match(rule) :            
+         (rule:DefActionRule) :
+            val p = parse-pattern(pattern(rule), true)
+            ensure-resolvable-productions(p, all-productions)
+         (rule:DefNotRule) :
+            val p = parse-pattern(pattern(rule), false)
+            ensure-resolvable-productions(p, all-productions)
+         (rule:DefFailRule) :
+            val p = parse-pattern(pattern(rule), true)
+            ensure-resolvable-productions(p, all-productions)
+         (rule:DefInlineRule) :
+            val name = subsymbol(unwrap-token(inlined-production(rule)), 1)
+            ensure-declared-pattern(name)   
+
+   ;Package
+   val package-table = HashTable<Symbol,Symbol|Token>()
+   for import in imports do :
+      val p = package(import)
+      do({package-table[unwrap-token(_)] = p}, names(import))
+   for p in productions do :
+      package-table[unwrap-token(name(p))] = name(r)
+   for import in import-rules do :
+      package-table[unwrap-token(new-name(import))] = name(r)
+
+   ;Return new properties
+   new SyntaxProperties :
+      defmethod name (this) : name(r)
+      defmethod base (this, prod:Symbol|Token) : package-table[unwrap-token(prod)]
+      defmethod stanza-expressions (this) : stanza-expressions
+      defmethod imports (this) : imports
+      defmethod productions (this) : productions
+      defmethod rules (this) : rules
+      defmethod import-rules (this) : import-rules
+
+;============================================================
+;================ Samll Compilation Utilities ===============
+;============================================================
+
+;Return a new symbol that strips away the first 'n'
+;characters from 'x'. Used mostly for converting '#exp'
+;to 'exp'.
+defn subsymbol (x:Symbol, n:Int) -> Symbol :
+   to-symbol(to-string(x)[n to false])
+
+;Create a deep binding given the qualified name.
+;eg. qualified(`core/Token) returns `Token => deep(`core/Token)
+defn qualified (name:Symbol) -> KeyValue<Symbol,?> :
+  val [package, local] = qualifier(name)
+  if package is False : fatal("The 'qualified' function requires a \
+                               package-qualified name but got: '%_'." % [name])
+  local => deep(name)

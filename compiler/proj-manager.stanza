@@ -1,0 +1,271 @@
+defpackage stz/proj-manager :
+  import core
+  import collections
+  import core/parsed-path
+  import stz/pkg
+  import stz/proj
+  import stz/utils
+  import stz/algorithms
+  import stz/aux-file
+  import stz/package-stamps
+
+;<doc>=======================================================
+;=================== Project Manager ========================
+;============================================================
+
+### Purpose ###
+
+The ProjManager handles all things related to Stanza packages:
+  - Where packages are located.
+  - Which packages are conditionally imported.
+  - Whether package .pkg files are up-to-date.
+  - Track whether package .pkg files are up-to-date.
+  - What external dependencies are pulled in by packages.
+
+### Looking for the source file of a package ###
+
+Input: The name of the package
+
+Output: The PkgLocation structure if the package is found. 
+
+### Updating the Auxiliary File ###
+
+Input:
+
+The statistics corresponding to all the saved packages.
+
+### Collect Conditional Imports From Current Load List ###
+
+Input:
+
+The names of the packages that have currently been loaded. 
+
+Output:
+
+The names of all the new packages that need to be loaded, based upon
+the conditional dependencies.
+
+;============================================================
+;=======================================================<doc>
+
+public deftype ProjManager
+public defmulti find-package (l:ProjManager, name:Symbol) -> PkgLocation|False
+public defmulti update-aux-file (l:ProjManager, pkgs:Seqable<SavedPkg>) -> False
+public defmulti conditional-imports (l:ProjManager, packages:Seqable<Symbol>) -> Tuple<Symbol>
+
+public defn ProjManager (proj:ProjFile, params:ProjParams, auxfile:AuxFile|False) :
+  ;Build package tree
+  val package-tree = PackageTree(filter-by<PackagesDefinedInStmt>(stmts(proj)))
+  
+  ;Build source file table
+  val source-file-table = to-hashtable<Symbol,String> $
+    for s in filter-by<DefinedInStmt>(stmts(proj)) seq :
+      package(s) => filename(s)
+
+  ;Find the source file that contains the package.
+  defn source-file? (name:Symbol) -> String|False :
+    match(get?(source-file-table, name)) :
+      (path:String) :
+        path
+      (f:False) :
+        val path = filename(package-tree, name)
+        match(path:String) :
+          path when file-exists?(path)
+
+  ;Find a package
+  defn find-package (name:Symbol) -> PkgLocation|False :
+    val pkg-path = find-pkg(name, optimize?(params))
+    val src-path = source-file?(name)
+    val read-pkg? = match(pkg-path, src-path) :
+      (pkg-path:String, src-path:String) :
+        match(auxfile:AuxFile) :
+          if file-exists?(src-path) :
+            val rec = PkgRecord(name,
+                                filestamp(pkg-path), filestamp(src-path)
+                                flags(params), optimize?(params))
+            key?(auxfile, rec)
+      (pkg-path:String, src-path:False) : true
+      (pkg-path:False, src-path) : false
+    if pkg-path is-not False or src-path is-not False :
+      PkgLocation(name, src-path, pkg-path, read-pkg?)
+
+  ;Updating the auxiliary file
+  defn update-aux-file (pkgs:Seqable<SavedPkg>) :
+    fatal("No auxiliary file provided to project manager.") when auxfile is False
+    for pkg in pkgs do :
+      val r = PkgRecord(package(pkg), filestamp(pkg), source(pkg),
+                        flags(params), optimize?(params))
+      add(auxfile as AuxFile, r)    
+
+  ;Retrieve conditional imports
+  defn conditional-imports (packages:Seqable<Symbol>) :
+    val load-set = to-hashset<Symbol>(packages)
+    val next-load-set = HashSet<Symbol>()
+    val import-stmts = to-tuple(filter-by<ImportWhenStmt>(stmts(proj)))
+    within progress = fixpoint() :
+      for s in import-stmts do :
+        if all?({load-set[_]}, dependencies(s)) :
+          if add(load-set, package(s)) :
+            add(next-load-set, package(s))
+            progress()
+    to-tuple(next-load-set)
+
+  ;Return new project manager
+  new ProjManager :
+    defmethod find-package (this, name:Symbol) : find-package(name)
+    defmethod update-aux-file (this, pkgs:Seqable<SavedPkg>) : update-aux-file(pkgs)
+    defmethod conditional-imports (this, packages:Seqable<Symbol>) : conditional-imports(packages)
+
+;============================================================
+;===================== Structures ===========================
+;============================================================
+
+public defstruct ProjParams :
+  flags: Tuple<Symbol>
+  optimize?: True|False
+
+public defstruct SavedPkg :
+  package: Symbol
+  filestamp: FileStamp
+  source: FileStamp
+
+;============================================================
+;===================== Package Tree =========================
+;============================================================
+
+defstruct PackageTree :
+  children:HashTable<String,PackageTree> with:
+    init => HashTable-init<String,PackageTree>(PackageTree{})
+  path:String|False with:
+    init => false
+    setter => set-path
+
+defn PackageTree (stmts:Seqable<PackagesDefinedInStmt>) -> PackageTree :
+  val tree = PackageTree()
+  for stmt in stmts do :
+    val parts = match(packages(stmt)) :
+                  (s:Symbol) : split-package-name(s)
+                  (f:False) : to-seq([])
+    add-to-tree(tree, parts, filename(stmt))
+  tree
+
+;Helper: Split a package a/b/c into its parts.
+defn split-package-name (package:Symbol) -> Seq<String> :
+  split(to-string(package), "/")
+
+;Helper: Add a split-up package into a tree.
+defn add-to-tree (tree:PackageTree, names:Seq<String>, path:String) -> False :
+  if empty?(names) :
+    set-path(tree, path)
+  else :
+    val subtree = children(tree)[next(names)]
+    add-to-tree(subtree, names, path)
+
+;Helper: Retrieve the subtree and the number of parts traversed.
+;Ensures that the returned subtree has a path.
+defn subtree (tree:PackageTree, path:Tuple<String>, n:Int) -> Maybe<[PackageTree, Int]> :
+  ;Try to traverse further down the path.
+  val result =
+    if n < length(path) :
+      val name = path[n]
+      match(get?(children(tree), name)) :
+        (t:PackageTree) : subtree(t, path, n + 1)
+        (f:False) : None()
+    else : None()
+
+  ;Check whether the traversal succeeded. If it hasn't,
+  ;then check whether the current tree has a path.
+  if empty?(result) :
+    if /path(tree) is String : One([tree, n])
+    else : None()
+  else :
+    result
+
+;If the PackageTree contains an entry, return the source file
+;for the given package.
+defn filename (tree:PackageTree, package:Symbol) -> String|False :
+  ;Split up the package into its parts.
+  val parts = to-tuple(split-package-name(package))
+  val n = length(parts)
+
+  ;Lookup in the tree.
+  val result = subtree(tree, parts[0 to n - 1], 0)
+
+  ;If it does not exist in the tree, then no path.
+  if empty?(result) :
+    false
+  ;If it does exist in the tree, then we can create the
+  ;correct path.
+  else :
+    val [subtree, num-parts] = value!(result)
+
+    ;Compute whether the rest of the package parts
+    ;are valid directory/file names.
+    val uses-valid-chars? = for i in num-parts to n all? :
+      valid-dir-chars?(parts[i])
+
+    ;If we use valid directory characters, then we are
+    ;able the construct the final path.
+    if uses-valid-chars? :
+
+      ;Construct the remaining path.
+      val rest-path = ParsedPath $ to-tuple $
+        for i in num-parts to n seq :
+          if i == n - 1 :
+            NamedPath(to-string("%_.stanza" % [parts[i]]))
+          else :
+            NamedPath(parts[i])
+            
+      ;Get the path in the tree.
+      val dir-path = parse-path(path(subtree) as String)
+
+      ;Return the joined path.
+      to-string(relative-to-dir(dir-path, rest-path))
+
+defmethod print (o:OutputStream, t:PackageTree) :
+  val o2 = IndentedStream(o)
+  val o3 = IndentedStream(o2)
+  print(o, "PackageTree:")
+  lnprint(o2, "path = %~" % [path(t)])
+  lnprint(o2, "children:")
+  do(lnprint{o3, _}, children(t))
+
+;============================================================
+;================ Valid Directory Characters ================
+;============================================================
+
+;Compute the valid directory characters.
+defn make-valid-dir-chars () -> BitArray :
+  val chars = BitArray(256)
+
+  ;Helper utilities to set bits within 'chars'.
+  defn mark-as-valid (i:Int) :
+    chars[i] = true
+  defn mark-as-valid (c:Char) :
+    mark-as-valid(to-int(c))
+  defn mark-as-valid (c1:Char, c2:Char) :
+    do(mark-as-valid, to-int(c1) through to-int(c2))
+  defn mark-as-valid (s:String) :
+    do(mark-as-valid, s)
+
+  ;Mark the following ranges as valid.
+  mark-as-valid('a', 'z')
+  mark-as-valid('A', 'Z')
+  mark-as-valid('0', '9')
+  mark-as-valid("_-.")
+
+  ;Return the characters.
+  chars
+
+;Compute the valid directory characters.
+val VALID-DIR-CHARS = make-valid-dir-chars()
+
+;Return true if the given character is a valid
+;directory character.
+defn valid-dir-char? (c:Char) -> True|False :
+  VALID-DIR-CHARS[to-int(c)]
+
+;Return true if all the given characters are
+;valid directory characters.
+defn valid-dir-chars? (s:String) -> True|False :
+  all?(valid-dir-char?, s)

@@ -1,0 +1,293 @@
+defpackage parser/syntax-package-registry :
+  import core
+  import collections
+  import parser/patterns
+  import parser/syntax-packages
+  import parser/syntax-package-compiler
+  import parser/context
+  import parser/errors
+  import parser/ops
+  import parser/engine
+
+;============================================================
+;==================== Registry ==============================
+;============================================================
+
+;Represents the registry and all its cache information.
+;- packages: The table of all syntax packages in the registry.
+;- compiled: The cached compiled syntax packages.
+;- current-overlays: The overlays that are currently in active
+;  and is retrieved by 'current-overlays'. 
+defstruct SyntaxPackageRegistry :
+  packages: HashTable<Symbol,SyntaxPackage> with:
+    init => HashTable<Symbol,SyntaxPackage>()
+  compiled-packages: HashTable<List<Symbol>, OpPackage> with:
+    init => HashTable-init<List<Symbol>, OpPackage>(compile-packages{packages, _})
+  compiled-patterns: HashTable<PatternKey, OpMatchPattern> with:
+    init => HashTable<PatternKey, OpMatchPattern>()
+  current-overlays: List<Symbol> with:
+    setter => set-current-overlays
+    init => List()
+
+;------------------------------------------------------------
+;------------------- Construction ---------------------------
+;------------------------------------------------------------
+
+;Mix and compile the syntax packages with the given names.
+;The first name in names is the name of the base package.
+defn compile-packages (packages:HashTable<Symbol,SyntaxPackage>,
+                       names:List<Symbol>) -> OpPackage :
+  compile-syntax-packages $ to-tuple $
+    seq({packages[_]}, names)
+
+;============================================================
+;=============== Called by Expanded Macros ==================
+;============================================================
+
+;Register a new syntax package with the registry.
+;Fatal if the package already exists.
+defn register-syntax-package (reg:SyntaxPackageRegistry, p:SyntaxPackage) -> False :
+  if key?(packages(reg), name(p)) :
+    fatal("Could not define syntax package %_. There is already a syntax package with that name." % [name(p)])
+  packages(reg)[name(p)] = p
+
+;Parse a production.
+;- base: The base syntax package.
+;- overlays: The overlays to use.
+;- form: The form to parse.
+;- prod: The name of the production to parse.
+;- repeat?: Whether to parse the production repeatedly, or just once.
+defn syntax-parse (reg:SyntaxPackageRegistry,
+                   base:Symbol,
+                   overlays:List<Symbol>,
+                   form:List,
+                   prod:Symbol,
+                   repeat?:True|False) -> ? :
+  within package = retrieve-compiled-package(reg, base, overlays) :
+    val prod-id = production-id?(package, prod)
+    match(prod-id:Int) :
+      parse(form, package, prod-id, repeat?)
+    else :
+      fatal("No production named '%_' in syntax package '%_'." % [prod, base])
+
+;Perform a match against a bunch of patterns.
+;- filename: The filename containing the usage of 'match-syntax'.
+;- id: The id of the usage of 'match-syntax'.
+;- base: The base syntax package.
+;- overlays: The overlays to use.
+;- form: The form to match against.
+;- pat: The closure for creating the pattern.
+;- actions: The actions to execute for the pattern. Includes both
+;  guards and bodies.
+defn syntax-match (reg:SyntaxPackageRegistry,
+                   filename:String|False,
+                   id:Long,
+                   base:Symbol,
+                   overlays:List<Symbol>,
+                   form:List,
+                   pat: () -> Pattern,
+                   actions: Tuple<(Context -> ?)>) -> ? :
+  within package = retrieve-compiled-package(reg, base, overlays) :
+    val match-pattern = retrieve-compiled-pattern(reg, PatternKey(filename, id), package, pat)
+    parse(form, package, match-pattern, actions)
+
+;============================================================
+;================== Existence ===============================
+;============================================================
+
+;Return true if there is a syntax package with the given name in the
+;registry.
+defn syntax-package-exists? (reg:SyntaxPackageRegistry, name:Symbol) -> True|False :
+  key?(packages(reg), name)
+
+;For each package name, (empty and current-overlays are not supported),
+;throw an exception if any of the names are not a registered syntax package.
+defn ensure-packages-exist! (reg:SyntaxPackageRegistry, names:Seqable<Symbol>) -> False :
+  for name in names do :
+    if not key?(packages(reg), name) :
+      throw(NoSyntaxPackage(name))
+
+;============================================================
+;=================== Package List ===========================
+;============================================================
+
+;Retrieve the full list of packages implied by the given
+;list of packages and overlays. Includes all the packages
+;listed by current-overlays, if current-overlays is used, and
+;includes their dependencies.
+;The first name in names must be the base package.
+
+defn package-list (reg:SyntaxPackageRegistry, names:Collection<Symbol>) -> List<Symbol> :
+  ;Accumulate all added packages to the list and set.
+  val pkgs = Vector<Symbol>()
+  val pkg-set = HashSet<Symbol>()
+
+  ;Add the given package to the package list (if not already there).
+  ;Recursively add the package's dependencies.
+  defn add? (name:Symbol) -> False :
+    if add(pkg-set, name) :
+      add(pkgs, name)
+      if not syntax-package-exists?(reg,name) :
+        fatal("Could not resolve syntax package %_." % [name])
+      do(add?{package(_)}, imports(packages(reg)[name]))
+
+  ;Process all names.
+  ;Treat `empty, and `current-overlays specially.
+  for name in names do :
+    switch(name) :
+      `empty : false
+      `current-overlays : do(add?, current-overlays(reg))
+      else : add?(name)
+
+  ;Return the computed list of all packages.
+  to-list(pkgs)
+
+;============================================================
+;================== Cached Compiled Package =================
+;============================================================
+
+;Retrieve the compiled syntax package corresponding to the
+;given base and overlays, and execute f.
+;During execution of f, current-overlays is set to the
+;list of overlays implied by 'base + overlays'.
+defn retrieve-compiled-package<?T> (f:OpPackage -> ?T,
+                                    reg:SyntaxPackageRegistry,
+                                    base:Symbol,
+                                    overlays:List<Symbol>) -> T :
+  val names = package-list(reg, cons(base, overlays))
+  val package = compiled-packages(reg)[names]
+  val old-overlays = current-overlays(reg)
+  dynamic-wind(
+    fn () : set-current-overlays(reg, names)
+    fn () : f(package)
+    fn () : set-current-overlays(reg, old-overlays))
+
+;============================================================
+;================== Cached Compiled Pattern =================
+;============================================================
+
+;The lookup key to use for retrieving a cached
+;match-syntax pattern.
+defstruct PatternKey <: Hashable&Equalable :
+  filename: String|False
+  id: Long
+with:
+  hashable => true
+  equalable => true
+
+;Retrieve the compiled match pattern for the given key.
+defn retrieve-compiled-pattern (reg:SyntaxPackageRegistry,
+                                key:PatternKey,
+                                package:OpPackage,
+                                pat: () -> Pattern) -> OpMatchPattern :
+  if not key?(compiled-patterns(reg), key) :
+    compiled-patterns(reg)[key] = compile-pattern(package, pat())
+  compiled-patterns(reg)[key]
+
+;============================================================
+;================== Current Registry ========================
+;============================================================
+
+;These functions are a mirror of the API of SyntaxPackageRegistry
+;except that it uses the implicit global PACKAGE-REGISTRY.
+
+val PACKAGE-REGISTRY = SyntaxPackageRegistry()
+
+public defn register-syntax-package (p:SyntaxPackage) -> False :
+  register-syntax-package(PACKAGE-REGISTRY, p)
+
+public defn syntax-parse (base:Symbol,
+                          overlays:List<Symbol>,
+                          form:List,
+                          prod:Symbol,
+                          repeat?:True|False) -> ? :
+  trace-syntax-parse?(base, overlays, form, prod, repeat?)
+  syntax-parse(PACKAGE-REGISTRY,
+               base,
+               overlays,
+               form,
+               prod,
+               repeat?)
+
+public defn syntax-match (filename:String|False,
+                          id:Long,
+                          base:Symbol,
+                          overlays:List<Symbol>,
+                          form:List,
+                          pat: () -> Pattern,
+                          actions: Tuple<(Context -> ?)>) -> ? :
+  syntax-match(PACKAGE-REGISTRY,
+               filename,
+               id,
+               base,
+               overlays,
+               form,
+               pat,
+               actions)
+
+public defn syntax-package-exists? (name:Symbol) -> True|False :
+  syntax-package-exists?(PACKAGE-REGISTRY, name)
+
+;============================================================
+;================= Control Debugging ========================
+;============================================================
+
+;Control whether tracing syntax-parse is enabled/disabled.
+var TRACE-SYNTAX-PARSE:True|False = false
+
+;Either enable/disable tracing syntax-parse.
+public defn set-trace-syntax-parse (enable:True|False) :
+  TRACE-SYNTAX-PARSE = enable
+
+;Call trace-syntax-parse if the setting is turned on.
+defn trace-syntax-parse? (base:Symbol,
+                          overlays:List<Symbol>,
+                          form:List,
+                          prod:Symbol,
+                          repeat?:True|False) :
+  if TRACE-SYNTAX-PARSE :
+    trace-syntax-parse(base, overlays, form, prod, repeat?)
+
+;============================================================
+;============== Format Syntax-Parse Arguments ===============
+;============================================================
+
+;Print out that syntax-parse was called to the
+;current output stream. Used for debugging.
+defn trace-syntax-parse (base:Symbol,
+                         overlays:List<Symbol>,
+                         form:List,
+                         prod:Symbol,
+                         repeat?:True|False) :
+                         
+  val overlay-str = "" when empty?(overlays)
+               else " + %," % [overlays]
+               
+  val repeat-str = " ..." when repeat?
+              else ""
+              
+  println("parse-syntax[%_%_ / #%_%_](%~)" % [
+          base,
+          overlay-str,
+          prod,
+          repeat-str,
+          to-short-string(80, form)])  
+
+;Return x printed out to a String with maxium 'n' characters.
+;If x's length exceeds n, then "..." is added to the end
+;of the string.
+defn to-short-string (n:Int, x) -> String :
+  ;Print characters to buffer.
+  ;Stop immediately if more than n characters have been
+  ;printed.
+  label<String> return :
+    val buffer = StringBuffer()  
+    val stream = new OutputStream :
+      defmethod print (this, x:Char) :
+        if length(buffer) >= n :
+          add-all(buffer, " ...")
+          return(to-string(buffer))
+        else :
+          add(buffer, x)
+    print(stream, x)
+    to-string(buffer)

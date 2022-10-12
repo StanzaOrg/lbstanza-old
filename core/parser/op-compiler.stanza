@@ -1,0 +1,403 @@
+defpackage parser/op-compiler :
+  import core
+  import collections
+  import parser/ops with:
+    prefix(Terminal,
+           Action,
+           Return,
+           Rest,
+           Any,
+           NoMatch,
+           Lookahead,
+           ActionCallback,
+           ActionParams) => Op
+  import parser/context
+  import parser/engine-lang
+  import parser/lookahead-tokens
+
+;============================================================
+;============== Compilation of Package ======================
+;============================================================
+
+public defn compile (package:PatternPackage) -> OpPackage :
+  val compiler = Compiler(length(productions(package)))
+  for prod in productions(package) do :
+    compile(prod, compiler)
+    
+  val productions = productions(compiler)
+  val ops = ops(compiler)
+  val lookahead = LookaheadTable(ops)
+
+  val actions = map(translate-callback, actions(package))
+
+  OpPackage(productions, actions, ops, lookahead)
+
+defn compile (def:DefProduction, c:Compiler) -> False :
+  val name = name(def) when public?(def)
+  emit-production-label(c, id(def), name)
+  compile(pattern(def), c, false)
+  emit(c, OpReturn())
+
+;============================================================
+;============ Compilation of Match Pattern ==================
+;============================================================
+
+public defn compile-match (pattern:Pattern, params:Tuple<ActionParams>) -> OpMatchPattern :
+  val c = Compiler(0)
+  compile(pattern, c, true)
+  emit(c, OpReturn())
+  OpMatchPattern(ops(c), map(translate-params, params))
+
+;============================================================
+;================ Translation of Callbacks ==================
+;============================================================
+
+;Translate into the ActionCallback defined in parser/ops.
+defn translate-callback (c:ActionCallback) -> OpActionCallback :
+  OpActionCallback(callback(c), translate-params(params(c)))
+
+;Translate into the ActionParams defined in parser/ops.
+defn translate-params (p:ActionParams) -> OpActionParams :
+  OpActionParams(lazy?(p), bind-arity(p))
+
+;============================================================
+;================= Compilation Algorithm ====================
+;============================================================
+
+;Compile a single pattern.
+;- call-by-id?: True if productions should be called by their id
+;  instead of address.
+defn compile (pat:Pattern, c:Compiler, call-by-id?:True|False) -> False :
+  match(pat) :
+    (pat:Terminal|Rest|Any|Production|ListPattern) :
+      compile-bindable-pattern(pat, c, false, false, call-by-id?)
+    (pat:Binder) :
+      compile-bindable-pattern(pattern(pat), c, true, false, call-by-id?)
+    (pat:NoMatch) :
+      emit(c, OpNoMatch())
+    (pat:NotPattern) :
+      val end-label = make-label(c)
+      emit(c, InvBranch(end-label))
+      compile(pattern(pat), c, call-by-id?)
+      emit(c, Commit())
+      emit-label(c, end-label)
+    (pat:Empty) :
+      false    
+    (pat:Sequence) :
+      for pat in patterns(pat) do :
+        compile(pat, c, call-by-id?)
+    (pat:Choice) :
+      val branch-labels = to-list(seq(make-label{c}, branches(pat)))
+      val end-label = make-label(c)
+      emit(c, Branch(branch-labels, end-label))
+      for (branch in branches(pat), blabel in branch-labels) do :
+        emit-label(c, blabel)
+        compile(pattern(branch), c, call-by-id?)
+        if abandon-on-match?(branch) : emit(c, CommitNoMatch())
+        else : emit(c, Commit())
+      emit-label(c, end-label)
+    (pat:Lookahead) :
+      ;By default, branches are compiled to:
+      ;  operations ... [Commit], or
+      ;  operations ... [CommitNoMatch]
+      ;This is because, in general, each LookaheadEntry contains maps to multiple
+      ;branches, and compiles to a [Branch].
+      ;However, if a branch is never part of a multiple option LookaheadEntry,
+      ;then it can be compile down to:
+      ;  operations ..., [Goto] or
+      ;  operations ... [NoMatch]
+
+      ;Identify which branches are not part of any multiple option LookaheadEntry.
+      val single-target-branches? = Array<True|False>(length(branches(pat)), true)
+      defn identify-single-target-branches (options:Tuple<Int>) :
+        if length(options) > 1 :
+          for o in options do :
+            single-target-branches?[o] = false
+      do(identify-single-target-branches{options(_)}, entries(pat))
+      identify-single-target-branches(else-options(pat))
+
+      ;Create the labels for the branches.
+      val branch-labels = map(make-label{c}, branches(pat))
+
+      ;Create the label to jump to if the dispatch is all
+      ;successful.
+      val end-label = make-label(c)
+
+      ;Create the labels for the dispatch instructions.
+      val dispatch-labels = HashTable<Tuple<Int>,Int>()
+      defn make-dispatch-label (options:Tuple<Int>) :
+        val single-target-entry? = length(options) == 1
+                               and single-target-branches?[options[0]]
+        if not single-target-entry? :
+          set?(dispatch-labels, options, make-label{c})
+      do(make-dispatch-label{options(_)}, entries(pat))
+      make-dispatch-label(else-options(pat))
+
+      ;Emit Lookahead Op.
+      emit(c, OpLookahead(
+                map(compile-entry, entries(pat))
+                compile-else(else-options(pat)))) where :
+        defn compile-options (os:Tuple<Int>) -> Int :
+          match(get?(dispatch-labels, os)) :
+            (l:Int) :
+              l
+            (f:False) :
+              fatal("Unexpected target.") when length(os) != 1
+              branch-labels[os[0]]
+        defn compile-entry (e:LookaheadEntry) -> LookaheadBranch :
+          LookaheadBranch(value(e), compile-options(options(e)))
+        defn compile-else (os:Tuple<Int>) -> Int|False :
+          compile-options(os) when not empty?(os)
+
+      ;Emit dispatch branches
+      defn emit-dispatch (os:Tuple<Int>) :
+        match(get?(dispatch-labels, os)) :
+          (lbl:Int) :
+            emit-label(c, lbl)
+            val alts = to-list $
+              seq({branch-labels[_]}, os)
+            emit(c, Branch(alts, end-label))
+          (f:False) :
+            false
+      do(emit-dispatch, keys(dispatch-labels))
+
+      ;Emit branches
+      for (branch in branches(pat),
+           branch-label in branch-labels,
+           single-target? in single-target-branches?) do :
+        emit-label(c, branch-label)
+        compile(pattern(branch), c, call-by-id?)
+        val end-instruction = match(single-target?, abandon-on-match?(branch)) :
+          (st:True, ab:True) : OpNoMatch()
+          (st:True, ab:False) : Goto(end-label)
+          (st:False, ab:True) : CommitNoMatch()
+          (st:False, ab:False) : Commit()
+        emit(c, end-instruction)
+
+      ;Emit ending label
+      emit-label(c, end-label)      
+    (pat:Repeat) :
+      val end-label = make-label(c)
+      emit(c, Loop(end-label, bind-arity(pattern(pat))))
+      compile(pattern(pat), c, call-by-id?)
+      emit(c, LoopEnd())
+      emit-label(c, end-label)
+    (pat:Action) :
+      emit(c, OpAction())
+      compile(pattern(pat), c, call-by-id?)
+      match(guard-index(pat):Int) :
+        emit(c, GuardCheck(guard-index(pat) as Int))
+      if fail?(pat) : emit(c, Fail(index(pat)))
+      else : emit(c, Succeed(index(pat)))
+    (pat:SingleBinderGuard) :
+      val b = pattern(pat) as Binder
+      compile-bindable-pattern(pattern(b), c, true, index(pat), call-by-id?)
+
+;Compile a pattern that is able to be bound.
+;Assumes that binders have been pushed inwards.
+;- bind?: True if the pattern should be bound.
+;- guard-index: Int if the pattern is part of a SingleBinderGuard.
+;- call-by-id?: True if productions should be called by
+;  their id instead of by address. Match-syntax patterns
+;  should use true for this.
+defn compile-bindable-pattern (pat:Pattern,
+                               c:Compiler,
+                               bind?:True|False,
+                               guard-index:Int|False,
+                               call-by-id?:True|False) -> False :
+  ;Sanity check on configuration:
+  if guard-index is Int and not bind? :
+    fatal("Illegal simple guard when bind? is false.")
+    
+  match(pat) :
+    (pat:Terminal) :
+      emit(c, OpTerminal(value(pat), bind?))
+      emit(c, ImmediateGuardCheck(guard-index as Int)) when guard-index is Int
+    (pat:Rest) :
+      emit(c, OpRest(bind?))
+      fatal("Invalid simple guard") when guard-index is Int
+    (pat:Any) :
+      emit(c, OpAny(bind?))
+      emit(c, ImmediateGuardCheck(guard-index as Int)) when guard-index is Int
+    (pat:Production) :
+      if call-by-id? : emit(c, CallProduction(id(pat), bind?))
+      else : emit(c, Call(id(pat), id(pat), bind?))
+      fatal("Invalid simple guard") when guard-index is Int
+    (pat:ListPattern) :
+      val end-label = make-label(c)
+      emit(c, LParen(end-label, bind?))
+      emit(c, ImmediateGuardCheck(guard-index as Int)) when guard-index is Int
+      compile(pattern(pat), c, call-by-id?)
+      emit(c, RParen())
+      emit-label(c, end-label)
+    (pat) :
+      fatal("Unexpected %_ pattern within Binder pattern." % [object-type(pat)])
+
+;============================================================
+;===================== Bind Arity ===========================
+;============================================================
+
+defn bind-arity (p:Pattern) -> Int :
+  match(p) :
+    (p:Terminal) : 0
+    (p:Any) : 0
+    (p:Binder) : 1
+    (p:Sequence) : sum(seq(bind-arity, patterns(p)))
+    (p:Choice|Lookahead) :
+      val b = find!({not abandon-on-match?(_)}, branches(p))
+      bind-arity(pattern(b))
+    (p:ListPattern) : bind-arity(pattern(p))
+    (p:Production) : 0
+    (p:Repeat) : bind-arity(pattern(p))
+    (p:NotPattern) : 0
+    (p:SingleBinderGuard) : bind-arity(pattern(p))
+    (p:Action) : fatal("Invalid argument")
+
+;============================================================
+;=================== Lookahead Table ========================
+;============================================================
+
+;Scan through the operations and build the fast
+;lookahead table.
+defn lookahead-table (ops:Tuple<Op>) -> HashTable<[Int,LookaheadToken],Int> :
+  val table = HashTable<[Int, LookaheadToken],Int>()
+  for (op in ops, i in 0 to false) do :
+    match(op:OpLookahead) :
+      for b in branches(op) do :
+        table[[i, token(b)]] = address(b)
+  table
+
+;============================================================
+;===================== Compiler =============================
+;============================================================
+
+;Utility for making and resolving labels, and collecting
+;generated operations.
+deftype Compiler
+
+;Create a new label. Returns the label id. The label still
+;must be used using emit-label.
+defmulti make-label (c:Compiler) -> Int
+
+;Emit a previously created label at the current position.
+defmulti emit-label (c:Compiler, id:Int) -> False
+
+;Emit the label indicating the start of a production.
+defmulti emit-production-label (c:Compiler, prod-id:Int, name:Symbol|False) -> False
+
+;Emit an operation.
+defmulti emit (c:Compiler, op:Op) -> False
+
+;Used at the end. Return all the productions emitted by the compiler.
+defmulti productions (c:Compiler) -> Tuple<ProductionOp>
+
+;Used at the end. Return all the ops emitted by the compiler.
+defmulti ops (c:Compiler) -> Tuple<Op>
+
+;------------------------------------------------------------
+;------------------- Implementation -------------------------
+;------------------------------------------------------------
+
+;The number of productions is required for allocating storage
+;for storing the addresses of each production.
+defn Compiler (num-productions:Int) -> Compiler :
+
+  ;Add all generated ops here.
+  val accum = Vector<Op>()
+
+  ;Store addresses of all labels here.
+  ;labels[id] = addr means that the address for label with
+  ;label 'id' is 'addr'. If addr is false, it means that the
+  ;label has been created, but not yet emitted.
+  val labels = Vector<Int|False>()
+
+  ;Store the created productions for each production.
+  ;If a slot is false it means that the label for that
+  ;production has not been emitted yet.
+  val op-productions = Array<ProductionOp|False>(num-productions, false)
+
+  ;Fatal if there exists created labels that are not
+  ;emitted.
+  defn ensure-labels-assigned! () :
+    for id in 0 to length(labels) do :
+      if labels[id] is False :
+        fatal("Address for label %_ is unassigned" % [id])
+
+  ;Fatal if there exists productions for which their label
+  ;has not yet been emitted.
+  defn ensure-op-productions-assigned! () :
+    for id in 0 to num-productions do :
+      if op-productions[id] is False :
+        fatal("Address for production %_ is unassigned" % [id])
+
+  ;Fill generated Ops with absolute addresses of labels
+  ;and productions.
+  defn fill-addresses () :
+    defn prod-address (id:Int) -> Int :
+      address(op-productions[id] as ProductionOp)
+    defn label-address (id:Int) -> Int :
+      labels[id] as Int
+    for op in accum map! :
+      map-address(op, label-address, prod-address)
+
+  ;Create the compiler.
+  new Compiler :
+    ;Allocate a new label.
+    defmethod make-label (this) -> Int :
+      add(labels, false)
+      length(labels) - 1
+      
+    ;Emit an already-created label.
+    ;Fatal if that label has already been emitted.
+    defmethod emit-label (this, id:Int) -> False :
+      if labels[id] is Int :
+        fatal("Label %_ already emitted." % [id])
+      labels[id] = length(accum)
+
+    ;Emit a label for a production.
+    ;Fatal if that production's label has already been emitted.
+    defmethod emit-production-label (this, prod-id:Int, name:Symbol|False) -> False :
+      if op-productions[prod-id] is-not False :
+        fatal("Production %_ already emitted." % [prod-id])
+      op-productions[prod-id] = ProductionOp(prod-id, name, length(accum))
+      
+    ;Emit an operation.
+    defmethod emit (this, op:Op) -> False :
+      add(accum, op)
+
+    ;Return all the emitted operations.
+    defmethod ops (this) :
+      ensure-op-productions-assigned!()
+      ensure-labels-assigned!()
+      fill-addresses()
+      to-tuple(accum)
+      
+    ;Return all the emitted productions.
+    defmethod productions (this) :
+      ensure-op-productions-assigned!()
+      to-tuple(op-productions) as Tuple<ProductionOp>
+
+;============================================================
+;============= Fill in Resolved Addresses in Op =============
+;============================================================
+
+;Fill in any labels or productions with their absolute addresses
+;in the given op.
+;- faddr (label-id) -> address: Returns the absolute address
+;  of the given label.
+;- fprod (prod-id) -> address: Returns the absolute address
+;  of the given production.
+defn map-address (op:Op
+                  faddr:Int -> Int,
+                  fprod:Int -> Int) -> Op :
+  defn faddr? (a:Int|False) : match(a:Int) : faddr(a)
+  defn fbranch (b:LookaheadBranch) : LookaheadBranch(token(b), faddr(address(b)))
+  match(op) :
+    (op:Branch) : Branch(map(faddr,alts(op)), faddr(conseq(op)))
+    (op:LParen) : LParen(faddr(end-address(op)), bind?(op))
+    (op:Call) : Call(production(op), fprod(address(op)), bind?(op))
+    (op:Loop) : Loop(faddr(end-address(op)), bind-arity(op))
+    (op:InvBranch) : InvBranch(faddr(end-address(op)))
+    (op:OpLookahead) : OpLookahead(map(fbranch,branches(op)), faddr?(alt(op)))
+    (op:Goto) : Goto(faddr(address(op)))
+    (op) : op

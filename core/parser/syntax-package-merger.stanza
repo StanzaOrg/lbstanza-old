@@ -1,0 +1,258 @@
+defpackage parser/syntax-package-merger :
+  import core
+  import collections
+  import parser/syntax-packages
+  import parser/patterns
+  import parser/merged-syntax-package
+  import stz/algorithms
+
+;Merge all the given syntax packages into one.
+public defn merge (pkgs:Tuple<SyntaxPackage>) -> MergedSyntaxPackage :
+  ;Holds the records for all defined productions in all packages.
+  val production-table = HashTable<ProdName,ProdRecord>()
+
+  ;Holds the records in production-table keyed by id.
+  val production-table-by-id = Vector<ProdRecord>()
+
+  ;An entry, ProdName(mypackage, myprod) => rec, mean that the production
+  ;'myprod' referenced from within package 'mypackage' resolves to
+  ;production 'rec'.
+  val local-table = HashTable<ProdName,ProdRecord>()
+
+  ;An entry, ProdName(mypackage, myprod) => 13, means that when within
+  ;package 'mypackage', an inlining directive for 'myprod' indicates to
+  ;inline the foreign rules for production 13. Also, by default, a production
+  ;has all its foreign rules tacked on at the end. This entry also means that
+  ;production 13 explicitly controls where foreign rules are included and
+  ;they should not be added to the end.
+  val imported-foreign-rule-table = HashTable<ProdName,Int>()
+
+  ;Suppose production 13 is defined in 'mypackage'. An entry, 13 => ps ..., means
+  ;that 'ps' are all the rules in 'mypackage' defined for production 13.
+  val local-rules = IntTable-init<Vector<PackageRule>>(Vector<PackageRule>{})
+
+  ;Suppose production 13 is defined in 'mypackage'. An entry, 13 => ps ..., means
+  ;that 'ps' are all the rules outside of 'mypackage' defined for production 13.
+  val foreign-rules = IntTable-init<Vector<PackageRule>>(Vector<PackageRule>{})
+
+  ;Gather all the production records from all packages into a
+  ;'production-table'.
+  defn fill-production-table () :
+    for (pkg in pkgs, index in 0 to false) do :
+      for prod in productions(pkg) do :
+        val prod-name = ProdName(name(pkg), name(prod))
+        val rec = ProdRecord(index == 0, public?(prod), 
+                             name(pkg), name(prod),
+                             length(production-table))
+        production-table[prod-name] = rec
+        production-table-by-id[id(rec)] = rec
+        local-table[prod-name] = rec
+
+  ;For all imports in all productions ensure that the
+  ;productions can be resolved, and they are public.
+  defn add-imports-to-local-table () :
+    for pkg in pkgs do :
+      for import in imports(pkg) do :
+        for name in names(import) do :
+          val prod-name = ProdName(package(import), name)
+          if not key?(production-table, prod-name) :
+            fatal("Cannot import production %_ from package %_ into package %_. \
+                   No such production." % [name, package(import), /name(pkg)])
+          else if not public?(production-table[prod-name]) :
+            fatal("Cannot import production %_ from package %_ into package %_. \
+                   Production is not public." % [name, package(import), /name(pkg)])
+          else :
+            val local-name = ProdName(/name(pkg), name)
+            local-table[local-name] = production-table[prod-name]
+
+  ;For all ImportRules in all productions fill the imported-foreign-rule-table.
+  defn fill-imported-foreign-rule-table () :
+    for pkg in pkgs do :
+      for rule in import-rules(pkg) do :
+        val prod-name = ProdName(name(pkg), name(rule))
+        val prod-id = id(production-table[prod-name])
+        imported-foreign-rule-table[ProdName(name(pkg), new-name(rule))] = prod-id
+
+  ;Scan through all DefRule and add them to the local-rules and foreign-rules
+  ;tables.  
+  defn fill-rule-tables () :
+    ;The packages are traversed in reverse order so that the
+    ;foreign rules come out in the proper order.
+    ;Given base + p1, p2, the final ordering of foreign rules are:
+    ;  p2 / rule1
+    ;  p2 / rule2
+    ;  p2 / ...
+    ;  p1 / rule1
+    ;  p1 / rule2
+    ;  p1 / ...
+    ;  base / rule1
+    ;  base / rule2
+    ;  base / ...
+    for pkg in in-reverse(pkgs) do :
+      for rule in rules(pkg) do :
+        val rec = local-table[ProdName(name(pkg), name(rule))]
+        val local? = package(rec) == name(pkg)
+        val pkg-rule = PackageRule(name(pkg), pattern(rule))
+        if local? : add(local-rules[id(rec)], pkg-rule)
+        else : add(foreign-rules[id(rec)], pkg-rule)      
+
+  ;Resolve all productions in all patterns.
+  defn resolve-rules () :
+  
+    ;Resolve all Production to ProductionId in the package.
+    defn resolve (package:Symbol, p:Pattern) -> Pattern :
+      match(p) :
+        (p:Production) :
+          val rec = local-table[ProdName(package, name(p))]
+          ProductionId(id(rec))
+        (p) :
+          map(resolve{package, _}, p)
+
+    ;Resolve an inline directive:
+    ;- prod-id: The production to inline into.
+    ;- package: The package that this directive was used in.
+    ;- name: The production/rules to inline.
+    defn resolve-inline (prod-id:Int, package:Symbol, name:Symbol) -> InlinedRules|InlinedProduction :
+      ;Are we inlining a set of rules or an entire production.
+      val rule-for-prod = get?(imported-foreign-rule-table, ProdName(package, name))
+      match(rule-for-prod:Int) :
+        if rule-for-prod != prod-id :
+          val inlining-prod-name = /name(production-table-by-id[prod-id])
+          val rules-for-prod-name = /name(production-table-by-id[rule-for-prod])
+          fatal("In package mypackage, production '%_' attempts to inline the foreign rules '%_', but \
+                 those rules are for production '%_'." % [inlining-prod-name, name, rules-for-prod-name])
+        InlinedRules()
+      ;Otherwise, we are inlining an entire production.
+      else :
+        val rec = local-table[ProdName(package,name)]
+        InlinedProduction(id(rec))
+
+    ;Resolve all patterns in local-rules and foreign-rules.
+    for entry in cat(local-rules, foreign-rules) do :
+      val prod-id = key(entry)
+      for rule in value(entry) map! :
+        val new-pat = match(pattern(rule)) :
+          (p:Inlined) : resolve-inline(prod-id, package(rule), name(p))
+          (p) : resolve(package(rule), p)
+        PackageRule(package(rule), new-pat)
+
+  ;Ensure no mutual inlining cycles.
+  defn ensure-no-mutual-inlining-cycles! () :
+    val inlining-entries = 
+      for entry in cat(local-rules, foreign-rules) seq :
+        val prod-id = key(entry)
+        val inlined-ids = seq(id, filter-by<InlinedProduction>(seq(pattern, value(entry))))
+        prod-id => to-list(inlined-ids)
+    val cycles = filter-by<List<Int>>(strong-components(inlining-entries))
+    for cycle in cycles do :
+      val prod-names = map(name{production-table-by-id[_]}, cycle)
+      fatal("Productions %, circularly inline each other." % [prod-names])
+
+  ;Compute complete set of rules for all productions by evaluating
+  ;InlinedRules.
+  defn compute-inlined-rules () -> IntTable<Vector<PackageRule>> :
+    to-inttable<Vector<PackageRule>> $
+      for entry in local-rules seq :
+        val new-rules = Vector<PackageRule>()
+        var inlined-foreign-rules?:True|False = false
+
+        ;Evaluate any InlinedRules patterns in the local rules.
+        for rule in value(entry) do :
+          match(pattern(rule)) :
+            (p:InlinedRules) :
+              if inlined-foreign-rules? :
+                fatal("Redundant inlining of foreign rules.")
+              else :
+                add-all(new-rules, foreign-rules[key(entry)])
+                inlined-foreign-rules? = true
+            (p) :
+              add(new-rules, rule)
+              
+        ;If no InlinedRules patterns were executed, then by default
+        ;add all foreign rules to the start of the list.
+        if not inlined-foreign-rules? :
+          if not empty?(foreign-rules[key(entry)]) :
+            val saved-rules = to-tuple(new-rules)
+            clear(new-rules)
+            add-all(new-rules, cat(foreign-rules[key(entry)], saved-rules))
+          
+        key(entry) => new-rules
+
+  ;Compute all rules for all productions by evaluating
+  ;InlinedProduction.
+  defn compute-inlined-prods (prod-rules:IntTable<Vector<PackageRule>>) -> IntTable<Vector<PackageRule>> :
+    val table = IntTable<Vector<PackageRule>>()
+    defn rules (prod-id:Int) -> Vector<PackageRule> :
+      if not key?(table, prod-id) :
+        val new-rules = Vector<PackageRule>()
+        for rule in get?(prod-rules, prod-id, []) do :
+          match(pattern(rule)) :
+            (p:InlinedProduction) : add-all(new-rules, rules(id(p)))
+            (p) : add(new-rules, rule)
+        table[prod-id] = new-rules
+      table[prod-id]
+    do(rules, keys(prod-rules))
+    table
+
+  ;Compute the set of merged productions.
+  defn make-merged-productions (rules:IntTable<Vector<PackageRule>>) -> Tuple<MergedProduction> :
+    to-tuple $ for rec in production-table-by-id seq :
+      val patterns = to-tuple $ seq(pattern, get?(rules, id(rec), []))
+      MergedProduction(public?(rec) and base?(rec),
+                       id(rec),
+                       package(rec),
+                       name(rec),
+                       patterns)
+
+  ;Make the final merged package.
+  defn make-merged-package () -> MergedSyntaxPackage :
+    val base = name(pkgs[0])
+    val productions = compute-inlined-rules() $>
+                      compute-inlined-prods $>
+                      make-merged-productions
+    MergedSyntaxPackage(base, productions)
+
+  ;Launch!
+  fill-production-table()
+  add-imports-to-local-table()
+  fill-imported-foreign-rule-table()
+  fill-rule-tables()
+  resolve-rules()
+  ensure-no-mutual-inlining-cycles!()
+  make-merged-package()
+
+;Represents the definition details of a production.
+;- base?: True if the production was defined in the base package.
+;- public?: True if the production was defined as public.
+;- id: An integer for referring to the production.
+defstruct ProdRecord :
+  base?:True|False
+  public?:True|False
+  package:Symbol
+  name:Symbol
+  id:Int
+
+;Represents a rule defined in some package.
+;- pattern: The pattern for the rule.
+;- package: The package that the rule was originally defined in.
+defstruct PackageRule :
+  package:Symbol
+  pattern:Pattern
+with:
+  printer => true
+
+;Represents an inlining of a specific production/ruleset.
+defstruct InlinedProduction <: Pattern :
+  id:Int
+  
+;Represents an inlining of all foreign rules.
+defstruct InlinedRules <: Pattern
+
+;Represents a package name paired with a production name.
+defstruct ProdName <: Hashable&Equalable :
+  package:Symbol
+  prod:Symbol
+with:
+  printer => true
+  hashable => true
+  equalable => true

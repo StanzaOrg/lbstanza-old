@@ -1,0 +1,729 @@
+defpackage parser/postprocessing :
+  import core
+  import collections
+  import parser/engine-lang with:
+    prefix(ActionParams) => Eng
+  import parser/lookahead-tokens
+  import parser/errors
+  import parser/context
+  import stz/algorithms
+
+;============================================================
+;=============== Flatten Choice and Sequence ================
+;============================================================
+
+;Optimize the pattern to:
+;1. Reduce the number of Choice nested within Choice patterns.
+;2. Eliminate Sequence nested within Sequence patterns.
+public defn flatten-choice-and-seqs (p:Pattern) -> Pattern :
+  match(map(flatten-choice-and-seqs, p)) :
+    (p:Choice) : flatten-choice(p)
+    (p:Sequence) : Sequence?(patterns(p))
+    (p) : p
+
+;If the Choice contains nested Choice patterns, then attempt to
+;lift the nested branches up one level. Assumes that the nested patterns
+;have already undergone flattening.
+defn flatten-choice (c:Choice) -> Pattern :
+  ;Accumulate new choice branches here.
+  val new-branches = Vector<ChoiceBranch>()
+
+  ;Iterate through branches and try to collapse nested Choice patterns.
+  for b in branches(c) do :
+    match(pattern(b)) :
+      (pat:Choice) :
+        val first-abandon? = index-when(abandon-on-match?, branches(pat))
+        val num-lift = match(first-abandon?:Int) : first-abandon?
+                       else : length(branches(pat))
+        for i in 0 to num-lift do :
+          val branch-pat = pattern(branches(pat)[i])
+          add(new-branches, ChoiceBranch(abandon-on-match?(b), branch-pat))
+        match(first-abandon?:Int) :
+          val bs = branches(pat)[first-abandon? to false]
+          add(new-branches, ChoiceBranch(abandon-on-match?(b), Choice(bs)))
+      (pat) :
+        add(new-branches, b)
+
+  ;Return the new Choice pattern.
+  Choice?(new-branches)
+
+;============================================================
+;===================== Identify Rest ========================
+;============================================================
+
+;Make the following two substitutions to the pattern:
+;  Repeat(Any) => Rest
+;  Repeat(Binder(Any)) => Binder(Rest)
+public defn identify-rest-pattern (p:Pattern) -> Pattern :
+
+  ;Return true if p is Binder(Any).
+  defn binder-to-any? (p:Pattern) -> True|False :
+    match(p:Binder) :
+      pattern(p) is Any
+
+  ;Recursively make substitutions.
+  match(map(identify-rest-pattern,p)) :
+    (p:Repeat) :
+      if pattern(p) is Any : Rest()
+      else if binder-to-any?(pattern(p)) : Binder(Rest())
+      else : p
+    (p) :
+      p
+
+;============================================================
+;================ Pushing Binders Inwards ===================
+;============================================================
+
+public defn push-binders-inwards (p:Pattern) -> Pattern :
+  match(p) :
+    (p:Binder) :
+      if easy-bind?(pattern(p)) : p
+      else if bindable?(pattern(p)) : push-binder(pattern(p))
+      else : p
+    (p) :
+      map(push-binders-inwards, p)
+
+defn easy-bind? (p:Pattern) -> True|False :
+  p is Terminal|Any|Production|Rest|ListPattern
+
+defn bindable? (p:Pattern) -> True|False :
+  if easy-bind?(p) :
+    true
+  else :
+    match(p) :
+      (p:Repeat) : bindable?(pattern(p))
+      (p:Choice) : all?(bindable?{pattern(_)}, branches(p))
+      (p) : false
+
+defn push-binder (p:Pattern) -> Pattern :
+  if easy-bind?(p) :
+    Binder(p)
+  else :
+    match(p) :
+      (p:Repeat) :
+        Repeat(push-binder(pattern(p)))
+      (p:Choice) :
+        val new-branches = for b in branches(p) map :
+          ChoiceBranch(abandon-on-match?(b), push-binder(pattern(b)))
+        Choice(new-branches)
+
+;============================================================
+;==================== Nullable Analysis =====================
+;============================================================
+
+public defstruct NullableSet :
+  productions:IntSet
+
+public defn nullable-production? (s:NullableSet, id:Int) -> True|False :
+  productions(s)[id]
+
+public defn nullable? (s:NullableSet, p:Pattern) -> True|False :
+  match(p) :
+    (p:Terminal) : false
+    (p:Rest) : true
+    (p:Any) : false
+    (p:NoMatch) : false
+    (p:NotPattern) : true
+    (p:Empty) : true
+    (p:Binder) : nullable?(s, pattern(p))
+    (p:SingleBinderGuard) : nullable?(s, pattern(p))
+    (p:Sequence) : all?(nullable?{s, _}, patterns(p))
+    (p:Choice|Lookahead) :
+      for b in branches(p) any? :
+        (not abandon-on-match?(b)) and nullable?(s, pattern(b))
+    (p:ListPattern) : false
+    (p:Production) : nullable-production?(s, id(p))
+    (p:Repeat) : true
+    (p:Action) : nullable?(s, pattern(p))
+
+public defn NullableSet (package:PatternPackage) -> NullableSet :
+  val null-set = NullableSet(IntSet())
+
+  ;Iterate until fixpoint.
+  within progress = fixpoint() :
+    for p in productions(package) do :
+      if not nullable-production?(null-set, id(p)) :
+        if nullable?(null-set, pattern(p)) :
+          add(productions(null-set), id(p))
+          progress()
+
+  ;Return nullable set.
+  null-set
+
+;<doc>=======================================================
+;================== First set Analysis ======================
+;============================================================
+
+When inspecting the upcoming form, there are only 3 cases:
+  Case: A terminal is upcoming (e.g. hello)
+  Case: The form is empty.
+  Case: A list is upcoming (e.g. (hello))
+
+We will precompute the first set of a pattern. e.g. {A0, A1, A2, ...}.
+
+Each atom in the first set specifies which input cases the pattern
+has a possibility of matching against.
+
+High-level Algorithm:
+  val case = get-upcoming-input-case()
+  if nullable(pattern) then :
+    try matching against pattern
+  else :
+    for atom in first-set(pattern) do :
+      if atom allows-for case then:
+        try matching against pattern
+
+;============================================================
+;=======================================================<doc>
+
+public defstruct FirstSet :
+  null-set:NullableSet
+  first-lists: Array<List<FirstSetAtom>>
+
+;Return every first set atom in the given pattern.
+;Depends upon calculation of first lists for productions.
+public defn first-set (return:FirstSetAtom -> False, p:Pattern, fset:FirstSet) -> False :
+  match(p) :
+    (p:Terminal) :
+      if value(p) is List : return(ListAtom)
+      else : return(TerminalAtom(value(p)))
+    (p:Rest) :
+      false
+    (p:Any) :
+      return(NonEmptyAtom)
+    (p:NoMatch) :
+      false
+    (p:NotPattern) :
+      false
+    (p:Empty) :
+      false
+    (p:Binder) :
+      first-set(return, pattern(p), fset)
+    (p:SingleBinderGuard) :
+      first-set(return, pattern(p), fset)
+    (p:Sequence) :
+      val ps = to-seq(patterns(p))
+      let loop () :
+        if not empty?(ps) :
+          val p = next(ps)
+          first-set(return, p, fset)
+          loop() when nullable?(null-set(fset), p)
+    (p:Choice|Lookahead) :
+      for b in branches(p) do :
+        if not abandon-on-match?(b) :
+          first-set(return, pattern(b), fset)
+    (p:ListPattern) :
+      return(ListAtom)
+    (p:Production) :
+      do(return, first-lists(fset)[id(p)])
+    (p:Repeat) :
+      first-set(return, pattern(p), fset)
+    (p:Action) :
+      first-set(return, pattern(p), fset)
+
+public defn FirstSet (package:PatternPackage, s:NullableSet) -> FirstSet :
+  val added = HashSet<[Int,FirstSetAtom]>()
+  val num-productions = length(productions(package))
+  val fset = FirstSet(s, Array<List<FirstSetAtom>>(num-productions, List()))
+
+  ;Iterate until fixpoint.
+  within progress = fixpoint() :
+    for p in productions(package) do :
+      within atom = first-set(pattern(p), fset) :
+        if add(added, [id(p), atom]) :
+          first-lists(fset)[id(p)] = cons(atom, first-lists(fset)[id(p)])
+          progress()
+
+  ;Return the first set.
+  fset
+
+public defn FirstSet (package:PatternPackage) -> FirstSet :
+  FirstSet(package, NullableSet(package))
+
+defmethod print (o:OutputStream, fset:FirstSet) :
+  val items = for (atoms in first-lists(fset), id in 0 to false) seq :
+    "Prod %_: %_" % [id, atoms]
+  val indented-items = Indented("%n" % [items])
+  println("FirstSet:\n%_" % [indented-items])
+
+;------------------------------------------------------------
+;---------------- Listing of all FirstSetAtoms --------------
+;------------------------------------------------------------
+
+public deftype FirstSetAtom <: Hashable&Equalable
+
+public defstruct TerminalAtom <: FirstSetAtom :
+  value
+with:
+  printer => true
+  equalable => true
+  hashable => true
+
+;- NonEmptyAtom: This atom indicates that the pattern allows for all input cases
+;  as long as the input is non-empty.
+;- ListAtom: This atom indicates that the pattern allows for only upcoming lists.
+public defenum SpecialAtom <: FirstSetAtom :
+  NonEmptyAtom
+  ListAtom
+
+;============================================================
+;================ Left-Recursion Analysis ===================
+;============================================================
+
+;------------------------------------------------------------
+;--------------- Definition of Left Recursion ---------------
+;------------------------------------------------------------
+
+;Return all direct left-recursive productions in the pattern.
+public defn direct-left-recursive-prods (return:Int -> ?, p:Pattern, null-set:NullableSet) -> False :
+  let loop (p:Pattern = p) :
+    match(p) :
+      ;Return the production.
+      (p:Production) : return(id(p))
+      ;Step past nullable patterns.
+      (p:Sequence) :
+        val ps = to-seq(patterns(p))
+        let loop-next () :
+          if not empty?(ps) :
+            val p = next(ps)
+            loop(p)
+            loop-next() when nullable?(null-set, p)
+      ;Recurse on all branches.
+      (p:Choice|Lookahead) :
+        do(loop{pattern(_)}, branches(p))
+      ;Simple recurse
+      (p:NotPattern) : loop(pattern(p))
+      (p:Repeat) : loop(pattern(p))
+      (p:Action) : loop(pattern(p))
+      (p:Binder) : loop(pattern(p))
+      (p:SingleBinderGuard) : loop(pattern(p))
+      ;Otherwise
+      (p) : false
+  false
+
+;Return true if the pattern p left-recurses on prod.
+defn left-recurses? (p:Pattern, prod:Int, null-set:NullableSet) -> True|False :
+  label<True|False> return :
+    within prod-id = direct-left-recursive-prods(p, null-set) :
+      return(true) when prod == prod-id
+    false
+
+;Identify all left-recursion cycles.
+public defn left-recursion-cycles (p:PatternPackage, null-set:NullableSet) -> Tuple<List<Int>> :
+
+  defn left-recursive-prods (p:Pattern) -> List<Int> :
+    val prod-set = IntSet()
+    within id = direct-left-recursive-prods(p, null-set) :
+      add(prod-set, id)
+    to-list(prod-set)
+
+  val components = strong-components $
+    for p in productions(p) seq :
+      id(p) => left-recursive-prods(pattern(p))
+  to-tuple $ filter-by<List<Int>>(components)
+
+;------------------------------------------------------------
+;----------------- ProductionPattern ------------------------
+;------------------------------------------------------------
+
+defstruct ProductionPattern :
+  rules:Tuple<RulePattern>
+
+defstruct RulePattern :
+  abandon-on-match?:True|False
+  action:ActionParams|False
+  patterns:Tuple<Pattern> with: (ensure => non-empty!, updater => sub-patterns)
+
+defstruct ActionParams :
+  index:Int
+  guard-index:Int|False
+  fail?:True|False
+
+defn non-empty! (description:String, value:Tuple) :
+  if empty?(value) :
+    fatal("Tuple provided to %_ cannot be empty." % [description])
+
+defn ProductionPattern (p:Pattern) -> ProductionPattern :
+  defn rules (p:Pattern) -> Tuple<RulePattern> :
+    match(p:Choice) :
+      for b in branches(p) map :
+        rule-pattern(abandon-on-match?(b), pattern(b))
+    else :
+      [rule-pattern(false, p)]
+  defn rule-pattern (abandon-on-match?:True|False, p:Pattern) -> RulePattern :
+    match(p:Action) : action-pattern(abandon-on-match?, ActionParams(index(p), guard-index(p), fail?(p)), pattern(p))
+    else : action-pattern(abandon-on-match?, false, p)
+  defn action-pattern (abandon-on-match?:True|False, action:ActionParams|False, p:Pattern) -> RulePattern :
+    match(p:Sequence) : RulePattern(abandon-on-match?, action, patterns(p))
+    else : RulePattern(abandon-on-match?, action, [p])
+  ProductionPattern(rules(p))
+
+defn to-pattern (p:ProductionPattern) -> Pattern :
+  defn to-branch (r:RulePattern) -> ChoiceBranch :
+    ChoiceBranch(abandon-on-match?(r), action-pattern(r))
+  defn action-pattern (r:RulePattern) -> Pattern :
+    match(action(r)) :
+      (action:ActionParams) : Action(index(action), guard-index(action), fail?(action), Sequence?(patterns(r)))
+      (f:False) : Sequence?(patterns(r))
+  defn non-empty-rule? (r:RulePattern) :
+    patterns(r)[0] is-not NoMatch
+
+  val branches = to-tuple $
+    seq(to-branch,filter(non-empty-rule?,rules(p)))
+  switch(length(branches)) :
+    0 : NoMatch()
+    1 : if abandon-on-match?(branches[0]) : Choice(branches)
+        else : pattern(branches[0])
+    else : Choice(branches)
+
+defn left-recurses? (rule:RulePattern, prod:Int, null-set:NullableSet) :
+  left-recurses?(Sequence?(patterns(rule)), prod, null-set)
+
+;------------------------------------------------------------
+;--------------- Determination of Removability --------------
+;------------------------------------------------------------
+
+;Return true if the pattern p can have its left-recursion removed.
+defn removable-left-recursion? (prod:Int, p:Pattern, null-set:NullableSet) -> True|False :
+
+  ;Given that p is left-recursive on prod. Return true if it
+  ;can be removed.
+  defn removable? (p:Pattern) -> True|False :
+    match(p) :
+      (p:Production) : true
+      (p:Binder) : removable?(pattern(p))
+      (p) : false
+
+  ;Launch!
+  val prod-pattern = ProductionPattern(p)
+  for rule in rules(prod-pattern) all? :
+    if left-recurses?(rule, prod, null-set) :
+      removable?(patterns(rule)[0])
+    else :
+      true
+
+;------------------------------------------------------------
+;-------------------- Pattern Processor ---------------------
+;------------------------------------------------------------
+
+deftype PatternProcessor
+defmulti make-pattern (proc:PatternProcessor, name:Symbol, pat:Pattern) -> Int
+defmulti null-set (proc:PatternProcessor) -> NullableSet
+defmulti action (proc:PatternProcessor, index:Int) -> ActionCallback
+defmulti make-action (proc:PatternProcessor, callback:? -> ?, params:EngActionParams) -> Int
+
+;------------------------------------------------------------
+;---------------- Remove Left Recursion ---------------------
+;------------------------------------------------------------
+
+deftype Suffix
+defmulti fail? (s:Suffix) -> True|False
+defmulti eval-with-seed (s:Suffix, seed:() -> ?) -> ?  
+
+;Remove the left recursive production.
+defn remove-left-recursion (prod:Int,
+                            p:Pattern,
+                            processor:PatternProcessor) -> Pattern  :
+
+  ;Transform the rules in p using f and return the resulting pattern.
+  defn transform-rules (f:RulePattern -> RulePattern, p:ProductionPattern) -> Pattern :
+    to-pattern(ProductionPattern(map(f, rules(p))))
+
+  ;Create the seed pattern.
+  defn seed-subpattern (rule:RulePattern) -> RulePattern :
+    if left-recurses?(Sequence(patterns(rule)), prod, null-set(processor)) :
+      sub-patterns(rule, [NoMatch()])
+    else : 
+      rule
+
+  ;Return true if the seed production is bound.
+  defn seed-is-bound? (rule:RulePattern) -> True|False :
+    patterns(rule)[0] is Binder
+
+  ;Assume rule is left-recursive and has form:
+  ;  ?head:e + ?tail:suffix
+  ;Where e can be optionally bound.
+  ;Context c is the context passed in to the transformed suffix pattern, where
+  ;'head' has been removed. 
+  ;This function returns the context that the rule's action requires, where
+  ;'head' is bound to slot 0.  
+  defn shift-context (rule:RulePattern, suffix-c:Context, slot0:() -> ?) -> Context :
+    if seed-is-bound?(rule) :
+      new Context :
+        defmethod get (this, i:Int) :
+          if i == 0 : slot0()
+          else : suffix-c[i - 1]
+        defmethod get-all (this) :
+          try :
+            val slot0-value = slot0()
+            val suffix-values = get-all(suffix-c)
+            add-head(slot0-value, suffix-values)
+          catch (e1:Exception) :
+            try :
+              get-all(suffix-c)
+              throw(e1)
+            catch (e2:Exception) :
+              throw(join-errors(e1,e2))          
+        defmethod info (this) :
+          info(suffix-c)
+    else :
+      suffix-c
+
+  ;Assume that 'rule' is the original left-recursive rule.
+  ;This returns the shifted params for the suffix pattern.
+  defn shift-params (rule:RulePattern, params:EngActionParams) -> EngActionParams :
+    if seed-is-bound?(rule) : EngActionParams(lazy?(params), bind-arity(params) - 1)
+    else : params
+
+  ;Create the suffix pattern.
+  defn suffix-subpattern (rule:RulePattern) -> RulePattern :
+    ;If this rule is left-recursive, then it's part of the
+    ;suffix pattern.
+    if left-recurses?(rule, prod, null-set(processor)) :
+
+      ;Calculate new parameters of rule one-by-one.
+      var new-patterns:Tuple<Pattern>
+      var new-action-params:ActionParams|False = false
+    
+      ;Compute new rule patterns.
+      new-patterns = let :
+        val accum = Vector<Pattern>()
+        for i in 1 to length(patterns(rule)) do :
+          add(accum, patterns(rule)[i])
+        if empty?(accum) : [Empty()]
+        else : to-tuple(accum)
+
+      ;Compute new action parameters
+      if action(rule) is-not False :
+        val params = action(rule) as ActionParams
+
+        ;Create the new action for the rule.
+        val old-action = action(processor, index(params))
+        val new-action = 
+          if fail?(params) :
+            make-action(
+              processor,
+              fn (suffix-c:Context) -> Exception :
+                defn bad-access () : fatal("Cannot access seed production in failure rule \
+                                           for left-recursive production.")
+                callback(old-action)(shift-context(rule, suffix-c, bad-access))
+              shift-params(rule, /params(old-action)))
+          else :
+            make-action(
+              processor, 
+              fn (suffix-c:Context) -> Suffix :
+                new Suffix :
+                  defmethod fail? (this) :
+                    false                    
+                  defmethod eval-with-seed (this, seed:() -> ?) :
+                    callback(old-action)(shift-context(rule, suffix-c, seed))
+              shift-params(rule, /params(old-action)))        
+
+        ;Create the new guard for the rule.
+        val new-guard = if guard-index(params) is Int :
+          val old-guard = action(processor, guard-index(params) as Int)
+          make-action(
+            processor, 
+            fn (suffix-c:Context) -> True|False :
+              defn bad-access () : fatal("Cannot access seed production in guard.")
+              callback(old-guard)(shift-context(rule, suffix-c, bad-access))
+            shift-params(rule, /params(old-guard)))
+
+        ;Bundle together in new action parameters
+        new-action-params = ActionParams(new-action,
+                                         new-guard,
+                                         fail?(params))
+
+      ;Create the new rule
+      RulePattern(abandon-on-match?(rule),
+                  new-action-params,
+                  new-patterns)
+      
+    ;If this rule is not left-recursive, then it's part
+    ;of the the seed and not the suffix pattern.
+    else :
+      sub-patterns(rule, [NoMatch()])
+
+  ;Create the iteration pattern.
+  defn iteration-pattern (seed:Int, suffix:Int) -> Pattern :
+    val pattern = Sequence $ [
+      Binder(Production(seed))
+      Repeat(Binder(Production(suffix)))]
+
+    val action = make-action(
+      processor,
+      fn (c:Context) :
+        defn* apply-suffix-ops (seed:() -> ?, suffixes:List<Suffix>) :
+          if empty?(suffixes) :
+            seed()
+          else :
+            val suffix = head(suffixes)
+            val rest = tail(suffixes)
+            if fail?(suffix) : throw(eval-with-seed(suffix, seed))
+            else : apply-suffix-ops(eval-with-seed{suffix, seed}, rest)
+        apply-suffix-ops({c[0]}, c[1] as List<Suffix>)
+      EngActionParams(true, 2))
+
+    Action(action, false, false, pattern)
+
+  ;Launch!
+  val prod-pat = ProductionPattern(p)
+  val seed-id = make-pattern(processor, `seed, transform-rules(seed-subpattern, prod-pat))
+  val suffix-id = make-pattern(processor, `suffix, transform-rules(suffix-subpattern, prod-pat))
+  iteration-pattern(seed-id, suffix-id)
+
+;------------------------------------------------------------
+;------------------ Check Errors ----------------------------
+;------------------------------------------------------------
+
+public defn check-left-recursion-errors! (p:PatternPackage,
+                                          null-set:NullableSet,
+                                          cycles:Tuple<List<Int>>) -> False :
+  val errors = Vector<Exception>()
+  for cycle in cycles do :
+    if length(cycle) > 1 :
+      val names = to-tuple $ seq(name{productions(p)[_]}, cycle)
+      add(errors, MutualLeftRecursion(names))
+    else if nullable-production?(null-set, head(cycle)) :
+      val name = name(productions(p)[head(cycle)])
+      add(errors, NullableLeftRecursion(name))
+    else :
+      val def = productions(p)[head(cycle)]
+      if not removable-left-recursion?(head(cycle), pattern(def), null-set) :
+        add(errors, NonRemovableLeftRecursion(name(def)))
+  if not empty?(errors) :
+    throw(PostProcessingErrors(to-tuple(errors)))
+    
+;------------------------------------------------------------
+;------------------ Overall Driver --------------------------
+;------------------------------------------------------------
+
+public defn remove-left-recursion (p:PatternPackage) -> PatternPackage :
+  ;Compute the nullable set. Necessary for all calculations.
+  val null-set = NullableSet(p)
+
+  ;Compute set of all left-recursive productions.
+  val cycles = left-recursion-cycles(p, null-set)
+
+  ;Check whether all occurrences are supported by left-recursion elimination.
+  check-left-recursion-errors!(p, null-set, cycles)
+
+  ;Construct new definitions.
+  val new-defs = to-vector<DefProduction>(productions(p))
+  val new-actions = to-vector<ActionCallback>(actions(p))
+  defn make-processor (base-name:Symbol) :
+    new PatternProcessor :
+      defmethod make-pattern (this, name:Symbol, pat:Pattern) :
+        val id = length(new-defs)
+        val full-name = symbol-join([base-name "-" name])
+        add(new-defs, DefProduction(false, id, full-name, pat))
+        id
+      defmethod null-set (this) :
+        null-set
+      defmethod action (this, index:Int) :
+        new-actions[index]
+      defmethod make-action (this, f:? -> ?, params:EngActionParams) :
+        val id = length(new-actions)
+        add(new-actions, ActionCallback(f,params))
+        id
+
+  for cycle in cycles do :
+    val def = productions(p)[head(cycle)]
+    val new-pattern = remove-left-recursion(id(def), pattern(def), make-processor(name(def)))
+    new-defs[head(cycle)] = sub-pattern(def, new-pattern)
+
+  PatternPackage(to-tuple(new-defs)
+                 to-tuple(new-actions))
+
+;============================================================
+;================== Lookahead Analysis ======================
+;============================================================
+
+public defn lookahead-analysis (p:PatternPackage) -> PatternPackage :
+  val fset = FirstSet(p)
+  map(lookahead-analysis{_, fset}, p)
+
+public defn lookahead-analysis (p:Pattern, fset:FirstSet) -> Pattern :
+  match(p:Choice) :
+    ;Compute first set atoms for branches.
+    val fset-atoms = Vector<Vector<FirstSetAtom>>()
+    for b in branches(p) do :
+      val atoms = Vector<FirstSetAtom>()
+      within atom = first-set(pattern(b), fset) :
+        add(atoms, atom)
+      add(fset-atoms, atoms)
+
+    ;Compute which keys in the dispatch table are needed.
+    val needed-keys = to-tuple(token-set) where :
+      val token-set = HashSet<LookaheadToken>()
+      for atom in cat-all(fset-atoms) do :
+        match(atom) :
+          (atom:TerminalAtom) : add(token-set, TerminalToken(value(atom)))
+          (atom:ListAtom) : add(token-set, ListToken())
+          (atom) : false
+      if any?(nullable?{null-set(fset), pattern(_)}, branches(p)) :
+        add(token-set, EndToken())
+
+    ;Reserve the lists for the options in the dispatch table.
+    val dispatch-table = to-hashtable<LookaheadToken,Vector<Int>> $
+      for key in needed-keys seq : key => Vector<Int>()
+    val else-options = Vector<Int>()
+    defn add-unless-exists (v:Vector<Int>, x:Int) :
+      add(v,x) when empty?(v) or peek(v) != x
+
+    ;Add all branch indices to the correct dispatch-table.
+    for (branch in branches(p), atoms in fset-atoms, branch-index in 0 to false) do :
+      if nullable?(null-set(fset), pattern(branch)) :
+        for key in needed-keys do :
+          add-unless-exists(dispatch-table[key], branch-index)
+        add(else-options, branch-index)
+      else :
+        for atom in atoms do :
+          match(atom) :
+            (atom:TerminalAtom) :
+              add-unless-exists(dispatch-table[TerminalToken(value(atom))], branch-index)
+            (atom:NonEmptyAtom) :
+              for key in needed-keys do :
+                if key is-not EndToken :
+                  add-unless-exists(dispatch-table[key], branch-index)
+              add(else-options, branch-index)
+            (atom:ListAtom) :
+              add-unless-exists(dispatch-table[ListToken()], branch-index)
+
+    ;Remove dispatch entries if they are equivalent to the else branch.
+    val unnecessary-keys = to-tuple $ for entry in dispatch-table seq? :
+      if same-contents?(value(entry), else-options) : One(key(entry))
+      else : None()
+    do(remove{dispatch-table, _}, unnecessary-keys)
+
+    ;Create Lookahead pattern if appropriate.
+    val new-branches = for b in branches(p) map :
+      ChoiceBranch(abandon-on-match?(b), lookahead-analysis(pattern(b), fset))
+    val entries = to-tuple $ for entry in dispatch-table seq :
+      LookaheadEntry(key(entry), to-tuple(value(entry)))
+
+    ;If there are no entries, then don't bother creating the Lookahead
+    ;structure.
+    if empty?(entries) : Choice(new-branches)
+    else : Lookahead(entries, to-tuple(else-options), new-branches)
+
+  ;Other patterns are passed through as is.
+  else :
+    map(lookahead-analysis{_, fset}, p)
+
+;============================================================
+;===================== Misc Utilities =======================
+;============================================================
+
+;Add x to the head of ys.
+defn add-head<?T> (x:T, ys:Tuple<?T>) -> Tuple<T> :
+  to-tuple $ for i in 0 through length(ys) seq :
+    if i == 0 : x
+    else : ys[i - 1]
+
+;Join the two errors together into a ParserErrors object.
+defn join-errors (e1:Exception, e2:Exception) -> Exception :
+  defn split (e:Exception) -> Seqable<Exception> :
+    match(e:ParseErrors) : errors(e)
+    else : [e]
+  ParseErrors(to-tuple(cat(split(e1), split(e2))))

@@ -1,0 +1,1010 @@
+;See License.txt for details about licensing.
+
+defpackage stz/main :
+  import core
+  import collections
+  import reader
+  import arg-parser
+  import line-wrap
+  import stz/compiler
+  import stz/params
+  import stz/config
+  import stz/repl
+  import stz/dependencies
+  import stz/auto-doc
+  import stz/defs-db
+  import stz/proj-manager
+  import stz/aux-file
+  import stz/comments
+  import core/parsed-path
+  import stz/terminal-style
+  import stz/timing-log-api
+  import stz/verbose
+  import parser/errors
+  
+  ;Macro Packages
+  import stz/ast-lang
+  import stz/reader-lang
+  import stz/ast-printer-lang
+  import stz/check-lang
+  import stz/renamer-lang
+  import stz/resolver-lang
+  import stz/serializer-lang
+  import stz/test-lang
+
+;============================================================
+;================== Standard Commands =======================
+;============================================================
+
+val STANZA-COMMANDS = Vector<Command>()
+
+public defn add-stanza-command (c:Command) :
+  add(STANZA-COMMANDS, c)
+
+public defn stanza-commands () :
+  to-tuple(STANZA-COMMANDS)
+
+;============================================================
+;====================== Timers ==============================
+;============================================================
+
+val READ-CONFIG-FILE = TimerLabel("Read config file")
+
+;If -timing-log flag is provided, then execute the body
+;with support for timing.
+defn run-with-timing-log<?T> (body:() -> ?T, cmd-args:CommandArgs) -> T :
+  if flag?(cmd-args, "timing-log") :
+    create-timing-log(body, cmd-args["timing-log"])
+  else :
+    body()
+
+;============================================================
+;====================== Verbosity ===========================
+;============================================================
+
+;If -verbose is provided, then execute the body with support
+;for verbosity level.
+defn run-with-verbose-flag<?T> (body:() -> ?T, cmd-args:CommandArgs) -> T :
+  if flag?(cmd-args, "verbose") :
+    run-with-verbose-level(body, 1)
+  else :
+    body()
+
+;============================================================
+;====================== Version =============================
+;============================================================
+
+val ABOUT-MSG =
+\<MSG>
+             L.B.Stanza Programming Language
+
+                    Version %_
+
+Copyright (c) 2016-2019, Patrick Shaobai Li, The Regents of the University of California. All Rights Reserved.
+<MSG>
+
+defn version-message () :
+  val version = string-join(STANZA-VERSION, ".")
+  to-string(ABOUT-MSG % [version])
+
+defn print-version-command () :
+  val flags = [
+    Flag("terse", ZeroFlag, OptionalFlag,
+      "Print the version information in X.Y.Z form without \
+      surrounding title information.")]
+
+  val version-msg = "Prints the version information of the \
+  Stanza compiler."
+  defn print-version (cmd-args:CommandArgs) :
+    if flag?(cmd-args, "terse") :
+      print(string-join(STANZA-VERSION, "."))
+    else :
+      println(
+        LineWrapStream(current-output-stream(), 65),
+        version-message())
+  
+  Command("version",
+          ZeroArg, false,
+          flags,
+          version-msg, print-version)
+
+;============================================================
+;================== Compilation System ======================
+;============================================================
+
+defn build-system (verbose?:True|False) :
+  new System :
+    defmethod call-cc (this, platform:Symbol, asm:String, ccfiles:Tuple<String>, ccflags:Tuple<String> output:String) :        
+      ;Collect arguments
+      val args = Vector<String>()
+      defn emit-arg (s:String) : add(args, s)
+      defn emit-args (ss:Seqable<String>) : do(emit-arg, ss)
+
+      ;Compiler name
+      emit-arg $ switch(platform) :
+        `os-x : "cc"
+        `linux : "cc"
+        `windows : "gcc"
+
+      ;All files
+      emit-arg(asm)
+      emit-args(ccfiles)
+
+      ;All flags
+      emit-args(ccflags)
+      emit-args(["-o" output])
+
+      ;Output for debugging
+      if verbose? :
+        println("Call C compiler with arguments:")
+        within indented() :
+          for a in args do :
+            println("%~" % [a])
+
+      ;Call system
+      val return-code = call-system(args[0], to-tuple(args))
+      
+      ;Return true if successful
+      return-code == 0
+
+    defmethod call-shell (this, platform:Symbol, command:String) :
+      if verbose? :
+        println("Call shell with command:")
+        within indented() :
+          println("%~" % [command])
+      if platform == `windows :
+        ;The Windows "cmd /c" command expects the input command
+        ;to be input as separate arguments. (This is a quirk resulting
+        ;from how call-system is implemented in core.) Therefore
+        ;we have to first tokenize the command. 
+        val cmd-args = to-tuple $ cat(
+                         ["cmd" "/c"],
+                         tokenize-shell-command(command))
+        call-system("cmd", cmd-args)
+      else :
+        call-system("sh", ["sh" "-c" command])
+      false
+      
+    defmethod make-temporary-file (this) :
+      val filename = to-string("temp%_.s" % [rand()])
+      if verbose? :
+        println("Create temporary file %~." % [filename])
+      filename
+      
+    defmethod delete-temporary-file (this, file:String) :
+      if verbose? :
+        println("Delete temporary file %~." % [file])
+      delete-file(file)
+
+;============================================================
+;================= Common Stanza Flags ======================
+;============================================================
+
+val COMMON-STANZA-FLAGS = [
+  Flag("o", OneFlag, OptionalFlag,
+    "The name of the output executable file.")
+  Flag("s", OneFlag, OptionalFlag,
+    "The name of the output assembly file.")
+  Flag("pkg", ZeroOrOneFlag, OptionalFlag,
+    "Requests the compiler to output the .pkg files. The name of the folder to store the output .pkg files can be optionally provided.")
+  Flag("optimize", ZeroFlag, OptionalFlag,
+    "Requests the compiler to compile in optimized mode.")
+  Flag("ccfiles", ZeroOrMoreFlag, OptionalFlag,
+    "The set of C language files to link the final generated assembly against to produce the final executable.")
+  Flag("ccflags", GreedyFlag, OptionalFlag,
+    "The set of flags to pass to the linker to link the final generated assembly to produce the final executable.")
+  Flag("flags", ZeroOrMoreFlag, OptionalFlag,
+    "The set of compile-time flags to be set before compilation of the source code.")
+  Flag("verbose", ZeroFlag, OptionalFlag,
+    "Controls whether the compiler should output verbose messages indicating status of compilation.")      
+  Flag("supported-vm-packages", ZeroOrMoreFlag, OptionalFlag,
+    "The list of Stanza packages with extern definitions that the Stanza REPL should support.")
+  Flag("platform", OneFlag, OptionalFlag,
+    "Provide the target platform to compile to.")
+  Flag("external-dependencies", OneFlag, OptionalFlag,
+    "The name of the output external dependencies file.")
+  Flag("timing-log", OneFlag, OptionalFlag,
+    "If provided, the filename of the timing log to generate.")]
+
+defn common-stanza-flags (desired-flags:Tuple<String>) -> Tuple<Flag> :
+  to-tuple(filter(contains?{desired-flags, name(_)}, COMMON-STANZA-FLAGS))
+
+defn common-stanza-flag (flag:String) -> Flag :
+  for f in COMMON-STANZA-FLAGS find! :
+    name(f) == flag
+
+defn ensure-supported-platform! (cmd-args:CommandArgs) :
+  if flag?(cmd-args, "platform") :
+    ensure-supported-platform(to-symbol(cmd-args["platform"]))
+
+;============================================================
+;================== Compilation =============================
+;============================================================
+defn compile-command () :
+  ;Verify wellformed arguments.
+  defn verify-args (cmd-args:CommandArgs) :        
+    defn ensure-output-flag! () :
+      val has-output? = flag?(cmd-args, "s") or flag?(cmd-args, "o") or flag?(cmd-args, "pkg")
+      if not has-output? :
+        throw(ArgParseError("The 'compile' command requires either a -s, -o, or -pkg flag."))
+
+    defn ensure-output-for-dependencies! () :
+      if flag?(cmd-args, "external-dependencies") :
+        val has-output? = flag?(cmd-args, "s") or flag?(cmd-args, "o")
+        if not has-output? :
+          throw(ArgParseError("The -external-dependencies flag can only be used when -s or -o options are used."))
+
+    ;Launch!
+    ensure-supported-platform!(cmd-args)
+    ensure-output-flag!()
+    ensure-output-for-dependencies!()
+
+  ;Main action for command
+  val compile-msg = "Compile the given Stanza input files to either executable, \
+  assembly, or pkg form."
+  defn compile-action (cmd-args:CommandArgs) :
+    defn build-settings () :
+      defn symbol? (name:String) :
+        to-symbol(cmd-args[name]) when flag?(cmd-args, name)
+      val pkg-dir = if flag?(cmd-args, "pkg") :
+        value?(cmd-args["pkg"], ".")
+      val ccflags =
+        if flag?(cmd-args, "ccflags") :
+          val flag1 = cmd-args["ccflags"]
+          to-tuple(tokenize-shell-command(flag1))
+        else : []      
+      BuildSettings(
+        BuildPackages(to-tuple(args(cmd-args))),
+        get?(cmd-args, "supported-vm-packages", [])
+        symbol?("platform")
+        get?(cmd-args, "s", false)
+        get?(cmd-args, "o", false)
+        get?(cmd-args, "external-dependencies", false)
+        pkg-dir
+        flag?(cmd-args, "optimize")
+        get?(cmd-args, "ccfiles", [])
+        ccflags
+        map(to-symbol, get?(cmd-args, "flags", [])))
+
+    ;Launch!
+    within run-with-timing-log(cmd-args) :
+      within run-with-verbose-flag(cmd-args) :
+        compile(build-settings(), build-system(verbose-setting?()), verbose-setting?())
+
+  ;Command 
+  Command("compile",
+          AtLeastOneArg, "the .stanza/.proj input files or Stanza package names.",
+          common-stanza-flags(["o" "s" "pkg" "optimize" "ccfiles" "ccflags" "flags"
+                               "verbose" "supported-vm-packages" "platform" "external-dependencies" "timing-log"]),
+          compile-msg, false, verify-args, intercept-no-match-exceptions(compile-action))
+ 
+
+;============================================================
+;==================== Build Command =========================
+;============================================================
+defn build-command () :
+  ;Main action for command
+  val build-msg = "Build one of the targets defined in the .proj file."
+  defn build (cmd-args:CommandArgs) :
+    defn build-settings () :
+      val pkg-dir = if flag?(cmd-args, "pkg") :
+        value?(cmd-args["pkg"], ".")
+      val target = if empty?(args(cmd-args)) : `main
+                   else : to-symbol(arg(cmd-args,0))
+      val ccflags =
+        if flag?(cmd-args, "ccflags") :
+          val flag1 = cmd-args["ccflags"]
+          to-tuple(tokenize-shell-command(flag1))
+        else : []      
+      BuildSettings(
+        BuildTarget(target)
+        []
+        false
+        get?(cmd-args, "s", false)
+        get?(cmd-args, "o", false)
+        get?(cmd-args, "external-dependencies", false)
+        pkg-dir
+        flag?(cmd-args, "optimize")
+        []
+        ccflags
+        map(to-symbol, get?(cmd-args, "flags", [])))
+
+    ;Launch!
+    within run-with-timing-log(cmd-args) :
+      within run-with-verbose-flag(cmd-args) :
+        compile(build-settings(), build-system(verbose-setting?()), verbose-setting?())        
+
+  ;Command definition
+  Command("build",
+          ZeroOrOneArg, "the name of the build target. If not supplied, the default build target is 'main'.",
+          common-stanza-flags(["s" "o" "external-dependencies" "pkg" "flags" "optimize" "verbose" "ccflags" "timing-log"]),
+          build-msg, intercept-no-match-exceptions(build))
+
+;============================================================
+;==================== Clean Command =========================
+;============================================================
+
+defn clean-command () :
+  val clean-msg = "Deletes the stanza.aux file which maintains the \
+  cache between previously compiled source files and their resulting \
+  .pkg files."
+  defn clean (cmd-args:CommandArgs) :
+    read-config-file()  
+    delete-aux-file()
+
+  Command("clean",
+          ZeroArg, false,
+          [],
+          clean-msg, clean)
+
+;============================================================
+;==================== Extension =============================
+;============================================================
+defn extend-command () :
+  ;Verify wellformed arguments.
+  defn verify-args (cmd-args:CommandArgs) :        
+    val has-output? = flag?(cmd-args, "s") or flag?(cmd-args, "o")
+    if not has-output? :
+      throw(ArgParseError("The 'extend' command requires either a -s or -o flag."))
+
+  ;Main action for command
+  val extend-msg = "Extends the Stanza compiler with additional syntax packages and external bindings."
+  defn extend (cmd-args:CommandArgs) :
+    defn main () :
+      val verbose? = flag?(cmd-args, "verbose")
+      compile(build-settings(), build-system(verbose?), verbose?)
+
+    defn build-settings () :
+      val ccflags =
+        if flag?(cmd-args, "ccflags") :
+          val flag1 = cmd-args["ccflags"]
+          to-tuple(tokenize-shell-command(flag1))
+        else : []  
+      val new-args = to-tuple $
+        cat(args(cmd-args), ["stz/driver"])
+      BuildSettings(
+        BuildPackages(new-args),
+        get?(cmd-args, "supported-vm-packages", []),
+        false
+        get?(cmd-args, "s", false)
+        get?(cmd-args, "o", false)
+        get?(cmd-args, "external-dependencies", false)
+        false
+        flag?(cmd-args, "optimize")
+        get?(cmd-args, "ccfiles", [])
+        ccflags
+        map(to-symbol, get?(cmd-args, "flags", [])))
+
+    ;Launch!
+    run-with-timing-log(main, cmd-args)
+  
+  ;Command definition
+  Command("extend",
+          ZeroOrMoreArg, "the .stanza/.proj input files or Stanza packages to use to extend the current compiler with.",
+          common-stanza-flags(["s" "o" "external-dependencies" "ccfiles" "ccflags" "flags" "supported-vm-packages" "optimize" "verbose" "timing-log"])
+          extend-msg, false, verify-args, intercept-no-match-exceptions(extend))
+
+;============================================================
+;================== Compile Test ============================
+;============================================================
+defn compile-test-command () :
+  ;Verify wellformed arguments.
+  defn verify-args (cmd-args:CommandArgs) :        
+    defn ensure-output-flag! () :
+      val has-output? = flag?(cmd-args, "s") or flag?(cmd-args, "o") or flag?(cmd-args, "pkg")
+      if not has-output? :
+        throw(ArgParseError("The 'compile-test' command requires either a -s, -o, or -pkg flag."))
+
+    defn ensure-output-for-dependencies! () :
+      if flag?(cmd-args, "external-dependencies") :
+        val has-output? = flag?(cmd-args, "s") or flag?(cmd-args, "o")
+        if not has-output? :
+          throw(ArgParseError("The -external-dependencies flag can only be used when -s or -o options are used."))
+
+    ;Launch!
+    ensure-supported-platform!(cmd-args)
+    ensure-output-flag!()
+    ensure-output-for-dependencies!()
+
+  ;Main action for command
+  val compile-test-msg = "Compiles the given test files together with the Stanza testing framework to build a test executable."
+  defn compile-test (cmd-args:CommandArgs) :
+    defn main () :
+      val verbose? = flag?(cmd-args, "verbose")
+      compile(build-settings(), build-system(verbose?), verbose?)
+
+    defn build-settings () :
+      defn symbol? (name:String) :
+        to-symbol(cmd-args[name]) when flag?(cmd-args, name)
+      val pkg-dir = if flag?(cmd-args, "pkg") :
+        value?(cmd-args["pkg"], ".")
+      val ccflags =
+        if flag?(cmd-args, "ccflags") :
+          val flag1 = cmd-args["ccflags"]
+          to-tuple(tokenize-shell-command(flag1))
+        else : []      
+      val new-args = to-tuple $ cat(
+        args(cmd-args)
+        ["stz/test-driver"])
+      val new-flags = to-tuple $ cat(
+        map(to-symbol, get?(cmd-args, "flags", []))
+        [`TESTING])
+      BuildSettings(
+        BuildPackages(new-args)
+        []
+        symbol?("platform")
+        get?(cmd-args, "s", false)
+        get?(cmd-args, "o", false)
+        get?(cmd-args, "external-dependencies", false)
+        pkg-dir
+        flag?(cmd-args, "optimize")
+        get?(cmd-args, "ccfiles", [])
+        ccflags
+        new-flags)
+
+    ;Launch!
+    run-with-timing-log(main, cmd-args)
+
+  ;Command definition
+  Command("compile-test",
+          AtLeastOneArg, "the .stanza/.proj input files or Stanza packages names containing tests.",
+          common-stanza-flags(["platform" "s" "o" "external-dependencies" "pkg" "ccfiles" "ccflags" "flags" "optimize" "verbose" "timing-log"])
+          compile-test-msg, false, verify-args, intercept-no-match-exceptions(compile-test))
+
+;============================================================
+;=================== Installation ===========================
+;============================================================
+
+defn install-command () :
+  ;Flags
+  val flags = [
+    Flag("platform", OneFlag, RequiredFlag,
+      "Provide the target platform to install to.")
+    Flag("path", OneFlag, OptionalFlag,
+      "Provide the directory to generate the .stanza file in. By default, \
+       the .stanza file is generated in the user's home directory.")]
+       
+  ;Main action for command
+  val install-msg = "Installs the Stanza compiler to the current system."
+  defn install (cmd-args:CommandArgs) :
+    ;Get Stanza platform
+    val platform = to-symbol(cmd-args["platform"])
+    
+    ;Get installation directory
+    val install-dir = match(resolve-path(system-filepath(".", StanzaLicense))) :
+      (path:String) :
+        to-string(enclosing-dir(path))
+      (path:False) :
+        throw $ Exception("Could not determine Stanza installation directory.")
+
+    ;Config file contents
+    defn config-file-contents () :
+      val buffer = StringBuffer()
+      println(buffer, "install-dir = %~" % [install-dir])
+      println(buffer, "platform = %~" % [platform])
+      to-string(buffer)
+
+    ;Open and write the config file.
+    defn open-and-write-config-file () :
+      if flag?(cmd-args, "path") :
+        val path = cmd-args["path"]
+        val filepath = system-filepath(path, DotStanza)
+        spit(filepath, config-file-contents())
+        match(resolve-path(filepath)) :
+          (fullpath:String) :
+            val dir = to-string(enclosing-dir(fullpath))
+            println("Stanza installation finished. Created %_ file." % [fullpath])                  
+            println("Remember to add %_ to your STANZA_CONFIG environment variable." % [dir])                  
+          (fullpath:False) :
+            throw $ Exception("Stanza installation failed. Could not create %_ file." % [filepath])
+      else :
+        match(get-env("HOME")) :
+          (home:String) :
+            val filepath = system-filepath(home, DotStanza)
+            spit(filepath, config-file-contents())
+          (home:False) :
+            throw $ Exception("Could not locate user's home directory.")               
+
+    ;Driver
+    open-and-write-config-file()
+
+  ;Command definition
+  Command("install",
+          ZeroArg, false,
+          flags,
+          install-msg, false, ensure-supported-platform!, install)
+
+;============================================================
+;===================== Path =================================
+;============================================================
+
+defn show-path-command () :
+  ;Main action for command
+  val show-path-msg = "Retrieve the installation path of the current \
+  Stanza installation."
+  defn show-path (cmd-args:CommandArgs) :
+    read-config-file()
+    println(STANZA-INSTALL-DIR)
+
+  ;Command definition
+  Command("path",
+          ZeroArg, false,
+          [],
+          show-path-msg, intercept-no-match-exceptions(show-path))
+
+;============================================================
+;======================= Repl Command =======================
+;============================================================
+
+defn repl-command () :
+  ;Flags
+  val flags = [
+    Flag("pkg", ZeroOrMoreFlag, OptionalFlag,
+      "The set of additional directories to look in for .pkg files during \
+       this REPL session.")
+    Flag("flags", ZeroOrMoreFlag, OptionalFlag,
+      "The set of compile-time flags to be set before beginning this REPL session.")
+    Flag("confirm-before-exit", ZeroFlag, OptionalFlag,
+      "If provided, the user will be asked to hit ENTER before the REPL process fully terminates.")
+    Flag("terminal-style", OneFlag, OptionalFlag,
+      "The terminal style (simple/edit) to use for the REPL. If not provided, defaults to 'edit' if available \
+       on the current platform.")
+    Flag("-", AllRemainingFlag, OptionalFlag,
+      "If provided, the remaining arguments after this flag will be set as the command line arguments for the REPL session.")]
+
+  ;Verify that the passed options are good.
+  defn verify-args (cmd-args:CommandArgs) :
+    ;Ensure that -terminal-style is passed something sensible.
+    if flag?(cmd-args, "terminal-style") :
+      val style = parse-terminal-style(cmd-args["terminal-style"])
+      if style is False :
+        val msg = "Valid options for the -terminal-style flag is 'simple' or 'edit': '%_' is not a valid \
+                   option."
+        throw(ArgParseError(msg % [cmd-args["terminal-style"]]))
+
+  ;Main action for command
+  val repl-msg = "Launch the interactive Stanza REPL."
+  defn launch-repl (cmd-args:CommandArgs) :
+    ;Main code. Will potentially be wrapped in a finally clause
+    ;if -confirm-before-exit is provided.
+    defn main () :
+      ;Read configuration file
+      read-config-file()
+
+      ;Add pkg directories to pkg-dirs
+      for dir in get?(cmd-args, "pkg", []) do :
+        STANZA-PKG-DIRS = cons(dir, STANZA-PKG-DIRS)
+
+      ;Add flags
+      for flag in get?(cmd-args, "flags", []) do :
+        add-flag(to-symbol(flag))
+
+      ;Add platform flag
+      add-flag(platform-flag(OUTPUT-PLATFORM))
+
+      ;Setup command line arguments.
+      val new-cmd-args = to-tuple $ cat(["repl"], get?(cmd-args, "-", []))
+      set-command-line-arguments(new-cmd-args)
+
+      ;Get the desired terminal style.
+      val terminal-style =
+        if flag?(cmd-args, "terminal-style") :
+          parse-terminal-style(cmd-args["terminal-style"]) as TerminalStyle
+        else :
+          default-terminal-style()
+
+      ;Launch REPL  
+      repl(args(cmd-args), terminal-style)
+
+    ;Confirm exit
+    if flag?(cmd-args, "confirm-before-exit") :
+      try :
+        main()
+      catch (e:Exception) :
+        println(LineWrapped(e))
+      finally :
+        val msg = "\nThe Stanza REPL session has finished. Please press ENTER to terminate the process."
+        println(LineWrapped(msg))
+        get-char(STANDARD-INPUT-STREAM)
+    else :
+      main()
+
+  ;Command definition
+  Command("repl",
+          ZeroOrMoreArg, "the .stanza/.proj input files or Stanza package names to load upon initialization of the REPL."
+          flags,
+          repl-msg,
+          false
+          verify-args,
+          intercept-no-match-exceptions(launch-repl))
+
+;============================================================
+;======================= Run Command ========================
+;============================================================
+
+defn run-command () :
+  ;Flags
+  val flags = [
+    Flag("pkg", ZeroOrMoreFlag, OptionalFlag,
+      "The set of additional directories to look in for .pkg files.")
+    Flag("flags", ZeroOrMoreFlag, OptionalFlag,
+      "The set of compile-time flags to be set before beginning execution.")
+    common-stanza-flag("timing-log")
+    Flag("-", AllRemainingFlag, OptionalFlag,
+      "If provided, the remaining arguments after this flag will be set as the command line arguments for the REPL session.")]
+
+  ;Main action for command
+  val launch-msg = "Execute Stanza files directly using the Stanza virtual machine."
+  defn launch-run (cmd-args:CommandArgs) :
+    ;Support timing logs
+    within run-with-timing-log(cmd-args) :
+    
+      ;Read configuration file
+      within log-time(READ-CONFIG-FILE) :
+        read-config-file()
+
+      ;Add pkg directories to pkg-dirs
+      for dir in get?(cmd-args, "pkg", []) do :
+        STANZA-PKG-DIRS = cons(dir, STANZA-PKG-DIRS)
+
+      ;Add flags
+      for flag in get?(cmd-args, "flags", []) do :
+        add-flag(to-symbol(flag))
+
+      ;Add platform flag
+      add-flag(platform-flag(OUTPUT-PLATFORM))
+
+      ;Setup command line arguments.
+      val new-cmd-args = to-tuple $ cat(["run"], get?(cmd-args, "-", []))
+      set-command-line-arguments(new-cmd-args)
+
+      ;Run in REPL
+      run-in-repl(args(cmd-args))
+
+  ;Command definition
+  Command("run",
+          AtLeastOneArg, "the .stanza/.proj input files or Stanza package names to execute in the virtual machine.",
+          flags,
+          launch-msg, intercept-no-match-exceptions(launch-run))
+
+;============================================================
+;==================== Run Test Command ======================
+;============================================================
+
+defn run-test-command () :
+  ;Flags
+  val flags = [
+    Flag("pkg", ZeroOrMoreFlag, OptionalFlag,
+      "The set of additional directories to look in for .pkg files.")
+    Flag("flags", ZeroOrMoreFlag, OptionalFlag,
+      "The set of compile-time flags to be set before beginning execution.")
+    Flag("named", AtLeastOneFlag, OptionalFlag,
+      "If given, only the tests with the given names will be executed.")
+    Flag("tagged", AtLeastOneFlag, OptionalFlag,
+      "If given, only the tests with the given tags will be executed.")
+    Flag("not-tagged", AtLeastOneFlag, OptionalFlag,
+      "If given, the tests with the given tags will not be executed.")
+    Flag("log", OneFlag, OptionalFlag,
+      "The directory to output the test results to.")
+    common-stanza-flag("timing-log")]
+
+  ;Main action
+  val run-tests-msg = "Execute Stanza test files directly using the Stanza virtual machine."
+  defn run-tests (cmd-args:CommandArgs) :
+    ;Support timing log
+    within run-with-timing-log(cmd-args) :
+    
+      ;Read configuration file
+      read-config-file()
+
+      ;Add pkg directories to pkg-dirs
+      for dir in get?(cmd-args, "pkg", []) do :
+        STANZA-PKG-DIRS = cons(dir, STANZA-PKG-DIRS)
+
+      ;Add flags
+      for flag in get?(cmd-args, "flags", []) do :
+        add-flag(to-symbol(flag))
+
+      ;Add platform flag
+      add-flag(platform-flag(OUTPUT-PLATFORM))
+
+      ;Add testing flag
+      add-flag(`TESTING)
+
+      ;New arguments
+      val new-args = to-tuple $ cat(
+        args(cmd-args)
+        ["stz/test-driver"])
+     
+      ;Create new command-line arguments for test driver
+      val driver-flags = Vector<String>()
+      defn emit-flag (s:String) : add(driver-flags, s)
+      defn emit-flags (ss:Seqable<String>) : do(emit-flag, ss)
+      emit-flags $ ["run-test" "run"]
+      emit-flags $ get?(cmd-args, "named", [])
+      if flag?(cmd-args, "tagged") :
+        emit-flag $ "-tagged"
+        emit-flags $ get?(cmd-args, "tagged", [])
+      if flag?(cmd-args, "not-tagged") :
+        emit-flag $ "-not-tagged"
+        emit-flags $ get?(cmd-args, "not-tagged", [])
+      if flag?(cmd-args, "log") :
+        emit-flag $ "-log"
+        emit-flag $ cmd-args["log"]
+      set-command-line-arguments(to-tuple(driver-flags))
+
+      ;Run in REPL
+      run-in-repl(new-args)
+
+  ;Command definition
+  Command("run-test",
+          AtLeastOneArg, "the .stanza/.proj input files or Stanza package names to execute in the testing framework in the virtual machine.",
+          flags,
+          run-tests-msg, intercept-no-match-exceptions(run-tests))
+
+;============================================================
+;================= Dependency Analysis Command ==============
+;============================================================
+
+defn analyze-dependencies-command () :
+  ;All flags
+  val new-flags = [
+    Flag("o", OneFlag, OptionalFlag,
+      "The name of the output dependencies file.")
+    Flag("graphviz", OneFlag, OptionalFlag,
+      "If given, outputs the dependencies using the GraphViz format to the given file.")
+    Flag("build-target", ZeroFlag, OptionalFlag,
+      "If given, then the argument is interpreted to be the name of a build target instead of a Stanza package.")
+    Flag("ignore-cache", ZeroFlag, OptionalFlag,
+      "If given, then packages will always be loaded from their source files instead of their .pkg files if \
+       their source files are available.")
+    Flag("pkg", ZeroOrOneFlag, OptionalFlag,
+      "If provided, search the given folder for .pkg files.")]
+
+  ;Verify arguments
+  defn verify-args (cmd-args:CommandArgs) :
+    defn ensure-single-build-target! () :
+      if flag?(cmd-args, "build-target") and num-args(cmd-args) != 1 :
+        throw(ArgParseError("If the -build-target flag is given, then there needs to be exactly one argument \
+                             provided: the name of the build target."))        
+    ensure-supported-platform!(cmd-args)
+    ensure-single-build-target!()
+
+  ;Main action for command
+  val analyze-msg = "Analyzes the package dependencies between the inputs given. \
+  Computes which packages are imported by which other packages, the source files that \
+  each package is defined in, and whether there exists any cyclic dependencies \
+  between packages."
+  defn analyze-dependencies-action (cmd-args:CommandArgs) :
+    defn main () :
+      val ignore-cache? = flag?(cmd-args, "ignore-cache")
+      val output = get?(cmd-args, "o", false)
+      val graphviz = get?(cmd-args, "graphviz", false)
+      analyze-dependencies(build-settings(), ignore-cache?, output, graphviz)
+
+    defn build-settings () :
+      defn symbol? (name:String) :
+        to-symbol(cmd-args[name]) when flag?(cmd-args, name)
+      val pkg-dir = if flag?(cmd-args, "pkg") :
+        value?(cmd-args["pkg"], ".")
+      val input =
+        if flag?(cmd-args, "build-target") :
+          BuildTarget(to-symbol(arg(cmd-args,0)))
+        else :
+          BuildPackages(args(cmd-args))
+      BuildSettings(
+        input,
+        get?(cmd-args, "supported-vm-packages", []),
+        symbol?("platform")
+        false
+        false
+        false
+        pkg-dir
+        flag?(cmd-args, "optimize")
+        []
+        []
+        map(to-symbol, get?(cmd-args, "flags", [])))
+
+    ;Launch!
+    run-with-timing-log(main, cmd-args)
+
+  ;Command definition
+  Command("analyze-dependencies",
+          AtLeastOneArg, "the .stanza/.proj inputs or Stanza package names to analyze.",
+          to-tuple $ cat(new-flags, common-stanza-flags(["platform" "flags" "supported-vm-packages" "optimize" "timing-log"]))
+          analyze-msg, false, verify-args, intercept-no-match-exceptions(analyze-dependencies-action))
+
+;============================================================
+;========================= Doc Command ======================
+;============================================================
+
+defn auto-doc-command () :
+  ;Flags
+  val new-flags = [
+    Flag("o", OneFlag, RequiredFlag, false)
+    Flag("pkg-filter", OneFlag, OptionalFlag, false)
+    Flag("fig-filter", OneFlag, OptionalFlag, false)
+    Flag("toc-renamer", OneFlag, OptionalFlag, false)
+    Flag("trace", ZeroFlag, OptionalFlag, false)
+    Flag("platform", OneFlag, OptionalFlag, false)
+    Flag("build-target", ZeroFlag, OptionalFlag,
+      "If given, then the argument is interpreted to be the name of a build target instead of a Stanza package.")]
+
+  ;Verify args
+  defn verify-args (cmd-args:CommandArgs) :
+    defn ensure-single-build-target! () :
+      if flag?(cmd-args, "build-target") and num-args(cmd-args) != 1 :
+        throw(ArgParseError("If the -build-target flag is given, then there needs to be exactly one argument \
+                             provided: the name of the build target."))        
+    ensure-supported-platform!(cmd-args)
+    ensure-single-build-target!()
+    
+  ;Main action for command
+  val auto-doc-msg = "Autogenerates documentation from Stanza source files."
+  defn auto-doc-action (cmd-args:CommandArgs) :
+    defn main () :
+      val output = cmd-args["o"]
+      val pkg-filter = get?(cmd-args, "pkg-filter", false)
+      val fig-filter = get?(cmd-args, "fig-filter", false)
+      val toc-renamer = get?(cmd-args, "toc-renamer", false)
+      val trace? = flag?(cmd-args, "trace")
+      auto-doc(build-settings(), output, pkg-filter, fig-filter, toc-renamer, trace?)
+
+    defn build-settings () :
+      defn symbol? (name:String) :
+        to-symbol(cmd-args[name]) when flag?(cmd-args, name)
+      val pkg-dir = if flag?(cmd-args, "pkg") :
+        value?(cmd-args["pkg"], ".")
+      val input =
+        if flag?(cmd-args, "build-target") :
+          BuildTarget(to-symbol(arg(cmd-args,0)))
+        else :
+          BuildPackages(args(cmd-args))
+      BuildSettings(
+        input,
+        [],
+        symbol?("platform")
+        false
+        false
+        false
+        pkg-dir
+        flag?(cmd-args, "optimize")
+        []
+        []
+        map(to-symbol, get?(cmd-args, "flags", [])))
+
+    ;Launch!
+    run-with-timing-log(main, cmd-args)
+
+  ;Command definition
+  Command("doc",
+          AtLeastOneArg, "the .stanza/.proj input files or Stanza package names to generate documentation for."
+          to-tuple $ cat(new-flags, common-stanza-flags(["pkg", "flags", "optimize", "timing-log"])),
+          auto-doc-msg, false, verify-args, intercept-no-match-exceptions(auto-doc-action))
+ 
+
+;============================================================
+;======================= DefsDB Command =====================
+;============================================================
+
+defn defs-db-command () :
+  ;Flags
+  val new-flags = [
+    Flag("o", OneFlag, RequiredFlag,
+      "The name of the output definitions file.")
+    Flag("merge-with", OneFlag, OptionalFlag,
+      "The path to an existing definitions file, with which to merge \
+       the newly generated definitions.")]
+
+  ;Verify arguments
+  defn verify-args (cmd-args:CommandArgs) :
+    defn ensure-proj-file! (file:String) :
+      if not suffix?(file, ".proj") :
+        throw(ArgParseError("File %~ is not a valid file for building definitions database. \
+                             A project file (.proj) is expected." % [file]))                         
+    do(ensure-proj-file!, args(cmd-args))
+  
+  ;Main action for command
+  val defs-db-msg = "Generates the Stanza definitions database that is used \
+  in conjunction with the Stanza language server."
+  
+  defn defs-db-action (cmd-args:CommandArgs) :
+    defn main () :
+      read-config-file()
+      val output = cmd-args["o"]
+      defs-db(db-input(), output)
+
+    defn db-input () -> DefsDbInput :
+      DefsDbInput(
+        args(cmd-args),                               ;proj-files
+        OUTPUT-PLATFORM,                              ;platform
+        map(to-symbol, get?(cmd-args, "flags", [])),  ;flags
+        flag?(cmd-args, "optimize")                   ;optimize?
+        get?(cmd-args, "merge-with", false))          ;merge-db?
+
+    ;Launch!
+    run-with-timing-log(main, cmd-args)
+
+  ;Command definition
+  Command("definitions-database",
+          AtLeastOneArg, "the .proj files to use to generate definitions for.",
+          to-tuple $ cat(new-flags, common-stanza-flags(["platform", "flags", "optimize", "timing-log"])),
+          defs-db-msg, false, verify-args, intercept-no-match-exceptions(defs-db-action))
+ 
+
+;============================================================
+;================== Check Docs Command ======================
+;============================================================
+
+defn check-docs-command () :
+  ;Flags
+  val flags = [
+    Flag("accept", AtLeastOneFlag, OptionalFlag,
+      "The names of the sections to force accept as up-to-date.")]
+
+  ;Main action
+  val check-comments-msg = "Checks the documentation structure given the input \
+  .doc file, and ensure that it is consistent with the source code."
+  defn check-comments (cmd-args:CommandArgs) :
+    ;Retrieve name of doc structure file
+    val structure-file = arg(cmd-args,0)
+
+    ;Retrieve blocks to accept
+    val accepts = get?(cmd-args, "accept", [])
+
+    ;Launch!
+    check-project-doc-consistency(structure-file, accepts)
+
+  ;Command definition
+  Command("check-docs",
+          OneArg, "the .doc file that describes the documentation structure.",
+          flags,
+          check-comments-msg, intercept-no-match-exceptions(check-comments))
+
+;============================================================
+;======================= Helpers ============================
+;============================================================
+
+defn ExceptionList (es:Seqable<Exception>) :
+  new Exception :
+    defmethod print (o:OutputStream, this) :
+      print(o, "%n" % [es])
+
+defn intercept-no-match-exceptions (f:CommandArgs -> ?) -> CommandArgs -> ? :
+  fn (cmd-args:CommandArgs) :
+    try :
+      f(cmd-args)
+    catch (e:NoMatchError) :
+      throw(ExceptionList(errors(e)))
+
+;============================================================
+;==================== Main Commands =========================
+;============================================================
+
+add-stanza-command(print-version-command())
+add-stanza-command(install-command())
+add-stanza-command(compile-command())
+add-stanza-command(repl-command())
+add-stanza-command(run-command())
+add-stanza-command(compile-test-command())
+add-stanza-command(run-test-command())
+add-stanza-command(build-command())
+add-stanza-command(show-path-command())
+add-stanza-command(extend-command())
+add-stanza-command(analyze-dependencies-command())
+add-stanza-command(clean-command())
+add-stanza-command(check-docs-command())
+add-stanza-command(auto-doc-command())
+add-stanza-command(defs-db-command())    
+
+;============================================================
+;================== Main Interface ==========================
+;============================================================
+
+public defn stanza-main (commands:Collection<Command>, default-command:String|False) :
+  initialize-process-launcher()
+  set-max-heap-size(STANZA-MAX-COMPILER-HEAP-SIZE)
+  simple-command-line-cli(version-message(), to-tuple(commands), default-command, true)
+  
+public defn stanza-main () :
+  stanza-main(stanza-commands(), "compile")

@@ -1,0 +1,262 @@
+defpackage parser/translate :
+  import core
+  import collections
+  import parser/engine-lang with:
+    prefix(Pattern,Choice,Action,Empty,
+           Terminal,Repeat,Binder,Production,Guard) => E
+  import parser/patterns
+  import parser/merged-syntax-package
+  import parser/context
+  import parser/binding-analysis
+
+;============================================================
+;============ Translation of a Syntax Package ===============
+;============================================================
+
+;Translate a set of merged syntax packages into the
+;language representation accepted by the engine.
+public defn translate (rs:MergedSyntaxPackage) -> PatternPackage :
+  val translator = Translator()
+  val defs = for prod in productions(rs) map :
+    val pattern = Choice? $
+      for e in choice-entries(patterns(prod)) seq :
+        ChoiceBranch(not-branch?(e), translate(pattern(e),translator))
+    DefProduction(public?(prod), id(prod), name(prod), pattern)
+  PatternPackage(defs, actions(translator))
+
+;Translate a pattern into an engine pattern.
+public defn translate (p:Pattern, t:Translator) -> EPattern :
+  ;Helper: Recursively call translate with same translator.
+  defn recur (p:Pattern) :
+    translate(p,t)
+
+  ;Helper: Convert ChoiceEntry into a ChoiceBranch.
+  defn to-branch (e:ChoiceEntry) -> ChoiceBranch :
+    ChoiceBranch(not-branch?(e), recur(pattern(e)))
+
+  match(p) :
+    (p:SeqPat) :
+      if choice-seq?(p) : Choice? $ seq(to-branch, choice-chain(p))
+      else : Sequence? $ seq(recur, seq-chain(p))
+    (p:Choice) :
+      Choice? $ seq(to-branch, choice-chain(p))
+    (p:Empty) :
+      EEmpty()
+    (p:Terminal) :
+      ETerminal(value(p))
+    (p:Action|FailPat) :
+      translate-action(p, t)
+    (p:NotPat) :
+      NotPattern(recur(pattern(p)))
+    (p:Form) :
+      Any()
+    (p:Production) :
+      EProduction(resolve-production(t, name(p)))
+    (p:ProductionId) :
+      EProduction(id(p))
+    (p:Repeat) :
+      ERepeat(recur(pattern(p)))
+    (p:ListPat) :
+      ListPattern(recur(pattern(p)))
+    (p:Binder) :
+      EBinder(recur(pattern(p)))
+    (p:Guard) :
+      translate-single-binder-guard(p, t)
+
+;Extract the parameters of the actions in the given pattern.
+public defn extract-action-params (pat:Pattern) -> Tuple<ActionParams> :
+  val params = Vector<ActionParams|False>()
+
+  defn extract-params (index:Int, p:Pattern, lazy?:True|False) :
+    if length(params) < index + 1 :
+      lengthen(params, index + 1, false)
+    if params[index] is-not False :
+      fatal("ActionParams for index %_ already set." % [index])
+    val num-binders = get-num-binders(p)
+    params[index] = ActionParams(lazy?, num-binders)
+    
+  defn scan (p:Pattern) :
+    match(p) :
+      (p:Action) :
+        extract-params(action(p) as Int, pattern(p), lazy?(p))
+      (p:FailPat) :
+        extract-params(action(p) as Int, pattern(p), lazy?(p))      
+      (p:Guard) :
+        extract-params(predicate(p) as Int, pattern(p), false)
+      (p) :
+        do(scan, p)
+
+  ;Scan for any included parameters.
+  scan(pat)
+
+  ;Ensure all parameters have been discovered.
+  for (p in params, i in 0 to false) do :
+    if p is False :
+      fatal("ActionParams for index %_ not yet set. Pattern was %_." % [i, pat])
+
+  ;Return the parameters
+  to-tuple(params as Vector<ActionParams>)
+
+;Helper: Translate an action pattern (Action|FailPat) into an engine EAction pattern.
+defn translate-action (p:Action|FailPat, t:Translator) -> EAction :
+  var action-index:Int
+  var guard-index:Int|False = false
+  var type:ActionType
+
+  ;Retrieve the action index for the given action.
+  defn get-action-index (action:Int|(? -> ?), pat:Pattern, lazy?:True|False) -> Int :
+    match(action) :
+      ;If the action is already indexed, then use the existing index.
+      (action:Int) :
+        action
+      ;Otherwise, register a new action with the translator.
+      (action:? -> ?) :
+        val num-binders = get-num-binders(pat)
+        val params = ActionParams(lazy?, num-binders)
+        /action-index(t, action, params)
+
+  defn f1 (p:Pattern) :
+    match(p) :
+      (p:Action) :
+        action-index = get-action-index(action(p), pattern(p), lazy?(p))
+        type = StandardAction
+        f2(pattern(p))
+      (p:FailPat) :
+        action-index = get-action-index(action(p), pattern(p), lazy?(p))
+        type = FailAction
+        f2(pattern(p))
+  defn f2 (p:Pattern) :
+    match(p:Guard) :
+      ;Determine whether it is a single-binder-guard?
+      if single-binder-guard?(p) :
+        f3(translate-single-binder-guard(p,t))
+      else :
+        guard-index = get-action-index(predicate(p), pattern(p), false)
+        f3(translate(pattern(p),t))
+    else :
+      f3(translate(p,t))
+  defn f3 (p:EPattern) :
+    EAction(action-index,
+            guard-index,
+            type == FailAction,
+            p)
+
+  f1(p)
+
+;Return true if the given pattern is a single binder guard.
+defn single-binder-guard? (p:Guard) -> True|False :
+  length(get-simple-bindings(pattern(p))) == 1
+
+;Translate a single binder guard.
+;This is done by first translating the pattern, and then pushing
+;the guard inwards to surround the binder.
+defn translate-single-binder-guard (p:Guard, t:Translator) -> EPattern :
+  val pat = translate(pattern(p), t)
+  val guard-index = match(predicate(p)) :
+    (action:Int) : action
+    (action:? -> ?) : action-index(t, action, ActionParams(false,1))
+  push-guard-to-binder(guard-index, pat)
+
+;For every Binder within p, surround it with a
+;SingleBinderGuard with the given index.
+defn push-guard-to-binder (index:Int, p:EPattern) -> EPattern :
+  val simple-binder? = match(p:EBinder) : simple-bind?(pattern(p))
+  if simple-binder? : SingleBinderGuard(index, p)
+  else : map(push-guard-to-binder{index, _}, p)
+
+;Return true if the pattern is 'simple', i.e.
+;it is accessible by a guard.
+defn simple-bind? (p:EPattern) -> True|False :
+  match(p) :
+    (p:ETerminal|Any|ListPattern) : true
+    (p:EChoice) : all?(simple-bind?{pattern(_)}, branches(p))
+    (p) : false
+
+;Represents whether an action is a failure action
+;or a standard action.
+defenum ActionType :
+  FailAction
+  StandardAction  
+
+;============================================================
+;=================== Chain Utilities ========================
+;============================================================
+
+;Sequences that begin with a NotPat are better
+;represented using a Choice. Return true if it
+;is such a SeqPat.
+defn choice-seq? (p:SeqPat) -> True|False :
+  a(p) is NotPat
+
+;Flatten a SeqPat pattern into a single sequence
+;of patterns.
+defn seq-chain (p:SeqPat) -> Seqable<Pattern> :
+  generate<Pattern> :
+    let loop (p:Pattern = p) :
+      match(p:SeqPat) :
+        loop(a(p))
+        loop(b(p))
+      else :
+        yield(p)
+
+;Convert a set of patterns into a set of ChoiceEntry.
+;Useful for converting MergedProduction.
+defn choice-entries (ps:Tuple<Pattern>) -> Tuple<ChoiceEntry> :
+  for p in ps map :
+    match(p:NotPat) : ChoiceEntry(pattern(p), true)
+    else : ChoiceEntry(p, false)  
+
+;Flatten a Choice|SeqPat pattern into a list of branches
+;represented using ChoiceEntry.
+defn choice-chain (p:Choice|SeqPat) -> Seqable<ChoiceEntry> :
+  generate<ChoiceEntry> :
+    let loop (p:Pattern = p) :
+      match(p) :
+        (p:Choice) :
+          loop(a(p))
+          loop(b(p))
+        (p:SeqPat) :
+          if a(p) is NotPat :
+            val nested-pat = pattern(a(p) as NotPat)
+            yield(ChoiceEntry(nested-pat, true))
+            loop(b(p))
+          else :
+            yield(ChoiceEntry(p, false))
+        (p) :
+          yield(ChoiceEntry(p, false))
+
+;Represents one branch of a Choice pattern.
+;- pattern: The pattern to match against.
+;- not-branch?: If the pattern matches then abandon the rest of the
+;  Choice.
+defstruct ChoiceEntry :
+  pattern:Pattern
+  not-branch?:True|False
+
+;============================================================
+;================== Translator Utility ======================
+;============================================================
+
+;Utility for tracking state of translator.
+public deftype Translator
+
+;Register the given action and returns its index.
+defmulti action-index (t:Translator, f:? -> ?, params:ActionParams) -> Int
+
+;Retrieve all registered actions. Used at the end of
+;translation.
+defmulti actions (t:Translator) -> Tuple<ActionCallback>
+
+;Resolve the given production. Only required to translate
+;patterns that are not already resolved.
+public defmulti resolve-production (t:Translator, name:Symbol) -> Int
+
+;Create the translator utility before starting translation.
+defn Translator () :
+  val actions = Vector<ActionCallback>()
+  new Translator :
+    defmethod action-index (this, f:? -> ?, params:ActionParams) :
+      add(actions,ActionCallback(f,params))
+      length(actions) - 1
+    defmethod actions (this) :
+      to-tuple(actions)

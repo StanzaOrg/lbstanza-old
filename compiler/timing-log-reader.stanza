@@ -1,0 +1,1018 @@
+defpackage stz/timing-log-reader :
+  import core
+  import collections
+  import reader
+  import stz/line-noise-prompter
+  import stz/timing-log
+  import stz/uitree
+  import stz/timing-log-options
+  import stz/timing-log-overlap-analysis with:
+    prefix(Interval) => OV
+  import stz/timing-log-commands
+
+;============================================================
+;==================== Records ===============================
+;============================================================
+
+public defstruct TimingRecords :
+  ids: Vector<NamedId> with:
+    init => Vector<NamedId>()
+
+  records: Vector<LoggedEvent> with:
+    init => Vector<LoggedEvent>()
+
+  start-time?: Long|False with:
+    init => false
+    setter => set-start-time
+
+  end-time?: Long|False with:
+    init => false
+    setter => set-end-time
+
+public defstruct NamedId :
+  id:Int
+  name:String
+  parent:Int|False
+with:
+  printer => true
+  
+public defstruct LoggedEvent :
+  id:Int
+  type:EventType
+  time:Long
+with:
+  printer => true
+
+;============================================================
+;==================== Accessors =============================
+;============================================================
+
+public defn start-time (r:TimingRecords) : start-time?(r) as Long
+public defn end-time (r:TimingRecords) : end-time?(r) as Long
+
+;============================================================
+;====================== Printer =============================
+;============================================================
+
+defmethod print (o:OutputStream, r:TimingRecords) :
+  val o2 = IndentedStream(o)
+  print(o, "TimingRecords:")
+  lnprint(o2, "start-time: %_" % [start-time(r)])
+  lnprint(o2, "end-time: %_" % [end-time(r)])
+  do(lnprint{o2, _}, ids(r))
+  do(lnprint{o2, _}, records(r))
+
+;============================================================
+;================== Timing Record API =======================
+;============================================================
+
+defn add (r:TimingRecords, named-id:NamedId) -> False :
+  if id(named-id) == length(ids(r)) :
+    add(ids(r), named-id)
+  else :
+    throw(InternalLogReadError())
+
+defn add (r:TimingRecords, e:LoggedEvent) -> False :
+  add(records(r), e)
+
+;============================================================
+;================== Read from File ==========================
+;============================================================
+
+public defn read-timing-records (filename:String) -> TimingRecords :
+  val records = TimingRecords()
+  val stream = FileInputStream(filename)
+  let loop () :
+    val type = read-type-or-eof(stream)
+    match(type) :
+      (t:IdEvent) :
+        val id = read-int(stream)
+        val parent = read-int?(stream)
+        val name = read-string(stream)
+        add(records, NamedId(id, name, parent))
+      (t:BeginEvent) :
+        val time = read-long(stream)
+        set-start-time(records, time)
+      (t:EndEvent) :
+        val time = read-long(stream)
+        set-end-time(records, time)
+      (t:StartEvent|StopEvent|LogEvent) :
+        val id = read-int(stream)
+        val time = read-long(stream)
+        add(records, LoggedEvent(id, t, time))
+      (t:False) :
+        false
+    loop() when type is EventType
+
+  if start-time?(records) is False or
+     end-time?(records) is False :
+    throw(InternalLogReadError())
+
+  records
+
+;============================================================
+;================== Internal Graph Analysis =================
+;============================================================
+
+defstruct IntervalAnalysis :
+  roots:Vector<Int>
+  intervals:Vector<Interval>
+  child-relations:Vector<ChildRelation>
+  errors:Vector<IntervalError>
+
+defstruct Interval :
+  id:Int
+  start-index:Int
+  stop-index:Int|False with: (updater => sub-stop-index)
+with:
+  printer => true
+
+defstruct ChildRelation :
+  id:Int
+  parent:Int
+with:
+  printer => true
+
+deftype IntervalError
+
+defstruct OverlapRelation <: IntervalError :
+  later-id:Int
+  earlier-id:Int
+with:
+  printer => true
+
+defstruct InvalidStop <: IntervalError :
+  index:Int
+  label-id:Int
+with:
+  printer => true
+
+defstruct UnclosedInterval <: IntervalError :
+  id:Int
+with:
+  printer => true
+
+defn analyze-intervals (records:TimingRecords) -> IntervalAnalysis :
+  val roots = Vector<Int>()
+  val intervals = Vector<Interval>()
+  val active-intervals = IntTable<List<Int>>(List())
+  val child-relations = Vector<ChildRelation>()
+  val errors = Vector<IntervalError>()
+
+  defn active-interval (label-id:Int) -> Interval|False :
+    val ids = active-intervals[label-id]
+    intervals[head(ids)] when not empty?(ids)
+  
+  defn start-interval (label-id:Int, start:Int) -> False :
+    val id = length(intervals)
+    add(intervals, Interval(id, start, false))
+    update(active-intervals, cons{id, _}, label-id)
+    false
+    
+  defn stop-interval (label-id:Int, stop:Int) -> False :
+    val int = active-interval(label-id) as Interval
+    intervals[id(int)] = sub-stop-index(int, stop)
+    val new-active = tail(active-intervals[label-id])
+    if empty?(new-active) : remove(active-intervals, label-id)
+    else : active-intervals[label-id] = new-active
+    false
+
+  defn classify-active-intervals (start:Int) -> [Vector<Interval>, Vector<Interval>] :
+    val before = Vector<Interval>()
+    val after = Vector<Interval>()
+    for id in cat-all(values(active-intervals)) do :
+      val int = intervals[id]
+      if start-index(int) < start : add(before, int)
+      else if start-index(int) > start : add(after, int)
+      else : fatal("Unexpected case")
+    [before, after]
+
+  defn mark-child-interval (child:Int, parent:Int) :
+    add(child-relations, ChildRelation(child, parent))
+
+  defn mark-overlapped-interval (later-id:Int, earlier-id:Int) :
+    add(errors, OverlapRelation(later-id, earlier-id))
+
+  defn find-roots () :
+    val possible-roots = Array<True|False>(length(intervals), true)
+    for r in child-relations do :
+      possible-roots[id(r)] = false
+    for (root? in possible-roots, i in 0 to false) do :
+      add(roots, i) when root?
+
+  defn mark-unclosed-intervals () :
+    ;Compute set of unclosed intervals.
+    val unclosed-set = to-intset(seq-cat(value, active-intervals))
+
+    ;Generate unclosed interval errors
+    add-all(errors, seq(UnclosedInterval, unclosed-set))
+
+    ;Remove relations and errors dealing with unclosed
+    ;intervals.
+    for r in child-relations remove-when :
+      unclosed-set[id(r)] or unclosed-set[parent(r)]
+    for e in errors remove-when :
+      match(e) :
+        (e:OverlapRelation) : unclosed-set[later-id(e)] or unclosed-set[earlier-id(e)]
+        (e) : false
+
+    ;Remove roots with unclosed intervals
+    for r in roots remove-when :
+      unclosed-set[r]
+
+  for (record in /records(records), i in 0 to false) do :
+    switch(type(record)) :
+      StartEvent :
+        start-interval(id(record), i)
+      StopEvent :
+        val int = active-interval(id(record))
+        match(int:Interval) :
+          stop-interval(id(record), i)
+          val [before, after] = classify-active-intervals(start-index(int))
+          for parent in before do :
+            mark-child-interval(id(int), id(parent))
+          for parent in after do :
+            mark-overlapped-interval(id(int), id(parent))
+        else :
+          add(errors, InvalidStop(i, /id(record)))
+      LogEvent :
+        false
+
+  find-roots()
+  mark-unclosed-intervals()
+
+  IntervalAnalysis(roots,
+                   intervals,
+                   child-relations,
+                   errors)
+
+defmethod print (o:OutputStream, r:IntervalAnalysis) :
+  val o2 = IndentedStream(o)
+  print(o, "IntervalAnalysis:")
+  do(lnprint{o2, _}, intervals(r))
+  do(lnprint{o2, _}, child-relations(r))
+  do(lnprint{o2, _}, errors(r))
+
+;============================================================
+;==================== IntervalGraph =========================
+;============================================================
+
+defn interval-graph (records:TimingRecords, analysis:IntervalAnalysis) -> IntTable<List<Int>> :
+  ;Create the children table.
+  val children-table = IntTable<List<Int>>(List())
+  val edge-set = HashSet<KeyValue<Int,Int>>()
+  defn add-child (child:Int, parent:Int) :
+    if add(edge-set, parent => child) :
+      update(children-table, cons{child, _}, parent)
+  for c in child-relations(analysis) do :
+    add-child(id(c), parent(c))
+
+  ;Compute the reduction
+  for entry in children-table do :
+    val u = key(entry)
+    for child in value(entry) do :
+      for v in children-table[child] do :
+        remove(edge-set, u => v)
+
+  ;Update children table with reduction.
+  for entry in children-table map! :
+    val u = key(entry)
+    to-list $ lazy-qsort $ for v in value(entry) filter :
+      edge-set[u => v]
+
+  ;Return the child table
+  children-table
+
+;============================================================
+;===================== IntervalInfo =========================
+;============================================================
+
+deftype IntervalInfo
+defmulti interval-id (info:IntervalInfo, start-index:Int) -> Int
+defmulti interval-label-id (info:IntervalInfo, id:Int) -> Int
+defmulti interval-parent-id (info:IntervalInfo, id:Int) -> Int|False
+defmulti label-parent-id (info:IntervalInfo, label-id:Int) -> Int|False
+defmulti interval-start-index (info:IntervalInfo, id:Int) -> Int
+defmulti interval-stop-index (info:IntervalInfo, id:Int) -> Int
+defmulti label-name (info:IntervalInfo, label-id:Int) -> String
+defmulti interval-duration (info:IntervalInfo, id:Int) -> Long
+defmulti num-intervals (info:IntervalInfo) -> Int
+defmulti root-intervals (info:IntervalInfo) -> Tuple<Int>
+defmulti child-intervals (info:IntervalInfo, id:Int) -> Tuple<Int>
+defmulti program-duration (info:IntervalInfo) -> Long
+defmulti records (info:IntervalInfo) -> TimingRecords
+defmulti analysis (info:IntervalInfo) -> IntervalAnalysis
+
+defn IntervalInfo (records:TimingRecords,
+                   analysis:IntervalAnalysis,
+                   child-table:IntTable<List<Int>>) -> IntervalInfo :
+  new IntervalInfo :
+    defmethod records (this) :
+      records
+    defmethod analysis (this) :
+      analysis
+    defmethod num-intervals (this) :
+      length(intervals(analysis))
+    defmethod root-intervals (this) :
+      to-tuple(roots(analysis))
+    defmethod interval-start-index (this, id:Int) :
+      start-index(intervals(analysis)[id])
+    defmethod interval-stop-index (this, id:Int) :
+      stop-index(intervals(analysis)[id]) as Int
+    defmethod interval-label-id (this, id:Int) :
+      val index = start-index(intervals(analysis)[id])
+      val event = /records(records)[index]
+      /id(event)
+    defmethod interval-parent-id (this, id:Int) :
+      val index = start-index(intervals(analysis)[id])
+      val event = /records(records)[index]
+      val name-id = ids(records)[/id(event)]
+      parent(name-id)
+    defmethod label-parent-id (this, id:Int) :
+      val name-id = ids(records)[id]
+      parent(name-id)
+    defmethod label-name (this, label-id:Int) :
+      name(ids(records)[label-id])
+    defmethod interval-duration (this, id:Int) :
+      val int = intervals(analysis)[id]
+      val start-time = time(/records(records)[start-index(int)])
+      val stop-time = time(/records(records)[stop-index(int) as Int])
+      stop-time - start-time
+    defmethod program-duration (this) :
+      end-time(records) - start-time(records)
+    defmethod child-intervals (this, id:Int) -> Tuple<Int> :
+      to-tuple(get?(child-table, id, []))
+
+defn all-parents (info:IntervalInfo, id:Int) :
+  generate<Int> :
+    let loop (id:Int|False = interval-parent-id(info, id)) :
+      match(id:Int) :
+        yield(id)
+        loop(label-parent-id(info, id))
+
+defn interval-label (info:IntervalInfo, id:Int) -> String :
+  val label-id = interval-label-id(info, id)
+  label-name(info, label-id)
+
+defn label-parent (info:IntervalInfo,
+                   parent-set:IntSet,
+                   label-id:Int|False) -> Int|False :
+  match(label-id:Int) :
+    if parent-set[label-id] : label-id
+    else : label-parent(info, parent-set, label-parent-id(info, label-id))
+
+defn interval-parent-id (info:IntervalInfo,
+                         parent-set:IntSet,
+                         id:Int) -> Int|False :
+  val label-id = interval-parent-id(info, id)
+  label-parent(info, parent-set, label-id)
+
+defn child-interval-ids (info:IntervalInfo, data:UIData) -> Tuple<Int> :
+  match(data) :
+    (data:RootData) : root-intervals(info)
+    (data:IntervalData) : child-intervals(info, id(data))
+    (data:IdGroupData|ParentGroupData) : children(data)
+
+defn interval-child-durations (info:IntervalInfo,id:Int) -> Long :
+  sum $ for child in child-intervals(info, id) seq :
+    interval-duration(info, child)
+
+;============================================================
+;================== Reading Utilities =======================
+;============================================================
+
+defn read-type-or-eof (stream:FileInputStream) -> EventType|False :
+  match(get-int(stream)) :
+    (n:Int) :
+      match(EventType?(n)) :
+        (t:EventType) : t
+        (f:False) : throw(InternalLogReadError())
+    (f:False) :
+      false
+
+defn read-int (stream:FileInputStream) -> Int :
+  read-or-error(get-int, stream)
+
+defn read-int? (stream:FileInputStream) -> Int|False :
+  switch(read-byte(stream)) :
+    0Y : false
+    1Y : read-int(stream)
+    else : throw(InternalLogReadError())    
+
+defn read-length (stream:FileInputStream) -> Int :
+  val n = read-int(stream)
+  if n < 0 : throw(InternalLogReadError())
+  n
+
+defn read-long (stream:FileInputStream) -> Long :
+  read-or-error(get-long, stream)
+
+defn read-string (stream:FileInputStream) -> String :
+  val n = read-length(stream)
+  val chars = Vector<Char>()
+  for i in 0 to n do :
+    add(chars, read-char(stream))
+  String(chars)
+
+defn read-char (stream:FileInputStream) -> Char :
+  to-char(read-byte(stream))
+
+defn read-byte (stream:FileInputStream) -> Byte :
+  read-or-error(get-byte, stream)
+
+defn read-or-error<?T> (read:InputStream -> ?T|False, stream:FileInputStream) -> T :
+  match(read(stream)) :
+    (f:False) : throw(InternalLogReadError())
+    (x:T) : x
+
+defstruct InternalLogReadError <: Exception
+
+;============================================================
+;====================== UI Data =============================
+;============================================================
+
+deftype UIData
+defmulti duration (d:UIData) -> Long
+defmulti options (d:UIData) -> ViewOptions
+defmulti sub-options (d:UIData, o:ViewOptions) -> UIData
+
+defstruct RootData <: UIData :
+  duration:Long with: (as-method => true)
+  options:ViewOptions with: (as-method => true, updater => sub-options)
+
+defstruct IntervalData <: UIData :
+  id:Int
+  duration:Long with: (as-method => true)
+  child-duration:Long
+  options:ViewOptions with: (as-method => true, updater => sub-options)
+  separate-end?:True|False with: (updater => sub-separate-end?)
+
+defstruct IdGroupData <: UIData :
+  label-id:Int
+  duration:Long with: (as-method => true)
+  options:ViewOptions with: (as-method => true, updater => sub-options)
+  separate-end?:True|False with: (updater => sub-separate-end?)
+  children:Tuple<Int>
+
+defstruct ParentGroupData <: UIData :
+  parent-id:Int|False
+  duration:Long with: (as-method => true)
+  options:ViewOptions with: (as-method => true, updater => sub-options)
+  separate-end?:True|False with: (updater => sub-separate-end?)
+  children:Tuple<Int>
+
+defstruct IntervalEnd <: UIData : (id:Int)
+defstruct IdGroupEnd <: UIData : (label-id:Int)
+defstruct ParentGroupEnd <: UIData : (parent-id:Int|False)
+
+;============================================================
+;===================== Convenience ==========================
+;============================================================
+
+defn DefaultViewOptions () :
+  ViewOptions(SortByTime, NoGrouping())
+
+;============================================================
+;===================== Engine ===============================
+;============================================================
+
+defn UIEngine (info:IntervalInfo) :
+  new UITreeEngine<UIData> :
+    defmethod print (this, o:OutputStream, data:UIData) :
+    
+      defn view-options-str () :
+        val o = options(data)
+        val items = Vector<String>()
+        switch(sorting(o)) :
+          SortByTime : false
+          SortByDuration : add(items, "Sort by Duration")
+        match(grouping(o)) :
+          (g:NoGrouping) : false
+          (g:GroupById) : add(items, "Group by Id")
+          (g:GroupByParents) : add(items, "Group by Parents")
+          (g:GroupAllByParents) : add(items, "Group All by Parents")
+        if empty?(items) : ""
+        else : " (%,)" % [items]
+          
+      match(data) :
+        (data:RootData) :
+          print(o, "Total Program Duration: %_ us%_" % [commas(duration(data)), view-options-str()])
+        (data:IntervalData) :
+          val ilabel = interval-label(info, id(data))
+          val dots = " .." when separate-end?(data) else ""
+          val child-durations-str = " (sum of children = %_ us)" % [commas(child-duration(data))]
+          print(o, "(intv %_%_) %_ (%_ us)%_%_" % [
+            id(data), dots, ilabel, commas(duration(data)), child-durations-str, view-options-str()])
+        (data:IdGroupData) :
+          val label-name = label-name(info, label-id(data))
+          val dots = " .." when separate-end?(data) else ""
+          print(o, "(group id %_%_) %_ (%_ us)%_" % [label-id(data), dots, label-name, commas(duration(data)), view-options-str()])
+        (data:ParentGroupData) :
+          val dots = " .." when separate-end?(data) else ""
+          if parent-id(data) is Int :
+            val label-name = label-name(info, parent-id(data) as Int)
+            print(o, "(parent id %_%_) %_ (%_ us)%_" % [parent-id(data), dots, label-name, commas(duration(data)), view-options-str()])
+          else :
+            print(o, "(no parent%_) (%_ us)%_" % [dots, commas(duration(data)), view-options-str()])
+        (data:IntervalEnd) :
+          val ilabel = interval-label(info, id(data))
+          print(o, "(.. intv %_) %_" % [id(data), ilabel])
+        (data:IdGroupEnd) :
+          val label-name = label-name(info, label-id(data))
+          print(o, "(.. group id %_) %_" % [label-id(data), label-name])          
+        (data:ParentGroupEnd) :
+          if parent-id(data) is Int :
+            val label-name = label-name(info, parent-id(data) as Int)
+            print(o, "(.. parent id %_) %_" % [parent-id(data), label-name])
+          else :
+            print(o, "(.. no parent)")
+          
+    defmethod expand (this, data:UIData, options:ViewOptions) :
+      defn data-index (data:UIData) -> Int :
+        match(data) :
+          (data:IntervalData) : interval-start-index(info, id(data))
+          (data:IdGroupData) : interval-start-index(info, children(data)[0])
+          (data:ParentGroupData) : interval-start-index(info, children(data)[0])
+
+      defn sort-data (data:Vector<UIData>, order:SortOrder) -> False :
+        switch(order) :
+          SortByTime :
+            false
+          SortByDuration :
+            qsort!(duration, data)
+            reverse!(data)
+
+      defn analyze-overlaps? (data:Vector<UIData>, order:SortOrder) -> Tuple<UIData> :
+        if order == SortByTime : analyze-overlaps(info, data)
+        else : to-tuple(data)
+
+      match(grouping(options)) :
+      
+        (g:NoGrouping) :
+          val intervals = to-vector<UIData> $
+            for id in child-interval-ids(info,data) seq :
+              IntervalData(id,
+                           interval-duration(info,id),
+                           interval-child-durations(info,id),
+                           DefaultViewOptions(), false)
+          sort-data(intervals, sorting(options))
+          val new-root = sub-options(data, options)
+          ExpandedData<UIData>(new-root, analyze-overlaps?(intervals, sorting(options)))          
+
+        (g:GroupById) :
+          ;Group children by label id.
+          val groups = IntTable-init<Vector<Int>>(Vector<Int>{})
+          for id in child-interval-ids(info,data) do :
+            val label-id = interval-label-id(info, id)
+            add(groups[label-id], id)
+
+          ;Create groups for each entry.
+          val group-data = to-vector<UIData> $
+            for entry in groups seq :
+              val label-id = key(entry)
+              val ids = value(entry)
+              val duration = sum(seq(interval-duration{info, _}, ids))
+              IdGroupData(label-id, duration, DefaultViewOptions(), false, to-tuple(ids))
+          sort-data(group-data, sorting(options))
+
+          val new-root = sub-options(data, options)
+          ExpandedData<UIData>(new-root, analyze-overlaps?(group-data, sorting(options)))
+          
+        (g:GroupByParents) :
+          ;Helper: Set of all parents to group by.
+          val parent-set = to-intset(parents(g))
+
+          ;Group children by parent id.
+          val groups = HashTable-init<Int|False, Vector<Int>>(Vector<Int>{})
+          for id in child-interval-ids(info,data) do :
+            val parent-id = interval-parent-id(info, parent-set, id)
+            add(groups[parent-id], id)
+
+          ;Create groups for each entry.
+          val group-data = to-vector<UIData> $
+            for entry in groups seq :
+              val parent-id = key(entry)
+              val ids = value(entry)
+              val duration = sum(seq(interval-duration{info, _}, ids))
+              ParentGroupData(parent-id, duration, DefaultViewOptions(), false, to-tuple(ids))
+          sort-data(group-data, sorting(options))
+
+          val new-root = sub-options(data, options)
+          ExpandedData<UIData>(new-root, analyze-overlaps?(group-data, sorting(options)))
+
+        (g:GroupAllByParents) :
+          ;Helper: Set of all parents to group by.
+          val parent-set = to-intset(parents(g))
+
+          ;Group children by parent id.
+          val groups = IntTable-init<Vector<Int>>(Vector<Int>{})
+          val visited = IntSet()
+          defn scan-interval (id:Int) :
+            if add(visited, id) :
+              val p = interval-parent-id(info, parent-set, id)
+              match(p:Int) : add(groups[p], id)
+              else : do(scan-interval, child-intervals(info, id))
+          do(scan-interval, child-interval-ids(info,data))
+
+          ;Create groups for each entry.
+          val group-data = to-vector<UIData> $
+            for entry in groups seq :
+              val parent-id = key(entry)
+              val ids = value(entry)
+              val duration = sum(seq(interval-duration{info, _}, ids))
+              ParentGroupData(parent-id, duration, DefaultViewOptions(), false, to-tuple(ids))
+          sort-data(group-data, sorting(options))
+
+          val new-root = sub-options(data, options)
+          ExpandedData<UIData>(new-root, analyze-overlaps?(group-data, sorting(options)))
+          
+    defmethod expandable? (this, data:UIData) :
+      match(data) :
+        (data:RootData) :
+          not empty?(root-intervals(info))
+        (data:IntervalData) :
+          not empty?(child-intervals(info, id(data)))
+        (data:IdGroupData) :
+          true
+        (data:ParentGroupData) :
+          true
+        (data:IntervalEnd|
+              IdGroupEnd|
+              ParentGroupEnd) :
+          false
+
+;============================================================
+;================== Overlap Calculations ====================
+;============================================================
+
+defn analyze-overlaps (info:IntervalInfo, datas:IndexedCollection<UIData>) -> Tuple<UIData> :
+  defn make-interval (id:Int) -> OVInterval :
+    OVInterval(interval-start-index(info,id)
+               interval-stop-index(info,id))
+             
+  defn to-item (data:UIData) -> GroupedIntervals|OVInterval :
+    match(data) :
+      (data:IntervalData) :
+        make-interval(id(data))
+      (data:IdGroupData) :
+        GroupedIntervals(map(make-interval, children(data)))
+      (data:ParentGroupData) :
+        GroupedIntervals(map(make-interval, children(data)))
+        
+  defn from-item (item:IntervalItem) -> UIData :
+    val data = datas[index(item)] as IntervalData|IdGroupData|ParentGroupData
+    switch(type(item)) :
+      Start :
+        sub-separate-end?(data, true)
+      End :
+        match(data) :
+          (d:IntervalData) : IntervalEnd(id(d))
+          (d:IdGroupData) : IdGroupEnd(label-id(d))
+          (d:ParentGroupData) : ParentGroupEnd(parent-id(d))
+      Full :
+        data
+        
+  val result = analyze-overlaps(seq(to-item, datas))
+  map(from-item, result)
+
+;============================================================
+;====================== New UI ==============================
+;============================================================
+
+defstruct LogUI :
+  info:IntervalInfo
+  tree:UITree<UIData>
+
+defn LogUI (info:IntervalInfo) :
+  val root = RootData(program-duration(info), DefaultViewOptions())
+  val tree = UITree(UIEngine(info), root)
+  set-expansion(tree, 0, One(DefaultViewOptions()))
+  LogUI(info, tree)
+
+defn expand (ui:LogUI, id:Int, options:ViewOptions) :
+  set-expansion(tree(ui), id, One(options))
+
+defn fold (ui:LogUI, id:Int) :
+  set-expansion(tree(ui), id, None())
+
+defn save-raw (ui:LogUI, filename:String) :
+  val item = new Printable :
+    defmethod print (o:OutputStream, this) :
+      format-raw(o, records(info(ui)))
+  spit(filename, item)
+  println("Saved raw log to %_." % [filename])
+
+defn save (ui:LogUI, filename:String) :
+  spit(filename, tree(ui))
+  println("Saved to %_." % [filename])
+
+defn save-analysis (ui:LogUI, filename:String) :
+  val item = new Printable :
+    defmethod print (o:OutputStream, this) :
+      format-analysis(o, records(info(ui)), analysis(info(ui)))
+  spit(filename, item)
+  println("Saved analysis to %_." % [filename])
+
+defn list-parents (ui:LogUI, id:Int) :
+  val data = value!(data(tree(ui), id))
+  val children = child-interval-ids(info(ui), data)
+  val parents = IntSet()
+  for id in children do :
+    add-all(parents, all-parents(info(ui), id))
+    
+  if empty?(parents) :
+    println("No tagged intervals.")
+  else :
+    println("Set of parent tags:")
+    within indented() :
+      format-labels(current-output-stream(), info(ui), parents)
+
+defn list-all-ids (ui:LogUI, data-id:Int) :
+  val all-ids = IntSet()
+  val visited = IntSet()
+  defn scan-interval (id:Int) :
+    if add(visited, id) :
+      add(all-ids, id)
+      do(scan-interval, child-intervals(info(ui), id))  
+  val data = value!(data(tree(ui), data-id))
+  do(scan-interval, child-interval-ids(info(ui), data))
+  
+  if empty?(all-ids) :
+    println("No child ids.")
+  else :
+    println("Set of all ids:")
+    within indented() :
+      format-labels(current-output-stream(), info(ui), all-ids)
+
+defn list-all-parents (ui:LogUI, data-id:Int) :
+  val parents = IntSet()
+  val visited = IntSet()
+  defn scan-interval (id:Int) :
+    if add(visited, id) :
+      add-all(parents, all-parents(info(ui), id))
+      do(scan-interval, child-intervals(info(ui), id))
+  val data = value!(data(tree(ui), data-id))
+  do(scan-interval, child-interval-ids(info(ui), data))
+  
+  if empty?(parents) :
+    println("No tagged intervals.")
+  else :
+    println("Set of parent tags:")
+    within indented() :
+      format-labels(current-output-stream(), info(ui), parents)
+
+defn fold-children (ui:LogUI, id:Int) :
+  val options = expansion-key(tree(ui), id)
+  if not empty?(options) :
+    set-sole-expansion(tree(ui), id, options)
+  else :
+    println("Not yet expanded.")
+
+defn group (ui:LogUI, id:Int, type:GroupType) :
+  val options = expansion-key(tree(ui), id)
+  if not empty?(options) :
+    val new-options = sub-grouping(value!(options), type)
+    set-expansion(tree(ui), id, One(new-options))
+  else :
+    println("Not yet expanded.")
+
+defn sort (ui:LogUI, id:Int, type:SortOrder) :
+  val options = expansion-key(tree(ui), id)
+  if not empty?(options) :
+    val new-options = sub-sorting(value!(options), type)
+    set-expansion(tree(ui), id, One(new-options))
+  else :
+    println("Not yet expanded.")
+
+defn set-root (ui:LogUI, id:Int) :
+  set-root(tree(ui), id)
+
+;============================================================
+;======================= Formatting =========================
+;============================================================
+
+defn format-raw (o:OutputStream, rs:TimingRecords) :
+  println(o, "start-time: %_ ms" % [start-time(rs)])
+  println(o, "end-time: %_ ms" % [end-time(rs)])
+  for (r in records(rs), index in 0 to false) do :
+    val name = name(ids(rs)[id(r)])
+    val type-str = switch(type(r)) :
+      StartEvent: "START"
+      StopEvent: "STOP"
+      LogEvent: "LOG"
+    println(o, "%_) %_ : %_ %_ %~" % [index, time(r), type-str, id(r), name])
+
+defn format-analysis (o:OutputStream, rs:TimingRecords, analysis:IntervalAnalysis) :
+  println(o, "Intervals:")
+  for int in intervals(analysis) do :
+    println(o, intv-str(rs, analysis, id(int)))
+  println(o, "")
+
+  println(o, "Child Relations:")
+  for r in child-relations(analysis) do :
+    println(o, "%_ is a child interval of:" % [intv-str(rs, analysis, id(r))])
+    println(o, "  %_" % [intv-str(rs, analysis, parent(r))])
+  println(o, "")
+  
+  if not empty?(errors(analysis)) :
+    println(o, "\nERRORS:")
+    format-errors(o, rs, analysis)
+
+defn format-errors (o:OutputStream,
+                    rs:TimingRecords,
+                    analysis:IntervalAnalysis) :
+  for e in errors(analysis) do :
+    format-error(o, rs, analysis, e)
+  
+defn format-error (o:OutputStream,
+                   rs:TimingRecords,
+                   analysis:IntervalAnalysis,
+                   e:IntervalError) :  
+  match(e) :
+    (e:OverlapRelation) :
+      println(o, "The following two intervals overlap:")
+      for int-id in [later-id(e), earlier-id(e)] do :
+        println(o, "  %_" % [intv-str(rs, analysis, int-id)])
+    (e:InvalidStop) :
+      val name = name(ids(rs)[label-id(e)])
+      println(o, "Invalid attempt to stop an interval that has not been started:")
+      println(o, "  STOP %_ %_ (index %_)" % [label-id(e), name, index(e)])
+    (e:UnclosedInterval) :
+      println(o, "The following interval was never stopped:")
+      println(o, "  %_" % [intv-str(rs, analysis, id(e))])
+
+defn intv-str (rs:TimingRecords, analysis:IntervalAnalysis, int-id:Int) :
+  val int = intervals(analysis)[int-id]
+  val rec = records(rs)[start-index(int)]
+  val name = name(ids(rs)[id(rec)])
+  val stop-index-str = match(stop-index(int)) :
+    (i:Int) : i
+    (f:False) : "..."
+  "(intv %_) %_ (Span %_ to %_)" % [
+    int-id, name, start-index(int), stop-index-str]
+
+defn commas (x:Long) :
+  val s = to-string(x)
+  val n = length(s)
+  val chars = Vector<Char>()  
+  for i in 0 to n do :
+    if i > 0 and i % 3 == 0 : add(chars, ',')
+    add(chars, s[n - 1 - i])
+  reverse!(chars)
+  String(chars)  
+
+defn format-labels (o:OutputStream,
+                    info:IntervalInfo,
+                    labels:Collection<Int>) :
+  val child-table = HashTable<Int|False, List<Int>>(List())
+  for id in labels do :
+    val p = label-parent-id(info, id)
+    update(child-table, cons{id, _}, p)
+
+  val visited = IntSet()
+  defn make-tree (id:Int) -> ParentTree :
+    ;Have we been visited before?
+    val visited? = not add(visited, id)
+
+    ;Compute children
+    val children =
+      if visited? : []
+      else : to-tuple(seq(make-tree, child-table[id]))
+
+    ;Return node
+    ParentTree(id, label-name(info,id), visited?, children)
+
+  defn format-tree (o:OutputStream, t:ParentTree) :
+    val visited-str = "" when not visited?(t)
+                 else " (visited)"
+    println(o, "[Parent %_] %_%_" % [id(t), name(t), visited-str])
+    do(format-tree{IndentedStream(o), _}, children(t))
+
+  for child in child-table[false] do :
+    format-tree(o, make-tree(child))
+
+defstruct ParentTree :
+  id:Int
+  name:String
+  visited?:True|False
+  children:Tuple<ParentTree>
+
+;============================================================
+;================== Command Interpreter =====================
+;============================================================
+
+defenum InterpretAction :
+  QuitAction
+  DoneAction
+
+defn interpret (ui:LogUI, c:Command) -> InterpretAction :
+  match(c) :
+    (c:PrintCommand) :
+      println(tree(ui))
+      DoneAction
+    (c:RawCommand) :
+      save-raw(ui, filename(c))
+      DoneAction
+    (c:SaveCommand) :
+      save(ui, filename(c))
+      DoneAction
+    (c:AnalysisCommand) :
+      save-analysis(ui, filename(c))
+      DoneAction
+    (c:QuitCommand) :
+      QuitAction
+    (c:ExpandCommand) :
+      do(ensure-tree-item!{ui, _}, ids(c))
+      for id in ids(c) do :
+        expand(ui, id, DefaultViewOptions())
+      println(tree(ui))
+      DoneAction
+    (c:FoldCommand) :
+      do(ensure-tree-item!{ui, _}, ids(c))
+      for id in ids(c) do :
+        fold(ui, id)
+      println(tree(ui))
+      DoneAction      
+    (c:FoldChildrenCommand) :
+      ensure-tree-item!(ui, id(c))
+      fold-children(ui, id(c))
+      println(tree(ui))
+      DoneAction      
+    (c:SortCommand) :
+      ensure-tree-item!(ui, id(c))
+      sort(ui, id(c), type(c))
+      println(tree(ui))
+      DoneAction
+    (c:GroupCommand) :
+      ensure-tree-item!(ui, id(c))
+      group(ui, id(c), type(c))
+      println(tree(ui))
+      DoneAction    
+    (c:ListParentsCommand) :
+      ensure-tree-item!(ui, id(c))
+      list-parents(ui, id(c))
+      DoneAction
+    (c:ListAllParentsCommand) :
+      ensure-tree-item!(ui, id(c))
+      list-all-parents(ui, id(c))
+      DoneAction
+    (c:ListAllIdsCommand) :
+      ensure-tree-item!(ui, id(c))
+      list-all-ids(ui, id(c))
+      DoneAction
+    (c:SetRootCommand) :
+      ensure-root-item!(ui, id(c))
+      set-root(ui, id(c))
+      println(tree(ui))
+      DoneAction
+
+defn command-loop (ui:LogUI) -> False :
+  println(tree(ui))
+  let loop () :
+    match(read-command()) :
+      (command:Command) :
+        try :
+          switch(interpret(ui, command)) :
+            DoneAction :
+              loop()
+            QuitAction :
+              false
+        catch (e:InterpretError) :
+          println(e)
+          loop()
+      (e:CommandException) :
+        println(e)
+        loop()
+
+defn ensure-tree-item! (ui:LogUI, id:Int) :
+  if empty?(data(tree(ui), id)) :
+    throw(InterpretError("No tree item with id %_." % [id]))
+
+defn ensure-root-item! (ui:LogUI, id:Int) :
+  if id != 0 and empty?(data(tree(ui), id)) :
+    throw(InterpretError("No tree item with id %_." % [id]))
+
+defstruct InterpretError <: Exception :
+  message
+defmethod print (o:OutputStream, e:InterpretError) :
+  print(o, message(e))
+
+;============================================================
+;======================== Main ==============================
+;============================================================
+
+public defn main () :
+  val filename = command-line-arguments()[1]
+  val records = read-timing-records(filename)
+  val int-analysis = analyze-intervals(records)
+  val tree = interval-graph(records, int-analysis)
+  val info = IntervalInfo(records, int-analysis, tree)
+  val ui = LogUI(info)
+  command-loop(ui)
+
+;within (package, sig) = set-stack-trace-filter() :
+;  package != `core
+;set-command-line-arguments(["log-reader", "timing.log"])
+;set-command-line-arguments(["log-reader", "timing-log.txt"])
+
+main()

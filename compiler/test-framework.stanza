@@ -1,0 +1,491 @@
+defpackage stz/test-framework :
+  import core
+  import collections
+  import arg-parser
+
+;============================================================
+;=================== Testing Structure ======================
+;============================================================
+
+protected deftype DefTest
+protected defmulti name (t:DefTest) -> String
+protected defmulti run (t:DefTest) -> ?
+protected defmulti tags (t:DefTest) -> List<Symbol>
+
+;============================================================
+;====================== Assertion ===========================
+;============================================================
+
+protected deftype Assertion
+protected defmulti run (a:Assertion, vs:AssertionValues) -> True|False
+protected defmulti description (a:Assertion) -> String|False
+protected defmulti info (a:Assertion) -> FileInfo|False
+protected defmulti num-subexps (a:Assertion) -> Int
+protected defmulti subexp-descriptions (a:Assertion) -> Tuple<String>
+protected defmulti halt-on-failure? (a:Assertion) -> True|False
+
+;============================================================
+;================== AssertionValues =========================
+;============================================================
+
+protected deftype AssertionValues <: Collection<Maybe>
+protected defmulti set<?T> (v:AssertionValues, i:Int, v:?T) -> T
+
+defn AssertionValues (len:Int) :
+  val values = Array<Maybe>(len, None())
+  new AssertionValues :
+    defmethod set<?T> (this, i:Int, v:?T) -> T :
+      values[i] = One(v)
+      v
+    defmethod to-seq (this) :
+      to-seq(values)
+
+;============================================================
+;================ Command-line Interface ====================
+;============================================================
+
+var TESTING-STATE:TestingState|False = false
+
+defn init-testing-state () :
+  ;All flag definitions
+  val flags = [
+    Flag("tagged", AtLeastOneFlag, OptionalFlag,
+      "If given, only the tests with the given tags will be executed.")
+    Flag("not-tagged", AtLeastOneFlag, OptionalFlag,
+      "If given, the tests with the given tags will not be executed.")
+    Flag("log", OneFlag, OptionalFlag,
+      "The directory to output the test results to.")]
+
+  val run-msg = "Run the tests using the Stanza testing \
+  framework."
+  ;Grab the required parameters.
+  defn run (cmd-args:CommandArgs) :
+    defn to-symbols? (f:False) : f
+    defn to-symbols? (xs:Seqable<String>) : to-list(seq(to-symbol,xs))
+    val tests = to-list(args(cmd-args)) when not empty?(args(cmd-args))
+    val tags = to-symbols?(get?(cmd-args, "tagged", false))
+    val not-tags = to-symbols?(get?(cmd-args, "not-tagged", false))
+    val logger? = Logger(cmd-args["log"]) when flag?(cmd-args, "log")
+    TESTING-STATE = TestingState(logger?, tests, tags, not-tags)
+
+  ;Command definition
+  val run-cmd = Command("run",
+                        ZeroOrMoreArg, "the names of the tests to run.",
+                        flags,
+                        run-msg, run)
+  simple-command-line-cli(false, [run-cmd], "run", true, false)
+
+defn testing-state () -> TestingState :
+  if TESTING-STATE is False :
+    init-testing-state()
+  TESTING-STATE as TestingState
+
+;============================================================
+;===================== Testing State ========================
+;============================================================
+
+;Record of all tests
+defstruct TestingState :
+  records: Vector<TestRecord> with: (init => Vector<TestRecord>())
+  logger: Logger|False
+  tests: List<String>|False
+  tags: List<Symbol>|False
+  not-tags: List<Symbol>|False
+
+;A single test record
+deftype TestRecord
+defmulti name (r:TestRecord) -> String
+
+defstruct SkippedTest <: TestRecord :
+  name:String with: (as-method => true)
+defstruct RanTest <: TestRecord :
+  name:String with: (as-method => true)
+  time:TestTime
+  passed?:True|False
+
+;Represents time taken to run a test
+defstruct TestTime <: Comparable<TestTime> :
+  value:Long
+  unit:TimeUnit
+
+defenum TimeUnit :
+  Milliseconds
+  Microseconds
+
+defn num-tests (s:TestingState) -> Int :
+  length(records(s))
+
+;============================================================
+;================== Comparing Times =========================
+;============================================================
+
+defmethod compare (a:TestTime, b:TestTime) -> Int :
+  match(unit(a), unit(b)) :
+    (ua:Milliseconds, ub:Milliseconds) :
+      compare(value(a), value(b))
+    (ua:Microseconds, ub:Microseconds) :
+      compare(value(a), value(b))
+    (ua:Milliseconds, ub:Microseconds) :
+      val b-ms = value(b) / 1000L
+      val b-us = value(b) % 1000L
+      val c1 = compare(value(a), b-ms)
+      if c1 == 0 : compare(0L, b-us)
+      else : c1
+    (ua:Microseconds, ub:Milliseconds) :
+      -1 * compare(b,a)
+
+;============================================================
+;======================== Run Test ==========================
+;============================================================
+
+deftype RunTestResult
+defstruct SkipTest <: RunTestResult
+defstruct RunTest <: RunTestResult
+defstruct IgnoreTest <: RunTestResult
+
+defn run-test? (t:DefTest) :
+  val s = testing-state()
+
+  ;Compute whether the given arguments indicate to include
+  ;the test.
+  val args-indicate-include = match(tests(s)) :
+    (ts:List<String>) : contains?(ts, name(t))
+    (f:False) : true
+  
+  ;Compute whether the given tags indicate to include
+  ;the test.
+  val tags-indicate-include = match(tags(s)) :
+    (ts:List<Symbol>) : for tag in ts any? : contains?(tags(t), tag)
+    (f:False) : true
+
+  ;Compute whether the exclude tags indicate to include
+  ;the test.
+  val not-tags-indicate-include = match(not-tags(s)) :
+    (ts:List<Symbol>) : for tag in ts none? : contains?(tags(t), tag)
+    (f:False) : true
+
+  ;Combine results
+  if args-indicate-include :
+    if tags-indicate-include and not-tags-indicate-include : RunTest()
+    else : SkipTest()
+  else : IgnoreTest()
+
+protected defn run-test (t:DefTest) :
+  ;Reporting errors
+  val out = STANDARD-OUTPUT-STREAM
+  val out2 = IndentedStream(STANDARD-OUTPUT-STREAM)
+
+  match(run-test?(t)) :
+    (result:IgnoreTest) :
+      false
+    (result:SkipTest) :
+      add(records(testing-state()), SkippedTest(name(t)))
+      val test-num = num-tests(testing-state()) + 1
+      println(out, "[Test %_] %_ [SKIPPED]\n" % [test-num, name(t)])
+    (result:RunTest) :
+      ;Prepare timers
+      val millisecond-timer = MillisecondTimer("Test")
+      val microsecond-timer = MicrosecondTimer("Test")
+      
+      defn start-timers () :
+        start(millisecond-timer)
+        start(microsecond-timer)
+        
+      defn read-time () -> TestTime :
+        stop(millisecond-timer)
+        stop(microsecond-timer)
+        val ms = time(millisecond-timer)
+        if ms < 10L : TestTime(time(microsecond-timer), Microseconds)
+        else : TestTime(ms, Milliseconds)
+
+      ;Record whether test ran to completion successfully
+      var encountered-error?:True|False = false
+
+      ;Record whether we have already saved a record for
+      ;this test.
+      var record-saved?:True|False = false
+      
+      ;Print out test label
+      val test-num = num-tests(testing-state()) + 1
+      print(out, "[Test %_] %_ " % [test-num, name(t)])
+
+      ;Save test record
+      defn save-test-record (passed?:True|False) :
+        ;Note: We have to double check that we haven't already
+        ;saved the test for this record already. Here is one circumstance
+        ;where it is necessary:
+        ;The user's main failing code is surrounded by a try/finally
+        ;block, and the finally block also contains a failure.
+        ;Thus, when the testing framework encounters the first error in the
+        ;main code, it will save a testing record.
+        ;Then, when we attempt to stop the test, and unwind the stack,
+        ;executing the finally block will result in an additional failure.
+        if not record-saved? :
+          record-saved? = true
+          val rec = RanTest(name(t), read-time(), passed?)
+          add(records(testing-state()), rec)
+
+      ;Print new line if log is not captured.
+      defn newline-if-not-logged () :
+        if logger(testing-state()) is False :
+          print(out, "\n")
+          
+      ;Save the output log
+      defn save-output-log () :
+        val logger = logger(testing-state())
+        match(logger:Logger) :
+          if anything-logged?(logger) :
+            val path = save-log(logger, name(t))
+            println(out2, "Log saved to %_" % [path])
+
+      ;Redirect output if a logger is present
+      defn with-logger? (body:() -> ?, l:Logger|False) :
+        match(l:Logger) : with-output-to-buffer(body, l)
+        else : body()
+
+      ;Executed upon assertion failure
+      defn handle-assertion (a:Assertion, vs:AssertionValues) :
+        println(out, "[FAIL]")
+        println-assertion-failure(out2, a, vs)
+        if halt-on-failure?(a) :
+          save-output-log()
+          println(out, "")
+          save-test-record(false)
+        else :
+          encountered-error? = true          
+
+      ;Execute body with exceptions logged.
+      defn with-logged-exceptions (body:() -> ?) :
+        label break :
+          defn log-exception (e:Exception) -> Void :
+            println(out, "[FAIL]")
+            println(out2, "Uncaught Exception: %_" % [e])
+            print-stack-trace(out2)
+            save-output-log()
+            println(out, "")
+            save-test-record(false)
+            encountered-error? = true
+            break()
+          with-exception-interceptor(body, log-exception) 
+
+      ;Executed upon fatal error
+      defn handle-error (error-msg:String) :
+        println(out, "[FAIL]")
+        println(out2, "Fatal Error: %_" % [error-msg])
+        print-stack-trace(out2)
+        save-output-log()
+        println(out, "")
+        save-test-record(false)
+
+      ;Executed when test runs to completion
+      defn handle-test-end () :
+        if not encountered-error? :
+          println(out, "[PASS]")
+        save-output-log()
+        println(out, "")
+        save-test-record(not encountered-error?)
+
+      ;Launch test
+      newline-if-not-logged()
+      within execute-with-error-handler(handle-error) :
+        within with-logged-exceptions() :
+          within with-assertion-handler(handle-assertion) :
+            within with-logger?(logger(testing-state())) :
+              start-timers()
+              run(t)
+              handle-test-end()
+
+;============================================================
+;================== Assertion Handler =======================
+;============================================================
+
+;The default assertion handler runs when not in a deftest.
+;This happens normally when working by loading in some test code
+;into the REPL, and uncommenting the deftest. 
+defn default-assertion-handler (a:Assertion, vs:AssertionValues) :
+  println(STANDARD-ERROR-STREAM, "[FAIL]")
+  println-assertion-failure(IndentedStream(STANDARD-ERROR-STREAM), a, vs)
+  fatal("Assertion failed outside of deftest.") when halt-on-failure?(a)
+
+var CURRENT-ASSERTION-HANDLER:(Assertion, AssertionValues) -> ? = default-assertion-handler
+
+defn with-assertion-handler (body:() -> ?, handler:(Assertion, AssertionValues) -> ?) :
+  label break :
+    defn assertion-failed (a:Assertion, vs:AssertionValues) :
+      handler(a,vs)
+      break() when halt-on-failure?(a)
+    let-var CURRENT-ASSERTION-HANDLER = assertion-failed :
+      body()
+    
+protected defn assert (a:Assertion) :
+  val vs = AssertionValues(num-subexps(a))
+  if not run(a,vs) :
+    CURRENT-ASSERTION-HANDLER(a,vs)
+
+defn println-assertion-failure (o:OutputStream, a:Assertion, vs:AssertionValues) :
+  val info-str = "" when info(a) is False
+            else "%_: " % [info(a)]
+  val name-str = "" when description(a) is False
+            else " \"%_\"" % [description(a)]
+  val type-str = "Assertion" when halt-on-failure?(a) else "Expectation"
+  println(o, "%_%_%_ failed." % [info-str, type-str, name-str])
+  for (description in subexp-descriptions(a), v in vs) do :
+    if not empty?(v) :
+      println(o, Indented("%_ = %~" % [description, value!(v)]))
+
+;============================================================
+;====================== Logger ==============================
+;============================================================
+
+deftype Logger <: Resource
+defmulti with-output-to-buffer (body:() -> ?, l:Logger) -> False
+defmulti save-log (l:Logger, file:String) -> String
+defmulti anything-logged? (l:Logger) -> True|False
+
+defn Logger (dir-name:String) :
+  ;Track directory name
+  var dir-created?:True|False = false
+  defn create-dir-if-necessary () :
+    if not dir-created? :
+      dir-created? = true
+      create-dir(dir-name)
+
+  ;Keep buffer file
+  var buffer-file-name:String|False = false
+  var buffer-file:RandomAccessFile|False = false
+  defn create-buffer-file-if-necessary () :
+    if buffer-file is False :
+      buffer-file-name = to-string("buffer%_.dat" % [current-time-ms()])
+      buffer-file = RandomAccessFile(buffer-file-name as String, true)
+    buffer-file as RandomAccessFile
+
+  ;Execute body with output to a buffer
+  defn with-output-to-buffer (body:() -> ?) :
+    val buffer = create-buffer-file-if-necessary()
+    set-length(buffer, 0L)
+    val out = output-stream(buffer)
+    with-output-stream(out, fn () :
+      with-error-stream(out, body))
+    flush(out)
+
+  ;Save the buffer
+  defn save-buffer-as (path:String) :
+    ;Get the current name of the buffer
+    val old-path = buffer-file-name as String
+    ;Close the file
+    close(buffer-file as RandomAccessFile)
+    buffer-file = false
+    buffer-file-name = false
+    ;Move the buffer to the given path
+    rename-file(old-path, path)    
+ 
+  ;Delete the buffer if one was created
+  defn delete-buffer-file-if-necessary () :
+    if buffer-file is-not False :
+      delete-file(buffer-file-name as String)
+
+  ;Track file name
+  val file-count = HashTable<String,Int>(0)
+  defn rename (file:String) :
+    val index = update(file-count, {_ + 1}, file)
+    if index == 1 : file
+    else : "%_$%_" % [file, index]
+
+  ;Create Logger
+  new Logger :
+    defmethod free (this) :
+      delete-buffer-file-if-necessary()
+    defmethod with-output-to-buffer (body:() -> ?, this) :
+      with-output-to-buffer(body)
+    defmethod anything-logged? (this) :
+      match(buffer-file:RandomAccessFile) :
+        position(buffer-file) > 0L
+    defmethod save-log (this, file:String) :
+      val filename = rename(sanitize-filename(file))
+      val path = to-string("%_/%_.log" % [dir-name, filename])
+      create-dir-if-necessary()
+      save-buffer-as(path)
+      path
+
+defn attach-filename-suffix (filename:String, suffix) :
+  match(last-index-of-char(filename, '.')) :
+    (i:Int) :
+      string-join([filename[0 to i], suffix, filename[i to false]])
+    (f:False) :
+      string-join([filename, suffix])
+
+defn sanitize-filename (s:String) :
+  defn acceptable? (c:Char) :
+    letter?(c) or digit?(c) or
+    (c == '.') or
+    (c == '_') or
+    (c == '-') or
+    (c == '#') or
+    (c == '$') or
+    (c == '@') or
+    (c == '%')
+
+  if all?(acceptable?, s) :
+    s
+  else :
+    String $ for c in s seq :
+      c when acceptable?(c) else '-'
+
+;============================================================
+;====================== Final Report ========================
+;============================================================
+
+defmethod print (o:OutputStream, r:SkippedTest) :
+  print(o, "[SKIPPED] %_" % [name(r)])
+
+defmethod print (o:OutputStream, r:RanTest) :
+  val pass-str = "PASS" when passed?(r) else "FAIL"
+  print(o, "[%_] %_ (%_)" % [pass-str, name(r), time(r)])
+
+defmethod print (o:OutputStream, t:TestTime) :
+  val unit-str = switch(unit(t)) :
+    Milliseconds : "ms"
+    Microseconds : "us"
+  print(o, "%_ %_" % [value(t), unit-str])
+
+protected defn print-test-report (exit-on-fail?:True|False) :
+  val s = testing-state()
+
+  ;Count statistics
+  val skip-counter = to-seq(0 to false)
+  val pass-counter = to-seq(0 to false)
+  val fail-counter = to-seq(0 to false)
+  for r in records(s) do :
+    match(r) :
+      (r:SkippedTest) : next(skip-counter)
+      (r:RanTest) : next(pass-counter when passed?(r) else fail-counter)
+  ;Print statistics
+  println(STANDARD-OUTPUT-STREAM, "Tests Finished: %_/%_ tests passed. %_ tests skipped. %_ tests failed." % [
+    peek(pass-counter), num-tests(s), peek(skip-counter), peek(fail-counter)])
+
+  ;First print failed tests
+  val failed-tests = for t in records(s) filter :
+    match(t:RanTest) : not passed?(t)
+  if not empty?(failed-tests) :
+    println(STANDARD-OUTPUT-STREAM, "\nFailed Tests:")
+    do(println{STANDARD-OUTPUT-STREAM, _}, failed-tests)
+
+  ;Next print all tests sorted by running time.
+  defn compare-running-time (a:TestRecord, b:TestRecord) -> Int :
+    match(a, b) :
+      (a:SkippedTest, b:SkippedTest) : 0
+      (a:RanTest, b:SkippedTest) : -1
+      (a:SkippedTest, b:RanTest) : 1
+      (a:RanTest, b:RanTest) : compare(time(b), time(a))
+
+  println(STANDARD-OUTPUT-STREAM, "\nLongest Running Tests:")
+  do(println{STANDARD-OUTPUT-STREAM, _}, lazy-qsort(records(s), compare-running-time))
+    
+  ;Release the logger
+  match(logger(s)) :
+    (l:Logger) : free(l)
+    (f:False) : false
+
+  ;Exit with proper exit code when requested
+  if exit-on-fail? and peek(fail-counter) > 0 :
+    exit(-1)
