@@ -79,6 +79,7 @@ public defstruct AsmStubs :
   extern-table:Int
   extern-defn-table:Int
   init-extern-table:Int
+  safepoint-table:Int
   id-counter:Seq<Int>
 
 public defn AsmStubs (backend:Backend) :
@@ -132,6 +133,7 @@ public defn AsmStubs (backend:Backend) :
     next(id-counter)  ;extern-table:Int
     next(id-counter)  ;extern-defn-table:Int
     next(id-counter)  ;init-extern-table:Int
+    next(id-counter)  ;safepoint-table:Int
     id-counter)
 
 public defn unique-id (s:AsmStubs) :
@@ -221,7 +223,30 @@ public defn compile-runtime-stubs (emitter:CodeEmitter, stubs:AsmStubs) :
   comment("stackmap-table = %_" % [stackmap-table(stubs)])
   comment("extern-table = %_" % [extern-table(stubs)])
   comment("init-extern-table = %_" % [init-extern-table(stubs)])
+  comment("safepoint-table = %_" % [safepoint-table(stubs)])
   compile-entry-function(emitter, stubs)
+  compile-restore-context-trampoline(emitter, stubs)
+
+;============================================================
+;================== Entry Function ==========================
+;============================================================
+;Globally exposed definitions:
+;- stanza_saved_c_rsp: Holds the value of RSP when execution
+;  first transfers to Stanza. To make C calls, Stanza sets RSP back
+;  to this saved value so that C code executes on the C stack.
+;  Exposed publicly so that signal handler can redirect C calls
+;  to occur on a separate signal handling stack.
+;- stanza_stack_pointer: Holds the value of the Stanza RSP right
+;  before transfering execution to C code. When C code transfers
+;  execution back, the Stanza stack is restored by restoring RSP
+;  from this saved value. Exposed publicly so that signal handler can
+;  redirect execution of the Stanza signal handling closure to
+;  occur on the Stanza stack.
+;- stanza_vmstate: Holds the compiled VMState structure.
+;  Exposed publicly so that signal handler can direct execution
+;  to the registered signal handler closure.
+;- stanza_entry: The address of the stanza_entry function.
+;  Exposed publicly so that it can be called by the C driver.
 
 public defn compile-entry-function (emitter:CodeEmitter, stubs:AsmStubs) :
   val backend = backend(stubs)
@@ -241,6 +266,7 @@ public defn compile-entry-function (emitter:CodeEmitter, stubs:AsmStubs) :
     E $ Label(n)
     E $ DefLong(0L)
   E $ DefData()
+  E $ ExLabel(`stanza_saved_c_rsp)
   make-long-storage(saved-c-rsp(stubs))
   do(make-long-storage, saved-regs(stubs))
   do(make-long-storage, saved-fregs(stubs))
@@ -250,11 +276,13 @@ public defn compile-entry-function (emitter:CodeEmitter, stubs:AsmStubs) :
   E $ DefData()
   make-long-storage(swap-lbl(stubs))
   make-long-storage(stack-limit(stubs))
+  E $ ExLabel(`stanza_stack_pointer)
   make-long-storage(stack-pointer(stubs))
   E $ DefText()
 
   ;Emit labels for holding the VM state
   let :
+    defn #false () : E $ DefLong(2L)
     defn #long () : E $ DefLong(0L)
     defn #int () : E $ DefInt(0)
     defn #L (f:AsmStubs -> Int) : E $ Label(f(stubs))
@@ -262,8 +290,10 @@ public defn compile-entry-function (emitter:CodeEmitter, stubs:AsmStubs) :
     defn #space (sz:Int) : E $ DefSpace(sz)
 
     E $ DefData()
+    E $ ExLabel(`stanza_vmstate)
     #L(vmstate)                #long()                        ;global-offsets: ptr<long>
                                #label(globals)                ;global-mem: ptr<byte>
+                               #false()                       ;sig-handler: ref<?>
                                #label(const-table)            ;const-table: ptr<long>
                                #label(const-mem)              ;const-mem: ptr<byte>
                                #long()                        ;data-offsets: ptr<int>
@@ -293,6 +323,7 @@ public defn compile-entry-function (emitter:CodeEmitter, stubs:AsmStubs) :
                                #long()                        ;heap.max-incomplete: ptr<?>
                                #long()                        ;heap.iterate-roots:ptr<((ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>, ptr<Heap>) -> ref<False>)>
                                #long()                        ;heap.iterate-references-in-stack-frames:ptr<((ptr<Stack>, ptr<((ptr<long>, ptr<Heap>) -> ref<False>)>, ptr<Heap>) -> ref<False>)>
+                               #label(safepoint-table)        ;safepoint-table:ptr<?>
                                #label(class-table)            ;class-table:ptr<?>
                                #label(global-root-table)      ;global-root-table:ptr<GlobalRoots>
                                #label(stackmap-table)         ;stackmap-table:ptr<?>
@@ -370,3 +401,81 @@ public defn compile-entry-function (emitter:CodeEmitter, stubs:AsmStubs) :
 
   ;Return
   E $ Return()
+
+;============================================================
+;============== Debugger Context Trampoline =================
+;============================================================
+;Globally exposed definitions:
+;- stanza_sighandler_context: Holds the saved execution
+;  context at the point when the interrupt is triggered.
+;  Execution will be resumed by restoring all registers
+;  from this saved context.
+;
+;  lostanza deftype Context :
+;    rip: long
+;    rsp: long
+;    crsp: long
+;    regs: long[num-regs in backend]
+;    fregs: long[num-fregs in backend]
+;
+;- stanza_sighandler_trampoline: Restores execution of the
+;  program from the saved sighandler context.
+;  The signal handler needs to set this as the return address
+;  of calling the Stanza signal handling closure.
+
+defn compile-restore-context-trampoline (emitter:CodeEmitter, stubs:AsmStubs) :
+  ;Pull out useful definitions
+  val backend = backend(stubs)
+  defn E (i:Ins) : emit(emitter, i)
+
+  ;Label for context.
+  val context-lbl = unique-id(stubs)
+
+  ;Declare space for saved context.
+  E $ DefData()
+  E $ ExLabel(`stanza_sighandler_context)
+  E $ Label(context-lbl)
+  E $ DefLong(0L) ;RIP
+  E $ DefLong(0L) ;RSP
+  E $ DefLong(0L) ;CRSP
+  for i in 0 to num-regs(backend) do :
+    E $ DefLong(0L)
+  for i in 0 to num-fregs(backend) do :
+    E $ DefLong(0L)
+  E $ DefText()
+
+  ;Offsets
+  val rsp-offset = 8
+  val crsp-offset = 16
+  val reg-offset = 24
+  val freg-offset = reg-offset + 8 * num-regs(backend)
+
+  ;Trampoline for restoring context.
+  E $ ExLabel(`stanza_sighandler_trampoline)
+
+  ;Store RSP back
+  ;Note: Because this code is inside a trampoline, it runs after the 'ret'
+  ;instruction has already executed, and therefore RSP is 8 higher than
+  ;what it should be.
+  E $ SubL(R0, RSP, INT(8))
+  E $ StoreL(M(stack-pointer(stubs)), R0)
+
+  ;Restore CRSP
+  E $ LoadL(R0, Mem(context-lbl, crsp-offset))
+  E $ StoreL(M(saved-c-rsp(stubs)), R0)
+
+  ;Restore registers
+  for i in 0 to num-regs(backend) do :
+    val offset = reg-offset + 8 * i
+    E $ LoadL(Reg(i), Mem(context-lbl, offset))
+    
+  ;Restore float registers
+  for i in 0 to num-fregs(backend) do :
+    val offset = freg-offset + 8 * i
+    E $ LoadD(FReg(i), Mem(context-lbl, offset))
+
+  ;Restore RSP register
+  E $ LoadL(RSP, Mem(context-lbl, rsp-offset))
+
+  ;Restore RIP register
+  E $ LoadGoto(Mem(context-lbl, 0)) 

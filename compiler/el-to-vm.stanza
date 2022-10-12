@@ -4,7 +4,7 @@ defpackage stz/el-to-vm :
   import stz/el-ir
   import stz/el-utils
   import stz/el
-  import stz/dl-ir  
+  import stz/dl-ir
   import stz/vm-ir
   import stz/typeset
   import stz/vm-analyze
@@ -13,6 +13,7 @@ defpackage stz/el-to-vm :
   import stz/algorithms
   import stz/ehier
   import core/stack-trace
+  import stz/safepoint-table-creator
 
 ;============================================================
 ;======================== Driver ============================
@@ -32,10 +33,10 @@ public defn compile (epackage:EPackage) -> VMPackage :
   compile-debug-info(progbuffer, io)
   val init = within time-ms!("Compile to VM") :
     for e in exps(epackage) do :
-      match(e) :    
+      match(e) :
         (e:EDefn) : compile(e, global-table, iotable, ehier, progbuffer)
         (e:EDefClosure) : compile(e, dtable, global-table, iotable, ehier, progbuffer)
-        (e:EDefGlobal) : compile(e, global-table, progbuffer)
+        (e:EDefGlobal) : compile(e, global-table, iotable, progbuffer)
         (e:EDefStruct) : compile(e, global-table, iotable, progbuffer)
         (e:EInit) : compile(init-compiler, e)
         (e:EExtern) : compile(e, progbuffer)
@@ -49,9 +50,9 @@ public defn compile (epackage:EPackage) -> VMPackage :
     init
 
   val vmp = to-vmpackage(progbuffer, io, init)
-  ;dump(vmp, "logs", "pre-analyze")  
+  ;dump(vmp, "logs", "pre-analyze")
   val vmp* = within time-ms!("VM Analyze") : analyze(vmp)
-  ;dump(vmp*, "logs", false)
+  dump(vmp*, "logs", false)
   vmp*
 
 ;============================================================
@@ -97,7 +98,7 @@ defn analyze-dependencies (ep:EPackage, gt:GlobalTable) :
   ;Returns all dependencies in ELItem
   defn scan (e:ELItem, initial-set:Seqable<Int>) :
     val dependencies = to-intset(initial-set)
-    let loop (e:ELItem = e) :    
+    let loop (e:ELItem = e) :
       do(loop, e)
       match(e) :
         ;Types
@@ -122,9 +123,9 @@ defn analyze-dependencies (ep:EPackage, gt:GlobalTable) :
         ;Remaining
         (e) : false
     to-tuple(dependencies)
-    
+
   defn scan (e:ELItem) :
-    scan(e, IntSet())    
+    scan(e, IntSet())
 
   ;Compute dependency graph
   val dtable = IntTable<Tuple<Int>>([])
@@ -146,7 +147,7 @@ defn analyze-dependencies (ep:EPackage, gt:GlobalTable) :
         (e:EExternFn) :
           dtable[n(e)] = scan(e)
         (e:EExtern) :
-          dtable[n(e)] = scan(e)      
+          dtable[n(e)] = scan(e)
         (e:EInit) :
           false
         (e:EDefType) :
@@ -158,9 +159,9 @@ defn analyze-dependencies (ep:EPackage, gt:GlobalTable) :
 
   ;Compute function and object dependencies
   val reload-set = to-intset(seq(n, exports(packageio(ep))))
-  
+
   val dclosure = within time-ms!("Compute Bipartite Closure") :
-    bipartite-closure $ 
+    bipartite-closure $
       for entry in dtable seq? :
         if reload-set[key(entry)] : None()
         else : One(key(entry) => value(entry))
@@ -183,12 +184,23 @@ defn compile (e:EDefClosure, dtable:IntTable<Tuple<Int>>,
   val f = compile-efunction(true, n(e), closure(e), func(e), global-table, iotable, ehier, progbuffer)
   add(progbuffer, sub-dependencies(f, dtable[n(e)]))
 
-defn compile (e:EDefGlobal, global-table:GlobalTable, progbuffer:ProgBuffer) :
+defn compile (e:EDefGlobal, global-table:GlobalTable, iotable:IOTable, progbuffer:ProgBuffer) :
+  ;Compile the VMGlobal definition.
   val size = size(global-table, type(e))
   val offsets = offsets(global-table, type(e))
   val vmtypes = vmtypes(global-table, type(e))
   val roots = roots(global-table, type(e))
   add(progbuffer, VMGlobal(n(e), size, roots))
+
+  ;Compile the VMDebugName entry.
+  ;Retrieve the name of the imported/exported definitions.
+  defn name? (n:Int) -> String|False :
+    if key?(iotable,n) :
+      val rec = iotable[n]
+      to-string(name(id(rec)))
+  match(name?(n(e))) :
+    (str:String) : add(progbuffer, VMDebugName(n(e), str))
+    (f:False) : false
 
 defn parent-ids (t:EType|False) :
   val ids = Vector<Int>()
@@ -206,7 +218,7 @@ defn compile (e:EDefStruct, global-table:GlobalTable, iotable:IOTable, progbuffe
   val base-roots = roots(global-table, n(e))
   val class = match(items(e)) :
     ;Object class
-    (items:False) :            
+    (items:False) :
       VMLeafClass(n(e), class-name, [n(e)], parents, base-size, base-roots)
     ;Array class
     (items:EDefField) :
@@ -218,9 +230,9 @@ defn compile (e:EDefStruct, global-table:GlobalTable, iotable:IOTable, progbuffe
 defn compile (compiler:Compiler, e:EInit) :
   val body = body(e)
   for l in localtypes(body) do :
-    make-tvar-local(compiler, n(l))
+    make-tvar-local(compiler, n(l), false)
   for l in locals(body) do :
-    make-locals(compiler, n(l), type(l))
+    make-locals(compiler, n(l), type(l), false)
   compile(compiler, ins(body))
   clear-locals(compiler)
 
@@ -228,7 +240,13 @@ defn compile-init (compiler:Compiler, iotable:IOTable, progbuffer:ProgBuffer) ->
   if not empty?(compiler) :
     val id = uniqueid()
     emit(compiler, ReturnIns([false-obj(iotable)]))
-    add(progbuffer, VMDefn(id, VMFunc([], defs(compiler), ins(compiler))))
+
+    ;Debugname table is empty for now because inits don't have any arguments,
+    ;and we haven't yet added the locals yet.
+    val func = VMFunc([], defs(compiler), ins(compiler), VMDebugNameTable([]))
+
+    ;Add to program buffer, and return its id.
+    add(progbuffer, VMDefn(id, func))
     id
 
 defn compile (e:EDefObject, dtable:IntTable<Tuple<Int>>, global-table:GlobalTable, iotable:IOTable, progbuffer:ProgBuffer) :
@@ -245,14 +263,14 @@ defn compile (e:EDefType, progbuffer:ProgBuffer) :
 
 defn compile (e:EExtern, progbuffer:ProgBuffer) :
   add(progbuffer, VMExtern(n(e), lbl(e)))
-  
+
 defn compile (e:EDefTypeObject, global-table:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
   defn call-util (compiler:Compiler, x:Local, fid:RecId, args:Tuple<VMImm>) :
     val arity = NumConst(length(args))
     val ys = to-tuple $ cat([false-obj(iotable), arity], args)
     val code = CodeId(n(iotable,fid))
     emit(compiler, CallIns([x], code, ys, false))
-    
+
   ;Compile function for testing its argument
   defn test-function () :
     ;Create compiler
@@ -260,20 +278,22 @@ defn compile (e:EDefTypeObject, global-table:GlobalTable, iotable:IOTable, ehier
 
     ;Argument 0: type object
     ;Argument 1: arity
-    ;Argument 2: argument to check  
+    ;Argument 2: argument to check
     val tobj = make-local(compiler, VMRef())
     val arg = make-local(compiler, VMRef())
     ;Make locals for free type variables
     val tvars = for i in 0 to nargs(e) map :
-      val tvar = make-tvar-local(compiler, i)
+      val tvar = make-tvar-local(compiler, i, false)
       val offset = 8 + 8 + 8 * i
       emit(compiler, LoadIns(tvar, tobj, offset, n(iotable,CORE-TYPE-ID)))
       tvar
     ;Function to check whether argument is a type of type
     return-typeof(compiler, arg, type(e))
 
-    ;Compile to function
-    VMFunc([tobj, VMLong(), arg], defs(compiler), ins(compiler))
+    ;Compile to function.
+    ;  Debugname table is empty for autogenerated function that debugger won't
+    ;  step inside of.
+    VMFunc([tobj, VMLong(), arg], defs(compiler), ins(compiler), VMDebugNameTable([]))
 
   ;Compile function for returning itself as a printable tuple
   defn print-function () :
@@ -285,7 +305,7 @@ defn compile (e:EDefTypeObject, global-table:GlobalTable, iotable:IOTable, ehier
     val tobj = make-local(compiler, VMRef())
     ;Make locals for free type variables
     val tvars = for i in 0 to nargs(e) map :
-      val tvar = make-tvar-local(compiler, i)
+      val tvar = make-tvar-local(compiler, i, false)
       val offset = 8 + 8 + 8 * i
       emit(compiler, LoadIns(tvar, tobj, offset, n(iotable,CORE-TYPE-ID)))
       tvar
@@ -302,7 +322,7 @@ defn compile (e:EDefTypeObject, global-table:GlobalTable, iotable:IOTable, ehier
           val chars = uniqueid()
           add(progbuffer, VMData(chars, string-bytes(part)))
           ;Create a Stanza String
-          val s = make-local(compiler, VMRef())          
+          val s = make-local(compiler, VMRef())
           call-util(compiler, s, CORE-MAKE-STRING-ID, [DataId(chars)])
           ;Store string into tuple
           s
@@ -313,40 +333,44 @@ defn compile (e:EDefTypeObject, global-table:GlobalTable, iotable:IOTable, ehier
     ;Return created tuple
     emit(compiler, ReturnIns([tuple]))
 
-    ;Compile to function
-    VMFunc([VMLong(), VMLong(), tobj], defs(compiler), ins(compiler))
+    ;Compile to function.
+    ;  Debugname table is empty for autogenerated function that debugger won't
+    ;  step inside of.
+    VMFunc([VMLong(), VMLong(), tobj], defs(compiler), ins(compiler), VMDebugNameTable([]))
 
   ;Add to top level
   val type-func = VMMultifn(1, [1 => print-function()], test-function())
-  add(progbuffer, VMDefn(n(e), type-func))  
+  add(progbuffer, VMDefn(n(e), type-func))
 
 defn compile (e:EDefmulti, global-table:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
   val compiler = Compiler(global-table, iotable, ehier, progbuffer)
 
   ;Generate instructions
-  val targs = for v in targs(e) map : make-tvar-local(compiler, v)
-  val args = for t in a1(e) map : make-local(compiler, VMRef())
-  val arity = NumConst(length(a1(e)))
+  val targs = for v in targs(e) map :
+    make-tvar-local(compiler, n(v), debug-name(v))
+  val args = for a in args(e) map :
+    make-local(compiler, n(a), VMRef(), debug-name(a))
+  val arity = NumConst(length(/args(e)))
   val ys = to-tuple(cat([false-obj(iotable), arity], targs))
   method-dispatch(compiler, n(e), ys, args, info(e))
 
   ;Compile to function
   val all-args = to-tuple $ cat-all $ [[VMLong(), VMLong()], targs, args]
-  val func = VMFunc(all-args, defs(compiler), ins(compiler))
+  val func = VMFunc(all-args, defs(compiler), ins(compiler), debug-name-table(compiler))
 
   ;Add to top level
   add(progbuffer, VMDefn(n(e), func))
 
 defn compile (e:EDefmethod, global-table:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
   add(progbuffer, compile-efunction(true, n(e), false, func(e), global-table, iotable, ehier, progbuffer))
-  val types = map(to-typeset, a1(func(e)))
+  val types = map(to-typeset{type(_)}, args(func(e)))
   val instance-method? = instance-method?(global-table, n(e))
   add(progbuffer, VMMethod(instance-method?, multi(e), types, n(e)))
 
 defn compile (e:EExternFn, global-table:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
   val f = func(e)
   add(progbuffer, compile-efunction(false, n(e), false, f, global-table, iotable, ehier, progbuffer))
-  add(progbuffer, VMExternDefn(lbl(e), n(e), map(to-vm-type,a1(f)), to-vm-type(a2(f))))
+  add(progbuffer, VMExternDefn(lbl(e), n(e), map(to-vm-type{type(_)},args(f)), to-vm-type(ret(f))))
 
 ;- include-closure-and-arity-args? controls whether the calling convention includes
 ;  the closure and the arity as the first arguments. If true, then they are included
@@ -379,23 +403,23 @@ defn compile-efn (include-closure-and-arity-args?:True|False,
 
   ;Make local for closure
   val closure-local =
-    match(closure:Int) : make-local(compiler, closure, VMRef())
+    match(closure:Int) : make-local(compiler, closure, VMRef(), false)
     else : VMLong()
   val arity-local =
     match(closure:Int) : make-local(compiler, VMLong())
     else : VMLong()
-    
+
   ;Make locals for arguments
   val targ-locals = for t in targs(f) map :
-    make-tvar-local(compiler, t)
-  val arg-locals = for (a in args(f), t in a1(f)) map-cat :
-    make-locals(compiler, a, t)
+    make-tvar-local(compiler, n(t), debug-name(t))
+  val arg-locals = for a in args(f) map-cat :
+    make-locals(compiler, n(a), type(a), debug-name(a))
 
   ;Make locals for locals
   for l in localtypes(body(f)) do :
-    make-tvar-local(compiler, n(l))
+    make-tvar-local(compiler, n(l), false)
   for l in locals(body(f)) do :
-    make-locals(compiler, n(l), type(l))
+    make-locals(compiler, n(l), type(l), false)
 
   ;Guard the arity if it's a closure
   match(arity-local:Local) :
@@ -408,14 +432,14 @@ defn compile-efn (include-closure-and-arity-args?:True|False,
     emit(compiler, CallIns([], arity-err, [false-obj(iotable), NumConst(1L), arity-local], info(f) as StackTraceEntry|False))
     emit(compiler, UnreachableIns())
     emit(compiler, LabelIns(pass-lbl))
-    
-  ;Compile instructions  
+
+  ;Compile instructions
   compile(compiler, ins(body(f)))
-      
+
   ;Return the compiled function
   val closure-args = [closure-local, arity-local] when include-closure-and-arity-args? else []
   val args = to-tuple $ cat-all $ [closure-args, targ-locals, arg-locals]
-  VMFunc(args, defs(compiler), ins(compiler))
+  VMFunc(args, defs(compiler), ins(compiler), debug-name-table(compiler))
 
 defn wrong-arity-fn (iotable:IOTable, info:TraceInfo) :
   val arity-err = CodeId(n(iotable,CORE-ARITY-ERROR-ID))
@@ -425,7 +449,7 @@ defn wrong-arity-fn (iotable:IOTable, info:TraceInfo) :
   val ins = [
     CallIns([], arity-err, [false-obj(iotable), num-args, arity], info as StackTraceEntry|False)
     UnreachableIns()]
-  VMFunc([VMLong(), arity], [arity-def], ins)
+  VMFunc([VMLong(), arity], [arity-def], ins, VMDebugNameTable([]))
 
 ;============================================================
 ;================= Human-Readable Names =====================
@@ -497,6 +521,8 @@ defmulti add (b:ProgBuffer, e:VMExtern) -> False
 defmulti add (b:ProgBuffer, e:VMExternDefn) -> False
 defmulti add (b:ProgBuffer, e:VMMethod) -> False
 defmulti add (b:ProgBuffer, e:VMDebugInfo) -> False
+defmulti add (b:ProgBuffer, e:SafepointEntry) -> SafepointIns
+defmulti add (b:ProgBuffer, e:VMDebugName) -> False
 defmulti to-vmpackage (b:ProgBuffer, io:PackageIO, init:Int|False) -> VMPackage
 
 defn ProgBuffer () :
@@ -509,6 +535,8 @@ defn ProgBuffer () :
   val extern-defns = Vector<VMExternDefn>()
   val methods = Vector<VMMethod>()
   val debug = Vector<VMDebugInfo>()
+  val debugnames = Vector<VMDebugName>()
+  val sptable = VMSafepointTableCreator(uniqueid)
   new ProgBuffer :
     defmethod add (this, e:VMGlobal) : add(globals, e)
     defmethod add (this, e:VMData) : add(datas, e)
@@ -519,7 +547,9 @@ defn ProgBuffer () :
     defmethod add (this, e:VMExternDefn) : add(extern-defns, e)
     defmethod add (this, e:VMMethod) : add(methods, e)
     defmethod add (this, e:VMDebugInfo) : add(debug, e)
-    defmethod to-vmpackage (this, io:PackageIO, init:Int|False) :      
+    defmethod add (this, e:SafepointEntry) : add(sptable, e)
+    defmethod add (this, e:VMDebugName) : add(debugnames, e)
+    defmethod to-vmpackage (this, io:PackageIO, init:Int|False) :
       VMPackage(io, init,
                 to-tuple(globals),
                 to-tuple(datas),
@@ -529,71 +559,168 @@ defn ProgBuffer () :
                 to-tuple(methods),
                 to-tuple(externs),
                 to-tuple(extern-defns),
-                VMDebugInfoTable(to-tuple(debug)))
-       
+                VMDebugNameTable(to-tuple(debugnames)),
+                VMDebugInfoTable(to-tuple(debug)),
+                compile(sptable))
+
 ;============================================================
 ;================= Instruction Compiler =====================
 ;============================================================
 
+;------------------------------------------------------------
+;---------------------- API----------------------------------
+;------------------------------------------------------------
+
+;Utility for compiling instructions from EL to VM instructions.
 deftype Compiler
+
+;Create a temporary with the given type.
 defmulti make-local (c:Compiler, t:VMType) -> Local
-defmulti make-local (c:Compiler, x:Int, t:VMType) -> Local
-defmulti make-locals (c:Compiler, x:Int, t:EType) -> Tuple<Local>
+
+;Create a local with the given type and id. Type must
+;be a single-word value.
+defmulti make-local (c:Compiler, x:Int, t:VMType, debug-name:String|False) -> Local
+
+;Create locals representing the given type.
+defmulti make-locals (c:Compiler, x:Int, t:EType, debug-name:String|False) -> Tuple<Local>
+
+;Create a fresh type variable local.
+defmulti make-tvar-local (c:Compiler, x:Int, debug-name:String|False) -> Local
+
+;Create a fresh label.
 defmulti make-label (c:Compiler) -> Int
-defmulti make-tvar-local (c:Compiler, x:Int) -> Local
+
+;Clear the locals tables such that we cannot lookup
+;the local given the variable id. Used during compilation
+;of EInit: All the inits are compiled together into a single
+;function, but one init cannot reference the local in another
+;init.
+;Not strictly necessary, but prevents us from accidentally
+;referencing locals that we shouldn't.
 defmulti clear-locals (c:Compiler) -> False
+
+;Compile the given instructions to VM-IR.
 defmulti compile (c:Compiler, ins:Seqable<EIns>) -> False
-defmulti defs (c:Compiler) -> Tuple<VMDef>
-defmulti ins (c:Compiler) -> Tuple<VMIns>
+
+;Bypass the compile function and directly emit low-level VM-IR.
 defmulti emit (c:Compiler, i:VMIns) -> False
+
+;Generate code: If x is t, then return 1L, otherwise return 0L.
+;Used during compilation of type objects.
 defmulti return-typeof (c:Compiler, x:VMImm, t:EType) -> False
+
+;Generate code: Perform dispatch for given multi using given arguments.
 defmulti method-dispatch (c:Compiler, multi:Int, ys:Tuple<VMImm>, zs:Tuple<VMImm>, info:TraceInfo) -> False
+
+;Return true if no VM instructions has been generated yet.
 defmulti empty? (c:Compiler) -> True|False
 
-defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
-  ;Defs
+;Retrieve all the definitions created using make-local.
+defmulti defs (c:Compiler) -> Tuple<VMDef>
+
+;Retrieve all the compiled and emitted VM instructions.
+defmulti ins (c:Compiler) -> Tuple<VMIns>
+
+;Return the debug name table holding the debugger names
+;of all generated locals.
+defmulti debug-name-table (c:Compiler) -> VMDebugNameTable
+
+;------------------------------------------------------------
+;-------------------- Implementation ------------------------
+;------------------------------------------------------------
+
+defn Compiler (gt:GlobalTable,
+               iotable:IOTable,
+               ehier:EHier,
+               progbuffer:ProgBuffer) :
+
+  ;---------------------------------------------------------
+  ;--------------- VMDef List ------------------------------
+  ;---------------------------------------------------------
+  ;Accumulate all generated locals.
   val defs = Vector<VMDef>()
-  defn makedef (t:VMType) :
+
+  ;Create a local corresponding to the given type.
+  defn makedef (t:VMType) -> Local :
     val n = length(defs)
     add(defs, VMDef(n, t, 0))
     Local(n)
-  defn makedefs (ts:Tuple<VMType>) :
+
+  ;Create multiple locals corresponding to the given types.
+  defn makedefs (ts:Tuple<VMType>) -> Tuple<Local> :
     map(makedef, ts)
 
-  ;Instructions
+  ;---------------------------------------------------------
+  ;--------------- DebugName List --------------------------
+  ;---------------------------------------------------------
+  ;Accumulate the human-readable debugger names for
+  ;locals.
+  ;[TODO] Note that for EL variables that are stored
+  ;in multiple slots, we will need more sophisticated
+  ;handling for the debugger to know where to find its fields.
+  val debug-names = Vector<VMDebugName>()
+
+  ;If a name is given for the local, then record it.
+  defn record-debug-name? (l:Local, name:String|False) :
+    match(name:String) :
+      add(debug-names, VMDebugName(index(l),name))
+
+  ;---------------------------------------------------------
+  ;--------------- Instruction Buffer ----------------------
+  ;---------------------------------------------------------
+  ;Stores all generated VM instructions.
   val insbuffer = Vector<VMIns>()
+
+  ;Add instruction to buffer.
   defn emit (c:VMIns) : add(insbuffer, c)
+
+  ;Add top-level data/const definition to program buffer.
   defn emit (c:VMData|VMConst) : add(progbuffer, c)
 
-  ;Define locals
+  ;---------------------------------------------------------
+  ;-------------------- Locals Table -----------------------
+  ;---------------------------------------------------------
+  ;Given the EL-IR id of a variable, retrieve the generated
+  ;local corresponding to it.
   val locals-table = IntTable<Tuple<Local>>()
   val tlocals-table = IntTable<Local>()
-  defn locals (x:EVarLoc) :
+
+  ;Retrieve the set of Locals for a given variable location.
+  defn locals (x:EVarLoc) -> Tuple<Local> :
     locals-table[n(x)]
-  defn local (x:EVarLoc) :
+
+  ;Retrieve the Local for a given variable location.
+  ;Mandates that the variable corresponds to a single local.
+  defn local (x:EVarLoc) -> Local :
     val xs = locals(x)
     fatal("Incorrect length") when length(xs) != 1
     xs[0]
-  defn local (x:ETVarLoc) :
+
+  ;Retrieve the local for a given type variable.
+  defn local (x:ETVarLoc) -> Local :
     tlocals-table[n(x)]
 
-  ;Return the local for x other false if x is false.
-  defn local? (x:EVarLoc|False) -> Local|False :
-    match(x:EVarLoc) : local(x)
-  defn local! (x:EVarLoc|False) -> Local :
-    match(x:EVarLoc) : local(x)
-    else : fatal("x is not a EVarLoc.")
-    
-  ;Define labels  
+  ;---------------------------------------------------------
+  ;-------------------- Labels Table -----------------------
+  ;---------------------------------------------------------
+  ;Given the EL-IR id of a label, store the corresponding
+  ;VM label.
   val labels-table = IntTable<Int>()
-  val num-labels = to-seq(0 to false)
-  defn make-label () :
-    next(num-labels)
-  defn get-label (n:Int) :
+
+  ;Create a unique label.
+  val label-counter = to-seq(0 to false)
+  defn make-label () -> Int :
+    next(label-counter)
+
+  ;Retrieve the VM label corresponding to the given EL label.
+  defn get-label (n:Int) -> Int :
     if not key?(labels-table, n) :
-      labels-table[n] = next(num-labels)
+      labels-table[n] = make-label()
     labels-table[n]
 
+  ;---------------------------------------------------------
+  ;---------------------------------------------------------
+  ;---------------------------------------------------------
   ;Put a compiled value into a compiled location
   defn put (x:EVarLoc, y:CVal) :
     val xs = locals(x)
@@ -652,7 +779,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
     subtype?(ehier, EOf(n), EOf(unique-n))
 
   ;Compile an immediate to a location
-  defn cval (x:EImm) -> CVal :   
+  defn cval (x:EImm) -> CVal :
     match(x) :
       (x:EVar) :
         match(get?(locals-table, n(x))) :
@@ -675,7 +802,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
           (v:True) :
             CImm([true-obj(iotable)])
           (v:False) :
-            CImm([false-obj(iotable)])            
+            CImm([false-obj(iotable)])
       (x:ELiteral) :
         match(value(x)) :
           (v:Char|Byte|Int|Float) :
@@ -702,7 +829,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
       (x:EConstType) :
         val cid = uniqueid()
         emit(VMConst(cid, VMTypeObject(CodeId(n(x)))))
-        CImm([ConstId(cid)])        
+        CImm([ConstId(cid)])
       (x:ESizeof) :
         val sz = size(gt,type(x))
         CImm([NumConst(to-long(sz))])
@@ -734,7 +861,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
           (l) : standard-field()
         where :
           defn tagged-primitive-field (y:EImm) :
-            TaggedPrimLoc(cval(y), n(x))            
+            TaggedPrimLoc(cval(y), n(x))
           defn standard-field () :
             match(cloc(loc(x))) :
               (l:LocalLoc) : field-of-local(l)
@@ -788,7 +915,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
         emit(LabelIns(pass))
         return-ctypeof(x, b(t))
         emit(LabelIns(fail))
-        emit(ReturnIns([LongConst(0)]))        
+        emit(ReturnIns([LongConst(0)]))
       (t:EOr) :
         val pass = make-label()
         val fail = make-label()
@@ -800,7 +927,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
 
   ;If x typeof t goto pass, otherwise goto fail
   defn ctypeof (pass:Int, fail:Int, x:VMImm, t:EType) :
-    match(t) :    
+    match(t) :
       (t:ETVar) :
         val pred = makedef(VMLong())
         val t* = imm!(t)
@@ -812,7 +939,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
         val next = make-label()
         ctypeof(next, fail, x, a(t))
         emit(LabelIns(next))
-        ctypeof(pass, fail, x, b(t))        
+        ctypeof(pass, fail, x, b(t))
       (t:EOr) :
         val next = make-label()
         ctypeof(pass, next, x, a(t))
@@ -842,7 +969,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
       val tuple = makedef(VMRef())
       ctuple(tuple, zs, info)
       tuple
-    
+
     val default = make-label()
     val amb = make-label()
     emit(MethodDispatchIns(multi, ys, zs, default, amb))
@@ -857,7 +984,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
       (ins:EDef) :
         match(y(ins)) :
           ;Initialize local to tagged primitive
-          (y:ELiteral) :            
+          (y:ELiteral) :
             match(value(y)) :
               (v:Char|Byte|Int|Float) :
                 val x = local(x(ins))
@@ -962,7 +1089,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
         val item-size = item-size(gt,n(ins))
         ;Evaluate arguments
         val ys = map-cat(imms!, ys(ins))
-        val len = ys[0]        
+        val len = ys[0]
         ;Compute size
         val size = makedef(VMLong())
         if item-size == 1 :
@@ -974,13 +1101,13 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
             emit(Op2Ins(size, AddOp(), size, LongConst(base-size)))
           else :
             emit(Op2Ins(size, AddOp(), size, LongConst(base-size + 7)))
-            emit(Op2Ins(size, AndOp(), size, LongConst(-8)))            
+            emit(Op2Ins(size, AndOp(), size, LongConst(-8)))
         ;Allocate array
         val x = local(x(ins))
         emit(AllocIns([x], [n(ins)], [size], info(ins) as StackTraceEntry|False))
         for (y in ys, o in base+item-offsets(gt,n(ins))) do :
           ;No write barrier needed because of array construction.
-          emit(StoreIns(x, o, y, n(ins)))          
+          emit(StoreIns(x, o, y, n(ins)))
       (ins:EStruct) :
         val xs = to-seq(locals(x(ins)))
         for y in ys(ins) do :
@@ -992,7 +1119,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
               val a = address(y)
               for o in offsets(y) do :
                 emit(LoadIns(next(xs), a, o))
-      (ins:EPtr) :        
+      (ins:EPtr) :
         val x = local(x(ins))
         val ptr = cloc(loc(ins)) as PtrLoc
         if base(loc(ins)) is EDeref :
@@ -1011,8 +1138,8 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
             (r1:False, r2:True) :
               emit(Op2Ins(x, AddOp(), imm!(base(ptr)), LongConst(const(ptr))))
             (r1:False, r2:False) :
-              put(/x(ins), base(ptr))       
-      (ins:ELoad) :     
+              put(/x(ins), base(ptr))
+      (ins:ELoad) :
         match(cloc(loc(ins))) :
           (l:TaggedPrimLoc) :
             val x = local(x(ins))
@@ -1039,7 +1166,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
             (l:EDeref) : true
             (l:EDeptr) : false
             (l:EField) : heap-object-location?(loc(l))
-            (l:ESlot) : heap-object-location?(loc(l))      
+            (l:ESlot) : heap-object-location?(loc(l))
 
         match(cloc(loc(ins)), cval(y(ins))) :
           (l:LocalLoc, y:CImm) :
@@ -1067,7 +1194,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
                 ;[TODO] If storing objects that fit in a single word, then no write barrier needed.
                 val class = class(loc(ins))
                 if heap-object-location?(loc(ins)) :
-                  ;Storing into a heap object location.                  
+                  ;Storing into a heap object location.
                   emit(StoreWithBarrierIns(base, base-offset, const(l), imm!(y), class as Int))
                 else :
                   ;Storing into a non-heap object location.
@@ -1091,7 +1218,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
             call-pointer(xs, f, ys(ins), tail?)
           (f:ECurry, ct:CallStanza) :
             if function?(gt, n(x(f))) : call-code(n(x(f)), xs, targs(f), ys(ins), tail?)
-            else : call-closure(xs, x(f), targs(f), ys(ins), tail?)            
+            else : call-closure(xs, x(f), targs(f), ys(ins), tail?)
           (f:EVar, ct:CallStanza) :
             if function?(gt, n(f)) : call-code(n(f), xs, [], ys(ins), tail?)
             else : call-closure(xs, f, [], ys(ins), tail?)
@@ -1102,7 +1229,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
             else : call-c-pointer(xs, f, ys(ins))
           (f, ct:CallC) :
             call-c-pointer(xs, f, ys(ins))
-        where :              
+        where :
           ;Call a known function with the Stanza calling convention
           defn call-code (n:Int, xs:Tuple<Local>, targs:Tuple<EType>, args:Tuple<EImm>, tail?:True|False) :
             val args* = cat-all $ [
@@ -1120,7 +1247,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
               seq-cat(imms!, args)]
             if tail? : emit(TCallIns(f*, to-tuple(args*)))
             else : emit(CallIns(xs, f*, to-tuple(args*), info?))
-            
+
           ;Call a stanza closure
           defn call-closure (xs:Tuple<Local>, f:EImm, targs:Tuple<EType>, args:Tuple<EImm>, tail?:True|False) :
             val f* = imm!(f)
@@ -1143,33 +1270,33 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
         emit(DumpIns(ys*))
       (ins:EInterpret) :
         emit(Op1Ins(local(x(ins)), InterpretOp(), imm!(y(ins))))
-      (ins:EConv) :        
+      (ins:EConv) :
         emit(Op1Ins(local(x(ins)), ConvOp(), imm!(y(ins))))
       (ins:EGoto) :
         emit(GotoIns(get-label(n(ins))))
       (ins:EPrim) :
         match(op(ins)) :
           (op:YieldOp) :
-            val x = local!(x(ins))
+            val x = local(x(ins) as EVarLoc)
             val stk = imm!(ys(ins)[0])
             val y = imm!(ys(ins)[1])
             emit(YieldIns(false, [x], stk, [y], info(ins) as StackTraceEntry|False))
           (op:EnterStackOp) :
-            val x = local!(x(ins))
+            val x = local(x(ins) as EVarLoc)
             val args = to-tuple(seq-cat(imms!, ys(ins)))
             val stk = args[0]
             val arity = length(ys(ins))
             val all-args = to-tuple(cat([false-obj(iotable), NumConst(arity)], args))
             emit(YieldIns(true, [x], stk, all-args, info(ins) as StackTraceEntry|False))
           (op:BasicOp) :
-            val x = local?(x(ins))
+            val x = local(x(ins) as EVarLoc) when x(ins) is EVarLoc
             defn y0 () : imm!(ys(ins)[0])
             defn y1 () : imm!(ys(ins)[1])
             emit $ switch(arity(op)) :
               0 : Op0Ins(x, op)
               1 : Op1Ins(x, op, y0())
               2 : Op2Ins(x, op, y0(), y1())
-      (ins:EIf) :        
+      (ins:EIf) :
         val pass-lbl = get-label(n1(ins))
         val fail-lbl = get-label(n2(ins))
         defn y0 () : imm!(ys(ins)[0])
@@ -1243,7 +1370,7 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
         emit(AllocIns([x], [n(iotable,CORE-BOX-ID)], [NumConst(8)], false))
         ;No write barrier needed for construction of box.
         emit(StoreIns(x, 0, v, n(iotable,CORE-BOX-ID)))
-      (ins:EBoxGet) :        
+      (ins:EBoxGet) :
         val x = local(x(ins))
         emit(LoadIns(x, imm!(y(ins)), 0, n(iotable,CORE-BOX-ID)))
       (ins:EBoxSet) :
@@ -1306,52 +1433,77 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
       (ins:ELive) :
         val xs* = seq-cat(imms!, xs(ins))
         emit(LiveIns(to-tuple(xs*)))
+      (ins:ESafepoint) :
+        defn* scan (info:TraceInfo) :
+          match(info) :
+            (entry:StackTraceEntry) : scan(/info(entry))
+            (info:FileInfo) : make-safepoint(info)
+            (f:False) : false
+        defn* make-safepoint (info:FileInfo) :
+          match(resolve-path(filename(info))) :
+            (filepath:String) :
+              val entry = SafepointEntry(filepath, line(info), column(info), group-id(ins))
+              val ins = add(progbuffer, entry)
+              emit(ins)
+            (_:False) : false
+        scan(info(ins))
 
-  ;Return compiler
+  ;---------------------------------------------------------
+  ;--------------- Create the Compiler Type ----------------
+  ;---------------------------------------------------------
   new Compiler :
-    ;Emit instruction
     defmethod emit (this, i:VMIns) :
       emit(i)
-      
-    ;Create locals
+
     defmethod make-local (this, t:VMType) :
       makedef(t)
-    defmethod make-local (this, x:Int, t:VMType) :
+
+    defmethod make-local (this, x:Int, t:VMType, debug-name:String|False) :
       val l = makedef(t)
       locals-table[x] = [l]
-      l
-    defmethod make-locals (this, x:Int, t:EType) :
-      val ls = makedefs(vmtypes(gt,t))
-      locals-table[x] = ls
-      ls
-    defmethod make-tvar-local (this, x:Int) :
-      val l = makedef(VMRef())
-      tlocals-table[x] = l
+      record-debug-name?(l, debug-name)
       l
 
-    ;Create labels
+    defmethod make-locals (this, x:Int, t:EType, debug-name:String|False) :
+      val ls = makedefs(vmtypes(gt,t))
+      locals-table[x] = ls
+      record-debug-name?(ls[0], debug-name)
+      ls
+
+    defmethod make-tvar-local (this, x:Int, debug-name:String|False) :
+      val l = makedef(VMRef())
+      tlocals-table[x] = l
+      record-debug-name?(l, debug-name)
+      l
+
     defmethod make-label (this) :
       make-label()
-      
-    ;Clear locals
+
     defmethod clear-locals (this) :
       clear(locals-table)
       clear(tlocals-table)
       clear(labels-table)
-      
-    ;Compile instructions
+
     defmethod compile (this, ins:Seqable<EIns>) :
       do(compile, ins)
+
     defmethod return-typeof (this, x:VMImm, t:EType) :
       return-ctypeof(x,t)
-    defmethod method-dispatch (this, multi:Int, ys:Tuple<VMImm>, zs:Tuple<VMImm>, trace-entry:False|StackTraceEntry) :
+
+    defmethod method-dispatch (this,
+                               multi:Int, ys:Tuple<VMImm>, zs:Tuple<VMImm>,
+                               trace-entry:False|StackTraceEntry) :
       method-dispatch(multi, ys, zs, trace-entry)
 
-    ;Retrieve results
     defmethod defs (this) : to-tuple(defs)
+
     defmethod ins (this) : to-tuple(insbuffer)
+
     defmethod empty? (this) : empty?(insbuffer)
-      
+
+    defmethod debug-name-table (this) :
+      VMDebugNameTable(to-tuple(debug-names))
+
 deftype CVal
 defstruct CImm <: CVal :
   imms: Tuple<VMImm>
@@ -1427,7 +1579,7 @@ defn to-typeset (t:EType) :
 
 defn string-bytes (s:String) :
   val n = length(s)
-  val a = ByteArray(n + 1)  
+  val a = ByteArray(n + 1)
   for (c in s, i in 0 to false) do :
     a[i] = to-byte(c)
   a[n] = 0Y
@@ -1451,7 +1603,7 @@ defn to-int (c:CastErrorContext) :
 
 defn false-obj (iotable:IOTable) :
   Marker(n(iotable,CORE-FALSE-ID))
-  
+
 defn true-obj (iotable:IOTable) :
   Marker(n(iotable,CORE-TRUE-ID))
 
@@ -1539,7 +1691,7 @@ defstruct VarEntry <: GlobalEntry :
   extern?: True|False
 defstruct FnEntry <: GlobalEntry :
   type: FnType
-defstruct StructEntry <: GlobalEntry :  
+defstruct StructEntry <: GlobalEntry :
   base: Tuple<EDefField>
   items: False|EDefField
   offsets: Tuple<Int> with: (default => void)
@@ -1575,7 +1727,7 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
   val instance-methods = IntSet()
 
   ;Create global entries
-  val table = IntTable<GlobalEntry>()  
+  val table = IntTable<GlobalEntry>()
   for import in imports(io) do :
     match(rec(import)) :
       (r:FnRec|MultiRec|ExternFnRec) :
@@ -1594,7 +1746,7 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
         val base* = map(sfield, base(r))
         val items* = match(items(r)) :
           (items:StructField) : sfield(items)
-          (items:False) : false          
+          (items:False) : false
         table[n(import)] = StructEntry(base*, items*)
       (r) : false
   for e in exps(epackage) do :
@@ -1633,7 +1785,7 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
         do(compute-properties{n(_)}, structs)
         table[sn] = analyze(e)
         add(analyzed, sn)
-      
+
     ;Analyze the given StructEntry
     ;(assumes that all dependencies have been analyzed)
     defn analyze (e:StructEntry) :
@@ -1645,7 +1797,7 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
       val vmtypes-list = Vector<VMType>()
       val field-indices-list = Vector<Int>()
       val field-offsets-list = Vector<Int>()
-      
+
       ;Analyze each base field
       for t in seq(type, base(e)) do :
         ;Retrieve properties of this type
@@ -1666,7 +1818,7 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
         size-accum = size-accum + size
         length-accum = length-accum + len
         alignment-accum = max(alignment-accum, aln)
-        
+
       ;Pad to appropriate alignment to finish
       match(items(e)) :
         (items:EDefField) :
@@ -1674,18 +1826,18 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
           size-accum = (size-accum + aln - 1) & (- aln)
         (items:False) :
           size-accum = (size-accum + alignment-accum - 1) & (- alignment-accum)
-          
+
       ;Return analyzed StructEntry
       StructEntry(base(e), items(e),
                   to-tuple(offsets-list),
                   size-accum,
                   length-accum,
-                  alignment-accum,                  
+                  alignment-accum,
                   to-tuple(vmtypes-list),
                   to-tuple(field-indices-list),
                   to-tuple(field-offsets-list))
 
-    ;Driver    
+    ;Driver
     do(compute-properties, struct-ns) where :
       val structs = filter({value(_) is StructEntry}, table)
       val struct-ns = seq(key, structs)
@@ -1747,7 +1899,7 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
     defmethod size (this, n:Int) :
       size(table[n] as StructEntry)
     defmethod length (this, t:EType) :
-      match(t) :      
+      match(t) :
         (t:EStructT) : length(table[n(t)] as StructEntry)
         (t:EFnT) : fatal("Invalid argument")
         (t:EUnknown) : fatal("Invalid argument")
@@ -1790,13 +1942,13 @@ defn GlobalTable (io:PackageIO, epackage:EPackage) :
       val base-size = size(this, n)
       val item-size = size(this, type(items(e) as EDefField))
       val item-os = offsets(this, type(items(e) as EDefField))
-      val recur-item-os = 
+      val recur-item-os =
         for offset in base-size to false by item-size seq-cat :
           seq({offset + _}, item-os)
       cat(offsets(this,n), recur-item-os)
     defmethod instance-method? (this, n:Int) :
       instance-methods[n]
-      
+
   compute-struct-properties(gt)
   gt
 
@@ -1808,5 +1960,4 @@ defn roots (gt:GlobalTable, n:Int) -> Tuple<Int> :
 
 defn roots (offsets:Seqable<Int>, types:Seqable<VMType>) :
   val root-offsets = for (o in offsets, t in types) filter : t is VMRef
-  to-tuple(seq({_ / 8}, root-offsets))  
-
+  to-tuple(seq({_ / 8}, root-offsets))

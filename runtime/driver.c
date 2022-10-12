@@ -1104,7 +1104,15 @@ static stz_long bitset_size (stz_long heap_size) {
   return ROUND_UP_TO_WHOLE_PAGES(bitset_size_in_longs << LOG_BYTES_IN_LONG);
 }
 
+#ifdef BUILD_DEBUG
+int stanza_main (int argc, char* argv[]) {
+  printf("C: Running program with %d arguments:\n", argc);
+  for (char** p = argv; *p != NULL; p++)
+    printf("  \"%s\"\n", *p);
+
+#else
 STANZA_API_FUNC int main (int argc, char* argv[]) {
+#endif
   input_argc = (stz_int)argc;
   input_argv = (stz_byte **)argv;
   input_argv_needs_free = 0;
