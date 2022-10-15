@@ -21,10 +21,13 @@ defpackage stz/stitcher :
   import stz/set-utils
   import stz/binary-tree
   import stz/c-trampoline
-  import core/stack-trace
   import stz/packed-class-table
   import stz/stitcher-safepoints
   import stz/stitcher-debug
+  import stz/stitcher-global-table
+  import stz/absolute-info
+  import stz/trace-info
+
 
 ;<DOC>=======================================================
 ;===================== Documentation ========================
@@ -188,6 +191,9 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
   val id-indices = HashTable<RecId,Int>()
   val package-ids = HashTable<Symbol,PackageIds>()
 
+  ;Collect global info
+  val global-table = GlobalTable(stubs)
+
   ;Add a new global record
   defn add-global-record (r:Rec) -> Int :
     val global-id = length(global-props)
@@ -258,16 +264,7 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
         set-global-prop(pkgids, id(d), DataProps(unique-id(stubs)))
 
   ;Global table
-  val global-entries = Vector<GlobalTableEntry>()
   defn initialize-global-table () :
-    ;Retrieve the alignment in bytes for the global
-    defn global-alignment (g:VMGlobal) -> Int :
-      if size(g) >= 8 : 8
-      else : size(g)
-
-    ;Track the offset since the beginning of the table.
-    val offset-counter = Counter(0)
-
     ;For each package
     for p in packages do :
       ;Retrieve the ids in the package
@@ -278,37 +275,31 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
         for e in entries(debug-table(p)) seq :
           id(e) => e
 
-      ;Add padding to the global in the package
-      val [padded-globals, _] = pad(global-alignment, size, globals(p), 8)
+      ;Construct the info for the description of the global,
+      ;and recording its offset.
+      val global-info = new GlobalInfo :
+      
+        ;Record the global offset for this global.
+        defmethod save-offset (this, id:Int, offset:Int) :
+          set-global-prop(pkgids, id, GlobalProps(offset))
 
-      ;Add entries for each global.
-      for g in padded-globals do :
-        match(g) :
-          ;If it's a padding.
-          (g:Padding) :
-            ;Increment the offset.
-            next(offset-counter, size(g))
-          ;Otherwise, if it is a global.
-          (g:VMGlobal) :
-            ;Retrieve the offset of the global (and increment the offset counter).
-            val offset = next(offset-counter, size(g))
+        ;Generate a nice description of the global
+        ;to use as a comment in the assembly code.
+        defmethod description (this, id:Int, offset:Int) :
+          val [name, info] = match(get?(debug-info, id)) :
+            (dbg:VMDebugInfo) : [name(dbg), info(dbg)]
+            (f:False) : [false, false]
+          val name-str = match(name) :
+            (name:False) : "Unnamed global"
+            (name:String) : name
+          val info-str = match(info) :
+            (info:AbsoluteFileInfo) : " at %_" % [/info(info)]
+            (info:False) : ""
+          val location-str = " (L%_ + %_)" % [globals(stubs), offset]
+          string-join([name-str, info-str, location-str])
 
-            ;Store the offset in the property table.
-            set-global-prop(pkgids, id(g), GlobalProps(offset))
-
-            ;Add the starting marker for the global
-            val [name, info] = match(get?(debug-info, id(g))) :
-              (dbg:VMDebugInfo) : [name(dbg), info(dbg)]
-              (f:False) : [false, false]
-            add(global-entries, StartOfGlobal(offset, name, info))
-
-            ;Store the roots in the table.
-            for r in roots(g) do :
-              fatal("Unaligned global reference") when offset % 8 != 0
-              add(global-entries, GlobalRoot(offset + r * 8))
-
-      ;End of table
-      add(global-entries, EndOfGlobals(value(offset-counter)))
+      ;Load the globals
+      load-globals(global-table, globals(p), global-info)
 
   ;Constant pool
   val const-pool = ConstantPool()
@@ -432,18 +423,9 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
     stackmap-table[m]
 
   ;Accumulate info table
-  val trace-table = Vector<KeyValue<Int,StackTraceEntry>>()
-  defn add-trace-entry (n:Int, entry:StackTraceEntry) :
-    add(trace-table, n => resolve-filepath(entry))
-  defn resolve-filepath (e:StackTraceEntry) :
-    match(info(e)) :
-      (info:FileInfo) :
-        match(resolve-path(filename(info))) :
-          (s:String) :
-            StackTraceEntry(package(e), signature(e), FileInfo(s, line(info), column(info)))
-          (f:False) : e
-      (f:False) : e
-
+  val trace-table = Vector<KeyValue<Int,StackTraceInfo>>()
+  defn add-trace-entry (n:Int, entry:StackTraceInfo) :
+    add(trace-table, n => entry)
 
   ;Collect safepoints
   val safepoints = Safepoints(packages, stubs)
@@ -753,7 +735,7 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
             val n* = label-table[n(i)]
             E $ Label(n*)
             match(trace-entry(i)) :
-              (entry:StackTraceEntry) : add-trace-entry(n*, entry)
+              (entry:StackTraceInfo) : add-trace-entry(n*, entry)
               (entry:False) : false
           (i:Match) :
             val branches* = map(resolve-branch, branches(i))
@@ -798,60 +780,6 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
         E $ SubL(RSP, RSP, INT(frame-size + 8))
     E $ SetL(R0, INT(0))
     E $ Return()
-
-  ;Emit global table
-  defn emit-global-table (code-emitter:CodeEmitter) :
-    defn E (i:Ins) : emit(code-emitter, i)
-
-    ;Human-readable description of global
-    defn comment-string (r:StartOfGlobal) -> String :
-      val name = match(name(r)) :
-        (name:False) : "Unnamed global"
-        (name:String) : name
-      val info-str = match(info(r)) :
-        (info:FileInfo) : " at %_" % [info]
-        (info:False) : ""
-      val location-str = " (L%_ + %_)" % [globals(stubs), offset(r)]
-      string-join([name, info-str, location-str])
-
-    ;Memory for globals
-    E $ Comment("Globals Table")
-    E $ DefData()
-    E $ Label(globals(stubs))
-
-    ;Emit entries for each global
-    defn DefSpace? (sz:Int) :
-      E(DefSpace(sz)) when sz > 0
-    var current-size:Int = 0
-    for r in global-entries do :
-      match(r) :
-        (r:StartOfGlobal) :
-          DefSpace?(offset(r) - current-size)
-          E $ Comment(comment-string(r))
-          current-size = offset(r)
-        (r:GlobalRoot) :
-          DefSpace?(offset(r) - current-size)
-          E $ DefLong(to-long(-1 << 3 + 2))
-          current-size = offset(r) + 8
-        (r:EndOfGlobals) :
-          DefSpace?(size(r) - current-size)
-
-    ;End of memory for globals
-    E $ DefText()
-    E $ Comment("End of Globals Table")
-
-    ;Memory for global roots
-    val roots = to-tuple $ filter-by<GlobalRoot>(global-entries)
-    E $ Comment("Global Root Table")
-    E $ DefData()
-    E $ Label(global-root-table(stubs))
-    E $ Comment(to-string("%_ roots in total" % [length(roots)]))
-    E $ DefInt(length(roots))
-    E $ Comment("Indices of roots")
-    for r in roots do :
-      E $ DefInt(offset(r) / 8)
-    E $ DefText()
-    E $ Comment("End of Global Root Table")
 
   ;Emit constant table
   defn emit-const-table (code-emitter:CodeEmitter) :
@@ -965,12 +893,14 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
         (s:String) : E $ DefLabel(string-lbls[s])
         (f:False) : E $ DefLong(0L)
       match(info(trace-entry)) :
-        (info:FileInfo) :
+        (info:AbsoluteFileInfo) :
+          E $ DefLabel(string-lbls[base(info)])
           E $ DefLabel(string-lbls[filename(info)])
           E $ DefInt(line(info))
           E $ DefInt(column(info))
         (f:False) :
-          E $ DefLong(0L)
+          E $ DefLong(0L)        
+          E $ DefLong(0L)        
           E $ DefInt(0)
           E $ DefInt(0)
     E $ DefText()
@@ -1060,6 +990,17 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
       for def in defns do :
         E $ DefExportLabel(def)
 
+  ;Return the variable information needed by the debug table.
+  defn debug-var-info () -> VarInfo :
+    new VarInfo :
+      defmethod package-info (this, name:Symbol) :
+        val pkgids = package-ids[name]
+        new PackageVarInfo :
+          defmethod global-offset (this, id:Int) :
+            val gid = global-id(pkgids, id) as Int
+            val props = global-props[gid] as GlobalProps
+            offset(props)
+
   ;Initialize record tables
   initialize-record-tables()
   initialize-simple-props()
@@ -1074,14 +1015,14 @@ public defn Stitcher (packages:Collection<VMPackage>, bindings:Bindings|False, s
       emitter(package, code-emitter)
     defmethod emit-tables (this, code-emitter:CodeEmitter) :
       emit-initialization-function(code-emitter)
-      emit-global-table(code-emitter)
+      emit(global-table, code-emitter)
       emit-const-table(code-emitter)
       emit-data-table(code-emitter)
       emit-class-table(code-emitter)
       emit-stackmap-table(code-emitter)
       emit-info-table(code-emitter)
       emit(safepoints, code-emitter)
-      emit(debug-table, code-emitter)
+      emit(debug-table, code-emitter, debug-var-info())
       emit-extern-table(code-emitter)
       ; On Windows, create an EXPORTS table for `extern defn` symbols
       ; so they can be dynamically imported by other executables
@@ -1568,8 +1509,8 @@ deftype GlobalTableEntry
 defstruct StartOfGlobal <: GlobalTableEntry :
   offset:Int
   name:String|False
-  info:FileInfo|False
-
+  info:AbsoluteFileInfo|False
+  
 ;A global root
 defstruct GlobalRoot <: GlobalTableEntry :
   offset:Int

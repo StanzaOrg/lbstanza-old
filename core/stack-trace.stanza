@@ -1,6 +1,7 @@
 defpackage core/stack-trace :
   import core
   import collections
+  import stz/absolute-info
 
 ;============================================================
 ;================ High Level Representation =================
@@ -9,9 +10,11 @@ defpackage core/stack-trace :
 ;Representation of a StackTrace
 public deftype StackTrace
 
+;Represents a single packed stack trace.
 public lostanza deftype SingleStackTrace <: StackTrace & Unique :
   data:ptr<PackedStackTrace>
 
+;Represents a number of traces appended together.
 public defstruct AppendedStackTrace <: StackTrace :
   traces:Tuple<SingleStackTrace>
 
@@ -19,24 +22,27 @@ public defstruct AppendedStackTrace <: StackTrace :
 public defstruct StackTraceEntry <: Hashable & Equalable :
   package:Symbol
   signature:String|False
-  info:FileInfo|False
+  info:AbsoluteFileInfo|False
+with:
+  hashable => true
+  equalable => true
 
-;------------------------------------------------------------
-;-------------------- Hash and Equality ---------------------
-;------------------------------------------------------------
+;============================================================
+;================== Datastructure Printers ==================
+;============================================================
 
-defmethod hash (e:StackTraceEntry) :
-  hash $ [package(e), signature(e), info(e)]
+defmethod print (o:OutputStream, e:StackTraceEntry) :
+  val sig-str = "" when signature(e) is False else "/%_" % [signature(e)]
+  val info-str = "" when info(e) is False else " at %_" % [/info(info(e) as AbsoluteFileInfo)]
+  print(o, "StackTraceEntry(%_%_%_)" % [package(e), sig-str, info-str])
 
-defmethod equal? (a:StackTraceEntry, b:StackTraceEntry) :
-  package(a) == package(b) and
-  signature(a) == signature(b) and
-  info(a) == info(b)
+;============================================================
+;=================== Stylized Printing ======================
+;============================================================
 
-;------------------------------------------------------------
-;------------------- Printing -------------------------------
-;------------------------------------------------------------
-
+;Print the given trace to the given outputstream.
+;An optional filtering function can be provided to filter out
+;stack entries (e.g. e.g. stack frames from system and core libraries). 
 public defn print-stack-trace (o:OutputStream,
                                trace:StackTrace,
                                filter:((Symbol, String|False) -> True|False)|False) -> False :
@@ -47,16 +53,13 @@ public defn print-stack-trace (o:OutputStream,
   for e in entries(trace) do :
     print-trace-entry(o, e) when keep?(e)
 
-public defn print-trace-entry (o:OutputStream, e:StackTraceEntry) :
+;Print a single trace entry to the given output stream.
+defn print-trace-entry (o:OutputStream, e:StackTraceEntry) :
   val sig-str = "" when signature(e) is False else "/%_" % [signature(e)]
-  println(o, "  in %_%_" % [package(e), sig-str])
-  match(info(e):FileInfo) :
-    println(o, "    at %_" % [info(e)])
-
-defmethod print (o:OutputStream, e:StackTraceEntry) :
-  val sig-str = "" when signature(e) is False else "/%_" % [signature(e)]
-  val info-str = "" when info(e) is False else " at %_" % [info(e)]
-  print(o, "StackTraceEntry(%_%_%_)" % [package(e), sig-str, info-str])
+  println(o, "  in %_%_" % [package(e), sig-str])  
+  match(info(e)) :
+    (info:AbsoluteFileInfo) : println(o, "    at %_" % [/info(info)])
+    (f:False) : false
 
 ;------------------------------------------------------------
 ;---------------------- API Functions -----------------------
@@ -116,6 +119,13 @@ lostanza defmethod run (f:ref<TraceFinalizer>) -> ref<False> :
 ;============================================================
 
 ;Packed representation of a stack trace.
+;Layout is:
+;  num-entries:int ...
+;  num-records:int ...
+;  num-chars-words:int ...
+;  entries:int ... (x num-entries)
+;  records:PackedStackTraceRecord ... (x num-records)
+;  strings:long ... (x num-char-words)
 public lostanza deftype PackedStackTrace :
   var reference-count:int
   num-entries:int
@@ -127,6 +137,7 @@ public lostanza deftype PackedStackTrace :
 lostanza deftype PackedStackTraceRecord :
   package:int
   signature:int
+  base:int
   file:int
   line:int
   column:int
@@ -171,11 +182,14 @@ lostanza defn record (trace:ptr<PackedStackTrace>, i:int) -> ref<StackTraceEntry
   val r = records(trace)[i]
   val package = unpack-string(trace, r.package) as ref<String>
   val signature = unpack-string(trace, r.signature)
+  val base = unpack-string(trace, r.base)
   val file = unpack-string(trace, r.file)
-  var info:ref<FileInfo|False> = false
-  if file != false :
-    info = FileInfo(file as ref<String>,
-                    new Int{r.line}, new Int{r.column})
+  var info:ref<AbsoluteFileInfo|False> = false
+  if base != false and file != false :
+    info = AbsoluteFileInfo(
+             base as ref<String>,
+             file as ref<String>,
+             new Int{r.line}, new Int{r.column})
   return StackTraceEntry(to-symbol(package), signature, info)
 
 ;Unpack the given entry at the given index.
@@ -195,6 +209,7 @@ lostanza defn entry (trace:ptr<PackedStackTrace>, i:int) -> ref<StackTraceEntry>
 public lostanza deftype StackTraceRecord :
   package:ptr<byte>
   signature:ptr<byte>
+  base:ptr<byte>
   file:ptr<byte>
   line:int
   column:int
@@ -231,6 +246,7 @@ lostanza defn add-record? (b:ref<StackTraceBuilder>, e:ptr<StackTraceRecord>) ->
                       new Long{e as long},
                       add-string?(b, e.package),
                       add-string?(b, e.signature),
+                      add-string?(b, e.base),
                       add-string?(b, e.file),
                       new Int{e.line}
                       new Int{e.column})
@@ -251,13 +267,14 @@ lostanza defn add-string? (b:ref<StackTraceBuilder>, s:ptr<byte>) -> ref<Int> :
 defn add-record? (b:StackTraceBuilder, e:StackTraceEntry) -> Int :
   match(record-index?(b, e)) :
     (f:False) :
-      val [info-file, info-line, info-column] = match(info(e)) :
-        (info:FileInfo) : [filename(info), line(info), column(info)]
-        (f:False) : [false, 0, 0]
+      val [base, info-file, info-line, info-column] = match(info(e)) :
+        (info:AbsoluteFileInfo) : [base(info), filename(info), line(info), column(info)]
+        (f:False) : [false, false, 0, 0]
       add-record(b,
                  e,
                  add-string?(b, to-string(package(e))),
                  add-string?(b, signature(e)),
+                 add-string?(b, base)
                  add-string?(b, info-file)
                  info-line,
                  info-column)
@@ -288,7 +305,7 @@ public deftype StackTraceBuilder
 defmulti add-entry (b:StackTraceBuilder, entry:Int) -> False
 defmulti record-index? (b:StackTraceBuilder, record:Long|StackTraceEntry) -> Int|False
 defmulti add-record (b:StackTraceBuilder, key:Long|StackTraceEntry,
-                     package:Int, signature:Int, file:Int, line:Int, column:Int) -> Int
+                     package:Int, signature:Int, base:Int, file:Int, line:Int, column:Int) -> Int
 defmulti string-index? (b:StackTraceBuilder, str:Long|String) -> Int|False
 defmulti add-string (b:StackTraceBuilder, key:Long|String, str:String) -> Int
 defmulti pack-buffer (b:StackTraceBuilder) -> ByteBuffer
@@ -309,11 +326,12 @@ public defn StackTraceBuilder () -> StackTraceBuilder :
     defmethod record-index? (this, key:Long|StackTraceEntry) :
       get?(record-table, key)
     defmethod add-record (this, key:Long|StackTraceEntry,
-                          package:Int, signature:Int, file:Int, line:Int, column:Int) :
+                          package:Int, signature:Int, base:Int, file:Int, line:Int, column:Int) :
       val index = length(record-table)
       record-table[key] = index
       put(record-buffer, package)
       put(record-buffer, signature)
+      put(record-buffer, base)
       put(record-buffer, file)
       put(record-buffer, line)
       put(record-buffer, column)
