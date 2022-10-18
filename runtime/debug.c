@@ -2144,7 +2144,7 @@ enum {
 typedef struct {
   uint64_t id;  // Unique id that combines thread/coroutine id and frame id in the stack (i.e. offset from the bottom).
   const char* function_name;  // Not owned by StackTraceFrame
-  const char* source_path;    // Not owned by StackTraceFrame
+  char* source_path;          // Owned by StackTraceFrame
   int64_t line;   // 1-based
   int64_t column; // 1-based, 0 denotes unknown
 } StackTraceFrame;
@@ -2160,6 +2160,8 @@ static void StackTrace_initialize(StackTrace* st) {
   //TODO: handle possible OOME
 }
 static inline void StackTrace_destroy(StackTrace* st) {
+  for (const StackTraceFrame *p = st->data, *const limit = p + st->length; p < limit; p++)
+    free(p->source_path);
   free(st->data);
 }
 static inline StackTraceFrame* StackTrace_allocate(StackTrace* st) {
@@ -2176,7 +2178,7 @@ void append_stack_frame(StackTrace* st, uint64_t frame_id, const char* function_
   StackTraceFrame* frame = StackTrace_allocate(st);
   frame->id = frame_id;
   frame->function_name = function_name;
-  frame->source_path = source_path;
+  frame->source_path = strdup(source_path);
   frame->line = line;
   frame->column = column;
 }
