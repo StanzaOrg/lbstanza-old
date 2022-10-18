@@ -1416,7 +1416,7 @@ static inline void define_capabilities(JSBuilder* builder) {
     // TODO: support 'exceptionOptions' on the setExceptionBreakpoints request.
     {"supportsExceptionOptions", false},
     // TODO: Support a 'format' attribute on the stackTraceRequest, variablesRequest, and evaluateRequest.
-    {"supportsValueFormattingOptions", false},
+    {"supportsValueFormattingOptions", true},
     // TODO: support the exceptionInfo request.
     {"supportsExceptionInfoRequest", false},
     // TODO: support the 'terminateDebuggee' attribute on the 'disconnect' request.
@@ -2141,6 +2141,35 @@ enum {
   INVALID_FRAME_ID = -1
 };
 
+#define DEFINE_STACK_FRAME_FORMAT(def)\
+  def(0, hex)            \
+  def(1, parameters)     \
+  def(2, parameterTypes) \
+  def(3, parameterNames) \
+  def(4, parameterValues)\
+  def(5, line)           \
+  def(6, module)         \
+  def(7, includeAll)
+enum {
+  #define DEFINE_STACK_FRAME_FORMAT_MASK(number, name) STACK_FRAME_FORMAT_##name = 1 << number,
+  DEFINE_STACK_FRAME_FORMAT(DEFINE_STACK_FRAME_FORMAT_MASK)
+  #undef DEFINE_STACK_FRAME_FORMAT_MASK
+};
+static inline uint64_t parse_stack_frame_format(const JSObject* format) {
+  static const char* const names[] = {
+    #define DEFINE_STACK_FRAME_FORMAT_NAME(number, name) #name,
+    DEFINE_STACK_FRAME_FORMAT(DEFINE_STACK_FRAME_FORMAT_NAME)
+    #undef DEFINE_STACK_FRAME_FORMAT_NAME
+    NULL
+  };
+
+  uint64_t x = 0;
+  uint64_t mask = 1;
+  for (const char* const* name = names; *name; name++, mask <<= 1)
+    if (JSObject_get_bool_field(format, *name, false))
+      x |= mask;
+  return x;
+}
 typedef struct {
   uint64_t id;  // Unique id that combines thread/coroutine id and frame id in the stack (i.e. offset from the bottom).
   const char* function_name;  // Not owned by StackTraceFrame
@@ -2186,19 +2215,20 @@ void append_stack_frame(StackTrace* st, uint64_t frame_id, const char* function_
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
 // Frames not visible to the debugger can be skipped.
 // Returns total number of frames in thread_id stack or -1 when no thread with given therad_id thread_is found.
-int32_t create_stack_trace(StackTrace* st) ;
+int32_t create_stack_trace(StackTrace* st, const uint64_t format) ;
 
 typedef struct {
   DelayedRequest parent;
   int64_t thread_id;
   int64_t start_frame;
   int64_t max_frames;
+  uint64_t format;
 } DelayedRequestStackTrace;
 static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
   StackTrace st;
   StackTrace_initialize(&st);
-  if (!terminated_event_sent && stack_trace_available) create_stack_trace(&st);
+  if (!terminated_event_sent && stack_trace_available) create_stack_trace(&st, req->format);
   const int64_t total_frames = st.length;
 
   JSBuilder builder;
@@ -2239,6 +2269,7 @@ static inline DelayedRequest* DelayedRequestStackTrace_create(const JSObject* re
   req->thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
   req->start_frame = JSObject_get_integer_field(arguments, "startFrame", 0);
   req->max_frames = JSObject_get_integer_field(arguments, "levels", INT64_MAX);
+  req->format = parse_stack_frame_format(JSObject_get_object_field(arguments, "format"));
   return (DelayedRequest*) req;
 }
 static bool request_stackTrace(const JSObject* request) {
