@@ -2,6 +2,14 @@ defpackage stz/dispatch-dag :
   import core
   import collections
   import stz/set-utils
+  import stz/timing-log-api
+  import stz/overlap-table
+
+;============================================================
+;===================== Timers ===============================
+;============================================================
+
+val COMPUTE-DISPATCH-DAG = TimerLabel("Compute Dispatch Dag")
 
 ;============================================================
 ;==================== Input Datastructure ===================
@@ -322,43 +330,144 @@ public defn check-ordered (s:Soln, case:Tuple<Int>, table:BranchTable) -> True|F
         case?(case, bs[i])
 
 ;============================================================
+;================== Reindex for Proximity ===================
+;============================================================
+
+;Execute the given body with a reindexed branch table for
+;interval proximity.
+defn reindex (body:BranchTable -> Dag, t:BranchTable) -> Dag :
+  ;First collect all of the nums in the table.
+  val all-nums = Vector<Tuple<Int>>()
+  add-all(all-nums, seq(values, filter-by<Nums>(seq-cat(args, branches(t)))))
+  add(all-nums, to-tuple(abstract-nums(t)))
+
+  ;Sort the nums by their length.
+  qsort!(length, all-nums)
+
+  ;Assign new numbers.
+  val var-table = IntTable<Int>()
+  val old-vars = Vector<Int>()
+  for v in cat-all(all-nums) do :
+    if not key?(var-table, v) :
+      val new-v = length(var-table)
+      var-table[v] = new-v
+      old-vars[new-v] = v
+
+  ;Helper: Reindex Arg, Branch, IntSet, DagEntry, Dag
+  defn reindex (arg:Arg) -> Arg :
+    match(arg:Nums) : Nums(qsort(seq({var-table[_]}, values(arg))))
+    else : arg
+  defn reindex (b:Branch) -> Branch :
+    Branch(map(reindex, args(b)))
+  defn reindex (ns:IntSet) -> IntSet :
+    to-intset(seq({var-table[_]}, ns))
+  defn reindex (t:BranchTable) -> BranchTable :
+    BranchTable(
+      map(reindex, branches(t))
+      reindex(abstract-nums(t)))
+
+  ;Back index
+  defn backindex (arg:Arg) -> Arg :
+    match(arg:Nums) : Nums(qsort(seq({old-vars[_]}, values(arg))))
+    else : arg
+  defn backindex (e:DagEntry) -> DagEntry :
+    val new-entries = for e in entries(e) map :
+      backindex(key(e)) as Nums => value(e)
+    DagEntry(depth(e), new-entries, default(e))
+  defn backindex (d:Dag) -> Dag :
+    Dag(depth(d), map(backindex,entries(d)))
+
+  ;Launch!
+  val t2 = reindex(t)
+  val result = body(t2)
+  backindex(result)
+
+;Run the given body with reindexing if the branch table
+;is large enough to warrant it.
+defn reindex-if-large? (body:BranchTable -> Dag, t:BranchTable, topological?:True|False) -> Dag :
+  ;if topological? and length(branches(t)) > 10 : reindex(body, t)
+  ;else : body(t)
+  body(t)
+
+;============================================================
 ;====================== Ancestor Table ======================
 ;============================================================
 
 ;Returns a strict ancestor table.
 defn ancestor-table (branches:Tuple<Branch>) :
+
+  ;An entry, a => (b, c, d), means that a is a subbranch of
+  ;b, c, and d.
   val ancestors = IntListTable<Int>()
-  within (ba, bb) = overlaps(branches) :
-    switch(compare-branch(branches[ba], branches[bb])) :
-      -1 : add(ancestors, ba, bb)
-      1 : add(ancestors, bb, ba)
+
+  ;Check the relationship between branch a and branch b and
+  ;add them to the ancestor table.
+  defn check-whether-ancestor (a:Int, b:Int) :
+    switch(compare-branch(branches[a], branches[b])) :
+      -1 : add(ancestors, a, b)
+      1 : add(ancestors, b, a)
       0 : false
       false : false
+
+  ;Check all remaining overlaps that aren't already masked off.
+  overlaps(check-whether-ancestor, branches)
+
+  ;Return the ancestor table.
   ancestors
 
+;Call return(a,b) on all pairs of branches whose argument
+;Nums overlap. If two branches do not overlap, they are
+;guaranteed not to be ancestors of each other.
 defn overlaps (return:(Int, Int) -> ?, branches:Tuple<Branch>) :
-  val overlap-count = HashTable<[Int,Int],Int>(0)
   val num-coords = length(args(branches[0]))
+  val overlaps = OverlapTable(length(branches), num-coords)
   for coord in 0 to num-coords do :
-    within (branch-a, branch-b) = sweep-line(coordinate-intervals(branches, coord)) :
-      val p = [branch-a, branch-b]
-      val count = update(overlap-count, {_ + 1}, p)
-      return(branch-a, branch-b) when count == num-coords
+    val [groups, singles] = find-coordinate-groupings(branches, coord)
+    do(add-group{overlaps, coord, _}, groups)
+    sweep-line(add-pairwise{overlaps, coord, _, _},
+               coordinate-intervals(branches, coord, singles))
+  all-overlaps(return, overlaps)
 
-defn coordinate-intervals (branches:Collection<Branch>, coord:Int) :
-  val ints = Vector<IntervalEvent>()
+;Group the given branches along given coordinate.
+;If args(branch-a)[coord] == args(branch-b)[coord], then they are part of the same group.
+;Returns [groups, singles]. 
+defn find-coordinate-groupings (branches:Tuple<Branch>, coord:Int) -> [Tuple<List<Int>>, Tuple<Int>] :
+  ;Group all branches by their Arg.
+  val table = ListTable<Arg, Int>()
   for (b in branches, branch-id in 0 to false) do :
+    update(table, cons{branch-id, _}, args(b)[coord])
+
+  ;Discover all groups, and add them to the overlap table.
+  val groups = to-tuple $ for entry in table seq? :
+    if length(value(entry)) > 1 : One(value(entry))
+    else : None()
+
+  ;Find remaining single and exemplar branches.
+  val singles = to-tuple $ for entry in table seq :
+    head(value(entry))
+
+  ;Return both groups and singles.
+  [groups, singles]
+
+;Compute the coordinate interval events for the branches with the given indices
+;along the specified coord.
+defn coordinate-intervals (branches:Tuple<Branch>, coord:Int, branch-indices:Tuple<Int>) -> Vector<IntervalEvent> :
+  val ints = Vector<IntervalEvent>()
+  for branch-id in branch-indices do :
+    val b = branches[branch-id]
     val [start,end] = match(args(b)[coord]):
       (a:Top): [INT-MIN, INT-MAX]
       (a:Nums): [xs[0], xs[n - 1]] where :
                   val xs = values(a)
                   val n = length(xs)
     add(ints, IntervalEvent(branch-id, true, start))
-    add(ints, IntervalEvent(branch-id, true, end))
+    add(ints, IntervalEvent(branch-id, false, end))
   qsort!(ints)
   ints
 
-defn sweep-line (return:(Int, Int) -> ?, intervals:Collection<IntervalEvent>) :
+;Sweep along the given interval events, and call return on
+;all overlapping intervals.
+defn sweep-line (return:(Int, Int) -> ?, intervals:Collection<IntervalEvent>) -> False :
   val id-set = HashSet<Int>()
   for e in intervals do :
     if start?(e) :
@@ -369,11 +478,15 @@ defn sweep-line (return:(Int, Int) -> ?, intervals:Collection<IntervalEvent>) :
     else :
       remove(id-set, id(e))
 
+;Represents an interval event.
 defstruct IntervalEvent <: Comparable<IntervalEvent> :
   id:Int
   start?:True|False
   value:Int
+with:
+  printer => true
 
+;Compare the ordering of two interval events.
 defmethod compare (a:IntervalEvent, b:IntervalEvent) :
   val c = compare(value(a), value(b))
   if c == 0 :
@@ -609,20 +722,22 @@ defn all-cases (dag:Dag) :
 ;============================================================
 
 public defn compute-dispatch-dag (btable:BranchTable, topological?:True|False) -> Dag :
-  ;Canonicalize table
-  val num-branches = length(branches(btable))
-  ;Empty branch table
-  if empty?(branches(btable)) :
-    EmptyDag(NoSoln())
-  ;Topological branch table
-  else if topological? :
-    val ancestors = ancestor-table(branches(btable))
-    val topo-order = topo-order(num-branches,ancestors)
-    compute-dag(btable, topo-order, topo-soln{_, btable})
-  ;Ordered branch table
-  else :
-    defn first-soln (solns:Tuple<Soln>) : solns[0]
-    compute-dag(btable, 0 to num-branches, first-soln)
+  within log-time(COMPUTE-DISPATCH-DAG) :
+    within btable = reindex-if-large?(btable, topological?) :
+      ;Canonicalize table
+      val num-branches = length(branches(btable))
+      ;Empty branch table
+      if empty?(branches(btable)) :
+        EmptyDag(NoSoln())
+      ;Topological branch table
+      else if topological? :
+        val ancestors = ancestor-table(branches(btable))
+        val topo-order = topo-order(num-branches,ancestors)
+        compute-dag(btable, topo-order, topo-soln{_, btable})
+      ;Ordered branch table
+      else :
+        defn first-soln (solns:Tuple<Soln>) : solns[0]
+        compute-dag(btable, 0 to num-branches, first-soln)
 
 ;============================================================
 ;=================== Resolving a Dag ========================
