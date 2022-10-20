@@ -1804,7 +1804,6 @@ void append_breakpoint(BreakpointVector* v, uint64_t id, uint64_t line, uint64_t
 }
 void set_safepoints (const char* filename, SourceBreakpoint* sbp, long sbp_length, BreakpointVector* out);
 
-//TODO: Remove me
 typedef struct {
   DelayedRequest parent;
   char* source_path;  // Owned by this request
@@ -1825,7 +1824,6 @@ static void DelayedRequestSetBreakpoints_handle(DelayedRequest* request) {
     JSBuilder_array_field_begin(&builder, "breakpoints");
     {
       const char* source_path = req->source_path;
-      //TODO: Remove me
       for (const Breakpoint *p = out_breakpoints.data, *const limit = p + out_breakpoints.length; p < limit; p++) {
         JSBuilder_next(&builder);
         JSBuilder_write_breakpoint(&builder, p->id, p->verified, source_path, p->line, p->column);
