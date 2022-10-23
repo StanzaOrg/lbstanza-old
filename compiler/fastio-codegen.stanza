@@ -3,7 +3,32 @@ defpackage stz/fastio-codegen :
   import collections
   import macro-utils
   import stz/fastio-serializer-lang with:
-    prefix(Constructor) => lang-
+    prefix(Constructor,
+           EnumConstructor,
+           StructConstructor,
+           StructField,
+           UnionConstructor,
+           UnionBranch) => lang-
+
+;<doc>=======================================================
+;======================= Documentation ======================
+;============================================================
+
+### Datastructure Tree ###
+
+Constructor:
+  AtomConstructor
+  EnumConstructor
+  StructConstructor
+  UnionConstructor
+  SpecRW
+  
+SpecRW:
+  NamedSpec
+  CastedSpec
+
+;============================================================
+;=======================================================<doc>
 
 ;============================================================
 ;======================= Code IR ============================
@@ -24,12 +49,37 @@ public defstruct IOType :
   constructor:Constructor
 
 ;Represents code for reading/writing a type.
-public deftype Constructor
+public deftype Constructor :
+  SpecRW <: Constructor
 
 ;Represents code for reading/writing an atom type.
 public defstruct AtomConstructor <: Constructor :
   writer
   reader
+
+;Represents code for reading/writing an enum type.
+public defstruct EnumConstructor <: Constructor :
+  enum-name:Symbol
+
+;Represents code for reading/writing a structure type.
+public defstruct StructConstructor <: Constructor :
+  struct-name:Symbol
+  fields:Tuple<StructField>
+
+;Represents a single field.
+public defstruct StructField :
+  name:Symbol
+  writer:SpecRW
+  reader:SpecRW
+
+;Represents code for reading/writing a union type.
+public defstruct UnionConstructor <: Constructor :
+  branches:Tuple<UnionBranch>
+
+;Represents one branch in a constructor.
+defstruct UnionBranch :
+  type
+  constructor:Constructor
 
 ;Represents readers/writers for a specification.
 public deftype SpecRW
@@ -42,22 +92,9 @@ public defstruct NamedSpecRW <: SpecRW :
 ;Read/write using the defined reading/writing functions
 ;with an additional cast.
 public defstruct CastedSpecRW <: SpecRW :
-  writer:Symbol
-  reader:Symbol
+  writer:SpecRW
+  reader:SpecRW
   type
-
-;Read/write a struct with the given name and fields.
-public defstruct StructSpecRW <: SpecRW :
-  info:FileInfo|False
-  struct:Symbol
-  fields:Tuple<FieldRW>
-
-;Represents a field in a struct, and the reader and writer
-;to us for writing its value.
-public defstruct FieldRW :
-  name:Symbol
-  writer:Symbol
-  reader:Symbol
 
 ;Resolved writer special expression.
 ;- writer: The name of the writer function to use.
@@ -113,13 +150,6 @@ public defn to-sexp (ir:CodeIR) :
 
 ;Convenience launcher that just calls the multi.
 defn to-sexp (env:CodeGenEnv, t:IOType) -> Substitute :
-  to-sexp(env, t, constructor(t))
-
-;Generate reader/writer for the given type with the given constructor.
-defmulti to-sexp (env:CodeGenEnv, t:IOType, c:Constructor) -> Substitute
-
-;Code generation for atoms.
-defmethod to-sexp (env:CodeGenEnv, t:IOType, c:AtomConstructor) -> Substitute :
   val template = `(
     ;Write given type to the buffer.
     info{
@@ -140,8 +170,168 @@ defmethod to-sexp (env:CodeGenEnv, t:IOType, c:AtomConstructor) -> Substitute :
     `Type => type(t)
     `write-xxx => writer-name(t)
     `read-xxx => reader-name(t)
-    `writer-exp => fill-special-exp(env, writer(c))
-    `reader-exp => fill-special-exp(env, reader(c))])
+    `writer-exp => writer-exp(env, constructor(t), binder(t))
+    `reader-exp => reader-exp(env, constructor(t))])
+
+;Multis for writing/reading using a given constructor.
+defmulti writer-exp (env:CodeGenEnv, c:Constructor, item) -> ?
+defmulti reader-exp (env:CodeGenEnv, c:Constructor) -> ?
+
+;Code generation for atoms.
+defmethod writer-exp (env:CodeGenEnv, c:AtomConstructor, item) :
+  fill-special-exp(env, writer(c))
+defmethod reader-exp (env:CodeGenEnv, c:AtomConstructor) :
+  fill-special-exp(env, reader(c))
+
+;Code generation for enums.
+defmethod writer-exp (env:CodeGenEnv, c:EnumConstructor, item) :
+  false
+defmethod reader-exp (env:CodeGenEnv, c:EnumConstructor) :
+  enum-name(c)
+
+;Code generation for unions.
+defmethod writer-exp (env:CodeGenEnv, c:UnionConstructor, item) :
+  ;Determine the number of branches, and the representation
+  ;to use.
+  val num-branches = length(branches(c))
+
+  val representation =
+    if num-branches <= 0xFF : `byte
+    else if num-branches <= 0xFFFF : `short
+    else : `int
+
+  ;Determine the writer to use to write the tag.
+  val write-tag = switch(representation) :
+    `byte : `stz/fastio-buffer/write-byte
+    `short : `stz/fastio-buffer/write-short
+    `int : `stz/fastio-buffer/write-int
+
+  ;Convert the tag into the appropriate representation.
+  defn to-tag (i:Int) -> Byte|Int :
+    if representation == `byte : to-byte(i)
+    else : i    
+
+  ;Binder to represent item.
+  val binder = gensym(`x)
+
+  ;Compile each of the branches.
+  val compiled-branches = to-tuple $ for (branch in branches(c), index in 0 to false) seq :
+    [`Type => type(branch)
+     `tag => to-tag(index)
+     `writer-exp => writer-exp(env, constructor(branch), binder)]
+
+  ;Match on the item, and for each branch, write a tag, and dispatch
+  ;to the appropriate constructor.
+  val template = `(
+    match(item) :
+      branches{
+        (x:Type) :
+          write-tag(buffer, tag)
+          writer-exp
+      }
+      (x) : error)
+
+  substitute(template, [
+    `item => item
+    `buffer => buffer-name(env)
+    `write-tag => write-tag
+    `branches => nested(compiled-branches)
+    `x => binder
+    `error => throw-error-form(env)])
+
+defmethod reader-exp (env:CodeGenEnv, c:UnionConstructor) :
+  ;Determine the number of branches, and the representation
+  ;to use.
+  val num-branches = length(branches(c))
+
+  val representation =
+    if num-branches <= 0xFF : `byte
+    else if num-branches <= 0xFFFF : `short
+    else : `int  
+
+  ;Convert the tag into the appropriate representation.
+  defn to-tag (i:Int) -> Byte|Int :
+    if representation == `byte : to-byte(i)
+    else : i    
+
+  ;Determine the reader to use to read the tag.
+  val read-tag = switch(representation) :
+    `byte : `stz/fastio-buffer/read-byte
+    `short : `stz/fastio-buffer/read-short
+    `int : `stz/fastio-buffer/read-int
+
+  ;Compile each of the branches.
+  val compiled-branches = to-tuple $ for (branch in branches(c), index in 0 to false) seq :
+    [`tag => to-tag(index)
+     `reader-exp => reader-exp(env, constructor(branch))]
+
+  ;Read the tag, and for each known tag, dispatch to the
+  ;appropriate reader.
+  val template = `(
+    switch(read-tag(buffer)) :
+      branches{
+        tag : reader-exp
+      }
+      else :
+        error)
+  substitute(template, [
+    `buffer => buffer-name(env)
+    `read-tag => read-tag
+    `branches => nested(compiled-branches)
+    `error => throw-error-form(env)])
+
+;Code generation for structures.
+defmethod writer-exp (env:CodeGenEnv, c:StructConstructor, item) :
+  val writer-exps = to-list $ for f in fields(c) seq :
+    val field-item = substitute(`(field(item)), [
+                       `field => name(f)
+                       `item => item])
+    writer-exp(env, writer(f), field-item)
+  splice(writer-exps)
+    
+defmethod reader-exp (env:CodeGenEnv, c:StructConstructor) :
+  val reader-exps = to-list $ for f in fields(c) seq :
+    reader-exp(env, reader(f))
+  substitute(`(Struct(fields)), [
+    `Struct => struct-name(c)
+    `fields => splice(reader-exps)])
+
+;Code generation for simple NamedSpecRW.
+defmethod writer-exp (env:CodeGenEnv, spec:NamedSpecRW, item) :
+  substitute(`(writer(serializer, buffer, item)), [
+    `writer => writer(spec)
+    `buffer => buffer-name(env)
+    `item => item])
+
+;Reader expression for a simple NamedSpecRW.
+defmethod reader-exp (env:CodeGenEnv, spec:NamedSpecRW) :
+  substitute(`(reader(serializer, buffer)), [
+    `reader => reader(spec)
+    `buffer => buffer-name(env)])
+
+;Code generation for CastedSpecRW
+defmethod writer-exp (env:CodeGenEnv, spec:CastedSpecRW, item) :
+  val template = `(
+    match(item) :
+      (x:Type) : writer-exp
+      (x) : error)
+  val x = gensym(`x)
+  substitute(template, [
+    `item => item
+    `x => x
+    `Type => type(spec)
+    `writer-exp => writer-exp(env, writer(spec), x)])
+
+defmethod reader-exp (env:CodeGenEnv, spec:CastedSpecRW) :
+  val template = `(
+    match(reader-exp) :
+      (x:Type) : x
+      (x) : error)
+  substitute(template, [
+    `x => gensym(`x)
+    `reader-exp => reader-exp(env, reader(spec))
+    `Type => type(spec)
+    `error => throw-error-form(env)])
 
 ;============================================================
 ;============== Code Generation Environment =================
