@@ -1787,7 +1787,7 @@ static void BreakpointVector_initialize(BreakpointVector* vector) {
 static inline void BreakpointVector_destroy(BreakpointVector* vector) {
   free(vector->data);
 }
-static Breakpoint* BreakpointVector_allocate(BreakpointVector* vector) {
+static inline Breakpoint* BreakpointVector_allocate(BreakpointVector* vector) {
   if (vector->length == vector->capacity) {
     vector->capacity <<= 1;
     vector->data = realloc(vector->data, vector->capacity * sizeof(Breakpoint));
@@ -1795,12 +1795,12 @@ static Breakpoint* BreakpointVector_allocate(BreakpointVector* vector) {
   }
   return vector->data + vector->length++;
 }
-void append_breakpoint(BreakpointVector* v, uint64_t id, uint64_t line, uint64_t column) {
+void append_breakpoint(BreakpointVector* v, uint64_t id, uint64_t line, uint64_t column, bool available) {
   Breakpoint* bp = BreakpointVector_allocate(v);
   bp->id = id;
   bp->line = line;
   bp->column = column;
-  bp->verified = true; // TODO: may need to assign a meaningful value here.
+  bp->verified = available;
 }
 void set_safepoints (const char* filename, SourceBreakpoint* sbp, long sbp_length, BreakpointVector* out);
 
