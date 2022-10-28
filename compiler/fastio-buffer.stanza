@@ -1,0 +1,175 @@
+defpackage stz/fastio-buffer :
+  import core
+  import collections
+  import stz/fastio-errors
+
+;A buffer to write to.
+;- length: The total size of the buffer.
+;- head: The tip of the buffer to write to.
+;- end: The end of the buffer. The buffer is flushed when head passes end.
+;- data: The start of the buffer's memory.
+public lostanza deftype FastIOBuffer :
+  var length:long
+  var head:ptr<?>
+  var end:ptr<?>
+  var data:ptr<?>
+  flush:ref<(FastIOBuffer -> ?)>
+
+;The optional result of a flush representing the new
+;parameters of the buffer. Used internally for implementing reallocating-buffer.
+lostanza deftype FlushResult :
+  length:long
+  head:ptr<?>
+  data:ptr<?>  
+
+;Create a FastIOBuffer with the given length and the given flush function.
+public lostanza defn FastIOBuffer (length:ref<Int>, flush:ref<(FastIOBuffer -> ?)>) -> ref<FastIOBuffer> :
+  val len = length.value
+  val data = call-c clib/malloc(len)
+  val end = data + len - MAX-ATOM
+  return new FastIOBuffer{len, data, end, data, flush}
+
+;Free all memory in the buffer.
+public lostanza defn free (b:ref<FastIOBuffer>) -> ref<False> :
+  call-c clib/free(b.data)
+  b.data = null
+  return false
+
+;Create a FastIOBuffer with the given length that automatically flushes to
+;the given FileOutputStream.
+public defn FastIOBuffer (length:Int, file:FileOutputStream) -> FastIOBuffer :
+  FastIOBuffer(length, flush-to-file{_, file})
+
+;Create a FastIOBuffer with a preallocated memory buffer.
+public lostanza defn FastIOBuffer (length:long, data:ptr<?>, flush:ref<(FastIOBuffer -> ?)>) -> ref<FastIOBuffer> :
+  val end = data + length - MAX-ATOM
+  return new FastIOBuffer{length, data, end, data, flush}
+
+;Create a FastIOBuffer that doubles in size when full.
+public lostanza defn FastIOBuffer (length:ref<Int>) -> ref<FastIOBuffer> :
+  return FastIOBuffer(length, fn(reallocating-flush))
+
+;Create a FastIOBuffer that reads from the given buffer.
+public lostanza defn read-from (b:ref<FastIOBuffer>) -> ref<FastIOBuffer> :
+  return FastIOBuffer(b.length, b.data, fn(forbid-flush))
+
+;Reset the head of the buffer to the beginning again.
+public lostanza defn reset (b:ref<FastIOBuffer>) -> ref<False> :
+  b.head = b.data
+  return false
+
+;Set the end field of the buffer to be maximum 'limit' number of bytes.
+;Reads beyond this limit will result in a FastIOReadPastLimitError().
+public lostanza defn set-read-limit (b:ref<FastIOBuffer>, limit:ref<Int>) -> ref<False> :
+  b.end = b.data + limit.value
+  return false
+
+;Helper: Flush that just calls fatal.
+defn forbid-flush (buf:FastIOBuffer) -> False :
+  fatal("Flush cannot run for a read-only buffer.")
+
+;Helper: Flush function that writes buffer output to file.
+lostanza defn flush-to-file (buffer:ref<FastIOBuffer>, stream:ref<FileOutputStream>) -> ref<False> :
+  val num-bytes = buffer.head - buffer.data
+  call-c clib/fwrite(buffer.data, 1, num-bytes, stream.file)
+  return false
+
+;Helper: Flush function that simply increases the total length of the buffer.
+lostanza defn reallocating-flush (buffer:ref<FastIOBuffer>) -> ref<FlushResult> :
+  val new-length = buffer.length * 2
+  val new-data = call-c clib/realloc(buffer.data, new-length)
+  if new-data == null : fatal("Could not allocate more memory.")
+  val new-head = new-data + (buffer.head - buffer.data)
+  return new FlushResult{new-length, new-head, new-data}
+
+;Size in bytes of the largest atom that can be written
+;to a buffer.
+lostanza val MAX-ATOM:long = 8
+
+;Flush the contents of the buffer and reset it.
+public lostanza defn flush (buffer:ref<FastIOBuffer>) -> ref<False> :
+  if buffer.head > buffer.data :
+    val result = [buffer.flush](buffer)
+    match(result) :
+      (result:ref<FlushResult>) :
+        buffer.length = result.length
+        buffer.head = result.head
+        buffer.data = result.data
+        buffer.end = buffer.data + buffer.length - MAX-ATOM
+      (result) :
+        buffer.head = buffer.data
+        buffer.end = buffer.data + buffer.length - MAX-ATOM
+  return false
+
+;Flush the buffer contents if the buffer is full.
+lostanza defn flush? (buffer:ref<FastIOBuffer>) -> ref<False> :
+  if buffer.head > buffer.end : flush(buffer)
+  return false
+
+;Define the primitive writing functions.
+#for (write-ls-xxx in [write-ls-byte, write-ls-short, write-ls-int, write-ls-long, write-ls-float, write-ls-double],
+      write-xxx in [write-byte, write-short, write-int, write-long, write-float, write-double],
+      type in [byte, int, int, long, float, double],
+      Type in [Byte, Int, Int, Long, Float, Double],
+      num-bytes in [1 2 4 8 4 8]) :
+      
+  public lostanza defn write-ls-xxx (buffer:ref<FastIOBuffer>, x:type) -> ref<False> :
+    [buffer.head as ptr<type>] = x
+    buffer.head = buffer.head + num-bytes
+    flush?(buffer)
+    return false
+
+  public lostanza defn write-xxx (buffer:ref<FastIOBuffer>, x:ref<Type>) -> ref<False> :
+    return write-ls-xxx(buffer, x.value)
+  
+;Define the primitive reading functions.
+#for (read-ls-xxx in [read-ls-byte, read-ls-short, read-ls-int, read-ls-long, read-ls-float, read-ls-double],
+      read-xxx in [read-byte, read-short, read-int, read-long, read-float, read-double],
+      type in [byte, int, int, long, float, double],
+      Type in [Byte, Int, Int, Long, Float, Double],
+      and-mask in splice([() (& 0xFFFF) () () () ()]),
+      num-bytes in [1 2, 4 8 4 8]) :
+
+  public lostanza defn read-ls-xxx (buffer:ref<FastIOBuffer>) -> type :
+    val result = [buffer.head as ptr<type>]
+    buffer.head = buffer.head + num-bytes
+    if buffer.head > buffer.end : throw(FastIOReadPastLimitError())
+    return result and-mask
+
+  public lostanza defn read-xxx (buffer:ref<FastIOBuffer>) -> ref<Type> :
+    return new Type{read-ls-xxx(buffer)}
+  
+;Read 'num-bytes' bytes into the given 'store' from
+;the buffer.
+public lostanza defn read-ls-bytes (store:ptr<byte>
+                                    buffer:ref<FastIOBuffer>,
+                                    num-bytes:long) -> ref<False> :
+  val head = buffer.head
+  buffer.head = buffer.head + num-bytes
+  if buffer.head > buffer.end : throw(FastIOReadPastLimitError())
+  call-c clib/memcpy(store, head, num-bytes)
+  return false
+
+;Fill the given string with characters from the buffer.
+public lostanza defn read-chars (store:ref<String>,
+                                 buffer:ref<FastIOBuffer>) -> ref<False> :
+  val n = length(store).value
+  read-ls-bytes(addr!(store.chars), buffer, n)
+  return false
+
+;Fill the given byte array with bytes from the buffer.
+public lostanza defn read-bytes (store:ref<ByteArray>,
+                                 buffer:ref<FastIOBuffer>) -> ref<False> :
+  val n = length(store).value
+  read-ls-bytes(addr!(store.data), buffer, n)
+  return false
+
+;LoStanza skip bytes function.
+public lostanza defn skip-ls (buffer:ref<FastIOBuffer>, num-bytes:long) -> ref<False> :
+  buffer.head = buffer.head + num-bytes
+  if buffer.head > buffer.end : throw(FastIOReadPastLimitError())
+  return false
+
+;LoStanza skip bytes function.
+public lostanza defn skip (buffer:ref<FastIOBuffer>, num-bytes:ref<Int>) -> ref<False> :
+  return skip-ls(buffer, num-bytes.value)

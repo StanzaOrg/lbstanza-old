@@ -1,0 +1,188 @@
+defpackage stz/fastio-to-codegen-ir :
+  import core
+  import collections
+  import stz/fastio-serializer-lang with:
+    prefix(SizeSpec) => Lang
+  import stz/fastio-deftable
+  import stz/fastio-size
+  import stz/fastio-codegen with:
+    prefix(IOSpec,
+           CastedSpec,
+           NamedSpec,
+           UnionBranch) => Code
+
+;Convert the pre-transformed input IR to CodeGen IR.
+public defn to-codegen-ir (s:DefSerializer) -> CodeIR :
+  ;Accumulate Stanza expressions here.
+  val stanza-exps = Vector<?>()
+  
+  ;Accumulate converted IOType here.
+  val iotypes = Vector<IOType>()
+
+  ;Gather all entry points
+  val entry-points = to-hashset<Symbol> $
+    entry-points(s)
+
+  ;Convert all TopExp to IOType.
+  val names = generate-writer-reader-names(s)
+  val deftable = DefTable(s)
+  for e in exps(s) do :
+    match(e) :
+      (e:DefAtom|DefType|DefUnion) :
+        val entry-point? = entry-points[name(e)]
+        add(iotypes, to-type(e, entry-point?, deftable, names))
+      (e:StanzaExp) :
+        add(stanza-exps, Token?(exp(e), info(e)))
+      
+  ;Create final CodeIR.
+  CodeIR(info(s),
+         name(s),
+         arguments(s),
+         to-tuple(stanza-exps),
+         to-tuple(iotypes))
+
+;Convert the input TopExp into the CodeGen IOType.
+public defn to-type (e:TopExp,
+                     entry-point?:True|False,
+                     deftable:DefTable,
+                     names:HashTable<Symbol,DefNames>) -> IOType :
+  match(e) :
+    (e:DefAtom) :
+      ;Resolve special expressions in writer and reader.
+      val writer-body = to-code-body(writer(e), names)
+      val reader-body = to-code-body(reader(e), names)
+      val atom-size = resolve-code-body(size(deftable,name(e)), names) as AtomSize
+      val spec = AtomSpec(writer-body, reader-body, atom-size)
+      ;Create the IOType.
+      val names = names[name(e)]
+      IOType(info(e), name(e), entry-point?, type(e), binder(e),
+             writer(names), reader(names), skipper(names), size(names), spec)
+    (e:DefType) :
+      val spec = to-spec(constructor(e), type(e), deftable, names)
+      val names = names[name(e)]
+      IOType(info(e), name(e), entry-point?, type(e), gensym(`x),
+             writer(names), reader(names), skipper(names), size(names), spec)
+    (e:DefUnion) :
+      val branches = for b in branches(e) map :
+        CodeUnionBranch(type(b), to-spec(constructor(b), type(b), deftable, names))
+      val union-size = resolve-code-body(size(deftable, name(e)), names) as UnionSize
+      val spec = UnionSpec(branches, union-size)        
+      val names = names[name(e)]
+      IOType(info(e), name(e), entry-point?, type(e), gensym(`x),
+             writer(names), reader(names), skipper(names), size(names), spec)
+    (e) :
+      fatal("Unexpected expression of type %_." % [object-type(e)])
+
+;Return an integer if the given form represents just a straightforward integer.
+defn integer? (form) -> Int|False :
+  match(unwrap-token(form)) :
+    (form:Int) : form
+    (form) : false
+
+;Convert the given constructor into an IOSpec.
+defn to-spec (c:Constructor,
+              type,
+              deftable:DefTable,
+              names:HashTable<Symbol,DefNames>) -> CodeIOSpec :
+  match(c) :
+    (c:EnumConstructor) :
+      ;Assume to be valid Symbol because of validation checks.
+      val enum-name = unwrap-token(type) as Symbol
+      EnumSpec(enum-name)
+    (c:StructConstructor) :
+      ;Assume to be valid Symbol because of validation checks.
+      val struct-name = unwrap-token(type) as Symbol
+      val struct-fields = for f in args(c) map :
+        StructField(name(f), to-code-spec(spec(f), names))
+      val struct-size = resolve-code-body(size(deftable, c), names) as StructSize
+      StructSpec(struct-name, struct-fields, struct-size)
+    (c:IOSpec) :
+      to-code-spec(c, names)
+
+;Convert the given spec into a Codegen IOSpec.
+defn to-code-spec (s:IOSpec,
+                   names:HashTable<Symbol,DefNames>) -> CodeIOSpec :
+  match(s) :
+    (s:NamedSpec) :
+      val names = names[name(s)]
+      CodeNamedSpec(writer(names), reader(names), skipper(names), size(names))
+    (s:CastedSpec) :
+      val spec = to-code-spec(spec(s), names)
+      CodeCastedSpec(spec, type(s))
+    (s:CombinatorSpec) :
+      fatal("Unexpected CombinatorSpec.")
+
+;Convert the given body into a Codegen body.
+defn to-code-body (form,
+                   names:HashTable<Symbol,DefNames>) -> ? :
+  match(form) :
+    (form:Token) :
+      Token(to-code-body(item(form), names), info(form))
+    (form:List) :
+      map(to-code-body{_, names}, form)
+    (form:WriteSpec) :
+      val new-item = to-code-body(item(form), names)
+      val new-spec = to-code-spec(spec(form), names)
+      ResolvedWriteSpec(info(form), new-spec, new-item)
+    (form:ReadSpec) :
+      val new-spec = to-code-spec(spec(form), names)
+      ResolvedReadSpec(info(form), new-spec)
+    (form:LangSizeSpec) :
+      val new-spec = to-code-spec(spec(form), names)
+      ResolvedSizeSpec(info(form), new-spec)
+    (form:SkipSpec) :
+      val new-spec = to-code-spec(spec(form), names)
+      ResolvedSkipSpec(info(form), new-spec)
+    (form) :
+      form
+
+defn resolve-code-body (size:SizeSpec,
+                        names:HashTable<Symbol,DefNames>) -> SizeSpec :
+  match(size) :
+    (size:ComputableSize) :
+      ComputableSize(to-code-body(exp(size), names))
+    (size:SkipExp) :
+      SkipExp(to-code-body(exp(size), names))
+    (size:ConstantSize|ComputeFromChildren|SkipChildren) :
+      size  
+
+;Represent generated names for a definition.
+defstruct DefNames :
+  writer:Symbol
+  reader:Symbol
+  skipper:Symbol
+  size:Symbol
+
+;Generate the reader/writer names for the definitions in the given
+;serializer.
+defn generate-writer-reader-names (s:DefSerializer)
+                                -> HashTable<Symbol,DefNames> :
+  ;Compute the set of existing names.
+  val name-set = to-hashset<Symbol> $
+    for e in exps(s) seq? :
+      match(e) :
+        (e:DefAtom|DefType|DefUnion) : One(name(e))
+        (e) : None()
+
+  ;Add the given prefix to a symbol.
+  defn prefix (pre:String, s:Symbol) -> Symbol :
+    match(s) :
+      (s:StringSymbol) :
+        gensym(append(pre, name(s)))
+      (s:GenSymbol) :
+        gensym(append(pre, name(s)))
+
+  ;Generate new names for all existing names.
+  to-hashtable<Symbol,DefNames> $
+    for entry in name-set seq :
+      val new-names = DefNames(
+        prefix("write-", entry)
+        prefix("read-", entry)
+        prefix("skip-", entry)
+        prefix("size-", entry))
+      entry => new-names
+
+;Helper: Create a Token using the given info if one is provided.
+defn Token? (x, info:FileInfo|False) -> ? :
+  match(info:FileInfo) : Token(unwrap-token(x), info)
+  else : x

@@ -1,0 +1,640 @@
+defpackage stz/fastio-codegen :
+  import core
+  import collections
+  import macro-utils
+  import stz/core-macros
+  import stz/fastio-size
+  import stz/fastio-serializer-lang with:
+    prefix(IOSpec,
+           StructField,
+           UnionBranch,
+           CastedSpec,
+           NamedSpec) => lang-
+
+;<doc>=======================================================
+;======================= Documentation ======================
+;============================================================
+
+### Datastructure Tree ###
+
+IOSpec:
+  AtomSpec
+  EnumSpec
+  StructSpec
+  UnionSpec
+  NamedSpec
+  CastedSpec
+
+;============================================================
+;=======================================================<doc>
+
+;============================================================
+;======================= Code IR ============================
+;============================================================
+
+public defstruct CodeIR :
+  info:FileInfo|False
+  name:Symbol
+  arguments:List
+  stanza-exps:Tuple
+  types:Tuple<IOType>
+
+;Represents a definition of a type.
+;- writer-name: The name of the function for writing an item of this type.
+;- reader-name: The name of the function for reading an item of this type.
+;- skipper-name: The name of the function for skipping an item of this type.
+;- size-name: The name of the function for computing the size of this type.
+public defstruct IOType :
+  info:FileInfo|False
+  name:Symbol
+  entry-point?:True|False with: (updater => sub-entry-point?)
+  type
+  binder:Symbol
+  writer-name:Symbol
+  reader-name:Symbol
+  skipper-name:Symbol
+  size-name:Symbol
+  spec:IOSpec
+
+;Represents code for reading/writing a type.
+public deftype IOSpec
+
+;Represents code for reading/writing an atom type.
+;- size: One(exp) if the atom has a computable size.
+;  And exp will be of type 'Int' if atom has constant size.
+;  None, if the atom has a variable size.
+;- skipper: One(exp) if the atom 
+public defstruct AtomSpec <: IOSpec :
+  writer
+  reader
+  skipper:AtomSize
+
+;Represents code for reading/writing an enum type.
+public defstruct EnumSpec <: IOSpec :
+  enum-name:Symbol
+
+;Represents code for reading/writing a structure type.
+public defstruct StructSpec <: IOSpec :
+  struct-name:Symbol
+  fields:Tuple<StructField>
+  skipper:StructSize
+
+;Represents a single field.
+public defstruct StructField :
+  name:Symbol
+  spec:IOSpec
+
+;Represents code for reading/writing a union type.
+public defstruct UnionSpec <: IOSpec :
+  branches:Tuple<UnionBranch>
+  skipper:UnionSize
+
+;Represents one branch in a constructor.
+public defstruct UnionBranch :
+  type
+  spec:IOSpec
+
+;Read/write using the defined reading/writing functions.
+public defstruct NamedSpec <: IOSpec :
+  writer:Symbol
+  reader:Symbol
+  skipper:Symbol
+  size:Symbol
+
+;Read/write using the defined reading/writing functions
+;with an additional cast.
+public defstruct CastedSpec <: IOSpec :
+  spec:IOSpec
+  type
+
+;Resolved writer special expression.
+public defstruct ResolvedWriteSpec <: SpecialExp :
+  info:FileInfo|False
+  spec:IOSpec
+  item
+
+;Resolved reader special expression.
+public defstruct ResolvedReadSpec <: SpecialExp :
+  info:FileInfo|False
+  spec:IOSpec
+
+;Resolved size special expression.
+public defstruct ResolvedSizeSpec <: SpecialExp :
+  info:FileInfo|False
+  spec:IOSpec
+
+;Resolved skip special expression.
+public defstruct ResolvedSkipSpec <: SpecialExp :
+  info:FileInfo|False
+  spec:IOSpec
+
+;============================================================
+;===================== Code Generation ======================
+;============================================================
+
+;Generate the s-expressions for the given CodeIR.
+;Output is not yet lowered to core forms.
+public defn to-sexp (ir:CodeIR) :
+  ;Overall template.
+  val template = `(
+
+    ;Define the serializer.
+    info{deftype Serializer <: FastIOSerializer}
+
+    ;Entry points
+    entry-points{
+      defmulti serialize-xxx (s:Serializer, obj:Type, buffer:FastIOBuffer) -> core/False
+      defmulti deserialize-xxx (s:Serializer, buffer:FastIOBuffer) -> Type
+    }
+
+    ;Define the constructor for the serializer.
+    defn Serializer (arguments) -> Serializer :
+
+      ;Execute all the Stanza expressions to initialize the serializer.
+      stanza-exps{
+        exp
+      }
+
+      ;Define the serialization functions.
+      types{
+        exp
+      }
+
+      ;Return the new Serializer.
+      new Serializer :
+        entry-points{
+          defmethod serialize-xxx (this, obj:Type, buffer:FastIOBuffer) :
+            write-xxx(this, buffer, obj)
+          defmethod deserialize-xxx (this, buffer:FastIOBuffer) -> Type :
+            read-xxx(this, buffer)
+        }
+  )
+
+  ;Code generation environment
+  val env = CodeGenEnv(name(ir))
+
+  ;Compile the stanza expressions.
+  val stanza-exps = [
+    `exp => stanza-exps(ir)]
+
+  ;Compile the entry points.
+  val entry-points = to-tuple $
+    for t in filter(entry-point?, types(ir)) seq :
+      [`serialize-xxx => symbol-join(["serialize-" name(t)])
+       `deserialize-xxx => symbol-join(["deserialize-" name(t)])
+       `Type => type(t)
+       `write-xxx => writer-name(t)
+       `read-xxx => reader-name(t)]
+
+  ;Compile the types.
+  val compiled-types = for t in types(ir) map :
+    [`exp => to-sexp(env, t)]
+
+  ;Fill template with info and types.
+  val filled = substitute(template, [
+    `arguments => splice(arguments(ir))
+    `stanza-exps => repeated(stanza-exps)
+    `entry-points => nested(entry-points)
+    `info => wrap-info(info(ir))
+    `types => nested(compiled-types)])
+
+  ;Fill with the rest of the environment.
+  fill-template(fill-env(filled, env))
+
+;============================================================
+;============ Generation of Each Constructor ================
+;============================================================
+
+;Convenience launcher that just calls the multi.
+defn to-sexp (env:CodeGenEnv, t:IOType) -> Substitute :
+  val template = `(
+    ;Write given type to the buffer.
+    info{
+      defn write-xxx (serializer:Serializer, buffer:FastIOBuffer, binder:Type) -> False :
+        writer-exp
+    }
+
+    ;Read given type from the buffer.
+    info{
+      defn read-xxx (serializer:Serializer, buffer:FastIOBuffer) -> Type :
+        reader-exp
+    }
+
+    ;Return the size of the item.
+    info{
+      defn size-xxx (serializer:Serializer) -> Int|False :
+        size-exp
+    }
+
+    ;Skip given type from the buffer
+    info{
+      defn skip-xxx (serializer:Serializer, buffer:FastIOBuffer) -> False :
+        skipper-exp
+    }
+  )
+      
+  substitute(template, [
+    `info => wrap-info(info(t))
+    `buffer => buffer-name(env)
+    `binder => binder(t)
+    `Type => type(t)
+    `write-xxx => writer-name(t)
+    `read-xxx => reader-name(t)
+    `size-xxx => size-name(t)
+    `skip-xxx => skipper-name(t)
+    `writer-exp => writer-exp(env, spec(t), binder(t))
+    `reader-exp => reader-exp(env, spec(t))
+    `size-exp => size-exp(env, spec(t))
+    `skipper-exp => skipper-exp(env, spec(t))])
+
+;============================================================
+;=========== Generation of Each Specification ===============
+;============================================================
+
+;Multis for writing/reading/skipping using a given specification.
+defmulti writer-exp (env:CodeGenEnv, s:IOSpec, item) -> ?
+defmulti reader-exp (env:CodeGenEnv, s:IOSpec) -> ?
+defmulti skipper-exp (env:CodeGenEnv, s:IOSpec) -> ?
+defmulti size-exp (env:CodeGenEnv, s:IOSpec) -> ?
+
+;------------------------------------------------------------
+;--------------------- Helper for Skipper -------------------
+;------------------------------------------------------------
+
+;Return code to skip size-exp number of bytes.
+defn skip-using-size (env:CodeGenEnv, s:IOSpec) -> Substitute :
+  val template = `(
+    stz/fastio-buffer/skip(buffer, size-exp as Int))
+  substitute(template, [
+    `size-exp => size-exp(env, s)])
+    
+;------------------------------------------------------------
+;----------------------- Atoms ------------------------------
+;------------------------------------------------------------
+
+defmethod writer-exp (env:CodeGenEnv, s:AtomSpec, item) :
+  fill-special-exp(env, writer(s))
+
+defmethod reader-exp (env:CodeGenEnv, s:AtomSpec) :
+  fill-special-exp(env, reader(s))
+
+defmethod size-exp (env:CodeGenEnv, s:AtomSpec) :
+  match(skipper(s)) :
+    (s:ConstantSize) : size(s)
+    (s:ComputableSize) : fill-special-exp(env, exp(s))
+    (s:SkipExp) : false
+
+defmethod skipper-exp (env:CodeGenEnv, spec:AtomSpec) :
+  match(skipper(spec)) :
+    (s:SkipExp) :
+      fill-special-exp(env, exp(s))
+    (s:ConstantSize|ComputableSize) :
+      skip-using-size(env, spec)
+
+;------------------------------------------------------------
+;----------------------- Enums ------------------------------
+;------------------------------------------------------------
+
+defmethod writer-exp (env:CodeGenEnv, s:EnumSpec, item) :
+  false
+
+defmethod reader-exp (env:CodeGenEnv, s:EnumSpec) :
+  enum-name(s)
+
+defmethod skipper-exp (env:CodeGenEnv, s:EnumSpec) :
+  false
+
+defmethod size-exp (env:CodeGenEnv, s:EnumSpec) :
+  0
+
+;------------------------------------------------------------
+;----------------------- Unions -----------------------------
+;------------------------------------------------------------
+
+;Helper: Retrieve the read-tag, write-tag, to-tag expressions
+defn tag-helpers (num-branches:Int)
+              -> [Symbol, Symbol, Int -> Byte|Int] :
+  val representation =
+    if num-branches <= 0xFF : `byte
+    else if num-branches <= 0xFFFF : `short
+    else : `int
+    
+  ;Convert the tag into the appropriate representation.
+  defn to-tag (i:Int) -> Byte|Int :
+    if representation == `byte : to-byte(i)
+    else : i    
+
+  ;Determine the writer to use to write the tag.
+  val write-tag = switch(representation) :
+    `byte : `stz/fastio-buffer/write-byte
+    `short : `stz/fastio-buffer/write-short
+    `int : `stz/fastio-buffer/write-int
+
+  ;Determine the reader to use to read the tag.
+  val read-tag = switch(representation) :
+    `byte : `stz/fastio-buffer/read-byte
+    `short : `stz/fastio-buffer/read-short
+    `int : `stz/fastio-buffer/read-int
+
+  ;Return all three helpers.
+  [write-tag, read-tag, to-tag]  
+
+;Helper: Retrieve the number of bytes used for the tag.
+defn tag-size (num-branches:Int) -> Int :
+  val representation =
+    if num-branches <= 0xFF : `byte
+    else if num-branches <= 0xFFFF : `short
+    else : `int  
+
+  switch(representation) :
+    `byte : 1
+    `short : 2
+    `int : 4
+
+;Helper: Tree dispatch
+defn tree-dispatch (code:Tuple) -> Substitute :
+  ;Get helpers.
+  val [write-tag, read-tag, to-tag] = tag-helpers(length(code))
+
+  ;Helper: Generate the dispatch tree given the
+  ;RangeTree representing where we are in the generation.
+  ;Assumes that we're guaranteed we are within range of t.
+  defn gen-code (t:RangeTree) :
+    if empty?(children(t)) :
+      code[start(t)]
+    else :
+      val [left, right] = value!(children(t))
+      val template = `(
+        if i <= end-tag :
+          conseq
+        else :
+          alt)
+      substitute(template, [
+        `end-tag => to-tag(end(left))
+        `conseq => gen-code(left)
+        `alt => gen-code(right)])
+
+  val template = `(
+    val i = read-tag(buffer)
+    if i < zero :
+      throw-error
+    else if i >= n :
+      throw-error
+    else :
+      tree)
+      
+  substitute(template, [
+    `i => deep(gensym(`i))
+    `read-tag => read-tag
+    `zero => to-tag(0)
+    `n => to-tag(length(code))
+    `tree => gen-code(integer-tree(length(code)))])  
+
+;Code generation for unions.
+defmethod writer-exp (env:CodeGenEnv, s:UnionSpec, item) :
+  ;Get helpers.
+  val [write-tag, read-tag, to-tag] = tag-helpers(length(branches(s)))
+
+  ;Binder to represent item.
+  val binder = gensym(`x)
+
+  ;Compile each of the branches.
+  val compiled-branches = to-tuple $ for (branch in branches(s), index in 0 to false) seq :
+    [`Type => type(branch)
+     `tag => to-tag(index)
+     `writer-exp => writer-exp(env, spec(branch), binder)]
+
+  ;Match on the item, and for each branch, write a tag, and dispatch
+  ;to the appropriate constructor.
+  val template = `(
+    match(item) :
+      branches{
+        (x:Type) :
+          write-tag(buffer, tag)
+          writer-exp
+      }
+      (x) : throw-error)
+
+  substitute(template, [
+    `item => item
+    `write-tag => write-tag
+    `branches => nested(compiled-branches)
+    `x => binder])
+
+defmethod reader-exp (env:CodeGenEnv, s:UnionSpec) :
+  val codes = for branch in branches(s) map :
+    reader-exp(env, spec(branch))
+  tree-dispatch(codes)
+
+defmethod size-exp (env:CodeGenEnv, spec:UnionSpec) :
+  match(skipper(spec)) :
+    (s:ConstantSize) : tag-size(length(branches(spec))) + size(s)
+    (s:SkipChildren) : false
+
+defmethod skipper-exp (env:CodeGenEnv, spec:UnionSpec) :
+  match(skipper(spec)) :
+    (s:ConstantSize) :
+      skip-using-size(env, spec)
+    (s:SkipChildren) :
+      val codes = for branch in branches(spec) map :
+        skipper-exp(env, /spec(branch))
+      tree-dispatch(codes)
+
+;------------------------------------------------------------
+;--------------------- Structs ------------------------------
+;------------------------------------------------------------
+
+defmethod writer-exp (env:CodeGenEnv, s:StructSpec, item) :
+  val writer-exps = to-list $ for f in fields(s) seq :
+    val field-item = substitute(`(field(item)), [
+                       `field => name(f)
+                       `item => item])
+    writer-exp(env, spec(f), field-item)
+  splice(writer-exps)
+    
+defmethod reader-exp (env:CodeGenEnv, s:StructSpec) :
+  val reader-exps = to-list $ for f in fields(s) seq :
+    reader-exp(env, spec(f))
+  substitute(`(Struct(fields)), [
+    `Struct => struct-name(s)
+    `fields => splice(reader-exps)])
+
+defmethod skipper-exp (env:CodeGenEnv, spec:StructSpec) :
+  match(skipper(spec)) :
+    (s:SkipChildren) :
+      val fs = to-list(fields(spec))
+      val template = `(skip-exps)
+      substitute(template, [
+        `skip-exps => splice(map(skipper-exp{env, /spec(_)}, fs))])
+    (s:ConstantSize|ComputeFromChildren) :
+      val zero? = match(s:ConstantSize) : size(s) == 0
+      if not zero? : 
+        skip-using-size(env, spec)
+
+defmethod size-exp (env:CodeGenEnv, spec:StructSpec) :
+  match(skipper(spec)) :
+    (s:ConstantSize) :
+      size(s)
+    (s:ComputeFromChildren) :
+      val fs = to-list(fields(spec))
+      val template = `(size0 rest{+ size})
+      substitute(template, [
+        `size0 => size-exp(env, /spec(head(fs)))
+        `rest => repeated $ [
+          `size => map(size-exp{env, /spec(_)}, tail(fs))]])
+    (s:SkipChildren) :
+      false
+  
+;------------------------------------------------------------
+;--------------------- NamedSpec ----------------------------
+;------------------------------------------------------------
+defmethod writer-exp (env:CodeGenEnv, s:NamedSpec, item) :
+  substitute(`(writer(serializer, buffer, item)), [
+    `writer => writer(s)
+    `item => item])
+
+defmethod reader-exp (env:CodeGenEnv, s:NamedSpec) :
+  substitute(`(reader(serializer, buffer)), [
+    `reader => reader(s)])
+
+defmethod size-exp (env:CodeGenEnv, s:NamedSpec) :
+  substitute(`(size(serializer)), [
+    `size => size(s)])
+
+defmethod skipper-exp (env:CodeGenEnv, s:NamedSpec) :
+  substitute(`(skip(serializer, buffer)), [
+    `skip => skipper(s)])
+
+;------------------------------------------------------------
+;--------------------- CastedSpec ---------------------------
+;------------------------------------------------------------
+
+defmethod writer-exp (env:CodeGenEnv, spec:CastedSpec, item) :
+  val template = `(
+    match(item) :
+      (x:Type) : writer-exp
+      (x) : throw-error)
+  val x = gensym(`x)
+  substitute(template, [
+    `item => item
+    `x => x
+    `Type => type(spec)
+    `writer-exp => writer-exp(env, /spec(spec), x)])
+
+defmethod reader-exp (env:CodeGenEnv, spec:CastedSpec) :
+  val template = `(
+    match(reader-exp) :
+      (x:Type) : x
+      (x) : throw-error)
+  substitute(template, [
+    `x => gensym(`x)
+    `reader-exp => reader-exp(env, /spec(spec))
+    `Type => type(spec)])
+
+defmethod size-exp (env:CodeGenEnv, spec:CastedSpec) :
+  size-exp(env, /spec(spec))
+
+defmethod skipper-exp (env:CodeGenEnv, spec:CastedSpec) :
+  skipper-exp(env, /spec(spec))
+
+;============================================================
+;============== Code Generation Environment =================
+;============================================================
+
+;Represents necessary symbols and forms for filling
+;special expressions.
+;- buffer-name: The name of the FastIOBuffer.
+;- throw-error-form: The code to execute when we encounter an error.
+defstruct CodeGenEnv :
+  buffer-name: Symbol
+  throw-error-form
+  Serializer-name: Symbol
+  serializer-name: Symbol
+
+;Generate names given the name of the overall serializer.
+defn CodeGenEnv (Serializer:Symbol) -> CodeGenEnv :
+  val buffer-name = gensym(`buffer)
+  val throw-error = `($do core/throw ($do stz/fastio-errors/FastIOSerializationError))
+  val serializer-name = gensym(`serializer)
+  CodeGenEnv(buffer-name, throw-error, Serializer, serializer-name)
+
+;Fill the item with the generated names in CodeGenEnv.
+defn fill-env (item, env:CodeGenEnv) -> Substitute :
+  substitute(`x, [
+    `x => item
+    `buffer => deep(buffer-name(env))
+    `throw-error => deep(throw-error-form(env))
+    `Serializer => deep(Serializer-name(env))
+    `serializer => deep(serializer-name(env))
+    `FastIOBuffer => deep(`stz/fastio-buffer/FastIOBuffer)
+    `FastIOSerializer => deep(`stz/fastio-runtime/FastIOSerializer)])
+
+;============================================================
+;============== Filling Special Expressions =================
+;============================================================
+
+;Fill occurrences of special expressions within the given
+;environment.
+defn fill-special-exp (env:CodeGenEnv, exp) -> ? :
+  defn fill (exp) -> ? :
+    match(exp) :
+      (exp:Token) :
+        sub-token-item?(exp, fill(item(exp)))
+      (exp:List) :
+        map(fill, exp)
+      (exp:ResolvedWriteSpec) :
+        val filled = fill-template(fill-env(writer-exp(env, spec(exp), item(exp)), env))
+        val core-form = parse-syntax[core / #exp](filled)
+        Token?(core-form, info(exp))
+      (exp:ResolvedReadSpec) :
+        val filled = fill-template(fill-env(reader-exp(env, spec(exp)), env))
+        val core-form = parse-syntax[core / #exp](filled)
+        Token?(core-form, info(exp))
+      (exp:ResolvedSizeSpec) :
+        val filled = fill-template(fill-env(size-exp(env, spec(exp)), env))
+        val core-form = parse-syntax[core / #exp](filled)
+        Token?(core-form, info(exp))
+      (exp:ResolvedSkipSpec) :
+        val filled = fill-template(fill-env(skipper-exp(env, spec(exp)), env))
+        val core-form = parse-syntax[core / #exp](filled)
+        Token?(core-form, info(exp))        
+      (exp:NotifyError) :
+        Token?(throw-error-form(env), info(exp))
+      (exp:ReifyBuffer) :
+        Token?(buffer-name(env), info(exp))
+      (exp:SpecialExp) :
+        fatal("Unexpected special expression of type %_ during filling." % [
+              object-type(exp)])
+      (exp) :
+        exp  
+  fill(exp)
+
+;Create a Token using the given info if one is provided.
+defn Token? (x, info:FileInfo|False) -> ? :
+  match(info:FileInfo) : Token(x, info)
+  else : x
+
+;============================================================
+;==================== RangeTree Utility =====================
+;============================================================
+
+defstruct RangeTree :
+  start:Int
+  end:Int
+  children:Maybe<[RangeTree, RangeTree]>
+with:
+  printer => true
+
+defn integer-tree (n:Int) -> RangeTree :
+  defn make-tree (start:Int, end:Int) -> RangeTree :
+    val n = end - start + 1
+    if n < 1 :
+      fatal("Empty range.")
+    else if n == 1 :
+      RangeTree(start, end, None())
+    else :
+      val mid = (start + end) / 2
+      val children = [make-tree(start,mid),
+                      make-tree(mid + 1, end)]
+      RangeTree(start, end, One(children))
+  make-tree(0, n - 1)
