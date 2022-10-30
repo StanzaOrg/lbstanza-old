@@ -18,6 +18,7 @@ defpackage stz/jit-encoder :
   import stz/code-table
   import stz/jit-code-table
   import stz/shuffle
+  import stz/timing-log-api
 
 ;============================================================
 ;===================== JIT Encoder ==========================
@@ -33,6 +34,14 @@ defpackage stz/jit-encoder :
 ;- caches first 2 VM registers and 3 locals in x86 registers
 ;- uses ASMJit labels instead of buffer positions
 ;- uses ASMJit Funcs for functions instead of buffer positions
+
+;============================================================
+;====================== Timers ==============================
+;============================================================
+
+val JIT-ENCODER = TimerLabel("JIT Encoder")
+val JIT-EMIT-FN = TimerLabel(JIT-ENCODER, suffix("Emit fn"))
+val COMPUTE-ABSOLUTE-ADDRESSES = TimerLabel(JIT-ENCODER, suffix("Compute absolute addresses"))
 
 ;============================================================
 ;=================== Encoded Functions ======================
@@ -372,16 +381,24 @@ defn AsmGen (code:CodeHolder,
   ;=========================================================
   ;============== Function Stack Frame =====================
   ;=========================================================
+  ;Extract the local deftable if there is one.
+  val local-deftable = match(func-info:FuncInfo) :
+    deftable(func-info)
+
   ;Force retrieve the input FuncInfo.
   defn func-info! () -> FuncInfo :
     if func-info is False :
       fatal("No function information is given.")
     func-info as FuncInfo
 
+  ;Force retrieve the deftable.
+  defn deftable! () -> IntTable<VMDef> :
+    local-deftable as IntTable<VMDef>
+
   ;Retrieve the stack frame slot that the local is
   ;stored in.
   defn slot (l:Local) -> Int :
-    /local(deftable(func-info!())[index(l)])
+    /local(deftable!()[index(l)])
 
   ;Call slot if x is a Local otherwise return dummy value 0.
   ;The dummy value is fine because in this case the instruction
@@ -412,8 +429,7 @@ defn AsmGen (code:CodeHolder,
   ;Retrieve type of immediate
   defn imm-type (x:VMImm) :
     match(x:Local) :
-      val deftable = deftable(func-info!())
-      type(deftable[index(x)])
+      type(deftable!()[index(x)])
     else : type(x)
   defn imm-type (x:VMType) :
     x
@@ -462,11 +478,6 @@ defn AsmGen (code:CodeHolder,
   ;=========================================================
 
   ;Set and Get all the structure fields. 
-  defn struct-get (base:VMRegItem, offset:Int, dst:Gp) -> Gp :
-    mov(a, dst, MemPtr(reg(base), offset))
-  defn struct-set (base:VMRegItem, offset:Int, value:Gp) :
-    mov(a, MemPtr(reg(base), offset), value)
-
   #for (get-field in [get-vmstate-registers
                       get-vmstate-global-offsets
                       get-vmstate-global-mem
@@ -550,19 +561,50 @@ defn AsmGen (code:CodeHolder,
                    STACK-SIZE-OFFSET
                    STACK-FRAMES-OFFSET
                    STACK-STACK-POINTER-OFFSET
-                   STACK-PC-OFFSET]) :
+                   STACK-PC-OFFSET]
+        memptr in [vmstate-registers-memptr
+                   vmstate-global-offsets-memptr
+                   vmstate-global-mem-memptr
+                   vmstate-const-table-memptr
+                   vmstate-const-mem-memptr
+                   vmstate-data-offsets-memptr
+                   vmstate-data-mem-memptr
+                   vmstate-code-offsets-memptr
+                   vmstate-heap-start-memptr
+                   vmstate-heap-top-memptr
+                   vmstate-heap-limit-memptr
+                   vmstate-heap-bitset-base-memptr
+                   vmstate-current-stack-memptr
+                   vmstate-system-stack-memptr
+                   vmstate-system-registers-memptr
+                   stack-frame-return-memptr
+                   stack-frame-liveness-map-memptr
+                   stack-size-memptr
+                   stack-frames-memptr
+                   stack-stack-pointer-memptr
+                   stack-pc-memptr]) :
+
+    val memptr = MemPtr(reg(BaseReg), OFFSET)
     defn get-field (dst:Gp) :
-      struct-get(BaseReg, OFFSET, dst)
+      mov(a, dst, memptr)      
     defn set-field (value:Gp) :
-      struct-set(BaseReg, OFFSET, value)
+      mov(a, memptr, value)
 
   ;Returns the location of the i'th local stored in the
-  ;current stack frame. 
+  ;current stack frame.
+  val stack-local-memptrs =
+    match(func-info:FuncInfo) :
+      to-tuple $
+        for i in 0 to num-locals() seq :
+          val offset = i * SIZEOF-LONG + STACK-FRAME-SLOTS-OFFSET
+          MemPtr(reg(StackPointerReg), offset)
+    else :
+      []
   defn stack-local (i:Int) -> Gp|MemPtr :
     if i < length(LOCAL-ITEMS) : reg(LOCAL-ITEMS[i])
     else : stack-local-mem(i)
   defn stack-local-mem (i:Int) -> MemPtr :
-    MemPtr(reg(StackPointerReg), i * SIZEOF-LONG + STACK-FRAME-SLOTS-OFFSET)
+    stack-local-memptrs[i]
 
   ;Returns the stack-local in a register.
   ;Use the given temporary register if necessary.
@@ -585,11 +627,15 @@ defn AsmGen (code:CodeHolder,
     xmm
 
   ;Retrieve the location of the i'th vm register.
+  ;(For memory-optimization, pre-generate the first 16 Memptr.)
+  val vm-register-memptrs = to-tuple $ for i in 0 to 16 seq :
+    MemPtr(reg(RegistersReg), i * SIZEOF-LONG)
   defn vm-register (i:Int) -> Gp|MemPtr :
     if i < length(VMREG-ITEMS) : reg(VMREG-ITEMS[i])
     else : vm-register-mem(i)
   defn vm-register-mem (i:Int) -> MemPtr :
-    MemPtr(reg(RegistersReg), i * SIZEOF-LONG)
+    if i < 16 : vm-register-memptrs[i]
+    else : MemPtr(reg(RegistersReg), i * SIZEOF-LONG)
 
   ;Retrieve the location of the i'th vm register.
   ;Use the given temporary register if necessary.
@@ -614,8 +660,8 @@ defn AsmGen (code:CodeHolder,
   ;The launcher stores:
   ;  VMState at RSP[8]
   ;  CRSP at RSP[0]
-  defn saved-vmstate () : MemPtr(rsp, 8)
-  defn saved-crsp () : MemPtr(rsp, 0)
+  val saved-vmstate = MemPtr(rsp, 8)
+  val saved-crsp = MemPtr(rsp, 0)
 
   ;=========================================================
   ;========= Switching Contexts and Cache Registers ========
@@ -722,7 +768,7 @@ defn AsmGen (code:CodeHolder,
   defn restore-reg (item:VMRegItem) :
     switch(item) :
       VMStateReg :
-        mov(a, reg(item), saved-vmstate())
+        mov(a, reg(item), saved-vmstate)
       RegistersReg :
         get-vmstate-registers(reg(item))
       FunctionsReg :
@@ -2531,7 +2577,7 @@ defn AsmGen (code:CodeHolder,
         false
 
       (ins:RecordLiveIns) :
-        val live-map = liveness-map(resolver, map(slot, live(ins)), num-locals())
+        val live-map = liveness-map(resolver, seq(slot, live(ins)), num-locals())
         mov(a, reg(Tmp1), live-map)
         set-liveness-map(reg(Tmp1))
 
@@ -2623,7 +2669,7 @@ defn AsmGen (code:CodeHolder,
             switch-context-stanza-to-jit(Exit, true, false)
             set-local(slot?(x(ins)), reg(VMStateReg), 8)
           (op:CRSPOp) :
-            mov(a, reg(Tmp1), saved-crsp())
+            mov(a, reg(Tmp1), saved-crsp)
             set-local(slot?(x(ins)), reg(Tmp1), 8)                
 
       (ins:Op1Ins) :
@@ -2890,19 +2936,22 @@ public defn encode (func:VMFunction, stubs:JITStubs, rt:JitRuntime, resolver:Enc
 
   ;Generate code for single fn
   defn emit-fn (code:CodeHolder, assembler:Assembler, trace-entry-table:Vector<TraceTableEntry>, f:VMFunc) :
-    val gen = AsmGen(code, assembler, resolver, func-info(f), trace-entry-table, backend)
-    emit-function-prelude(gen, args(f), extend-stack(stubs))
-    do(emit-ins{gen, _}, ins(f))    
+    within log-time(JIT-EMIT-FN) :
+      val gen = AsmGen(code, assembler, resolver, func-info(f), trace-entry-table, backend)
+      emit-function-prelude(gen, args(f), extend-stack(stubs))
+      do(emit-ins{gen, _}, ins(f))
 
   ;Launch!
-  val trace-entry-table = Vector<TraceTableEntry>()
-  val jit-func = within (code, assembler) = gen-code(rt) :
-    match(func) :
-      (func:VMMultifn) : emit-multifn(code, assembler, trace-entry-table, func)
-      (func:VMFunc) : emit-fn(code, assembler, trace-entry-table, func)
+  within log-time(JIT-ENCODER) :
+    val trace-entry-table = Vector<TraceTableEntry>()
+    val jit-func = within (code, assembler) = gen-code(rt) :
+      match(func) :
+        (func:VMMultifn) : emit-multifn(code, assembler, trace-entry-table, func)
+        (func:VMFunc) : emit-fn(code, assembler, trace-entry-table, func)
 
-  ;Relocate trace addresses
-  compute-absolute-addresses!(trace-entry-table, jit-func)
+    ;Relocate trace addresses
+    within log-time(COMPUTE-ABSOLUTE-ADDRESSES) :
+      compute-absolute-addresses!(trace-entry-table, jit-func)
 
-  ;Return the final encoded function
-  EncodedFunction(jit-func, trace-entry-table)
+    ;Return the final encoded function
+    EncodedFunction(jit-func, trace-entry-table)
