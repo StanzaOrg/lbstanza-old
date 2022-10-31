@@ -40,6 +40,8 @@ extern "C" {
   void assembler_jae(Assembler *a, Label *x);
   void assembler_jb(Assembler *a, Label *x);
   void assembler_jbe(Assembler *a, Label *x);
+  void assembler_jp(Assembler *a, Label *x);
+  void assembler_jnp(Assembler *a, Label *x);
   void assembler_jmp_label(Assembler *a, Label *label);
   void assembler_jmp_mem(Assembler *a, MemPtr *mem);
   void assembler_jmp_reg(Assembler *a, Gp *reg);
@@ -99,6 +101,8 @@ extern "C" {
   void assembler_set_ae(Assembler *a, const Gp *x);
   void assembler_set_b(Assembler *a, const Gp *x);
   void assembler_set_be(Assembler *a, const Gp *x);
+  void assembler_set_p(Assembler *a, const Gp *x);
+  void assembler_set_np(Assembler *a, const Gp *x);
   void assembler_movss_xmm_xmm(Assembler *a, const Xmm *dst, const Xmm *src);
   void assembler_movss_xmm_mem(Assembler *a, MemPtr *dst, const Xmm *src);
   void assembler_movss_mem_xmm(Assembler *a, const Xmm *dst, MemPtr *src);
