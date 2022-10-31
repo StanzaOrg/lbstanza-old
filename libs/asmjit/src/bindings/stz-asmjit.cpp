@@ -70,6 +70,12 @@ void assembler_je(Assembler *a, Label *label) {
 void assembler_jne(Assembler *a, Label *label) {
   a->jne(*label);
 }
+void assembler_jp(Assembler *a, Label *label) {
+  a->jp(*label);
+}
+void assembler_jnp(Assembler *a, Label *label) {
+  a->jnp(*label);
+}
 void assembler_js(Assembler *a, Label *label) {
   a->js(*label);
 }
@@ -278,6 +284,12 @@ void assembler_set_be(Assembler *a, const Gp *x) {
 }
 void assembler_set_c(Assembler *a, const Gp *x) {
   a->setc(*x);
+}
+void assembler_set_p(Assembler *a, const Gp *x) {
+  a->setp(*x);
+}
+void assembler_set_np(Assembler *a, const Gp *x) {
+  a->setnp(*x);
 }
 
 void assembler_movss_xmm_xmm(Assembler *a, const Xmm *dst, const Xmm *src) {

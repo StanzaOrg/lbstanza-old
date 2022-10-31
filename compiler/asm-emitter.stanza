@@ -9,6 +9,56 @@ defpackage stz/asm-emitter :
   ;import stz/ids
   import stz/backend
 
+;<doc>=======================================================
+;===================== Notes ================================
+;============================================================
+
+## Note on Floating Point Comparisons ##
+
+These are fairly tricky because of NaN.
+
+Given this instruction:
+
+  ucommiss B, A
+
+Here are the flag results:
+
+                | ZF  PF  CF
+  --------------------------              
+  A or B is nan |  1   1   1
+  A > B         |  0   0   0
+  A < B         |  0   0   1
+  A = B         |  1   0   0
+
+Therefore here are the implementations of the operations:
+
+To check A >= B:
+
+  Ensure CF = 0
+
+  SetAE
+
+To check A > B:
+
+  Ensure CF = 0 and ZF = 0
+
+  SetA
+
+To check A = B:
+
+  Ensure ZF = 1 and PF = 0
+
+  SetE AND SetNP
+
+To check A != B:
+
+  Ensure ZF = 0 OR PF = 1
+
+  SetNE OR SetP
+
+;============================================================
+;=======================================================<doc>
+
 ;============================================================
 ;================== Restrictions ============================
 ;============================================================
@@ -55,6 +105,8 @@ defn check-restriction (ins:Ins, backend:Backend) :
    ;     Assumptions about Operators
    ;     ---------------------------
    defn #DIVMOD! (op:Op) : RE() when op is-not DivModOp
+
+   defn #NanEQNE! (op:Op) : RE() when op is-not NanEqOp|NanNeOp
 
    ;     Compound Assumptions
    ;     --------------------
@@ -216,22 +268,16 @@ defn check-restriction (ins:Ins, backend:Backend) :
                (op:SubOp) : ncom-op()
                (op:MulOp) : reg-op()
                (op:DivOp) : ncom-op()
-               (op:EqOp) : cmp-op()
-               (op:NeOp) : cmp-op()
                (op:LtOp) : cmp-op()
                (op:GtOp) : cmp-op()
                (op:LeOp) : cmp-op()
                (op:GeOp) : cmp-op()
-               (op:UleOp) : cmp-op()
-               (op:UltOp) : cmp-op()
-               (op:UgtOp) : cmp-op()
-               (op:UgeOp) : cmp-op()
                (op) : RE()
          else : RE()
       (ins:DualOp) :
          val [t, x1, x2, op, y, z] = [type(ins), x1(ins), x2(ins), op(ins), y(ins), z(ins)]
          if #IL(t) : (#R0!(x1), #R3!(x2), #R!(y), #R!(z), #DIVMOD!(op), #neq!(x1, z), #neq!(x2, z))
-         else : RE()
+         else : (#R!(x1), #R!(x2), #F!(y), #F!(z), #NanEQNE!(op))
       (ins:Load) :
          val [t, x, y] = [type(ins), x(ins), y(ins)]
          #nExM!(y)
@@ -293,6 +339,16 @@ val REG-FLOAT-NAMES = [
    "%xmm8", "%xmm9", "%xmm10", "%xmm11",
    "%xmm12", "%xmm13", "%xmm14", "%xmm15"]
 
+;            Temporary Labels
+;            ================
+
+val TEMP-LABEL-COUNTER = to-seq(0 to false)
+
+;Generate a temporary label only for use by the
+;assembler.
+defn temp-label () -> ? :
+  val i = next(TEMP-LABEL-COUNTER)
+  "asm_temp_label%_" % [i]
 
 ;               Generation of Instructions
 ;               ==========================
@@ -596,13 +652,17 @@ defn gen (os:OutputStream, ins:Ins, backend:Backend) :
          (op:GeOp) : "ae"
 
    defn #fcmp (t:ASMType, x:Loc, y:Imm, op:Op, z:Imm) :
-      val comm = fcmp-suffix(op)
-      val sz = size-suffix(t)
-      match(y, z) :
-         (y:FReg, z:FReg) :
+      match(op) :
+         (op:GeOp|GtOp) :
+            val comm = fcmp-suffix(op)
+            val sz = size-suffix(t)
+            val y = y as FReg
+            val z = z as FReg
             #println(os, "   ucomis%_ %_, %_" % [sz, #imm(t,z), #imm(t,y)])
             #println(os, "   movq $0, %_" % [#imm(LongT(), x)])
-            #println(os, "   set%_ %_" % [comm, #imm(ByteT(), x)])
+            #println(os, "   set%_ %_" % [comm, #imm(ByteT(), x)])            
+         (op:LeOp|LtOp) :
+            #fcmp(t, x, z, swap(op), y)
 
    defn #br (t:ASMType, x:Imm, y:Imm, op:Op, z:Imm) :
       val sz = size-suffix(t)
@@ -616,13 +676,29 @@ defn gen (os:OutputStream, ins:Ins, backend:Backend) :
             #br(t, x, z, swap(op), y)
 
    defn #fbr (t:ASMType, x:Imm, y:Imm, op:Op, z:Imm) :
-      val sz = size-suffix(t)
-      val comm = fcmp-suffix(op)
-      match(y, z) :
-         (y:FReg, z:FReg) :
+      match(op) :
+         (op:GeOp|GtOp) :
             val x = x as Mem|ExMem
+            val sz = size-suffix(t)
+            val comm = fcmp-suffix(op)
             #println(os, "   ucomis%_ %_, %_" % [sz, #imm(t,z), #imm(t,y)])
             #println(os, "   j%_ %_ + %_" % [comm, #lbl(x), offset(x)])
+         (op:LeOp|LtOp) :
+            #fbr(t, x, z, swap(op), y)
+         (op:NeOp) :
+            val x = x as Mem|ExMem
+            val sz = size-suffix(t)
+            #println(os, "   ucomis%_ %_, %_" % [sz, #imm(t,z), #imm(t,y)])
+            #println(os, "   jne %_ + %_" % [#lbl(x), offset(x)])
+            #println(os, "   jp %_ + %_" % [#lbl(x), offset(x)])            
+         (op:EqOp) :
+            val x = x as Mem|ExMem
+            val sz = size-suffix(t)
+            val tmp-label = temp-label()
+            #println(os, "   ucomis%_ %_, %_" % [sz, #imm(t,z), #imm(t,y)])
+            #println(os, "   jp %_" % [tmp-label])
+            #println(os, "   je %_ + %_" % [#lbl(x), offset(x)])            
+            #println(os, "%_:" % [tmp-label])
 
    ;     Dual Divide Operator
    ;     --------------------
@@ -636,6 +712,29 @@ defn gen (os:OutputStream, ins:Ins, backend:Backend) :
       else :
          #set(t, x1, y)
          #divmod(t, x1, x2, x1, op z)
+
+   ;     NanNe|NanEq Operator
+   ;     --------------------
+   defn #nan-eq-ne (t:ASMType, x1:Loc, x2:Loc, arg-y:Imm, op:Op, arg-z:Imm) :
+      val y = arg-y as FReg
+      val z = arg-z as FReg
+      val sz = size-suffix(t)
+      val x1-byte = #imm(ByteT(), x1)
+      val x2-byte = #imm(ByteT(), x2)
+      val x1-long = #imm(LongT(), x1)
+      val x2-long = #imm(LongT(), x2)
+      #println(os, "   ucomis%_ %_, %_" % [sz, #imm(t,z), #imm(t,y)])
+      #println(os, "   movq $0, %_" % [x1-long])
+      #println(os, "   movq $0, %_" % [x2-long])
+      match(op) :
+        (op:NanEqOp) :
+          #println(os, "   sete %_" % [x1-byte])
+          #println(os, "   setnp %_" % [x2-byte])
+          #println(os, "   andq %_, %_" % [x2-long, x1-long])
+        (op:NanNeOp) :
+          #println(os, "   setne %_" % [x1-byte])
+          #println(os, "   setp %_" % [x2-byte])
+          #println(os, "   orq %_, %_" % [x2-long, x1-long])
 
    ;====== Driver ======
    match(ins) :
@@ -685,19 +784,15 @@ defn gen (os:OutputStream, ins:Ins, backend:Backend) :
                (op:SubOp) : #fncom(t, x, y, op, z)
                (op:MulOp) : #fcom(t, x, y, op, z)
                (op:DivOp) : #fncom(t, x, y, op, z)
-               (op:EqOp) : #fcmp(t, x, y, op, z)
-               (op:NeOp) : #fcmp(t, x, y, op, z)
                (op:LtOp) : #fcmp(t, x, y, op, z)
                (op:GtOp) : #fcmp(t, x, y, op, z)
                (op:LeOp) : #fcmp(t, x, y, op, z)
                (op:GeOp) : #fcmp(t, x, y, op, z)
-               (op:UleOp) : #fcmp(t, x, y, op, z)
-               (op:UltOp) : #fcmp(t, x, y, op, z)
-               (op:UgtOp) : #fcmp(t, x, y, op, z)
-               (op:UgeOp) : #fcmp(t, x, y, op, z)
       (ins:DualOp) :
          val [t, x1, x2, op, y, z] = [type(ins), x1(ins), x2(ins), op(ins), y(ins), z(ins)]
-         #divmod(t, x1, x2, y, op, z)
+         match(op) :
+           (op:DivModOp) : #divmod(t, x1, x2, y, op, z)
+           (op:NanEqOp|NanNeOp) : #nan-eq-ne(t, x1, x2, y, op, z)
       (ins:Load) :
          #load(type(ins), x(ins), y(ins), offset(ins))
       (ins:Store) :
