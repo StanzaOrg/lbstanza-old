@@ -46,7 +46,7 @@ defatom string (x:String) :
     for c in x do : #write[char](c)
   reader :
     val len = #read[length]
-    val str = uninitialized-string(len)
+    val str = stz/fastio-runtime/uninitialized-string(len)
     read-chars(str, #buffer)
     str
   skip :
