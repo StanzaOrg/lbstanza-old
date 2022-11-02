@@ -2326,11 +2326,13 @@ static bool request_stackTrace(const JSObject* request) {
   def(LOCALS,     "Locals",     "locals"    )\
   def(GLOBALS,    "Globals",    "globals"   )
 enum {
+  INITIAL_SCOPE,  // O.P: It looks like VSCode requires strictly positive scope id
   #define DEF_SCOPE_ID(id, name, hint) SCOPE_ID_##id,
     VARIABLE_SCOPES(DEF_SCOPE_ID)
   #undef DEF_SCOPE_ID
   NUMBER_OF_SCOPES
 };
+uint32_t get_named_variable_count_in_scope(const uint32_t scope_id);
 
 // Varaiable attributes (must be knwn to the debugger)
 enum {
@@ -2350,23 +2352,77 @@ static inline const char* variable_visibility(const unsigned variable_attributes
   return names[variable_attributes & VARIABLE_VISIBILITY_MASK];
 }
 
+static inline ssize_t align_down(const ssize_t value, const ssize_t granularity) {
+  return value & (-granularity);
+}
+static inline ssize_t align_up(const ssize_t value, const ssize_t granularity) {
+  return align_down(value + (granularity - 1), granularity);
+}
+
+enum {
+  VARIABLE_LOG_MAX_FIELDS_IN_CHUNK = 10,
+  VARIABLE_MAX_FIELDS_IN_CHUNK = 1 << VARIABLE_LOG_MAX_FIELDS_IN_CHUNK
+};
+static inline ssize_t align_field_index_down(const ssize_t index) {
+  return align_down(index, VARIABLE_MAX_FIELDS_IN_CHUNK);
+}
+static inline ssize_t align_field_index_up(const ssize_t index) {
+  return align_up(index, VARIABLE_MAX_FIELDS_IN_CHUNK);
+}
 typedef struct {
-  const char* name;     // Not owned by Variable
-  const char* type;     // Not owned by Variable
-  char* value;          // Optional, owned by Variable
+  char* name;         // Owned by Variable
+  const char* type;   // Optional, not owned by Variable
+  char* value;        // Optional, owned by Variable
   ssize_t named_fields_count;
   ssize_t indexed_fields_count;
+  ssize_t first_field_index;
   uint8_t attributes;
 } Variable;
-static inline void Variable_initialize(Variable* var, const char* name) {
-  var->name = name;
+static inline ssize_t Variable_fields_count(const Variable* var) {
+  return var->named_fields_count + var->indexed_fields_count;
+}
+static inline ssize_t Variable_has_large_fields_count(const Variable* var) {
+  return Variable_fields_count(var) >> VARIABLE_LOG_MAX_FIELDS_IN_CHUNK;
+}
+static inline Variable* Variable_initialize(Variable* var, const char* name) {
+  var->name = strdup(name);
   var->type = NULL;
   var->value = NULL;
   var->named_fields_count = 0;
   var->indexed_fields_count = 0;
+  var->first_field_index = 0;
+  return var;
 }
-static inline void Variable_destroy(Variable* var) {
+static inline void Variable_destroy(const Variable* var) {
+  free(var->name);
   free(var->value);
+}
+static void JSBuilder_write_variable_field_counts(JSBuilder* builder, const Variable* var) {
+  JSBuilder_write_optional_unsigned_field(builder, "namedVariables", var->named_fields_count);
+  JSBuilder_write_optional_unsigned_field(builder, "indexedVariables", var->indexed_fields_count);
+}
+static inline void JSBuilder_write_variable(JSBuilder* builder, const Variable* var, const uint64_t var_id) {
+  JSBuilder_object_begin(builder);
+  {
+    // Variable with zero fields must have zero id.
+    JSBuilder_write_unsigned_field(builder, "variablesReference", Variable_fields_count(var) ? var_id : 0);
+    JSBuilder_write_raw_string_field(builder, "name", var->name);
+    JSBuilder_write_optional_string_field(builder, "type", var->type);
+    JSBuilder_write_string_field(builder, "value", var->value);
+    JSBuilder_write_variable_field_counts(builder, var);
+
+    const unsigned attributes = var->attributes;
+    if (attributes) {
+      JSBuilder_object_field_begin(builder, "presentationHint");
+      {
+        if (attributes & VARIABLE_CONSTANT)
+          JSBuilder_write_raw_string_field(builder, "attributes", "constant");
+        JSBuilder_write_optional_raw_string_field(builder, "visibility", variable_visibility(attributes));
+      }
+      JSBuilder_object_field_end(builder);
+    }
+  }
+  JSBuilder_object_end(builder);
 }
 
 typedef struct {
@@ -2390,16 +2446,16 @@ static inline void Environment_reset(Environment* env) {
   Environment_destroy(env);
   Environment_initialize(env);
 }
-static inline Variable* Environment_allocate(Environment* env) {
+static inline Variable* Environment_allocate(Environment* env, const char* name) {
   if (env->length == env->capacity) {
     env->capacity <<= 1;
     env->data = realloc(env->data, env->capacity * sizeof(Variable));
     //TODO: handle possible OOM
   }
-  return env->data + env->length++;
+  return Variable_initialize(env->data + env->length++, name);
 }
 
-static Environment current_frame_env;
+static Environment current_frame_env; // Belongs to the app thread
 static int64_t current_frame_id = INVALID_FRAME_ID;
 
 typedef struct {
@@ -2410,13 +2466,14 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
   const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
   current_frame_id = req->frame_id;
   Environment_reset(&current_frame_env);
+  Environment_allocate(&current_frame_env, "Initial scope");
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   {
     JSBuilder_array_field_begin(&builder, "scopes");
-    for (int scope_id = 0; scope_id < NUMBER_OF_SCOPES; scope_id++) {
+    while (current_frame_env.length < NUMBER_OF_SCOPES) {
       JSBuilder_next(&builder);
       JSBuilder_object_begin(&builder);
       {
@@ -2425,13 +2482,15 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
             VARIABLE_SCOPES(DEF_SCOPE_ATTRIBUTES)
           #undef DEF_SCOPE_ATTRIBUTES
         };
-        const char* scope_name = scope_attributes[scope_id].name;
-        const char* scope_hint = scope_attributes[scope_id].hint;
-        Variable* var = Environment_allocate(&current_frame_env);
-        Variable_initialize(var, scope_name);
+        const ssize_t scope_id = current_frame_env.length;
+        const char* scope_name = scope_attributes[scope_id - 1].name;
+        const char* scope_hint = scope_attributes[scope_id - 1].hint;
+        Variable* var = Environment_allocate(&current_frame_env, scope_name);
         JSBuilder_write_raw_string_field(&builder, "name", scope_name);
         JSBuilder_write_raw_string_field(&builder, "presentationHint", scope_hint);
         JSBuilder_write_unsigned_field(&builder, "variablesReference", scope_id);
+        var->named_fields_count = get_named_variable_count_in_scope(scope_id);
+        JSBuilder_write_variable_field_counts(&builder, var);
         JSBuilder_write_bool_field(&builder, "expensive", false);
       }
       JSBuilder_object_end(&builder);
@@ -2554,8 +2613,28 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   const DelayedRequestVariables* req = (const DelayedRequestVariables*)request;
 
   const uint64_t variable_id = req->variable_id;
-  const ssize_t start_index = current_frame_env.length;
-  if (variable_id < (uint64_t)start_index) {
+  if (variable_id >= (uint64_t)current_frame_env.length) {  // Sanity check for variable id
+    respond_to_delayed_request(request, "Invalid variable reference");
+    return;
+  }
+
+  uint64_t fields_start = req->start;
+  uint64_t fields_limit = fields_start + req->count;
+  Variable* var = current_frame_env.data + variable_id;
+  const uint64_t fields_count = Variable_fields_count(var);
+  if (fields_start > fields_count) fields_start = fields_count;
+  if (fields_limit > fields_count) fields_limit = fields_count;
+
+  if (fields_limit > fields_start && !var->first_field_index) {
+    var->first_field_index = current_frame_env.length;
+    for (uint64_t i = 0; i < fields_count; i++) {
+      static char buffer[17];
+      snprintf(buffer, sizeof buffer, "var%" PRIu64, i);
+      Variable* field = Environment_allocate(&current_frame_env, buffer);
+      field->type = "int";
+      snprintf(buffer, sizeof buffer, "%" PRIu64, i);
+      field->value = strdup(buffer);
+    }
     // TODO: ask debugger to add `count` of variable at `variable_id` in `current_frame_id`,
     // startung from `start` kid to current_frame_env, formatting their values according to `hex`
   }
@@ -2566,30 +2645,11 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   {
     JSBuilder_array_field_begin(&builder, "variables");
     const Variable* data = current_frame_env.data;
-    for (ssize_t var_id = start_index, limit = current_frame_env.length; var_id < limit; var_id++) {
+    const Variable* var = data + variable_id;
+    const uint64_t start = var->first_field_index + fields_start;
+    for (uint64_t i = start, limit = i + (fields_limit - fields_start); i < limit; i++) {
       JSBuilder_next(&builder);
-      JSBuilder_object_begin(&builder);
-      {
-        const Variable* var = data + var_id;
-        JSBuilder_write_unsigned_field(&builder, "variablesReference", var_id);
-        JSBuilder_write_raw_string_field(&builder, "name", var->name);
-        JSBuilder_write_optional_string_field(&builder, "type", var->type);
-        JSBuilder_write_string_field(&builder, "value", var->value);
-        JSBuilder_write_optional_unsigned_field(&builder, "namedVariables", var->named_fields_count);
-        JSBuilder_write_optional_unsigned_field(&builder, "indexedVariables", var->indexed_fields_count);
-
-        const unsigned attributes = var->attributes;
-        if (attributes) {
-          JSBuilder_object_field_begin(&builder, "presentationHint");
-          {
-            if (attributes & VARIABLE_CONSTANT)
-              JSBuilder_write_raw_string_field(&builder, "attributes", "constant");
-            JSBuilder_write_optional_raw_string_field(&builder, "visibility", variable_visibility(attributes));
-          }
-          JSBuilder_object_field_end(&builder);
-        }
-      }
-      JSBuilder_object_end(&builder);
+      JSBuilder_write_variable(&builder, data + i, i);
     }
     JSBuilder_array_field_end(&builder);
   }
@@ -2601,7 +2661,10 @@ static inline DelayedRequest* DelayedRequestVariables_create(const JSObject* req
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   req->variable_id = JSObject_get_integer_field(arguments, "variablesReference", -1);
   req->start = JSObject_get_integer_field(arguments, "start", 0);
-  req->count = JSObject_get_integer_field(arguments, "count", UINT64_MAX);
+  // Missing or zero 'count' denotes all fields starting with 'start'
+  uint64_t count = JSObject_get_integer_field(arguments, "count", 0);
+  if (!count) count = UINT64_MAX;
+  req->count = count;
   const JSObject* format = JSObject_get_object_field(arguments, "format");
   req->hex = JSObject_get_bool_field(format, "hex", false);
   return (DelayedRequest*) req;
