@@ -2335,7 +2335,7 @@ enum {
   #undef DEF_SCOPE_ID
   NUMBER_OF_SCOPES
 };
-uint32_t get_named_variable_count_in_scope(const uint32_t scope_id);
+uint32_t number_of_variables_in_scope(const uint32_t scope_id);
 
 // Varaiable attributes (must be knwn to the debugger)
 enum {
@@ -2360,20 +2360,15 @@ typedef struct {
   const char* type;       // Optional, not owned by Variable
   char* value;            // Optional, owned by Variable
   size_t fields_base;
-  size_t named_fields_count;
-  size_t indexed_fields_count;
+  size_t fields_count;
   uint8_t attributes;
 } Variable;
-static inline size_t Variable_fields_count(const Variable* var) {
-  return var->named_fields_count + var->indexed_fields_count;
-}
 static inline Variable* Variable_initialize(Variable* var, const char* name) {
   var->name = strdup(name);
   var->type = NULL;
   var->value = NULL;
+  var->fields_count = 0;
   var->fields_base = 0;
-  var->named_fields_count = 0;
-  var->indexed_fields_count = 0;
   var->attributes = 0;
   return var;
 }
@@ -2381,19 +2376,18 @@ static inline void Variable_destroy(const Variable* var) {
   free(var->name);
   free(var->value);
 }
-static void JSBuilder_write_variable_field_counts(JSBuilder* builder, const Variable* var) {
-  JSBuilder_write_optional_unsigned_field(builder, "namedVariables", var->named_fields_count);
-  JSBuilder_write_optional_unsigned_field(builder, "indexedVariables", var->indexed_fields_count);
+static void JSBuilder_write_variable_fields_count(JSBuilder* builder, const Variable* var) {
+  JSBuilder_write_optional_unsigned_field(builder, "namedVariables", var->fields_count);
 }
 static inline void JSBuilder_write_variable(JSBuilder* builder, const Variable* var, const uint64_t var_id) {
   JSBuilder_object_begin(builder);
   {
     // Variable with zero fields must have zero id.
-    JSBuilder_write_unsigned_field(builder, "variablesReference", Variable_fields_count(var) ? var_id : 0);
+    JSBuilder_write_unsigned_field(builder, "variablesReference", var->fields_count ? var_id : 0);
     JSBuilder_write_raw_string_field(builder, "name", var->name);
     JSBuilder_write_optional_string_field(builder, "type", var->type);
     JSBuilder_write_string_field(builder, "value", var->value);
-    JSBuilder_write_variable_field_counts(builder, var);
+    JSBuilder_write_variable_fields_count(builder, var);
 
     const unsigned attributes = var->attributes;
     if (attributes) {
@@ -2442,6 +2436,13 @@ static inline Variable* Environment_allocate(Environment* env, const char* name)
 static Environment current_frame_env; // Belongs to the app thread
 static int64_t current_frame_id = INVALID_FRAME_ID;
 
+void append_variable(const char* name, const char* value, uint64_t fields_count, uint8_t attributes) {
+  Variable* v = Environment_allocate(&current_frame_env, name);
+  v->value = strdup(value);
+  v->fields_count = fields_count;
+  v->attributes = attributes;
+}
+
 typedef struct {
   DelayedRequest parent;
   int64_t frame_id;
@@ -2473,8 +2474,8 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
         JSBuilder_write_raw_string_field(&builder, "name", scope_name);
         JSBuilder_write_raw_string_field(&builder, "presentationHint", scope_hint);
         JSBuilder_write_unsigned_field(&builder, "variablesReference", scope_id);
-        var->named_fields_count = get_named_variable_count_in_scope(scope_id);
-        JSBuilder_write_variable_field_counts(&builder, var);
+        var->fields_count = number_of_variables_in_scope(scope_id);
+        JSBuilder_write_variable_fields_count(&builder, var);
         JSBuilder_write_bool_field(&builder, "expensive", false);
       }
       JSBuilder_object_end(&builder);
@@ -2602,7 +2603,7 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
 
   Variable* var = current_frame_env.data + variable_id;
   size_t fields_base = var->fields_base;
-  const uint64_t fields_count = Variable_fields_count(var);
+  const uint64_t fields_count = var->fields_count;
   if (fields_count && !fields_base) {
     fields_base = current_frame_env.length;
     var->fields_base = fields_base;
