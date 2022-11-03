@@ -19,6 +19,9 @@
   typedef int SOCKET;
 #endif
 
+static inline void* memclear(void* data, size_t size) {
+  return memset(data, 0, size);
+}
 static const char* current_error(void) {
   return strerror(errno);
 }
@@ -37,7 +40,7 @@ static void log_printf(const char* fmt, ...) {
     pthread_mutex_unlock(&log_lock);
   }
 }
-static void log_packet(const char* prefix, const char* data, ssize_t length) {
+static void log_packet(const char* prefix, const char* data, size_t length) {
   if (debug_adapter_log) {
     pthread_mutex_lock(&log_lock);
 
@@ -50,8 +53,8 @@ static void log_packet(const char* prefix, const char* data, ssize_t length) {
 }
 
 typedef struct {
-  ssize_t length;
-  ssize_t capacity;
+  size_t length;
+  size_t capacity;
   char** data;
 } StringVector;
 static void StringVector_initialize(StringVector* vector) {
@@ -98,18 +101,18 @@ static inline void free_path(const char* s) {
 
 // I/O interface and its implementation over files and sockets.
 // Note: I am not sure why is this necessary in LLDB.
-static ssize_t (*debug_adapter_read) (char* data, ssize_t length);
-static ssize_t (*debug_adapter_write) (const char* data, ssize_t length);
+static ssize_t (*debug_adapter_read) (char* data, size_t length);
+static ssize_t (*debug_adapter_write) (const char* data, size_t length);
 
 static SOCKET debug_adapter_socket;
-static ssize_t read_from_socket(char* data, ssize_t length) {
+static ssize_t read_from_socket(char* data, size_t length) {
   const ssize_t bytes_received = recv(debug_adapter_socket, data, length, 0);
 #ifdef PLATFORM_WINDOWS
   errno = WSAGetLastError();
 #endif
   return bytes_received;
 }
-static ssize_t write_to_socket(const char* data, ssize_t length) {
+static ssize_t write_to_socket(const char* data, size_t length) {
   const ssize_t bytes_sent = send(debug_adapter_socket, data, length, 0);
 #ifdef PLATFORM_WINDOWS
   errno = WSAGetLastError();
@@ -119,14 +122,14 @@ static ssize_t write_to_socket(const char* data, ssize_t length) {
 
 static int debug_adapter_input_fd;
 static int debug_adapter_output_fd;
-static ssize_t read_from_file(char* data, ssize_t length) {
+static ssize_t read_from_file(char* data, size_t length) {
   return read(debug_adapter_input_fd, data, length);
 }
-static ssize_t write_to_file(const char* data, ssize_t length) {
+static ssize_t write_to_file(const char* data, size_t length) {
   return write(debug_adapter_output_fd, data, length);
 }
 
-static void write_full(const char* data, ssize_t length) {
+static void write_full(const char* data, size_t length) {
   while (length) {
     const ssize_t bytes_written = (*debug_adapter_write)(data, length);
     if (bytes_written < 0) {
@@ -141,7 +144,7 @@ static void write_full(const char* data, ssize_t length) {
   }
 }
 
-static bool read_full(char* data, ssize_t length) {
+static bool read_full(char* data, size_t length) {
   while (length) {
     const ssize_t bytes_read = (*debug_adapter_read)(data, length);
     if (bytes_read == 0) {
@@ -170,7 +173,7 @@ static inline void write_unsigned(const unsigned long long v) {
   snprintf(buffer, sizeof buffer, "%llu", v);
   write_string(buffer);
 }
-static inline void write_packet(const char* data, const ssize_t length) {
+static inline void write_packet(const char* data, const size_t length) {
   pthread_mutex_lock(&send_lock);
 
   write_string("Content-Length: ");
@@ -185,10 +188,10 @@ static inline void write_packet(const char* data, const ssize_t length) {
 
 static bool read_expected(const char* expected) {
   char buffer[32];
-  ssize_t length = strlen(expected);
+  size_t length = strlen(expected);
   return read_full(buffer, length) && memcmp(buffer, expected, length) == 0;
 }
-static inline ssize_t read_unsigned(void) {
+static inline size_t read_unsigned(void) {
   char buffer[32];
   int count = 0;
   char c;
@@ -251,8 +254,8 @@ typedef struct {
 } JSObject;
 
 typedef struct {
-  ssize_t length;
-  ssize_t capacity;
+  size_t length;
+  size_t capacity;
   struct JS_VALUE* data;
 } JSArray;
 
@@ -410,7 +413,7 @@ typedef struct {
   char error[256];
 } JSParser;
 
-static inline void JSParser_initialize(JSParser* parser, const char* data, ssize_t length) {
+static inline void JSParser_initialize(JSParser* parser, const char* data, size_t length) {
   parser->start = data;
   parser->p = data;
   parser->limit = data + length;
@@ -440,7 +443,7 @@ static char JSParser_next(JSParser* parser) {
 }
 
 static bool JSParser_expect(JSParser* parser, const char* s) {
-  ssize_t length = strlen(s) - 1; // First character has already matched
+  size_t length = strlen(s) - 1; // First character has already matched
   if (!memcmp(parser->p, s + 1, length)) { // Parser text buffer is zero-terminated
     parser->p += length;
     return true;
@@ -547,8 +550,8 @@ static bool JSParser_parse_value(JSParser* parser, JSValue* value) {
 }
 
 typedef struct {
-  ssize_t length;
-  ssize_t capacity;
+  size_t length;
+  size_t capacity;
   char* data;
   int indent;
   uint64_t nexts;  // Stack of bit nexts of nested lists
@@ -583,10 +586,10 @@ static inline void JSBuilder_pop_nexts(JSBuilder* builder) {
   builder->nexts >>= 1;
 }
 
-static void JSBuilder_ensure_capacity(JSBuilder* builder, ssize_t size) {
-  ssize_t capacity = builder->capacity;
-  const ssize_t length = builder->length;
-  const ssize_t required_capacity = length + size;
+static void JSBuilder_ensure_capacity(JSBuilder* builder, size_t size) {
+  size_t capacity = builder->capacity;
+  const size_t length = builder->length;
+  const size_t required_capacity = length + size;
   if (required_capacity <= capacity) return;
 
   while (capacity < required_capacity)
@@ -598,7 +601,7 @@ static void JSBuilder_ensure_capacity(JSBuilder* builder, ssize_t size) {
   //TODO: handle possible OOM
   free(data);
 }
-static char* JSBuilder_allocate(JSBuilder* builder, ssize_t size) {
+static char* JSBuilder_allocate(JSBuilder* builder, size_t size) {
   JSBuilder_ensure_capacity(builder, size);
   char* data = builder->data + builder->length;
   builder->length += size;
@@ -607,7 +610,7 @@ static char* JSBuilder_allocate(JSBuilder* builder, ssize_t size) {
 static void JSBuilder_append_char(JSBuilder* builder, char c) {
   JSBuilder_allocate(builder, 1)[0] = c;
 }
-static void JSBuilder_append_text(JSBuilder* builder, const char* data, ssize_t length) {
+static void JSBuilder_append_text(JSBuilder* builder, const char* data, size_t length) {
   if (length)
     memcpy(JSBuilder_allocate(builder, length), data, length);
 }
@@ -637,7 +640,7 @@ static void JSBuilder_write_quoted_raw_string(JSBuilder* builder, const char* s)
 static inline char hex_nybble(char c) {
   return "0123456789ABCDEF"[c & 0xF];
 }
-static void JSBuilder_write_quoted_text(JSBuilder* builder, const char* data, ssize_t length) {
+static void JSBuilder_write_quoted_text(JSBuilder* builder, const char* data, size_t length) {
   JSBuilder_append_quotes(builder);
   for (const char* limit = data + length;;) {
     const char* p = data;
@@ -1142,7 +1145,7 @@ static inline const char* output_category(const OutputType type) {
   return names[type];
 }
 
-static void send_output(const OutputType out, const char* data, ssize_t length) {
+static void send_output(const OutputType out, const char* data, size_t length) {
   assert(length > 0);
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "output");
@@ -1745,8 +1748,8 @@ typedef struct {
 } SourceBreakpoint;
 
 typedef struct {
-  ssize_t length;
-  ssize_t capacity;
+  size_t length;
+  size_t capacity;
   SourceBreakpoint* data;
 } SourceBreakpointVector;
 static void SourceBreakpointVector_initialize(SourceBreakpointVector* vector) {
@@ -1774,8 +1777,8 @@ typedef struct {
   bool verified;
 } Breakpoint;
 typedef struct {
-  ssize_t length;
-  ssize_t capacity;
+  size_t length;
+  size_t capacity;
   Breakpoint* data;
 } BreakpointVector;
 static void BreakpointVector_initialize(BreakpointVector* vector) {
@@ -2167,8 +2170,8 @@ typedef struct {
   int64_t column;       // 1-based, 0 denotes unknown
 } StackTraceFrame;
 typedef struct {
-  ssize_t length;
-  ssize_t capacity;
+  size_t length;
+  size_t capacity;
   StackTraceFrame* data;
 } StackTrace;
 static void StackTrace_initialize(StackTrace* st) {
@@ -2352,50 +2355,43 @@ static inline const char* variable_visibility(const unsigned variable_attributes
   return names[variable_attributes & VARIABLE_VISIBILITY_MASK];
 }
 
-static inline ssize_t align_down(const ssize_t value, const ssize_t granularity) {
-  return value & (-granularity);
-}
-static inline ssize_t align_up(const ssize_t value, const ssize_t granularity) {
-  return align_down(value + (granularity - 1), granularity);
-}
-
 enum {
-  VARIABLE_LOG_MAX_FIELDS_IN_CHUNK = 10,
-  VARIABLE_MAX_FIELDS_IN_CHUNK = 1 << VARIABLE_LOG_MAX_FIELDS_IN_CHUNK
+  LOG_FIELDS_IN_CHUNK = 10,
+  FIELDS_IN_CHUNK = 1 << LOG_FIELDS_IN_CHUNK,
+  FIELDS_IN_CHUNK_MASK = FIELDS_IN_CHUNK - 1
 };
-static inline ssize_t align_field_index_down(const ssize_t index) {
-  return align_down(index, VARIABLE_MAX_FIELDS_IN_CHUNK);
+static inline size_t fields_index_size(const size_t fields_count) {
+  const size_t length = (fields_count + FIELDS_IN_CHUNK_MASK) >> LOG_FIELDS_IN_CHUNK;
+  return length * sizeof(size_t);
 }
-static inline ssize_t align_field_index_up(const ssize_t index) {
-  return align_up(index, VARIABLE_MAX_FIELDS_IN_CHUNK);
+static inline uint64_t field_index(const size_t* fields_index, const uint64_t i) {
+  return fields_index[i >> LOG_FIELDS_IN_CHUNK] + (i & FIELDS_IN_CHUNK_MASK);
 }
 typedef struct {
-  char* name;         // Owned by Variable
-  const char* type;   // Optional, not owned by Variable
-  char* value;        // Optional, owned by Variable
-  ssize_t named_fields_count;
-  ssize_t indexed_fields_count;
-  ssize_t first_field_index;
+  char* name;             // Owned by Variable
+  const char* type;       // Optional, not owned by Variable
+  char* value;            // Optional, owned by Variable
+  size_t* fields_index;  // Lazily allocated, owned by variable
+  size_t named_fields_count;
+  size_t indexed_fields_count;
   uint8_t attributes;
 } Variable;
-static inline ssize_t Variable_fields_count(const Variable* var) {
+static inline size_t Variable_fields_count(const Variable* var) {
   return var->named_fields_count + var->indexed_fields_count;
-}
-static inline ssize_t Variable_has_large_fields_count(const Variable* var) {
-  return Variable_fields_count(var) >> VARIABLE_LOG_MAX_FIELDS_IN_CHUNK;
 }
 static inline Variable* Variable_initialize(Variable* var, const char* name) {
   var->name = strdup(name);
   var->type = NULL;
   var->value = NULL;
+  var->fields_index = NULL;
   var->named_fields_count = 0;
   var->indexed_fields_count = 0;
-  var->first_field_index = 0;
   return var;
 }
 static inline void Variable_destroy(const Variable* var) {
   free(var->name);
   free(var->value);
+  free(var->fields_index);
 }
 static void JSBuilder_write_variable_field_counts(JSBuilder* builder, const Variable* var) {
   JSBuilder_write_optional_unsigned_field(builder, "namedVariables", var->named_fields_count);
@@ -2426,8 +2422,8 @@ static inline void JSBuilder_write_variable(JSBuilder* builder, const Variable* 
 }
 
 typedef struct {
-  ssize_t length;
-  ssize_t capacity;
+  size_t length;
+  size_t capacity;
   Variable* data;
 } Environment;
 static inline void Environment_initialize(Environment* env) {
@@ -2482,7 +2478,7 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
             VARIABLE_SCOPES(DEF_SCOPE_ATTRIBUTES)
           #undef DEF_SCOPE_ATTRIBUTES
         };
-        const ssize_t scope_id = current_frame_env.length;
+        const size_t scope_id = current_frame_env.length;
         const char* scope_name = scope_attributes[scope_id - 1].name;
         const char* scope_hint = scope_attributes[scope_id - 1].hint;
         Variable* var = Environment_allocate(&current_frame_env, scope_name);
@@ -2622,11 +2618,18 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   uint64_t fields_limit = fields_start + req->count;
   Variable* var = current_frame_env.data + variable_id;
   const uint64_t fields_count = Variable_fields_count(var);
+  size_t* fields_index = var->fields_index;
   if (fields_start > fields_count) fields_start = fields_count;
   if (fields_limit > fields_count) fields_limit = fields_count;
 
-  if (fields_limit > fields_start && !var->first_field_index) {
-    var->first_field_index = current_frame_env.length;
+  if (fields_limit > fields_start) {
+    if (!fields_index) {
+      const size_t index_size = fields_index_size(fields_count);
+      fields_index = memclear(malloc(index_size), index_size);
+      var->fields_index = fields_index;
+    }
+    var = NULL; // Nuke 'var', it may become invalid when 'env.data' expands.
+    if (!fields_index[0]) fields_index[0] = current_frame_env.length;
     for (uint64_t i = 0; i < fields_count; i++) {
       static char buffer[17];
       snprintf(buffer, sizeof buffer, "var%" PRIu64, i);
@@ -2645,11 +2648,10 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   {
     JSBuilder_array_field_begin(&builder, "variables");
     const Variable* data = current_frame_env.data;
-    const Variable* var = data + variable_id;
-    const uint64_t start = var->first_field_index + fields_start;
-    for (uint64_t i = start, limit = i + (fields_limit - fields_start); i < limit; i++) {
+    for (uint64_t i = fields_start; i < fields_limit; i++) {
       JSBuilder_next(&builder);
-      JSBuilder_write_variable(&builder, data + i, i);
+      const size_t index = field_index(fields_index, i);
+      JSBuilder_write_variable(&builder, data + index, index);
     }
     JSBuilder_array_field_end(&builder);
   }
@@ -2910,7 +2912,7 @@ static bool (*request_handlers[])(const JSObject*) = {
 };
 #undef FOR_EACH_REQUEST
 
-static inline bool parse_request(JSValue* value, const char* data, ssize_t length) {
+static inline bool parse_request(JSValue* value, const char* data, size_t length) {
   JSParser parser;
   JSParser_initialize(&parser, data, length);
   if (JSParser_parse_value(&parser, value) && JSParser_skip_spaces(&parser) != parser.limit)
@@ -3063,7 +3065,7 @@ int main(int argc, char** argv) {
 
     {
       struct sockaddr_in serv_addr;
-      memset(&serv_addr, 0, sizeof serv_addr);
+      memclear(&serv_addr, sizeof serv_addr);
       serv_addr.sin_family = AF_INET;
       serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
       serv_addr.sin_port = htons(port);
