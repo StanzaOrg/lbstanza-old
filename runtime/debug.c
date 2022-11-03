@@ -2356,24 +2356,27 @@ static inline const char* variable_visibility(const unsigned variable_attributes
 }
 
 typedef struct {
-  char* name;             // Owned by Variable
-  const char* type;       // Optional, not owned by Variable
-  char* value;            // Optional, owned by Variable
-  size_t fields_base;
+  char* name;           // Owned by Variable
+  char* type;           // Owned by Variable
+  char* value;          // Owned by Variable
+  const void* ref;
   size_t fields_count;
+  size_t fields_base;
   uint8_t attributes;
 } Variable;
-static inline Variable* Variable_initialize(Variable* var, const char* name) {
+static inline Variable* Variable_initialize(Variable* var, const void* ref, const char* name, size_t fields_count) {
   var->name = strdup(name);
   var->type = NULL;
   var->value = NULL;
-  var->fields_count = 0;
+  var->ref = ref;
+  var->fields_count = fields_count;
   var->fields_base = 0;
   var->attributes = 0;
   return var;
 }
 static inline void Variable_destroy(const Variable* var) {
   free(var->name);
+  free(var->type);
   free(var->value);
 }
 static void JSBuilder_write_variable_fields_count(JSBuilder* builder, const Variable* var) {
@@ -2424,24 +2427,17 @@ static inline void Environment_reset(Environment* env) {
   Environment_destroy(env);
   Environment_initialize(env);
 }
-static inline Variable* Environment_allocate(Environment* env, const char* name) {
+static Variable* Environment_allocate(Environment* env, const void* ref, const char* name, size_t fields_count) {
   if (env->length == env->capacity) {
     env->capacity <<= 1;
     env->data = realloc(env->data, env->capacity * sizeof(Variable));
     //TODO: handle possible OOM
   }
-  return Variable_initialize(env->data + env->length++, name);
+  return Variable_initialize(env->data + env->length++, ref, name, fields_count);
 }
 
 static Environment current_frame_env; // Belongs to the app thread
 static int64_t current_frame_id = INVALID_FRAME_ID;
-
-void append_variable(const char* name, const char* value, uint64_t fields_count, uint8_t attributes) {
-  Variable* v = Environment_allocate(&current_frame_env, name);
-  v->value = strdup(value);
-  v->fields_count = fields_count;
-  v->attributes = attributes;
-}
 
 typedef struct {
   DelayedRequest parent;
@@ -2451,7 +2447,7 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
   const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
   current_frame_id = req->frame_id;
   Environment_reset(&current_frame_env);
-  Environment_allocate(&current_frame_env, "Initial scope");
+  Environment_allocate(&current_frame_env, NULL, "Root scope", NUMBER_OF_SCOPES);
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
@@ -2470,11 +2466,11 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
         const size_t scope_id = current_frame_env.length;
         const char* scope_name = scope_attributes[scope_id - 1].name;
         const char* scope_hint = scope_attributes[scope_id - 1].hint;
-        Variable* var = Environment_allocate(&current_frame_env, scope_name);
+        Variable* var = Environment_allocate(&current_frame_env, (const void*)scope_id, scope_name,
+          number_of_variables_in_scope(scope_id));
         JSBuilder_write_raw_string_field(&builder, "name", scope_name);
         JSBuilder_write_raw_string_field(&builder, "presentationHint", scope_hint);
         JSBuilder_write_unsigned_field(&builder, "variablesReference", scope_id);
-        var->fields_count = number_of_variables_in_scope(scope_id);
         JSBuilder_write_variable_fields_count(&builder, var);
         JSBuilder_write_bool_field(&builder, "expensive", false);
       }
@@ -2587,6 +2583,16 @@ static bool request_scopes(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
+void append_variable(const void* ref, const char* name, const char* type, const char* value,
+                     uint64_t fields_count, uint8_t attributes) {
+  Variable* v = Environment_allocate(&current_frame_env, ref, name, fields_count);
+  v->type = strdup(type);
+  v->value = strdup(value);
+  v->attributes = attributes;
+  v->ref = ref;
+}
+void create_fields(const void* ref, const char* name, uint64_t fields_count, uint64_t hex);
+
 typedef struct {
   DelayedRequest parent;
   uint64_t variable_id;
@@ -2607,18 +2613,8 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   if (fields_count && !fields_base) {
     fields_base = current_frame_env.length;
     var->fields_base = fields_base;
-
-    var = NULL; // Nuke 'var', it may become invalid when 'env.data' expands.
-    // TODO: ask debugger to append all fields of variable at `variable_id` in `current_frame_id`,
-    // startung at `field`, formatting their values according to `hex`
-    for (uint64_t i = 0; i < fields_count; i++) {
-      static char buffer[17];
-      snprintf(buffer, sizeof buffer, "var%" PRIu64, i);
-      Variable* v = Environment_allocate(&current_frame_env, buffer);
-      v->type = "int";
-      snprintf(buffer, sizeof buffer, "%" PRIu64, i);
-      v->value = strdup(buffer);
-    }
+    create_fields(var->ref, var->name, fields_count, req->hex);
+    var = NULL; // Nuke 'var' as it could become invalid when 'env.data' expands.
   }
 
   JSBuilder builder;
