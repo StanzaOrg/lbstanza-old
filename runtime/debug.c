@@ -2360,12 +2360,20 @@ enum {
   FIELDS_IN_CHUNK = 1 << LOG_FIELDS_IN_CHUNK,
   FIELDS_IN_CHUNK_MASK = FIELDS_IN_CHUNK - 1
 };
-static inline size_t fields_index_size(const size_t fields_count) {
-  const size_t length = (fields_count + FIELDS_IN_CHUNK_MASK) >> LOG_FIELDS_IN_CHUNK;
-  return length * sizeof(size_t);
+static inline uint64_t first_field_in_chunk(const uint64_t chunk_index) {
+  return chunk_index << LOG_FIELDS_IN_CHUNK;
+}
+static inline uint64_t field_chunk_index(const uint64_t i) {
+  return i >> LOG_FIELDS_IN_CHUNK;
+}
+static inline uint64_t field_index_in_chunk(const uint64_t i) {
+  return i & FIELDS_IN_CHUNK_MASK;
 }
 static inline uint64_t field_index(const size_t* fields_index, const uint64_t i) {
-  return fields_index[i >> LOG_FIELDS_IN_CHUNK] + (i & FIELDS_IN_CHUNK_MASK);
+  return fields_index[field_chunk_index(i)] + field_index_in_chunk(i);
+}
+static inline size_t fields_index_size(const size_t fields_count) {
+  return field_chunk_index(fields_count + FIELDS_IN_CHUNK_MASK) * sizeof(size_t);
 }
 typedef struct {
   char* name;             // Owned by Variable
@@ -2386,6 +2394,7 @@ static inline Variable* Variable_initialize(Variable* var, const char* name) {
   var->fields_index = NULL;
   var->named_fields_count = 0;
   var->indexed_fields_count = 0;
+  var->attributes = 0;
   return var;
 }
 static inline void Variable_destroy(const Variable* var) {
@@ -2629,17 +2638,26 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
       var->fields_index = fields_index;
     }
     var = NULL; // Nuke 'var', it may become invalid when 'env.data' expands.
-    if (!fields_index[0]) fields_index[0] = current_frame_env.length;
-    for (uint64_t i = 0; i < fields_count; i++) {
-      static char buffer[17];
-      snprintf(buffer, sizeof buffer, "var%" PRIu64, i);
-      Variable* field = Environment_allocate(&current_frame_env, buffer);
-      field->type = "int";
-      snprintf(buffer, sizeof buffer, "%" PRIu64, i);
-      field->value = strdup(buffer);
+    const uint64_t first_chunk_index = field_chunk_index(fields_start);
+    const uint64_t last_chunk_index = field_chunk_index(fields_limit - 1);
+    for (uint64_t i = first_chunk_index; i <= last_chunk_index; i++) {
+      if (fields_index[i]) continue;  // This chunk is already filled
+      fields_index[i] = current_frame_env.length;
+      uint64_t field = first_field_in_chunk(i);
+      uint64_t limit = field + FIELDS_IN_CHUNK;
+      if (limit > fields_count) limit = fields_count;
+      // TODO: ask debugger to add `limit` - `field` fields
+      // of variable at `variable_id` in `current_frame_id`,
+      // startung at `field`, formatting their values according to `hex`
+      for (; field < limit; field++) {
+        static char buffer[17];
+        snprintf(buffer, sizeof buffer, "var%" PRIu64, field);
+        Variable* v = Environment_allocate(&current_frame_env, buffer);
+        v->type = "int";
+        snprintf(buffer, sizeof buffer, "%" PRIu64, field);
+        v->value = strdup(buffer);
+      }
     }
-    // TODO: ask debugger to add `count` of variable at `variable_id` in `current_frame_id`,
-    // startung from `start` kid to current_frame_env, formatting their values according to `hex`
   }
 
   JSBuilder builder;
