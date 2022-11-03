@@ -2355,31 +2355,11 @@ static inline const char* variable_visibility(const unsigned variable_attributes
   return names[variable_attributes & VARIABLE_VISIBILITY_MASK];
 }
 
-enum {
-  LOG_FIELDS_IN_CHUNK = 10,
-  FIELDS_IN_CHUNK = 1 << LOG_FIELDS_IN_CHUNK,
-  FIELDS_IN_CHUNK_MASK = FIELDS_IN_CHUNK - 1
-};
-static inline uint64_t first_field_in_chunk(const uint64_t chunk_index) {
-  return chunk_index << LOG_FIELDS_IN_CHUNK;
-}
-static inline uint64_t field_chunk_index(const uint64_t i) {
-  return i >> LOG_FIELDS_IN_CHUNK;
-}
-static inline uint64_t field_index_in_chunk(const uint64_t i) {
-  return i & FIELDS_IN_CHUNK_MASK;
-}
-static inline uint64_t field_index(const size_t* fields_index, const uint64_t i) {
-  return fields_index[field_chunk_index(i)] + field_index_in_chunk(i);
-}
-static inline size_t fields_index_size(const size_t fields_count) {
-  return field_chunk_index(fields_count + FIELDS_IN_CHUNK_MASK) * sizeof(size_t);
-}
 typedef struct {
   char* name;             // Owned by Variable
   const char* type;       // Optional, not owned by Variable
   char* value;            // Optional, owned by Variable
-  size_t* fields_index;  // Lazily allocated, owned by variable
+  size_t fields_base;
   size_t named_fields_count;
   size_t indexed_fields_count;
   uint8_t attributes;
@@ -2391,7 +2371,7 @@ static inline Variable* Variable_initialize(Variable* var, const char* name) {
   var->name = strdup(name);
   var->type = NULL;
   var->value = NULL;
-  var->fields_index = NULL;
+  var->fields_base = 0;
   var->named_fields_count = 0;
   var->indexed_fields_count = 0;
   var->attributes = 0;
@@ -2400,7 +2380,6 @@ static inline Variable* Variable_initialize(Variable* var, const char* name) {
 static inline void Variable_destroy(const Variable* var) {
   free(var->name);
   free(var->value);
-  free(var->fields_index);
 }
 static void JSBuilder_write_variable_field_counts(JSBuilder* builder, const Variable* var) {
   JSBuilder_write_optional_unsigned_field(builder, "namedVariables", var->named_fields_count);
@@ -2610,8 +2589,6 @@ static bool request_scopes(const JSObject* request) {
 typedef struct {
   DelayedRequest parent;
   uint64_t variable_id;
-  uint64_t start;
-  uint64_t count;
   bool hex;
 } DelayedRequestVariables;
 static void DelayedRequestVariables_handle(DelayedRequest* request) {
@@ -2623,40 +2600,23 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
     return;
   }
 
-  uint64_t fields_start = req->start;
-  uint64_t fields_limit = fields_start + req->count;
   Variable* var = current_frame_env.data + variable_id;
+  size_t fields_base = var->fields_base;
   const uint64_t fields_count = Variable_fields_count(var);
-  size_t* fields_index = var->fields_index;
-  if (fields_start > fields_count) fields_start = fields_count;
-  if (fields_limit > fields_count) fields_limit = fields_count;
+  if (fields_count && !fields_base) {
+    fields_base = current_frame_env.length;
+    var->fields_base = fields_base;
 
-  if (fields_limit > fields_start) {
-    if (!fields_index) {
-      const size_t index_size = fields_index_size(fields_count);
-      fields_index = memclear(malloc(index_size), index_size);
-      var->fields_index = fields_index;
-    }
     var = NULL; // Nuke 'var', it may become invalid when 'env.data' expands.
-    const uint64_t first_chunk_index = field_chunk_index(fields_start);
-    const uint64_t last_chunk_index = field_chunk_index(fields_limit - 1);
-    for (uint64_t i = first_chunk_index; i <= last_chunk_index; i++) {
-      if (fields_index[i]) continue;  // This chunk is already filled
-      fields_index[i] = current_frame_env.length;
-      uint64_t field = first_field_in_chunk(i);
-      uint64_t limit = field + FIELDS_IN_CHUNK;
-      if (limit > fields_count) limit = fields_count;
-      // TODO: ask debugger to add `limit` - `field` fields
-      // of variable at `variable_id` in `current_frame_id`,
-      // startung at `field`, formatting their values according to `hex`
-      for (; field < limit; field++) {
-        static char buffer[17];
-        snprintf(buffer, sizeof buffer, "var%" PRIu64, field);
-        Variable* v = Environment_allocate(&current_frame_env, buffer);
-        v->type = "int";
-        snprintf(buffer, sizeof buffer, "%" PRIu64, field);
-        v->value = strdup(buffer);
-      }
+    // TODO: ask debugger to append all fields of variable at `variable_id` in `current_frame_id`,
+    // startung at `field`, formatting their values according to `hex`
+    for (uint64_t i = 0; i < fields_count; i++) {
+      static char buffer[17];
+      snprintf(buffer, sizeof buffer, "var%" PRIu64, i);
+      Variable* v = Environment_allocate(&current_frame_env, buffer);
+      v->type = "int";
+      snprintf(buffer, sizeof buffer, "%" PRIu64, i);
+      v->value = strdup(buffer);
     }
   }
 
@@ -2666,10 +2626,9 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   {
     JSBuilder_array_field_begin(&builder, "variables");
     const Variable* data = current_frame_env.data;
-    for (uint64_t i = fields_start; i < fields_limit; i++) {
+    for (uint64_t i = fields_base, limit = i + fields_count; i < limit; i++) {
       JSBuilder_next(&builder);
-      const size_t index = field_index(fields_index, i);
-      JSBuilder_write_variable(&builder, data + index, index);
+      JSBuilder_write_variable(&builder, data + i, i);
     }
     JSBuilder_array_field_end(&builder);
   }
@@ -2680,11 +2639,6 @@ static inline DelayedRequest* DelayedRequestVariables_create(const JSObject* req
   DelayedRequestVariables* req = DelayedRequest_create(request, sizeof(DelayedRequestVariables), &DelayedRequestVariables_handle);
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   req->variable_id = JSObject_get_integer_field(arguments, "variablesReference", -1);
-  req->start = JSObject_get_integer_field(arguments, "start", 0);
-  // Missing or zero 'count' denotes all fields starting with 'start'
-  uint64_t count = JSObject_get_integer_field(arguments, "count", 0);
-  if (!count) count = UINT64_MAX;
-  req->count = count;
   const JSObject* format = JSObject_get_object_field(arguments, "format");
   req->hex = JSObject_get_bool_field(format, "hex", false);
   return (DelayedRequest*) req;
