@@ -2,6 +2,7 @@ defpackage stz/repl :
   import core
   import collections
   import reader
+  import parser/macroexpander
   import parser/errors
   import parser/syntax-package-registry
   import macro-utils
@@ -31,11 +32,14 @@ defpackage stz/repl :
   import stz/params
   import stz/proj-manager
   import stz/proj
+  import stz/proj-errors
+  import stz/proj-ir
   import stz/front-end
   import stz/aux-file
   import core/sha256
   import stz/package-stamps
   import stz/terminal-style
+  import stz/macroexpander
   import stz/timing-log-api
 
 ;============================================================
@@ -267,7 +271,7 @@ defmulti clear (repl:REPL) -> False
 defmulti use-syntax (repl:REPL, inputs:Tuple<Symbol>, add-to-existing?:True|False) -> False
 defmulti shutdown (repl:REPL) -> False
 
-public defn REPL () :
+public defn REPL (macro-plugins:Tuple<String>) :
   ;============================================================
   ;===================== REPL State ===========================
   ;============================================================
@@ -277,6 +281,15 @@ public defn REPL () :
   val file-env = FileEnv()
   val proj-files = Vector<String>()
   val syntaxes = to-hashset<Symbol>(REPL-INITIAL-SYNTAX-PACKAGES)
+  val macroexpander = StanzaMacroexpander()
+  do(load-macro-plugin{macroexpander, _}, macro-plugins)
+
+  ;============================================================
+  ;=============== Ensure Syntax Packages Exist ===============
+  ;============================================================
+  match(syntax-packages-exist?(macroexpander, to-list(syntaxes))) :
+    (t:True) : false
+    (e:MissingPackages) : throw(ReplErrors([e]))
 
   ;============================================================
   ;===================== Project Manager ======================
@@ -311,12 +324,19 @@ public defn REPL () :
   ;Returns the name of the last package that was loaded if any.
   defn load-files (inputs:Tuple<String|Symbol>) -> Symbol|False :
     ;Load project files separately
+    var proj-files-added?: True|False = false
     val inputs* = Vector<String|Symbol>()
     for input in inputs do :
       match(input:String) :
-        if suffix?(input, ".proj") : add-proj-file(input)
+        if suffix?(input, ".proj") :
+          proj-files-added? = true
+          add-proj-file(input)
         else : add(inputs*, input)
       else : add(inputs*, input)
+
+    ;Update the macroexpander if necessary.
+    if proj-files-added? :
+      set-proj-manager(macroexpander, proj-manager())
 
     if not empty?(inputs*) :
       within intercept-errors() :
@@ -392,13 +412,16 @@ public defn REPL () :
   ;==================== Stages of Loading =====================
   ;============================================================
   defn to-ipackage (form) -> IPackage :
-    val expanded =
+    val expanded-il =
       try :
-        val overlays = cons(`current-overlays, to-list(syntaxes))
-        syntax-parse(`core, overlays, List(form), `exp!, false)
-      catch (e:NoMatchError) : throw(ReplErrors(errors(e)))
-      catch (e:Exception) : throw(ReplErrors([e]))
-    repl-package(repl-env, to-il(expanded))
+        ;val overlays = cons(`current-overlays, to-list(syntaxes))
+        val expanded = macroexpand(macroexpander, form, to-list(syntaxes))
+        to-il(expanded)
+      catch (e:NoMatchError) :
+        throw(ReplErrors(errors(e)))
+      catch (e:Exception) :
+        throw(ReplErrors([e]))
+    repl-package(repl-env, expanded-il)
 
   defn live-recs (ios:Tuple<PackageIO>) :
     compute-live(vm, seq(package,ios))
@@ -408,6 +431,7 @@ public defn REPL () :
                               repl-package?:Symbol|False) -> Tuple<VMPackage> :
     ;Compile to epackages
     val proj-manager = proj-manager()
+    set-proj-manager(macroexpander, proj-manager)
     val result = /compile-to-el $ new FrontEndInputs :
       defmethod inputs (this) : inputs
       defmethod find-package (this, name:Symbol) :
@@ -426,6 +450,8 @@ public defn REPL () :
         package-priority(repl-env, repl-package? as Symbol) when repl-package? is Symbol
       defmethod load-pkg-with-asm? (this) :
         false
+      defmethod macroexpander (this) :
+        macroexpander
 
     ;Register file associations with file environment.
     do(register{file-env, _}, pkgstamps(result))
@@ -492,14 +518,18 @@ public defn REPL () :
     defmethod unimport (this, package:Symbol) :
       println(unimport(repl-env, package))
     defmethod use-syntax (this, packages:Tuple<Symbol>, add-to-existing?:True|False) :
-      ;Throw NoSyntaxPackage if any of the mentioned packages do not exist.
-      val missing-packages = filter({not syntax-package-exists?(_)}, packages)
-      if not empty?(missing-packages) :
-        val es = seq(NoSyntaxPackage, missing-packages)
-        throw(ReplErrors(to-tuple(es)))      
-      ;Clear syntaxes when not add to existing syntaxes.
-      clear(syntaxes) when not add-to-existing?
-      add-all(syntaxes, packages)
+      ;Ensure that the syntax packages exist.
+      val new-packages = to-list(cat(syntaxes,packages)) when add-to-existing?
+                    else to-list(packages)
+      try :              
+        match(syntax-packages-exist?(macroexpander, new-packages)) :
+          (t:True) : false
+          (e:MissingPackages) : throw(ReplErrors([e]))
+        ;Clear syntaxes when not add to existing syntaxes.
+        clear(syntaxes) when not add-to-existing?
+        add-all(syntaxes, packages)
+      catch (e:Exception) :
+        throw(ReplErrors([e]))
     defmethod shutdown (this) :
       shutdown(vm)
 
@@ -828,7 +858,7 @@ defn script? (exp:Load) -> String|False :
       throw(ReplErrors([LoadMultipleScripts(s)]))
     s
 
-public defn eval-exp (repl:REPL, exp:RExp) :
+defn eval-exp (repl:REPL, exp:RExp) :
   match(exp) :
     (exp:Load) :
       match(script?(exp)) :
@@ -855,10 +885,19 @@ defn run-script (repl:REPL, s:String) :
     finally :
       close(file)
   catch (e:IOException) :
-    throw(ReplErrors([e]))    
+    throw(ReplErrors([e]))
 
-public defn repl (args:Tuple<String>, style:TerminalStyle) :
-  val repl = REPL()
+;============================================================
+;==================== Main REPL Loop ========================
+;============================================================
+
+;Starts up an interactive REPL.
+;Implements the 'stanza repl' command.
+
+public defn repl (args:Tuple<String>,
+                  style:TerminalStyle,
+                  macro-plugins:Tuple<String>) :
+  val repl = REPL(macro-plugins)
  
   ;Create a LoadExp expression out of the command line
   ;arguments. And execute them in the REPL.
@@ -894,21 +933,30 @@ public defn repl (args:Tuple<String>, style:TerminalStyle) :
   finally :
     shutdown(repl)
 
-;------------------------------------------------------------
-;------------------- Convenience Overrides ------------------
-;------------------------------------------------------------
+;============================================================
+;=================== Convenience Overloads ==================
+;============================================================
+;Default args is [].
+;Default macro-plugins is [].
+;Default terminal-style is default-terminal-style().
 
-public defn repl (style:TerminalStyle) : repl([], style)
-public defn repl (args:Tuple<String>) : repl(args, default-terminal-style())
-public defn repl () : repl(default-terminal-style())
+public defn repl (style:TerminalStyle) :
+  repl([], style, [])
+public defn repl (args:Tuple<String>) :
+  repl(args, default-terminal-style(), [])
+public defn repl () :
+  repl([], default-terminal-style(), [])
 
 ;============================================================
 ;==================== Run Immediately =======================
 ;============================================================
 
-public defn run-in-repl (args:Tuple<String>) :
+;Execute the given arguments in the virtual
+;machine. Implements the 'stanza run' command.
+public defn run-in-repl (args:Tuple<String>,
+                         macro-plugins:Tuple<String>) :
   val repl = within log-time(REPL-CREATION) :
-    REPL()
+    REPL(macro-plugins)
   try:
     within log-time(REPL-EXP-EVALUATION) :
       eval-exp(repl, make-load-exp(args, false))

@@ -1,0 +1,314 @@
+defpackage stz/macroexpander :
+  import core
+  import collections
+  import parser/syntax-package-registry
+  import parser/macroexpander
+  import stz/macro-master
+  import stz/core-macros
+  import stz/proj-manager
+
+;============================================================
+;====================== API =================================
+;============================================================
+
+;Utility type that can expand macros.
+public deftype StanzaMacroexpander <: Macroexpander
+
+;Returns true if the macroexpander supports the given syntax packages.
+;Used to issue a useful error for 'use-syntax'. 
+public defmulti syntax-packages-exist? (e:StanzaMacroexpander, overlays:List<Symbol>) -> True|MissingPackages
+
+;Register a macro plugin with the expander.
+public defmulti load-macro-plugin (e:StanzaMacroexpander, filename:String) -> False
+
+;Set the proj manager for searching for macros to load.
+public defmulti set-proj-manager (e:StanzaMacroexpander, proj:ProjManager) -> False
+
+;============================================================
+;======================= Implementation =====================
+;============================================================
+
+public defn StanzaMacroexpander () -> StanzaMacroexpander :
+  ;Holds the macros that have been loaded.
+  ;Maintain their order such that more relevant ones appear
+  ;first.
+  val loaded-macros = SortedVector<LoadedMacros>(relevance)
+
+  ;Holds the proj manager to use for finding plugins.
+  var proj-manager:ProjManager|False = false
+
+  ;Helper: Load the macro from the file.
+  ;- expected-packages: If given, then we check to ensure that the loaded
+  ;  macro contains a superset of the expected packages.
+  defn load-macro-from-file (source:MacroSource,
+                             filename:String,
+                             expected-packages:Maybe<Tuple<Symbol>>) -> LoadedMacros :
+    val plugin = load-macro-plugin(filename, expected-packages)
+    val loaded = LoadedMacros(source, plugin)    
+    add(loaded-macros, loaded)
+    loaded
+
+  ;Helper: Find the most relevant plugin for the given syntax packages.
+  ;Returns false if the root system supports the given packages.
+  ;Returns MissingPackages if the given packages cannot be supported.
+  defn find-plugin (packages:Tuple<Symbol>) -> MacroPlugin|False|MissingPackages :
+    ;Helper: Find a loaded macro that supports the given packages.
+    defn find-loaded-macro () -> LoadedMacros|False :
+      for p in loaded-macros find :
+        supports?(p, packages)
+
+    ;Helper: Find a macro plugin using the proj file.
+    defn find-using-proj () -> MacroPlugin|False :
+      match(proj-manager:ProjManager) :
+        val filename = find-syntax-packages(proj-manager, packages)
+        match(filename:String) :
+          plugin(load-macro-from-file(LoadedFromProj, filename, One(packages)))
+
+    ;Helper: Return true if the root expander
+    ;supports the given packages.
+    defn supported-by-root? () -> True|False :
+      subset?(packages, syntax-packages())
+
+    ;Helper: Compute the MissingPackages error.
+    defn compute-error () -> MissingPackages :
+      compute-missing-packages(packages, loaded-macros)
+
+    ;Main algorithm
+    label<MacroPlugin|False|MissingPackages> return :
+
+      ;Find the loaded macro
+      val lm = find-loaded-macro()
+
+      ;Return the loaded macro if one was found, and
+      ;it was from a file.
+      match(lm:LoadedMacros) :
+        if source(lm) == LoadedFromFile :
+          return(plugin(lm))
+
+      ;Check whether the root expander supports it.
+      if supported-by-root?() :
+        return(false)
+
+      ;Now check whether a loaded already supports it.
+      match(lm:LoadedMacros) :
+        return(plugin(lm))
+
+      ;Now see whether a plugin can be found via the proj file.
+      match(find-using-proj()) :
+        (p:MacroPlugin) : return(p)
+        (f:False) : false
+        
+      ;Failed to find an appropriate support, return an error.
+      compute-error()
+
+  ;Convenience: Use the names as the overlays.
+  ;Assume that the base is `core.
+  defn find-plugin (overlays:Overlays) -> MacroPlugin|False|MissingPackages :
+    if base(overlays) != `core :
+      fatal("Expected base package is core.")
+    find-plugin(to-tuple(names(overlays)))
+
+  ;Return new macroexpander object.
+  new StanzaMacroexpander :
+  
+    defmethod load-macro-plugin (this, filename:String) :
+      load-macro-from-file(LoadedFromFile, filename, None())
+      false
+
+    defmethod set-proj-manager (this, proj:ProjManager) -> False :
+      proj-manager = proj
+
+    defmethod macroexpand (this, form, overlay-specifiers:List<Symbol>) :
+      ;Compute the complete set of overlays.
+      val overlays = compute-overlays(`core, overlay-specifiers, false)
+      match(find-plugin(overlays)) :
+        (p:MacroPlugin) :
+          macroexpand(p, form, names(overlays))
+        (f:False) :
+          within parser/core-macroexpander/with-core-macroexpander(this) :
+            syntax-parse(`core, names(overlays), List(form), `exp, false)
+        (e:MissingPackages) :
+          throw(e)
+
+    defmethod syntax-packages-exist? (this, packages:List<Symbol>) :
+      ensure-no-current-overlays!(packages)
+      match(find-plugin(to-tuple(packages))) :
+        (p:MacroPlugin|False) : true
+        (e:MissingPackages) : e
+
+;============================================================
+;================= SanityCheck ==============================
+;============================================================
+
+;Fatal if any of the names are current overlays.
+defn ensure-no-current-overlays! (names:Collection<Symbol>) -> False :
+  for name in names do :
+    if name == `current-overlays :
+      fatal("The current-overlays directive is expected to be handled already.")
+
+;============================================================
+;================ Utility: LoadedMacros =====================
+;============================================================
+
+;Create one of these for every MacroPlugin that is loaded.
+;- priority: Lower priority takes precedence over other higher
+;  priority plugins.
+defstruct LoadedMacros :
+  source:MacroSource
+  plugin:MacroPlugin
+
+;Indicate where a macro was loaded from. This affects the
+;prioritization.
+defenum MacroSource :
+  LoadedFromFile
+  LoadedFromProj
+
+;Returns a Comparable object representing the relevance
+;of the loaded macros.
+defn relevance (lm:LoadedMacros) -> Comparable :
+  val priority = switch(source(lm)) :
+    LoadedFromFile: 0
+    LoadedFromProj: 1
+  [priority, (- num-packages(lm))]
+
+;Returns true if the given loaded macros supports the
+;given syntax packages.
+defn supports? (lm:LoadedMacros, ps:Seqable<Symbol>) -> True|False :
+  subset?(ps, syntax-packages(plugin(lm)))
+
+;Returns the number of syntax packages supported by the loaded macros.
+defn num-packages (lm:LoadedMacros) -> Int :
+  length(syntax-packages(plugin(lm)))
+
+;Helper: Return true if xs is a subset of ys.
+defn subset? (xs:Seqable<Symbol>, ys:Seqable<Symbol>) -> True|False :
+  val ys-set = to-hashset<Symbol>(ys)
+  for x in xs all? : ys-set[x]
+
+;============================================================
+;================= Utility: SortedVector ====================
+;============================================================
+
+;Represents a vector of T that maintains its order.
+deftype SortedVector<T> <: Collection<T>
+
+;Add a new item to the sorted vector.
+defmulti add<?T> (v:SortedVector<?T>, item:T) -> False
+
+;Create a vector that maintains sort order using
+;the given key.
+defn SortedVector<T> (key:T -> Comparable) :
+
+  ;Keep items in here.
+  val items = Vector<T>()
+
+  ;Use this flag to record whether 'items'
+  ;is currently sorted or not.
+  var sorted:True|False = true
+
+  ;If the items are not already sorted,
+  ;then sort them.
+  defn ensure-sorted () :
+    if not sorted :
+      qsort!(key, items)
+      sorted = true
+  
+  ;Return the sorted vector.
+  new SortedVector<T> :
+    defmethod add (this, item:T) :
+      add(items, item)
+      sorted = false
+    defmethod to-seq (this) :
+      ensure-sorted()
+      to-seq(items)
+
+;============================================================
+;============ Computing MissingPackages Error ===============
+;============================================================
+
+;Compute the MissingPackages exception.
+;- Assumes that we were unable to find a plugin that
+;  supports the given packages.
+defn compute-missing-packages (packages:Tuple<Symbol>,
+                               macros:Collection<LoadedMacros>) -> MissingPackages :
+  ;Collect complete set of defined packages.                              
+  val package-set = HashSet<Symbol>()
+  add-all(package-set, seq-cat(syntax-packages{plugin(_)}, macros))
+  add-all(package-set, syntax-packages())
+
+  ;Determine which packages are missing from the package-set.
+  val missing = for p in packages filter :
+    not package-set[p]
+  if not empty?(missing) :
+    NoPackages(to-tuple(missing))
+
+  ;If there are no packages missing, then determine which
+  ;of the loaded macros are relevant for the error message.
+  else :
+    ;Get set of packages to cover.
+    val package-set = to-hashset<Symbol>(packages)
+    val relevant-macros = Vector<LoadedPackages>()
+
+    ;Returns true if the given LoadedMacros supports
+    ;at least one relevant package.
+    defn contains-relevant-packages? (lm:LoadedMacros) -> True|False :
+      for p in syntax-packages(plugin(lm)) any? :
+        package-set[p]
+
+    ;Add the given LoadedMacros as relevant.
+    defn add-as-relevant (lm:LoadedMacros) :
+      val lp = LoadedPackages(syntax-packages(plugin(lm)), filename(plugin(lm)))
+      add(relevant-macros, lp)
+      for p in syntax-packages(plugin(lm)) do :
+        remove(package-set, p)
+
+    ;Add all the relevant macros.
+    for m in macros do :
+      if contains-relevant-packages?(m) :
+        add-as-relevant(m)
+
+    ;Create error object.
+    NoPackageCombination(packages,
+                         to-tuple(relevant-macros))
+
+;============================================================
+;=============== Missing Packages Explanation ===============
+;============================================================
+
+;Occurs when not every missing package is available.
+public deftype MissingPackages <: Exception
+
+;Occurs when there are packages that don't exist
+;anywhere.
+public defstruct NoPackages <: MissingPackages :
+  packages:Tuple<Symbol>
+defmethod print (o:OutputStream, e:NoPackages) :
+  print(o, "The syntax packages %_ could not be found." % [
+    quotes(packages(e))])
+
+;Occurs when the set of packages that were provided don't
+;exist in that combination.
+public defstruct NoPackageCombination <: MissingPackages :
+  packages:Tuple<Symbol>
+  loaded:Tuple<LoadedPackages>
+  
+defstruct LoadedPackages :
+  packages:Tuple<Symbol>
+  filename:String
+
+defmethod print (o:OutputStream, e:NoPackageCombination) :
+  ;Report what the loaded packages contain.
+  val plugin-strs = for l in loaded(e) seq :
+    "Plugin %~ supports %_" % [filename(l), quotes(packages(l))]
+  val loaded-str = Indented("%n" % [plugin-strs])
+  
+  ;Print the error report.
+  print(o, "There is no single macro plugin that contains support for all syntax packages %_. \
+            The following plugins support the relevant packages but not all together:\n%_" % [
+    quotes(packages(e)), loaded-str])
+
+;Add quotes around the symbols and join with commas.
+defn quotes (ps:Seqable<Symbol>) -> ? :
+  val items = for p in ps seq : "'%~'" % [p]
+  "%," % [items]
+
