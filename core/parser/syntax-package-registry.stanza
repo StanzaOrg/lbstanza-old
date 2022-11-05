@@ -25,9 +25,35 @@ defstruct SyntaxPackageRegistry :
     init => HashTable-init<List<Symbol>, OpPackage>(compile-packages{packages, _})
   compiled-patterns: HashTable<PatternKey, OpMatchPattern> with:
     init => HashTable<PatternKey, OpMatchPattern>()
-  current-overlays: List<Symbol> with:
+  current-overlays: Overlays|False with:
     setter => set-current-overlays
-    init => List()
+    init => false
+
+;------------------------------------------------------------
+;--------------------- Overlays -----------------------------
+;------------------------------------------------------------
+
+;Represents the current base package and overlays
+;that are in effect during parsing.
+public defstruct Overlays :
+  base: Symbol
+  names: List<Symbol> with: (ensure => unique-overlays!(base))
+
+defmethod print (o:OutputStream, ol:Overlays) :
+  val overlay-str = "" when empty?(names(ol))
+               else " + %," % [names(ol)]
+  print(o, "[%_%_]" % [base(ol), overlay-str])
+
+;Sanity check to ensure that overlays are unique,
+;and does not include the base.
+defn unique-overlays! (base:Symbol) :
+  fn (description:String, value:List<Symbol>) :
+    val visited = HashSet<Symbol>()
+    add(visited, base)
+    for v in value do :
+      if not add(visited, v) :
+        fatal("Invalid overlays %_ (upon base %_) given to %_." % [
+          value, base, description])
 
 ;------------------------------------------------------------
 ;------------------- Construction ---------------------------
@@ -100,18 +126,75 @@ defn syntax-match (reg:SyntaxPackageRegistry,
 defn syntax-package-exists? (reg:SyntaxPackageRegistry, name:Symbol) -> True|False :
   key?(packages(reg), name)
 
-;For each package name, (empty and current-overlays are not supported),
-;throw an exception if any of the names are not a registered syntax package.
-defn ensure-packages-exist! (reg:SyntaxPackageRegistry, names:Seqable<Symbol>) -> False :
-  for name in names do :
-    switch(name) :
-      `empty :
-        false
-      `current-overlays :
-        false
-      else : 
-        if not syntax-package-exists?(reg, name) :
+;Return the set of all syntax packages in the registry.
+defn syntax-packages (reg:SyntaxPackageRegistry) -> Tuple<Symbol> :
+  to-tuple(keys(packages(reg)))
+
+;Interpret the given names and return an Overlays object.
+;Throws a NoSyntaxPackage exception if the overlays do not exist.
+defn compute-overlays (reg:SyntaxPackageRegistry,
+                       base:Symbol,
+                       overlays:List<Symbol>,
+                       force-resolveable?:True|False) -> Overlays :
+  ;Helper: Ensure resolveable.
+  defn ensure-resolveable (name:Symbol) :
+    if force-resolveable? :
+      if name != `empty and name != `current-overlays :
+        if not syntax-package-exists?(reg,name) :
           throw(NoSyntaxPackage(name))
+
+  ;Case: Special-case where overlays is empty.
+  if empty?(overlays) :
+    ensure-resolveable(base)
+    Overlays(base, List())
+    
+  ;Case: Specical-case where overlays is `(current-overlays)
+  else if overlays == `(current-overlays) :
+    ensure-resolveable(base)
+    val old-overlays = match(current-overlays(reg)) :
+      (o:Overlays) :
+        if /base(o) == base : names(o)
+        else : cons(/base(o), names(o))
+      (f:False) :
+        List()
+    Overlays(base, old-overlays)
+    
+  ;General case:
+  else :
+    ;Ensure resolveable
+    ensure-resolveable(base)
+    do(ensure-resolveable, overlays)
+
+    ;Next compute the new set of overlays.
+
+    ;Maintain a set of symbols that should not appear
+    ;in the new-overlays.
+    val visited-set = HashSet<Symbol>()
+    add(visited-set, base)
+
+    ;Next maintain the list of new overlays.
+    val new-overlays = Vector<Symbol>()
+    defn add-overlay (name:Symbol) :
+      if add(visited-set, name) :
+        add(new-overlays, name)
+
+    ;Interpret the given overlays
+    for name in overlays do :
+      switch(name) :
+        `empty :
+          false
+        `current-overlays :
+          match(current-overlays(reg)) :
+            (o:Overlays) :
+              add-overlay(/base(o))
+              do(add-overlay, names(o))
+            (f:False) :
+              false
+        else :
+          add-overlay(name)
+
+    ;Return the new overlays
+    Overlays(base, to-list(new-overlays))
 
 ;============================================================
 ;=================== Package List ===========================
@@ -123,7 +206,7 @@ defn ensure-packages-exist! (reg:SyntaxPackageRegistry, names:Seqable<Symbol>) -
 ;includes their dependencies.
 ;The first name in names must be the base package.
 
-defn package-list (reg:SyntaxPackageRegistry, names:Collection<Symbol>) -> List<Symbol> :
+defn expand-syntax-package-list (reg:SyntaxPackageRegistry, overlay:Overlays) -> List<Symbol> :
   ;Accumulate all added packages to the list and set.
   val pkgs = Vector<Symbol>()
   val pkg-set = HashSet<Symbol>()
@@ -131,19 +214,17 @@ defn package-list (reg:SyntaxPackageRegistry, names:Collection<Symbol>) -> List<
   ;Add the given package to the package list (if not already there).
   ;Recursively add the package's dependencies.
   defn add? (name:Symbol) -> False :
-    if add(pkg-set, name) :
-      add(pkgs, name)
-      if not syntax-package-exists?(reg,name) :
-        fatal("Could not resolve syntax package %_." % [name])
-      do(add?{package(_)}, imports(packages(reg)[name]))
+    if name != `empty :
+      if add(pkg-set, name) :
+        add(pkgs, name)
+        if not syntax-package-exists?(reg,name) :
+          fatal("Could not resolve syntax package %_." % [name])
+        do(add?{package(_)}, imports(packages(reg)[name]))
 
   ;Process all names.
   ;Treat `empty, and `current-overlays specially.
-  for name in names do :
-    switch(name) :
-      `empty : false
-      `current-overlays : do(add?, current-overlays(reg))
-      else : add?(name)
+  add?(base(overlay))
+  do(add?, names(overlay))
 
   ;Return the computed list of all packages.
   to-list(pkgs)
@@ -160,14 +241,14 @@ defn retrieve-compiled-package<?T> (f:OpPackage -> ?T,
                                     reg:SyntaxPackageRegistry,
                                     base:Symbol,
                                     overlays:List<Symbol>) -> T :
-  ;Throw an exception if the syntax packages do not exist.
-  ensure-packages-exist!(reg, cons(base, overlays))
-  
-  val names = package-list(reg, cons(base, overlays))
+  ;Compute the new overlays.
+  val new-overlays = compute-overlays(reg, base, overlays, true)
+  ;Compute full list of syntax packages.
+  val names = expand-syntax-package-list(reg, new-overlays)  
   val package = compiled-packages(reg)[names]
   val old-overlays = current-overlays(reg)
   dynamic-wind(
-    fn () : set-current-overlays(reg, names)
+    fn () : set-current-overlays(reg, new-overlays)
     fn () : f(package)
     fn () : set-current-overlays(reg, old-overlays))
 
@@ -236,6 +317,14 @@ public defn syntax-match (filename:String|False,
 
 public defn syntax-package-exists? (name:Symbol) -> True|False :
   syntax-package-exists?(PACKAGE-REGISTRY, name)
+
+public defn syntax-packages () -> Tuple<Symbol> :
+  syntax-packages(PACKAGE-REGISTRY)
+
+public defn compute-overlays (base:Symbol,
+                              overlays:List<Symbol>,
+                              force-resolveable?:True|False) -> Overlays :
+  compute-overlays(PACKAGE-REGISTRY, base, overlays, force-resolveable?)
 
 ;============================================================
 ;================= Control Debugging ========================

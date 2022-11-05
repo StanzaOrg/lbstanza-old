@@ -1,0 +1,121 @@
+defpackage stz/plugin-interface :
+  import core
+  import collections
+  import core/stack-trace
+  import stz/fastio-buffer
+  import stz/fastio-runtime
+  import stz/plugin-result
+  import core/dynamic-library
+
+;============================================================
+;=================== PluginInterface ========================
+;============================================================
+
+;A type to aid in the implementation of receiving and replying
+;from a plugin.
+;- output: The FastIOBuffer for sending messages back to caller.
+;- serializer: The PluginResultSerializer to use to write out messages to caller.
+public defstruct PluginInterface :
+  output:FastIOBuffer
+  object-io:FastObjectIO
+  plugin-io:FastObjectIO<PluginResult>
+
+;Create a new plugin interface that reads/writes objects
+;using the given object-io.
+public defn PluginInterface (object-io:FastObjectIO) -> PluginInterface :
+  PluginInterface(
+    FastIOBuffer(1024),
+    object-io,
+    PluginResultIO(object-io))
+
+;============================================================
+;============= Implementation of Initialize =================
+;============================================================
+
+;Call the main function within a dynamic library.
+public lostanza defn call-main (lib:ref<DynamicLibrary>) -> ref<False> :
+  val main = dynamic-library-symbol(lib, String("main"))
+  val f = main.address as ptr<((int, ptr<ptr<byte>>) -> int)>
+  call-c [f](clib/input_argc, clib/input_argv)
+  return false
+
+;============================================================
+;=============== Implementation of Send =====================
+;============================================================
+
+;Call the given entry function in the dynamic library.
+public lostanza defn call-entry (interface:ref<PluginInterface>,
+                                 lib:ref<DynamicLibrary>,
+                                 entry-name:ref<String>,
+                                 argument:ref<?>) -> ref<?> :
+  val entry = dynamic-library-symbol(lib, entry-name)
+  val f = entry.address as ptr<(ptr<byte> -> ptr<byte>)>
+  return send(interface, f, argument)
+
+;Send the given argument object to the given plugin entry point.
+public lostanza defn send (interface:ref<PluginInterface>,
+                           func:ptr<(ptr<byte> -> ptr<byte>)>
+                           argument:ref<?>) -> ref<?> :
+  ;Write the argument object to memory,
+  ;and retrieve the pointer to the data.
+  write-to-memory(output(interface),
+                  object-io(interface),
+                  argument)
+  val arg-data = output(interface).data
+
+  ;Execute the given function pointer and get the result
+  ;data back.
+  call-c clib/printf("Wrote out argument to %lx\n", arg-data)
+  val result-data = call-c [func](arg-data)
+
+  ;Read the plugin result from the result data.
+  val result = read-from-memory(result-data, plugin-io(interface))
+
+  ;If the plugin ran successfully then return the wrapped object.
+  ;Otherwise throw an exception.
+  match(result) :
+    (result:ref<PluginError>) :
+      return throw(result)
+    (result:ref<PluginSuccess>) :
+      return object(result)
+
+;============================================================
+;============== Implementation of Receive ===================
+;============================================================
+
+;Receive a message from the main program by executing the
+;given function. Returns the pointer to the reply.
+public lostanza defn receive (interface:ref<PluginInterface>,
+                              input:ptr<byte>,
+                              func:ref<(? -> ?)>) -> ptr<?> :
+  ;Read the argument object from memory.
+  val object = read-from-memory(input, object-io(interface))
+                                
+  ;Execute the receive function given the argument and
+  ;get a PluginResult back.
+  val result = execute(func, object)
+
+  ;Serialize the PluginResult to the output buffer.
+  write-to-memory(output(interface),
+                  plugin-io(interface),
+                  result)
+
+  ;Return the pointer to the output buffer.
+  return output(interface).data
+
+;Execute the given function with the given object,
+;and return a PluginResult.
+defn execute (func:? -> ?, object) -> PluginResult :
+  var trace:StackTrace|False = false
+  try :
+    with-exception-interceptor(
+      fn () :
+        PluginSuccess(func(object))
+      fn (e) :
+        trace = collect-stack-trace()
+        throw(e))
+  catch (e) :
+    if trace is False :
+      fatal("Error: An exception was thrown by the plugin but \
+             no stack trace was collected.")
+    PluginError(to-string(e), trace as StackTrace)
