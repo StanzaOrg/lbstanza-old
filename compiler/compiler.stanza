@@ -5,7 +5,8 @@ defpackage stz/compiler :
   import collections
   import stz/params
   import stz/proj-manager
-  import stz/build-manager
+  import stz/build-manager with:
+    prefix(ProjDependencies) => build-
   import stz/proj
   import stz/proj-ir
   import stz/proj-utils
@@ -18,8 +19,11 @@ defpackage stz/compiler :
   import core/parsed-path
   import stz/compiler-build-settings
   import stz/compiler-result
+  import stz/compiler-linking
+  import stz/linking-errors
   import stz/file-stamps
   import stz/macroexpander
+  import stz/external-dependencies
 
 ;============================================================
 ;==================== System Callbacks ======================
@@ -35,7 +39,8 @@ public defmulti delete-temporary-file (s:System, file:String) -> False
 ;================== Compute Build Settings ==================
 ;============================================================
 
-defn compute-build-settings (settings:BuildSettings, platform:Symbol) -> [ProjFile, BuildSettings] :
+defn compute-build-settings (settings:BuildSettings,
+                             platform:Symbol) -> [ProjFile, BuildSettings] :
   match(inputs(settings)) :
     (inputs:BuildTarget) :
       val proj-files = default-proj-files()
@@ -85,8 +90,10 @@ defn compute-build-settings (settings:BuildSettings, platform:Symbol) -> [ProjFi
         build-ccflags,
         to-tuple(build-flags),
         macro-plugins(settings))
-      ;Return
+
+      ;Return new settings.
       [proj, settings*]
+
     (inputs:BuildPackages) :
       val proj-files = default-proj-files()
       add-all(proj-files, /proj-files(names(inputs)))
@@ -99,6 +106,8 @@ defn compute-build-settings (settings:BuildSettings, platform:Symbol) -> [ProjFi
                       sub-platform{_, platform} $
                       sub-output{_, build-out} $
                       settings
+
+      ;Return new settings.
       [proj, settings*]
 
 ;If we are compiling on windows, then adjust the path
@@ -115,6 +124,22 @@ defn add-exe-suffix? (path:String|False, platform:Symbol) -> String|False :
         else : path
       else : path
     else : path
+
+;Ensure that, if appropriate, that an assembly file
+;exists in the build settings.
+defn ensure-asmfile (settings:BuildSettings,
+                     system:System) -> BuildSettings :
+  ;Determine whether we should autogenerate an assembly file.
+  val genfile? = match(assembly(settings)) :
+    (f:AsmFile) : false
+    (f:False) : output(settings) is-not False
+
+  ;If so, then call the system and request a temporary filename.
+  if genfile? :
+    val asmfile = AsmFile(make-temporary-file(system), true)
+    sub-assembly(settings, asmfile)
+  else :
+    settings
 
 ;============================================================
 ;================ Compute Dependencies ======================
@@ -157,7 +182,9 @@ public defn compile (settings:BuildSettings, system:System, verbose?:True|False)
   defn main () :
     read-config-file()
     val build-platform = compute-build-platform()
-    val [proj, settings*] = compute-build-settings(settings, build-platform)
+    val [proj, settings*] = let :
+      val [proj, settings*] = compute-build-settings(settings, build-platform)
+      [proj, ensure-asmfile(settings*, system)]
     val auxfile = AuxFile()
     if empty?(names!(inputs(settings*))) :
       println("No inputs given to compiler.")
@@ -165,19 +192,13 @@ public defn compile (settings:BuildSettings, system:System, verbose?:True|False)
       println("Build target %~ is already up-to-date." % [target?(inputs(settings))])
     else :
       setup-system-flags(settings*)
-      val proj-manager = ProjManager(proj, ProjParams(compiler-flags(), optimize?(settings*)), auxfile)      
-      val [build-asm, temporary-asm?] = make-asm-file?(settings*)      
+      val proj-manager = ProjManager(proj, ProjParams(compiler-flags(), optimize?(settings*)), auxfile)
+      val [build-asm, temporary-asm?] = make-asm-file?(settings*)
       val comp-result = compile(proj-manager, names!(inputs(settings*)), vm-packages(settings*), build-asm, pkg-dir(settings*),
                                 backend(platform(settings*) as Symbol), optimize?(settings*), verbose?, macro-plugins(settings*))
       save(auxfile)
-
-      println("LINK OUTPUT FILE:")
-      println("Settings* = %_" % [settings*])
-      println("comp-result = %_" % [comp-result])
-      
-
-      link-output-file(settings*, build-asm, temporary-asm?, comp-result, target?(inputs(settings)), proj, auxfile)
-      save(auxfile)
+      within delete-temporary-file-on-finish(settings*) :
+        link-output-file(settings*, comp-result, proj, auxfile)
 
   defn compute-build-platform () :
     match(platform(settings)) :
@@ -201,145 +222,56 @@ public defn compile (settings:BuildSettings, system:System, verbose?:True|False)
       `linux : L64Backend()
       `windows : W64Backend()
 
-  defn link-output-file (settings:BuildSettings, build-asm:String|False, temporary-asm?:True|False,
-                         comp-result:CompilationResult, target:Symbol|False, proj:ProjFile, auxfile:AuxFile) :
-    ;Accumulate filestamps
-    val filestamps = Vector<FileStamp>()    
-
-    ;Main algorithm
-    defn driver () :
-      ;Add package stamps from front end compilation result
-      add-all(filestamps, output-pkgs(comp-result))
-      ;Categorize cases
-      match(output(settings), build-asm) :
-        (build-out:String, build-asm) : compile-exe(build-asm as String, build-out)
-        (build-out:False, build-asm:String) : compiled-asm(build-asm)
-        (build-out:False, build-asm:False) : compiled-pkgs()
-
-    ;Case: Build an executable
-    defn compile-exe (build-asm:String, build-out:String) :
+  ;Execute the body and delete the temporary file when the body finishes.
+  defn* delete-temporary-file-on-finish (body:() -> False, settings:BuildSettings) :
+    ;Determine whether a temporary file has been generated.
+    val temp-file? = match(assembly(settings)) :
+      (asm:AsmFile) : filename(asm) when auto-generated?(asm)
+      (f:False) : false
+    match(temp-file?:String) :
       try :
-        ;Compute dependencies
-        val build-manager = BuildManager(proj)
-        val ds = calc-dependencies(build-manager, platform(settings) as Symbol)
-        ;Save the external dependencies if requested
-        if external-dependencies(settings) is String :
-          val file = external-dependencies(settings) as String
-          spit(file, ds)
-          add-filestamp(file)
-        ;Compute compilation commands
-        for bc in build-commands(build-manager, ds) do :
-          ;Add its filestamps
-          add-filestamp(bc)
-          ;Execute it's compilation statement
-          val cstmt = compile(bc)
-          match(cstmt:CompileStmt) :
-            execute(build-manager, cstmt)
-        ;Create the output file
-        val platform = platform(settings) as Symbol
-        val successful? = call-cc(system, platform, build-asm, ccfiles(ds), ccflags(ds), build-out)
-        ;Update the auxiliary file if we successfully compiled it.
-        if successful? :
-          add-filestamp(build-asm) when not temporary-asm?
-          add-filestamp(build-out)
-          update-aux-file()
+        body()
       finally :
-        ;Delete the temporary asm file if necessary
-        delete-temporary-file(system, build-asm) when temporary-asm?
+        try: delete-temporary-file(system, temp-file?)
+        catch (e) : false      
+    else :
+      body()
 
-    ;Case: Compiled to assembly. Do not link final executable.
-    defn compiled-asm (build-asm:String) :
-      ;Add the built assembly file as something to track
-      add-filestamp(build-asm)
-      ;If the external dependencies should be output, then
-      ;compute and save them.
-      if external-dependencies(settings) is String :
-        val file = external-dependencies(settings) as String
-        val build-manager = BuildManager(proj)
-        val ds = calc-dependencies(build-manager, platform(settings) as Symbol)
-        spit(file, ds)
-        add-filestamp(file)
-      ;Update the aux file
-      update-aux-file()
-
-    ;Case: Compiled to pkgs
-    defn compiled-pkgs () :
-      update-aux-file()
-
-    ;Given the build platform, compute the set of file and flag dependencies
-    ;that the build depends upon.
-    ;Special note about the flag dependencies:
-    ;  The ordering of flags is important in GCC. Suppose we give the flags -lLIBA -lLIBB -lLIBC.
-    ;  When processing -lLIBC, GCC will keep only the definitions in LIBC that have been used
-    ;  thus far by the flags that have come before. Therefore, if LIBB uses definitions from LIBC,
-    ;  then we must ensure that -lLIBC comes after -lLIBB.       
-    defn calc-dependencies (build-manager:BuildManager, platform:Symbol) -> ProjDependencies :
-      ;Compute original dependencies
-      val ds = dependencies(build-manager,
-                            unique-join(compiled-packages(comp-result),
-                                        binding-packages(comp-result)),
-                            platform)
-      ;Compute the project external dependencies
-      ProjDependencies(unique-join(ccfiles(ds), ccfiles(settings)),
-                       unique-join-last-occurrence(ccflags(ds), ccflags(settings)))
-
-    ;Execute an external compilation command
-    defn execute (build-manager:BuildManager, stmt:CompileStmt) :
-      ;Create external file record
-      defn ext-rec () :
-        val filetype = ExternalFile(filestamp(name(stmt))) when file?(stmt)
-                  else ExternalFlag(name(stmt))
-        val ds = map(filestamp,dependencies(stmt))
-        ExternalFileRecord(filetype, ds, commands(stmt))
-
-      ;Determine whether already compiled
-      val already-compiled? =
-        try : key?(auxfile,ext-rec())
-        catch (e:PathResolutionError) : false
-
-      ;If there isn't already a record cached?
-      if already-compiled? :
+  defn link-output-file (settings:BuildSettings,
+                         comp-result:CompilationResult,
+                         proj:ProjFile,
+                         auxfile:AuxFile) :
+    val errors = Vector<LinkingError>()
+    val linkenv = new LinkerEnv :
+      defmethod issue-error (this, err:LinkingError) :
+        add(errors, err)
+      defmethod computed-dependencies (this, deps:ProjDependencies) :
+        if external-dependencies(settings) is String :
+          val filename = external-dependencies(settings) as String
+          spit(filename, format-report(deps))
+      defmethod notify-external-dependency-up-to-date (this, file?:True|False, name:String) :
         if verbose? :
-          println("External dependency %~ is up-to-date." % [name(stmt)])
-      else :
-        if verbose? :
-          println("Compiling external dependency %~." % [name(stmt)])
-        ;Execute compilation statements
-        val platform = platform(settings) as Symbol
-        for command in commands(stmt) do :
-          call-shell(system, platform, command)
-        ;And record external file record
-        add(auxfile, ext-rec())
-
-    defn add-filestamp (file:String) :
-      add(filestamps, filestamp(file))
-
-    defn add-filestamp? (file:String) :
-      add-filestamp(file) when file-exists?(file)
-
-    defn add-filestamp (c:BuildCommand) :
-      ;Cases: Either the build command
-      ;  (1) requires an external build command, or
-      ;  (2) is included directly in the link arguments.
-      ;Case (1): The dependencies of the build command needs to be tracked.
-      ;Case (2): The file itself needs to be tracked (if it is a file)
-      match(compile(c)) :
-        (comp:CompileStmt) :
-          do(add-filestamp, dependencies(comp))
-        (f:False) :
-          add-filestamp(name(c)) when file?(c)
-          
-    defn update-aux-file () :
-      match(target:Symbol) :
-        val packages = to-tuple $ cat(compiled-packages(comp-result),
-                                      binding-packages(comp-result))
-        val proj-isolate = isolate-stmts(proj, packages)
-        val rec = BuildRecord(target, package-stamps(comp-result),
-                              to-tuple(filestamps), BuildRecordSettings(settings), proj-isolate)
-        add(auxfile, rec)                      
-        
-    ;Launch!
-    driver()
+          val type-str = "file" when file? else "flag"
+          println("External dependency: %_ %~ is up-to-date." % [type-str, name])
+      defmethod call-shell (this, platform:Symbol, command:String) :
+        call-shell(system, platform, command)
+      defmethod call-cc (this,
+                         platform:Symbol,
+                         asm:String,
+                         ccfiles:Tuple<String>,
+                         ccflags:Tuple<String>,
+                         exefile:String) :
+        call-cc(system, platform, asm,  ccfiles,ccflags, exefile)
+      defmethod update-aux-file (this,
+                                 records:Tuple<AuxRecord>) :
+        do(add{auxfile, _}, records)
+        save(auxfile)
+    val input = LinkerInput(settings,
+                            comp-result,
+                            proj,
+                            auxfile)
+    link(input, linkenv)
+    throw-linker-errors?(errors)
 
   ;Launch!
   main()
@@ -381,7 +313,7 @@ defn unique-join-last-occurrence<?T> (xs:Seqable<?T&Equalable>, ys:Seqable<?T&Eq
   val items = to-vector<T&Equalable>(cat(xs, ys))
   val unique-items = to-vector<T>(unique(in-reverse(items)))
   to-tuple(in-reverse(unique-items))
-  
+
 defn has-extension? (s:String) :
   index-of-char(s, '.') is Int
 
@@ -395,15 +327,15 @@ defn target? (inputs:BuildInputs) :
 defn names! (inputs:BuildInputs) :
   names(inputs as BuildPackages)
 
-defn proj-file? (s:String|Symbol) : 
+defn proj-file? (s:String|Symbol) :
   match(s:String) : suffix?(s, ".proj")
-  
+
 defn proj-files (ss:Tuple<String|Symbol>) :
   filter(proj-file?, ss) as Seq<String>
-  
+
 defn non-proj-files (ss:Tuple<String|Symbol>) :
   filter({not proj-file?(_)}, ss)
-  
+
 defn non-files-to-symbols (ss:Seqable<String|Symbol>) :
   for s in ss seq :
     match(s) :
