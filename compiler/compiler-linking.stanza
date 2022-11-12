@@ -4,6 +4,7 @@ defpackage stz/compiler-linking :
   import stz/compiler-build-settings
   import stz/compiler-result
   import stz/proj-ir
+  import stz/proj-utils
   import stz/aux-file
   import stz/system-dependencies
   import stz/external-dependencies
@@ -79,6 +80,11 @@ public defmulti call-cc (e:LinkerEnv,
                          ccflags:Tuple<String>,
                          exefile:String) -> True|False
 
+;Called to request that the auxfile be updated with the additional records.
+public defmulti update-aux-file (e:LinkerEnv,
+                                 auxfile:AuxFile,
+                                 records:Tuple<AuxRecord>) -> False
+
 ;============================================================
 ;=================== Main Driver ============================
 ;============================================================
@@ -90,22 +96,28 @@ public defn link (input:LinkerInput, env:LinkerEnv) -> False :
   ;Retrieve the build platform.
   val build-platform = platform(build-settings(input)) as Symbol
 
-  ;Begin
+  ;Compute the set of all external dependencies required
+  ;by the program.
   val deps = compute-dependencies(
                compiler-result(input)
                proj(input)
                build-settings(input))
   println(deps)
 
+  ;Compute the compilation statements that must be
+  ;executed.
   val commands = compute-build-commands(deps, proj(input), env)
   println(commands)
 
+  ;Execute the given build commands if they are not
+  ;already up-to-date.
   val build-result = execute-build-commands(
                        commands,
                        auxfile(input),
                        build-platform,
                        env)
 
+  ;Execute the final command for building the program executable.
   val build-prog? = output(build-settings(input)) is-not False
                 and not errors?(build-result)
                 and not errors?(commands)
@@ -117,8 +129,17 @@ public defn link (input:LinkerInput, env:LinkerEnv) -> False :
       build-platform,
       env)
 
-  ;calculate all the stamps and stuff that needs to be saved
-  ;in the auxiliary file, and save them. 
+  ;Compute the set of all AuxRecords to use to update
+  ;the auxiliary file.
+  val aux-records = aux-records-to-save(
+                      build-settings(input),
+                      compiler-result(input),
+                      build-result,
+                      prog-result,
+                      proj(input))
+
+  ;Update the AuxFile.
+  update-aux-file(env, auxfile(input), aux-records)
 
   false
 
@@ -253,13 +274,18 @@ defn execute-build-commands (cmds:BuildCommands,
   for stmt in stmts(cmds) do :      
     ;Check whether the external file has already been compiled,
     ;by checking the aux file.
-    val already-compiled? = match(ext-rec(stmt)) :
+    val prev-ext-rec = ext-rec(stmt)
+    val already-compiled? = match(prev-ext-rec) :
       (rec:ExternalFileRecord) : key?(auxfile, rec)
       (rec) : false
 
     ;If the file is up-to-date, then notify the environment.
-    if already-compiled? :
+    if already-compiled? :    
       notify-external-dependency-up-to-date(env, file?(stmt), name(stmt))
+      
+      ;Save the record.
+      add(saved-records, prev-ext-rec as ExternalFileRecord)
+
     ;If not up-to-date, then execute the commands.
     else :
       ;Execute the commands, and track any execution error
@@ -280,7 +306,7 @@ defn execute-build-commands (cmds:BuildCommands,
       else :
         val rec = ext-rec(stmt)
         match(rec:ExternalFileRecord) :
-          add(saved-records, rec)      
+          add(saved-records, rec)
 
   ;Return the result of the build commands.
   BuildResult(to-tuple(saved-records), errors?)
@@ -336,3 +362,84 @@ defn execute-final-build-command (settings:BuildSettings,
 defstruct FinalBuildResult :
   asm-filestamp: FileStamp|False
   exe-filestamp: FileStamp
+
+;============================================================
+;============== Calculate All Stamps To Save ================
+;============================================================
+
+;Compute the set of all AuxRecords to use to update
+;the auxiliary file.
+defn aux-records-to-save (settings:BuildSettings,
+                          compiler-result:CompilationResult,
+                          build-result:BuildResult,
+                          prog-result:FinalBuildResult|False,
+                          projfile:ProjFile)
+                       -> Tuple<AuxRecord> :
+
+  ;Accumulate all records here.
+  val all-records = Vector<AuxRecord>()
+
+  ;All the ExternalFileRecord from compiling the external
+  ;dependencies should be saved, if they have trackable dependencies.
+  defn trackable-dependencies? (r:ExternalFileRecord) -> True|False :
+    filetype(r) is ExternalFile or
+    not empty?(dependencies(r))
+  add-all(all-records, filter(trackable-dependencies?, records(build-result)))
+
+  ;If we are building a build target, then save a BuildRecord
+  ;as well.
+  val package-inputs = inputs(settings) as BuildPackages
+  val build-target = original-target(package-inputs)
+  val asmfile = assembly(settings) as AsmFile
+  val original-assembly = filename(asmfile) when not auto-generated?(asmfile)
+  match(build-target:Symbol) :
+    ;Create the BuildRecordSettings.
+    val build-record-settings = BuildRecordSettings(
+      names(package-inputs),            ;inputs
+      vm-packages(settings),            ;vm-packages
+      platform(settings),               ;platform
+      original-assembly,                ;assembly
+      output(settings),                 ;output
+      external-dependencies(settings),  ;external-dependencies
+      pkg-dir(settings),                ;pkg-dir
+      optimize?(settings),              ;optimize?
+      ccfiles(settings),                ;ccfiles
+      ccflags(settings),                ;ccflags
+      flags(settings))                  ;flags
+
+    ;Compute the project isolate.
+    val proj-isolate = isolate-stmts(projfile, all-packages) where :
+      val all-packages = unique-join(compiled-packages(compiler-result),
+                                     binding-packages(compiler-result))
+
+    ;Compute the set of all filestamps.
+    val filestamps = Vector<FileStamp>()
+
+    ;Add stamps from finished output pkgfiles.
+    add-all(filestamps, output-pkgs(compiler-result))
+
+    ;Add stamps from external dependencies.
+    for rec in records(build-result) do :
+      match(filetype(rec)) :
+        (f:ExternalFile) : add(filestamps, filestamp(f))
+        (f:ExternalFlag) : false
+      add-all(filestamps, dependencies(rec))
+      
+    ;Add stamps from final artifact.
+    match(prog-result:FinalBuildResult) :
+      match(asm-filestamp(prog-result)) :
+        (s:FileStamp) : add(filestamps,s)
+        (f:False) : false
+      add(filestamps, exe-filestamp(prog-result))
+
+    ;Create the build record.
+    val rec = BuildRecord(
+                build-target,
+                package-stamps(compiler-result),
+                to-tuple(filestamps),
+                build-record-settings,
+                proj-isolate)
+    add(all-records, rec)
+
+  ;Return all computed records.
+  to-tuple(all-records)
