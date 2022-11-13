@@ -1,0 +1,184 @@
+defpackage stz/proj-variable-substitution :
+  import core
+  import collections
+  import stz/proj-ir
+  import stz/proj-stage0
+  import stz/proj-errors
+
+;============================================================
+;============ Variable Substitution on File =================
+;============================================================
+
+;Perform variable substitution in the given file. 
+
+public defn variable-substitution (f:ProjFileS0) -> ProjFileS0 :
+
+  ;Compute values of all symbols
+  val symbol-table = HashTable<Symbol,ProjValue>()
+
+  ;Accumulate errors
+  val errors = Vector<ProjFileError>()
+
+  ;Perform substitution on the given statement.
+  defn sub-stmt-vars (s:ProjStmt, proj-file-id:Int) -> ProjStmt :
+    match(s) :
+      (s:IncludedStmtsS0) :
+        val result = for item in s map :
+          sub-stmt-vars(item as ProjStmt, /proj-file-id(s))
+        result as IncludedStmtsS0
+      (s) :
+        defn lookup-var (name:Symbol) : get?(symbol-table,name)
+        val s* = sub-vars(lookup-var, s, proj-file-id, errors)
+        match(s*:VarStmtS0) :
+          symbol-table[name(s*)] = value(s*)
+        s*
+
+  ;Launch!
+  val stmts* = map(sub-stmt-vars{_, id(f)}, stmts(f))
+  throw-proj-file-errors?(errors)
+  sub-stmts(f, stmts*)
+
+;============================================================
+;========== Variable Substitution within Statement ==========
+;============================================================
+
+;Perform variable substitution on the given statement.
+;Just calls the sub-vars function recursively on all nested
+;ProjValue. Cannot be called on IncludedStmtsS0 as that
+;one contains nested statements.
+
+defn sub-vars (f:Symbol -> ProjValue|False,
+               stmt:ProjStmt,
+               proj-file-id:Int,
+               errors:Vector<ProjFileError>) -> ProjStmt :
+  ;Sanity check.             
+  if stmt is IncludedStmtsS0 :
+    fatal("Illegal input.")
+  ;Perform substitution within item.              
+  defn subvalue (v:ProjItem) -> ProjItem :
+    sub-vars(f, v as ProjValue, proj-file-id, errors) as ProjValue
+  map(subvalue, stmt) as ProjStmt
+
+;============================================================
+;=============== Variable within ProjValue ==================
+;============================================================
+
+;Substitutes variables in the given ProjValue.
+;This function is guaranteed to succeed but the return
+;result may contain dummy values.
+;
+;This function contains built-in support for looking up:
+;  - Special placeholders {.} and {WORKDIR}
+;  - Environment variables
+;
+;- f: The function for looking up the replacement value
+;  given a variable name. Allowed to fail and return false if
+;  no substitution can be found.
+
+defn sub-vars (f:Symbol -> ProjValue|False,
+               v:ProjValue,
+               proj-file-id:Int,
+               errors:Vector<ProjFileError>) -> ProjValue :
+
+  ;Lookup a variable with the given name.
+  defn lookup-var (info:FileInfo|False, name:Symbol) -> ProjValue :
+    match(f(name)) :
+      ;Case: A variable exists with that name.
+      (v:ProjValue) :
+        v
+      ;Case: No variable exists, so then check the environment variables.
+      (f:False) :
+        val env-v = get-env(to-string(name))
+        ;Case: An environment variable exists, so return that.
+        match(env-v:String) :
+          AtomValue(info, env-v)
+        ;Case: No variable exists.
+        else :
+          ;Record error.
+          val msg = "Cannot resolve variable %_." % [name]
+          add(errors, ProjFileError(info, to-string(msg)))
+          ;Return dummy value.
+          VarValue(info, name)
+
+  ;Substitute all curlies in the given string.
+  defn sub-vars-in-string (info:FileInfo|False, str:String) -> ProjValue :
+    within name = sub-curly(info, str) :
+      switch(name) :
+        "." : ProjDir(proj-file-id, info)
+        "WORKDIR" : WorkDir(info)
+        else : lookup-var(info,to-symbol(name))
+
+  ;Recursively substitute variables in the entire ProjValue.
+  defn sub-vars (v:ProjValue) -> ProjValue :
+    match(v) :
+      ;Lookup the replacement value for the given variable.
+      (v:VarValue) :
+        lookup-var(info(v), name(v))
+        
+      ;Replace the curlies in the strings within AtomValue.
+      (v:AtomValue) :
+        match(value(v)) :
+          (value:String) : sub-vars-in-string(info(v), value)
+          (value:Symbol) : v
+            
+      ;Call sub-curly recursively.
+      (v) :
+        val result = map(sub-vars{_ as ProjValue}, v)
+        result as ProjValue
+
+  ;Launch!
+  sub-vars(v)
+      
+
+;============================================================
+;================= Curly Substitution Utility ===============
+;============================================================
+
+;Substitutes appearances of {VARIABLE} in strings, and
+;returns the results represented using either a AtomValue or a
+;a SplicedString. If the string contains no curlies, then an AtomValue
+;is returned, otherwise a SplicedString is returned.
+;- f: The function for looking up the value of a variable.
+;- info: The FileInfo of the returned AtomValue|SplicedString.
+
+defn sub-curly (f:String -> ProjValue,
+                info:FileInfo|False,
+                s:String) -> ProjValue :
+  ;Case: No curlies at all.
+  if index-of-char(s, '{') is False :
+    AtomValue(info, s)
+  else :
+    ;Create a buffer to hold all the ProjValue.
+    val buffer = Vector<ProjValue>()
+
+    ;Iterate through the curlies
+    let loop (start:Int = 0) :
+      ;Determine curly bounds
+      val [i, j]:[Int|False, Int|False] = let :
+        val i = index-of-char(s, start to false, '{')
+        match(i:Int) :
+          [i, index-of-char(s, (i + 1) to false, '}')]
+        else : [i, false]
+        
+      ;Case: A curly was found.
+      match(i:Int, j:Int) :
+        ;Add string up to curly
+        if start < i :
+          add(buffer, AtomValue(info, s[start to i]))
+          
+        ;Add replacement
+        val replacement = f(s[(i + 1) through (j - 1)])
+        add(buffer, replacement)
+        
+        ;Continue past } char
+        loop(j + 1)
+        
+      ;Case: No curlies remaining.
+      else :
+        ;End of string, add the rest
+        if start < length(s) :
+          add(buffer, AtomValue(info, s[start to false]))
+
+    ;Return spliced string
+    SplicedString(info, to-tuple(buffer))
+
