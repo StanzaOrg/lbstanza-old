@@ -11,6 +11,7 @@ defpackage stz/compiler-linking :
   import stz/linking-errors
   import stz/utils
   import stz/file-stamps
+  import stz/foreign-package-files
 
 ;<doc>=======================================================
 ;================ High-Level Algorithm ======================
@@ -120,49 +121,58 @@ public defn link (input:LinkerInput, env:LinkerEnv) -> False :
   val deps = compute-dependencies(
                compiler-result(input)
                proj(input)
-               build-settings(input))
-  computed-dependencies(env, deps)
+               build-settings(input)
+               env)
+  computed-dependencies(env, dependencies(deps))
 
-  ;The rest of the flow is about executing the build
-  ;commands. Proceed only if an output executable is desired.
-  if output-required?(build-settings(input)) :
+  ;Proceed with the rest of the flow if dependencies
+  ;were computed without errors.
+  if not errors?(deps) :
 
-    ;Compute the compilation statements that must be
-    ;executed.
-    val commands = compute-build-commands(deps, proj(input), env)
-    computed-build-commands(env, stmts(commands))
+    ;The rest of the flow is about executing the build
+    ;commands. Proceed only if an output executable is desired.
+    if output-required?(build-settings(input)) :
 
-    ;Execute the given build commands if they are not
-    ;already up-to-date.
-    val build-result = execute-build-commands(
-                         commands,
-                         auxfile(input),
-                         build-platform,
-                         env)
+      ;Compute the compilation statements that must be
+      ;executed.
+      val commands = compute-build-commands(dependencies(deps), proj(input), env)
+      computed-build-commands(env, stmts(commands))
 
-    ;Execute the final command for building the program executable.
-    val build-prog? = output(build-settings(input)) is-not False
-                  and not errors?(build-result)
-                  and not errors?(commands)
+      ;Satisy the foreign package dependencies.
+      for package in foreign-packages(dependencies(deps)) do :
+        satisfy-foreign-packages(env, package)
 
-    val prog-result = if build-prog? :
-      execute-final-build-command(
-        build-settings(input),
-        deps,
-        build-platform,
-        env)
+      ;Execute the given build commands if they are not
+      ;already up-to-date.
+      val build-result = execute-build-commands(
+                           commands,
+                           auxfile(input),
+                           build-platform,
+                           env)
 
-    ;Compute the set of all AuxRecords to use to update
-    ;the auxiliary file.
-    val aux-records = aux-records-to-save(
-                        build-settings(input),
-                        compiler-result(input),
-                        build-result,
-                        prog-result,
-                        proj(input))
+      ;Execute the final command for building the program executable.
+      val build-prog? = output(build-settings(input)) is-not False
+                    and not errors?(build-result)
+                    and not errors?(commands)
 
-    ;Update the AuxFile.
-    update-aux-file(env, aux-records)
+      val prog-result = if build-prog? :
+        execute-final-build-command(
+          build-settings(input),
+          dependencies(deps),
+          build-platform,
+          env)
+
+      ;Compute the set of all AuxRecords to use to update
+      ;the auxiliary file.
+      val aux-records = aux-records-to-save(
+                          build-settings(input),
+                          compiler-result(input),
+                          build-result,
+                          prog-result,
+                          proj(input))
+
+      ;Update the AuxFile.
+      update-aux-file(env, aux-records)
 
 ;============================================================
 ;================ Compute Dependencies ======================
@@ -172,7 +182,20 @@ public defn link (input:LinkerInput, env:LinkerEnv) -> False :
 ;by the program.
 defn compute-dependencies (result:CompilationResult,
                            proj:ProjFile,
-                           settings:BuildSettings) -> ProjDependencies :
+                           settings:BuildSettings,
+                           env:LinkerEnv) -> AllDependencies :
+
+  ;==========================================================
+  ;=================== Error Tracking =======================
+  ;==========================================================
+
+  ;Flip to true if encountered-error is ever called.
+  var errors?: True|False = false
+
+  ;Encountered a new during dependency resolution.
+  defn encountered-error (e:LinkingError) :
+    issue-error(env, e)
+    errors? = true
 
   ;==========================================================
   ;=================== Start of Iteration ===================
@@ -217,7 +240,7 @@ defn compute-dependencies (result:CompilationResult,
                        proj-file-dependencies()]
 
   ;==========================================================
-  ;=========== Iteration: Compile Statements ================
+  ;================== Iterative Step ========================
   ;==========================================================
 
   ;Dependencies in .proj files required for compiling
@@ -239,31 +262,76 @@ defn compute-dependencies (result:CompilationResult,
                            foreign-packages(stmt))
     filter-by<ProjDependencies>(dependencies)
 
-  defn package-manager-system-dependencies (deps:ProjDependencies) -> Seqable<ProjDependencies> :
-    
+  ;Dependencies imposed by the package managers.
+  ;Based upon the required ForeignPackageFiles, retrieve the corresponding ForeignPackageParamsStmt
+  ;from the .proj file, and request the environment to return the manager's system dependencies.
+  ;If there is no ForeignPackageParamsStmt in the .proj file, then it means that the program
+  ;depends upon packages from e.g. conan, but the project was not configured to work with conan.
+  ;- already-included: Includes the set of foreign package managers whose dependencies are
+  ;  already included in deps. This function will directly add the additional package managers
+  ;  to already-included.
+  defn package-manager-system-dependencies (deps:ProjDependencies,
+                                            already-included:HashSet<Symbol>) -> Seqable<ProjDependencies> :
+    ;Retrieve all the configurations for the foreign package managers.
+    val package-params = to-hashtable(package-manager,
+      filter-by<ForeignPackageParamsStmt>(stmts(proj)))
 
-  ;Based upon the initial set, add the compile statement dependencies.
-  ;Returns false if there are no additional dependencies to add.
-  defn add-compilation-dependencies (deps:ProjDependencies) -> ProjDependencies|False :
-    compilation-dependencies(deps)
-    
-  ;First compute all the dependencies disregarding the
-  ;foreign packages required by compile statements.
-  val dependencies0 = merge $ cat-all $
-                      [[system-dependencies()
-                        explicit-dependencies()]
-                       proj-file-dependencies()]
-  ;Then add the foreign packages induced by the compilation
-  ;statements.
-  merge $ cat-all $
-          [[dependencies0]
-           compilation-dependencies(dependencies0)]
-      
-;Helper: Unique join.
-defn unique-join<?T> (xs:Tuple<?T>, ys:Tuple<?T>) -> Tuple<T> :
-  val visited = HashSet<?>()
-  to-tuple $ for v in cat(xs,ys) filter :
-    add(visited,v)
+    ;Compute new set of dependencies.
+    val new-deps = Vector<ProjDependencies>()
+    for package in foreign-packages(deps) do :
+      if add(already-included, package-manager(package)) :
+        match(get?(package-params, package-manager(package))) :
+          (params:ForeignPackageParamsStmt) :
+            add(new-deps, foreign-package-manager-dependencies(env, params))
+          (f:False) :
+            encountered-error(NoConfigurationForPackageManager(package-manager(package), files(package)))
+
+    ;Return the new dependencies
+    new-deps    
+
+  ;Based upon the initial set, add the additional dependencies from
+  ;the compile statements and the package managers.
+  ;- already-included-managers: Includes the set of foreign package
+  ;  managers whose dependencies are already included in deps.
+  defn add-additional-dependencies (deps:ProjDependencies,
+                                    already-included-managers:HashSet<Symbol>) -> ProjDependencies|False :
+    ;Compute the new set of dependencies.
+    val new-deps = merge $ cat-all $ [                                
+      [deps]
+      compilation-dependencies(deps)
+      package-manager-system-dependencies(deps, already-included-managers)]
+    ;Return the new dependencies only if they are different.
+    new-deps when new-deps != deps
+
+  ;==========================================================
+  ;=============== Main Iterative Loop ======================
+  ;==========================================================
+
+  ;Iteratively call add-additional-dependencies until convergence.
+  defn iteratively-compute-dependencies () -> ProjDependencies :
+    val included-managers = HashSet<Symbol>()
+    let loop (deps:ProjDependencies = all-initial-dependencies()) :
+      val added-deps = add-additional-dependencies(deps, included-managers)
+      match(added-deps:ProjDependencies) :
+        loop(added-deps)
+      else :
+        deps
+
+  ;==========================================================
+  ;==================== Launch! =============================
+  ;==========================================================
+
+  val deps = iteratively-compute-dependencies()
+  AllDependencies(deps, errors?)
+
+;Wrap up the computed dependencies along with information about
+;whether any errors occurred.
+defstruct AllDependencies :
+  dependencies: ProjDependencies
+  errors?:True|False
+with:
+  printer => true
+     
 
 ;============================================================      
 ;================ Compute Shell Commands ====================
@@ -523,3 +591,13 @@ defn aux-records-to-save (settings:BuildSettings,
 
   ;Return all computed records.
   to-tuple(all-records)
+
+;============================================================
+;==================== Small Utilities =======================
+;============================================================
+
+;Helper: Unique join.
+defn unique-join<?T> (xs:Tuple<?T>, ys:Tuple<?T>) -> Tuple<T> :
+  val visited = HashSet<?>()
+  to-tuple $ for v in cat(xs,ys) filter :
+    add(visited,v)
