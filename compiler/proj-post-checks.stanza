@@ -7,21 +7,50 @@ defpackage stz/proj-post-checks :
   import stz/proj-errors
   import stz/proj-field-types
   import stz/proj-value-types
+  import stz/check-set-equal
+  import stz/utils
+
+;============================================================
+;================= Main Implementation ======================
+;============================================================
 
 ;This pass ensures that all the post-normalized values
 ;are appropriate in the given file.
 
-public defn post-normalization-checks (f:ProjFileS0, env:ProjEnv) -> ProjFileS0 :
+;During this pass, we detect how ProjValues match up against
+;their expected types. For tables specifically, if an optional
+;field is not explicitly provided, but a default value is available,
+;then this pass fills in the table with the default value.
+;The provided 'translate-value' is used to translate the default value
+;into an appropriate ProjValue for this pass.
+
+;- translate-value (v, type, proj-path, errors) where:
+;  - proj-path: The full path of the proj file containing this value.
+
+public defn post-normalization-checks (f:ProjFileS0,
+                                       env:ProjEnv,
+                                       translate-value:(?, ValueType, String, Vector<ProjFileError>) -> ProjValue)
+                                    -> ProjFileS0 :
   val errors = Vector<ProjFileError>()
-  val checker = Checker(env, errors)
-  defn scan (stmt:ProjStmt) :
+  
+  defn make-checker (proj-path:String) -> Mapper :
+    Checker(env, errors, translate-value{_, _, proj-path, _})
+    
+  defn scan (stmt:ProjStmt, checker:Mapper) -> ProjStmt :
     match(stmt:IncludedStmtsS0) :
-      do(scan, stmts(stmt))
+      val new-checker = make-checker(full-path(stmt))
+      val new-stmts = map(scan{_, new-checker}, stmts(stmt))
+      sub-stmts(stmt, new-stmts)
     else :     
-      check-types(stmt, checker)
-  do(scan, stmts(f))
+      map-fields(stmt, checker)
+
+  ;Launch!
+  val root-checker = make-checker(full-path(f))
+  val new-stmts = map(scan{_, root-checker}, stmts(f))
+
   throw-proj-file-errors?(errors)
-  f
+
+  sub-stmts(f, new-stmts)
 
 ;============================================================
 ;================ Check Individual Statement ================
@@ -29,58 +58,171 @@ public defn post-normalization-checks (f:ProjFileS0, env:ProjEnv) -> ProjFileS0 
 
 ;Create a checker for use in calling check-types.
 defn Checker (env:ProjEnv,
-              errors:Vector<ProjFileError>) -> Checker :
-  ;Create the param type table.
-  ;Each entry, [manager, field] => type, indicates that the param
-  ;called 'field' for the package manager 'manager' is expected
-  ;to have type 'type'.
-  val param-type-table = HashTable<[Symbol,Symbol],ValueType>()
-  for info in foreign-package-managers(env) do :
-    for param in params(info) do :
-      param-type-table[[name(info), field-name(param)]] = field-type(param)
+              errors:Vector<ProjFileError>,
+              translate-value:(?, ValueType, Vector<ProjFileError>) -> ProjValue) -> Mapper :
+  ;Create the table of foreign package managers.
+  val manager-table = to-hashtable(name, foreign-package-managers(env))
 
-  new Checker :
-    defmethod field-type (this, manager:Symbol, field:Symbol) -> ValueType :
-      param-type-table[[manager, field]]
-    defmethod check (this, v:ProjValue, t:ValueType) -> False :
-      match(v) :
-        (v:ProjValues) :
-          if single?(t) :
-            val msg = "Expected %_ here." % [description(t)]
-            add(errors, ProjFileError(info(v), to-string(msg)))
-          else :
-            for v in values(v) do :
-              check(this, v, t)
-        (v:CommandString) :
-          check(this, value(v), t)
-        (v:FilePath) :
-          check(this, value(v), t)
-        (v:AtomValue) :
-          if not typeof?(v, atom-type(t)) :
-            val msg = "Expected %_ here." % [description(t)]
-            add(errors, ProjFileError(info(v), to-string(msg)))  
+  ;Translate the given value, pushing any errors to 'errors'.
+  defn translate-and-push-error (v, t:ValueType) -> ProjValue :
+    translate-value(v, t, errors)
 
-;Return true if the given atomic value is an instance
-;of the given type.
-defn typeof? (v:AtomValue, t:AtomType) -> True|False :
-  switch(t) :
-    StringType :
-      value(v) is String
-    SymbolType :
-      value(v) is Symbol
-    StanzaInputType :
-      match(value(v)) :
-        (value:String) : any?(suffix?{value, _}, [".stanza" ".pkg" ".fpkg"])
-        (value:Symbol) : true
+  new Mapper :
+    ;Retrieve the field type returned by the package manager.
+    defmethod field-types (this, manager:Symbol) -> Tuple<TableEntry> :
+      params(manager-table[manager])
+
+    ;Check that v is of type t.
+    ;Push any type errors to 'errors'.
+    defmethod map-field (this, v:ProjValue, t:ValueType) -> ProjValue :
+      val [mismatches, new-v] = check-welltyped(v,t,translate-and-push-error)
+      for mismatch in mismatches do :
+        match(diff(mismatch)) :
+          (diff:UnsupportedItem) :
+            val msg = "Unsupported field '%~'." % [name(diff)]
+            add(errors, ProjFileError(info(value(mismatch)), to-string(msg)))
+          (diff:DuplicateItem) :
+            val msg = "Duplicate entry for field '%~'." % [name(diff)]
+            add(errors, ProjFileError(info(value(mismatch)), to-string(msg)))
+          (diff:MissingItem) :
+            val msg = "Required field '%~' is missing." % [name(diff)]
+            add(errors, ProjFileError(info(value(mismatch)), to-string(msg)))
+          (diff:False) :
+            val msg = "Expected %_ here." % [description(type(mismatch))]
+            add(errors, ProjFileError(info(value(mismatch)), to-string(msg)))
+      ;Return filled in value.
+      new-v
 
 ;Returns a human-readable description of the type.
 ;If single? is true, should return something like: "a single string".
 ;If single? is false, should return something like: "a string".
 ;Used to generate sentences like: "Expected a single string here."
 defn description (t:ValueType) -> String :
-  val atom-description = switch(atom-type(t)) :
-    StringType: "string"
-    SymbolType: "symbol"
-    StanzaInputType: "Stanza file or package"
+  val atom-description = let loop (t:ValueType = t) :
+    match(t) :
+      (t:StringType) : "string"
+      (t:SymbolType) : "symbol"
+      (t:StanzaInputType) : "Stanza file or package"
+      (t:FilepathType) : "file path"
+      (t:FlagType) : "C compiler flag"
+      (t:MultipleType) : loop(type(t))
+      (t:TupleType) : "tuple"
+      (t:TableType) : "table of key-value entries"    
   if single?(t) : to-string("a single %_" % [atom-description])
   else : to-string("a %_" % [atom-description])
+
+;============================================================
+;================ Definition of Welltyped ===================
+;============================================================
+
+;Check whether v is of type t.
+;Returns [mismatches, new-value] where:
+;- mismatches: Any type mismatches in the given value. Empty
+;  if the value is welltyped.
+;- new-value: A transformed value with default values filled in.
+
+defn check-welltyped (v:ProjValue,
+                      t:ValueType,
+                      translate-value:(?, ValueType) -> ProjValue)
+                  -> [Vector<TypeMismatch>, ProjValue] :
+
+  ;Accumulate all detected type mismatches here.
+  val mismatches = Vector<TypeMismatch>()
+
+  ;Assert that v should be of type t.
+  ;Push any mismatches to the 'mismatches' list.
+  defn recur (v:ProjValue, t:ValueType) -> ProjValue :
+
+    ;Helper: Indicate a mismatch between v and t.
+    defn add-mismatch (diff:SetDifference|False) :
+      add(mismatches, TypeMismatch(v,t,diff))
+    defn add-mismatch () :
+      add-mismatch(false)
+
+    ;Categorize cases depending on t.
+    match(v, t) :
+      ;Cases: Welltyped definitions for atom types.
+      
+      (v:AtomValue, t:StringType) :
+        add-mismatch() when value(v) is-not String
+        v
+      (v:AtomValue, t:SymbolType) :
+        add-mismatch() when value(v) is-not Symbol
+        v
+      (v:AtomValue, t:StanzaInputType) :
+        match(value(v)) :
+          (value:String) :
+            if none?(suffix?{value, _}, [".stanza" ".pkg" ".fpkg"]) :
+              add-mismatch()
+          (value:Symbol) :
+            false
+        v    
+      (v:AtomValue, t:FilepathType) :
+        add-mismatch() when value(v) is-not String
+        v
+      (v:AtomValue, t:FlagType) :
+        add-mismatch() when value(v) is-not String
+        v
+      (v:ProjTuple, t:FlagType) :
+        ProjTuple(info(v), recur(value(v), MultipleType(StringType)))
+
+      ;Cases: Tuple type    
+      (v:ProjTuple, t:TupleType) :
+        ProjTuple(info(v), recur(value(v), MultipleType(type(t))))
+        
+      ;Cases: TableType
+      (v:ProjTableS0, t:TableType) :
+        ;First check whether all the expected fields are there.
+        val given-names = map(key, values(v))
+        val expected-items = for entry in entries(t) map :
+          Item(name(entry), optional?(entry))
+        val diffs = check-set-equal(given-names, expected-items)
+        do(add-mismatch, diffs)
+
+        ;Then fill in the right fields, if the right fields are there.
+        if empty?(diffs) :
+          val value-set = to-hashtable<Symbol,ProjValue>(values(v))
+          val new-values = to-tuple $ for entry in entries(t) seq? :
+            if key?(value-set, name(entry)) :
+              val field-value = value-set[name(entry)]
+              val new-field-value = recur(field-value, type(entry))
+              One(name(entry) => new-field-value)
+            else :
+              ;Sanity check: Field must be optional.
+              fatal("Expected optional table entry.") when not optional?(entry)
+              ;Check whether a default value is provided.
+              if empty?(default-value(entry)) :
+                None()
+              else :
+                val field-value = translate-value(
+                                    value!(default-value(entry)),
+                                    type(entry))
+                val new-field-value = recur(field-value, type(entry))
+                One(name(entry) => new-field-value)
+          ProjTableS0(info(v), new-values)
+
+        else :
+          v
+
+      ;Cases: MultipleType
+      (v:ProjValues, t:MultipleType) :
+        val vs = map(recur{_, t}, values(v))
+        ProjValues(info(v), vs)
+      (v, t:MultipleType) :
+        recur(v, type(t))
+
+      ;Otherwise type mismatch
+      (v, t) :
+        add-mismatch()
+        v
+
+  ;Launch!
+  val new-v = recur(v,t)
+  [mismatches, new-v]
+
+;Indicates that 'value' is not a match against the type 'type'.
+;If it is due to set difference then 'diff' is not false.
+defstruct TypeMismatch :
+  value:ProjValue
+  type:ValueType
+  diff:SetDifference|False
