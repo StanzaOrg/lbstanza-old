@@ -1,0 +1,199 @@
+defpackage stz/reg-alloc-port-prefs :
+  import core
+  import collections
+  import stz/reg-alloc-engine
+  import stz/reg-alloc-ir
+
+public defn compute-port-prefs (e:RegAllocEngine) -> False :
+  do(compute-local-port-prefs{e, _}, blocks(e))
+  propagate-prefs(e)
+
+;============================================================
+;================== Local Analysis ==========================
+;============================================================
+
+;After computing local prefs, these are the states:
+;1) Vx enters this block, and this block requires it
+;   to be saved. I.e. this block calls a function which
+;   clears all registers.
+;2) Vx enters this block, and this block prefers it
+;   to be loaded. I.e. this block immediately uses
+;   Vx as an argument to an operation.
+;3) Vx enters this block, but doesn't have any
+;   local preference for how Vx is treated. That
+;   depends upon successors.
+
+;Compute local port preferences.
+defn compute-local-port-prefs (e:RegAllocEngine, b:Block) -> False :
+  ;Record the save/load preferences of variables.
+  val save-prefs = IntTable<SavePref>()
+  val load-prefs = IntTable<LoadPref>()
+  val liveset = IntSet()
+
+  ;Initialize based upon the output ports of the block.
+  for p in outputs(b) do :
+    add(liveset, id(p))
+    save-prefs[id(p)] = PreferSaveIfSuccessor
+    load-prefs[id(p)] = PreferLoadIfSuccessor
+
+  ;Scan through the operations in reverse.
+  within (i, op) = operations-in-reverse(e, b) :
+    ;Remove statuses for this variable.
+    ;Computed statuses no longer apply.
+    for v in results(op) do :
+      remove(liveset, v)
+      remove(save-prefs, v)
+      remove(load-prefs, v)
+      
+    ;If the operation clears all registers, then
+    ;the live variables need to be saved, and the
+    ;variables do not need to be loaded.
+    if clears-registers?(e, op) :
+      for v in liveset do :
+        save-prefs[v] = PreferSave
+        load-prefs[v] = PreferNoLoad
+
+    ;All the arguments to the operation are now live,
+    ;and they prefer to be loaded.
+    for v in args(op) do :
+      add(liveset, v)
+      load-prefs[v] = PreferLoad
+
+  ;Write the calculated quantities to the block.
+  val new-input-ports = to-tuple $ for p in inputs(b) seq :
+    val pref = PortPref(
+                 get?(save-prefs, id(p), PreferNoSave)
+                 get?(load-prefs, id(p), PreferNoLoad))
+    sub-prefs(p, pref)
+  set-contents(inputs(b), new-input-ports)
+
+;============================================================
+;================== Propagation Analysis ====================
+;============================================================
+
+;Returns true if the input preferences have changed.
+defn compute-output-prefs (e:RegAllocEngine, b:Block) -> True|False :
+  ;Compute list of all merged preferences.
+  val merged-prefs = IntTable<List<PortPref>>(List())
+  for succ in succ-blocks(e,b) do :
+    for input in inputs(succ) do :
+      val prefs = prefs(input) as PortPref
+      update(merged-prefs, cons{prefs, _}, id(input))
+  ;Update output ports.
+  for p in outputs(b) update :
+    val new-prefs = merge(merged-prefs[id(p)])
+    One(sub-prefs(p, new-prefs))
+  ;Update input ports.
+  inherit-prefs(inputs(b), outputs(b))
+  
+;Inherit the preferences of output-ports into input-ports,
+;if preferences are specified to be inherited from successors.
+defn inherit-prefs (input-ports:Vector<Port>,
+                    output-ports:Vector<Port>) -> True|False :
+  var inputs-changed?:True|False = false
+  val output-prefs = to-inttable<PortPref> $
+    for p in output-ports seq : id(p) => prefs(p) as PortPref
+  for p in input-ports update :
+    val prefs = prefs(p) as PortPref
+    val output-prefs = get?(output-prefs, id(p))
+    val new-save-pref = match(save-pref(prefs)) :
+      (p:PreferSaveIfSuccessor) : save-pref(output-prefs as PortPref)
+      (p) : p
+    val new-load-pref = match(load-pref(prefs)) :
+      (p:PreferLoadIfSuccessor) : load-pref(output-prefs as PortPref)
+      (p) : p
+    val new-prefs = PortPref(new-save-pref, new-load-pref)
+    if new-prefs != prefs :
+      inputs-changed? = true
+    One(sub-prefs(p, new-prefs))
+  inputs-changed?
+
+;Compute the merged port preferences.
+defn merge (prefs:List<PortPref>) -> PortPref :
+
+  defn rank-load (p:LoadPref) -> Int :
+    switch(p) :
+      ;Always opt to do the least work. If one
+      ;of the successors don't require the variable to be loaded,
+      ;then don't force ourselves to do extra work.
+      PreferNoLoad: 0
+      ;Otherwise, load if all successors prefer loading.
+      PreferLoad: 1
+      ;Last rank so that we start the iteration somewhere.
+      PreferLoadIfSuccessor: 2
+
+  defn rank-save (p:SavePref) -> Int :
+    switch(p) :
+      ;Always opt to do the least work. If one
+      ;of the successors don't require the variable to be saved,
+      ;then don't force ourselves to do extra work.
+      PreferNoSave: 0
+      ;Otherwise, save if all successors prefer saving.
+      PreferSave: 1
+      ;Last rank so that we start the iteration somewhere.
+      PreferSaveIfSuccessor: 2
+
+  if empty?(prefs) :
+    PortPref(
+      PreferNoSave
+      PreferNoLoad)
+  else :
+    PortPref(
+      minimum(rank-save, seq(save-pref, prefs))
+      minimum(rank-load, seq(load-pref, prefs)))
+
+;============================================================
+;=============== Propagate until Convergence ================
+;============================================================
+
+;Propagate inputs and outputs across blocks.
+defn propagate-prefs (e:RegAllocEngine) -> False :
+  val processed-blocks = IntSet()
+  val worklist = Queue<Int>()
+  defn mark-processed (block-id:Int, inputs-changed?:True|False) :
+    add(processed-blocks, block-id)
+    if inputs-changed? :
+      val block = blocks(e)[block-id]
+      for pred-id in preds(block) do :
+        remove(processed-blocks, pred-id)
+        add(worklist, pred-id)
+
+  for b in blocks(e) do :
+    add(worklist, index(b))
+  let loop () :
+    if not empty?(worklist) :
+      val block-id = pop(worklist)
+      if not processed-blocks[block-id] :
+        val block = blocks(e)[block-id]
+        val inputs-changed? = compute-output-prefs(e, block)
+        mark-processed(block-id, inputs-changed?)
+      loop()
+    
+
+;============================================================
+;==================== Helpers ===============================
+;============================================================
+
+;Helper: Return all the successors block of the given block.
+defn succ-blocks (e:RegAllocEngine, b:Block) -> Seqable<Block> :
+  for succ in succs(b) seq :
+    blocks(e)[succ]
+      
+;Helper: Return true if the given operation calls clear-registers.
+defn clears-registers? (e:RegAllocEngine, op:OperationStmt) -> True|False :
+  val props = model-properties(e)[op-id(op)]
+  clears-registers?(props)
+
+;Helper: Iterate through all OperationStmt in the block in reverse order.
+defn operations-in-reverse (f:(Int, OperationStmt) -> ?, e:RegAllocEngine, b:Block) -> False :
+  val indices = reverse(start(b) to start(b) + length(b))
+  val stmts = stmts(program(e))
+  for i in indices do :
+    val stmt = stmts[i]
+    match(stmt:OperationStmt) :
+      f(i - start(b), stmt)
+
+;Helper: Set the contents of the given vector.
+defn set-contents<?T> (vs:Vector<?T>, xs:Seqable<T>) :
+  clear(vs)
+  add-all(vs,xs)      
