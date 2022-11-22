@@ -1,62 +1,72 @@
 
-BUILD_DIR := build
+# Stanza version to download in the form 0_12_34 matching what's in the zip filename
+STANZA_VERSION := 0_17_40
+
+# detect platform
+SYS := $(shell gcc -dumpmachine)
+ifneq (, $(findstring linux, $(SYS)))
+  PLATFORM := LINUX
+  STANZA_ZIP := lstanza_$(STANZA_VERSION).zip
+else ifneq (, $(findstring mingw, $(SYS)))
+  PLATFORM := WINDOWS
+  STANZA_ZIP := wstanza_$(STANZA_VERSION).zip
+else ifneq (, $(findstring darwin, $(SYS)))
+  PLATFORM := OS_X
+  STANZA_ZIP := stanza_$(STANZA_VERSION).zip
+else
+  PLATFORM := UNKNOWN
+  $(error Unknown platform: $(SYS))
+endif
+
 CURL := curl
 CURL_ARGS := -LsS
-STANZA_DIR := stanza
-STANZA_ZIP := lstanza_0_17_27.zip
-STANZA_URL := http://lbstanza.org/resources/stanza/${STANZA_ZIP}
 UNZIP := unzip -q
 
+BUILD_DIR := build
+STANZA_DIR := stanza
+STANZA_URL := http://lbstanza.org/resources/stanza/$(STANZA_ZIP)
+
 STANZA := stanza/stanza
+VERBOSE := -verbose
 
 .ONESHELL:
-.PHONY: help all stanza-download stanza-install conan-setup conan-install clean
+.PHONY: help all clean clean-stanza clean-all
 
 
-all: stanza conan asmjit-app
+all: asmjit-app
 
 
-stanza: stanza-download stanza-install
+# download and unzip stanza
+$(STANZA_DIR):
+	@echo "Downloading $(STANZA_ZIP)"
+	$(RM) -r $(STANZA_DIR)
+	$(CURL) $(CURL_ARGS) -o $(STANZA_ZIP) $(STANZA_URL)
+	$(UNZIP) -d $(STANZA_DIR) $(STANZA_ZIP)
+	$(RM) $(STANZA_ZIP)
 
-stanza-download:
-	@echo "Downloading ${STANZA_ZIP}"
-	rm -rf ${STANZA_DIR}
-	${CURL} ${CURL_ARGS} -o ${STANZA_ZIP} ${STANZA_URL}
-	${UNZIP} -d ${STANZA_DIR} ${STANZA_ZIP}
-	rm -f ${STANZA_ZIP}
-
-stanza-install:
-	cd ${STANZA_DIR}
+# install/configure stanza
+.stanza: | $(STANZA_DIR)
+	cd $(STANZA_DIR)
 	./stanza install -platform linux -path ..
 	cd ..
 
-conan: conan-setup conan-install
 
-conan-setup:
-	export CONAN_USER_HOME="$$PWD"
-	conan config set general.revisions_enabled=1
-	conan remote clean
-	conan remote add jitx-conan-remote http://ec2-44-226-24-141.us-west-2.compute.amazonaws.com:9300
-	conan remote add conancenter https://center.conan.io
-	conan remote list
+# link final executable
+$(BUILD_DIR)/asmjit-app: stanza.proj ###_when_using_release_stanza >>> ### | .stanza
+	###_when_using_release_stanza >>> ### export STANZA_CONFIG="$$PWD"
+	$(STANZA) compile asmjit-app -o $(BUILD_DIR)/asmjit-app $(VERBOSE)
 
-conan-install:
-	export CONAN_USER_HOME="$$PWD"
-	conan install . --install-folder ${BUILD_DIR} --build never
+# convenience target
+asmjit-app: $(BUILD_DIR)/asmjit-app
+	ls -l $(BUILD_DIR)/asmjit-app
 
-%: %.stanza
-	mkdir -p ${BUILD_DIR}
-	export STANZA_CONFIG="$$PWD"
-	export CONAN_USER_HOME="$$PWD"
-	${STANZA} compile $< -o ${BUILD_DIR}/$@
 
+# clean
 clean:
-	rm -rf ${BUILD_DIR}
-
-clean-conan:
-	rm -rf .conan
+	rm -rf $(BUILD_DIR) asmjit-app
 
 clean-stanza:
-	rm -rf ${STANZA_DIR} .stanza
+	rm -rf $(STANZA_DIR) .stanza
 
-clean-all: clean clean-conan clean-stanza
+clean-all: clean clean-stanza
+	rm -rf .conan conanfile.txt
