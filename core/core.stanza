@@ -79,10 +79,10 @@ protected extern stz_memory_resize: (ptr<?>, long, long) -> int
 
 ;Process libraries
 #if-defined(PLATFORM-WINDOWS):
-  protected extern launch_process: (ptr<byte>, int, int, int, ptr<byte>, ptr<?>) -> int
+  protected extern launch_process: (ptr<byte>, int, int, int, ptr<byte>, ptr<byte>, ptr<?>) -> int
   protected extern close_process_handle: (ptr<byte>) -> int
 #else:
-  protected extern launch_process: (ptr<byte>, ptr<ptr<byte>>, int, int, int, int, ptr<byte>, ptr<?>) -> int
+  protected extern launch_process: (ptr<byte>, ptr<ptr<byte>>, int, int, int, int, ptr<byte>, ptr<ptr<byte>>, ptr<?>) -> int
   protected extern delete_process_pipes: (ptr<?>, ptr<?>, ptr<?>, int) -> int
   protected extern initialize_launcher_process: () -> int
 protected extern retrieve_process_state: (ptr<?>, ptr<?>, int) -> int
@@ -9407,7 +9407,9 @@ defn SystemCallException (msg:String) :
                                 input:ref<StreamSpecifier>,
                                 output:ref<StreamSpecifier>,
                                 error:ref<StreamSpecifier>,
-                                working-dir:ref<String|False>) -> ref<Process> :
+                                working-dir:ref<String|False>,
+                                env-vars:ref<Tuple<KeyValue<String,String>>|False>) -> ref<Process> :
+    ensure-valid-env-var-names!(env-vars)
     ensure-valid-stream-specifiers(input, output, error)
     val proc = new Process{0, null, -1, null, null, null, false, false, false, false}
 
@@ -9422,6 +9424,9 @@ defn SystemCallException (msg:String) :
     val output_v = value(output).value
     val error_v = value(error).value
 
+    ;Create the environment variable string.
+    val env-var-string = to-windows-env-var-string(env-vars)
+
     ;Retrieve the characters of the working directory (or null if false).
     var working-dir-chars:ptr<byte>
     match(working-dir) :
@@ -9430,7 +9435,9 @@ defn SystemCallException (msg:String) :
 
     ;Launch the process
     val launch_success = call-c clib/launch_process(
-      addr!(command-line.chars), input_v, output_v, error_v, working-dir-chars, addr!([proc]))
+      addr!(command-line.chars), input_v, output_v, error_v, working-dir-chars, env-var-string, addr!([proc]))
+    ;Free any malloc'd memory.
+    if env-var-string != null : call-c clib/free(env-var-string)
     ;Throw an exception if launch failed.
     if launch_success != 0 :
       throw(SystemCallException(windows-error-msg()))
@@ -9451,6 +9458,27 @@ defn SystemCallException (msg:String) :
     call-c clib/close_process_handle(f.handle)
     return false
 
+  ;Format the given tuple of key-value pairs into an environment variable string
+  ;to pass to Windows.
+  ;Format of the final string is: "MYVAR1=MYVALUE1\0MYVAR2=MYVALUE2\0\0". Note the
+  ;final \0 at the end to signify the end of the list itself.
+  defn create-windows-env-var-string (env-vars:Tuple<KeyValue<String,String>>) -> ByteBuffer :
+    val buffer = ByteBuffer()
+    for entry in env-vars do :
+      print(buffer, "%_=%_" % [key(entry), value(entry)])
+      put(buffer, 0Y)
+    put(buffer, 0Y)
+    buffer
+
+  ;Create a stable memory location for use in holding the windows env-var string.
+  lostanza defn to-windows-env-var-string (env-vars:ref<Tuple<KeyValue<String,String>>|False>) -> ptr<byte> :
+    match(env-vars) :
+      (vs:ref<False>) :
+        return null
+      (vs:ref<Tuple<KeyValue<String,String>>>) :
+        val buffer = create-windows-env-var-string(env-vars)
+        return copy-buffer-to-stable-memory(buffer)
+
 #else:
   val PIPE-ID-GENERATOR = Random()
 
@@ -9459,7 +9487,9 @@ defn SystemCallException (msg:String) :
                                 input:ref<StreamSpecifier>,
                                 output:ref<StreamSpecifier>,
                                 error:ref<StreamSpecifier>,
-                                working-dir:ref<String|False>) -> ref<Process> :
+                                working-dir:ref<String|False>
+                                env-vars:ref<Tuple<KeyValue<String,String>>|False>) -> ref<Process> :
+    ensure-valid-env-var-names!(env-vars)
     ensure-valid-stream-specifiers(input, output, error)
     val args = to-tuple(args0)
     val pipe-id = next-int(PIPE-ID-GENERATOR).value
@@ -9473,27 +9503,80 @@ defn SystemCallException (msg:String) :
     for (var i:long = 0, i < nargs, i = i + 1) :
       argvs[i] = addr!(args.items[i].chars)
 
+    ;Create the array of environment variable strings.
+    val env-var-string = to-linux-env-var-string(env-vars)
+
     ;Retrieve the characters of the working directory (or null if false).
     var working-dir-chars:ptr<byte>
     match(working-dir) :
       (working-dir:ref<String>) : working-dir-chars = addr!(working-dir.chars)
       (working-dir:ref<False>) : working-dir-chars = null
+
     ;Launch the process
     val launch_succ = call-c clib/launch_process(addr!(filename.chars), argvs,
-      input_v, output_v, error_v, proc.pipeid, working-dir-chars, addr!([proc]))
+      input_v, output_v, error_v, proc.pipeid, working-dir-chars, env-var-string, addr!([proc]))
+
+    ;Free the memory created using malloc.
+    free-linux-env-var-string(env-var-string)
+
     ;Throw an exception if launch failed.
     if launch_succ != 0 :
       throw(SystemCallException(linux-error-msg()))
     ;Return the newly created process.
     return proc
 
-public defn Process (filename:String, args:Seqable<String>,
-                     input:StreamSpecifier, output:StreamSpecifier, error:StreamSpecifier) -> Process :
-  Process(filename, args, input, output, error, false)
+  ;Convert a tuple of key-value pairs into the array of strings as required by Linux.
+  lostanza defn to-linux-env-var-string (env-vars:ref<Tuple<KeyValue<String,String>>|False>) -> ptr<ptr<byte>> :
+    match(env-vars) :
+      (env-vars:ref<False>) :
+        return null
+      (env-vars:ref<Tuple<KeyValue<String,String>>>) :        
+        val n = env-vars.length
+        val scratch = ByteBuffer()
+        val env-array:ptr<ptr<byte>> = call-c clib/malloc((n + 1) * sizeof(ptr<?>))
+        for (var i:int = 0, i < n, i = i + 1) :
+          env-array[i] = to-env-var-entry(scratch, env-vars.items[i])
+        env-array[n] = null
+        return env-array
 
-public defn Process (filename:String, args:Seqable<String>) :
-  Process(filename, args, STANDARD-IN, STANDARD-OUT, STANDARD-ERR, false)
+  ;Free all memory allocated for the linux env-var string.
+  lostanza defn free-linux-env-var-string (str:ptr<ptr<byte>>) -> ref<False> :
+    if str != null :
+      var i:int = 0
+      while str[i] != null :
+        call-c clib/free(str[i])
+        i = i + 1
+      call-c clib/free(str)
+    return false
 
+  ;Return a malloc'd string representing the given key-value pair.
+  lostanza defn to-env-var-entry (scratch:ref<ByteBuffer>, entry:ref<KeyValue<String,String>>) -> ptr<byte> :
+    print-env-var-entry(scratch, entry)
+    return copy-buffer-to-stable-memory(scratch)
+
+  ;Fill the byte buffer with the contents of the env-var entry string.
+  defn print-env-var-entry (scratch:ByteBuffer, entry:KeyValue<String,String>) -> False :
+    clear(scratch)
+    print(scratch, "%_=%_" % [key(entry), value(entry)])
+    put(scratch, 0Y)
+
+;Helper: Copy the given byte buffer to a malloc'd piece of stable memory.
+lostanza defn copy-buffer-to-stable-memory (buffer:ref<ByteBuffer>) -> ptr<byte> :
+  val n = length(buffer).value
+  val data = data(buffer)
+  val copy = call-c clib/malloc(n)
+  call-c clib/memcpy(copy, data, n)
+  return copy
+
+;Helper: Verify valid environment variable names.
+defn ensure-valid-env-var-names! (vars:Tuple<KeyValue<String,String>>|False) -> False :
+  match(vars:Tuple<KeyValue<String,String>>) :
+    for entry in vars do :
+      if contains?(key(entry), '=') :
+        fatal("Because of operating system limitations, %~ is not a valid environment variable for 'call-system'. \
+               Environment variables are not allowed to contain a '=' character." % [key(entry)])
+
+;Helper: Ensure that the given stream specifiers are valid.
 defn ensure-valid-stream-specifiers (input:StreamSpecifier, output:StreamSpecifier, error:StreamSpecifier) :
   if not contains?([STANDARD-IN, PROCESS-IN], input) :
     fatal("%_ is not a valid input stream specifier." % [input])
@@ -9501,6 +9584,21 @@ defn ensure-valid-stream-specifiers (input:StreamSpecifier, output:StreamSpecifi
     fatal("%_ is not a valid output stream specifier." % [output])
   if not contains?([STANDARD-ERR, PROCESS-OUT, PROCESS-ERR], error) :
     fatal("%_ is not a valid error stream specifier." % [error])
+
+;------------------------------------------------------------
+;----------------- Convenient Overloads ---------------------
+;------------------------------------------------------------
+;Default working-dir is false. Default env-vars is false.
+public defn Process (filename:String, args:Seqable<String>,
+                     input:StreamSpecifier, output:StreamSpecifier, error:StreamSpecifier) -> Process :
+  Process(filename, args, input, output, error, false, false)
+
+public defn Process (filename:String, args:Seqable<String>,
+                     working-dir:String|False, env:Tuple<KeyValue<String,String>>|False) -> Process :
+  Process(filename, args, STANDARD-IN, STANDARD-OUT, STANDARD-ERR, working-dir, env)
+
+public defn Process (filename:String, args:Seqable<String>) :
+  Process(filename, args, STANDARD-IN, STANDARD-OUT, STANDARD-ERR, false, false)
 
 ;                            Stream API
 ;                            ==========
@@ -9593,18 +9691,39 @@ public defn* wait (p:Process) :
 
 ;                         System Call API
 ;                         ===============
-public defn call-system (file:String, args:Seqable<String>) -> Int :
-  match(wait(Process(file, args))) :
+public defn call-system (filename:String,
+                         args:Seqable<String>,
+                         working-dir:String|False,
+                         env-vars:Tuple<KeyValue<String,String>>|False) -> Int :
+  match(wait(Process(filename, args, working-dir, env-vars))) :
     (s:ProcessDone) : value(s)
-    (s) : throw(ProcessAbortedError(s))
+    (s) : throw(ProcessAbortedError(s))  
+
+public defn call-system (file:String, args:Seqable<String>) -> Int :
+  call-system(file, args, false, false)
+
+public defn call-system (args:Tuple<String>,
+                         working-dir:String|False,
+                         env-vars:Tuple<KeyValue<String,String>>|False) -> Int :
+  if empty?(args) :                       
+    fatal("Arguments must have length 1. Program name is expected to be first argument.")
+  call-system(args[0], args, working-dir, env-vars)
+
+public defn call-system (args:Tuple<String>) -> Int :
+  if empty?(args) :                       
+    fatal("Arguments must have length 1. Program name is expected to be first argument.")
+  call-system(args[0], args, false, false)
 
 ;============================================================
 ;=========== Call System and Retrieve Output ================
 ;============================================================
 
-public defn call-system-and-get-output (file:String, args:Seqable<String>) -> String :
+public defn call-system-and-get-output (file:String,
+                                        args:Seqable<String>,
+                                        working-dir:String|False,
+                                        env-vars:Tuple<KeyValue<String,String>>|False) -> String :
   val buffer = StringBuffer()
-  val proc = Process(file, args, STANDARD-IN, PROCESS-OUT, PROCESS-OUT)
+  val proc = Process(file, args, STANDARD-IN, PROCESS-OUT, PROCESS-OUT, working-dir, env-vars)
   val proc-out = output-stream(proc)
   let loop () :
     val c = get-char(proc-out)
@@ -9613,6 +9732,9 @@ public defn call-system-and-get-output (file:String, args:Seqable<String>) -> St
       loop()
   wait(proc)
   to-string(buffer)
+
+public defn call-system-and-get-output (file:String, args:Seqable<String>) -> String :
+  call-system-and-get-output(file, args, false, false)
 
 ;============================================================
 ;=============== Replace Current Process ====================

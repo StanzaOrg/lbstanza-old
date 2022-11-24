@@ -230,9 +230,12 @@ static void setup_file_handles(
   if (stderr_write != NULL) CloseHandle(stderr_write);
 }
 
+//- env_vars: If not null, a string with the setting of all environment variables packed
+//  into it. Format is "MYVAR1=MYVALUE1\0MYVAR2=MYVALUE2\0\0". Note the extra \0 at the end,
+//  which signifies the end of the environment variable list itself. 
 stz_int launch_process(stz_byte* command_line,
                        stz_int input, stz_int output, stz_int error,
-                       stz_byte* working_dir, Process* process) {
+                       stz_byte* working_dir, stz_byte* env_vars, Process* process) {
   // Set up our STDIN, STDOUT, and STDERR  
   HANDLE stdin_read, stdin_write,
          stdout_read, stdout_write,
@@ -262,7 +265,7 @@ stz_int launch_process(stz_byte* command_line,
       /* lpThreadAttributes   */ NULL,
       /* bInheritHandles      */ TRUE,
       /* dwCreationFlags      */ 0,
-      /* lpEnvironment        */ NULL,
+      /* lpEnvironment        */ (LPSTR)env_vars,
       /* lpCurrentDirectory   */ (LPSTR)working_dir,
       /* lpStartupInfo        */ &start_info,
       /* lpProcessInformation */ &proc_info);
