@@ -4,8 +4,8 @@ defpackage stz/proj :
   import reader
   import stz/params
   import stz/utils
-  import core/parsed-path
   import stz/timing-log-api
+  import stz/proj-env
   import stz/proj-errors
   import stz/proj-ir
   import stz/proj-reader
@@ -13,24 +13,26 @@ defpackage stz/proj :
   import stz/proj-wellformedness
   import stz/proj-traverse-includes
   import stz/proj-variable-substitution
+  import stz/proj-isolate-package-manager-params
   import stz/proj-normalization
   import stz/proj-post-checks
   import stz/proj-flattening
   import stz/proj-conversion
+  import stz/proj-value-types
 
 ;============================================================
 ;======================= Timers =============================
 ;============================================================
 
 val READ-PROJ-FILES = TimerLabel("Read Proj Files")
-val NORMALIZE = TimerLabel(READ-PROJ-FILES, suffix("Normalize"))
-val VARIABLE-SUBSTITUTION = TimerLabel(READ-PROJ-FILES, suffix("Variable Substitution"))
 
 ;============================================================
 ;======================== Driver ============================
 ;============================================================
 
-public defn read-proj-files (filenames:Seqable<String>, platform:Symbol) -> ProjFile :
+public defn read-proj-files (filenames:Seqable<String>,
+                             platform:Symbol,
+                             env:ProjEnv) -> ProjFile :  
   ;Return a new function that performs the same thing as stage,
   ;except that it is timed and attributed towards 'tlabel'.
   defn time<T,?S> (tlabel:TimerLabel, stage:T -> ?S) :
@@ -39,25 +41,104 @@ public defn read-proj-files (filenames:Seqable<String>, platform:Symbol) -> Proj
         stage(x)
 
   ;Helper: Read a projfile and ensure it is wellformed.
+  val wellformedness = ProjWellformedness(platform, env)
   defn read-wellformed-file (filename:String) -> ProjFileS0 :
-    filename $> time<String>(READ-PROJ-FILES, read-raw-proj-file)
-             $> ensure-wellformed{_, platform}
+    val proj-file = filename
+                 $> time<String>(READ-PROJ-FILES, read-raw-proj-file)
+    check(wellformedness, proj-file)
+    proj-file
 
-  ;Helper: Read and process a file.
-  defn process-file (filename:String) -> ProjFileS0 :
-    filename $> read-wellformed-file
-             $> traverse-includes{_, read-wellformed-file}
-             $> time<ProjFileS0>(VARIABLE-SUBSTITUTION, variable-substitution)
-             $> time<ProjFileS0>(NORMALIZE, normalize{_, platform})
-             $> post-normalization-checks
-             $> flatten-relative-paths
+  ;Stage: Read all the files, ensuring they are wellformed, and traverse
+  ;through include files.
+  defn read-files-deeply (filenames:Seqable<String>) -> Tuple<ProjFileS0> :
+    to-tuple $ for file in filenames seq :
+      file $> read-wellformed-file
+           $> traverse-includes{_, read-wellformed-file}
 
-  ;Process all files
-  filenames
-    $> seq{process-file, _}
-    $> to-tuple
-    $> combine
-    $> convert-proj
+  ;Stage: Substitute variables and normalize a single ProjValue.
+  ;This function is called to process the default value that is identified
+  ;as part of normalization-checks.
+  defn translate-substitute-and-normalize (vartable:HashTable<Symbol,ProjValue>) :
+    fn (v, t:ValueType, projpath:String, errors:Vector<ProjFileError>) -> ProjValue :
+      v $> translate-to-proj-value
+        $> variable-substitution{_, vartable, errors}
+        $> normalize{_, platform, workdir(env), projpath}
+
+  ;Stage: Finish all postprocessing stages to get files into final form.
+  defn sub-variables-and-finish-processing (files:Tuple<ProjFileS0>,
+                                            vartable:HashTable<Symbol,ProjValue>) -> ProjFile :
+    val new-files = for file in files map :
+      file $> variable-substitution{_, vartable}
+           $> normalize{_, platform, workdir(env)}
+           $> post-normalization-checks{_, env, translate-substitute-and-normalize(vartable)}
+           $> flatten-relative-paths{_, env}
+    new-files $> combine
+              $> convert-proj{_, env}
+
+  ;Stage: Compute new substitution variables.
+  defn compute-package-manager-variables (f:ProjFile) -> Tuple<KeyValue<Symbol,?>> :
+    to-tuple $ for file-stmt in stmts(f) seq-cat :
+      val stmt = file-stmt as ForeignPackageParamsStmt
+      val entries = package-manager-variables(env, stmt, platform)
+      ;Sanity check.
+      for e in entries do :
+        if not wellformed-proj-value?(value(e)) :
+          fatal("The package manager %_ returned an illegal value of type %_ for the variable '%~': %~." % [
+            package-manager(stmt), object-type(value(e)), key(e), value(e)])
+      ;Keep entries
+      entries
+
+  ;Helper: Add the additional variables to the given vartable.
+  defn add-additional-variables (vartable:HashTable<Symbol,ProjValue>,
+                                 entries:Tuple<KeyValue<Symbol,?>>) -> False :
+    for e in entries do :
+      vartable[key(e)] = translate-to-proj-value(value(e))
+
+  ;Main algorithm
+
+  ;1. Read all the files, ensure wellformedness, and traverse includes.
+  val read-files = read-files-deeply(filenames)
+  ;2. Build the variable table.
+  val var-table = build-variable-table(read-files)
+  ;3. Divide the files into two halves to identify the package manager params.
+  val [files-with-params, files-without-params] = isolate-package-manager-params(read-files)
+  ;4. Finish processing the package manager params.
+  val new-files-with-params = if not empty?(files-with-params) :
+    sub-variables-and-finish-processing(files-with-params, var-table)
+  ;5. If there are params, then request the additional build variables
+  ;   from the foreign package manager.
+  match(new-files-with-params:ProjFile) :
+    val new-entries = compute-package-manager-variables(new-files-with-params)
+    add-additional-variables(var-table, new-entries)
+  ;6. Finish processing the non-param statements in the proj files
+  ;   now that we have the final set of variable substitutions.
+  val new-files-without-params = 
+    if not empty?(files-without-params) :
+      sub-variables-and-finish-processing(
+        files-without-params,
+        var-table)
+    else :
+      ProjFile([])
+  ;7. Combine the two halves and return.
+  combine(new-files-with-params, new-files-without-params)
+
+;============================================================
+;========== S-Expression to ProjValue Translation ===========
+;============================================================
+
+;Translate a value from the foreign package manager into
+;the ProjValue used by the variable substitution algorithm.
+defn translate-to-proj-value (x) -> ProjValue :
+
+  ;Helper: Translate the value part of a key-value pair.
+  defn translate-entry (e:KeyValue<Symbol,?>) -> KeyValue<Symbol,ProjValue> :
+    key(e) => translate-to-proj-value(value(e))
+    
+  match(x) :
+    (x:Symbol|String) : AtomValue(false, x)
+    (x:List) : ProjValues(false, to-tuple(seq(translate-to-proj-value, x)))
+    (x:Tuple) : ProjTuple(false, ProjValues(false, map(translate-to-proj-value, x)))
+    (x:ProjTable) : ProjTableS0(false, map(translate-entry, entries(x)))
 
 ;============================================================
 ;===== All Project Files by Default During Compilation ======
@@ -101,3 +182,10 @@ defn combine (fs:Tuple<ProjFileS0>) -> ProjFileS0 :
 
   ;Return combined project file.
   sub-stmts(fs[0], to-tuple(all-stmts))
+
+;Helper: Combine two halves of the proj files, the half
+;comprised of ForeignPackageParams and the half that
+;doesn't contain any.
+defn combine (a:ProjFile|False, b:ProjFile) -> ProjFile :
+  match(a:ProjFile) : ProjFile(to-tuple(cat(stmts(a), stmts(b))))
+  else : b

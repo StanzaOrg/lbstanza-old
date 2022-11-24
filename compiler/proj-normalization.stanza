@@ -6,18 +6,37 @@ defpackage stz/proj-normalization :
   import stz/proj-errors
   import core/parsed-path
 
+;============================================================
+;========== Entry point: Normalize an Entire File ===========
+;============================================================
+
 ;This pass normalizes all ProjValue within the proj file.
 ;- Collapses all CondPlatform values into a single value.
-;- Separates SplicedString values that contain ProjValues.
+;- Collapses all SplicedString values into an AtomValue containing a String.
 ;- Guarantees that ProjValues do not recursively contain ProjValues.
 
-public defn normalize (f:ProjFileS0, current-platform:Symbol) -> ProjFileS0 :
-  val dirtable = SpecialDirTable(f)
+public defn normalize (f:ProjFileS0,
+                       current-platform:Symbol,
+                       workdir:String) -> ProjFileS0 :
+  val dirtable = SpecialDirTable(f, workdir)
   defn norm (item:ProjItem) -> ProjItem :
     match(item:ProjValue) : normalize(item, current-platform, dirtable)
     else : map(norm, item)
   val new-stmts = map({norm(_) as ProjStmt}, stmts(f))
   sub-stmts(f, new-stmts)
+
+;============================================================
+;============= Entry point: Normalize One Value =============
+;============================================================
+
+;Used to fill in default values.
+;- proj-path: The full path of the ProjFile containing this value.
+public defn normalize (v:ProjValue,
+                       current-platform:Symbol,
+                       workdir:String,
+                       proj-path:String) -> ProjValue :
+  val dirtable = SpecialDirTable(workdir, proj-path)
+  normalize(v, current-platform, dirtable)
 
 ;============================================================
 ;=================== Value Normalization ====================
@@ -32,9 +51,9 @@ defn normalize (v:ProjValue,
                 platform:Symbol,
                 dirtable:SpecialDirTable) -> ProjValue :
   v $> eval-condplatform{_, platform}
-    $> separate-spliced-strings
-    $> flatten-projvalues
     $> substitute-special-dirs{_, dirtable}
+    $> collapse-spliced-strings
+    $> flatten-projvalues
 
 ;============================================================
 ;================ Evaluate CondPlatform =====================
@@ -53,89 +72,6 @@ defn eval-condplatform (v:ProjValue, platform:Symbol) -> ProjValue :
     result as ProjValue
 
 ;============================================================
-;=============== Separating SplicedString ===================
-;============================================================
-
-;If a SplicedString contains a ProjValues, then treat the
-;values as if they contain a separator, and hence splits up the
-;overall string into multiple separate values.
-;The input SplicedString assumes that values contain no CondPlatform.
-
-defn separate-spliced-strings (v:ProjValue) -> ProjValue :
-  val result = map(separate-spliced-strings{_ as ProjValue}, v)
-  match(result) :
-    (result:SplicedString) :
-      separate-spliced-string(result)
-    (result:ProjValue) :
-      result
-
-defn separate-spliced-string (spliced-string:SplicedString) -> ProjValue :
-  ;Create buffer of values and separators
-  val buffer = Vector<ProjValue|Separator>()
-
-  ;Iterate through the values and add them to the buffer with
-  ;a separator between ProjValues.
-  for value in values(spliced-string) do :
-    let loop (value:ProjValue = value) :
-      match(value) :
-        (value:ProjValues) :
-          for (v in values(value), i in 0 to false) do :
-            add(buffer, Separator()) when i > 0
-            loop(v)
-        (value:SplicedString) :
-          add-all(buffer, values(value))
-        (value) :
-          add(buffer, value)
-
-  ;Identify all the continuous chains of values between the
-  ;separators.
-  defn continuous-chains () -> Seqable<Range> :
-    generate<Range> :
-      var start:Int = 0
-      for (v in buffer, i in 0 to false) do :
-        match(v:Separator) :
-          yield(start to i)
-          start = i + 1
-      yield(start to length(buffer))
-
-  ;For all the continuous chains of values that do not
-  ;contain a Separator, join them into one SplicedString.
-  val joined-values = to-tuple $
-    for r in continuous-chains() seq :
-      if length(r as Range&Lengthable) == 1 :
-        buffer[start(r)] as ProjValue
-      else :
-        val vs = for i in r seq : buffer[i] as ProjValue
-        SplicedString(info(spliced-string), to-tuple(vs))
-
-  ;Return either a single value or ProjValues.
-  if length(joined-values) == 1 : joined-values[0]
-  else : ProjValues(info(spliced-string), joined-values)
-
-;Dummy object for separating chains of values.
-defstruct Separator
-
-;============================================================
-;=================== Flatten ProjValues =====================
-;============================================================
-
-;Flatten every ProjValues. We guarantee after this that:
-;- ProjValues never recursively contains another ProjValues.
-;- ProjValues never have length 1.
-
-defn flatten-projvalues (v:ProjValue) -> ProjValue :
-  match(v:ProjValues) :
-    val vs = to-tuple $
-      for vi in values(v) seq-cat :
-        match(flatten-projvalues(vi)) :
-          (vi:ProjValues) : values(vi)
-          (v) : [v]
-    if length(vs) == 1 : vs[0]
-    else : ProjValues(info(v), vs)
-  else :
-    map(flatten-projvalues{_ as ProjValue}, v) as ProjValue
-
-;============================================================
 ;================ Substitute Special Dirs ===================
 ;============================================================
 
@@ -145,9 +81,8 @@ defstruct SpecialDirTable :
   projdirs:IntTable<String>
 
 ;Scan the file for the mapping from file ids to paths.
-defn SpecialDirTable (file:ProjFileS0) -> SpecialDirTable :
-  ;Get the current working directory.
-  val workdir = resolve-path!(".")
+;- workdir: The absolute path to the current working directory.
+defn SpecialDirTable (file:ProjFileS0, workdir:String) -> SpecialDirTable :
 
   ;Create the table of project directories.
   val projdirs = IntTable<String>()
@@ -169,8 +104,14 @@ defn SpecialDirTable (file:ProjFileS0) -> SpecialDirTable :
   ;Bundle up the SpecialDirTable.
   SpecialDirTable(workdir, projdirs)
 
+;Special case for building a SpecialDirTable for just one value.
+;The special id 0 is given to the proj-file-id. 
+defn SpecialDirTable (workdir:String, proj-path:String) -> SpecialDirTable :
+  val projdirs = IntTable<String>()
+  projdirs[0] = to-string(enclosing-dir(proj-path))
+  SpecialDirTable(workdir, projdirs)
+
 ;Substitute all the WorkDir|ProjDir values in the ProjValue.
-;Convert all SplicedString into AtomValue.
 defn substitute-special-dirs (v:ProjValue,
                               dirtable:SpecialDirTable) -> ProjValue :
   match(v) :
@@ -178,10 +119,66 @@ defn substitute-special-dirs (v:ProjValue,
       AtomValue(info(v), workdir(dirtable))
     (v:ProjDir) :
       AtomValue(info(v), projdirs(dirtable)[proj-file-id(v)])
-    (v:SplicedString) :
-      val new-values = for vi in values(v) map :
-        substitute-special-dirs(vi, dirtable) as AtomValue
-      val string = string-join(seq(value, new-values))
-      AtomValue(info(v), string)
     (v:ProjValue) :
       map(substitute-special-dirs{_ as ProjValue, dirtable}, v)
+
+
+;============================================================
+;================= Collapse SplicedString ===================
+;============================================================
+
+;If a SplicedString contains a ProjValues, then treat the
+;values as if they contain a separator, and hence splits up the
+;overall string into multiple separate values.
+;The input SplicedString assumes that values contain no CondPlatform.
+
+defn collapse-spliced-strings (v:ProjValue) -> ProjValue :
+  val result = map(collapse-spliced-strings{_ as ProjValue}, v)
+  match(result) :
+    (result:SplicedString) : join-string(result)
+    (result:ProjValue) : result
+
+;Join all the parts in the given spliced string into an
+;AtomValue.
+defn join-string (spliced-string:SplicedString) -> AtomValue :
+  ;Create buffer of all substrings.
+  val buffer = Vector<String>()
+
+  ;Iterate through all individual parts within v.
+  defn all-parts (return:AtomValue -> ?, v:ProjValue) :
+    match(v) :
+      (v:ProjValues) : do(all-parts{return, _}, values(v))
+      (v:ProjTuple) : all-parts(return, value(v))
+      (v:AtomValue) : return(v)
+
+  ;Iterate through the values and add them to the buffer with
+  ;a separator between ProjValues.
+  for value in values(spliced-string) do :
+    val index-counter = to-seq(0 to false)
+    for part in value all-parts :
+      add(buffer, " ") when next(index-counter) > 0
+      add(buffer, to-string(/value(part)))
+
+  ;Return the joined string.
+  AtomValue(info(spliced-string), string-join(buffer))
+
+;============================================================
+;=================== Flatten ProjValues =====================
+;============================================================
+
+;Flatten every ProjValues. We guarantee after this that:
+;- ProjValues never recursively contains another ProjValues.
+;- ProjValues never have length 1.
+
+defn flatten-projvalues (v:ProjValue) -> ProjValue :
+  match(v:ProjValues) :
+    val vs = to-tuple $
+      for vi in values(v) seq-cat :
+        match(flatten-projvalues(vi)) :
+          (vi:ProjValues) : values(vi)
+          (v) : [v]
+    if length(vs) == 1 : vs[0]
+    else : ProjValues(info(v), vs)
+  else :
+    map(flatten-projvalues{_ as ProjValue}, v) as ProjValue
+

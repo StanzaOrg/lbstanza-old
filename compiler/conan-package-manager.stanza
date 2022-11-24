@@ -1,0 +1,246 @@
+defpackage stz/conan-package-manager :
+  import collections
+  import core
+  import stz/external-dependencies
+  import stz/foreign-package-manager
+  import stz/proj-env
+  import stz/proj-ir
+  import stz/proj-value-types
+  import stz/printing-utils
+
+public defn ConanPackageManager () -> ForeignPackageManager :
+
+  ;Return the "conanbuildinfo.args" string to use a compiler flag.
+  defn build-info-args (params:PackageManagerParams) -> String :
+    ;Note: gcc recognizes the @file symbol to mean "Read command-line options from file"
+    ;https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html
+    val build-dir = lookup(entries(params), `conan-build-dir)
+    to-string("@%_/conanbuildinfo.args" % [build-dir])
+
+  ;Return the generated contents of the 'conanfile.txt' file given the
+  ;names of the Conan packages.
+  defn conan-file-contents (packages:Tuple<String>) -> Printable :
+    new Printable :
+      defmethod print (o:OutputStream, this) :
+        println(o, "[requires]")
+        for p in packages do :
+          println(o, p)
+        println(o, "")
+        println(o, "[generators]")
+        println(o, "compiler_args")
+
+  new ForeignPackageManager :
+    defmethod name (this) :
+      `conan
+
+    ;Return the parameters that a user should specify in their .proj file.
+    defmethod configuration-params (this) :
+      ;List out the schema for the .proj configuration of Conan.
+      [
+        ;Holds the name of the Conan program.
+        ;'conan' by default.
+        TableEntry(`conan-command
+                  SINGLE-STRING
+                  true
+                  One $ "conan")
+        ;These extra arguments are appended to the end of
+        ;the call to 'conan install'.
+        ;The default '--build never' prevents Conan from
+        ;building the packages and opts to only download them.
+        TableEntry(`conan-install-extra-args
+                   MULTIPLE-FLAGS
+                   true
+                   One $ List(
+                     ["--build" "never"]))
+        ;This is the default directory where all of the Conan
+        ;files will be generated. By default it will be in 'build'.
+        TableEntry(`conan-build-dir
+                   SINGLE-PATH
+                   true
+                   One $ "build")
+        ;This is the default directory where the .conan cache
+        ;directory will be created. By default it will be in the
+        ;project root directory.
+        TableEntry(`conan-cache-dir
+                   SINGLE-PATH
+                   true
+                   One $ "{.}")
+        ;These are additional environment variables to provide
+        ;to Conan. Must be given as a sequence of {name: "ENVVAR", value:"MYVALUE"}
+        ;pairs.
+        TableEntry(`conan-environment
+                   MultipleType $ TableType $ [
+                     TableEntry(`name SINGLE-STRING false)
+                     TableEntry(`value SINGLE-STRING false)]
+                   true)
+        ;These are additional Conan config settings. Each setting will be
+        ;relayed to Conan using the 'conan config set' command.
+        ;Must be given as a sequence of {name: "ENVVAR", value:"MYVALUE"}
+        ;pairs.
+        TableEntry(`conan-config
+                   MultipleType $ TableType $ [
+                     TableEntry(`name SINGLE-STRING false)
+                     TableEntry(`value SINGLE-STRING false)]
+                   true)
+        ;These are the list of Conan remotes.
+        ;Must be given as a sequence of {name: "REMOTENAME", value:"http://remote.com"}
+        ;pairs.
+        TableEntry(`conan-remotes
+                   MultipleType $ TableType $ [
+                     TableEntry(`name SINGLE-STRING false)
+                     TableEntry(`value SINGLE-STRING false)]
+                   true
+                   One $ to-list $ [
+                     ProjTable $ [
+                       `name => "conancenter"
+                       `value => "https://center.conan.io"]])
+      ]
+
+    defmethod system-dependencies (this, params:PackageManagerParams) :
+      ProjDependencies([], [build-info-args(params)], [])
+
+    defmethod proj-variables (this, params:PackageManagerParams, platform:Symbol) -> Tuple<KeyValue<Symbol,?>> :
+      [`CONAN-INCLUDES => build-info-args(params)]
+
+    defmethod satisfy-dependencies (this,
+                                    packages:Tuple<String>,
+                                    params:PackageManagerParams,
+                                    system:System) -> True|False :
+      ; Satisfy dependencies by calling 'conan install' in the project directory.
+
+      ; Build up the environment variables for conan from the provided settings.
+      val env-vars = Vector<KeyValue<String,String>>()
+
+      ; Since environment variables are not inherited automatically, manually
+      ; add the PATH variable so that we can find 'conan'.
+      match(get-env("PATH")) :
+        (path:String) : add(env-vars, "PATH" => path)
+        (f:False) : false
+
+      ; Set the conan home environment variable to the project directory to isolate it
+      ; from any user or system-level conan settings.
+      val conan-root = lookup(entries(params), `conan-cache-dir)
+      add(env-vars, "CONAN_USER_HOME" => conan-root)
+
+      ; Add the other environment vars from params.
+      val conan-env = merge-defaults(
+                        to-kv-tuple(lookup(entries(params), `conan-environment)),
+                        ["CONAN_LOGGING_LEVEL" => "info"
+                         "CONAN_PRINT_RUN_COMMANDS" => "1"
+                         "CONAN_SYSREQUIRES_MODE" => "verify"])
+      add-all(env-vars, conan-env)
+
+      ; Retrieve the name of the conan command.
+      val conan-cmd = lookup(entries(params), `conan-command)
+
+      ; Try calling 'conan --version' as a simple check to ensure that conan exists.
+      try :
+        val result = call-system(system, conan-cmd, [conan-cmd, "--version"], false, false)
+        throw(ConanNotInstalled(conan-cmd)) when result != 0
+      catch (e) :
+        throw(ConanNotInstalled(conan-cmd))
+
+      ; Now that we have the conan command, and all the environment variables built up,
+      ; we can start calling conan. This helper function calls conan in the proper
+      ; working directory, with the proper environment variables.
+      ; If conan fails, then an exception is thrown.
+      defn call-conan (args:Tuple<String>) :
+        val conan+args = to-tuple(cat([conan-cmd], args))
+        val result = call-system(system, conan-cmd, conan+args, conan-root, to-tuple(env-vars))
+        if result != 0 :
+          throw $ ConanCallFailure(conan-cmd,
+                                   args,
+                                   conan-root,
+                                   to-tuple(env-vars))
+
+      ; Call 'conan config set' for each conan config setting.
+      val conan-configs = merge-defaults(
+                            to-kv-tuple(lookup(entries(params), `conan-config))
+                            ["general.non_interactive" => "1"
+                             "general.read_only_cache" => "1"
+                             "general.revisions_enabled" => "1"])
+      for kv in conan-configs do :
+        val set-str = to-string("%_=%_" % [key(kv), value(kv)])
+        call-conan(["config" "set" set-str])
+
+      ; Set up conan remotes - order dependent.
+      val conan-remotes = to-kv-tuple(lookup(entries(params), `conan-remotes))
+      call-conan(["remote" "clean"])
+      for kv in conan-remotes do :
+        call-conan(["remote" "add" key(kv) value(kv)])
+
+      ; Generate the basic 'conanfile.txt'.
+      val conan-build-dir = lookup(entries(params), `conan-build-dir)
+      val file = to-string("%_/conanfile.txt" % [conan-build-dir])
+      write-file(system, file, conan-file-contents(packages))
+
+      ; Now call 'conan install' in the conan root directory.
+      val additional-flags = lookup(entries(params), `conan-install-extra-args)
+      call-conan $ flatten-tuple $ [
+        "install" conan-build-dir
+        "--install-folder" conan-build-dir
+        additional-flags]
+
+      ; Return false for now.
+      false
+
+;============================================================
+;=================== Small Utilities ========================
+;============================================================
+
+;Helper: Assume that 'lpt' is a list of ProjTables with format:
+;  {name: "entry name", value: "entry value"}
+;Convert these tables into a tuple of key-value pairs.
+defn to-kv-tuple (lpt:List<ProjTable>) -> Tuple<KeyValue<String,String>> :
+  to-tuple $ for pt in lpt seq :
+    val name = lookup(entries(pt), `name)
+    val value = lookup(entries(pt), `value)
+    name => value
+
+;Helper: Given a tuple possibly containing strings, and other tuples, flatten
+;everything into a single tuple of strings.
+defn flatten-tuple (xs:Tuple) -> Tuple<String> :
+  val vs = Vector<String>()
+  let loop (xs = xs) :
+    match(xs) :
+      (xs:Tuple|List) : do(loop, xs)
+      (xs:String) : add(vs, xs)
+      (xs) : fatal("Unexpected value of type %_." % [object-type(xs)])
+  to-tuple(vs)
+
+;Merge the two tables of key-value pairs. Entriies in 'entries'
+;override entries in defaults if they have the same key.
+defn merge-defaults (entries:Tuple<KeyValue<String,String>>,
+                     defaults:Tuple<KeyValue<String,String>>) -> Tuple<KeyValue<String,String>> :
+  val keep-defaults = for e in defaults filter :
+    lookup?(entries, key(e)) is False
+  to-tuple(cat(entries, keep-defaults))  
+
+;============================================================
+;==================== Errors ================================
+;============================================================
+
+;Represent a failure while calling Conan.
+public defstruct ConanCallFailure <: Exception :
+  conan-command:String
+  args:Tuple<String>
+  working-dir:String
+  env-vars:Tuple<KeyValue<String,String>>
+
+defmethod print (o:OutputStream, e:ConanCallFailure) :
+  val items = [
+    simple-field("Conan command", written(conan-command(e)))
+    named-list-fields("Arguments", seq(written,args(e)))
+    simple-field("Working Directory", written(working-dir(e)))
+    named-list-fields("Environment Variables", env-vars(e))]
+  print(o, "Call to Conan package manager failed%_" % [colon-field-list(items)])
+
+;Represent a failure when trying to detect Conan.
+public defstruct ConanNotInstalled <: Exception :
+  conan-command:String
+
+defmethod print (o:OutputStream, e:ConanNotInstalled) :
+  val msg = "This Stanza program requires the Conan package manager but we were unable \
+             to detect it under the name %~. Please confirm that Conan is installed and \
+             can be called using this name."
+  print(o, msg % [conan-command(e)])

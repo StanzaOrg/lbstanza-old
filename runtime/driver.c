@@ -579,6 +579,11 @@ void stz_memory_resize (void* p, stz_long old_size, stz_long new_size) {
 //------------------- Structures -----------------------------
 //------------------------------------------------------------
 
+//- working_dir: If not null, the working directory of the
+//  new process.
+//- env_vars: If not null, the environment variables to set in the
+//  child process. Each string has format "MYVAR=MYVALUE" and is null-terminated.
+//- argvs: The string arguments that are passed to the C main function.
 typedef struct {
   stz_byte* pipe;
   stz_byte* in_pipe;
@@ -586,6 +591,7 @@ typedef struct {
   stz_byte* err_pipe;
   stz_byte* file;
   stz_byte* working_dir;
+  stz_byte** env_vars;
   stz_byte** argvs;
 } EvalArg;
 
@@ -651,6 +657,18 @@ static void write_strings (FILE* f, stz_byte** s){
   for(int i=0; i<n; i++)
     write_string(f, s[i]);
 }
+
+//Write a list of strings. The list may be optional, and is
+//represented using NULL.
+static void write_optional_strings (FILE* f, stz_byte** s){
+  if(s == NULL){
+    write_int(f, 0);
+  }else{
+    write_int(f, 1);
+    write_strings(f, s);
+  }     
+}
+
 static void write_earg (FILE* f, EvalArg* earg){
   write_string(f, earg->pipe);
   write_string(f, earg->in_pipe);
@@ -658,8 +676,10 @@ static void write_earg (FILE* f, EvalArg* earg){
   write_string(f, earg->err_pipe);
   write_string(f, earg->file);
   write_string(f, earg->working_dir);
+  write_optional_strings(f, earg->env_vars);
   write_strings(f, earg->argvs);
 }
+
 static void write_process_state (FILE* f, ProcessState* s){
   write_int(f, s->state);
   write_int(f, s->code);
@@ -708,6 +728,16 @@ static stz_byte** read_strings (FILE* f){
   xs[n] = NULL;
   return xs;
 }
+
+static stz_byte** read_optional_strings (FILE* f){
+  stz_int flag = read_int(f);
+  if(flag == 0){
+    return NULL;
+  }else{
+    return read_strings(f);
+  }
+}
+
 static EvalArg* read_earg (FILE* f){
   EvalArg* earg = (EvalArg*)stz_malloc(sizeof(EvalArg));
   earg->pipe = read_string(f);
@@ -716,6 +746,7 @@ static EvalArg* read_earg (FILE* f){
   earg->err_pipe = read_string(f);
   earg->file = read_string(f);
   earg->working_dir = read_string(f);
+  earg->env_vars = read_optional_strings(f);
   earg->argvs = read_strings(f);
   return earg;
 }
@@ -725,15 +756,22 @@ static void read_process_state (FILE* f, ProcessState* s){
 }
 
 //===== Free =====
+static void free_strings (stz_byte** ss){
+  for(int i=0; ss[i] != NULL; i++)
+    stz_free(ss[i]);
+  stz_free(ss);
+}
+
 static void free_earg (EvalArg* arg){
   stz_free(arg->pipe);
   if(arg->in_pipe != NULL) stz_free(arg->in_pipe);
   if(arg->out_pipe != NULL) stz_free(arg->out_pipe);
   if(arg->err_pipe != NULL) stz_free(arg->err_pipe);
   stz_free(arg->file);
-  for(int i=0; arg->argvs[i] != NULL; i++)
-    stz_free(arg->argvs[i]);
-  stz_free(arg->argvs);
+  if(arg->working_dir != NULL) stz_free(arg->working_dir);
+  if(arg->env_vars != NULL) free_strings(arg->env_vars);
+  free_strings(arg->argvs);
+  stz_free(arg);
 }
 
 //------------------------------------------------------------
@@ -755,6 +793,23 @@ static void get_process_state (stz_long pid, ProcessState* s, int wait_for_termi
   else
     *s = (ProcessState){PROCESS_RUNNING, 0};
 }
+
+//------------------------------------------------------------
+//----------------------- Execvpe ----------------------------
+//------------------------------------------------------------
+//The 'execvpe' frontend to 'execvp' does not exist in OS-X.
+//So implement a quick version of it.
+
+#ifdef PLATFORM_OS_X
+extern char **environ;
+int execvpe(const char *program, char **argv, char **envp){
+  char **saved = environ;
+  environ = envp;
+  int rc = execvp(program, argv);
+  environ = saved;
+  return rc;
+}
+#endif
 
 //------------------------------------------------------------
 //---------------------- Launcher Main -----------------------
@@ -855,8 +910,12 @@ static void launcher_main (FILE* lin, FILE* lout){
           }
         }
 
-        //Launch child process
-        execvp(C_CSTR(earg->file), (char**)earg->argvs);
+        //Launch child process.
+        //If an environment is supplied then call execvpe, otherwise call execvp.
+        if(earg->env_vars == NULL)
+          execvp(C_CSTR(earg->file), (char**)earg->argvs);
+        else
+          execvpe(C_CSTR(earg->file), (char**)earg->argvs, (char**)earg->env_vars);
 
         //Unsuccessful exec, write error number
         write_error_and_exit(exec_error[WRITE]);
@@ -950,7 +1009,7 @@ stz_int delete_process_pipes (FILE* input, FILE* output, FILE* error, stz_int pi
 
 stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
                        stz_int output, stz_int error, stz_int pipeid,
-                       stz_byte* working_dir, Process* process) {
+                       stz_byte* working_dir, stz_byte** env_vars, Process* process) {
   //Initialize launcher if necessary
   initialize_launcher_process();
 
@@ -975,7 +1034,7 @@ stz_int launch_process(stz_byte* file, stz_byte** argvs, stz_int input,
     RETURN_NEG(make_pipe(pipe_name, "_err"))
 
   //Write in command and evaluation arguments
-  EvalArg earg = {STZ_STR(pipe_name), NULL, NULL, NULL, file, working_dir, argvs};
+  EvalArg earg = {STZ_STR(pipe_name), NULL, NULL, NULL, file, working_dir, env_vars, argvs};
   if(input == PROCESS_IN) earg.in_pipe = STZ_STR("_in");
   if(output == PROCESS_OUT) earg.out_pipe = STZ_STR("_out");
   if(output == PROCESS_ERR) earg.out_pipe = STZ_STR("_err");

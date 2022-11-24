@@ -11,6 +11,7 @@ defpackage stz/compiler-linking :
   import stz/linking-errors
   import stz/utils
   import stz/file-stamps
+  import stz/foreign-package-files
 
 ;<doc>=======================================================
 ;================ High-Level Algorithm ======================
@@ -64,6 +65,13 @@ public defstruct LinkerEnv
 ;Report to the caller that an error has occurred.
 public defmulti issue-error (e:LinkerEnv, err:LinkingError) -> False
 
+;Return the system dependencies that usages of a foreign-package-manager
+;will induce. Note that foreign-packages are not allowed here, only ccfiles and ccflags.
+public defmulti foreign-package-manager-dependencies (e:LinkerEnv,
+                                                      params:ForeignPackageParamsStmt,
+                                                      platform:Symbol)
+                                                   -> ProjDependencies
+
 ;Report to the caller that the external dependencies have been computed.
 public defmulti computed-dependencies (e:LinkerEnv, deps:ProjDependencies) -> False
 
@@ -71,8 +79,20 @@ public defmulti computed-dependencies (e:LinkerEnv, deps:ProjDependencies) -> Fa
 public defmulti computed-build-commands (e:LinkerEnv, stmts:Tuple<CompileStmt>) -> False :
   false
 
+;Called to request for the given foreign package dependencies to be satisfied.
+;If an error occurs, and the request cannot be satisfied, this call is expected to throw an exception,
+;which will halt the compilation process.
+;The function should return True if progress has been made, or false if the dependencies
+;were already up-to-date and have not changed since they were last satisfied.
+public defmulti satisfy-foreign-packages (e:LinkerEnv,
+                                          files:ForeignPackageFiles,
+                                          params:ForeignPackageParamsStmt,
+                                          platform:Symbol) -> True|False
+
 ;Called to report to the caller that an external dependency has already been built.
-public defmulti notify-external-dependency-up-to-date (e:LinkerEnv, file?:True|False, name:String) -> False
+public defmulti notify-external-dependency-up-to-date (e:LinkerEnv,
+                                                       file?:True|False,
+                                                       name:String|Tuple<String>) -> False
 
 ;Called to request that the caller execute a build command.
 ;Expected to throw an exception if some error occurs during execution.
@@ -107,58 +127,69 @@ public defn link (input:LinkerInput, env:LinkerEnv) -> False :
     val deps = compute-dependencies(
                  compiler-result(input)
                  proj(input)
-                 build-settings(input))
-    computed-dependencies(env, deps)
+                 build-settings(input)
+                 env)
+    computed-dependencies(env, dependencies(deps))
 
-    ;Case: An output executable is desired.
-    if output-required?(build-settings(input)) :
+    ;Proceed with the rest of the flow if dependencies
+    ;were computed without errors.
+    if not errors?(deps) :
 
-      ;Compute the compilation statements that must be
-      ;executed.
-      val commands = compute-build-commands(deps, proj(input), env)
-      computed-build-commands(env, stmts(commands))
+      ;Case: An output executable is desired.
+      if output-required?(build-settings(input)) :
 
-      ;Execute the given build commands if they are not
-      ;already up-to-date.
-      val build-platform = platform(build-settings(input)) as Symbol
-      val build-result = execute-build-commands(
-                           commands,
-                           auxfile(input),
-                           build-platform,
-                           env)
-      update-auxfile-for-external-dependencies(auxfile-updates,
-                                               build-result)
+        ;Compute the compilation statements that must be
+        ;executed.
+        val commands = compute-build-commands(dependencies(deps), proj(input), env)
+        computed-build-commands(env, stmts(commands))
 
-      ;Execute the final command for building the program executable,
-      ;if there are no errors so far.
-      val build-prog? = not errors?(build-result)
-                    and not errors?(commands)
-      if build-prog? :        
+        ;Satisy the foreign package dependencies.
+        val build-platform = platform(build-settings(input)) as Symbol
+        for package in foreign-packages(dependencies(deps)) do :
+          satisfy-foreign-packages(env,
+                                   package,
+                                   package-manager-params(proj(input), package-manager(package)),
+                                   build-platform)
 
-        ;Execute the final build command.
-        val prog-result = execute-final-build-command(
-                            build-settings(input),
-                            deps,
-                            build-platform,
-                            env)
+        ;Execute the given build commands if they are not
+        ;already up-to-date.        
+        val build-result = execute-build-commands(
+                             commands,
+                             auxfile(input),
+                             build-platform,
+                             env)
+        update-auxfile-for-external-dependencies(auxfile-updates,
+                                                 build-result)
 
-        ;If the program built successfully, then update the
-        ;auxfile.
-        match(prog-result:FinalBuildResult) :
-          update-auxfile-for-main-program(auxfile-updates,
-                                          build-settings(input),
-                                          build-result,
-                                          compiler-result(input),
-                                          prog-result,
-                                          proj(input))
-                                            
-    ;Case: An output executable is not desired, but an
-    ;assembly file is required.
-    else if only-assembly-required?(build-settings(input)) :
-      update-auxfile-for-assembly(auxfile-updates,
-                                  build-settings(input),
-                                  compiler-result(input),
-                                  proj(input))
+        ;Execute the final command for building the program executable.
+        val build-prog? = not errors?(build-result)
+                      and not errors?(commands)
+        if build-prog? :
+
+          ;Execute the final build command.
+          val prog-result = execute-final-build-command(
+                              build-settings(input),
+                              dependencies(deps),
+                              build-platform,
+                              env)
+
+          ;If the program built successfully, then update the
+          ;auxfile.
+          match(prog-result:FinalBuildResult) :
+            update-auxfile-for-main-program(auxfile-updates,
+                                            build-settings(input),
+                                            build-result,
+                                            compiler-result(input),
+                                            prog-result,
+                                            proj(input))
+
+      ;Case: An output executable is not desired, but an
+      ;assembly file is required.
+      else if only-assembly-required?(build-settings(input)) :
+        update-auxfile-for-assembly(auxfile-updates,
+                                    build-settings(input),
+                                    compiler-result(input),
+                                    proj(input))
 
 ;============================================================
 ;================ Compute Dependencies ======================
@@ -168,44 +199,161 @@ public defn link (input:LinkerInput, env:LinkerEnv) -> False :
 ;by the program.
 defn compute-dependencies (result:CompilationResult,
                            proj:ProjFile,
-                           settings:BuildSettings) -> ProjDependencies :
+                           settings:BuildSettings,
+                           env:LinkerEnv) -> AllDependencies :
 
+  ;==========================================================
+  ;=================== Error Tracking =======================
+  ;==========================================================
+
+  ;Flip to true if encountered-error is ever called.
+  var errors?: True|False = false
+
+  ;Encountered a new during dependency resolution.
+  defn encountered-error (e:LinkingError) :
+    issue-error(env, e)
+    errors? = true
+
+  ;==========================================================
+  ;=================== Start of Iteration ===================
+  ;==========================================================
+
+  ;Dependencies that are provided by the .proj files.
   defn proj-file-dependencies () -> Seqable<ProjDependencies> :
     ;The requires statements tells us what dependencies each
     ;package has.
     val requires-table = to-hashtable(package,
       filter-by<RequiresStmt>(stmts(proj)))
-
+    
     ;Gather both the compiled and binding packages.
     val all-packages = unique-join(compiled-packages(result),
                                    binding-packages(result))
-    val package-dependencies =
+    val package-dependencies =                                
       for package in all-packages seq :
         val requires = get?(requires-table, package)
         match(requires:RequiresStmt) :
-          ProjDependencies(ccfiles(requires), ccflags(requires))
+          ProjDependencies(ccfiles(requires),
+                           ccflags(requires),
+                           foreign-packages(requires))
     filter-by<ProjDependencies>(package-dependencies)
 
+  ;Explicit dependencies that are provided by the user directly
+  ;on the command line.
   defn explicit-dependencies () -> ProjDependencies :
     ProjDependencies(
       ccfiles(settings)
-      ccflags(settings))
+      ccflags(settings)
+      [])
 
-  ;Launch!
-  val all-dependencies = to-tuple $ cat([system-dependencies(platform(settings) as Symbol)
-                              explicit-dependencies()]
-                             proj-file-dependencies())
-  merge(all-dependencies)
+  ;Default dependencies that are required by the system.
+  defn system-dependencies () -> ProjDependencies :
+    /system-dependencies(platform(settings) as Symbol)
 
-;Helper: Unique join.
-defn unique-join<?T> (xs:Tuple<?T>, ys:Tuple<?T>) -> Tuple<T> :
-  val visited = HashSet<?>()
-  to-tuple $ for v in cat(xs,ys) filter :
-    add(visited,v)
+  ;Retrieve the initial list of dependencies that we use
+  ;to start the iterative process.
+  defn all-initial-dependencies () -> ProjDependencies :
+    merge $ cat-all $ [[system-dependencies()
+                        explicit-dependencies()]
+                       proj-file-dependencies()]
 
-;============================================================
+  ;==========================================================
+  ;================== Iterative Step ========================
+  ;==========================================================
+
+  ;Dependencies in .proj files required for compiling
+  ;external files or flags. 
+  defn compilation-dependencies (deps:ProjDependencies) -> Seqable<ProjDependencies> :
+    ;The compile statements tell us what foreign packages each
+    ;compilation command requires.
+    val compile-table = to-hashtable(name,
+      filter-by<CompileStmt>(stmts(proj)))
+      
+    ;Gather all the dependencies from the compile statements
+    ;necessitated by the given -ccfiles and -ccflags.
+    val dependencies =
+      for name in cat(ccfiles(deps), ccflags(deps)) seq :
+        val stmt = get?(compile-table, name)
+        match(stmt:CompileStmt) :
+          ProjDependencies([],
+                           [],
+                           foreign-packages(stmt))
+    filter-by<ProjDependencies>(dependencies)
+
+  ;Dependencies imposed by the package managers.
+  ;Based upon the required ForeignPackageFiles, retrieve the corresponding ForeignPackageParamsStmt
+  ;from the .proj file, and request the environment to return the manager's system dependencies.
+  ;If there is no ForeignPackageParamsStmt in the .proj file, then it means that the program
+  ;depends upon packages from e.g. conan, but the project was not configured to work with conan.
+  ;- already-included: Includes the set of foreign package managers whose dependencies are
+  ;  already included in deps. This function will directly add the additional package managers
+  ;  to already-included.
+  defn package-manager-system-dependencies (deps:ProjDependencies,
+                                            already-included:HashSet<Symbol>) -> Seqable<ProjDependencies> :
+    ;Retrieve all the configurations for the foreign package managers.
+    val package-params = to-hashtable(package-manager,
+      filter-by<ForeignPackageParamsStmt>(stmts(proj)))
+
+    ;Compute new set of dependencies.
+    val new-deps = Vector<ProjDependencies>()
+    for package in foreign-packages(deps) do :
+      if add(already-included, package-manager(package)) :
+        match(get?(package-params, package-manager(package))) :
+          (params:ForeignPackageParamsStmt) :
+            val platform = platform(settings) as Symbol
+            add(new-deps, foreign-package-manager-dependencies(env, params, platform))
+          (f:False) :
+            encountered-error(NoConfigurationForPackageManager(package-manager(package), files(package)))
+
+    ;Return the new dependencies
+    new-deps    
+
+  ;Based upon the initial set, add the additional dependencies from
+  ;the compile statements and the package managers.
+  ;- already-included-managers: Includes the set of foreign package
+  ;  managers whose dependencies are already included in deps.
+  defn add-additional-dependencies (deps:ProjDependencies,
+                                    already-included-managers:HashSet<Symbol>) -> ProjDependencies|False :
+    ;Compute the new set of dependencies.
+    val new-deps = merge $ cat-all $ [                                
+      [deps]
+      compilation-dependencies(deps)
+      package-manager-system-dependencies(deps, already-included-managers)]
+    ;Return the new dependencies only if they are different.
+    new-deps when new-deps != deps
+
+  ;==========================================================
+  ;=============== Main Iterative Loop ======================
+  ;==========================================================
+
+  ;Iteratively call add-additional-dependencies until convergence.
+  defn iteratively-compute-dependencies () -> ProjDependencies :
+    val included-managers = HashSet<Symbol>()
+    let loop (deps:ProjDependencies = all-initial-dependencies()) :
+      val added-deps = add-additional-dependencies(deps, included-managers)
+      match(added-deps:ProjDependencies) :
+        loop(added-deps)
+      else :
+        deps
+
+  ;==========================================================
+  ;==================== Launch! =============================
+  ;==========================================================
+
+  val deps = iteratively-compute-dependencies()
+  AllDependencies(deps, errors?)
+
+;Wrap up the computed dependencies along with information about
+;whether any errors occurred.
+defstruct AllDependencies :
+  dependencies: ProjDependencies
+  errors?:True|False
+with:
+  printer => true
+     
+
+;============================================================      
 ;================ Compute Shell Commands ====================
-;============================================================
+;============================================================      
 
 ;Returns the tuple of compilation statements that must be
 ;executed.
@@ -232,7 +380,7 @@ defn compute-build-commands (deps:ProjDependencies,
   ;Helper: Create a dummy statement for the files that do not
   ;have a registered CompileStmt.
   defn dummy-stmt (name:String) -> CompileStmt :
-    CompileStmt(true, name, [], [])
+    CompileStmt(true, name, [], [], [])
 
   ;Collect all compilation statements from files.
   for file in ccfiles(deps) do :
@@ -241,7 +389,7 @@ defn compute-build-commands (deps:ProjDependencies,
       if not file?(stmt) : encountered-error(MismatchedCompilationStmt(true, file))
       else : add(stmts, stmt)
     else : add(stmts, dummy-stmt(file))
-
+      
   ;Collect all compilation statements from flags.
   for flag in ccflags(deps) do :
     val stmt = get?(compile-table,flag)
@@ -274,7 +422,7 @@ defn execute-build-commands (cmds:BuildCommands,
   ;Note: This part may fail because of computing the filestamps.
   defn ext-rec (stmt:CompileStmt) -> ExternalFileRecord|False :
     try :
-      val filetype = ExternalFile(filestamp(name(stmt))) when file?(stmt)
+      val filetype = ExternalFile(filestamp(name(stmt) as String)) when file?(stmt)
                 else ExternalFlag(name(stmt))
       val deps = map(filestamp, dependencies(stmt))
       ExternalFileRecord(filetype, deps, commands(stmt))
@@ -288,7 +436,7 @@ defn execute-build-commands (cmds:BuildCommands,
   var errors?:True|False = false
 
   ;Execute each statement in turn.
-  for stmt in stmts(cmds) do :
+  for stmt in stmts(cmds) do :      
     ;Check whether the external file has already been compiled,
     ;by checking the aux file.
     val prev-ext-rec = ext-rec(stmt)
@@ -297,9 +445,9 @@ defn execute-build-commands (cmds:BuildCommands,
       (rec) : false
 
     ;If the file is up-to-date, then notify the environment.
-    if already-compiled? :
+    if already-compiled? :    
       notify-external-dependency-up-to-date(env, file?(stmt), name(stmt))
-
+      
       ;Save the record.
       add(saved-records, prev-ext-rec as ExternalFileRecord)
 
@@ -307,7 +455,7 @@ defn execute-build-commands (cmds:BuildCommands,
     else :
       ;Execute the commands, and track any execution error
       ;that occurs.
-      val execution-error =
+      val execution-error = 
         try :
           for command in commands(stmt) do :
             call-shell(env, platform, command)
@@ -316,7 +464,7 @@ defn execute-build-commands (cmds:BuildCommands,
           e
       ;If there was an error during execution.
       match(execution-error:Exception) :
-        issue-error(env,
+        issue-error(env, 
                     ErrorCompilingExternalDependency(file?(stmt), name(stmt), execution-error))
         errors? = true
       ;Otherwise, try recording the external file dependency.
@@ -359,7 +507,7 @@ defn execute-final-build-command (settings:BuildSettings,
               platform,
               filename(asmfile),
               ccfiles(deps),
-              ccflags(deps),
+              flat-ccflags(deps),
               exefile)
     catch (e) :
       issue-error(env, ErrorLinkingAsmfile(filename(asmfile), exefile, e))
@@ -373,8 +521,8 @@ defn execute-final-build-command (settings:BuildSettings,
       val exestamp = filestamp(exefile)
       FinalBuildResult(asmstamp, exestamp)
     catch (e) :
-      false
-
+      false    
+  
 ;Holds the filestamps of the final build result.
 defstruct FinalBuildResult :
   asm-filestamp: FileStamp|False
@@ -509,3 +657,18 @@ defn save-updates-to-auxfile<?T> (body:AuxFileUpdates -> ?T, env:LinkerEnv) :
   finally :
     if not empty?(records(updates)) :
       update-aux-file(env, to-tuple(records(updates)))
+
+;============================================================
+;==================== Small Utilities =======================
+;============================================================
+
+;Helper: Unique join.
+defn unique-join<?T> (xs:Tuple<?T>, ys:Tuple<?T>) -> Tuple<T> :
+  val visited = HashSet<?>()
+  to-tuple $ for v in cat(xs,ys) filter :
+    add(visited,v)
+
+;Retrieve the ForeignPackageParamsStmt statement from the .proj file.
+defn package-manager-params (proj:ProjFile, name:Symbol) -> ForeignPackageParamsStmt :
+  for stmt in filter-by<ForeignPackageParamsStmt>(stmts(proj)) find! :
+    package-manager(stmt) == name
