@@ -5,6 +5,8 @@ defpackage stz/reg-alloc-assignment :
   import stz/reg-alloc-ports
   import stz/reg-alloc-engine
   import stz/reg-alloc-block-engine
+  import stz/reg-alloc-shuffle
+  import stz/printing-utils
 
 ;<doc>=======================================================
 ;======================= Algorithm ==========================
@@ -39,7 +41,7 @@ Note that we need to choose registers for the arguments first,
 and then we need to interpret the model itself. The model
 will indicate when registers are released, and when registers
 are assigned. The model statements of interest are: Release,
-Assign, ClearRegisters. 
+Assign, ClearRegisters.
 
   Choosing Registers for Arguments:
 
@@ -101,33 +103,296 @@ check to ensure that the variable was actually assigned.
 public defn assign-registers (e:BlockEngine,
                               num-regs:Int,
                               num-fregs:Int) :
+
+  ;----------------------------------------------------------
+  ;-------------------- State Tables ------------------------
+  ;----------------------------------------------------------
+
+  ;Holds which registers are currently assigned to each
+  ;variable.
+  val register-table = IntTable<Reg|FReg>()
+
+  ;Holds which registers are currently assigned to the
+  ;temp variables.
+  val temp-table = Vector<Reg|FReg|False>()
+
+  ;----------------------------------------------------------
+  ;-------------------- State Manipulation ------------------
+  ;----------------------------------------------------------
+
+  ;Returns true if the given register is free to be assigned.
+  defn free-register? (r:Reg|FReg) -> True|False :
+    not contains?(values(register-table), r) and
+    not contains?(temp-table, r)
+
+  ;Returns a free register in the given category.
+  defn free-register (r:AnyReg|AnyFReg) -> Reg|FReg :
+    match(r) :
+      (r:AnyReg) : find!(free-register?, seq(Reg,0 to num-regs))
+      (r:AnyFReg) : find!(free-register?, seq(FReg,0 to num-fregs))
+
+  ;Assign the given register to the given port.
+  defn assign-register (v:Int, r:Reg|FReg) -> False :
+    ;Sanity checks
+    if not free-register?(r) : fatal("%_ is not free." % [r])
+    if key?(register-table,v) : fatal("V%_ is already assigned." % [v])
+    register-table[v] = r
+
+  ;Assign the given register to the given temporary.
+  defn assign-temp-register (index:Int, r:Reg|FReg) -> False :
+    ;Sanity checks
+    if not free-register?(r) : fatal("%_ is not free." % [r])
+    if temp-table[index] is-not False : fatal("Temp %_ is already assigned." % [index])
+    temp-table[index] = r
+
+  ;Print the current contents of the register table.
+  defn print-register-table () -> False :
+    val items = for e in register-table seq :
+      simple-field(to-string("V%_" % [key(e)]), value(e))
+    println("Currently assigned registers%_" % [colon-field-list(items)])
+
+  ;----------------------------------------------------------
+  ;-------------------- Main Algorithm ----------------------
+  ;----------------------------------------------------------
+
   ;Process the input ports.
   ;First assign registers for all the ports with preferred registers.
-  val queue = Vector<Port>()
+  val unassigned = Vector<Port>()
   for p in inputs(e) do :
-    if loaded-in-register?(p) :
-      if has-preferred-register?(p) :
-        val reg = pref-reg(p) as Reg|FReg
-        if free-register?(reg) : assign-register(id(p), reg)
-        else : add(queue, p)
-      else :
-        add(queue, p)
-        
-  ;Then assign arbitary registers for all the remaining ports.
-  for p in queue do :
-    assign-register(id(p), free-register(loaded-location(p)))
+    if loaded?(p) :
+      println("Port %_ is loaded" % [id(p)])
+      match(pref-reg(p)) :
+        (r:Reg|FReg) :
+          println("Port prefers register %_" % [r])
+          if free-register?(r) :
+            println("Assign register %_" % [r])
+            assign-register(id(p), r)
+          else :
+            add(unassigned, p)
+        (f:False) :
+          println("Port has no preferred register.")
+          add(unassigned, p)
+  ;Next assign arbitrary registers to remaining ports.
+  while not empty?(unassigned) :
+    val p = pop(unassigned)
+    val r = free-register(register-category(p))
+    assign-register(id(p), r)
 
-  ;Then record the final registers that we chose.
-  val new-inputs = to-tuple $ for p in inputs(e) seq :
-    sub-assigned-reg(p, assigned-register(id(p)))
-  set-contents(inputs(e), new-inputs)      
+  ;Print the currently assigned registers.
+  print-register-table()
+
+  ;Record the final registers that were assigned.
+  val new-input-ports = to-tuple $ for p in inputs(e) seq :
+    sub-assigned-reg(p, register-table[id(p)])
+  set-contents(inputs(e), new-input-ports)
+
+  ;Print the new input ports.
+  println("New input ports%_" % [colon-field-list(inputs(e))])
 
   ;Scan through the instructions.
   within (i, stmt, emit) = process-instructions(e) :
     println("Process: %_" % [stmt])
     match(stmt) :
       (stmt:AnnotatedOperationStmt) :
+        ;Retrieve:
+        ;- args: The argument variables to the operation.
+        ;- arg-input-regs: The registers they are currently in.
+        ;- arg-output-regs: The locations they need to be in.
+        ;And determine whether a straightforward assignment
+        ;will work.
+        val args = args(stmt)
+        val arg-input-regs = map({register-table[_]}, args)
+        val arg-output-regs = arg-registers(e, stmt)
+
+        ;Perform what is necessary to move arguments to the
+        ;right registers. And get final position of arguments.
+        val arg-final-regs = match(needs-shuffle?(arg-input-regs, arg-output-regs)) :
+          (status:AlreadyInPosition) :
+            arg-input-regs
+          (status:UseNaiveMoves) :
+            fatal("Not yet implemented")
+          (status:UseShuffle) :
+            fatal("Not yet implemented")
+
+        ;Now process each of the model statements.
+        process-model{_, e, stmt} $ new ModelProcessor :
+          defmethod release-temp (this, index:Int) :
+            false
+          defmethod release (this, v:Int) :
+            false
+          defmethod assign-temp (this, index:Int, loc:Location, pref:Preference) :
+            false
+          defmethod assign (this, id:Int, loc:Location, pref:Preference) :
+            false
+          defmethod clear-registers (this) :
+            false
+
       (stmt:Save) :
+        false
       (stmt:Unload) :
+        ;Sanity check: Ensure that the variable is assigned.
+        if not key?(register-table, arg(stmt)) :
+          fatal("Variable V%_ is not assigned." % [arg(stmt)])
+        ;Remove the assigned register from that variable.
+        remove(register-table, arg(stmt))
       (stmt:Load) :
-        
+        false
+
+;------------------------------------------------------------
+;--------------------- Process a Model ----------------------
+;------------------------------------------------------------
+
+;Callbacks for processing the different actions of a model.
+deftype ModelProcessor
+
+;Release the temporary at index 'index'.
+defmulti release-temp (proc:ModelProcessor, index:Int) -> False
+
+;Release the variable register.
+defmulti release (proc:ModelProcessor, id:Int) -> False
+
+;Assign the temporary at index 'index'.
+defmulti assign-temp (proc:ModelProcessor, index:Int, loc:Location, pref:Preference) -> False
+
+;Assign the variable with id 'id'.
+defmulti assign (proc:ModelProcessor, id:Int, loc:Location, pref:Preference) -> False
+
+;Clear all of the registers.
+defmulti clear-registers (proc:ModelProcessor) -> False
+
+defn process-model (proc:ModelProcessor,
+                    e:BlockEngine,
+                    anno-stmt:AnnotatedOperationStmt) -> False :
+  ;Retrieve the model.
+  val op-stmt = stmt(anno-stmt)
+  val model = models(e)[op-id(op-stmt)]
+
+  ;Retrieve the index ranges of the different variables.
+  val first-temp = length(results(model)) + length(args(model))
+  val first-arg = length(results(model))
+  val num-vars = length(results(model)) + length(args(model)) + length(temp(model))
+
+  ;Return true if the given variable is a temp variable.
+  defn temp? (v:Int) : v >= first-temp and v < num-vars
+
+  ;Return true if the given variable is an arg variable.
+  defn arg? (v:Int) : v >= first-arg and v < first-temp
+
+  ;Return true if arg at index 'i' is killed in this
+  ;operation.
+  defn arg-killed? (i:Int) -> True|False :
+    contains?(killed-args(anno-stmt), i)
+
+  ;Return the id of the global argument variable at index 'i'.
+  defn arg-var (i:Int) -> Int :
+    args(op-stmt)[i]
+
+  ;Return the index of the temp variable.
+  defn temp-index (v:Int) : v - first-temp
+
+  ;Return the index of the arg variable.
+  defn arg-index (v:Int) : v - first-arg
+
+  ;Return true if the model calls clear-registers.
+  defn model-clears-registers? () -> True|False :
+    val props = model-properties(e)[op-id(op-stmt)]
+    clears-registers?(props)
+
+  ;Analyze the given preference, and update it
+  ;to reflect the global variable ids.
+  defn analyze (pref:Preference) -> Preference :
+    match(pref:PreferSame) :
+      if temp?(arg(pref)) :
+        PreferSameAsTemp(temp-index(arg(pref)))
+      else if arg?(arg(pref)) :
+        val i = arg-index(arg(pref))
+        PreferSame(arg-var(i))
+      else :
+        fatal("Invalid preference: %_" % [pref])
+    else :
+      pref
+
+  ;Iterate through each statement and call
+  ;the appropriate callbacks.
+  for mstmt in stmts(model) do :
+    match(mstmt) :
+      (mstmt:Release) :
+        if temp?(arg(mstmt)) :
+          release-temp(proc, temp-index(arg(mstmt)))
+        else :
+          val i = arg-index(arg(mstmt))
+          release(proc, arg-var(i)) when arg-killed?(i)
+      (mstmt:Assign) :
+        if temp?(arg(mstmt)) :
+          assign-temp(proc,
+                      temp-index(arg(mstmt)),
+                      location(mstmt),
+                      analyze(preference(mstmt)))
+        else :
+          val i = arg-index(arg(mstmt))
+          assign(proc,
+                 arg-var(i),
+                 location(mstmt),
+                 analyze(preference(mstmt)))
+      (mstmt:ClearRegisters) :
+        clear-registers(proc)
+      (mstmt:Return) :
+        false
+
+  ;Finish by releasing any other temp/arg variables,
+  ;that hasn't explicitly been released.
+  if not model-clears-registers?() :
+    ;Compute all that has been released.
+    val all-released = to-intset $
+      seq(arg, filter-by<Release>(stmts(model)))
+
+    ;Release any other temp that hasn't yet been released.
+    for v in temp(model) do :
+      if not all-released[v] :
+        release-temp(proc, temp-index(v))
+
+    ;Release any other killed arguments that hasn't already been
+    ;released.
+    for v in seq(id,args(model)) do :
+      if not all-released[v] :
+        val i = arg-index(v)
+        release(proc, v) when arg-killed?(i)
+
+;Prefer to be same as the temp for the operation.
+defstruct PreferSameAsTemp <: Preference :
+  index:Int
+
+;------------------------------------------------------------
+;--------------------- Utilities ----------------------------
+;------------------------------------------------------------
+
+;Returns true if the given port is loaded into a register.
+defn loaded? (p:Port) -> True|False :
+  val s = status(p) as PortStatus
+  loaded(s) is Location
+
+;Returns the register category that a port is in.
+defn register-category (p:Port) -> AnyReg|AnyFReg :
+  val s = status(p) as PortStatus
+  loaded(s) as AnyReg|AnyFReg
+
+;Fill in the final assigned register for the given port.
+defn sub-assigned-reg (p:Port, r:Reg|FReg) -> Port :
+  val s = status(p) as PortStatus
+  val new-status = sub-loaded(s, r)
+  sub-status(p, new-status)
+
+;Helper: Set the contents of the given vector.
+defn set-contents<?T> (vs:Vector<?T>, xs:Seqable<T>) :
+  clear(vs)
+  add-all(vs,xs)
+
+;Return the argument variables to the operation.
+defn args (op:AnnotatedOperationStmt) -> Tuple<Int> :
+  args(stmt(op))
+
+;Helper: Return the registers that the arguments are required
+;to be in.
+defn arg-registers (e:BlockEngine, op:AnnotatedOperationStmt) -> Tuple<Location> :
+  val m = models(e)[op-id(stmt(op))]
+  map(location, args(m))
