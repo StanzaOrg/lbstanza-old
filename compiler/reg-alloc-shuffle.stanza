@@ -4,61 +4,41 @@ defpackage stz/reg-alloc-shuffle :
   import stz/reg-alloc-ir
 
 ;============================================================
-;==================== Fast Predicate ========================
-;============================================================
-
-;Categorizes the situation according to whether the shuffling engine
-;is required to perform the following parallel move.
-
-;Definition of naive algorithm on example:
-;  (R2, R6, R3) => (Rx, R2, R3)
-;Step 1. For all specific target registers, perform their
-;moves first, in any arbitrary order. (Release the source
-;registers as part of this move.)
-;Step 2. For all general target registers, perform these
-;moves, moving to some arbitrary free register.
-
-public defn needs-shuffle? (inputs:Tuple<Reg|FReg>,
-                            outputs:Tuple<Location>) -> NeedsShuffle :
-  ;Sanity check.
-  if length(inputs) != length(outputs) :
-    fatal("Mismatched lengths between inputs and outputs.")
-
-  ;First collect all the target registers.
-  ;These are the registers that will be one of the destinations
-  ;of a MOVE statement.
-  val target-registers = to-tuple $
-    for (input in inputs, output in outputs) seq? :
-      match(output:Reg|FReg) :
-        if input == output : None()
-        else : One(output)
-      else : None()
-        
-  ;Case: If there are no target registers, then we're done.
-  if empty?(target-registers) :
-    AlreadyInPosition
-  ;Case: If there exists overlap between the target registers
-  ;and the input registers, then we need to make sure that we
-  ;don't accidentally overwrite an input during a MOVE. In this
-  ;case, the naive algorithm won't work.
-  else if any?(contains?{inputs, _}, target-registers) :
-    UseShuffle
-  ;Case: Naive moves work fine.
-  else :
-    UseNaiveMoves
-
-;Represents the result of testing the shuffle engine.
-public defenum NeedsShuffle :
-  AlreadyInPosition
-  UseNaiveMoves
-  UseShuffle
-
-;============================================================
-;====================== Shuffling Engine ====================
+;================== Shuffling Engine API ====================
 ;============================================================
 
 ;Represents an abstract type for performing shuffles.
 public deftype ShuffleEngine
+
+;Categorize what sort of shuffle is needed for the given input.
+public defmulti categorize (engine:ShuffleEngine,
+                            inputs:Tuple<Reg|FReg>,
+                            outputs:Tuple<Location>) -> InputCategory
+
+;Represents the sort of shuffle that is required for a particular
+;input situation.
+public defenum InputCategory :
+  AlreadyInPosition
+  NeedNaive
+  NeedShuffle
+
+;Load the given shuffling problem.
+public defmulti load-problem (engine:ShuffleEngine,
+                              vars:Tuple<Int>,
+                              inputs:Tuple<Reg|FReg>,
+                              saved:Tuple<True|False>,
+                              outputs:Tuple<Location>) -> False
+
+;Assuming that the problem is loaded, and that v requires a register,
+;return Reg|FReg if there's a particular register v should not be assigned to.
+public defmulti avoid (engine:ShuffleEngine, v:Int) -> Reg|FReg|False
+
+;Emit the shuffling instructions for the loaded problem,
+;given the optional free registers.
+public defmulti shuffle (engine:ShuffleEngine,
+                         free-reg:Reg|False,
+                         free-freg:FReg|False,
+                         emit:ProgramStmt -> ?) -> False
 
 ;Use the engine to perform a parallel move.
 ;- vars: The ids of the variables being shuffled.
@@ -77,7 +57,103 @@ public defmulti shuffle (engine:ShuffleEngine,
                          free-freg:FReg|False,
                          emit:ProgramStmt -> ?) -> False 
 
-;Create a shuffle engine that can perform shuffles.
-public defn ShuffleEngine (num-regs:Int, num-fregs:Int) -> ShuffleEngine :
-  new ShuffleEngine
-  
+;============================================================
+;==================== Implementation ========================
+;============================================================
+
+;Create a Shuffle Engine with the given number of registers and
+;floating-point registers.
+public defn ShuffleEngine (num-regs:Int,
+                           num-fregs:Int,
+                           parent-table:IntTable<Int>) -> ShuffleEngine :
+  ;Represents the set for holding the input registers.
+  val input-reg-set = Array<Int>(num-regs, 0)
+  val inpug-freg-set = Array<Int>(num-fregs, 0)
+  var true-marker:Int = 0
+
+  ;Holds the mapping from the register to the variable.
+
+  ;Represents the loaded problem.
+  var vars:Tuple<Int>
+  var inputs:Tuple<Reg|FReg>
+  var saved:Tuple<True|False>
+  var outputs:Tuple<Location>
+
+  ;Load registers into the input set.
+  defn load-inputs-into-set (inputs:Tuple<Reg|FReg>) -> False :
+    val m = true-marker + 1
+    true-marker = m
+    for reg in inputs do :
+      match(reg) :
+        (reg:Reg) : input-reg-set[index(reg)] = m
+        (reg:FReg) : input-freg-set[index(reg)] = m
+        
+  ;Check whether a register is in the input set.
+  defn in-input-set? (r:Reg|FReg) -> True|False :
+    match(r) :
+      (r:Reg) : input-reg-set[index(r)] == true-marker
+      (r:FReg) : input-freg-set[index(r)] == true-marker
+
+  ;Create the Shuffle Engine.
+  new ShuffleEngine :
+
+    ;Categorize what sort of shuffle is needed for the given input.
+    defmethod categorize (this,
+                          inputs:Tuple<Reg|FReg>,
+                          outputs:Tuple<Location>) -> InputCategory :
+      ;Sanity check.
+      if length(inputs) != length(outputs) :
+        fatal("Mismatched input and output length.")
+        
+      load-inputs-into-set(inputs)
+      ;Loop through inputs and output and find "target" registers.
+      ;e.g. In R4 => R3: R3 is a target register.
+      val n = length(inputs)
+      let loop (i:Int = 0) :
+        if i < n :
+          val input = inputs[i]
+          val output = outputs[i]
+          if output is Reg|FReg and input != output :
+            ;Found 'output' as a target register.
+            ;Check whether it's also an input.
+            if in-input-set?(output as Reg|FReg) : NeedsShuffle
+            else : NeedsNaive
+          else :
+            loop(i + 1)
+        else :
+          ;If no target registers at all, then everything is already
+          ;in place.
+          AlreadyInPosition
+
+    ;Load the given problem and prepare for shuffling.
+    defmethod load-problem (this,
+                            problem-vars:Tuple<Int>,
+                            problem-inputs:Tuple<Reg|FReg>,
+                            problem-saved:Tuple<True|False>,
+                            problem-outputs:Tuple<Location>) -> False :
+      ;Save the problem locally.
+      vars = problem-vars
+      inputs = problem-inputs
+      saved = problem-saved
+      outputs = problem-outputs
+
+      ;Compute the register parents.
+      for (v in vars, input in inputs, output in outputs) do :
+        set-register(v, input)
+        if output is Reg|FReg and input != output :
+          set-parent(output as Reg|FReg, input)
+      
+    ;Assuming that the problem is loaded, and that v requires a register,
+    ;return Reg|FReg if there's a particular register v should not be assigned to.
+    defmethod avoid (this, v:Int) -> Reg|FReg|False :
+      val reg = get-register(v)
+      match(get-parent(reg)) :
+        ;Case: The register has a parent, so don't
+        ;allow assigning to the root.
+        (p:Reg|Freg) :
+          get-root-parent(p)
+
+        ;Case: The register has no parent, therefore
+        ;we cannot create any cycles. 
+        (f:False) :
+          false
