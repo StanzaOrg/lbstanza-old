@@ -2,6 +2,7 @@ defpackage stz/reg-alloc-shuffle :
   import core
   import collections
   import stz/reg-alloc-ir
+  import stz/reg-alloc-datastructures
 
 ;============================================================
 ;================== Shuffling Engine API ====================
@@ -29,33 +30,18 @@ public defmulti load-problem (engine:ShuffleEngine,
                               saved:Tuple<True|False>,
                               outputs:Tuple<Location>) -> False
 
-;Assuming that the problem is loaded, and that v requires a register,
-;return Reg|FReg if there's a particular register v should not be assigned to.
-public defmulti avoid (engine:ShuffleEngine, v:Int) -> Reg|FReg|False
+;Assuming that the problem is loaded, and that input at index 'i' requires a register,
+;return Reg|FReg if there's a particular register that it should not be assigned to.
+public defmulti avoid (engine:ShuffleEngine, i:Int) -> Reg|FReg|False
 
 ;Emit the shuffling instructions for the loaded problem,
 ;given the optional free registers.
+;Concrete destinations are given for all outputs now.
 public defmulti shuffle (engine:ShuffleEngine,
+                         outputs:Tuple<Reg|FReg>,
                          free-reg:Reg|False,
                          free-freg:FReg|False,
                          emit:ProgramStmt -> ?) -> False
-
-;Use the engine to perform a parallel move.
-;- vars: The ids of the variables being shuffled.
-;- inputs: The registers that the inputs are currently in.
-;- saved: For each input, whether they are already saved.
-;- outputs: The desired output locations for the variables.
-;- free-reg: An optional free register to use during shuffling.
-;- free-freg: An optional free floating-point register to use during shuffling.
-;- emit: The function to use to emit the instructions for shuffling.
-public defmulti shuffle (engine:ShuffleEngine,
-                         vars:Tuple<Int>,
-                         inputs:Tuple<Reg|FReg>,
-                         saved:Tuple<True|False>,
-                         outputs:Tuple<Location>,
-                         free-reg:Reg|False,
-                         free-freg:FReg|False,
-                         emit:ProgramStmt -> ?) -> False 
 
 ;============================================================
 ;==================== Implementation ========================
@@ -63,15 +49,13 @@ public defmulti shuffle (engine:ShuffleEngine,
 
 ;Create a Shuffle Engine with the given number of registers and
 ;floating-point registers.
-public defn ShuffleEngine (num-regs:Int,
-                           num-fregs:Int,
-                           parent-table:IntTable<Int>) -> ShuffleEngine :
-  ;Represents the set for holding the input registers.
-  val input-reg-set = Array<Int>(num-regs, 0)
-  val inpug-freg-set = Array<Int>(num-fregs, 0)
-  var true-marker:Int = 0
+public defn ShuffleEngine (resources:ResourceProvider) -> ShuffleEngine :
+  ;Represents the set for marking registers quickly.
+  val reg-mark-set = RegisterSet(resources)
 
-  ;Holds the mapping from the register to the variable.
+  ;Represents the parent/child register for each register.  
+  val register-parent-table = RegisterTable<Reg|FReg>(resources)
+  val register-child-table = RegisterTable<Reg|FReg>(resources)
 
   ;Represents the loaded problem.
   var vars:Tuple<Int>
@@ -79,20 +63,20 @@ public defn ShuffleEngine (num-regs:Int,
   var saved:Tuple<True|False>
   var outputs:Tuple<Location>
 
-  ;Load registers into the input set.
-  defn load-inputs-into-set (inputs:Tuple<Reg|FReg>) -> False :
-    val m = true-marker + 1
-    true-marker = m
-    for reg in inputs do :
-      match(reg) :
-        (reg:Reg) : input-reg-set[index(reg)] = m
-        (reg:FReg) : input-freg-set[index(reg)] = m
-        
-  ;Check whether a register is in the input set.
-  defn in-input-set? (r:Reg|FReg) -> True|False :
-    match(r) :
-      (r:Reg) : input-reg-set[index(r)] == true-marker
-      (r:FReg) : input-freg-set[index(r)] == true-marker
+  ;Represents all cycles and chains.
+  ;Chains are represented using the end of the chain: the register
+  ;without any children.
+  val cycles = Vector<Reg|FReg>()
+  val chains = Vector<Reg|FReg>()
+
+  ;Helper: Fill the register-parent-table.
+  defn fill-register-parent-child-tables (inputs:Tuple<Reg|FReg>, outputs:Tuple<Location>) -> False :
+    clear(register-parent-table)
+    clear(register-child-table)
+    for (input in inputs, output in outputs) do :
+      if output is Reg|FReg and input != output :
+        register-parent-table[output as Reg|FReg] = input
+        register-child-table[input] = output as Reg|FReg
 
   ;Create the Shuffle Engine.
   new ShuffleEngine :
@@ -104,8 +88,11 @@ public defn ShuffleEngine (num-regs:Int,
       ;Sanity check.
       if length(inputs) != length(outputs) :
         fatal("Mismatched input and output length.")
-        
-      load-inputs-into-set(inputs)
+
+      ;Load all the input registers into the reg-mark-set for
+      ;fast testing.
+      set-contents(reg-mark-set, inputs)
+      
       ;Loop through inputs and output and find "target" registers.
       ;e.g. In R4 => R3: R3 is a target register.
       val n = length(inputs)
@@ -116,7 +103,7 @@ public defn ShuffleEngine (num-regs:Int,
           if output is Reg|FReg and input != output :
             ;Found 'output' as a target register.
             ;Check whether it's also an input.
-            if in-input-set?(output as Reg|FReg) : NeedsShuffle
+            if reg-mark-set[output as Reg|FReg] : NeedsShuffle
             else : NeedsNaive
           else :
             loop(i + 1)
@@ -137,23 +124,216 @@ public defn ShuffleEngine (num-regs:Int,
       saved = problem-saved
       outputs = problem-outputs
 
-      ;Compute the register parents.
-      for (v in vars, input in inputs, output in outputs) do :
-        set-register(v, input)
-        if output is Reg|FReg and input != output :
-          set-parent(output as Reg|FReg, input)
+      ;Initialize the register-parent-table.
+      fill-register-parent-child-tables(inputs, outputs)
       
-    ;Assuming that the problem is loaded, and that v requires a register,
-    ;return Reg|FReg if there's a particular register v should not be assigned to.
-    defmethod avoid (this, v:Int) -> Reg|FReg|False :
-      val reg = get-register(v)
-      match(get-parent(reg)) :
-        ;Case: The register has a parent, so don't
-        ;allow assigning to the root.
-        (p:Reg|Freg) :
-          get-root-parent(p)
-
+    ;Assuming that the problem is loaded, and that input 'i' requires a register,
+    ;return Reg|FReg if there's a particular register that it should not be assigned to.
+    defmethod avoid (this, i:Int) -> Reg|FReg|False :
+      match(get?(register-parent-table, inputs[i])) :
+        ;Case: The register has a parent, so avoid assigning to the root
+        ;of this parent chain.
+        (p:Reg|FReg) :
+          ;Compute the root.
+          let loop (r:Reg|FReg = p) :
+            match(get?(register-parent-table, r)) :
+              (p:Reg|FReg) : loop(p)
+              (f:False) : r
+              
         ;Case: The register has no parent, therefore
-        ;we cannot create any cycles. 
+        ;we cannot create any cycles. Nothing to avoid.
         (f:False) :
           false
+
+    ;Emit the shuffling instructions for the loaded problem.
+    defmethod shuffle (this,
+                       new-outputs:Tuple<Reg|FReg>,
+                       free-reg:Reg|False,
+                       free-freg:FReg|False,
+                       emit:ProgramStmt -> ?) :
+      ;Update the problem.
+      outputs = new-outputs
+      
+      ;Initialize the parent child tables.
+      fill-register-parent-child-tables(inputs, outputs)
+
+      ;Clear the mark set.
+      clear(reg-mark-set)
+
+      ;Helper: Mark everything in group.
+      defn* mark-group (r:Reg|FReg) -> False :
+        if add(reg-mark-set, r) :
+          match(get?(register-parent-table, r)) :
+            (p:Reg|FReg) : mark-group(p)
+            (f:False) : false
+
+      ;Given a register that has already been detected to
+      ;either be a cycle or a chain, add it to the appropriate group.
+      defn add-cycle-or-chain (r:Reg|FReg) -> False :
+        val r0 = r
+        let loop (r:Reg|FReg = r) :
+          match(get?(register-child-table,r)) :
+            (c:Reg|FReg) :
+              ;Case: Looped back, it's a cycle.
+              if c == r0 : 
+                add(cycles,r0)
+                mark-group(r0)
+              ;Case: Continue following the edges.
+              else :
+                loop(c)
+            ;Case: Found the end. It's a chain.
+            (f:False) :
+              add(chains,r)
+              mark-group(r)
+
+      ;Classify every register in the output.
+      clear(cycles)
+      clear(chains)
+      for r in new-outputs do :
+        if not reg-mark-set[r] :
+          if key?(register-parent-table,r) or key?(register-child-table,r) :
+            add-cycle-or-chain(r)
+
+      ;Helper: Emit a chain
+      defn* emit-chain (r:Reg|FReg) -> False :
+        val p = get?(register-parent-table,r)
+        match(p:Reg|FReg) :
+          val v = register-var-table[p]
+          emit(Relocate(v, p, r))
+
+      ;Helper: Emit a cycle using the given swap register.
+      defn* emit-cycle (r:Reg|FReg, swap:Reg|FReg) -> False :
+        val r0 = r
+        val v0 = register-var-table[r0]
+        emit(Relocate(v0, r0, swap))
+        let loop (r:Reg|FReg = r) :
+          val p = register-parent-table[r]
+          if p == r0 :
+            emit(Relocate(v0, swap, r))
+          else :
+            val v = register-var-table[p]
+            emit(Relocate(v, p, r))
+            loop(p)
+
+      ;Helper: Given an arbitrary register that is guaranteed
+      ;to exist on a cycle, remove that cycle from the cycle list.
+      defn* remove-cycle (r:Reg|FReg) -> False :
+        clear(reg-mark-set)
+        add-all(reg-mark-set, cycles)
+        val exemplar = let loop (r:Reg|FReg = r) :
+          if reg-mark-set[r] : r
+          else : loop(register-parent-table[r])
+        remove-item(cycles, exemplar)
+
+      ;Helper: Force the given register to be a swap register.
+      ;Assume that it has been saved somehow.
+      ;Returns the Load statement that must execute at the end to
+      ;recover the variable.
+      defn force-as-swap (swap:Reg|FReg) -> Load :
+        ;Break up the cycle if swap is part of a cycle.
+        if key?(register-parent-table, swap) :
+          ;Remove the register from cycles, and add it to chains.
+          remove-cycle(swap)
+          add(chains, swap)
+          ;Retrieve the child of this swap register.
+          val child = register-child-table[swap]
+          ;Break the cycle by removing the edge from swap to child.
+          remove(register-child-table, swap)
+          remove(register-parent-table, child)
+          ;The child variable is now assigned using a load at the very end.
+          val v = register-var-table[swap]
+          Load(v, child)
+        ;If the swap is not from a cycle, and instead from a
+        ;standalone, then recover the variable at the end.
+        else :
+          val v = register-var-table[swap]
+          Load(v, swap)
+
+      ;If there are no cycles at all, then we can just emit
+      ;the moves now.
+      if empty?(cycles) :
+        ;Emit all the chains.
+        do(emit-chain, chains)
+
+      ;Otherwise, we have to shuffle the cycles.
+      else :
+        ;Compute the swap registers that we will use to shuffle the cycles.
+        var swap-reg:Reg|False = false
+        var swap-freg:Reg|False = false
+
+        ;If no free registers are provided, then look through our
+        ;chains, and see which ones of those can be used.
+        if free-reg is False or free-freg is False :
+          for c in chains do :
+            match(c) :
+              (c:Reg) : swap-reg = c
+              (c:FReg) : swap-freg = c
+
+        ;Next, see whether we have free registers already provided.
+        if free-reg is Reg : swap-reg = free-reg
+        if free-freg is FReg : swap-freg = free-freg
+
+        ;Next, compute which type of registers actually have cycles.
+        var reg-cycle?:True|False = false
+        var freg-cycle?:True|False = false
+        for c in cycles do :
+          match(c) :
+            (c:Reg) : reg-cycle? = true
+            (c:FReg) : freg-cycle? = true
+
+        ;Forcibly create swap registers by saving/loading if necessary.
+        ;By this point, all registers will either be stand-alone or
+        ;part of a cycle. We know there are no chains because we
+        ;would have used it as a swap register if we did.
+
+        ;Generate these load statements to use as cleanup
+        ;after everything.
+        var load-swap-reg-stmt:Load|False = false
+        var load-swap-freg-stmt:Load|False = false
+
+        ;Check whether we need to forcibly create a integer swap register.
+        if reg-cycle? and swap-reg is False :
+          ;First look for a saved variable that we can use.
+          for (r in inputs, save in saved) :
+            if r is Reg and save :
+              swap-reg = r
+          ;If we didn't find an already saved variable, then forcibly save one.
+          if swap-reg is False :
+            val r = find-by!<Reg>(inputs)
+            val v = register-var-table[r]
+            emit(Save(v))
+            swap-reg = r
+          ;Force the swap register
+          load-swap-reg-stmt = force-as-swap(swap-reg as Reg)
+
+        ;Check whether we need to forcibly create a floating-point swap register.
+        if freg-cycle? and swap-freg is False :
+          ;First look for a saved variable that we can use.
+          for (r in inputs, save in saved) :
+            if r is FReg and save :
+              swap-freg = r
+          ;If we didn't find an already saved variable, then forcibly save one.
+          if swap-freg is False :
+            val r = find-by!<FReg>(inputs)
+            val v = register-var-table[r]
+            emit(Save(v))
+            swap-freg = r
+          ;Force the swap register
+          load-swap-freg-stmt = force-as-swap(swap-freg as FReg)
+
+        ;Now emit all cycles.
+        for c in cycles do :
+          match(c) :
+            (c:Reg) : emit-cycle(c, swap-reg as Reg)
+            (c:FReg) : emit-cycle(c, swap-freg as FReg)
+        
+        ;Now emit all chains.
+        do(emit-chain, chains)
+
+        ;Now emit the loads that were necessary because we forced
+        ;the creation of swap registers.
+        match(load-swap-reg-stmt:Load) :
+          emit(load-swap-stmt)
+        match(load-swap-freg-stmt:Load) :
+          emit(load-swap-freg-stmt)
+          
