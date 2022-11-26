@@ -6,6 +6,7 @@ defpackage stz/reg-alloc-assignment :
   import stz/reg-alloc-engine
   import stz/reg-alloc-block-engine
   import stz/reg-alloc-shuffle
+  import stz/reg-alloc-datastructures
   import stz/printing-utils
 
 ;<doc>=======================================================
@@ -86,6 +87,9 @@ Reserve all of the concrete output registers right now.
 (If it's a ClearRegisters operation, then only reserve
  the concrete temporary registers.)
 
+Reserve (using the reserved-input set) all of the concrete input
+registers right now.
+
 ## Step: Processing the input arguments ##
 
 For each argument, the following cases apply:
@@ -164,9 +168,100 @@ The inputs to the shuffle are:
 ;=======================================================<doc>
 
 public defn assign-registers (e:BlockEngine,
-                              num-regs:Int,
-                              num-fregs:Int) :
-  fatal("Not yet implemented")
+                              assignment-table:AssignmentTable) :
+                         
+  within (i, stmt, emit) = process-instructions(e) :
+    match(stmt) :
+
+      ;Processing an operation statement.
+      (stmt:AnnotatedOperationStmt) :
+      
+        ;Step: Preemptively identify swap registers
+        val swap-reg = free-register(assignment-table, AnyReg(), true, true)
+        val swap-freg = free-register(assignment-table, AnyFReg(), true, true)
+
+        ;Step: Reserve input/output registers.
+        clear-reserved(assignment-table)
+        clear-reserved-input(assignment-table)
+        for r in temp-registers(e,stmt) do :
+          match(r:Reg|FReg) :
+            mark-reserved(assignment-table, r)
+        if not clears-registers?(e,stmt) :
+          for r in result-registers(e,stmt) do :
+            match(r:Reg|FReg) :
+              mark-reserved(assignment-table, r)
+        for r in arg-registers(e,stmt) do :
+          match(r:Reg|FReg) :
+            mark-reserved-input(assignment-table, r)
+              
+        ;Step: Process input arguments.
+        for (v in args(stmt), desired-reg in arg-registers(e,stmt)) do :
+          val current-reg = assignment-table[v]
+          match(desired-reg) :
+            ;Case: Desired register is concrete.
+            (desired-reg:Reg|FReg) :
+              if current-reg != desired-reg :
+                unassign(assignment-table, v)
+            ;Case: No desired register.
+            (desired-reg:AnyReg|AnyFReg) :
+              if reserved-input?(assignment-table, current-reg) :
+                unassign(assignment-table, v)
+                
+        ;Step: Process the model statements.
+        process-model{_, e ,stmt} $ new ModelProcessor :
+        
+          ;Processing an assignment statement.
+          defmethod assign (this, v:Int, loc:Location, pref:Preference) :
+            match(loc) :
+              (reg:Reg|FReg) :
+                match(get?(assignment-table, reg)) :
+                  ;Case: Assign a concrete register. Register is occupied.
+                  (occupant:Int) :
+                    add-displaced-variable(assignment-table, occupant, reg)
+                    unassign(assignment-table, occupant)
+                    assign(assignment-table, v, reg)                    
+                  ;Case: Assign a concrete register. Register is free.
+                  (f:False) :
+                    assign(assignment-table, v, reg)
+              ;Case: Assign an abitrary register.
+              (loc:AnyReg|AnyFReg) :
+                ;Find a non-reserved register.
+                val reg = free-register(assignment-table, loc, false, true)
+                assign(assignment-table, v, reg)
+                
+          ;Processing a release statement.
+          defmethod release (this, v:Int) :
+            match(get?(assignment-table,v)) :
+              ;Case: This register is safe to be kept for use by this argument.
+              (r:Reg|FReg) :
+                unassign(assignment-table, v, r)
+                fatal("RECORD THIS REG FOR THE ARGUMENT.")                
+              ;Case: Argument was unassigned. The register it was originally
+              ;in was required by one of the outputs.
+              (f:False) :
+                ;Find a non-reserved-input register.
+                val reg = free-register(assignment-table, loc, true, false)
+                mark-reserved-input(assignment-table, reg)
+                fatal("RECORD THIS REG FOR THE ARGUMENT.")                
+                ;Now that it is assigned, remove it from list of displaced variables.
+                remove-displaced-variable(assignment-table, v)
+
+          ;Processing a clear registers statement.
+          defmethod clear-registers (this) :
+            ;[TODO] Unassign all the registers.
+            ;[TODO] Reserve only the output registers again. (Ignoring the temp).
+            fatal("Not sure about this.")
+
+        ;Step: Relocating the displaced variables.
+        within (v, old-reg) = displaced-variables(assignment-table) :
+          ;Find a non-reserved-input register.
+          val new-reg = free-register(assignment-table, old-reg, true, false)
+          assign(assignment-table, v, new-reg)
+          add-to-shuffle(assignment-table, v, old-reg, new-reg)
+            
+        ;Step: Performing the shuffle.
+        
+  
 ;<comment>
   ;----------------------------------------------------------
   ;-------------------- State Tables ------------------------
@@ -179,41 +274,6 @@ public defn assign-registers (e:BlockEngine,
   ;Holds which registers are currently assigned to the
   ;temp variables.
   val temp-table = Vector<Reg|FReg|False>()
-
-  ;----------------------------------------------------------
-  ;-------------------- State Manipulation ------------------
-  ;----------------------------------------------------------
-
-  ;Returns true if the given register is free to be assigned.
-  defn free-register? (r:Reg|FReg) -> True|False :
-    not contains?(values(register-table), r) and
-    not contains?(temp-table, r)
-
-  ;Returns a free register in the given category.
-  defn free-register (r:AnyReg|AnyFReg) -> Reg|FReg :
-    match(r) :
-      (r:AnyReg) : find!(free-register?, seq(Reg,0 to num-regs))
-      (r:AnyFReg) : find!(free-register?, seq(FReg,0 to num-fregs))
-
-  ;Assign the given register to the given port.
-  defn assign-register (v:Int, r:Reg|FReg) -> False :
-    ;Sanity checks
-    if not free-register?(r) : fatal("%_ is not free." % [r])
-    if key?(register-table,v) : fatal("V%_ is already assigned." % [v])
-    register-table[v] = r
-
-  ;Assign the given register to the given temporary.
-  defn assign-temp-register (index:Int, r:Reg|FReg) -> False :
-    ;Sanity checks
-    if not free-register?(r) : fatal("%_ is not free." % [r])
-    if temp-table[index] is-not False : fatal("Temp %_ is already assigned." % [index])
-    temp-table[index] = r
-
-  ;Print the current contents of the register table.
-  defn print-register-table () -> False :
-    val items = for e in register-table seq :
-      simple-field(to-string("V%_" % [key(e)]), value(e))
-    println("Currently assigned registers%_" % [colon-field-list(items)])
 
   ;----------------------------------------------------------
   ;-------------------- Main Algorithm ----------------------
@@ -550,3 +610,66 @@ defn num-temp (e:BlockEngine, op:AnnotatedOperationStmt) -> Int :
   length(temp(m))
 
 ;<comment>
+
+;============================================================
+;==================== Assignment Table ======================
+;============================================================
+
+public deftype AssignmentTable
+
+;Record that the given variable has been saved.
+;The shuffling engine needs to know which variables are saved so that
+;it doesn't emit extraneous Save statements.
+public defmulti set-saved (t:AssignmentTable, v:Int, s:True|False) -> False
+
+;Return whether the variable has been saved.
+public defmulti saved? (t:AssignmentTable, v:Int) -> True|False
+
+;Assign the given register to the given variable.
+;Condition: r must not be assigned already.
+public defmulti assign (t:AssignmentTable, v:Int, r:Reg|FReg) -> False
+
+;Unassign the variable, such that it doesn't hold any register.
+;Condition: v must have an assigned register.
+public defmulti unassign (t:AssignmentTable, v:Int) -> False
+
+;Retrieve the register that the variable is assigned to (if any).
+public defmulti get? (t:AssignmentTable, v:Int) -> Reg|FReg|False
+
+;Retrieve the variable that the given register is assigned to (if any).
+public defmulti get? (t:AssignmentTable, r:Reg|FReg) -> Int|False
+
+;Retrieve a free register of the following type.
+;Used for:
+;- Identifying swap registers.
+;Arguments:
+;- category: The type of register that is desired.
+;- allow-reserved?: If false, then registers that are marked as reserved
+;  are not considered.
+;- allow-reserved-input?: If false, then registers that are marked in the
+;  reserved-input set are not considered.
+public defmulti free-register (t:AssignmentTable,
+                               category:AnyReg|AnyFReg,
+                               allow-reserved?:True|False,
+                               allow-reserved-input?:True|False) -> Reg|FReg
+
+;Mark and clear the reserved register set.
+;Used in free-register calculation when selecting registers for output variables.
+public defmulti clear-reserved (t:AssignmentTable) -> False
+public defmulti mark-reserved (t:AssignmentTable, r:Reg|FReg) -> True|False
+
+;Mark and clear the reserved-input register set.
+;Used in free-register calculation when selecting registers for input variables.
+public defmulti clear-reserved-input (t:AssignmentTable) -> False
+public defmulti mark-reserved-input (t:AssignmentTable, r:Reg|FReg) -> False
+
+;Record the registers that were ultimately chosen for an operation statement.
+public defmulti record-arg-register (t:AssignmentTable, arg-index:Int, r:Reg|FReg) -> False
+public defmulti record-temp-register (t:AssignmentTable, temp-index:Int, r:Reg|FReg) -> False
+public defmulti record-result-register (t:AssignmentTable, result-index:Int, r:Reg|FReg) -> False
+
+public defn AssignmentTable (resources:ResourceProvider) :
+  fatal("Not yet implemented")
+;  ;Hold which registers each variable is assigned to.
+;  ;e.g. V0 => R0
+;  val 
