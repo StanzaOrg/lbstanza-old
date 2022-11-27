@@ -19,15 +19,19 @@ public defmulti set-saved (t:AssignmentTable, v:Int, s:True|False) -> False
 ;Return whether the variable has been saved.
 public defmulti saved? (t:AssignmentTable, v:Int) -> True|False
 
-;Hold the registers that the arguments were originally in.
-;Given this set, when we evict a variable, we can determine
-;whether it was an argument or not.
-;This function must be called before evict? is called.
-public defmulti set-argument-original-registers (t:AssignmentTable, rs:Seqable<Reg|FReg>) -> False
+;Properly clear the assignment table before analyzing an operation.
+public defmulti initialize-before-operation (t:AssignmentTable,
+                                             arg-registers:Seqable<Reg|FReg>,
+                                             num-args:Int,
+                                             num-temp:Int) -> False
 
 ;Assign the given register to the given variable.
 ;Condition: r must not be assigned already.
 public defmulti assign (t:AssignmentTable, v:Int, r:Reg|FReg) -> False
+
+;Assign the given register to the given temporary.
+;Condition: r must not be assigned already.
+public defmulti assign-temp (t:AssignmentTable, temp:Int, r:Reg|FReg) -> False
 
 ;Unassign the variable, such that it doesn't hold any register.
 ;Condition: v must have an assigned register.
@@ -36,8 +40,17 @@ public defmulti unassign (t:AssignmentTable, v:Int) -> False
 ;Retrieve the register that the variable is assigned to (if any).
 public defmulti get? (t:AssignmentTable, v:Int) -> Reg|FReg|False
 
-;Retrieve the variable that the given register is assigned to (if any).
-public defmulti get? (t:AssignmentTable, r:Reg|FReg) -> Int|False
+;Retrieve the variable (or temporary) that the given register is assigned to (if any).
+public defmulti get? (t:AssignmentTable, r:Reg|FReg) -> Int|Temp|False
+
+;Retrieve the register assigned to the i'th temporary.
+public defmulti temp (t:AssignmentTable, i:Int) -> Reg|FReg|False
+
+;Record the register that was chosen for a given argument.
+public defmulti assign-arg (t:AssignmentTable, arg-index:Int, r:Reg|FReg) -> False
+
+;Return the recorded register chosen for a given argument.
+public defmulti arg (t:AssignmentTable, arg-index:Int) -> Reg|FReg|False
 
 ;Retrieve a free register of the following type.
 ;Used for:
@@ -72,30 +85,19 @@ public defmulti evict? (t:AssignmentTable, r:Reg|FReg) -> False
 ;Return the details of the non-arg variables that were evicted.
 public defmulti evicted (t:AssignmentTable) -> Vector<VarWithReg>
 
-;Clear the evicted vector.
-public defmulti clear-evicted (t:AssignmentTable) -> False
-
 ;Represents a pairing of a variable with a register.
 public defstruct VarWithReg :
   variable:Int
   reg:Reg|FReg
 with: (printer => true)
 
-;Record the register that was chosen for a given argument.
-public defmulti record-arg-assignment (t:AssignmentTable, arg-index:Int, r:Reg|FReg) -> False
-
-;Return the recorded register chosen for a given argument.
-public defmulti recorded-arg-assignment (t:AssignmentTable, arg-index:Int) -> Reg|FReg|False
-
-;Record the register that was chosen for a given temporary.
-public defmulti record-temp-assignment (t:AssignmentTable, temp-index:Int, r:Reg|FReg) -> False
-
-;Return the recorded register that was chosen for a given temporary.
-public defmulti recorded-temp-assignment (t:AssignmentTable, temp-index:Int) -> Reg|FReg|False
-
-;Clear all the recorded assignments for the current operation.
-;Writes false to the arg assignments.
-public defmulti clear-recorded-assignments (t:AssignmentTable, num-args:Int, num-temps:Int) -> False
+;Represent the index'th temporary in an operation.
+public defstruct Temp <: Hashable&Equalable :
+  index:Int
+with:
+  printer => true
+  hashable => true
+  equalable => true
 
 ;============================================================
 ;==================== Implementation ========================
@@ -106,7 +108,15 @@ public defn AssignmentTable (resources:ResourceProvider) :
   val var-table = VarTable<Reg|FReg>(resources)
 
   ;Holds the mapping from registers to variables.
-  val reg-table = RegisterTable<Int>(resources)
+  val reg-table = RegisterTable<Int|Temp>(resources)
+
+  ;Holds the mapping from temporaries to registers.
+  var num-temps:Int = 0
+  val temp-table = TempArray<Reg|FReg|False>(resources)
+
+  ;Hold the recorded argument/temporary assignments.
+  var num-args:Int = 0
+  val arg-table = ArgArray<Reg|FReg|False>(resources)
 
   ;Hold all the saved variables.
   val var-saved = VarSet(resources)
@@ -127,10 +137,6 @@ public defn AssignmentTable (resources:ResourceProvider) :
 
   ;Holds the list of variables that were evicted.
   val evicted-vars = Vector<VarWithReg>()
-
-  ;Hold the recorded argument/temporary assignments.
-  val recorded-args = ArgArray<Reg|FReg|False>(resources)
-  val recorded-temps = TempArray<Reg|FReg|False>(resources)
 
   ;Sanity check: Ensure that tables are self-consistent.
   defn ensure-consistent! () :
@@ -156,6 +162,26 @@ public defn AssignmentTable (resources:ResourceProvider) :
 
   ;Implementation of methods.
   new AssignmentTable :
+    ;Initialization
+    defmethod initialize-before-operation (this,
+                                           arg-registers:Seqable<Reg|FReg>,
+                                           num-op-args:Int,
+                                           num-op-temps:Int) :
+      ;Clear the temporary table.
+      num-temps = num-op-temps
+      for i in 0 to num-temps do :
+        temp-table[i] = false
+      ;Clear the argument table.
+      num-args = num-op-args
+      for i in 0 to num-args do :
+        arg-table[i] = false
+      ;Clear the reserved sets.
+      clear(reserved)
+      clear(reserved-inputs)
+      ;Initialize the argument register set.
+      set-contents(argument-original-register-set, arg-registers)
+      ;Clear the list of evicted vars.
+      clear(evicted-vars)      
   
     ;Record that the given variable has been saved.
     defmethod set-saved (this, v:Int, s:True|False) :
@@ -167,10 +193,6 @@ public defn AssignmentTable (resources:ResourceProvider) :
     defmethod saved? (this, v:Int) :
       var-saved[v]
 
-    ;Set the registers that the arguments were originally in.
-    defmethod set-argument-original-registers (this, rs:Seqable<Reg|FReg>) -> False :
-      set-contents(argument-original-register-set, rs)
-
     ;Assign the given register to the given variable.
     defmethod assign (this, v:Int, r:Reg|FReg) :
       #if-not-defined(OPTIMIZE) :
@@ -180,6 +202,16 @@ public defn AssignmentTable (resources:ResourceProvider) :
       reg-table[r] = v
       remove(free-regs, r)
       ensure-consistent!()
+
+    ;Assign the given register to the given temp variable.
+    defmethod assign-temp (this, temp:Int, r:Reg|FReg) -> False :
+      #if-not-defined(OPTIMIZE) :
+        if temp-table[temp] is-not False : fatal("Temporary T%_ already assigned." % [temp])
+        if key?(reg-table, r) : fatal("Register %_ is occupied." % [r])
+      temp-table[temp] = r
+      reg-table[r] = Temp(temp)
+      remove(free-regs, r)
+      ensure-consistent!()      
 
     ;Unassign the variable, such that it doesn't hold any register.
     defmethod unassign (this, v:Int) -> False :
@@ -196,8 +228,12 @@ public defn AssignmentTable (resources:ResourceProvider) :
       get?(var-table, v)
 
     ;Retrieve the variable that occupies the given register.
-    defmethod get? (this, r:Reg|FReg) -> Int|False :
+    defmethod get? (this, r:Reg|FReg) -> Int|Temp|False :
       get?(reg-table, r)
+
+    ;Retrieve the register that the temporary is assigned to.
+    defmethod temp (this, i:Int) -> Reg|FReg|False :
+      temp-table[i]
 
     ;Clear the reserved set.
     defmethod clear-reserved (this) :
@@ -272,6 +308,8 @@ public defn AssignmentTable (resources:ResourceProvider) :
           if not argument-original-register-set[r] :
             add(evicted-vars, VarWithReg(v,r))
           unassign(this, v)
+        (t:Temp) :
+          fatal("Cannot evict a register containing a temporary.")
         (f:False) :
           false
 
@@ -279,34 +317,13 @@ public defn AssignmentTable (resources:ResourceProvider) :
     defmethod evicted (this) -> Vector<VarWithReg> :
       evicted-vars
 
-    ;Clear the evicted vector.
-    defmethod clear-evicted (this) -> False :
-      clear(evicted-vars)
-
     ;Record the assignment chosen for a given argument.
-    defmethod record-arg-assignment (this, arg-index:Int, r:Reg|FReg) -> False :
-      recorded-args[arg-index] = r
-
-    ;Record the assignment chosen for a temp variable.
-    defmethod record-temp-assignment (this, temp-index:Int, r:Reg|FReg) -> False :
-      recorded-temps[temp-index] = r
+    defmethod assign-arg (this, arg-index:Int, r:Reg|FReg) -> False :
+      arg-table[arg-index] = r
 
     ;Return the recorded register chosen for a given argument.
-    defmethod recorded-arg-assignment (this, arg-index:Int) -> Reg|FReg|False :
-      recorded-args[arg-index] 
-
-    ;Return the recorded register that was chosen for a given temporary.
-    defmethod recorded-temp-assignment (this, temp-index:Int) -> Reg|FReg|False :
-      recorded-temps[temp-index]
-
-    ;Clear the recorded assignments for the current operation.
-    defmethod clear-recorded-assignments (this,
-                                          num-args:Int,
-                                          num-temps:Int) -> False :
-      for i in 0 to num-args do :
-        recorded-args[i] = false
-      for i in 0 to num-temps do :
-        recorded-temps[i] = false
+    defmethod arg (this, arg-index:Int) -> Reg|FReg|False :
+      arg-table[arg-index] 
 
     defmethod print (o:OutputStream, this) :
       print(o, "var-saved: %_" % [var-saved])
