@@ -1,3 +1,10 @@
+defpackage stz/reg-alloc-model-check :
+  import core
+  import collections
+  import stz/reg-alloc-ir
+  import stz/reg-alloc-datastructures
+  import stz/reg-alloc-errors
+
 ;<doc>=======================================================
 ;===================== Model Properties =====================
 ;============================================================
@@ -20,3 +27,257 @@
 
 ;============================================================
 ;=======================================================<doc>
+
+;============================================================
+;========================== API =============================
+;============================================================
+
+;Type with ability to detect errors in models.
+public deftype ModelChecker
+
+;Detect errors in the given model and throw errors.
+public defmulti check-model (c:ModelChecker, m:OperationModel) -> False
+
+;============================================================
+;===================== Implementation =======================
+;============================================================
+
+defn ModelChecker (resources:ResourceProvider,
+                   num-regs:Int,
+                   num-fregs:Int) -> ModelChecker :
+
+  ;Basic helpers for an OperationModel.
+
+  ;Helper: Classify the given variable.
+  defn result? (m:OperationModel, id:Int) -> True|False :
+    id >= 0 and id < length(results(m))
+    
+  defn arg? (m:OperationModel, id:Int) -> True|False :
+    id >= length(results(m)) and
+    id < length(results(m)) + length(args(m))
+    
+  defn temp? (m:OperationModel, id:Int) -> True|False :
+    id >= length(results(m)) + length(args(m)) and
+    id < length(results(m)) + length(args(m)) + length(temp(m))
+
+  ;Retrieve the ModelVar with the given id.
+  defn model-var (m:OperationModel, id:Int) -> ModelVar :
+    if result?(m,id) :
+      results(m)[id]
+    else if arg?(m,id) :
+      val i = id - length(results(m))
+      args(m)[i]
+    else if temp?(m,id) :
+      val i = id - length(results(m)) + length(args(m))
+      temp(m)[i]
+    else :
+      fatal("Invalid id.")
+
+  ;Helper: Return true if the given location is wellformed.
+  defn wellformed? (l:Location) -> True|False :
+    match(l) :
+      (r:Reg) : index(r) >= 0 and index(r) < num-regs
+      (r:FReg) : index(r) >= 0 and index(r) < num-fregs
+      (l) : false
+
+  ;Check basic properties of OperationModel.
+  defn check-model-basic (m:OperationModel) -> False :
+
+    ;State: Track which variables has been assigned.
+    val assigned = IntSet()
+    
+    ;State: Track which variables has been released.
+    val released = IntSet()
+
+    ;State: Track whether ClearRegisters has been encountered.
+    var clear-register-index:Int|False = false
+
+    ;Precompute: The index of the last statement.
+    val last-stmt-index = length(stmts(m)) - 1
+
+
+    ;Helper: Return true if i is after the clear-registers statement.
+    defn after-clear-register? (i:Int) -> True|False :
+      match(clear-register-index) :
+        (index:Int) : i > index
+        (index:False) : false
+
+    ;Check the given variable for the proper invariants.
+    defn check-var (v:ModelVar, prefer-same-allowed?:True|False) :
+      within stop-on-first-error() :
+        ;CHECK: If specific register required, then preference must be NoPreference.
+        if location(v) is Register and
+           preference(v) is-not NoPreference :
+          error(BadPreferenceForRequiredRegister())
+        ;CHECK: Is PreferSame allowed?
+        if not prefer-same-allowed? and
+           preference(v) is PreferSame :
+          error(PreferSameNotAllowed())
+        match(preference(v)) :
+          (pref:PreferSame) :
+            ;CHECK: Does PreferSame refer to argument?
+            if not arg?(m,id(pref)) :
+              error(BadPreferSame())
+            val arg = model-var(m,id(pref))
+            ;CHECK: Does PreferSame refer to argument with required register?
+            if location(arg) is Register :
+              error(PreferSameOfRequiredRegister())
+            ;CHECK: Does PreferSame refer to argument with different type?
+            if location(arg) != location(v) :
+              error(PreferSameDifferentType())
+          (pref) : false
+        ;CHECK: Are registers used in locations and preferences wellformed?
+        if not wellformed?(location(v)) :
+          error(BadlyFormedLocation())
+        ;CHECK: Are registers used in preferences wellformed?
+        match(preference(v)) :
+          (pref:PreferRegister) :
+            if not wellformed?(reg(pref)) :
+              error(BadlyFormedLocation())
+          (pref) : false          
+
+    ;Check that the given vars occupy different registers.
+    defn check-different-regs (vs:Tuple<ModelVar>) :
+      val reg-set = HashSet<Register>()
+      for v in vs do :
+        val loc = location(v)
+        match(loc:Register) :
+          if not add(reg-set, loc) :
+            error(DuplicateRequiredReg())
+
+    ;Basic checking on all the model variables.
+    do(check-var{_, false}, args(m))
+    do(check-var{_, true}, temp(m))
+    do(check-var{_, true}, results(m))
+
+    ;Check for unique arguments.
+    check-different-regs(args(m))
+    check-different-regs(temp(m))
+    check-different-regs(results(m))
+
+    ;Sweep through statements and check.
+    for (stmt in stmts(m), i in 0 to false) do :
+      match(stmt) :
+        (stmt:Release) :
+          within stop-on-first-error() :
+            ;CHECK: Ensure that we are releasing an argument.
+            if not arg?(m,id(stmt)) :
+              error(ReleaseBadVar())
+            ;CHECK: Ensure we aren't releasing it twice.
+            if not add(released, id(stmt)) :
+              error(AlreadyReleased())
+            ;CHECK: Ensure it's not after clear registers.
+            if after-clear-register?(i) :
+              error(BadReleaseAfterClearRegisters())
+        (stmt:Assign) :
+          within stop-on-first-error() :
+            ;CHECK: Ensure that we are assigning to an argument.
+            if not (temp?(m,id(stmt)) or result?(m,id(stmt))) :
+              error(AssignToBadVar())
+            ;CHECK: Ensure we haven't assigned to it already.
+            if not add(assigned, id(stmt)) :
+              error(AlreadyAssigned())
+            ;CHECK: Ensure we haven't assigned to temp after clear registers.
+            if after-clear-register?(i) and temp?(m,id(stmt)) :
+              error(BadAssignAfterClearRegisters())
+        (stmt:Return) :
+          within stop-on-first-error() :
+            ;CHECK: Ensure that the Return statement is the last statement in the model.
+            if i != last-stmt-index :
+              error(ReturnNotLastStmt())
+            ;CHECK: Ensure there are no results if there's a Return statement in the model.
+            if not empty?(results(m)) :
+              error(ReturnWithResults())
+            ;CHECK: Ensure there is no ClearRegisters statement if Return statement is used.
+            if clear-register-index is-not False :
+              error(ReturnWithClearRegisters())          
+        (stmt:ClearRegisters) :
+          within stop-on-first-error() :
+            ;CHECK: Ensure there is only a single ClearRegisters statement.
+            if clear-register-index is-not False :
+              error(RedundantClearRegisters())
+            clear-register-index = i
+
+    ;CHECK: Check if all results and temps are assigned.
+    for v in cat(results(m), temp(m)) do :
+      if not assigned[id(v)] :
+        error(UnassignedVar())
+
+    ;CHECK: Check if all arguments are released.
+    for v in args(m) do :
+      if not released[id(v)] :
+        error(UnreleasedVar())
+
+  ;Check satisfiability of OperationModel.
+  defn check-model-satisfiability (m:OperationModel) -> False :
+    val assigned-regs = HashSet<Register>()
+    defn assign (l:Location) :
+      match(l:Register) :
+        if not add(assigned-regs, l) :
+          error(AlreadyAssignedReg())
+    defn release (l:Location) :
+      match(l:Register) :
+        remove(assigned-regs, l)
+    
+    do(assign{location(_)}, args(m))
+    for stmt in stmts(m) do :
+      match(stmt) :
+        (stmt:Release) :
+          val v = model-var(m,id(stmt))
+          release(location(v))
+        (stmt:Assign) :
+          val v = model-var(m,id(stmt))
+          assign(location(v))
+        (stmt:ClearRegisters) :
+          false
+        (stmt:Return) :
+          false
+
+  ;Throw an error if the OperationModel is invalid.
+  defn check-model! (m:OperationModel) :
+    within throw-if-errors(OperationModelError{id(m), _}) :
+      check-model-basic(m)
+    within throw-if-errors(OperationModelError{id(m), _}) :
+      check-model-satisfiability(m)
+
+  ;Create the model checker.
+  new ModelChecker :
+    defmethod check-model (this, m:OperationModel) :
+      check-model!(m)
+
+;============================================================
+;====================== Error Utility =======================
+;============================================================
+
+;Holds the current error handler.
+var CURRENT-ERROR-HANDLER:Exception -> False =
+  fn (e) :
+    fatal("No error handler set.")
+
+;Emit an error.
+defn error (e:Exception) -> False :
+  CURRENT-ERROR-HANDLER(e)
+
+;Stop a block on the first error.
+defn stop-on-first-error (body:() -> ?) -> False :
+  val current-handler = CURRENT-ERROR-HANDLER
+  label break :
+    defn handler (e:Exception) :
+      current-handler(e)
+      break()
+    let-var CURRENT-ERROR-HANDLER = handler :
+      body()
+    false
+
+;Evaluate the given body and detect whether there are
+;any errors. If there are, then wrap it up and throw
+;the errors.
+defn throw-if-errors (body:() -> ?,
+                      Error:Tuple<Exception> -> Exception) -> False :
+  val buffer = Vector<Exception>()
+  defn push-error-to-buffer (e:Exception) :
+    add(buffer, e)
+  let-var CURRENT-ERROR-HANDLER = push-error-to-buffer :
+    body()
+  if not empty?(buffer) :
+    throw(Error(to-tuple(buffer)))
