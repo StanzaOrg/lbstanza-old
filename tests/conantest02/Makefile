@@ -1,6 +1,6 @@
 
 # Stanza version to download in the form 0_12_34 matching what's in the zip filename
-STANZA_VERSION := 0_17_40
+STANZA_VERSION := 0_17_44
 
 # detect platform
 SYS := $(shell gcc -dumpmachine)
@@ -36,6 +36,10 @@ VERBOSE := -verbose
 all: asmjit-app
 
 
+# create build dir
+$(BUILD_DIR):
+	mkdir build
+
 # download and unzip stanza
 $(STANZA_DIR):
 	@echo "Downloading $(STANZA_ZIP)"
@@ -52,8 +56,8 @@ $(STANZA_DIR):
 
 
 # link final executable
-$(BUILD_DIR)/asmjit-app: stanza.proj ###_when_using_release_stanza >>> ### | .stanza
-	###_when_using_release_stanza >>> ### export STANZA_CONFIG="$$PWD"
+$(BUILD_DIR)/asmjit-app: stanza.proj | .stanza $(STANZA_DIR) $(BUILD_DIR)
+	export STANZA_CONFIG="$$PWD"
 	$(STANZA) compile asmjit-app -o $(BUILD_DIR)/asmjit-app $(VERBOSE)
 
 # convenience target
