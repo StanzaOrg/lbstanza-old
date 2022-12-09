@@ -3,13 +3,11 @@ defpackage stz/reg-alloc-assignment :
   import collections
   import stz/reg-alloc-ir
   import stz/reg-alloc-ports
-  import stz/reg-alloc-engine
-  import stz/reg-alloc-block-engine
+  import stz/reg-alloc-block-stmt-processor
+  import stz/reg-alloc-model-env
   import stz/reg-alloc-shuffle
   import stz/reg-alloc-datastructures
   import stz/reg-alloc-assignment-table
-  import stz/reg-alloc-model-properties
-  import stz/printing-utils
 
 ;<doc>=======================================================
 ;======================= Algorithm ==========================
@@ -170,8 +168,12 @@ The inputs to the shuffle are:
 ;============================================================
 ;=======================================================<doc>
 
-public defn assign-registers (e:BlockEngine,
-                              assignment-table:AssignmentTable) :
+public defn assign-registers (proc:BlockStmtProcessor,
+                              models:ModelEnv,
+                              resources:ResourceProvider) :
+
+  val shuffle-engine = ShuffleEngine(resources)
+  val assignment-table = AssignmentTable(resources)
 
   ;## Step: Process the input ports ##
   ;- Try to assign the ports with free preferred registers first.
@@ -180,7 +182,7 @@ public defn assign-registers (e:BlockEngine,
 
   ;Assign the ports with preferred registers.
   val unassigned-ports = Vector<Port>()
-  for p in inputs(e) do :
+  for p in inputs(proc) do :
     if loaded?(p) :
       val reg = reg-pref(p)
       val assign? =
@@ -198,17 +200,16 @@ public defn assign-registers (e:BlockEngine,
     assign(assignment-table, id(p), r)
 
   ;Mark the saved ports.
-  for p in inputs(e) do :
+  for p in inputs(proc) do :
     set-saved(assignment-table, id(p), true) when saved?(p)      
 
   ;Record the final registers that were assigned to the ports.
-  val new-ports = to-tuple $ for p in inputs(e) seq :
+  for p in proc update-inputs :
     if loaded?(p) : sub-location(p, assignment-table[id(p)])
     else : p    
-  set-contents(inputs(e), new-ports)
     
   ;## Step: Process the instructions ##
-  within (i, stmt, emit) = process-instructions(e) :
+  within (i, stmt) = stmts(proc) :
     println("\n\nPROCESS: %_" % [stmt])
     
     match(stmt) :
@@ -217,7 +218,7 @@ public defn assign-registers (e:BlockEngine,
       (stmt:Save) :
         set-saved(assignment-table, id(stmt), true)
         val reg = assignment-table[id(stmt)]
-        emit(Save(id(stmt), reg))
+        emit(proc, Save(id(stmt), reg))
 
       ;Processing a Unload statement.
       (stmt:Unload) :
@@ -228,13 +229,13 @@ public defn assign-registers (e:BlockEngine,
         val type = reg(stmt) as RegisterType
         val reg = free-register(assignment-table, type, true, true, false)
         assign(assignment-table, id(stmt), reg)
-        emit(Load(id(stmt), reg))
+        emit(proc, Load(id(stmt), reg))
 
       ;Processing an operation statement.
       (stmt:AnnotatedOperationStmt) :
         ;Initialize the assignment table.
         initialize-before-operation(assignment-table, args(stmt), num-temps) where :
-          val num-temps = num-temps(e,stmt)
+          val num-temps = num-temps(models,op-id(stmt))
         
         ;Step: Preemptively identify swap registers
         val swap-reg = free-register(assignment-table, AnyReg(), true, true, false) as Reg|False
@@ -242,16 +243,16 @@ public defn assign-registers (e:BlockEngine,
         println("\n\nswap-reg = %_, swap-freg = %_" % [swap-reg, swap-freg])
 
         ;Step: Reserve input/output registers.
-        for r in temp-registers(e,stmt) do :
+        for r in temp-registers(models,op-id(stmt)) do :
           mark-reserved(assignment-table, r)
-        if not clears-registers?(e,stmt) :
-          for r in result-registers(e,stmt) do :
+        if not clears-registers?(models,op-id(stmt)) :
+          for r in result-registers(models,op-id(stmt)) do :
             mark-reserved(assignment-table, r)
-        for r in arg-registers(e,stmt) do :
+        for r in arg-registers(models,op-id(stmt)) do :
           mark-reserved-input(assignment-table, r)
 
         ;Step: Processing the input arguments.
-        for (v in args(stmt), reg in arg-locations(e,stmt), arg-index in 0 to false) do :
+        for (v in args(stmt), reg in arg-locations(models,op-id(stmt)), arg-index in 0 to false) do :
           match(reg:Register) :
             val current-reg = assignment-table[v]
             if current-reg != reg :
@@ -281,7 +282,7 @@ public defn assign-registers (e:BlockEngine,
         defn save-arg-and-temp-registers () :
           arg-regs = to-tuple $ for i in 0 to length(args(stmt)) seq :
             arg(assignment-table,i) as Register
-          temp-regs = to-tuple $ for i in 0 to num-temps(e,stmt) seq :
+          temp-regs = to-tuple $ for i in 0 to num-temps(models,op-id(stmt)) seq :
             temp(assignment-table,i) as Register
             
         ;Helper: Retrieve the final chosen result registers.
@@ -294,7 +295,7 @@ public defn assign-registers (e:BlockEngine,
         ;Will be called either during clear-registers, or right after
         ;processing the model (if the operation does not clear-registers.)
         defn assign-remaining-args () -> False :
-          for (v in args(stmt), loc in arg-locations(e,stmt), i in 0 to false) do :
+          for (v in args(stmt), loc in arg-locations(models,op-id(stmt)), i in 0 to false) do :
             if arg(assignment-table,i) is False :
               match(get?(assignment-table, v)) :
                 (reg:Register) :
@@ -341,19 +342,19 @@ public defn assign-registers (e:BlockEngine,
               add(saved, saved?(assignment-table,v))
               add(inputs, reg)
               add(outputs, new-reg)
-            load-problem(shuffle-engine(e),
+            load-problem(shuffle-engine,
                          to-tuple(vars),
                          to-tuple(inputs),
                          to-tuple(saved),
                          to-tuple(outputs))
-            shuffle(shuffle-engine(e),
+            shuffle(shuffle-engine,
                     to-tuple(outputs),
                     swap-reg,
                     swap-freg,
-                    emit)
+                    emit{proc, _})
                 
         ;Step: Process the model statements.
-        process-model{_, e ,stmt} $ new ModelProcessor :
+        process-model{_, models, stmt} $ new ModelProcessor :
         
           ;Processing an assignment statement to a variable.
           defmethod assign-result (this, v:Int, loc:Location, pref:Preference) :
@@ -393,34 +394,34 @@ public defn assign-registers (e:BlockEngine,
             clear-registers(assignment-table)
             ;Now reserve the output registers so that when we assign the result,
             ;they get the right registers.
-            for r in result-registers(e,stmt) do :
+            for r in result-registers(models,op-id(stmt)) do :
               mark-reserved(assignment-table, r)
 
         ;If the operation does not clear registers, then process everything
         ;required to get arguments into position.
-        if not clears-registers?(e,stmt) :
+        if not clears-registers?(models,op-id(stmt)) :
           assign-remaining-args()
           shuffle-args-into-position()
           save-arg-and-temp-registers()
 
         ;Emit the now assigned operation.
-        emit $ AssignedOperationStmt(/stmt(stmt),
-                                     arg-regs,
-                                     temp-regs,
-                                     result-regs())
+        emit(proc,
+             AssignedOperationStmt(/stmt(stmt),
+                                   arg-regs,
+                                   temp-regs,
+                                   result-regs()))
 
         ;Step: Release the temp variables unless clear-registers has already done it.
-        if not clears-registers?(e,stmt) :
+        if not clears-registers?(models,op-id(stmt)) :
           release-all-temp(assignment-table)
 
       ;Processing some other statement.
       (stmt) :
-        emit(stmt)
+        emit(proc,stmt)
 
   ;Record the final registers that were assigned to the output ports.
-  val new-output-ports = to-tuple $ for p in outputs(e) seq :
+  for p in proc update-outputs :
     sub-location(p, get?(assignment-table, id(p)))
-  set-contents(outputs(e), new-output-ports)
 
 ;------------------------------------------------------------
 ;--------------------- Process a Model ----------------------
@@ -443,11 +444,11 @@ defmulti clear-registers (proc:ModelProcessor) -> False
 
 ;Process the given operation statement using the model processor.
 defn process-model (proc:ModelProcessor,
-                    e:BlockEngine,
+                    models:ModelEnv,
                     anno-stmt:AnnotatedOperationStmt) -> False :
   ;Retrieve the model.
   val op-stmt = stmt(anno-stmt)
-  val model = models(e)[op-id(op-stmt)]
+  val model = model(models, op-id(op-stmt))
 
   ;Retrieve the index ranges of the different variables.
   val first-temp = length(results(model)) + length(args(model))
@@ -532,54 +533,3 @@ defn process-model (proc:ModelProcessor,
 ;because a specific register has not been assigned yet.
 defn location-type (p:Port) -> RegisterType :
   location(p) as RegisterType
-
-;Helper: Set the contents of the given vector.
-defn set-contents<?T> (vs:Vector<?T>, xs:Seqable<T>) :
-  clear(vs)
-  add-all(vs,xs)
-
-;Return the argument variables to the operation.
-defn args (op:AnnotatedOperationStmt) -> Tuple<Int> :
-  args(stmt(op))
-
-;Return the result variables to the operation.
-defn results (op:AnnotatedOperationStmt) -> Tuple<Int> :
-  results(stmt(op))
-
-;Helper: Return the number of temporary variables this
-;operation has.
-defn num-temps (e:BlockEngine, op:AnnotatedOperationStmt) -> Int :
-  val m = models(e)[op-id(stmt(op))]
-  length(temp(m))
-
-;Helper: Return the tuple of locations required by the temporaries of an operation.
-defn temp-locations (e:BlockEngine, op:AnnotatedOperationStmt) -> Tuple<Location> :
-  val m = models(e)[op-id(stmt(op))]
-  map(location, temp(m))
-
-;Helper: Return the tuple of locations required by the arguments of an operation.
-defn arg-locations (e:BlockEngine, op:AnnotatedOperationStmt) -> Tuple<Location> :
-  val m = models(e)[op-id(stmt(op))]
-  map(location, args(m))
-
-;Helper: Return the tuple of locations required by the results of an operation.
-defn result-locations (e:BlockEngine, op:AnnotatedOperationStmt) -> Tuple<Location> :
-  val m = models(e)[op-id(stmt(op))]
-  map(location, results(m))
-
-;Helper: Returns the sequence of required registers by the temporaries of an operation.
-defn temp-registers (e:BlockEngine, op:AnnotatedOperationStmt) -> Seqable<Register> :
-  filter-by<Register>(temp-locations(e,op))
-
-;Helper: Return the sequence of required registers by the arguments of an operation.
-defn arg-registers (e:BlockEngine, op:AnnotatedOperationStmt) -> Seqable<Register> :
-  filter-by<Register>(arg-locations(e,op))
-
-;Helper: Return the sequence of required registers by the results of an operation.
-defn result-registers (e:BlockEngine, op:AnnotatedOperationStmt) -> Seqable<Register> :
-  filter-by<Register>(result-locations(e,op))
-
-;Returns true if the given operation statement clears the registers.
-defn clears-registers? (e:BlockEngine, op:AnnotatedOperationStmt) -> True|False :
-  val mprops = model-properties(e)[op-id(stmt(op))]
-  clears-registers?(mprops)
