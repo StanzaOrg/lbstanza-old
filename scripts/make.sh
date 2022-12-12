@@ -55,7 +55,7 @@ esac
 echo "Building Stanza for $DPLATFORM"
 
 #Pkg packages
-PKGFILES="math core/meta-utils arg-parser line-wrap stz/test-driver stz/mocker stz/arg-parser stz/macro-plugin"
+PKGFILES="math core/meta-utils arg-parser line-wrap stz/test-driver stz/mocker stz/arg-parser stz/macro-plugin stz/timing-log-reader"
 PKGDIR="${PLATFORM_PREFIX}pkgs"
 STANZA_S="${PLATFORM_PREFIX}stanza.s"
 
