@@ -1,0 +1,184 @@
+defpackage stz/reg-alloc-stitcher :
+  import core
+  import collections
+  import stz/reg-alloc-ir
+  import stz/reg-alloc-ports
+  import stz/reg-alloc-block
+  import stz/reg-alloc-datastructures
+  import stz/reg-alloc-shuffle
+
+;============================================================
+;====================== API =================================
+;============================================================
+
+;Represents the stitching instructions for a set of blocks.
+public deftype StitchResults
+
+;Retrieve the preamble instructions for the given block.
+public defmulti preamble (emit:ProgramStmt -> ?, r:StitchResults, block:Int) -> False
+
+;Retrieve the postamble instructions for the given blcok.
+public defmulti postamble (emit:ProgramStmt -> ?, r:StitchResults, block:Int) -> False
+
+;============================================================
+;=============== Creating the Stitcher ======================
+;============================================================
+
+;Holds the stitching tables.
+public defstruct Stitcher :
+  shuffler:ShuffleEngine
+  port-table:VarTable<Port>
+  save-list:Vector<Save>
+  load-list:Vector<Load>
+  shuffle-vars:Vector<Int>
+  shuffle-saved:Vector<True|False>
+  shuffle-inputs:Vector<Register>
+  shuffle-outputs:Vector<Register>
+  shuffle-regset:RegisterSet
+with:
+  constructor => #Stitcher
+
+;Create a new stitcher.
+public defn Stitcher (shuffler:ShuffleEngine,
+                      resources:ResourceProvider) -> Stitcher :
+  #Stitcher(
+    shuffler,
+    VarTable<Port>(resources),  ;port-table
+    Vector<Save>()              ;save-list
+    Vector<Load>()              ;load-list
+    Vector<Int>()               ;shuffle-vars
+    Vector<True|False>()        ;shuffle-saved
+    Vector<Register>()          ;shuffle-inputs
+    Vector<Register>()          ;shuffle-outputs
+    RegisterSet(resources))     ;shuffle-regset
+
+;Reset all lists and tables in the stitcher.
+defn reset (s:Stitcher) -> False :
+  clear(port-table(s))
+  clear(save-list(s))
+  clear(load-list(s))
+  clear(shuffle-vars(s))
+  clear(shuffle-saved(s))
+  clear(shuffle-inputs(s))
+  clear(shuffle-outputs(s))
+  fill(shuffle-regset(s))
+
+;============================================================
+;================== Main Implementation =====================
+;============================================================
+
+;Main algorithm implementation.
+public defn stitch-blocks (stitcher:Stitcher, blocks:Vector<Block>) -> StitchResults :
+  ;Compute whether the block has a preamble.
+  ;Either simple chain, or predecessor ends with a fork.
+  defn preamble? (b:Int) -> True|False :
+    val block = blocks[b]
+    length(preds(block)) == 1
+    
+  ;Compute whether the block has a postamble.
+  ;Successor begins with a join.
+  defn postamble? (b:Int) -> True|False :
+    val block = blocks[b]
+    if length(succs(block)) == 1 :
+      val succ = succs(block)[0]
+      length(preds(blocks[succ])) > 1
+
+  ;Emit instructions for stitching the input ports
+  ;to the output ports.
+  defn stitch (emit:ProgramStmt -> ?,
+               inputs:Vector<Port>,
+               outputs:Vector<Port>) -> False :
+    ;Emit
+    defn print-list (name:String, xs:Seqable) :
+      println("%_:\n%_" % [name, Indented("%n" % [xs])])
+    println("Stitch:")
+    print-list("Inputs", inputs)
+    print-list("Outputs", outputs)
+
+    ;Reset the stitcher tables.
+    reset(stitcher)
+
+    ;Initialize the port table.
+    val port-table = port-table(stitcher)
+    for p in outputs do :
+      port-table[id(p)] = p
+
+    ;Collect saves, loads, and shuffles
+    val save-list = save-list(stitcher)
+    val load-list = load-list(stitcher)
+    var shuffle-needed?:True|False = false
+    for input in inputs do :
+      val v = id(input)
+      if key?(port-table, v) :
+        val output = port-table[v]
+        val in-status = status!(input)
+        val out-status = status!(output)
+       
+        ;Saves
+        match(saved?(in-status), saved?(out-status)) :
+          (s-in:False, s-out:True) :
+            add(save-list, Save(v, loaded(in-status) as Register))
+          (s-in, s-out) :
+            false
+    
+        ;Loads and Shuffles
+        match(loaded(in-status), loaded(out-status)) :
+          (l-in:False, l-out:Register) :
+            add(load-list, Load(v, l-out))
+          (l-in:Register, l-out:Register) :
+            if l-in != l-out : shuffle-needed? = true
+            add(shuffle-vars(stitcher), v)
+            add(shuffle-saved(stitcher), saved?(input))
+            add(shuffle-inputs(stitcher), l-in)
+            add(shuffle-outputs(stitcher), l-out)
+            remove(shuffle-regset(stitcher), l-in)
+            remove(shuffle-regset(stitcher), l-out)            
+          (l-in, l-out) :
+            false
+
+    ;Print results
+    print-list("Saves", save-list)
+    print-list("Loads", load-list)
+    print-list("Shuffle-vars", shuffle-vars(stitcher))
+    print-list("Shuffle-saved", shuffle-saved(stitcher))
+    print-list("Shuffle-inputs", shuffle-inputs(stitcher))
+    print-list("Shuffle-outputs", shuffle-outputs(stitcher))
+    println("Shuffle needed?: %_" % [shuffle-needed?])
+
+    ;Emit instructions
+    defn emit* (s:ProgramStmt) :
+      println("  Emit: %_" % [s])
+      emit(s)
+    do(emit*, save-list)
+    if shuffle-needed? :
+      ;Compute a free swap register.
+      val swap-reg = next-reg?(shuffle-regset(stitcher))
+      val swap-freg = next-freg?(shuffle-regset(stitcher))
+      ;Call the shuffling engine.
+      load-problem(shuffler(stitcher),
+                   to-tuple(shuffle-vars(stitcher)),
+                   to-tuple(shuffle-inputs(stitcher)),
+                   to-tuple(shuffle-saved(stitcher)),
+                   to-tuple(shuffle-outputs(stitcher)))
+      shuffle(shuffler(stitcher),
+              to-tuple(shuffle-outputs(stitcher)),
+              swap-reg,
+              swap-freg,
+              emit*)
+    do(emit*, load-list)
+
+  ;Return the stitched results.
+  new StitchResults :
+    defmethod preamble (emit:ProgramStmt -> ?, this, block:Int) :
+      if preamble?(block) :
+        val pred = preds(blocks[block])[0]
+        val pred-outputs = outputs(blocks[pred])
+        val block-inputs = inputs(blocks[block])
+        stitch(emit, pred-outputs, block-inputs)
+        
+    defmethod postamble (emit:ProgramStmt -> ?, this, block:Int) :
+      if postamble?(block) :
+        val succ = succs(blocks[block])[0]
+        val block-outputs = outputs(blocks[block])
+        val succ-inputs = inputs(blocks[succ])
+        stitch(emit, block-outputs, succ-inputs)
