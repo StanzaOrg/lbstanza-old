@@ -1,0 +1,210 @@
+defpackage stz/reg-alloc-verify :
+  import core
+  import collections
+  import stz/reg-alloc-ir
+  import stz/reg-alloc-model-processing
+  import stz/reg-alloc-model-env
+
+;Verify that the computed assignment for a program is correct.
+public defn verify (prog:Program,
+                    models:ModelEnv) -> False :
+
+  ;Holds the state of the verifier.
+  val state = VerifierState()
+
+  ;Gather label invariants.
+  defn gather-var-statuses () :
+    val label-var-statuses = label-var-statuses(state)
+    for i in 0 to length(stmts(prog)) do :
+      val stmt = stmts(prog)[i]
+      match(stmt:LabelStmt) :
+        ;Check that it's not the last statement in the program.
+        if i == length(stmts(prog)) - 1 :
+          fatal("Label statement cannot appear as last statement in program.")
+        ;Check that the next statement is a VarStatuses.
+        val next-stmt = stmts(prog)[i + 1]
+        if next-stmt is-not VarStatuses :
+          fatal("Statement following label is not VarStatuses.")
+        ;Save var statuses.
+        label-var-statuses[index(stmt)] = next-stmt as VarStatuses
+
+  ;Retrieve the slot that the given variable is in.
+  defn varslot (v:Int) -> Int :
+    val slot = varslots(stackmap!(prog))[v]
+    if slot is False :
+      fatal("Variable V%_ has no assigned slot." % [v])
+    slot as Int
+
+  ;Ensure that the state is consistent with the expected var statuses.
+  defn ensure-consistent-against (status:VarStatuses) -> False :
+    for s in statuses(status) do :
+      ;If variable is saved, then ensure that the slot contains
+      ;this variable.
+      if saved?(s) :
+        ensure-slot-occupant!(state, varslot(id(s)), id(s))
+      ;If variable is loaded, then ensure that the register contains
+      ;this variable.
+      match(loaded(s)) :
+        (reg:Register) : ensure-occupant!(state, reg, id(s))
+        (f:False) : false
+        (l:Location) : fatal("Unexpected unassigned variable.")
+
+  ;Loop through each instruction
+  defn check-stmts () -> False :
+    for stmt in stmts(prog) do :
+      match(stmt) :
+        (stmt:LabelStmt) :
+          false
+
+        (stmt:BranchStmt) :
+          ;Retrieve the expected var statuses at the given target locations,
+          ;and ensure that the state is consistent against those.
+          for target in targets(stmt) do :
+            val statuses = label-var-statuses(state)[target]
+            ensure-consistent-against(statuses)
+
+        (stmt:GotoStmt) :
+          ;Retrieve the expected var statuses at the given target location,
+          ;and ensure that the state is consistent against that.
+          val statuses = label-var-statuses(state)[target(stmt)]
+          ensure-consistent-against(statuses)
+
+        (stmt:AssignedSetStmt) :
+          ;Check that the arg-reg register holds the argument variable.
+          ;Record that the result-reg register now holds the result variable.
+          ensure-occupant!(state, arg-reg(stmt), arg(stmt))
+          set-occupant(state, result-reg(stmt), result(stmt))
+          
+        (stmt:AssignedOperationStmt) :
+          ;Retrieve the model.
+          val model = model(models, op-id(stmt))
+
+          ;Check that the assigned registers satisfy the registers required
+          ;by the model.
+          defn ensure-good-assignment! (name:String, reg:Register, modelvar:ModelVar) :
+            val good-location? = match(location(modelvar), reg) :
+              (l:AnyReg, reg:Reg) : true
+              (l:AnyFReg, reg:FReg) : true
+              (l:Reg, reg:Reg) : l == reg
+              (l:FReg, reg:FReg) : l == reg
+              (l, reg) : false
+            if not good-location? :
+              fatal("Model op%_ expects %_ in %_ but was assigned %_." % [
+                id(model), name, location(modelvar), reg])
+
+          ;Check arguments, temps, and results.
+          for (arg-reg in arg-regs(stmt), arg in args(model), i in 0 to false) do :
+            ensure-good-assignment!(to-string("argument %_" % [i]), arg-reg, arg)
+          for (temp-reg in temp-regs(stmt), temp in temp(model), i in 0 to false) do :
+            ensure-good-assignment!(to-string("temp %_" % [i]), temp-reg, temp)
+          for (result-reg in result-regs(stmt), result in results(model), i in 0 to false) do :
+            ensure-good-assignment!(to-string("result %_" % [i]), result-reg, result)
+
+          ;Process the model and ensure things are handled appropriately.
+          process-model(processor, models, stmt, false) where :
+            val processor = new ModelProcessor :
+            
+              defmethod release-arg (this, arg:Int, v:Int, reg:Register) :
+                ;Retrieve the register for arg 'arg', and the current occupant of that register.
+                ;Check that the current occupant is 'v'.
+                ensure-occupant!(state, reg, v)
+
+              defmethod assign-temp (this, temp:Int, reg:Register, pref:Preference) :
+                ;Retrieve the register for temp 'temp'.
+                ;Remove the current occupant of that register (if any).
+                remove-occupant(state, reg)
+                
+              defmethod assign-result (this, result:Int, v:Int, reg:Register, pref:Preference) :
+                ;Retrieve the register for result 'result'.
+                ;Record that the given register now holds the variable 'v'.
+                set-occupant(state, reg, v)
+                
+              defmethod clear-registers (this) :
+                ;Clear the occupants of all registers.
+                clear(register-occupants(state))
+          
+        (stmt:Save) :
+          ;Check that the given register holds the correct variable.
+          ;Indicate that the slot now holds this variable.
+          if reg(stmt) is-not Register :
+            fatal("Unexpected unassigned Save statement.")
+          ensure-occupant!(state, reg(stmt) as Register, id(stmt))
+          set-slot(state, varslot(id(stmt)), id(stmt))
+
+        (stmt:Load) :
+          ;Retrieve the slot meant for holding this variable.
+          ;Check that the slot actually holds this variable.
+          ;Record that the given register now holds this variable.
+          if reg(stmt) is-not Register :
+            fatal("Unexpected unassigned Load statement.")
+          ensure-slot-occupant!(state, varslot(id(stmt)), id(stmt))
+          set-occupant(state, reg(stmt) as Register, id(stmt))
+          
+        (stmt:Relocate) :
+          ;Check that the src register holds the given variable.
+          ;Record that the dst register now also holds the given variable.
+          ensure-occupant!(state, src(stmt), id(stmt))
+          set-occupant(state, dst(stmt), id(stmt))
+
+        (stmt:VarStatuses) :
+          ;Clear and fill the state with the new statuses.
+          clear(register-occupants(state))
+          clear(slot-occupants(state))
+          for s in statuses(stmt) do :
+            ;If the variable is saved, then record that the slot contains
+            ;this variable.
+            if saved?(s) :
+              set-slot(state, varslot(id(s)), id(s))
+            ;If the variable is loaded, then record that the register contains
+            ;this variable.
+            match(loaded(s)) :
+              (reg:Register) : set-occupant(state, reg, id(s))
+              (f:False) : false
+              (l:Location) : fatal("Unexpected unassigned variable.")
+          
+        (stmt) :
+          ;Indicate that this type of statement was unexpected.
+          fatal("Unexpected %_ statement in allocated program." % [
+                object-type(stmt)])
+
+  ;Launch!
+  gather-var-statuses()
+  check-stmts()
+
+;============================================================
+;====================== Verifier State ======================
+;============================================================
+
+;Holds the state of the verifier.
+defstruct VerifierState :
+  register-occupants:HashTable<Register,Int> with:
+    init => HashTable<Register,Int>()
+  slot-occupants:IntTable<Int> with:
+    init => IntTable<Int>()
+  label-var-statuses:IntTable<VarStatuses> with:
+    init => IntTable<VarStatuses>()
+
+;Ensure that the given slot contains the given variable.
+defn ensure-slot-occupant! (s:VerifierState, slot:Int, v:Int) -> False :
+  val occupant = get?(slot-occupants(s), slot)
+  if occupant != v :
+    fatal("Slot %_ does not contain variable V%_." % [slot, v])
+
+;Ensure that the given register contains the given variable.
+defn ensure-occupant! (s:VerifierState, reg:Register, v:Int) -> False :
+  val occupant = get?(register-occupants(s), reg)
+  if occupant != v :
+    fatal("Register %_ does not contain variable V%_." % [reg, v])
+
+;Set the occupant of the register to the given variable.
+defn set-occupant (s:VerifierState, reg:Register, v:Int) -> False :
+  register-occupants(s)[reg] = v
+
+;Set the occupant of the given slot to the given variable.
+defn set-slot (s:VerifierState, slot:Int, v:Int) -> False :
+  slot-occupants(s)[slot] = v
+
+;Removes the current occupant (if any) in the given register.
+defn remove-occupant (s:VerifierState, reg:Register) -> False :
+  remove(register-occupants(s), reg)
+  false
