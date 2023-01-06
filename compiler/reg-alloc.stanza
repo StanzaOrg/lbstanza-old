@@ -207,7 +207,12 @@ defpackage stz/reg-alloc :
 ;===================== Driver ===============================
 ;============================================================
 
-public defn allocate-registers (ins:VMFunction, emitter:CodeEmitter, backend:Backend, stubs:AsmStubs, print?:True|False) -> False :
+public defn allocate-registers (context-id:Int,
+                                ins:VMFunction,
+                                emitter:CodeEmitter,
+                                backend:Backend,
+                                stubs:AsmStubs,
+                                print?:True|False) -> False :
   take-ids(ins)
 
   if print? :
@@ -261,7 +266,7 @@ public defn allocate-registers (ins:VMFunction, emitter:CodeEmitter, backend:Bac
     println("==== Collapse Blocks ====")
     print-prog()
 
-  assemble(emitter, smap, stubs, print?)
+  assemble(emitter, context-id, smap, stubs, print?)
   clear-working-set()
 
 ;============================================================
@@ -434,8 +439,12 @@ public defstruct CContext <: FnContext :
 
 public deftype CallType
 
-public defstruct StanzaCall <: CallType :
+defstruct CallInfo :
   trace-entry: StackTraceInfo|False
+  named-vars: Tuple<Var>
+
+public defstruct StanzaCall <: CallType :
+  info: CallInfo|False
   func-reg: False|Loc
   arg-regs: List<Loc>
   ret-regs: List<Loc>
@@ -452,14 +461,14 @@ public defstruct CCall <: CallType :
 
 public defstruct YieldCall <: CallType :
   enter?: True|False
-  trace-entry: StackTraceInfo|False
+  info: CallInfo|False
   func-reg: Loc
   arg-regs: List<Loc>
   ret-regs: List<Loc>
   scratch-regs: List<Loc>
 
 public defstruct CollectGarbage <: CallType :
-  trace-entry: StackTraceInfo|False
+  info: CallInfo|False
   arg-regs: List<Loc>
   ret-regs: List<Loc>
 
@@ -547,9 +556,18 @@ public defstruct FlipOp <: VMOp : (op:VMOp)
 defmethod print (o:OutputStream, x:FlipOp) :
   print(o, "flip(%_)" % [op(x)])
 
-public defstruct SafepointOp <: VMOp : (id:Int, trace-entry:StackTraceInfo)
+public defstruct SafepointOp <: VMOp :
+  id:Int
+  trace-entry:StackTraceInfo
+  named-vars: Tuple<Var> with: (updater => sub-named-vars)
 defmethod print (o:OutputStream, op:SafepointOp) :
-  print(o, "safepoint(%_)" % [id(op)])
+  print(o, "safepoint(%_, %_)" % [id(op), named-vars(op)])
+
+defn attach-named-vars (e:Ins, vars:Tuple<Var>) -> Op :
+  val op-e = e as Op
+  val op = op(op-e) as SafepointOp
+  val new-op = sub-named-vars(op, vars)
+  sub-op(op-e, new-op)
 
 ;============================================================
 ;===================== Working Set ==========================
@@ -557,6 +575,7 @@ defmethod print (o:OutputStream, op:SafepointOp) :
 
 val BLOCKS = Vector<Block>()
 val VAR-TYPES = Vector<VMType>()
+val VAR-NAMES = Vector<String|False>()
 val IN-PORTS = Vector<List<Port>>()
 val OUT-PORTS = Vector<List<Port>>()
 val PREDECESSORS = Vector<List<Int>>()
@@ -567,6 +586,7 @@ defn nvars () : length(VAR-TYPES)
 defn clear-working-set () :
   clear(BLOCKS)
   clear(VAR-TYPES)
+  clear(VAR-NAMES)
 
 defn type (i:Imm) :
   match(i) :
@@ -576,7 +596,11 @@ defn type (i:Imm) :
 defn make-var (t:VMType) :
   val n = length(VAR-TYPES)
   add(VAR-TYPES, t)
+  add(VAR-NAMES, false)
   Var(n)
+
+defn assign-name (v:Var, name:String) :
+  VAR-NAMES[n(v)] = name
 
 ;============================================================
 ;====================== Printing ============================
@@ -796,14 +820,8 @@ defn load-instructions (function:VMFunc, backend:Backend) :
   val var-table = IntTable<Int>()
   defn make-var (n:Int, t:VMType) :
     fatal("Variable %_ already exists." % [n]) when key?(var-table,n)
-    var-table[n] = length(VAR-TYPES)
-    add(VAR-TYPES, t)
-;    if flag-defined?(`PRINT-REG-ALLOC) :
-;      println("V%_ = $v%_" % [var-table[n], n])
-  defn make-var (t:VMType) :
-    val n = length(VAR-TYPES)
-    add(VAR-TYPES, t)
-    Var(n)
+    val v = /make-var(t)
+    var-table[n] = /n(v)
   defn get-var (v:Int) :
     Var(var-table[v])
   defn get-var (v:Local) :
@@ -873,6 +891,10 @@ defn load-instructions (function:VMFunc, backend:Backend) :
       for d in defs(function) do :
         make-var(id(d), type(d))
         push(Def(get-var(id(d))))
+      for entry in entries(debug-name-table(function)) do :
+        val v = get-var(id(entry))
+        assign-name(v, name(entry))
+
     for i in start(b) to start(b) + length(b) do :
       match(ins(function)[i]) :
         (e:ArgIns) :
@@ -892,7 +914,7 @@ defn load-instructions (function:VMFunc, backend:Backend) :
           val a-regs = regs(a)
           val calltype = match(type(e)) :
             (t:vm-StanzaCall) :
-              StanzaCall(trace-entry(e), func-reg?(f(e), a-regs), a-regs, regs(r))
+              StanzaCall(CallInfo(trace-entry(e), []), func-reg?(f(e), a-regs), a-regs, regs(r))
             (t:vm-StanzaTCall) :
               StanzaTCall(func-reg?(f(e), a-regs), a-regs)
             (t:vm-CCall) :
@@ -900,7 +922,7 @@ defn load-instructions (function:VMFunc, backend:Backend) :
               CCall(num-mem-args(t), freg, a-regs, regs(r))
             (t:vm-YieldCall) :
               val rs = unused-regs(a-regs, 3, backend)
-              YieldCall(enter?(t), trace-entry(e), rs[0], a-regs, regs(r), List(rs[1], rs[2]))
+              YieldCall(enter?(t), CallInfo(trace-entry(e), []), rs[0], a-regs, regs(r), List(rs[1], rs[2]))
           push(Call(get-vars(locals(r)), get-imm(f(e)), get-imms(imms(a)), calltype))
         (e:ReturnRecordIns) :
           val r = args(e)
@@ -980,7 +1002,7 @@ defn load-instructions (function:VMFunc, backend:Backend) :
         (e:CommentIns) :
           false
         (e:SafepointIns) :
-          push(Op(SafepointOp(id(e), trace-entry!(e)), List(), List()))
+          push(Op(SafepointOp(id(e), trace-entry!(e), []), List(), List()))
         (e:UnreachableIns) :
           false
     val next = to-list $
@@ -1109,6 +1131,10 @@ defstruct VarUse :
 defn crosses-boundary? (i:Ins) :
   match(i:Call) :
     type(i) is-not ExtendStack
+
+defn safepoint? (i:Ins) -> True|False :
+  match(i:Op) :
+    op(i) is SafepointOp
 
 defn liveness-analysis () :
   ;Clear state
@@ -1309,8 +1335,28 @@ defn add-annotations (blk:Block, b:Int) :
           prefers-load[n(x)] = false
         ;Emit
         fn (e:Ins) :
-          val killed = to-list(filter({not live?(_)}, used-vars(e)))
-          emit(attach-killed(e, to-list(killed)))
+          ;Helper: Compute the set of named variables.
+          defn live-named-vars () -> Tuple<Var> :
+            val named-set = IntSet()
+            do-live $ fn (x) :
+              if VAR-NAMES[x] is-not False :
+                add(named-set, x)
+            to-tuple(seq(Var,named-set))
+
+          ;If it is a safepoint, then attach the killed variables, as
+          ;well as the named-vars.
+          if safepoint?(e) :
+            val killed = to-list(filter({not live?(_)}, used-vars(e)))
+            val e* = attach-killed(e, to-list(killed))
+            val named-vars = live-named-vars()
+            for v in named-vars do :
+              requires-save[n(v)] = true
+            emit(attach-named-vars(e*, named-vars))
+          ;Otherwise, just attach the killed variables.
+          else :
+            val killed = to-list(filter({not live?(_)}, used-vars(e)))
+            emit(attach-killed(e, to-list(killed)))
+            
           ;Cross call boundary
           if crosses-boundary?(e) :
             val live-set = IntSet()
@@ -1319,7 +1365,8 @@ defn add-annotations (blk:Block, b:Int) :
               requires-save[x] = true
               prefers-load[x] = false
             val live-vars = to-tuple(seq(Var,live-set))
-            emit(Op(RecordLiveOp(live-vars), List(), List(), List()))
+            emit(Op(RecordLiveOp(live-vars), List(), List(), List()))            
+
         ;Used
         fn (x:Var) :
           mark-used(n(x), i)
@@ -2010,7 +2057,10 @@ defn stack-intervals () -> Seq<Interval> :
         (e:Load) : note-usage(n(x(e)), pos)
         (e:Op) :
           match(op(e)) :
-            (op:RecordLiveOp) : do(note-usage{n(_), pos}, live-vars(op))
+            (op:RecordLiveOp) :
+              do(note-usage{n(_), pos}, live-vars(op))
+            (op:SafepointOp) :
+               do(note-usage{n(_), pos}, named-vars(op))
             (op) : false
         (e) : false
 
@@ -2453,8 +2503,11 @@ defn load-mem-arg-offset (op:LoadCArgOp, backend:Backend) -> Int :
 ;====================== Assemble ============================
 ;============================================================
 
-defn assemble (emitter:CodeEmitter, stackmap:StackMap,
-               stubs:AsmStubs, print?:True|False) :
+defn assemble (emitter:CodeEmitter,
+               context-id:Int,
+               stackmap:StackMap,
+               stubs:AsmStubs,
+               print?:True|False) :
   ;============================
   ;==== Assembly Utilities ====
   ;============================
@@ -2476,6 +2529,23 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap,
   val frames-offset = next(stack-offset-counter, 8)
   val sp-offset = next(stack-offset-counter, 8)
   val pc-offset = next(stack-offset-counter, 8)
+
+  ;====================
+  ;==== VarContext ====
+  ;====================
+  val named-vars = Vector<asm-NamedVar>()
+  val named-var-table = IntTable<Int>()
+  for (v in 0 to false, name in VAR-NAMES) do :
+    if name is String and location(stackmap,v) is-not False :
+      val entry = asm-NamedVar(offset(stackmap,v), name as String)
+      add(named-vars, entry)
+      named-var-table[v] = length(named-vars) - 1
+  E $ asm-VarContext(context-id, to-tuple(named-vars))
+
+  ;Helper: Retrieve the VarMap for the given variables.
+  defn varmap (vs:Tuple<Var>) -> asm-VarMap :
+    val indices = map({named-var-table[n(_)]}, vs)
+    asm-VarMap(context-id, qsort(indices))
 
   ;==============
   ;==== Body ====
@@ -2522,6 +2592,11 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap,
           (ctxt:CContext) :
             false
       (e:Call) :
+        defn emit-info-label (label-id:Int, info:CallInfo) :
+          E $ asm-Label(label-id, 
+                        trace-entry(info)
+                        varmap(/named-vars(info)))            
+
         match(type(e)) :
           (t:ExtendStack) :
             val return-lbl = unique-id(stubs)
@@ -2538,8 +2613,8 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap,
             val frame-size = INT(size(stackmap) + 8)
             E $ AddL(RSP, RSP, frame-size)
             E $ asm-Call(I(f(e)))
-            match(trace-entry(t):StackTraceInfo) :
-              E $ asm-Label(unique-id(stubs), trace-entry(t))
+            if info(t) is-not False :
+              emit-info-label(unique-id(stubs), info(t) as CallInfo)
             E $ SubL(RSP, RSP, frame-size)
           (t:StanzaTCall) :
             E $ asm-Goto(I(f(e)))
@@ -2591,7 +2666,12 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap,
 
             E $ LoadL(TMP, F, pc-offset)
             E $ asm-Goto(TMP)
-            E $ asm-Label(lbl, trace-entry(t))
+
+            ;Emit label
+            if info(t) is False :
+              E $ asm-Label(lbl, false)
+            else :
+              emit-info-label(lbl, info(t) as CallInfo)
       (e:Op) : ;[2]
         match(op(e)) :
           (op:SaveCContextOp) :
@@ -2679,7 +2759,7 @@ defn assemble (emitter:CodeEmitter, stackmap:StackMap,
             E $ StoreL(x, RSP, stack-pointer-offset)
             E $ SetL(x, M(vmstate(stubs)))
           (op:SafepointOp) :
-            E $ asm-Safepoint(id(op), trace-entry(op))
+            E $ asm-Safepoint(id(op), trace-entry(op), varmap(/named-vars(op)))
           (op) :
             fatal("Not yet implemented: %_" % [op])
       (e:Save) :
