@@ -253,11 +253,20 @@ void* untag_ref (uint64_t ref){
   return (void*)(ref - 1 + 8);
 }
 
+//Call this from within the Stanza signal handler.
+//Returns the address of the breakpoint that was hit.
 uint64_t get_signal_handler_ip (){
   //The stored RIP is the address immediately after
   //the INT3 instruction, which is guaranteed to be 1-byte.
   //Therefore we subtract 1 to obtain the address of the breakpoint.
   return stanza_sighandler_context.rip - 1;
+}
+
+//Call this from within the Stanza signal handler.
+//Returns the stack pointer of the child program at the time
+//the INT3 was hit.
+uint64_t get_signal_handler_sp (){
+  return stanza_sighandler_context.rsp;
 }
 
 //1) Set Stanza saved_c_rsp to point to Stanza signal handling stack.
