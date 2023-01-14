@@ -1,0 +1,386 @@
+defpackage stz/c-extern-trampoline :
+  import core
+  import collections
+  import stz/code-emitter
+  import stz/backend
+  import stz/backend-regs
+  import stz/asm-ir
+  import stz/asm-ir-utils
+  
+;============================================================
+;=================== Dynamic Code Template ==================
+;============================================================
+
+;The dynamic code template is a template meant to be copied-and-pasted
+;into executable memory for each 'extern defn' that is created.
+;
+;Holes:
+;  trampoline params address
+;  num-int-args
+;  num-float-args
+;  num-mem-args
+;  extern-index
+;  return-type
+;  trampoline address
+
+public defn compile-c-extern-dynamic-code-template (backend:Backend,
+                                                    emitter:CodeEmitter) -> False :
+
+  ;Helper: Emit an instruction.
+  defn E (i:Ins) : emit(emitter, i)
+
+  ;Retrieve free registers.
+  val free-regs = free-regs([CallCArgRegs, CallCPreservedRegs], backend)  
+  val PARAMS = free-regs[0]
+  val VALUE = free-regs[1]
+
+  ;Generate labels for settings.
+  val stub-end = unique-label(emitter)
+
+  ;Start marker.
+  E $ ExLabel(`c_extern_trampoline_stub_start)
+  
+  ;The address of the trampoline parameters.
+  E $ SetL(PARAMS, INT(0xcafebabecafebabeL))
+
+  ;Store parameters.
+  E $ SetL(VALUE, INT(0xcafebabecafebabeL))
+  E $ StoreL(PARAMS, VALUE, param-offset(`num-int-args))
+  E $ SetL(VALUE, INT(0xcafebabecafebabeL))
+  E $ StoreL(PARAMS, VALUE, param-offset(`num-float-args))
+  E $ SetL(VALUE, INT(0xcafebabecafebabeL))
+  E $ StoreL(PARAMS, VALUE, param-offset(`num-mem-args))
+  E $ SetL(VALUE, INT(0xcafebabecafebabeL))
+  E $ StoreL(PARAMS, VALUE, param-offset(`extern-index))
+  E $ SetL(VALUE, INT(0xcafebabecafebabeL))
+  E $ StoreL(PARAMS, VALUE, param-offset(`return-type))
+  E $ SetL(VALUE, M(stub-end))
+  E $ StoreL(PARAMS, VALUE, param-offset(`index-list))
+  
+  ;Jump to trampoline.
+  E $ SetL(VALUE, INT(0xcafebabecafebabeL))
+  E $ Goto(VALUE)
+
+  ;End marker.
+  E $ ExLabel(`c_extern_trampoline_stub_end)
+  E $ Label(stub-end)
+
+;============================================================
+;=============== Parameters to C Trampoline =================
+;============================================================
+
+;List all the parameters to the C extern trampoline.
+;- return-type: 1 for floating point return, 0 otherwise.
+val C-TRAMPOLINE-PARAMS = [
+  `num-int-args
+  `num-float-args
+  `num-mem-args
+  `extern-index
+  `entry-point
+  `index-list
+  `arguments
+  `return-type
+]
+
+;Retrieve the offset of the given trampoline parameter. 
+defn param-offset (name:Symbol) -> Int :
+  val i = index-of!(C-TRAMPOLINE-PARAMS, name)
+  i * 8
+
+;Return the number of bytes required to hold the parameters.
+defn space-for-params () -> Int :
+  length(C-TRAMPOLINE-PARAMS) * 8
+
+;<doc>=======================================================
+;=================== C Extern Trampoline ====================
+;============================================================
+
+The C extern trampoline is a generated function to be called from C
+that saves incoming C arguments, obeying the C calling register
+convention, to be laid out neatly in memory to be accessed via an
+interpreter.
+
+# Pseudocode #
+
+  set_int_args: [int_arg_0, int_arg_1, ..., int_arg_n]
+  set_float_args: [float_arg_0, float_arg_1, ..., float_arg_n]
+
+  c_extern_trampoline:
+
+    //Retrieve the index list.
+    INDEX-LIST = [INDEX-LIST-SLOT]
+    ARGS = [ARG-LIST]
+
+    //Set the integer registers.
+
+    JUMP set_int_args[NUM-INT-ARGS]
+
+  int_arg_n:
+    INDEX = [INDEX-LIST]
+    INDEX-LIST ++
+    ARGS[INDEX] = RXX  (ARGS + INDEX * 8)
+
+    ...
+
+  int_arg_2:
+    INDEX = [INDEX-LIST]
+    INDEX-LIST ++
+    ARGS[INDEX] = RAX
+
+  int_arg_1:
+    INDEX = [INDEX-LIST]
+    INDEX-LIST ++
+    ARGS[INDEX] = RCX
+
+  int_arg_0:
+
+    //Set the floating-point registers.
+
+    JUMP set_float_args[NUM-FLOAT-ARGS]
+
+  float_arg_n:
+    INDEX = [INDEX-LIST]
+    INDEX-LIST ++
+    ARGS[INDEX] = XMMN
+
+    ...
+
+  float_arg_2:
+    INDEX = [INDEX-LIST]
+    INDEX-LIST ++
+    ARGS[INDEX] = XMM1
+
+  float_arg_1:
+    INDEX = [INDEX-LIST]
+    INDEX-LIST ++
+    ARGS[INDEX] = XMM0
+
+  float_arg_0:
+
+
+  //for i in 0 to num-mem-args :
+  //  VALUE = RSP[i * 8 + offset]
+  loop:
+  if NUM-MEM-ARGS == 0 : goto end
+  
+    //Load value from C stack
+    VALUE = NUM-MEM-ARGS * 8
+    VALUE = VALUE + RSP
+    VALUE = [VALUE + offset]
+
+    //Retrieve index.
+    INDEX = [INDEX-LIST]
+    INDEX-LIST ++
+
+    //Store into args
+    ARGS[INDEX] = VALUE
+    
+    goto loop
+  end:
+
+    //Call the entry point.
+    PUSH DUMMY //Align the stack
+    FUNC = [ENTRY_POINT]
+    ARG0 = EXTERN_INDEX
+    CALL [FUNC]
+    POP DUMMY
+    
+    //Return value from entry point.
+    ARGS = [ARG-LIST]
+    TYPE = [RETURN-TYPE]
+    if TYPE == 0 :
+      RET = [ARGS]
+    else :
+      FRET = [ARGS]
+    RETURN
+
+;============================================================
+;=======================================================<doc>
+
+public defn compile-c-extern-trampoline-stub (backend:Backend,
+                                              emitter:CodeEmitter) -> False :
+  ;Helper: Emit an instruction.
+  defn E (i:Ins) : emit(emitter, i)
+
+  ;Backend parameters
+  val num-int-args = length(callc-regs(backend))
+  val num-float-args = length(callc-fregs(backend))  
+
+  ;Choose registers for variables in snippet.
+  val free-regs = free-regs([CallCArgRegs, CallCPreservedRegs], backend)  
+  val NUM-INT-ARGS = free-regs[0]
+  val NUM-FLOAT-ARGS = free-regs[0]
+  val INDEX = free-regs[0]
+  val FUNC = free-regs[0]
+  val INDEX-LIST = free-regs[1]
+  val ARG-LIST = free-regs[2]
+  val TABLE-ADDRESS = free-regs[2]
+  val RET-TYPE = free-regs[0]
+  val MEM-VALUE = R(c-preserved-regs(backend)[0])
+  val NUM-MEM-ARGS = R(c-preserved-regs(backend)[1])  
+
+  ;Save and restore preserved registers.
+  ;Currently we use 2 of them.
+  val preserve-registers-address = unique-label(emitter)
+  
+  defn save-preserved-regs () :
+    for i in 0 to 2 do :
+      E $ StoreL(Mem(preserve-registers-address, i * 8), R(c-preserved-regs(backend)[i]))
+      
+  defn restore-preserved-regs () :
+    for i in 0 to 2 do :
+      E $ LoadL(R(c-preserved-regs(backend)[i]), Mem(preserve-registers-address, i * 8))  
+  
+  ;Retrieve the argument registers.
+  val ARG0 = R(callc-regs(backend)[0])
+
+  ;Retrieve the return registers.
+  val RET = R(callc-ret(backend))
+  val FRET = F(callc-fret(backend))
+
+  ;Define the trampoline parameters.
+  val params-address = unique-label(emitter)
+  E $ DefData()
+  E $ ExLabel(`c_extern_trampoline_params)
+  E $ Label(params-address)
+  E $ DefSpace(space-for-params())
+  E $ DefText()
+
+  ;Load the parameter with the given name to the given location.
+  defn load-param (x:Loc, name:Symbol) -> False :
+    E $ LoadL(x, M(params-address), param-offset(name))
+
+  ;Define space for preserve registers.
+  E $ DefData()
+  E $ Label(preserve-registers-address)
+  E $ DefSpace(8 * 2)
+  E $ DefText()
+
+  ;Emit the jump tables for setting registers
+
+  ;Generate the jump table labels.
+  val reg-table-label = unique-label(emitter)
+  val reg-table-labels = to-tuple $
+    for i in 0 to num-int-args + 1 seq :
+      unique-label(emitter)
+  val freg-table-label = unique-label(emitter)
+  val freg-table-labels = to-tuple $
+    for i in 0 to num-float-args + 1 seq :
+      unique-label(emitter)
+
+  ;Emit the jump tables themselves.
+  E $ DefData()
+  E $ Label(reg-table-label)
+  do(E{DefLabel(_)}, reg-table-labels)
+  E $ Label(freg-table-label)
+  do(E{DefLabel(_)}, freg-table-labels)
+  E $ DefText()
+
+  ;Begin the trampoline.
+  val trampoline-address = unique-label(emitter)
+  E $ ExLabel(`c_extern_trampoline)
+  E $ Label(trampoline-address)
+
+  ;Save the preserved registers.
+  save-preserved-regs()
+
+  ;Retrieve the index list, arguments list.
+  load-param(INDEX-LIST, `index-list)
+
+  ;Jump to the correct label to set the arguments.
+  E $ Comment("Setting the integer arguments")
+  load-param(NUM-INT-ARGS, `num-int-args)
+  E $ ShlL(NUM-INT-ARGS, NUM-INT-ARGS, INT(3))
+  E $ SetL(TABLE-ADDRESS, M(reg-table-label))
+  E $ AddL(NUM-INT-ARGS, NUM-INT-ARGS, TABLE-ADDRESS)
+  E $ LoadL(NUM-INT-ARGS, NUM-INT-ARGS)
+  load-param(ARG-LIST, `arguments)
+  E $ Goto(NUM-INT-ARGS)
+  ;Free NUM-INT-ARGS
+
+  ;Load the integer arguments.
+  for n in reverse(1 through num-int-args) do :
+    E $ Label(reg-table-labels[n])
+    E $ Comment(to-string("Load integer argument %_" % [n - 1]))
+    E $ LoadL(INDEX, INDEX-LIST)
+    E $ AddL(INDEX-LIST, INDEX-LIST, INT(8))
+    E $ ShlL(INDEX, INDEX, INT(3))
+    E $ AddL(INDEX, INDEX, ARG-LIST)
+    E $ StoreL(INDEX, R(callc-regs(backend)[n - 1]))
+  E $ Label(reg-table-labels[0])
+  ;Free INDEX
+
+  ;Jump to the correct label to set the float arguments.
+  E $ Comment("Setting the floating-point arguments")
+  load-param(NUM-FLOAT-ARGS, `num-float-args)
+  E $ ShlL(NUM-FLOAT-ARGS, NUM-FLOAT-ARGS, INT(3))
+  E $ SetL(TABLE-ADDRESS, M(freg-table-label))
+  E $ AddL(NUM-FLOAT-ARGS, NUM-FLOAT-ARGS, TABLE-ADDRESS)
+  E $ LoadL(NUM-FLOAT-ARGS, NUM-FLOAT-ARGS)
+  load-param(ARG-LIST, `arguments)
+  E $ Goto(NUM-FLOAT-ARGS)
+  ;Free NUM-FLOAT-ARGS
+
+  ;Load the float arguments.
+  for n in reverse(1 through num-float-args) do :
+    E $ Label(freg-table-labels[n])
+    E $ Comment(to-string("Load float argument %_" % [n - 1]))
+    E $ LoadL(INDEX, INDEX-LIST)
+    E $ AddL(INDEX-LIST, INDEX-LIST, INT(8))
+    E $ ShlL(INDEX, INDEX, INT(3))
+    E $ AddL(INDEX, INDEX, ARG-LIST)
+    E $ StoreD(INDEX, F(callc-fregs(backend)[n - 1]))
+  E $ Label(freg-table-labels[0])
+  ;Free INDEX
+
+  ;Load the mem arguments.
+  E $ Comment("Setting the memory arguments")
+  val copy-mem-loop = unique-label(emitter)
+  val copy-mem-done = unique-label(emitter)
+  load-param(NUM-MEM-ARGS, `num-mem-args)
+  E $ Label(copy-mem-loop)
+  ;Test loop condition.
+  E $ BreakL(M(copy-mem-done), EqOp(), NUM-MEM-ARGS, INT(0))
+  ;Decrement num-mem-args.
+  E $ SubL(NUM-MEM-ARGS, NUM-MEM-ARGS, INT(1))
+  ;Load value from C stack.
+  val offset = 8 + c-num-spill-slots(backend) * 8
+  E $ ShlL(MEM-VALUE, NUM-MEM-ARGS, INT(3))
+  E $ AddL(MEM-VALUE, MEM-VALUE, RSP)
+  E $ LoadL(MEM-VALUE, MEM-VALUE, offset)
+  ;Retrieve index.
+  E $ LoadL(INDEX, INDEX-LIST)
+  E $ AddL(INDEX-LIST, INDEX-LIST, INT(8))
+  ;Store into args.
+  E $ ShlL(INDEX, INDEX, INT(3))
+  E $ AddL(INDEX, INDEX, ARG-LIST)
+  E $ StoreL(INDEX, MEM-VALUE)
+  ;Loop end.
+  E $ Goto(M(copy-mem-loop))
+  E $ Label(copy-mem-done)
+
+  ;Load the entry point.
+  E $ Comment("Load and call the entry point")
+  load-param(FUNC, `entry-point)
+
+  ;16-byte align the stack pointer, and then call
+  ;the function: func(extern-index).
+  load-param(ARG0, `extern-index)
+  E $ SubL(RSP, RSP, INT(8))
+  E $ Call(FUNC)
+  E $ AddL(RSP, RSP, INT(8))
+
+  ;Return from entry point.
+  val return-float = unique-label(emitter)
+  E $ Comment("Return from the entry point")
+  load-param(ARG-LIST, `arguments)
+  load-param(RET-TYPE, `return-type)
+  E $ BreakL(M(return-float), EqOp(), RET-TYPE, INT(1))
+  E $ LoadL(RET, ARG-LIST)
+  restore-preserved-regs()
+  E $ Return()
+  
+  E $ Label(return-float)
+  E $ LoadD(FRET, ARG-LIST)
+  restore-preserved-regs()
+  E $ Return()

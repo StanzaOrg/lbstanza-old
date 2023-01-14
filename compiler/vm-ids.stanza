@@ -6,6 +6,8 @@ defpackage stz/vm-ids :
   import stz/vm-load-unit
   import stz/data-pool
   import stz/const-pool
+  import stz/loaded-dynamic-libraries
+  import stz/extern-defn-table
 
 ;<doc>=======================================================
 ;================== VirtualMachine Ids ======================
@@ -30,9 +32,18 @@ to, may refer to different things.
   const-pool:ConstantPool
   package-inits:HashTable<Symbol,Int|False>
 
+
+  callback-table:IntTable<Int>
+
+    Global id 18 => Callback 0
+    Global id 21 => Callback 1
+    ...
+
 For fn-recs, global-recs, class-recs, the array index is the
 identifier of the definition, and the array value is the record id of
 the definition it refers to.
+
+
 
 # State for Dependency Tracking #
 
@@ -56,7 +67,8 @@ public defmulti load-packages (ids:VMIds, pkgs:Collection<VMPackage>) -> LoadUni
 public defmulti class-rec (ids:VMIds, global-id:Int) -> StructRec|TypeRec|False
 public defmulti package-init (ids:VMIds, package:Symbol) -> Int|False
 
-public defn VMIds () :
+public defn VMIds (dylibs:LoadedDynamicLibraries,
+                   extern-defns:ExternDefnTable) :
   ;Fixed Ids
   val fixed-ids = [
     CORE-EXTEND-HEAP-ID => EXTEND-HEAP-FN
@@ -83,6 +95,7 @@ public defn VMIds () :
   val data-pool = DataPool()
   val const-pool = ConstantPool()
   val package-inits = HashTable<Symbol,Int|False>()
+  val callback-table = IntTable<Int>()
   
   ;Generating new ids
   defn id-counter (pred:RecId -> True|False) :
@@ -98,28 +111,53 @@ public defn VMIds () :
   val class-dependencies = Vector<Tuple<Rec>>()
 
   ;Utility Tables
-  val extern-id-table = extern-id-table()
-  val callback-index-table = callback-index-table()
   val fixed-ids-table = to-hashtable<RecId,Int>(fixed-ids)
 
-  ;Store record
-  defn store-rec (r:Rec) :
-    ;Compute global id for r
-    val gid = label<Int> return :
-      defn return? (i:Int|False) : return(i as Int) when i is Int
-      return?(get?(id-table, id(r)))
-      return?(get?(fixed-ids-table, id(r)))
-      next $ match(r) :
-        (r:CodeRec&Rec) : code-id-counter
-        (r:ClassRec&Rec) : class-id-counter
-        (r:ValRec&Rec) : global-id-counter
+  ;The given record is exported by a package.
+  ;Assign it a global id if it doesn't have one already, and store
+  ;it in the id table.
+  defn store-exported-rec-in-id-table (package:Symbol, r:Rec) -> False :
+    ;Compute the global id for the given record.
+    ;  Case 1: It already has an id.
+    ;  Case 2: It has a system-mandated fixed id.
+    ;  Case 3: We need to create a fresh id for it, or lookup the
+    ;          library symbol for it.
+    ;  Case 4: We need to lookup the extern id from the loaded libraries.
+    defn compute-global-id () -> Int :
+      label<Int> return :
+        ;Helper: If given, assign to id-table and break.
+        defn return? (gid:Int|False) :
+          match(gid:Int) : return(gid)
+        ;Case 1: It already has an id.
+        return?(get?(id-table, id(r)))
+        ;Case 2: It has a system-mandated fixed id.
+        return?(get?(fixed-ids-table, id(r)))
+        ;Dispatch based on type of export.
+        match(r) :
+          ;Case 3: Create a new id for it.
+          (r:CodeRec&Rec) : next(code-id-counter)
+          (r:ClassRec&Rec) : next(class-id-counter)
+          (r:ValRec&Rec) : next(global-id-counter)
+          ;Case 4: Lookup from loaded libraries.
+          (r:ExternRec) : id(dylibs, package, lbl(r))
     ;Record global id
+    val gid = compute-global-id()
     id-table[id(r)] = gid
     ;Put record
     match(r) :
       (r:CodeRec&Rec) : put(code-recs, gid, r, false)
       (r:ClassRec&Rec) : put(class-recs, gid, r, false)
       (r:ValRec&Rec) : put(global-recs, gid, r, false)
+      (r:ExternRec) : false
+    ;Assign callback ids.
+    match(r:ExternFnRec) :
+      callback-table[gid] = id(extern-defns, lbl(r))
+
+  ;Store all the exported recs in the PackageIOs to the idtable.
+  defn store-exported-recs-in-id-table (packageios:Seqable<PackageIO>) -> False :
+    for packageio in packageios do :
+      for e in exports(packageio) do :
+        store-exported-rec-in-id-table(package(packageio), rec(e))
 
   ;Form a single LoadUnit from a group of packages
   defn load-packages (pkgs:Collection<VMPackage>) -> LoadUnit :
@@ -131,17 +169,17 @@ public defn VMIds () :
       val classes = Vector<LoadedClass>()
       val funcs = Vector<VMDefn>()
       val callbacks = Vector<Callback>()
-      store-exported-recs()
+      store-exported-recs-in-id-table(seq(packageio, pkgs))
       for pkg in pkgs do :
-        val [global-ids, extern-defn-table] = create-global-ids(pkg)
-        record-package-init(pkg, global-ids)
-        add(packages, make-load-package(pkg, global-ids))
-        add-all(classes, resolved-classes(pkg, global-ids))
-        add-all(funcs, resolved-defns(pkg, global-ids, extern-defn-table))
-        add-all(callbacks, resolved-callbacks(pkg, global-ids))
+        val local-to-global-map = local-to-global-table(pkg)
+        record-package-init(pkg, local-to-global-map)
+        add(packages, make-load-package(pkg, local-to-global-map))
+        add-all(classes, resolved-classes(pkg, local-to-global-map))
+        add-all(funcs, resolved-defns(pkg, local-to-global-map))
+        add-all(callbacks, resolved-callbacks(pkg, local-to-global-map))
         val iotable = IOTable(packageio(pkg))
-        record-dependencies(iotable, global-ids, /classes(pkg))
-        record-dependencies(iotable, global-ids, /funcs(pkg))
+        record-dependencies(iotable, local-to-global-map, /classes(pkg))
+        record-dependencies(iotable, local-to-global-map, /funcs(pkg))
       LoadUnit(
         to-tuple(packages),
         form-new-datas(data-pool, num-existing-datas),
@@ -150,13 +188,6 @@ public defn VMIds () :
         to-tuple(funcs),
         to-tuple(callbacks))
 
-    ;Store all the exported records.
-    ;Extern records are handled differently (through the extern id table).
-    defn store-exported-recs () :
-      for pkg in pkgs do :
-        for e in exports(packageio(pkg)) do :
-          store-rec(rec(e)) when rec(e) is-not ExternRec
-
     ;Resolve all ids in the given item using the given given global-ids table.
     ;- x: The item to resolve ids for.
     ;- global-ids: The table containing the mapping from old to new ids.
@@ -164,78 +195,74 @@ public defn VMIds () :
       defn resolve (x:VMItem) : map-id({global-ids[_]}, vm-map(resolve,x))
       resolve(x) as VMItem&T
 
-    ;Compute global ids for all definitions in package
-    defn create-global-ids (pkg:VMPackage) -> [IntTable<Int>, IntTable<Int>] :
-      val global-ids = IntTable<Int>()
-      ;First record ids for imported and exported definitions
+    ;Compute table mapping locals to globals for definitions in package.
+    defn local-to-global-table (pkg:VMPackage) -> IntTable<Int> :
+      ;Create the mapping table.
+      val mapping-table = IntTable<Int>()
+      
+      ;First, all exported records already have assigned ids, so look
+      ;them up.
       for i in cat(imports(packageio(pkg)), exports(packageio(pkg))) do :
-        val local-id = n(i)
-        val global-id = match(rec(i)) :
-          (r:ExternRec) : extern-id-table[lbl(r)]
-          (r) : id-table[id(r)]
-        global-ids[local-id] = global-id
-      ;Then create ids for unexported definitions
-      defn create-ids<?T> (entries: VMPackage -> Tuple<?T>, local-id: T -> Int, ids:Seq<Int>) :
+        mapping-table[n(i)] = id-table[id(rec(i))]
+        
+      ;Private definitions that are not exported will not
+      ;have any ids yet, so create global ids for any remaining items.
+      defn create-ids<?T> (entries: VMPackage -> Tuple<?T>,
+                           local-id: T -> Int,
+                           make-gid:T -> Int) :
         for e in entries(pkg) do :
-          if not key?(global-ids, local-id(e)) :
-            val gid = next(ids)
-            global-ids[local-id(e)] = gid
-      create-ids(globals, id, global-id-counter)
-      create-ids(classes, id, class-id-counter)
-      create-ids(funcs, id, code-id-counter)
+          if not key?(mapping-table, local-id(e)) :
+            mapping-table[local-id(e)] = make-gid(e)
+      create-ids(globals, id, next{global-id-counter})
+      create-ids(classes, id, next{class-id-counter})
+      create-ids(funcs, id, next{code-id-counter})
+      create-ids(externs, id, id{dylibs, name(pkg), name(_)})
+      
       ;Then create ids for datas and consts
       for d in datas(pkg) do :
         val local-id = id(d)
         val global-id = intern(data-pool, data(d))
-        global-ids[local-id] = global-id
+        mapping-table[local-id] = global-id
       for c in consts(pkg) do :
         val local-id = id(c)
-        val value* = resolve-ids(value(c), global-ids)
+        val value* = resolve-ids(value(c), mapping-table)
         val global-id = id(id(intern(const-pool, value*)))
-        global-ids[local-id] = global-id
-      ;Then create ids for externs
-      for e in externs(pkg) do :
-        val local-id = id(e)
-        val global-id = extern-id-table[name(e)]
-        global-ids[local-id] = global-id
-      ;Then create ids for extern-defns
-      ;Keys are the function-ids of all extern functions
-      ;Values are the extern index corresponding to their labels.
-      val extern-defn-table = IntTable<Int>()
-      for e in extern-defns(pkg) do :
-        val local-id = fid(e)
-        val global-id = extern-id-table[lbl(e)]
-        extern-defn-table[local-id] = global-id
+        mapping-table[local-id] = global-id
+
+      ;Create callback ids for any unexported extern defns.
+      for e in /extern-defns(pkg) do :
+        val gid = mapping-table[fid(e)]
+        if not key?(callback-table, gid) :
+          callback-table[gid] = id(extern-defns, lbl(e))
+        
       ;Return ids
-      [global-ids, extern-defn-table]
+      mapping-table
 
     ;Record package init
-    defn record-package-init (pkg:VMPackage, global-ids:IntTable<Int>) :
+    defn record-package-init (pkg:VMPackage, local-to-global-map:IntTable<Int>) :
       val init-id = match(init(pkg)) :
-        (i:Int) : global-ids[i]
+        (i:Int) : local-to-global-map[i]
         (i:False) : false
       package-inits[name(pkg)] = init-id
 
     ;Make a LoadPackage from a VMPackage
-    defn make-load-package (pkg:VMPackage, global-ids:IntTable<Int>) -> LoadPackage :
+    defn make-load-package (pkg:VMPackage, local-to-global-map:IntTable<Int>) -> LoadPackage :
       LoadPackage(
         name(pkg),
-        map(resolve-ids{_, global-ids}, globals(pkg)),
-        map(resolve-ids{_, global-ids}, methods(pkg)))
+        map(resolve-ids{_, local-to-global-map}, globals(pkg)),
+        map(resolve-ids{_, local-to-global-map}, methods(pkg)))
 
     ;Resolve all classes in the given package
-    defn resolved-classes (pkg:VMPackage, global-ids:IntTable<Int>) -> Seq<LoadedClass> :
+    defn resolved-classes (pkg:VMPackage, local-to-global-map:IntTable<Int>) -> Seq<LoadedClass> :
       for c in classes(pkg) seq :
-        LoadedClass(name(pkg), resolve-ids(c, global-ids))
+        LoadedClass(name(pkg), resolve-ids(c, local-to-global-map))
 
     ;Resolve a single func
-    defn resolved-defn (func:VMDefn,
-                        global-ids:IntTable<Int>,
-                        extern-defn-ids:IntTable<Int>) :
-      defn gid (n:Int) : global-ids[n]
+    defn resolved-defn (func:VMDefn, local-to-global-map:IntTable<Int>) :
+      defn gid (n:Int) : local-to-global-map[n]
       defn resolve-ids (x:VMItem) :
         match(x) :
-          (x:ExternDefnId) : ExternId(extern-defn-ids[id(x)])
+          (x:ExternDefnId) : ExternDefnId(callback-table[gid(id(x))])
           (x) : map-id(gid, vm-map(resolve-ids, x))
       new VMDefn :
         defmethod id (this) : gid(id(func))
@@ -243,29 +270,29 @@ public defn VMIds () :
         defmethod func (this) : resolve-ids(/func(func)) as VMFunction
 
     ;Resolve all funcs from packages
-    defn resolved-defns (pkg:VMPackage, global-ids:IntTable<Int>, extern-defn-ids:IntTable<Int>) :
+    defn resolved-defns (pkg:VMPackage, local-to-global-map:IntTable<Int>) :
       for f in funcs(pkg) seq :
-        resolved-defn(f, global-ids, extern-defn-ids)
+        resolved-defn(f, local-to-global-map)
 
     ;Resolve all Callbacks for extern defns
-    defn resolved-callbacks (pkg:VMPackage, global-ids:IntTable<Int>) :
-      for e in extern-defns(pkg) seq :
-        val fid = global-ids[fid(e)]
-        val callback-index = callback-index-table[lbl(e)]
-        Callback(callback-index, fid)        
+    defn resolved-callbacks (pkg:VMPackage, local-to-global-map:IntTable<Int>) :
+      for e in /extern-defns(pkg) seq :
+        val gid = local-to-global-map[fid(e)]
+        val callback-index = callback-table[gid]
+        Callback(callback-index, gid, a1(e), a2(e))
 
     ;Record class dependencies
-    defn record-dependencies (iotable:IOTable, global-ids:IntTable<Int>, classes:Tuple<VMClass>) :
+    defn record-dependencies (iotable:IOTable, local-to-global-map:IntTable<Int>, classes:Tuple<VMClass>) :
       for c in filter-by<VMArrayClass|VMLeafClass>(classes) do :
         val ds = map({iotable[_]}, dependencies(c))
-        val global-id = global-ids[id(c)]
+        val global-id = local-to-global-map[id(c)]
         put(class-dependencies, global-id, ds, [])
         
     ;Record function dependencies
-    defn record-dependencies (iotable:IOTable, global-ids:IntTable<Int>, funcs:Tuple<VMDefn>) :
+    defn record-dependencies (iotable:IOTable, local-to-global-map:IntTable<Int>, funcs:Tuple<VMDefn>) :
       for f in funcs do :
         val ds = map({iotable[_]}, dependencies(f))
-        val global-id = global-ids[id(f)]
+        val global-id = local-to-global-map[id(f)]
         put(function-dependencies, global-id, ds, [])
 
     ;Construct new datas
