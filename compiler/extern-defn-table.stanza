@@ -1,0 +1,213 @@
+;Implements the logic necessary to dynamically create new callback stubs
+;for virtual machine functions.
+
+defpackage stz/extern-defn-table :
+  import core
+  import collections
+  import stz/vm-ir
+  import stz/code-template-table
+  import stz/call-records
+  import stz/backend
+
+;============================================================
+;======================== API ===============================
+;============================================================
+  
+;Represents the table for holding callback addresses.
+public deftype ExternDefnTable
+
+;Request a new callback id. 
+public defmulti id (table:ExternDefnTable, lbl:Symbol|False) -> Int
+
+;Set the callback type signature.
+public defmulti set-signature (table:ExternDefnTable, id:Int, func:Int, a1:Tuple<VMType>, a2:VMType) -> False
+
+;------------------------------------------------------------
+;-------------------- Internal ------------------------------
+;------------------------------------------------------------
+
+;Retrieve the callback with the given id.
+defmulti callback (table:ExternDefnTable, id:Int) -> Callback
+
+;============================================================
+;==================== Derived API ===========================
+;============================================================
+
+;Retrieve the address of the callback with the given id.
+public lostanza defn address (table:ref<ExternDefnTable>, id:ref<Int>) -> ptr<?> :
+  return callback(table, id).address
+
+;Retrieve the address of the callback with the given id.
+public lostanza defn address-as-long (table:ref<ExternDefnTable>, id:ref<Int>) -> ref<Long> :
+  return new Long{callback(table, id).address as long}
+
+;============================================================
+;==================== Implementation ========================
+;============================================================
+
+;Create a fresh ExternDefnTable.
+public defn ExternDefnTable (backend:Backend) :
+
+  ;Read the named callbacks.
+  val named-callbacks = read-named-callbacks()
+
+  ;Callback list.
+  val callbacks = Vector<Callback|False>()
+
+  ;Code templates
+  val code-templates = CodeTemplateTable()
+
+  ;Create a new callback with the given signature and id.
+  defn make-callback (id:Int, func:Int, a1:Tuple<VMType>, a2:VMType) -> False :
+    ;Make the callback itself and store it in the 'callbacks' vector.
+    val callback = /make-callback(code-templates, backend, func, a1, a2)
+    callbacks[id] = callback
+    ;If it is one of the exposed callbacks, then patch in the address.
+    if id < length(named-callbacks) :
+      write-callback-address-to-label(id, callback)
+
+  ;Initialize the ids for the named callbacks.
+  for i in 0 to length(named-callbacks) do :
+    add(callbacks, false)
+
+  new ExternDefnTable :
+    defmethod id (this, lbl:Symbol|False) -> Int :
+      ;If it is a named extern defn then return the pre-created id of its
+      ;entry.
+      match(lbl:Symbol) :
+        if not key?(named-callbacks, lbl) :
+          throw(NoNamedCallback(lbl))
+        named-callbacks[lbl]
+      ;Otherwise, create a new template and return its id.
+      else :
+        add(callbacks, false)
+        length(callbacks) - 1
+
+    ;Set the callback signature of the given id.
+    defmethod set-signature (this, id:Int, func:Int, a1:Tuple<VMType>, a2:VMType) -> False :
+      make-callback(id, func, a1, a2)
+
+    ;Retrieve the callback with the given id.
+    defmethod callback (this, id:Int) :
+      if id >= length(callbacks) :
+        fatal("Callback %_ has not been created yet." % [id])
+      else if callbacks[id] is False :
+        if id < length(named-callbacks) :
+          fatal("Callback %_ is an named callback, but signature has not been set yet." % [id])
+        else :
+          fatal("Callback %_ has no set signature yet." % [id])
+      ;Return the callback.
+      callbacks[id] as Callback
+
+;============================================================
+;====================== Callbacks ===========================
+;============================================================
+
+;Represents a callback in the code template table.
+lostanza deftype Callback :  
+  address:ptr<?>
+
+;Create a new callback that accepts the given arguments.
+defn make-callback (table:CodeTemplateTable, backend:Backend,
+                    func:Int, a1:Tuple<VMType>, a2:VMType) -> Callback :
+  ;Compute the call records.
+  val a1-types = map(to-arg-type, a1)
+  val a2-type = to-arg-type(a2)
+  val call-records = callc-records(a1-types, a2-type, backend)
+
+  ;Shorthands
+  val num-i = num-int-args(call-records)
+  val num-f = num-real-args(call-records)
+  val num-m = num-mem-args(call-records)
+
+  ;Compute the indices
+  val indices = IntArray(num-i + num-f + num-m, length(a1))
+
+  ;Return the slot in the 'indices' array that indices where
+  ;to put the argument stored in the given location.
+  ;Note that the trampoline processes arguments from higher-indexed
+  ;to lower-indexed.
+  defn slot (loc:CallLoc) -> Int :
+    val I0 = num-i - 1
+    val F0 = num-i + num-f - 1
+    val M0 = num-i + num-f + num-m - 1
+    match(loc) :
+      (loc:RegLoc) : I0 - index(loc)
+      (loc:FRegLoc) : F0 - index(loc)
+      (loc:MemLoc) : M0 - index(loc)    
+
+  ;Initialize each element in the indices array.
+  for arg in args(call-records) do :
+    if value(arg) is StdArg :
+      indices[slot(loc(arg))] = index(value(arg) as StdArg)
+
+  ;Compute whether the function returns a float.
+  val returns-float? = a2-type is RealArg
+
+  ;Create the callback
+  make-callback(table, func, num-i, num-f, num-m, returns-float?, indices)
+
+;HiStanza wrapper for creating the callback object.
+lostanza defn make-callback (table:ref<CodeTemplateTable>,
+                             func:ref<Int>,
+                             num-int-args:ref<Int>,
+                             num-real-args:ref<Int>,
+                             num-mem-args:ref<Int>,
+                             returns-float?:ref<True|False>,
+                             indices:ref<IntArray>) -> ref<Callback> :
+  ;Compute return type marker.
+  var return-type:int = 0
+  if returns-float? == true : return-type = 1
+  ;Request a new address from the callback table.
+  val address = make-callback(table,
+                              num-int-args.value, num-real-args.value, num-mem-args.value, return-type,
+                              func.value,
+                              indices)  
+  return new Callback{address}
+
+;Utility: Translate a VMType into an ArgType.
+defn to-arg-type (t:VMType) -> ArgType :
+  match(t) :
+    (t:VMByte|VMInt|VMLong|VMRef) : IntArg()
+    (t:VMFloat|VMDouble) : RealArg()
+
+;============================================================
+;============= Static Labels for Extern Defn ================
+;============================================================
+
+;Read the core vm tables holding the named callbacks.
+lostanza defn read-named-callbacks () -> ref<HashTable<Symbol,Int>> :
+  val vms:ptr<core/VMState> = call-prim flush-vm()
+  val table = vms.extern-defn-table
+  val indices = HashTable<Symbol,Int>()
+  for (var i:long = 0, i < table.length, i = i + 1) :
+    val id = new Int{i as int}
+    val entry = addr(table.entries[i])
+    val name = to-symbol(String(entry.name))
+    set(indices, name, id)
+  return indices
+
+;Writes the address of the callback to the exposed label for callback 'id'
+;in the static extern defn table.
+lostanza defn write-callback-address-to-label (id:ref<Int>, callback:ref<Callback>) -> ref<False> :
+  val vms:ptr<core/VMState> = call-prim flush-vm()
+  val table = vms.extern-defn-table
+  val entry = addr(table.entries[id.value])
+  entry.address = callback.address
+  return false
+
+;============================================================
+;======================= Errors =============================
+;============================================================
+
+;Represents all errors occurring using the ExternDefnTable.
+public deftype ExternDefnTableError <: Exception
+
+;Occurs when we attempt to retrieve a symbol that does not
+;exist in the table.
+public defstruct NoNamedCallback <: ExternDefnTableError :
+  name:Symbol
+
+defmethod print (o:OutputStream,e:NoNamedCallback) :
+  print(o, "Missing static label '%_' in extern defn table. Use -supported-vm-packages \
+            to statically extend the Stanza compiler with this static label." % [name(e)])

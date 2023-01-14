@@ -21,6 +21,9 @@ defpackage stz/vm :
   import stz/params
   import stz/timing-log-api
   import stz/verbose
+  import stz/loaded-dynamic-libraries
+  import stz/extern-defn-table
+  import stz/code-template-table
 
 ;<doc>=======================================================
 ;================= Virtual Machine Interface ================
@@ -178,23 +181,7 @@ public defn LiveMapTable () :
     defmethod key? (this, i:Int) :
       i >= 0 and i < length(maps)
 
-;============================================================
-;==================== Extern Table ==========================
-;============================================================
 
-public deftype ExternTable
-public defmulti get (t:ExternTable, name:Symbol) -> Long
-public defmulti set (t:ExternTable, name:Symbol, addr:Long) -> False
-
-defn ExternTable () :
-  val table = HashTable<Symbol,Long>()
-  new ExternTable :
-    defmethod get (this, name:Symbol) :
-      table[name]
-    defmethod set (this, name:Symbol, addr:Long) :
-      table[name] = addr
-
-public val EXTERN-TABLE = ExternTable()
 
 ;============================================================
 ;===================== Format Table =========================
@@ -307,6 +294,8 @@ public defn marker-int (t:Int) :
 ;============================================================
 
 public lostanza deftype VirtualMachine :
+  dylibs: ref<LoadedDynamicLibraries>
+  extern-defns: ref<ExternDefnTable>
   backend: ref<Backend>
   vmtable: ref<VMTable>
   vm-ids: ref<VMIds>
@@ -332,6 +321,12 @@ lostanza defn backend (vm:ref<VirtualMachine>) -> ref<Backend> :
 lostanza defn live-map-table (vm:ref<VirtualMachine>) -> ref<LiveMapTable> :
   return live-map-table(linker(vm))
 
+lostanza defn dynamic-libraries (vm:ref<VirtualMachine>) -> ref<LoadedDynamicLibraries> :
+  return vm.dylibs
+
+lostanza defn extern-defns (vm:ref<VirtualMachine>) -> ref<ExternDefnTable> :
+  return vm.extern-defns
+
 lostanza defn update-vmstate (vm:ref<VirtualMachine>) -> ref<False> :
   val vms = vm.vmstate
   val vmt = vmtable(vm)
@@ -351,16 +346,16 @@ lostanza defn update-vmstate (vm:ref<VirtualMachine>) -> ref<False> :
 ;==================== VM Implementation =====================
 ;============================================================
 
-public defn VirtualMachine () :
+public defn VirtualMachine (dylibs:LoadedDynamicLibraries) :
   #if-defined(PLATFORM-WINDOWS) :
-    VirtualMachine(W64Backend())
+    VirtualMachine(dylibs, W64Backend())
   #else :
     #if-defined(PLATFORM-LINUX) :
-      VirtualMachine(L64Backend())
+      VirtualMachine(dylibs, L64Backend())
     #else :
-      VirtualMachine(X64Backend())
+      VirtualMachine(dylibs, X64Backend())
 
-public lostanza defn VirtualMachine (backend:ref<Backend>) -> ref<VirtualMachine> :
+public lostanza defn VirtualMachine (dylibs:ref<LoadedDynamicLibraries>, backend:ref<Backend>) -> ref<VirtualMachine> :
   val vmstate:ptr<VMState> = call-c clib/malloc(sizeof(VMState))
   vmstate.registers = call-c clib/malloc(8 * 256)
   vmstate.system-registers = call-c clib/malloc(8 * 256)
@@ -371,16 +366,20 @@ public lostanza defn VirtualMachine (backend:ref<Backend>) -> ref<VirtualMachine
   heap.iterate-roots = addr(vm-iterate-roots)
   heap.iterate-references-in-stack-frames = addr(vm-iterate-references-in-stack-frames)
 
+  ;Initialize extern trampoline
+  initialize-extern-trampoline(addr(call_extern), vmstate.registers)
+
   vmstate.trie-table = null
   vmstate.class-table = null
-  val vm-ids = VMIds()
+  val extern-defns = ExternDefnTable(backend)
+  val vm-ids = VMIds(dylibs, extern-defns)
   val class-table = ClassTable()
   val branch-table = BranchTable(class-table)
   val linker = Linker(branch-table)
-  val resolver = EncodingResolver(class-table, branch-table, live-map-table(linker))
+  val resolver = EncodingResolver(class-table, branch-table, live-map-table(linker), dylibs, extern-defns)
   val code-table = make-code-table(resolver, backend)
   val vmtable = VMTable(class-table, branch-table, code-table)
-  val vm = new VirtualMachine{backend, vmtable, vm-ids, linker, vmstate, false}
+  val vm = new VirtualMachine{dylibs, extern-defns, backend, vmtable, vm-ids, linker, vmstate, false}
   update-vmstate(vm)
   return vm
 
@@ -429,16 +428,16 @@ lostanza defn vm-iterate-references-in-stack-frames (stack:ptr<Stack>,
 ;================= Bytecode Loop ============================
 ;============================================================
 
-extern defn call_garbage_collector (vms:ptr<VMState>, size:long) -> long :
+protected extern defn call_garbage_collector (vms:ptr<VMState>, size:long) -> long :
   return extend-heap(current-vm(), size)
 
-extern defn call_print_stack_trace (vms:ptr<VMState>, stack:long) -> int :
+protected extern defn call_print_stack_trace (vms:ptr<VMState>, stack:long) -> int :
   val vm = current-vm()
   val stk:ptr<Stack> = untag(stack)
   print-stack-trace(stk, vmtable(vm), live-map-table(vm))
   return 0
 
-extern defn call_collect_stack_trace (vms:ptr<VMState>, stack:long) -> ptr<PackedStackTrace> :
+protected extern defn call_collect_stack_trace (vms:ptr<VMState>, stack:long) -> ptr<PackedStackTrace> :
   val vm = current-vm()
   val stk:ptr<Stack> = untag(stack)
   return collect-stack-trace(stk, vmtable(vm), live-map-table(vm))
@@ -466,12 +465,9 @@ public lostanza defn run-bytecode (vm:ref<VirtualMachine>, start-func:ref<Int>) 
   return false
 
 ;Called by the extern defn callbacks defined in the generated bindings
-public lostanza defn call-extern (extern-index:int) -> int :
+extern defn call_extern (func-id:int) -> int :
   ;Retrieve the currently active virtual machine
   val vm = current-vm()
-  ;Debug
-  ;Retrieve the function id for this extern index
-  val fid = get(vmtable(vm).extern-defn-funcs, new Int{extern-index})
   ;Set the returnpc to -1, so that execution will return here.
   var saved-ret:long
   let :
@@ -480,7 +476,7 @@ public lostanza defn call-extern (extern-index:int) -> int :
     saved-ret = sp.return
     sp.return = -1
   ;Execute from startin function
-  launch(new Long{vm.vmstate as long}, vm.vmtable.code-table, fid)
+  launch(new Long{vm.vmstate as long}, vm.vmtable.code-table, new Int{func-id})
   ;Restore the returnpc and return
   let :
     val stk:ptr<Stack> = current-stack(vm)
@@ -809,7 +805,11 @@ lostanza defn function-addresses (vmt:ref<VMTable>) -> ref<StableLongArray> :
 ;================= Instruction Encoding =====================
 ;============================================================
 
-defn EncodingResolver (class-table:ClassTable, branch-table:BranchTable, live-map-table:LiveMapTable) :
+defn EncodingResolver (class-table:ClassTable,
+                       branch-table:BranchTable,
+                       live-map-table:LiveMapTable,
+                       dylibs:LoadedDynamicLibraries,
+                       extern-defns:ExternDefnTable) :
   new EncodingResolver :
     defmethod liveness-map (this, live:Seqable<Int>, num-locals:Int) :
       map-index(live-map-table, live, num-locals)
@@ -841,6 +841,10 @@ defn EncodingResolver (class-table:ClassTable, branch-table:BranchTable, live-ma
         CHAR-TYPE : CHAR-TAG-INT
         INT-TYPE : INT-TAG-INT
         FLOAT-TYPE : FLOAT-TAG-INT
+    defmethod extern-address (this, id:Int) :
+      extern-address(dylibs, id)
+    defmethod extern-defn-address (this, id:Int) :
+      address-as-long(extern-defns, id)
 
 ;============================================================
 ;====================== Loading =============================
@@ -875,31 +879,40 @@ public defn load (vm:VirtualMachine, vmps:Collection<VMPackage>, keep-existing-g
       within log-time(LOAD-CLASSES) :
         load-classes(vmt, classes(load-unit))
 
+      ;Load callbacks
+      ;This has to be done before loading functions so that ExternDefnId
+      ;can be resolved to the right addresses.
+      vprintln("VM: Loading callbacks")
+      within log-time(LOAD-CALLBACKS) :
+        for c in callbacks(load-unit) do :
+          set-signature(extern-defns(vm), index(c), function-id(c), a1(c), a2(c))
+
       ;Load functions
       vprintln("VM: Encoding functions")
       within log-time(LOAD-FUNCTIONS) :
-        val encoding-resolver = EncodingResolver(class-table(vm), branch-table(vm), live-map-table(linker(vm)))
+        ;Compute the functions that are exposed externally via callbacks.
+        val callback-set = to-intset(seq(function-id, callbacks(load-unit)))
+        ;Create the encoding resolver for compiling the function.
+        val encoding-resolver = EncodingResolver(class-table(vm), branch-table(vm), live-map-table(linker(vm)),
+                                                 dynamic-libraries(vm), extern-defns(vm))
+        ;Load each of the functions.
         for f in funcs(load-unit) do :
-          load-function(vmt, f, encoding-resolver, backend(vm))
+          load-function(vmt, f, callback-set[id(f)], encoding-resolver, backend(vm))
         
       ;Load datas and consts
       vprintln("VM: Loading datas and constants")
       within log-time(LOAD-DATAS) :
         load-datas(vmt, datas(load-unit))
       within log-time(LOAD-CONSTS) :
-        load-consts(vmt, consts(load-unit))
-      ;Load callbacks
-      vprintln("VM: Loading callbacks")
-      within log-time(LOAD-CALLBACKS) :
-        for c in callbacks(load-unit) do :
-          load-callback(vmt, index(c), function-id(c))
+        load-consts(vmt, consts(load-unit))       
+          
       ;Update the virtual machine state
       vprintln("VM: Updating branch table")
       within log-time(UPDATE-BRANCH-TABLE) :
         update(branch-table(vm))
       vprintln("VM: Updating VMState")
       within log-time(UPDATE-VMSTATE) :
-        update-vmstate(vm)
+        update-vmstate(vm)      
 
       ;If core has been loaded, then initialize the constants by running
       ;the initialize-constants function.

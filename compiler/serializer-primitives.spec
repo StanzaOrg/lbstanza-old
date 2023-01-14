@@ -158,6 +158,28 @@ defcombinator opt (item:T) (x:T|False) :
       1Y : #skip[item]
       else : #error
 
+
+;============================================================
+;====================== Maybe ===============================
+;============================================================
+defcombinator maybe (item:T) (x:Maybe<T>) :
+  writer :
+    if empty?(x) :
+      #write[byte](0Y)
+    else :
+      #write[byte](1Y)
+      #write[item](value!(x))
+  reader :
+    switch(#read[byte]) :
+      0Y : None()
+      1Y : One(#read[item])
+      else : #error
+  skip :
+    switch(#read[byte]) :
+      0Y : false
+      1Y : #skip[item]
+      else : #error
+
 ;============================================================
 ;====================== FileInfo ============================
 ;============================================================
