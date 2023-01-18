@@ -2163,18 +2163,19 @@ static inline uint64_t parse_stack_frame_format(const JSObject* format) {
   return x;
 }
 typedef struct {
-  uint64_t id;  // Unique id that combines thread/coroutine id and frame id in the stack (i.e. offset from the bottom).
   char* function_name;  // Owned by StackTraceFrame
   char* source_path;    // Owned by StackTraceFrame
   int64_t line;         // 1-based
   int64_t column;       // 1-based, 0 denotes unknown
+  uint64_t pc;
+  uint64_t sp;
 } StackTraceFrame;
 typedef struct {
   size_t length;
   size_t capacity;
   StackTraceFrame* data;
 } StackTrace;
-static void StackTrace_initialize(StackTrace* st) {
+static inline void StackTrace_initialize(StackTrace* st) {
   st->length = 0;
   st->capacity = 16; // Initial stack trace size
   st->data = malloc(st->capacity * sizeof(StackTraceFrame));
@@ -2187,6 +2188,10 @@ static inline void StackTrace_destroy(StackTrace* st) {
   }
   free(st->data);
 }
+static inline void StackTrace_reset(StackTrace* st) {
+  StackTrace_destroy(st);
+  StackTrace_initialize(st);
+}
 static inline StackTraceFrame* StackTrace_allocate(StackTrace* st) {
   if (st->length == st->capacity) {
     st->capacity <<= 1;
@@ -2195,21 +2200,23 @@ static inline StackTraceFrame* StackTrace_allocate(StackTrace* st) {
   }
   return st->data + st->length++;
 }
+static StackTrace current_stack_trace;
 
-void append_stack_frame(StackTrace* st, uint64_t frame_id, const char* function_name,
+void append_stack_frame(uint64_t pc, uint64_t sp, const char* function_name,
                         const char* source_path, int64_t line, int64_t column) {
-  StackTraceFrame* frame = StackTrace_allocate(st);
-  frame->id = frame_id;
+  StackTraceFrame* frame = StackTrace_allocate(&current_stack_trace);
   frame->function_name = strdup(function_name);
   frame->source_path = strdup(source_path);
   frame->line = line;
   frame->column = column;
+  frame->pc = pc;
+  frame->sp = sp;
 }
 
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
 // Frames not visible to the debugger can be skipped.
 // Returns total number of frames in thread_id stack or -1 when no thread with given therad_id thread_is found.
-int32_t create_stack_trace(StackTrace* st, const uint64_t format) ;
+int32_t create_stack_trace(const uint64_t format) ;
 
 typedef struct {
   DelayedRequest parent;
@@ -2220,10 +2227,9 @@ typedef struct {
 } DelayedRequestStackTrace;
 static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
-  StackTrace st;
-  StackTrace_initialize(&st);
-  if (!terminated_event_sent && stack_trace_available) create_stack_trace(&st, req->format);
-  const int64_t total_frames = st.length;
+  StackTrace_reset(&current_stack_trace);
+  if (!terminated_event_sent && stack_trace_available) create_stack_trace(req->format);
+  const int64_t total_frames = current_stack_trace.length;
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
@@ -2231,11 +2237,11 @@ static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   if (total_frames >= 0) {
     JSBuilder_write_unsigned_field(&builder, "totalFrames", total_frames);
     JSBuilder_array_field_begin(&builder, "stackFrames");
-    for (const StackTraceFrame *p = st.data, *const limit = p + st.length; p < limit; p++) {
+    for (const StackTraceFrame *p = current_stack_trace.data, *const limit = p + total_frames; p < limit; p++) {
       JSBuilder_next(&builder);
       JSBuilder_object_begin(&builder);
       {
-        JSBuilder_write_unsigned_field(&builder, "id", p->id);
+        JSBuilder_write_unsigned_field(&builder, "id", (uint64_t)p);
         JSBuilder_write_string_field(&builder, "name", p->function_name);
         if (p->source_path) {
           JSBuilder_object_field_begin(&builder, "source");
@@ -2253,8 +2259,6 @@ static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   }
   JSBuilder_object_field_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
-
-  StackTrace_destroy(&st);
 }
 static inline DelayedRequest* DelayedRequestStackTrace_create(const JSObject* request) {
   DelayedRequestStackTrace* req = DelayedRequest_create(request, sizeof(DelayedRequestStackTrace), &DelayedRequestStackTrace_handle);
