@@ -2329,7 +2329,6 @@ static bool request_stackTrace(const JSObject* request) {
 
 // The debugger must be aware of the scope ids
 #define VARIABLE_SCOPES(def)\
-  def(PARAMETERS, "Parameters", "parameters")\
   def(LOCALS,     "Locals",     "locals"    )\
   def(GLOBALS,    "Globals",    "globals"   )
 enum {
