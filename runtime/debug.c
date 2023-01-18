@@ -2215,7 +2215,7 @@ void append_stack_frame(uint64_t pc, uint64_t sp, const char* function_name,
 
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
 // Frames not visible to the debugger can be skipped.
-// Returns total number of frames in thread_id stack or -1 when no thread with given therad_id thread_is found.
+// Returns total number of frames in thread_id stack or -1 when no thread with given thread_id thread_is found.
 int32_t create_stack_trace(const uint64_t format) ;
 
 typedef struct {
@@ -2339,7 +2339,7 @@ enum {
   #undef DEF_SCOPE_ID
   NUMBER_OF_SCOPES
 };
-uint32_t number_of_variables_in_scope(const uint32_t scope_id);
+uint32_t number_of_variables_in_scope(const uint32_t scope_id, const uint64_t pc);
 
 // Varaiable attributes (must be knwn to the debugger)
 enum {
@@ -2442,6 +2442,12 @@ static Variable* Environment_allocate(Environment* env, const void* ref, const c
 
 static Environment current_frame_env; // Belongs to the app thread
 static int64_t current_frame_id = INVALID_FRAME_ID;
+static inline uint64_t current_pc(void) {
+  return current_frame_id != INVALID_FRAME_ID ? ((const StackTraceFrame*)current_frame_id)->pc : 0;
+}
+static inline uint64_t current_sp(void) {
+  return current_frame_id != INVALID_FRAME_ID ? ((const StackTraceFrame*)current_frame_id)->sp : 0;
+}
 
 typedef struct {
   DelayedRequest parent;
@@ -2471,7 +2477,7 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
         const char* scope_name = scope_attributes[scope_id - 1].name;
         const char* scope_hint = scope_attributes[scope_id - 1].hint;
         Variable* var = Environment_allocate(&current_frame_env, (const void*)scope_id, scope_name,
-          number_of_variables_in_scope(scope_id));
+          number_of_variables_in_scope(scope_id, current_pc()));
         JSBuilder_write_raw_string_field(&builder, "name", scope_name);
         JSBuilder_write_raw_string_field(&builder, "presentationHint", scope_hint);
         JSBuilder_write_unsigned_field(&builder, "variablesReference", scope_id);
@@ -2487,10 +2493,21 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
 }
 #undef VARIABLE_SCOPES
 
+static inline bool is_valid_stack_trace_frame_id(const uint64_t frame_id) {
+  const uint64_t offset = frame_id - (uint64_t)current_stack_trace.data;
+  if (offset % sizeof(StackTraceFrame) == 0) {
+    const uint64_t index = offset / sizeof(StackTraceFrame);
+    return index < (uint64_t)current_stack_trace.length;
+  }
+  return false;
+}
 static inline DelayedRequest* DelayedRequestScopes_create(const JSObject* request) {
   DelayedRequestScopes* req = DelayedRequest_create(request, sizeof(DelayedRequestScopes), &DelayedRequestScopes_handle);
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  req->frame_id = JSObject_get_integer_field(arguments, "frameId", INVALID_FRAME_ID);
+  int64_t frame_id = JSObject_get_integer_field(arguments, "frameId", INVALID_FRAME_ID);
+  if (frame_id != INVALID_FRAME_ID && !is_valid_stack_trace_frame_id(frame_id))
+    frame_id = INVALID_FRAME_ID;
+  req->frame_id = frame_id;
   return (DelayedRequest*) req;
 }
 static bool request_scopes(const JSObject* request) {
@@ -2595,7 +2612,8 @@ void append_variable(const void* ref, const char* name, const char* type, const 
   v->attributes = attributes;
   v->ref = ref;
 }
-void create_fields(const void* ref, const char* name, uint64_t fields_count, uint64_t hex);
+void create_fields(const void* ref, const char* name, uint64_t fields_count, uint64_t hex,
+                   uint64_t pc, uint64_t sp);
 
 typedef struct {
   DelayedRequest parent;
@@ -2617,7 +2635,7 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   if (fields_count && !fields_base) {
     fields_base = current_frame_env.length;
     var->fields_base = fields_base;
-    create_fields(var->ref, var->name, fields_count, req->hex);
+    create_fields(var->ref, var->name, fields_count, req->hex, current_pc(), current_sp());
     var = NULL; // Nuke 'var' as it could become invalid when 'env.data' expands.
   }
 
