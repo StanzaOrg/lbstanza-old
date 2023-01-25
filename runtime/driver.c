@@ -329,6 +329,13 @@ stz_int get_file_type (const stz_byte* filename, stz_int follow_sym_links) {
 //     Environment Variable Setting
 //     ============================
 #ifdef PLATFORM_WINDOWS
+
+  //Retrieve all environment variables as a list.
+  extern char** _environ;
+  char** get_env_vars (){
+    return _environ;
+  }
+
   stz_int setenv (const stz_byte* name, const stz_byte* value, stz_int overwrite) {
     //If we don't want to overwrite previous value, then check whether it exists.
     //If it does, then just return 0.
@@ -351,6 +358,14 @@ stz_int get_file_type (const stz_byte* filename, stz_int follow_sym_links) {
     stz_free(buffer);
     return (stz_int)r;
   }
+#else
+
+  //Retrieve all environment variables as a list.
+  extern char** environ;
+  char** get_env_vars (){
+    return environ;
+  }
+
 #endif
 
 //             Time Modified
