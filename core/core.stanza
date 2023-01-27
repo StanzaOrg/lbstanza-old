@@ -3470,8 +3470,7 @@ lostanza defn DyCtxtFinallyFrame (f:ref<(() -> ?)>) -> ref<DyCtxtFrame> :
 ;- length: The number of active dynamic frames when this coroutine was
 ;  resumed.
 ;- top: The top-most frame when this coroutine was resumed.
-;- num-frames: If not the top-most coroutine, the number of frames in the coroutine.
-;  Otherwise -1.
+;- num-frames: The number of frames in the coroutine.
 lostanza deftype DyCtxtState :
   var length:int
   var top:int
@@ -3481,6 +3480,13 @@ lostanza deftype DyCtxtState :
 lostanza deftype DyCtxtPack :
   length:long
   var frames:ref<DyCtxtFrame> ...
+
+lostanza defn contains-finally? (pack:ref<DyCtxtPack>) -> long :
+  val len = pack.length
+  for (var i:long = 0, i < len, i = i + 1) :
+    val f = pack.frames[i]
+    if f.finally? : return 1
+  return 0
 
 lostanza defn length (p:ref<DyCtxtPack>) -> ref<Int> : 
   return new Int{p.length as int}
@@ -3499,7 +3505,7 @@ defmethod print (o:OutputStream, p:DyCtxtPack) :
 
 ;Retrieve the current state of the dynamic context stack.
 ;Used for when a Coroutine is created.
-lostanza defn current-dynamic-context-state (s:ref<DyCtxtState>) -> ref<False> :
+lostanza defn store-current-dynamic-context-state (s:ref<DyCtxtState>) -> ref<False> :
   val len = length(DYNAMIC-CONTEXTS).value
   s.length = len
   if len > 0 : s.top = peek(DYNAMIC-CONTEXTS).id
@@ -3589,6 +3595,14 @@ lostanza defn wind-in (pack:ref<DyCtxtPack>) -> ref<False> :
   for (var i:long = 0, i < len, i = i + 1) :
     push-dy-ctxt-frame(pack.frames[i])
   return false
+
+;Wind in only the finally frames.
+lostanza defn wind-in-finally (pack:ref<DyCtxtPack>) -> ref<False> :
+  val len = pack.length
+  for (var i:long = 0, i < len, i = i + 1) :
+    if pack.frames[i].finally? :
+      push-dy-ctxt-frame(pack.frames[i])    
+  return false  
 
 ;Error message for fatal.
 defn empty-dy-stack (id:Int) :
@@ -3738,17 +3752,32 @@ protected lostanza deftype RawCoroutine <: Coroutine & Unique :
   var status: ref<Int>
   dy-ctxt-state: ref<DyCtxtState>
   var crsp: long
-;  saved-winders: ref<SavedWinders>
+  saved-finally: ref<SavedFinally>
 
-;- attached-finalizer? is false by default, and is marked as true
-;  when winders is set to a list that contains at least one Winder
-;  with a final callback.
-;lostanza deftype SavedWinders :
-;  var winders: ref<List<Winder>>
-;  var attached-finalizer?: ref<True|False>
+;When a coroutine is garbage-collected or closed, we need to
+;execute its finally blocks. 
+;- attached-finalizer?: Gets set to true when we create a finalizer.
+lostanza deftype SavedFinally <: Finalizer :
+  var pack: ref<DyCtxtPack|False>
+  var registered?: ref<True|False>
 
-;lostanza deftype WinderFinalizer <: Finalizer :
-;  saved-winders: ref<SavedWinders>
+lostanza defn save-pack (saved:ref<SavedFinally>,
+                         pack:ref<DyCtxtPack>,
+                         c:ref<RawCoroutine>) -> ref<False> :
+  if contains-finally?(pack) :
+    saved.pack = pack
+    if saved.registered? == false :
+      saved.registered? = true
+      add-finalizer(saved, c)
+  return false
+
+lostanza defmethod run (f:ref<SavedFinally>) -> ref<False> :
+  val pack = f.pack
+  if pack != false :
+    val pack = pack as ref<DyCtxtPack>
+    wind-in-finally(pack)
+    wind-out(pack, false, true)
+  return false
 
 lostanza deftype CoroutineParams :
   parent-stack: ref<Stack>
@@ -3762,10 +3791,14 @@ lostanza defn initialize-coroutines () -> ref<False> :
   val vms:ptr<VMState> = call-prim flush-vm()
   val current-stack = vms.heap.current-stack as ref<Stack>
   val crsp = call-prim crsp() as long
-  current-coroutine = new RawCoroutine{0L, current-stack, false,
-                                       COROUTINE-ACTIVE, new DyCtxtState{0, 0, -1}, crsp,
-                                       ;new SavedWinders{List(), false}
-                                       }
+  current-coroutine = new RawCoroutine{
+                        0L,
+                        current-stack,
+                        false,
+                        COROUTINE-ACTIVE,
+                        new DyCtxtState{0, 0, 0},
+                        crsp,
+                        new SavedFinally{false, false}}
   COROUTINE-COUNTER = 1L
   return false
 
@@ -3791,19 +3824,16 @@ lostanza defmethod open? (c:ref<RawCoroutine>) -> ref<True|False> :
   if c.status == COROUTINE-OPEN : return true
   else : return false
 
-;lostanza defmethod run (f:ref<WinderFinalizer>) -> ref<False> :
-;  val winders = f.saved-winders.winders
-;  if empty?(winders) == false :
-;    f.saved-winders.winders = List()
-;    wind-out(winders, false, true)
-;  return false
-
 lostanza defn* setup-coroutine (stack:ref<Stack>, parent-stack:ref<Stack>, enter:ref<((RawCoroutine, ?) -> ?)>) -> ref<?> :
   val crsp = call-prim crsp() as long
-  val co = new RawCoroutine{COROUTINE-COUNTER, stack, false, COROUTINE-OPEN,
-                            new DyCtxtState{0, 0, -1}, crsp,
-                            ;new SavedWinders{List(), false}
-                            }
+  val co = new RawCoroutine{
+                 COROUTINE-COUNTER,
+                 stack,
+                 false,
+                 COROUTINE-OPEN,
+                 new DyCtxtState{0, 0, 0},
+                 crsp,
+                 new SavedFinally{false, false}}
   COROUTINE-COUNTER = COROUTINE-COUNTER + 1L
   val x0 = call-prim yield(parent-stack, co)
   return break(co, [enter](co, x0))
@@ -3863,14 +3893,9 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   val pack = dynamic-context-pack(c.dy-ctxt-state)
   wind-out(pack, true, false)
 
-;  call-c clib/printf("[%ld] Wind out\n", stack-id)
-;
-;  ;Set target winder environment and wind out
-;  c.saved-winders.winders = pop-winders(total-winders(c.parent))
-;  add-winders-finalizer-if-necessary?(c)
-;  wind-out(c.saved-winders.winders, true, false)
-;
-;  call-c clib/printf("[%ld] Wind outs finished\n", stack-id)
+  ;Save the dynamic context pack in case we need to
+  ;run its finally blocks later.
+  save-pack(c.saved-finally, pack, c)
 
   ;Detach coroutine
   detach-coroutine(c, COROUTINE-OPEN)
@@ -3880,13 +3905,6 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
 
   ;Wind in the dynamic context state.
   wind-in(pack)
-
-;  ;Wind in and restore original winder environment
-;  val winders = c.saved-winders.winders
-;  c.saved-winders.winders = List()
-;  wind-in(winders)
-;  push-winders(winders)
-
 
   ;Return execution
   return result
@@ -3900,11 +3918,12 @@ lostanza defmethod close (c:ref<RawCoroutine>) -> ref<False> :
   else if c.status == COROUTINE-SUSPENDED :
     return fatal("Cannot close coroutine. Coroutine's parent is suspended.")
 
-  ;Execute any final winders if necessary
-  ;val winders = c.saved-winders.winders
-  ;if empty?(winders) == false :
-  ;  c.saved-winders.winders = List()
-  ;  wind-out(winders, false, true)
+  ;Execute the finally blocks.
+  if c.saved-finally.pack != false :
+    val pack = c.saved-finally.pack as ref<DyCtxtPack>
+    c.saved-finally.pack = false
+    wind-in-finally(pack)
+    wind-out(pack, false, true)
 
   free-coroutine(c)
   return false
@@ -3965,10 +3984,16 @@ lostanza defn free-coroutine (c:ref<RawCoroutine>) -> int :
         (p:ref<False>) : return 0
 
 lostanza defn attach-coroutine (c:ref<RawCoroutine>) -> int :
-  ;Update dynamic context information of c and current-coroutine.
-  current-dynamic-context-state(c.dy-ctxt-state)
+  ;Store current state of dynamic context in c.
+  store-current-dynamic-context-state(c.dy-ctxt-state)
+
+  ;Now that cc is being closed off, compute its final number of frames.
   val cc = current-coroutine
   cc.dy-ctxt-state.num-frames = c.dy-ctxt-state.length - cc.dy-ctxt-state.length
+
+  ;Now that the coroutine is attached again, discard its saved finally
+  ;blocks.
+  c.saved-finally.pack = false
   
   labels :
     begin :
