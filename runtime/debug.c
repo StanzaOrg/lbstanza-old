@@ -99,6 +99,55 @@ static inline void free_path(const char* s) {
   free((char*)s);
 }
 
+typedef struct {
+  uint8_t* const address;
+  const uint64_t group;
+} SafepointAddress;
+
+typedef struct {
+  const uint64_t length;
+  const SafepointAddress addresses[];
+} AddressList;
+
+typedef struct {
+  const uint64_t line;
+  const AddressList* const address_list;
+} SafepointEntry;
+
+typedef struct {
+  const uint64_t num_entries;
+  const char* const filename;
+  const SafepointEntry entries[];
+} FileSafepoints;
+
+typedef struct {
+  const uint64_t num_files;
+  const FileSafepoints* const files[];
+} SafepointTable;
+
+const SafepointTable* app_safepoint_table;
+
+static void write_to_all_safepoints(uint8_t val) {
+  const SafepointTable* safepoints = app_safepoint_table;
+  if (safepoints) {
+    for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files; i++) {
+      const FileSafepoints* file = safepoints->files[i];
+      for (const SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++) {
+        const AddressList* list = entry->address_list;
+        for (const SafepointAddress *p = list->addresses, *lim = p + list->length; p < lim; p++) {
+          *p->address = val;
+        }
+      }
+    }
+  }
+}
+static inline void enable_all_safepoints(void) {
+  write_to_all_safepoints(0xCC); // INT3
+}
+static inline void disable_all_safepoints(void) {
+  write_to_all_safepoints(0x90); // NOP
+}
+
 // I/O interface and its implementation over files and sockets.
 // Note: I am not sure why is this necessary in LLDB.
 static ssize_t (*debug_adapter_read) (char* data, size_t length);
