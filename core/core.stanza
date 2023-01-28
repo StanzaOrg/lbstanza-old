@@ -3408,289 +3408,184 @@ defmethod length (x:List) :
 ;=================== Dynamic Context ========================
 ;============================================================
 
-;A counter for generating ids for dynamic context frames.
-var DYNAMIC-CONTEXT-COUNTER:Seq<Int>
-
-;Global stack of dynamic contexts.
-var DYNAMIC-CONTEXTS:Vector<DyCtxtFrame>
-
-;Initialize the global variables necessary for
-;tracking dynamic contexts.
-defn initialize-dynamic-contexts () :
-  DYNAMIC-CONTEXT-COUNTER = to-seq(0 to false)
-  DYNAMIC-CONTEXTS = Vector<DyCtxtFrame>()
-
 ;Represents a new dynamic context frame.
-lostanza deftype DyCtxtFrame :
-  id:int
-  finally?:int
-  in: ref<False|(() -> ?)>
-  out: ref<False|(() -> ?)>
+defstruct DyCtxtFrame :
+  finally?:True|False
+  in: False|(() -> ?)
+  out: False|(() -> ?)
 
-lostanza defn id (f:ref<DyCtxtFrame>) -> ref<Int> :
-  return new Int{f.id}
-lostanza defn finally? (f:ref<DyCtxtFrame>) -> ref<True|False> :
-  if f.finally? : return true
-  else : return false
-lostanza defn in (f:ref<DyCtxtFrame>) -> ref<False|(() -> ?)> :
-  return f.in
-lostanza defn out (f:ref<DyCtxtFrame>) -> ref<False|(() -> ?)> :
-  return f.out
+;Represents the state of the dynamic context stack in
+;a single coroutine.
+defstruct DyCtxtState <: Finalizer :
+  frames:List<DyCtxtFrame> with:
+    setter => set-frames
+    init => List()
+  saved:DyCtxtWinder|False with:
+    setter => set-saved
+    init => false
+  registered?:True|False with:
+    setter => set-registered?
+    init => false
 
-public defn print-dynamic-contexts () :
-  println("Dynamic Context:")
-  for f in in-reverse(DYNAMIC-CONTEXTS) do :
-    print("  ")
-    println(f)
+;Wind in and out the saved frames.
+defmethod run (s:DyCtxtState) -> False :
+  if saved(s) is-not False :
+    val winder = saved(s) as DyCtxtWinder
+    set-saved(s, false)
+    wind-in-out(winder)
 
-defmethod print (o:OutputStream, f:DyCtxtFrame) :
-  val in-str = " " when in(f) is False else "^"
-  val out-str = " " when out(f) is False else "v"
-  val f-str = "F" when finally?(f) else " "
-  print(o, "[%_ | %_ | %_ %_]" % [id(f), in-str, out-str, f-str])
+;Save the winders in the coroutine, so that if the coroutine
+;is closed, we can run the finally blocks.
+defn save-winders (co:RawCoroutine, w:DyCtxtWinder) -> False :
+  if contains-finally?(w) :
+    val s = dy-ctxt-state(co)
+    set-saved(s, w)
+    if not registered?(s) :
+      set-registered?(s,true)
+      add-finalizer(s, co)
+
+;Clear the winders in the coroutine because it's attached again.
+defn clear-winders (co:RawCoroutine) -> False :
+  set-saved(dy-ctxt-state(co), false)
+
+;Represents a runner that is winding-in/winding-out a set of
+;dynamic context frames.
+defstruct DyCtxtWinder :
+  entries:List<KeyValue<Int,DyCtxtFrame>> with:
+    setter => set-entries
+    init => List()
+
+;Returns true if any of the entries in the winder is a
+;finally block.
+defn contains-finally? (w:DyCtxtWinder) -> True|False :
+  for e in entries(w) any? :
+    finally?(value(e))
+
+;Returns the number of entries that need to be processed
+;to obtain all finally blocks.
+defn num-finally-blocks (w:DyCtxtWinder) -> Int :
+  var last-index:Int = -1
+  for (e in entries(w), i in 0 to false) do :
+    if finally?(value(e)) :
+      last-index = i
+  last-index + 1
+
+;Return true if the winder has no more entries.
+defn empty? (w:DyCtxtWinder) -> True|False :
+  empty?(entries(w))
+
+;Push a new entry to the winder.
+defn push (w:DyCtxtWinder, co-id:Int, frame:DyCtxtFrame) :
+  set-entries(w, cons(co-id => frame, entries(w)))
+
+;Pop an entry from the winder.
+defn pop (w:DyCtxtWinder) -> KeyValue<Int,DyCtxtFrame> :
+  val e = head(entries(w))
+  set-entries(w, tail(entries(w)))
+  e
+
+;Take a look at the top entry in the winder.
+defn peek (w:DyCtxtWinder) -> KeyValue<Int,DyCtxtFrame> :
+  head(entries(w))
 
 ;Create a new non-finally dynamic context frame.
-lostanza defn DyCtxtFrame (in:ref<False|(() -> ?)>,
-                           out:ref<False|(() -> ?)>) -> ref<DyCtxtFrame> :
-  return new DyCtxtFrame{
-           next(DYNAMIC-CONTEXT-COUNTER).value
-           0,
-           in,
-           out}
+defn DyCtxtFrame (in:False|(() -> ?),
+                  out:False|(() -> ?)) -> DyCtxtFrame :
+  DyCtxtFrame(false, in, out)                
 
 ;Create a new finally dynamic context frame.
-lostanza defn DyCtxtFinallyFrame (f:ref<(() -> ?)>) -> ref<DyCtxtFrame> :
-  return new DyCtxtFrame{
-           next(DYNAMIC-CONTEXT-COUNTER).value
-           1,
-           false,
-           f}
+defn DyCtxtFinallyFrame (out:False|(() -> ?)) -> DyCtxtFrame :
+  DyCtxtFrame(true, false, out)
 
-;Represents the state of the dynamic context stack.
-;- length: The number of active dynamic frames when this coroutine was
-;  resumed.
-;- top: The top-most frame when this coroutine was resumed.
-;- num-frames: The number of frames in the coroutine.
-lostanza deftype DyCtxtState :
-  var length:int
-  var top:int
-  var num-frames:int
+;Returns true if the state has no more frames.
+defn empty? (s:DyCtxtState) -> True|False :
+  empty?(frames(s))
 
-;Represents a pack of dynamic context frames.
-lostanza deftype DyCtxtPack :
-  length:long
-  var frames:ref<DyCtxtFrame> ...
+;Execute and push a new frame onto the state.
+defn push-frame (s:DyCtxtState, f:DyCtxtFrame) -> False :
+  match(in(f)) :
+    (f:False) : false
+    (f-in:() -> ?) : f-in()
+  set-frames(s, cons(f, frames(s)))
 
-lostanza defn contains-finally? (pack:ref<DyCtxtPack>) -> long :
-  val len = pack.length
-  for (var i:long = 0, i < len, i = i + 1) :
-    val f = pack.frames[i]
-    if f.finally? : return 1
-  return 0
+;Pop a new frame from the state, and execute it.
+defn pop-frame (s:DyCtxtState,
+                call-out?:True|False,
+                call-finally?:True|False) -> DyCtxtFrame :
+  val f = head(frames(s))
+  set-frames(s, tail(frames(s)))
+  match(out(f)) :
+    (f:False) :
+      false
+    (f-out:() -> ?) :
+      if finally?(f) :
+        f-out() when call-finally?
+      else :
+        f-out() when call-out?
+  f
 
-lostanza defn length (p:ref<DyCtxtPack>) -> ref<Int> : 
-  return new Int{p.length as int}
-
-lostanza defn get (p:ref<DyCtxtPack>, i:ref<Int>) -> ref<DyCtxtFrame> :
-  return p.frames[i.value]
-
-defmethod print (o:OutputStream, p:DyCtxtPack) :
-  val n = length(p)
-  if n == 0 :
-    print(o, "DyCtxtPack: ()")
-  else :
-    print(o, "DyCtxtPack:")
-    for i in reverse(0 to length(p)) do :
-      lnprint(o, "  %_" % [p[i]])
-
-;Retrieve the current state of the dynamic context stack.
-;Used for when a Coroutine is created.
-lostanza defn store-current-dynamic-context-state (s:ref<DyCtxtState>) -> ref<False> :
-  val len = length(DYNAMIC-CONTEXTS).value
-  s.length = len
-  if len > 0 : s.top = peek(DYNAMIC-CONTEXTS).id
-  else : s.top = 0
-  return false
-
-;Retrieve the top-n frames on the dynamic context stack, and return
-;the frames as a pack.
-lostanza defn dynamic-context-pack (state:ref<DyCtxtState>) -> ref<DyCtxtPack> :
-  ensure-consistent-state(state)
-  val num-frames = length(DYNAMIC-CONTEXTS).value
-  val pack-length = num-frames - state.length
-  if pack-length == 0 :
-    return EMPTY-DY-CTXT-PACK
-  else :
-    val start = state.length
-    val frame0 = get(DYNAMIC-CONTEXTS, new Int{start})
-    val pack = new DyCtxtPack{pack-length, frame0}
-    for (var i:long = 1, i < pack-length, i = i + 1) :
-      pack.frames[i] = frame0
-    for (var i:int = 1, i < pack-length, i = i + 1) :
-      pack.frames[i] = get(DYNAMIC-CONTEXTS, new Int{start + i})
-    return pack
-
-lostanza defn ensure-consistent-state (s:ref<DyCtxtState>) -> ref<False> :
-  ;Ensure the length is proper.
-  if s.length > length(DYNAMIC-CONTEXTS).value :
-    fatal(larger-state-than-expected(new Int{s.length}, length(DYNAMIC-CONTEXTS)))
-  ;Ensure the frame id is expected.
-  if s.length > 0 :
-    val f = get(DYNAMIC-CONTEXTS, new Int{s.length - 1})
-    if f.id != s.top :
-      fatal(wrong-dy-state(new Int{s.top}, new Int{f.id}))
-  return false
-
-defn larger-state-than-expected (expected:Int, actual:Int) :
-  "Expected length of dynamic context stack is %_, but actual \
-   length is %_." % [expected, actual]
-   
-defn wrong-dy-state (expected:Int, actual:Int) :
-  "Expected frame id is %_, but actual frame is %_." % [expected, actual]
-
-lostanza val EMPTY-DY-CTXT-PACK:ref<DyCtxtPack> = new DyCtxtPack{0}
-
-;Push a single dynamic context frame after we execute it.
-lostanza defn push-dy-ctxt-frame (f:ref<DyCtxtFrame>) -> ref<False> :
-  if f.in != false :
-    val f-in = f.in as ref<(() -> ?)>
-    [f-in]()
-  add(DYNAMIC-CONTEXTS, f)
-  return false
-
-;Pop a single dynamic context frame and then execute it.
-lostanza defn pop-dy-ctxt-frame (f:ref<DyCtxtFrame>,
-                                 call-out?:ref<True|False>,
-                                 call-finally?:ref<True|False>) -> ref<False> :
-  ;Check sanity frame.
-  if empty?(DYNAMIC-CONTEXTS) == true :
-    fatal(empty-dy-stack(new Int{f.id}))
-  if peek(DYNAMIC-CONTEXTS).id != f.id :
-    val top = peek(DYNAMIC-CONTEXTS)
-    fatal(wrong-dy-stack(new Int{f.id}, new Int{top.id}))
-
-  ;Pop the top frame.
-  pop(DYNAMIC-CONTEXTS)
-
-  ;Call the frame out if requested.
-  if f.out != false :
-    val f-out = f.out as ref<(() -> ?)>
-    if f.finally? :
-      if call-finally? == true : [f-out]()
+;Execute wind-out frames and save into winder.
+defn wind-out (c:RawCoroutine,
+               winder:DyCtxtWinder,
+               target-id:Int,
+               call-out?:True|False,
+               call-finally?:True|False) -> False :
+  let loop (c:RawCoroutine = c) :
+    val s = dy-ctxt-state(c)
+    if empty?(s) :
+      if id(c) != target-id :
+        loop(parent(c) as RawCoroutine)
     else :
-      if call-out? == true : [f-out]()
-  return false
+      val f = pop-frame(s, call-out?, call-finally?)
+      push(winder, id(c), f)
+      loop(c)
 
-;Wind out a frame pack.
-lostanza defn wind-out (pack:ref<DyCtxtPack>,
-                        call-out?:ref<True|False>
-                        call-finally?:ref<True|False>) -> ref<False> :
-  for (var i:long = pack.length - 1, i >= 0, i = i - 1) :
-    pop-dy-ctxt-frame(pack.frames[i], call-out?, call-finally?)
-  return false
+;Execute wind-in frames in winder and push onto state.
+defn wind-in (winder:DyCtxtWinder, c:RawCoroutine) -> False :
+  if not empty?(winder) :
+    defn* pop-next-frame (cos:List<RawCoroutine>) :
+      if not empty?(winder) :
+        val entry = pop(winder)
+        exec-frame(cos, key(entry), value(entry))
+    defn* exec-frame (cos:List<RawCoroutine>, co-id:Int, frame:DyCtxtFrame) :
+      val co = head(cos)
+      if id(co) == co-id :        
+        push-frame(dy-ctxt-state(co), frame)
+        pop-next-frame(cos)
+      else :
+        exec-frame(tail(cos), co-id, frame)
+    val entry0 = peek(winder)
+    pop-next-frame(reverse(collect-parents(c, key(entry0))))
 
-;Wind in a frame pack.
-lostanza defn wind-in (pack:ref<DyCtxtPack>) -> ref<False> :
-  val len = pack.length
-  for (var i:long = 0, i < len, i = i + 1) :
-    push-dy-ctxt-frame(pack.frames[i])
-  return false
+;Execute the given body with the given frame pushed into
+;the dynamic context of the current coroutine.
+defn dynamic-wind<?T> (body:() -> ?T,
+                       frame:DyCtxtFrame) -> T :
+  val s = dy-ctxt-state(current-coroutine)
+  push-frame(s, frame)
+  val result = body()
+  pop-frame(s, true, true)
+  result
 
-;Wind in only the finally frames.
-lostanza defn wind-in-finally (pack:ref<DyCtxtPack>) -> ref<False> :
-  val len = pack.length
-  for (var i:long = 0, i < len, i = i + 1) :
-    if pack.frames[i].finally? :
-      push-dy-ctxt-frame(pack.frames[i])    
-  return false  
-
-;Error message for fatal.
-defn empty-dy-stack (id:Int) :
-  "Expecting dynamic frame with id %_, but dynamic \
-   context stack is empty." % [id]
-defn wrong-dy-stack (id:Int, actual:Int) :
-  "Expecting dynamic frame with id %_, but top of dynamic \
-   context stack is frame %_." % [id, actual]
-
-;Pop a specific dynamic context frame.
-;defstruct Winder :
-;  in: False|(() -> ?)
-;  out: False|(() -> ?)
-;  final: False|(() -> ?)
-;
-;var WINDER-STACK:List<Winder>
-;var NUM-WINDERS:Int
-;
-;defn initialize-winders () :
-;  WINDER-STACK = List()
-;  NUM-WINDERS = 0
-;
-;defn pop-winder () :
-;  val w = head(WINDER-STACK)
-;  WINDER-STACK = tail(WINDER-STACK)
-;  NUM-WINDERS = NUM-WINDERS - 1
-;  w
-;
-;defn push-winder (w:Winder) :
-;  WINDER-STACK = cons(w, WINDER-STACK)
-;  NUM-WINDERS = NUM-WINDERS + 1
-;
-;defn pop-winders (n:Int) :
-;  defn pop (n:Int) :
-;    if n > 0 : cons(pop-winder(), pop(n - 1))
-;    else : List()
-;  pop(NUM-WINDERS - n)
-;
-;defn push-winders (ws:List<Winder>) :
-;  if not empty?(ws) :
-;    push-winders(tail(ws))
-;    push-winder(head(ws))
-;
-;defn total-winders (c:False|RawCoroutine) -> Int :
-;  match(c) :
-;    (c:False) : 0
-;    (c:RawCoroutine) : total-winders(parent(c)) + num-winders(c)
-;
-;defn wind-in (ws:List<Winder>) :
-;  if not empty?(ws) :
-;    wind-in(tail(ws))
-;    call?(in(head(ws)))
-;
-;defn wind-out (ws:List<Winder>, call-out:True|False, call-final:True|False) :
-;  if not empty?(ws) :
-;    call?(out(head(ws))) when call-out
-;    call?(final(head(ws))) when call-final
-;    wind-out(tail(ws), call-out, call-final)
-;
-;defn* call? (f: False|(() -> ?)) :
-;  match(f) :
-;    (f:() -> ?) : f()
-;    (f:False) : false
-;
-;lostanza defn inc-winders (c:ref<RawCoroutine>, n:ref<Int>) -> ref<False> :
-;  c.num-winders = c.num-winders + n.value
-;  return false
-;
-;lostanza defn num-winders (c:ref<RawCoroutine>) -> ref<Int> :
-;  return new Int{c.num-winders}
-
+;Execute the given body within the given dynamic context.
 public defn dynamic-wind<?T> (in:False|(() -> ?),
                               body:() -> ?T,
                               out:False|(() -> ?)) -> T :
-  val frame = DyCtxtFrame(in, out)
-  push-dy-ctxt-frame(frame)
-  val result = body()
-  pop-dy-ctxt-frame(frame, true, true)
-  result
+  dynamic-wind(body, DyCtxtFrame(in, out))
 
-;  call?(in*)
-;  push-winder(Winder(in*, out*, false))
-;  inc-winders(current-coroutine, 1)
-;  val result = body()
-;  pop-winder()
-;  inc-winders(current-coroutine, -1)
-;  call?(out*)
-;  result
+;Wind in and then wind out of all entries in the given winder.
+;Used to force finally blocks to run.
+defn wind-in-out (winder:DyCtxtWinder) -> False :
+  val num = num-finally-blocks(winder)
+  let loop (i:Int = 0) :
+    if i < num :
+      dynamic-wind(loop{i + 1}, value(pop(winder)))
+    false
+
+;Collect parents up to the given parent-id.
+defn collect-parents (c:RawCoroutine, parent-id:Int) -> List<RawCoroutine> :
+  if id(c) == parent-id : List(c)
+  else : cons(c, collect-parents(parent(c) as RawCoroutine, parent-id))
 
 ;============================================================
 ;====================== Coroutines ==========================
@@ -3750,34 +3645,11 @@ protected lostanza deftype RawCoroutine <: Coroutine & Unique :
   var stack: ref<Stack>
   var parent: ref<False|RawCoroutine>
   var status: ref<Int>
-  dy-ctxt-state: ref<DyCtxtState>
   var crsp: long
-  saved-finally: ref<SavedFinally>
+  dy-ctxt-state: ref<DyCtxtState>
 
-;When a coroutine is garbage-collected or closed, we need to
-;execute its finally blocks. 
-;- attached-finalizer?: Gets set to true when we create a finalizer.
-lostanza deftype SavedFinally <: Finalizer :
-  var pack: ref<DyCtxtPack|False>
-  var registered?: ref<True|False>
-
-lostanza defn save-pack (saved:ref<SavedFinally>,
-                         pack:ref<DyCtxtPack>,
-                         c:ref<RawCoroutine>) -> ref<False> :
-  if contains-finally?(pack) :
-    saved.pack = pack
-    if saved.registered? == false :
-      saved.registered? = true
-      add-finalizer(saved, c)
-  return false
-
-lostanza defmethod run (f:ref<SavedFinally>) -> ref<False> :
-  val pack = f.pack
-  if pack != false :
-    val pack = pack as ref<DyCtxtPack>
-    wind-in-finally(pack)
-    wind-out(pack, false, true)
-  return false
+lostanza defn dy-ctxt-state (co:ref<RawCoroutine>) -> ref<DyCtxtState> :
+  return co.dy-ctxt-state
 
 lostanza deftype CoroutineParams :
   parent-stack: ref<Stack>
@@ -3796,9 +3668,8 @@ lostanza defn initialize-coroutines () -> ref<False> :
                         current-stack,
                         false,
                         COROUTINE-ACTIVE,
-                        new DyCtxtState{0, 0, 0},
                         crsp,
-                        new SavedFinally{false, false}}
+                        DyCtxtState()}
   COROUTINE-COUNTER = 1L
   return false
 
@@ -3831,9 +3702,8 @@ lostanza defn* setup-coroutine (stack:ref<Stack>, parent-stack:ref<Stack>, enter
                  stack,
                  false,
                  COROUTINE-OPEN,
-                 new DyCtxtState{0, 0, 0},
                  crsp,
-                 new SavedFinally{false, false}}
+                 DyCtxtState()}
   COROUTINE-COUNTER = COROUTINE-COUNTER + 1L
   val x0 = call-prim yield(parent-stack, co)
   return break(co, [enter](co, x0))
@@ -3890,12 +3760,11 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
 
   ;Retrieve the pack of frames since parent was last exited,
   ;and wind out.
-  val pack = dynamic-context-pack(c.dy-ctxt-state)
-  wind-out(pack, true, false)
+  val winder = DyCtxtWinder()
+  wind-out(current-coroutine, winder, id(c), true, false)
 
-  ;Save the dynamic context pack in case we need to
-  ;run its finally blocks later.
-  save-pack(c.saved-finally, pack, c)
+  ;Save the winders in case we need to run its finally blocks later.
+  save-winders(c, winder)
 
   ;Detach coroutine
   detach-coroutine(c, COROUTINE-OPEN)
@@ -3903,8 +3772,11 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   ;Return to resume
   val result = call-prim yield(current-coroutine.stack, x)
 
+  ;Clear winders so now the coroutine is attached again.
+  clear-winders(c)
+
   ;Wind in the dynamic context state.
-  wind-in(pack)
+  wind-in(winder, current-coroutine)
 
   ;Return execution
   return result
@@ -3919,11 +3791,7 @@ lostanza defmethod close (c:ref<RawCoroutine>) -> ref<False> :
     return fatal("Cannot close coroutine. Coroutine's parent is suspended.")
 
   ;Execute the finally blocks.
-  if c.saved-finally.pack != false :
-    val pack = c.saved-finally.pack as ref<DyCtxtPack>
-    c.saved-finally.pack = false
-    wind-in-finally(pack)
-    wind-out(pack, false, true)
+  run(c.dy-ctxt-state)
 
   free-coroutine(c)
   return false
@@ -3942,8 +3810,8 @@ lostanza defmethod break (c:ref<RawCoroutine>, x:ref<?>) -> ref<Void> :
 
   ;Retrieve the pack of frames since parent was last exited,
   ;and wind out.
-  val pack = dynamic-context-pack(c.dy-ctxt-state)
-  wind-out(pack, true, true)
+  val winder = DyCtxtWinder()
+  wind-out(current-coroutine, winder, id(c), true, true)
 
 ;  call-c clib/printf("[%ld] Wind out\n", stack-id)
 ;
@@ -3983,18 +3851,7 @@ lostanza defn free-coroutine (c:ref<RawCoroutine>) -> int :
         (p:ref<RawCoroutine>) : goto loop(p)
         (p:ref<False>) : return 0
 
-lostanza defn attach-coroutine (c:ref<RawCoroutine>) -> int :
-  ;Store current state of dynamic context in c.
-  store-current-dynamic-context-state(c.dy-ctxt-state)
-
-  ;Now that cc is being closed off, compute its final number of frames.
-  val cc = current-coroutine
-  cc.dy-ctxt-state.num-frames = c.dy-ctxt-state.length - cc.dy-ctxt-state.length
-
-  ;Now that the coroutine is attached again, discard its saved finally
-  ;blocks.
-  c.saved-finally.pack = false
-  
+lostanza defn attach-coroutine (c:ref<RawCoroutine>) -> int :  
   labels :
     begin :
       goto loop(c)
@@ -4005,14 +3862,8 @@ lostanza defn attach-coroutine (c:ref<RawCoroutine>) -> int :
       c.crsp = call-prim crsp() as long
       current-coroutine = c
       match(p) :
-        (p:ref<RawCoroutine>) :
-          ;We now know the parent's dynamic context state.
-          p.dy-ctxt-state.length = c.dy-ctxt-state.length + c.dy-ctxt-state.num-frames
-          if c.dy-ctxt-state.num-frames == 0 :
-            p.dy-ctxt-state.top = c.dy-ctxt-state.top
-          goto loop(p)
-        (p:ref<False>) :
-          return 0
+        (p:ref<RawCoroutine>) : goto loop(p)
+        (p:ref<False>) : return 0
 
 ;Implements the semantics of suspending with 'c' as the argument coroutine.
 ;This function follows the parent pointer of the current coroutine until it reaches
@@ -4180,8 +4031,6 @@ protected val uninitialized = new Uninitialized
 
 initialize-error-handler()
 initialize-command-launcher()
-;initialize-winders()
-initialize-dynamic-contexts()
 initialize-coroutines()
 initialize-gc-notifiers()
 initialize-liveness-handlers()
@@ -6284,10 +6133,11 @@ defstruct NormalResult : (result)
 
 ;Run the given body with the equipped finally block.
 public defn with-finally<?T> (body: () -> ?T, finally: () -> ?) -> T :
+  val s = dy-ctxt-state(current-coroutine)
   val frame = DyCtxtFinallyFrame(finally)
-  push-dy-ctxt-frame(frame)
+  push-frame(s, frame)
   val result = body()
-  pop-dy-ctxt-frame(frame, true, true)
+  pop-frame(s, true, true)
   result
 
 
