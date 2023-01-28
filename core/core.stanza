@@ -3408,48 +3408,37 @@ defmethod length (x:List) :
 ;=================== Dynamic Context ========================
 ;============================================================
 
-;Represents a new dynamic context frame.
+;------------------------------------------------------------
+;----------- Representation of one Dynamic Frame ------------
+;------------------------------------------------------------
+;A dynamic frame consists of an entry thunk and an exit thunk.
+;A boolean flag indicates whether the exit thunk is a
+;'finally' block or not. Finally blocks are treated specially.
+
 defstruct DyCtxtFrame :
   finally?:True|False
   in: False|(() -> ?)
   out: False|(() -> ?)
 
-;Represents the state of the dynamic context stack in
-;a single coroutine.
-defstruct DyCtxtState <: Finalizer :
-  frames:List<DyCtxtFrame> with:
-    setter => set-frames
-    init => List()
-  saved:DyCtxtWinder|False with:
-    setter => set-saved
-    init => false
-  registered?:True|False with:
-    setter => set-registered?
-    init => false
+;Create a new non-finally dynamic context frame.
+defn DyCtxtFrame (in:False|(() -> ?),
+                  out:False|(() -> ?)) -> DyCtxtFrame :
+  DyCtxtFrame(false, in, out)                
 
-;Wind in and out the saved frames.
-defmethod run (s:DyCtxtState) -> False :
-  if saved(s) is-not False :
-    val winder = saved(s) as DyCtxtWinder
-    set-saved(s, false)
-    wind-in-out(winder)
+;Create a new finally dynamic context frame.
+defn DyCtxtFinallyFrame (out:False|(() -> ?)) -> DyCtxtFrame :
+  DyCtxtFrame(true, false, out)
 
-;Save the winders in the coroutine, so that if the coroutine
-;is closed, we can run the finally blocks.
-defn save-winders (co:RawCoroutine, w:DyCtxtWinder) -> False :
-  if contains-finally?(w) :
-    val s = dy-ctxt-state(co)
-    set-saved(s, w)
-    if not registered?(s) :
-      set-registered?(s,true)
-      add-finalizer(s, co)
+;------------------------------------------------------------
+;------------- State of a Winding Algorithm -----------------
+;------------------------------------------------------------
+;A DyCtxtWinder captures the in-progress state of performing
+;a wind-in, or wind-out operation.
+;As frames are pushed/popped into a coroutine, they are saved
+;onto the winder.
 
-;Clear the winders in the coroutine because it's attached again.
-defn clear-winders (co:RawCoroutine) -> False :
-  set-saved(dy-ctxt-state(co), false)
-
-;Represents a runner that is winding-in/winding-out a set of
-;dynamic context frames.
+;- entries: Each entry, CO => F, means that the frame
+;F was popped from the state of coroutine CO during wind-out.
 defstruct DyCtxtWinder :
   entries:List<KeyValue<Int,DyCtxtFrame>> with:
     setter => set-entries
@@ -3461,8 +3450,8 @@ defn contains-finally? (w:DyCtxtWinder) -> True|False :
   for e in entries(w) any? :
     finally?(value(e))
 
-;Returns the number of entries that need to be processed
-;to obtain all finally blocks.
+;Returns the minimum number of entries to pop
+;from winder until 'contains-finally?' returns false.
 defn num-finally-blocks (w:DyCtxtWinder) -> Int :
   var last-index:Int = -1
   for (e in entries(w), i in 0 to false) do :
@@ -3488,20 +3477,59 @@ defn pop (w:DyCtxtWinder) -> KeyValue<Int,DyCtxtFrame> :
 defn peek (w:DyCtxtWinder) -> KeyValue<Int,DyCtxtFrame> :
   head(entries(w))
 
-;Create a new non-finally dynamic context frame.
-defn DyCtxtFrame (in:False|(() -> ?),
-                  out:False|(() -> ?)) -> DyCtxtFrame :
-  DyCtxtFrame(false, in, out)                
+;------------------------------------------------------------
+;---------------- State of Dynamic Context ------------------
+;------------------------------------------------------------
+;Each coroutine stores its own stack of dynamic frames.
 
-;Create a new finally dynamic context frame.
-defn DyCtxtFinallyFrame (out:False|(() -> ?)) -> DyCtxtFrame :
-  DyCtxtFrame(true, false, out)
+;- frames: The frames that have finished winding-in.
+;  Most recent wind-in is at front.
+;- saved: If the coroutine is suspended and in OPEN status,
+;  then this contains a DyCtxtWinder that contains finally
+;  blocks that need to execute when the coroutine is closed.
+;- registered?: The DyCtxtState doubles as a finalizer which
+;  executes its saved finally blocks. To prevent it from
+;  being registered repeatedly, this field holds true if it
+;  has already been registered as a finalizer.
+defstruct DyCtxtState <: Finalizer :
+  frames:List<DyCtxtFrame> with:
+    setter => set-frames
+    init => List()
+  saved:DyCtxtWinder|False with:
+    setter => set-saved
+    init => false
+  registered?:True|False with:
+    setter => set-registered?
+    init => false
+
+;Execute the saved finally blocks.
+defmethod run (s:DyCtxtState) -> False :
+  if saved(s) is-not False :
+    val winder = saved(s) as DyCtxtWinder
+    set-saved(s, false)
+    wind-in-out(winder)
+
+;The coroutine co has just been suspended. Save the finally
+;blocks, and register the finalizer.
+defn save-winders (co:RawCoroutine, w:DyCtxtWinder) -> False :
+  if contains-finally?(w) :
+    val s = dy-ctxt-state(co)
+    set-saved(s, w)
+    if not registered?(s) :
+      set-registered?(s,true)
+      add-finalizer(s, co)
+
+;The coroutine co has just been resumed, so we don't need
+;its saved winders anymore.
+defn clear-winders (co:RawCoroutine) -> False :
+  set-saved(dy-ctxt-state(co), false)
 
 ;Returns true if the state has no more frames.
 defn empty? (s:DyCtxtState) -> True|False :
   empty?(frames(s))
 
 ;Execute and push a new frame onto the state.
+;The frame is pushed *after* it executes. 
 defn push-frame (s:DyCtxtState, f:DyCtxtFrame) -> False :
   match(in(f)) :
     (f:False) : false
@@ -3509,6 +3537,9 @@ defn push-frame (s:DyCtxtState, f:DyCtxtFrame) -> False :
   set-frames(s, cons(f, frames(s)))
 
 ;Pop a new frame from the state, and execute it.
+;The frame is *first* popped and then executed.
+;non-finally out-blocks are executed only if call-out? is true.
+;finally out-blocks are executed only if call-finally? is true.
 defn pop-frame (s:DyCtxtState,
                 call-out?:True|False,
                 call-finally?:True|False) -> DyCtxtFrame :
@@ -3524,7 +3555,13 @@ defn pop-frame (s:DyCtxtState,
         f-out() when call-out?
   f
 
-;Execute wind-out frames and save into winder.
+;------------------------------------------------------------
+;------------ Main Wind-in / Wind-out Algorithms ------------
+;------------------------------------------------------------
+
+;Execute all wind-out dynamic frames, pushing them into the
+;winder. Starts from c and traverses its parent chain until
+;target-id (inclusive) is processed.
 defn wind-out (c:RawCoroutine,
                winder:DyCtxtWinder,
                target-id:Int,
@@ -3540,7 +3577,8 @@ defn wind-out (c:RawCoroutine,
       push(winder, id(c), f)
       loop(c)
 
-;Execute wind-in frames in winder and push onto state.
+;Execute the stored wind-in frames in the winder, pushing them
+;back onto the coroutine state.
 defn wind-in (winder:DyCtxtWinder, c:RawCoroutine) -> False :
   if not empty?(winder) :
     defn* pop-next-frame (cos:List<RawCoroutine>) :
@@ -3556,6 +3594,15 @@ defn wind-in (winder:DyCtxtWinder, c:RawCoroutine) -> False :
         exec-frame(tail(cos), co-id, frame)
     val entry0 = peek(winder)
     pop-next-frame(reverse(collect-parents(c, key(entry0))))
+
+;Collect parents up to the given parent-id.
+defn collect-parents (c:RawCoroutine, parent-id:Int) -> List<RawCoroutine> :
+  if id(c) == parent-id : List(c)
+  else : cons(c, collect-parents(parent(c) as RawCoroutine, parent-id))
+
+;------------------------------------------------------------
+;--------------- Dynamic Wind Algorithm ---------------------
+;------------------------------------------------------------
 
 ;Execute the given body with the given frame pushed into
 ;the dynamic context of the current coroutine.
@@ -3581,11 +3628,6 @@ defn wind-in-out (winder:DyCtxtWinder) -> False :
     if i < num :
       dynamic-wind(loop{i + 1}, value(pop(winder)))
     false
-
-;Collect parents up to the given parent-id.
-defn collect-parents (c:RawCoroutine, parent-id:Int) -> List<RawCoroutine> :
-  if id(c) == parent-id : List(c)
-  else : cons(c, collect-parents(parent(c) as RawCoroutine, parent-id))
 
 ;============================================================
 ;====================== Coroutines ==========================
