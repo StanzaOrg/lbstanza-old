@@ -3559,11 +3559,11 @@ defn pop-frame (s:DyCtxtState,
 ;------------ Main Wind-in / Wind-out Algorithms ------------
 ;------------------------------------------------------------
 
-;Execute all wind-out dynamic frames, pushing them into the
-;winder. Starts from c and traverses its parent chain until
-;target-id (inclusive) is processed.
+;Execute all wind-out dynamic frames, pushing them into the winder (if
+;given). Starts from c and traverses its parent chain until target-id
+;(inclusive) is processed.
 defn wind-out (c:RawCoroutine,
-               winder:DyCtxtWinder,
+               winder:DyCtxtWinder|False,
                target-id:Int,
                call-out?:True|False,
                call-finally?:True|False) -> False :
@@ -3574,7 +3574,8 @@ defn wind-out (c:RawCoroutine,
         loop(parent(c) as RawCoroutine)
     else :
       val f = pop-frame(s, call-out?, call-finally?)
-      push(winder, id(c), f)
+      match(winder:DyCtxtWinder) :
+        push(winder, id(c), f)
       loop(c)
 
 ;Execute the stored wind-in frames in the winder, pushing them
@@ -3690,9 +3691,6 @@ protected lostanza deftype RawCoroutine <: Coroutine & Unique :
   var crsp: long
   dy-ctxt-state: ref<DyCtxtState>
 
-lostanza defn dy-ctxt-state (co:ref<RawCoroutine>) -> ref<DyCtxtState> :
-  return co.dy-ctxt-state
-
 lostanza deftype CoroutineParams :
   parent-stack: ref<Stack>
   coroutine: ref<RawCoroutine>
@@ -3728,6 +3726,8 @@ lostanza defn status (c:ref<RawCoroutine>) -> ref<Int> :
   return c.status
 lostanza defn id (c:ref<RawCoroutine>) -> ref<Int> :
   return new Int{c.id as int}
+lostanza defn dy-ctxt-state (co:ref<RawCoroutine>) -> ref<DyCtxtState> :
+  return co.dy-ctxt-state
 
 lostanza defmethod active? (c:ref<RawCoroutine>) -> ref<True|False> :
   if c.status == COROUTINE-ACTIVE : return true
@@ -3772,22 +3772,6 @@ lostanza defmethod resume (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   ;Return the result yielded by the coroutine.
   return result
 
-;;Return true if any of the given winders has a final callback.
-;defn has-final-callback? (winders:List<Winder>) -> True|False :
-;  for w in winders any? :
-;    final(w) is-not False
-
-;If the coroutine's saved winders contains a final callback and a
-;finalizer has not been attached to run them when the coroutine
-;is collected, then add it now.
-;lostanza defn add-winders-finalizer-if-necessary? (c:ref<RawCoroutine>) -> ref<False> :
-;  val saved-winders = c.saved-winders
-;  if saved-winders.attached-finalizer? == false and
-;     has-final-callback?(saved-winders.winders) == true :
-;    add-finalizer(new WinderFinalizer{saved-winders}, c)
-;    saved-winders.attached-finalizer? = true
-;  return false
-
 lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   ;Ensure coroutine is active
   if c.status == COROUTINE-CLOSED :
@@ -3798,10 +3782,10 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
     return fatal("Cannot suspend coroutine. Coroutine is already suspended.")
 
   ;Ensure coroutine was launched within same c context
-  ensure-target-in-same-c-ctxt!(c)
+  ensure-no-cross-ffi-call-boundary!(c)
 
-  ;Retrieve the pack of frames since parent was last exited,
-  ;and wind out.
+  ;Wind out from current-coroutine until we reach c.
+  ;Save wind-out frames into the winder.
   val winder = DyCtxtWinder()
   wind-out(current-coroutine, winder, id(c), true, false)
 
@@ -3814,7 +3798,7 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   ;Return to resume
   val result = call-prim yield(current-coroutine.stack, x)
 
-  ;Clear winders so now the coroutine is attached again.
+  ;Clear winders now that the coroutine is attached again.
   clear-winders(c)
 
   ;Wind in the dynamic context state.
@@ -3848,20 +3832,11 @@ lostanza defmethod break (c:ref<RawCoroutine>, x:ref<?>) -> ref<Void> :
     return fatal("Cannot break from coroutine. Coroutine is already suspended.")
 
   ;Ensure coroutine was launched within same c context
-  ensure-target-in-same-c-ctxt!(c)
+  ensure-no-cross-ffi-call-boundary!(c)
 
-  ;Retrieve the pack of frames since parent was last exited,
-  ;and wind out.
-  val winder = DyCtxtWinder()
-  wind-out(current-coroutine, winder, id(c), true, true)
-
-;  call-c clib/printf("[%ld] Wind out\n", stack-id)
-;
-;  ;Set target winder environment and wind out
-;  val winders = pop-winders(total-winders(c.parent))
-;  wind-out(winders, true, true)
-;
-;  call-c clib/printf("[%ld] Wind outs finished\n", stack-id)
+  ;Wind out from the current coroutine. No need
+  ;to store the frames since we won't wind-in again.
+  wind-out(current-coroutine, false, id(c), true, true)
 
   ;Adjust state
   detach-coroutine(c, COROUTINE-CLOSED)
@@ -3869,17 +3844,21 @@ lostanza defmethod break (c:ref<RawCoroutine>, x:ref<?>) -> ref<Void> :
   ;Begin execution
   return call-prim yield(current-coroutine.stack, x)
 
+;Return true if suspending from this coroutine will cross the FFI call boundary.
 lostanza defmethod suspension-crosses-ffi-call-boundary? (c:ref<RawCoroutine>) -> ref<True|False> :
   val crsp = call-prim crsp() as long
   if crsp == c.crsp : return false
   else : return true
 
-lostanza defn ensure-target-in-same-c-ctxt! (c:ref<RawCoroutine>) -> int :
-  val crsp = call-prim crsp() as long
-  if c.crsp != crsp :
-    fatal!("Cannot suspend coroutine. Coroutine was launched from a different C context. All 'extern defn' callbacks must return properly.")
+;Issue an error if suspending from this coroutine results in crossing the FFI call boundary.
+lostanza defn ensure-no-cross-ffi-call-boundary! (c:ref<RawCoroutine>) -> int :
+  if suspension-crosses-ffi-call-boundary?(c) == true :
+    fatal!("Cannot suspend coroutine. Coroutine was launched from a different C context. \
+            All 'extern defn' callbacks must return properly.")
   return 0
 
+;The given coroutine is finished. Close it and
+;free all it stacks.
 lostanza defn free-coroutine (c:ref<RawCoroutine>) -> int :
   labels :
     begin :
@@ -3893,6 +3872,9 @@ lostanza defn free-coroutine (c:ref<RawCoroutine>) -> int :
         (p:ref<RawCoroutine>) : goto loop(p)
         (p:ref<False>) : return 0
 
+;Fix up the .parent, .status, and .crsp links from
+;attaching the given coroutine to 'current-coroutine'.
+;The current coroutine will be set to the last parent in the chain.
 lostanza defn attach-coroutine (c:ref<RawCoroutine>) -> int :  
   labels :
     begin :
