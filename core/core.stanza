@@ -3405,80 +3405,234 @@ defmethod length (x:List) :
   loop(x, 0)
 
 ;============================================================
-;=================== Winders ================================
+;=================== Dynamic Context ========================
 ;============================================================
-defstruct Winder :
+
+;------------------------------------------------------------
+;----------- Representation of one Dynamic Frame ------------
+;------------------------------------------------------------
+;A dynamic frame consists of an entry thunk and an exit thunk.
+;A boolean flag indicates whether the exit thunk is a
+;'finally' block or not. Finally blocks are treated specially.
+
+defstruct DyCtxtFrame :
+  finally?:True|False
   in: False|(() -> ?)
   out: False|(() -> ?)
-  final: False|(() -> ?)
 
-var WINDER-STACK:List<Winder>
-var NUM-WINDERS:Int
+;Create a new non-finally dynamic context frame.
+defn DyCtxtFrame (in:False|(() -> ?),
+                  out:False|(() -> ?)) -> DyCtxtFrame :
+  DyCtxtFrame(false, in, out)                
 
-defn initialize-winders () :
-  WINDER-STACK = List()
-  NUM-WINDERS = 0
+;Create a new finally dynamic context frame.
+defn DyCtxtFinallyFrame (out:False|(() -> ?)) -> DyCtxtFrame :
+  DyCtxtFrame(true, false, out)
 
-defn pop-winder () :
-  val w = head(WINDER-STACK)
-  WINDER-STACK = tail(WINDER-STACK)
-  NUM-WINDERS = NUM-WINDERS - 1
-  w
+;------------------------------------------------------------
+;------------- State of a Winding Algorithm -----------------
+;------------------------------------------------------------
+;A DyCtxtWinder captures the in-progress state of performing
+;a wind-in, or wind-out operation.
+;As frames are pushed/popped into a coroutine, they are saved
+;onto the winder.
 
-defn push-winder (w:Winder) :
-  WINDER-STACK = cons(w, WINDER-STACK)
-  NUM-WINDERS = NUM-WINDERS + 1
+;- entries: Each entry, CO => F, means that the frame
+;F was popped from the state of coroutine CO during wind-out.
+defstruct DyCtxtWinder :
+  entries:List<KeyValue<Int,DyCtxtFrame>> with:
+    setter => set-entries
+    init => List()
 
-defn pop-winders (n:Int) :
-  defn pop (n:Int) :
-    if n > 0 : cons(pop-winder(), pop(n - 1))
-    else : List()
-  pop(NUM-WINDERS - n)
+;Returns true if any of the entries in the winder is a
+;finally block.
+defn contains-finally? (w:DyCtxtWinder) -> True|False :
+  for e in entries(w) any? :
+    finally?(value(e))
 
-defn push-winders (ws:List<Winder>) :
-  if not empty?(ws) :
-    push-winders(tail(ws))
-    push-winder(head(ws))
+;Returns the minimum number of entries to pop
+;from winder until 'contains-finally?' returns false.
+defn num-finally-blocks (w:DyCtxtWinder) -> Int :
+  var last-index:Int = -1
+  for (e in entries(w), i in 0 to false) do :
+    if finally?(value(e)) :
+      last-index = i
+  last-index + 1
 
-defn total-winders (c:False|RawCoroutine) -> Int :
-  match(c) :
-    (c:False) : 0
-    (c:RawCoroutine) : total-winders(parent(c)) + num-winders(c)
+;Return true if the winder has no more entries.
+defn empty? (w:DyCtxtWinder) -> True|False :
+  empty?(entries(w))
 
-defn wind-in (ws:List<Winder>) :
-  if not empty?(ws) :
-    wind-in(tail(ws))
-    call?(in(head(ws)))
+;Push a new entry to the winder.
+defn push (w:DyCtxtWinder, co-id:Int, frame:DyCtxtFrame) :
+  set-entries(w, cons(co-id => frame, entries(w)))
 
-defn wind-out (ws:List<Winder>, call-out:True|False, call-final:True|False) :
-  if not empty?(ws) :
-    call?(out(head(ws))) when call-out
-    call?(final(head(ws))) when call-final
-    wind-out(tail(ws), call-out, call-final)
+;Pop an entry from the winder.
+defn pop (w:DyCtxtWinder) -> KeyValue<Int,DyCtxtFrame> :
+  val e = head(entries(w))
+  set-entries(w, tail(entries(w)))
+  e
 
-defn* call? (f: False|(() -> ?)) :
-  match(f) :
-    (f:() -> ?) : f()
+;Take a look at the top entry in the winder.
+defn peek (w:DyCtxtWinder) -> KeyValue<Int,DyCtxtFrame> :
+  head(entries(w))
+
+;------------------------------------------------------------
+;---------------- State of Dynamic Context ------------------
+;------------------------------------------------------------
+;Each coroutine stores its own stack of dynamic frames.
+
+;- frames: The frames that have finished winding-in.
+;  Most recent wind-in is at front.
+;- saved: If the coroutine is suspended and in OPEN status,
+;  then this contains a DyCtxtWinder that contains finally
+;  blocks that need to execute when the coroutine is closed.
+;- registered?: The DyCtxtState doubles as a finalizer which
+;  executes its saved finally blocks. To prevent it from
+;  being registered repeatedly, this field holds true if it
+;  has already been registered as a finalizer.
+defstruct DyCtxtState <: Finalizer :
+  frames:List<DyCtxtFrame> with:
+    setter => set-frames
+    init => List()
+  saved:DyCtxtWinder|False with:
+    setter => set-saved
+    init => false
+  registered?:True|False with:
+    setter => set-registered?
+    init => false
+
+;Execute the saved finally blocks.
+defmethod run (s:DyCtxtState) -> False :
+  if saved(s) is-not False :
+    val winder = saved(s) as DyCtxtWinder
+    set-saved(s, false)
+    wind-in-out(winder)
+
+;The coroutine co has just been suspended. Save the finally
+;blocks, and register the finalizer.
+defn save-winders (co:RawCoroutine, w:DyCtxtWinder) -> False :
+  if contains-finally?(w) :
+    val s = dy-ctxt-state(co)
+    set-saved(s, w)
+    if not registered?(s) :
+      set-registered?(s,true)
+      add-finalizer(s, co)
+
+;The coroutine co has just been resumed, so we don't need
+;its saved winders anymore.
+defn clear-winders (co:RawCoroutine) -> False :
+  set-saved(dy-ctxt-state(co), false)
+
+;Returns true if the state has no more frames.
+defn empty? (s:DyCtxtState) -> True|False :
+  empty?(frames(s))
+
+;Execute and push a new frame onto the state.
+;The frame is pushed *after* it executes. 
+defn push-frame (s:DyCtxtState, f:DyCtxtFrame) -> False :
+  match(in(f)) :
     (f:False) : false
+    (f-in:() -> ?) : f-in()
+  set-frames(s, cons(f, frames(s)))
 
-lostanza defn inc-winders (c:ref<RawCoroutine>, n:ref<Int>) -> ref<False> :
-  c.num-winders = c.num-winders + n.value
-  return false
+;Pop a new frame from the state, and execute it.
+;The frame is *first* popped and then executed.
+;non-finally out-blocks are executed only if call-out? is true.
+;finally out-blocks are executed only if call-finally? is true.
+defn pop-frame (s:DyCtxtState,
+                call-out?:True|False,
+                call-finally?:True|False) -> DyCtxtFrame :
+  val f = head(frames(s))
+  set-frames(s, tail(frames(s)))
+  match(out(f)) :
+    (f:False) :
+      false
+    (f-out:() -> ?) :
+      if finally?(f) :
+        f-out() when call-finally?
+      else :
+        f-out() when call-out?
+  f
 
-lostanza defn num-winders (c:ref<RawCoroutine>) -> ref<Int> :
-  return new Int{c.num-winders}
+;------------------------------------------------------------
+;------------ Main Wind-in / Wind-out Algorithms ------------
+;------------------------------------------------------------
 
+;Execute all wind-out dynamic frames, pushing them into the winder (if
+;given). Starts from c and traverses its parent chain until target-id
+;(inclusive) is processed.
+defn wind-out (c:RawCoroutine,
+               winder:DyCtxtWinder|False,
+               target-id:Int,
+               call-out?:True|False,
+               call-finally?:True|False) -> False :
+  let loop (c:RawCoroutine = c) :
+    val s = dy-ctxt-state(c)
+    if empty?(s) :
+      if id(c) != target-id :
+        loop(parent(c) as RawCoroutine)
+    else :
+      val f = pop-frame(s, call-out?, call-finally?)
+      match(winder:DyCtxtWinder) :
+        push(winder, id(c), f)
+      loop(c)
+
+;Execute the stored wind-in frames in the winder, pushing them
+;back onto the coroutine state.
+defn wind-in (winder:DyCtxtWinder, c:RawCoroutine) -> False :
+  if not empty?(winder) :
+    defn* pop-next-frame (cos:List<RawCoroutine>) :
+      if not empty?(winder) :
+        val entry = pop(winder)
+        exec-frame(cos, key(entry), value(entry))
+    defn* exec-frame (cos:List<RawCoroutine>, co-id:Int, frame:DyCtxtFrame) :
+      val co = head(cos)
+      if id(co) == co-id :        
+        push-frame(dy-ctxt-state(co), frame)
+        pop-next-frame(cos)
+      else :
+        exec-frame(tail(cos), co-id, frame)
+    val entry0 = peek(winder)
+    pop-next-frame(reverse(collect-parents(c, key(entry0))))
+
+;Collect parents up to the given parent-id.
+defn collect-parents (c:RawCoroutine, parent-id:Int) -> List<RawCoroutine> :
+  if id(c) == parent-id : List(c)
+  else : cons(c, collect-parents(parent(c) as RawCoroutine, parent-id))
+
+;------------------------------------------------------------
+;--------------- Dynamic Wind Algorithm ---------------------
+;------------------------------------------------------------
+
+;Execute the given body with the given frame pushed into
+;the dynamic context of the current coroutine.
+defn dynamic-wind<?T> (body:() -> ?T,
+                       frame:DyCtxtFrame) -> T :
+  val s = dy-ctxt-state(current-coroutine)
+  push-frame(s, frame)
+  val result = body()
+  pop-frame(s, true, true)
+  result
+
+;Wind in and then wind out of all entries in the given winder.
+;Used to force finally blocks to run.
+defn wind-in-out (winder:DyCtxtWinder) -> False :
+  val num = num-finally-blocks(winder)
+  let loop (i:Int = 0) :
+    if i < num :
+      dynamic-wind(loop{i + 1}, value(pop(winder)))
+    false
+
+;Execute the given body within the given dynamic context.
 public defn dynamic-wind<?T> (in:False|(() -> ?),
                               body:() -> ?T,
                               out:False|(() -> ?)) -> T :
-  call?(in)
-  push-winder(Winder(in, out, false))
-  inc-winders(current-coroutine, 1)
-  val result = body()
-  pop-winder()
-  inc-winders(current-coroutine, -1)
-  call?(out)
-  result
+  dynamic-wind(body, DyCtxtFrame(in, out))
+
+;Run the given body with the equipped finally block.
+public defn with-finally<?T> (body: () -> ?T, finally: () -> ?) -> T :
+  dynamic-wind(body, DyCtxtFinallyFrame(finally))
 
 ;============================================================
 ;====================== Coroutines ==========================
@@ -3538,19 +3692,8 @@ protected lostanza deftype RawCoroutine <: Coroutine & Unique :
   var stack: ref<Stack>
   var parent: ref<False|RawCoroutine>
   var status: ref<Int>
-  var num-winders: int
   var crsp: long
-  saved-winders: ref<SavedWinders>
-
-;- attached-finalizer? is false by default, and is marked as true
-;  when winders is set to a list that contains at least one Winder
-;  with a final callback.
-lostanza deftype SavedWinders :
-  var winders: ref<List<Winder>>
-  var attached-finalizer?: ref<True|False>
-
-lostanza deftype WinderFinalizer <: Finalizer :
-  saved-winders: ref<SavedWinders>
+  dy-ctxt-state: ref<DyCtxtState>
 
 lostanza deftype CoroutineParams :
   parent-stack: ref<Stack>
@@ -3564,7 +3707,13 @@ lostanza defn initialize-coroutines () -> ref<False> :
   val vms:ptr<VMState> = call-prim flush-vm()
   val current-stack = vms.heap.current-stack as ref<Stack>
   val crsp = call-prim crsp() as long
-  current-coroutine = new RawCoroutine{0L, current-stack, false, COROUTINE-ACTIVE, 0, crsp, new SavedWinders{List(), false}}
+  current-coroutine = new RawCoroutine{
+                        0L,
+                        current-stack,
+                        false,
+                        COROUTINE-ACTIVE,
+                        crsp,
+                        DyCtxtState()}
   COROUTINE-COUNTER = 1L
   return false
 
@@ -3581,6 +3730,8 @@ lostanza defn status (c:ref<RawCoroutine>) -> ref<Int> :
   return c.status
 lostanza defn id (c:ref<RawCoroutine>) -> ref<Int> :
   return new Int{c.id as int}
+lostanza defn dy-ctxt-state (co:ref<RawCoroutine>) -> ref<DyCtxtState> :
+  return co.dy-ctxt-state
 
 lostanza defmethod active? (c:ref<RawCoroutine>) -> ref<True|False> :
   if c.status == COROUTINE-ACTIVE : return true
@@ -3590,16 +3741,15 @@ lostanza defmethod open? (c:ref<RawCoroutine>) -> ref<True|False> :
   if c.status == COROUTINE-OPEN : return true
   else : return false
 
-lostanza defmethod run (f:ref<WinderFinalizer>) -> ref<False> :
-  val winders = f.saved-winders.winders
-  if empty?(winders) == false :
-    f.saved-winders.winders = List()
-    wind-out(winders, false, true)
-  return false
-
 lostanza defn* setup-coroutine (stack:ref<Stack>, parent-stack:ref<Stack>, enter:ref<((RawCoroutine, ?) -> ?)>) -> ref<?> :
   val crsp = call-prim crsp() as long
-  val co = new RawCoroutine{COROUTINE-COUNTER, stack, false, COROUTINE-OPEN, 0, crsp, new SavedWinders{List(), false}}
+  val co = new RawCoroutine{
+                 COROUTINE-COUNTER,
+                 stack,
+                 false,
+                 COROUTINE-OPEN,
+                 crsp,
+                 DyCtxtState()}
   COROUTINE-COUNTER = COROUTINE-COUNTER + 1L
   val x0 = call-prim yield(parent-stack, co)
   return break(co, [enter](co, x0))
@@ -3615,7 +3765,7 @@ lostanza defmethod resume (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
 
   ;Adjust state
   attach-coroutine(c)
-
+  
   ;Begin execution
   val result = call-prim yield(current-coroutine.stack, x)
 
@@ -3625,22 +3775,6 @@ lostanza defmethod resume (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
 
   ;Return the result yielded by the coroutine.
   return result
-
-;Return true if any of the given winders has a final callback.
-defn has-final-callback? (winders:List<Winder>) -> True|False :
-  for w in winders any? :
-    final(w) is-not False
-
-;If the coroutine's saved winders contains a final callback and a
-;finalizer has not been attached to run them when the coroutine
-;is collected, then add it now.
-lostanza defn add-winders-finalizer-if-necessary? (c:ref<RawCoroutine>) -> ref<False> :
-  val saved-winders = c.saved-winders
-  if saved-winders.attached-finalizer? == false and
-     has-final-callback?(saved-winders.winders) == true :
-    add-finalizer(new WinderFinalizer{saved-winders}, c)
-    saved-winders.attached-finalizer? = true
-  return false
 
 lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   ;Ensure coroutine is active
@@ -3652,12 +3786,15 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
     return fatal("Cannot suspend coroutine. Coroutine is already suspended.")
 
   ;Ensure coroutine was launched within same c context
-  ensure-target-in-same-c-ctxt!(c)
+  ensure-no-cross-ffi-call-boundary!(c)
 
-  ;Set target winder environment and wind out
-  c.saved-winders.winders = pop-winders(total-winders(c.parent))
-  add-winders-finalizer-if-necessary?(c)
-  wind-out(c.saved-winders.winders, true, false)
+  ;Wind out from current-coroutine until we reach c.
+  ;Save wind-out frames into the winder.
+  val winder = DyCtxtWinder()
+  wind-out(current-coroutine, winder, id(c), true, false)
+
+  ;Save the winders in case we need to run its finally blocks later.
+  save-winders(c, winder)
 
   ;Detach coroutine
   detach-coroutine(c, COROUTINE-OPEN)
@@ -3665,17 +3802,16 @@ lostanza defmethod* suspend (c:ref<RawCoroutine>, x:ref<?>) -> ref<?> :
   ;Return to resume
   val result = call-prim yield(current-coroutine.stack, x)
 
-  ;Wind in and restore original winder environment
-  val winders = c.saved-winders.winders
-  c.saved-winders.winders = List()
-  wind-in(winders)
-  push-winders(winders)
+  ;Clear winders now that the coroutine is attached again.
+  clear-winders(c)
+
+  ;Wind in the dynamic context state.
+  wind-in(winder, current-coroutine)
 
   ;Return execution
   return result
 
 lostanza defmethod close (c:ref<RawCoroutine>) -> ref<False> :
-  ;call-c clib/printf("[from coroutine %d] closing coroutine %d\n", current-coroutine.id, c.id)
   ;Ensure coroutine is re-entrant
   if c.status == COROUTINE-CLOSED :
     return fatal("Cannot close coroutine. Coroutine is already closed.")
@@ -3684,11 +3820,8 @@ lostanza defmethod close (c:ref<RawCoroutine>) -> ref<False> :
   else if c.status == COROUTINE-SUSPENDED :
     return fatal("Cannot close coroutine. Coroutine's parent is suspended.")
 
-  ;Execute any final winders if necessary
-  val winders = c.saved-winders.winders
-  if empty?(winders) == false :
-    c.saved-winders.winders = List()
-    wind-out(winders, false, true)
+  ;Execute the finally blocks.
+  run(c.dy-ctxt-state)
 
   free-coroutine(c)
   return false
@@ -3703,11 +3836,11 @@ lostanza defmethod break (c:ref<RawCoroutine>, x:ref<?>) -> ref<Void> :
     return fatal("Cannot break from coroutine. Coroutine is already suspended.")
 
   ;Ensure coroutine was launched within same c context
-  ensure-target-in-same-c-ctxt!(c)
+  ensure-no-cross-ffi-call-boundary!(c)
 
-  ;Set target winder environment and wind out
-  val winders = pop-winders(total-winders(c.parent))
-  wind-out(winders, true, true)
+  ;Wind out from the current coroutine. No need
+  ;to store the frames since we won't wind-in again.
+  wind-out(current-coroutine, false, id(c), true, true)
 
   ;Adjust state
   detach-coroutine(c, COROUTINE-CLOSED)
@@ -3715,17 +3848,21 @@ lostanza defmethod break (c:ref<RawCoroutine>, x:ref<?>) -> ref<Void> :
   ;Begin execution
   return call-prim yield(current-coroutine.stack, x)
 
+;Return true if suspending from this coroutine will cross the FFI call boundary.
 lostanza defmethod suspension-crosses-ffi-call-boundary? (c:ref<RawCoroutine>) -> ref<True|False> :
   val crsp = call-prim crsp() as long
   if crsp == c.crsp : return false
   else : return true
 
-lostanza defn ensure-target-in-same-c-ctxt! (c:ref<RawCoroutine>) -> int :
-  val crsp = call-prim crsp() as long
-  if c.crsp != crsp :
-    fatal!("Cannot suspend coroutine. Coroutine was launched from a different C context. All 'extern defn' callbacks must return properly.")
+;Issue an error if suspending from this coroutine results in crossing the FFI call boundary.
+lostanza defn ensure-no-cross-ffi-call-boundary! (c:ref<RawCoroutine>) -> int :
+  if suspension-crosses-ffi-call-boundary?(c) == true :
+    fatal!("Cannot suspend coroutine. Coroutine was launched from a different C context. \
+            All 'extern defn' callbacks must return properly.")
   return 0
 
+;The given coroutine is finished. Close it and
+;free all it stacks.
 lostanza defn free-coroutine (c:ref<RawCoroutine>) -> int :
   labels :
     begin :
@@ -3739,7 +3876,10 @@ lostanza defn free-coroutine (c:ref<RawCoroutine>) -> int :
         (p:ref<RawCoroutine>) : goto loop(p)
         (p:ref<False>) : return 0
 
-lostanza defn attach-coroutine (c:ref<RawCoroutine>) -> int :
+;Fix up the .parent, .status, and .crsp links from
+;attaching the given coroutine to 'current-coroutine'.
+;The current coroutine will be set to the last parent in the chain.
+lostanza defn attach-coroutine (c:ref<RawCoroutine>) -> int :  
   labels :
     begin :
       goto loop(c)
@@ -3919,7 +4059,6 @@ protected val uninitialized = new Uninitialized
 
 initialize-error-handler()
 initialize-command-launcher()
-initialize-winders()
 initialize-coroutines()
 initialize-gc-notifiers()
 initialize-liveness-handlers()
@@ -5947,8 +6086,19 @@ public lostanza defn exit (code:ref<Int>) -> ref<Void> :
 ;===================== Exceptions ===========================
 ;============================================================
 
-;Represents all exceptions.
-public deftype Exception <: Unique
+;Represents all throwable objects.
+;Meant to act as a common ancestor of Exception and RuntimeException.
+public deftype Throwable <: Unique
+
+;Represents all standard exceptions.
+public deftype Exception <: Throwable
+
+;Represents errors that are uncommonly caught.
+;'try/catch' blocks default to Exception if no
+;type is provided for the catch argument, and hence
+;does not include RuntimeError. The user should expect
+;RuntimeError to mostly not be caught except for deliberately.
+public deftype RuntimeError <: Throwable
 
 ;Simple constructor for a generic exception.
 public defn Exception (msg) -> Exception :
@@ -5957,19 +6107,19 @@ public defn Exception (msg) -> Exception :
       print(o, msg)
 
 ;Holds the currently-equipped exception handler.
-var CURRENT-EXCEPTION-HANDLER : Exception -> Void =
-  fn (e:Exception) :
+var CURRENT-EXCEPTION-HANDLER : Throwable -> Void =
+  fn (e:Throwable) :
     fatal(e)
 
 ;Throw the given exception to the currently-set handler.
-public defn throw (e:Exception) :
+public defn throw (e:Throwable) :
   CURRENT-EXCEPTION-HANDLER(e)
 
 ;Run the given body with the equipped exception interceptor.
 public defn with-exception-interceptor<?T> (body: () -> ?T,
-                                            intercept: Exception -> Void) -> T :
+                                            intercept: Throwable -> Void) -> T :
   val handler = CURRENT-EXCEPTION-HANDLER
-  defn interceptor (e:Exception) :
+  defn interceptor (e:Throwable) :
     CURRENT-EXCEPTION-HANDLER = handler
     intercept(e)
   let-var CURRENT-EXCEPTION-HANDLER = interceptor :
@@ -5977,16 +6127,16 @@ public defn with-exception-interceptor<?T> (body: () -> ?T,
 
 ;Run the given body with the equipped catchers.
 public defn with-exception-handler<?T> (body: () -> ?T,
-                                        catch?: Exception -> True|False,
-                                        catcher: Exception -> ?T) -> T :
+                                        catch?: Throwable -> True|False,
+                                        catcher: Throwable -> ?T) -> T :
   ;Execute the body within a label so that stack can be unwound.
   val r = label<ExceptionResult|NormalResult> break :
-    ;Get the current handler. This needs to be called if the
-    ;equipped catcher doesn't handle this.
-    val current-handler = CURRENT-EXCEPTION-HANDLER
+    ;Holds the outer handler during the dynamic extent of this 'try' block.
+    ;Will be set during wind-in.
+    var outer-handler:Throwable -> Void
 
     ;Implementation of throw within the body.
-    defn throw-within-body (e:Exception) :
+    defn throw-within-body (e:Throwable) :
       ;First check whether the catcher is supposed to handle this
       ;exception.
       if catch?(e) :
@@ -5995,11 +6145,17 @@ public defn with-exception-handler<?T> (body: () -> ?T,
       else :
         ;Otherwise, pass the exception to the next handler
         ;to handle it.
-        current-handler(e)
+        outer-handler(e)
 
     ;Execute the body with the new throw equipped.
-    let-var CURRENT-EXCEPTION-HANDLER = throw-within-body :
-      NormalResult(body())
+    dynamic-wind(
+      fn () :
+        outer-handler = CURRENT-EXCEPTION-HANDLER
+        CURRENT-EXCEPTION-HANDLER = throw-within-body
+      fn () :
+        NormalResult(body())
+      fn () :
+        CURRENT-EXCEPTION-HANDLER = outer-handler)
 
   ;Depending on whether the body executed successfully, either
   ;run the catcher or not.
@@ -6009,18 +6165,10 @@ public defn with-exception-handler<?T> (body: () -> ?T,
 
 ;Represents the return value from a body when equipped
 ;with catchers.
-defstruct ExceptionResult : (exception: Exception)
+defstruct ExceptionResult : (exception: Throwable)
 defstruct NormalResult : (result)
 
-;Run the given body with the equipped finally block.
-public defn with-finally<?T> (body: () -> ?T, finally: () -> ?) -> T :
-  push-winder(Winder(false, false, finally))
-  inc-winders(current-coroutine, 1)
-  val result = body()
-  pop-winder()
-  inc-winders(current-coroutine, -1)
-  finally()
-  result
+
 
 ;============================================================
 ;============== Input/Output Exceptions =====================
