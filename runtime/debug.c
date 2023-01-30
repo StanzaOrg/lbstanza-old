@@ -99,6 +99,11 @@ static inline void free_path(const char* s) {
   free((char*)s);
 }
 
+enum {
+  NOP = 0x90,
+  INT3 = 0xCC
+};
+
 typedef struct {
   uint8_t* const address;
   const uint64_t group;
@@ -108,6 +113,10 @@ typedef struct {
   const uint64_t length;
   const SafepointAddress addresses[];
 } AddressList;
+static void AddressList_write(const AddressList* list, const uint8_t inst) {
+  for (const SafepointAddress *p = list->addresses, *lim = p + list->length; p < lim; p++)
+    *p->address = inst;
+}
 
 typedef struct {
   const uint64_t line;
@@ -119,33 +128,50 @@ typedef struct {
   const char* const filename;
   const SafepointEntry entries[];
 } FileSafepoints;
+static void FileSafepoints_write(const FileSafepoints* file, const uint8_t inst) {
+  for (const SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
+    AddressList_write(entry->address_list, inst);
+}
+static inline const SafepointEntry* FileSafepoints_find(const FileSafepoints* file, uint64_t line) {
+  for (const SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
+    if (entry->line >= line)
+      return entry;
+  return NULL;
+}
 
 typedef struct {
   const uint64_t num_files;
   const FileSafepoints* const files[];
 } SafepointTable;
-
 const SafepointTable* app_safepoint_table;
-
-static void write_to_all_safepoints(uint8_t val) {
+static void Safepoints_write(const uint8_t inst) {
+  const SafepointTable* safepoints = app_safepoint_table;
+  if (safepoints)
+    for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files; i++)
+      FileSafepoints_write(safepoints->files[i], inst);
+}
+static const FileSafepoints* Safepoints_find_file(const char* file_name) {
+  const char* file_path = get_absolute_path(file_name);
+  const FileSafepoints* result = NULL;
   const SafepointTable* safepoints = app_safepoint_table;
   if (safepoints) {
-    for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files; i++) {
-      const FileSafepoints* file = safepoints->files[i];
-      for (const SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++) {
-        const AddressList* list = entry->address_list;
-        for (const SafepointAddress *p = list->addresses, *lim = p + list->length; p < lim; p++) {
-          *p->address = val;
-        }
-      }
+    for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files && !result; i++) {
+      const FileSafepoints* p = safepoints->files[i];
+      const char* path = get_absolute_path(p->filename);
+      if (!strcmp(path, file_path))
+        result = p;
+      free_path(path);
     }
   }
+  free_path(file_path);
+  return result;
 }
+
 static inline void enable_all_safepoints(void) {
-  write_to_all_safepoints(0xCC); // INT3
+  Safepoints_write(INT3);
 }
 static inline void disable_all_safepoints(void) {
-  write_to_all_safepoints(0x90); // NOP
+  Safepoints_write(NOP);
 }
 
 // I/O interface and its implementation over files and sockets.
@@ -1790,137 +1816,43 @@ static bool request_launch(const JSObject* request) {
 //   "required": [ "line" ]
 // }
 
-// File path is specified separately.
-typedef struct {
-  uint64_t line;    // 1-based
-  uint64_t column;  // 1-based, 0 denotes undefined column
-} SourceBreakpoint;
-
-typedef struct {
-  size_t length;
-  size_t capacity;
-  SourceBreakpoint* data;
-} SourceBreakpointVector;
-static void SourceBreakpointVector_initialize(SourceBreakpointVector* vector) {
-  vector->length = 0;
-  vector->capacity = 16; // Initial vector size
-  vector->data = malloc(vector->capacity * sizeof(SourceBreakpoint));
-  //TODO: handle possible OOME
-}
-static inline void SourceBreakpointVector_destroy(SourceBreakpointVector* vector) {
-  free(vector->data);
-}
-static SourceBreakpoint* SourceBreakpointVector_allocate(SourceBreakpointVector* vector) {
-  if (vector->length == vector->capacity) {
-    vector->capacity <<= 1;
-    vector->data = realloc(vector->data, vector->capacity * sizeof(SourceBreakpoint));
-    //TODO: handle possible OOM
-  }
-  return vector->data + vector->length++;
-}
-
-typedef struct {
-  uint64_t id;
-  uint64_t line;    // 1-based
-  uint64_t column;  // 1-based, 0 denotes undefined column
-  bool verified;
-} Breakpoint;
-typedef struct {
-  size_t length;
-  size_t capacity;
-  Breakpoint* data;
-} BreakpointVector;
-static void BreakpointVector_initialize(BreakpointVector* vector) {
-  vector->length = 0;
-  vector->capacity = 16; // Initial vector size
-  vector->data = malloc(vector->capacity * sizeof(Breakpoint));
-  //TODO: handle possible OOME
-}
-static inline void BreakpointVector_destroy(BreakpointVector* vector) {
-  free(vector->data);
-}
-static inline Breakpoint* BreakpointVector_allocate(BreakpointVector* vector) {
-  if (vector->length == vector->capacity) {
-    vector->capacity <<= 1;
-    vector->data = realloc(vector->data, vector->capacity * sizeof(Breakpoint));
-    //TODO: handle possible OOM
-  }
-  return vector->data + vector->length++;
-}
-void append_breakpoint(BreakpointVector* v, uint64_t id, uint64_t line, uint64_t column, bool available) {
-  Breakpoint* bp = BreakpointVector_allocate(v);
-  bp->id = id;
-  bp->line = line;
-  bp->column = column;
-  bp->verified = available;
-}
-void set_safepoints (const char* filename, SourceBreakpoint* sbp, long sbp_length, BreakpointVector* out);
-
-typedef struct {
-  DelayedRequest parent;
-  char* source_path;  // Owned by this request
-  SourceBreakpointVector breakpoints;
-} DelayedRequestSetBreakpoints;
-static void DelayedRequestSetBreakpoints_handle(DelayedRequest* request) {
-  DelayedRequestSetBreakpoints* req = (DelayedRequestSetBreakpoints*)request;
-
-  BreakpointVector out_breakpoints;
-  BreakpointVector_initialize(&out_breakpoints);
-
-  set_safepoints(req->source_path, req->breakpoints.data, req->breakpoints.length, &out_breakpoints);
-
+static bool request_setBreakpoints(const JSObject* request) {
   JSBuilder builder;
-  JSBuilder_initialize_delayed_response(&builder, request, NULL);
+  JSBuilder_initialize_response(&builder, request, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   {
     JSBuilder_array_field_begin(&builder, "breakpoints");
     {
-      const char* source_path = req->source_path;
-      for (const Breakpoint *p = out_breakpoints.data, *const limit = p + out_breakpoints.length; p < limit; p++) {
-        JSBuilder_next(&builder);
-        JSBuilder_write_breakpoint(&builder, p->id, p->verified, source_path, p->line, p->column);
+      const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+      const JSObject* source = JSObject_get_object_field(arguments, "source");
+      const char* path = JSObject_get_string_field(source, "path");
+      const FileSafepoints* safepoints = Safepoints_find_file(path);
+      if (safepoints) {
+        FileSafepoints_write(safepoints, NOP);  // Clear all safeponts in the file
+        const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
+        if (breakpoints) {
+          for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
+            if (p->kind == JS_OBJECT) {
+              const JSObject* o = &p->u.o;
+              uint64_t line = JSObject_get_integer_field(o, "line", 0);
+              // const int64_t column = JSObject_get_integer_field(o, "column", 0);
+              // TODO: get optional condition, hitCondition and logMessage fields.
+              const SafepointEntry* entry = FileSafepoints_find(safepoints, line);
+              if (entry) {
+                line = entry->line;
+                AddressList_write(entry->address_list, INT3);
+              }
+              JSBuilder_next(&builder);
+              JSBuilder_write_breakpoint(&builder, (uint64_t)entry, entry != NULL, path, line, 0);
+            }
+          }
+        }
       }
     }
     JSBuilder_array_field_end(&builder); // breakpoints
   }
   JSBuilder_object_field_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
-
-  BreakpointVector_destroy(&out_breakpoints);
-
-  // Destroy 'req'
-  free(req->source_path);
-  SourceBreakpointVector_destroy(&req->breakpoints);
-}
-static inline DelayedRequest* DelayedRequestSetBreakpoints_create(const JSObject* request) {
-  DelayedRequestSetBreakpoints* req = DelayedRequest_create(request, sizeof(DelayedRequestSetBreakpoints), &DelayedRequestSetBreakpoints_handle);
-
-  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  const JSObject* source = JSObject_get_object_field(arguments, "source");
-  req->source_path = strdup(JSObject_get_string_field(source, "path")); // req owns source_path
-
-  SourceBreakpointVector* in_breakpoints = &req->breakpoints;
-  SourceBreakpointVector_initialize(in_breakpoints);
-  const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
-  if (breakpoints) {
-    // Validate brakpoints and store in in_breakpoints.
-    for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
-      if (p->kind == JS_OBJECT) {
-        const JSObject* o = &p->u.o;
-        const int64_t line = JSObject_get_integer_field(o, "line", 0);
-        const int64_t column = JSObject_get_integer_field(o, "column", 0);
-        // TODO: get optional condition, hitCondition and logMessage fields.
-        if (line <= 0 || column < 0) continue;
-        SourceBreakpoint* sbp = SourceBreakpointVector_allocate(in_breakpoints);
-        sbp->line = line;
-        sbp->column = column;
-      }
-    }
-  }
-  return (DelayedRequest*) req;
-}
-static bool request_setBreakpoints(const JSObject* request) {
-  insert_to_request_queue(DelayedRequestSetBreakpoints_create(request));
   return true;
 }
 
