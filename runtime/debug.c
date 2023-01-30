@@ -104,59 +104,59 @@ enum {
   INT3 = 0xCC
 };
 
-typedef struct {
+typedef const struct {
   uint8_t* const address;
   const uint64_t group;
 } SafepointAddress;
 
-typedef struct {
+typedef const struct {
   const uint64_t length;
-  const SafepointAddress addresses[];
+  SafepointAddress addresses[];
 } AddressList;
-static void AddressList_write(const AddressList* list, const uint8_t inst) {
-  for (const SafepointAddress *p = list->addresses, *lim = p + list->length; p < lim; p++)
+static void AddressList_write(AddressList* list, const uint8_t inst) {
+  for (SafepointAddress *p = list->addresses, *lim = p + list->length; p < lim; p++)
     *p->address = inst;
 }
 
-typedef struct {
+typedef const struct {
   const uint64_t line;
-  const AddressList* const address_list;
+  AddressList* const address_list;
 } SafepointEntry;
 
-typedef struct {
+typedef const struct {
   const uint64_t num_entries;
   const char* const filename;
-  const SafepointEntry entries[];
+  SafepointEntry entries[];
 } FileSafepoints;
-static void FileSafepoints_write(const FileSafepoints* file, const uint8_t inst) {
-  for (const SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
+static void FileSafepoints_write(FileSafepoints* file, const uint8_t inst) {
+  for (SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
     AddressList_write(entry->address_list, inst);
 }
-static inline const SafepointEntry* FileSafepoints_find(const FileSafepoints* file, uint64_t line) {
-  for (const SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
+static inline SafepointEntry* FileSafepoints_find(FileSafepoints* file, uint64_t line) {
+  for (SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
     if (entry->line >= line)
       return entry;
   return NULL;
 }
 
-typedef struct {
+typedef const struct {
   const uint64_t num_files;
-  const FileSafepoints* const files[];
+  FileSafepoints* const files[];
 } SafepointTable;
-const SafepointTable* app_safepoint_table;
+SafepointTable* app_safepoint_table;
 static void Safepoints_write(const uint8_t inst) {
-  const SafepointTable* safepoints = app_safepoint_table;
+  SafepointTable* safepoints = app_safepoint_table;
   if (safepoints)
     for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files; i++)
       FileSafepoints_write(safepoints->files[i], inst);
 }
-static const FileSafepoints* Safepoints_find_file(const char* file_name) {
+static FileSafepoints* Safepoints_find_file(const char* file_name) {
   const char* file_path = get_absolute_path(file_name);
-  const FileSafepoints* result = NULL;
-  const SafepointTable* safepoints = app_safepoint_table;
+  FileSafepoints* result = NULL;
+  SafepointTable* safepoints = app_safepoint_table;
   if (safepoints) {
     for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files && !result; i++) {
-      const FileSafepoints* p = safepoints->files[i];
+      FileSafepoints* p = safepoints->files[i];
       const char* path = get_absolute_path(p->filename);
       if (!strcmp(path, file_path))
         result = p;
@@ -1826,7 +1826,7 @@ static bool request_setBreakpoints(const JSObject* request) {
       const JSObject* arguments = JSObject_get_object_field(request, "arguments");
       const JSObject* source = JSObject_get_object_field(arguments, "source");
       const char* path = JSObject_get_string_field(source, "path");
-      const FileSafepoints* safepoints = Safepoints_find_file(path);
+      FileSafepoints* safepoints = Safepoints_find_file(path);
       if (safepoints) {
         FileSafepoints_write(safepoints, NOP);  // Clear all safeponts in the file
         const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
@@ -1837,7 +1837,7 @@ static bool request_setBreakpoints(const JSObject* request) {
               uint64_t line = JSObject_get_integer_field(o, "line", 0);
               // const int64_t column = JSObject_get_integer_field(o, "column", 0);
               // TODO: get optional condition, hitCondition and logMessage fields.
-              const SafepointEntry* entry = FileSafepoints_find(safepoints, line);
+              SafepointEntry* entry = FileSafepoints_find(safepoints, line);
               if (entry) {
                 line = entry->line;
                 AddressList_write(entry->address_list, INT3);
