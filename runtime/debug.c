@@ -129,11 +129,11 @@ typedef const struct {
   SafepointEntry entries[];
 } FileSafepoints;
 static void FileSafepoints_write(FileSafepoints* file, const uint8_t inst) {
-  for (SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
+  for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++)
     AddressList_write(entry->address_list, inst);
 }
 static inline SafepointEntry* FileSafepoints_find(FileSafepoints* file, uint64_t line) {
-  for (SafepointEntry *entry = file->entries, *limit = entry + file->num_entries; entry < limit; entry++)
+  for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++)
     if (entry->line >= line)
       return entry;
   return NULL;
@@ -172,6 +172,62 @@ static inline void enable_all_safepoints(void) {
 }
 static inline void disable_all_safepoints(void) {
   Safepoints_write(NOP);
+}
+
+typedef struct {
+  size_t length;
+  size_t capacity;
+  SafepointEntry** data;
+} SafepointEntryVector;
+static inline void SafepointEntryVector_initialize(SafepointEntryVector* v) {
+  v->length = 0;
+  v->capacity = 16; // Initial vector size
+  v->data = malloc(v->capacity * sizeof(v->data[0]));
+  //TODO: handle possible OOME
+}
+static inline void SafepointEntryVector_destroy(SafepointEntryVector* v) {
+  free(v->data);
+}
+static inline SafepointEntry** SafepointEntryVector_allocate(SafepointEntryVector* v) {
+  if (v->length == v->capacity) {
+    v->capacity <<= 1;
+    v->data = realloc(v->data, v->capacity * sizeof(v->data[0]));
+    //TODO: handle possible OOM
+  }
+  return v->data + v->length++;
+}
+static inline SafepointEntry** SafepointEntryVector_find(const SafepointEntryVector* v, SafepointEntry* entry) {
+  for (SafepointEntry **p = v->data, **lim = p + v->length; p < lim; p++)
+    if (*p == entry)
+      return p;
+  return NULL;
+}
+
+typedef struct ACTIVE_FILE_SAFEPOINTS {
+  struct ACTIVE_FILE_SAFEPOINTS* next;
+  FileSafepoints* file;
+  SafepointEntry* data[];
+} ActiveFileSafepoints;
+static ActiveFileSafepoints* active_file_safepoints;
+static inline void ActiveFileSafepoints_create(const FileSafepoints* file, const SafepointEntryVector* v) {
+  const size_t length = v->length;
+  if (length) {
+    ActiveFileSafepoints* p = malloc(sizeof(ActiveFileSafepoints) + (length+1)*sizeof(v->data[0]));
+    p->next = active_file_safepoints;
+    active_file_safepoints = p;
+    p->file = file;
+    p->data[length] = NULL;
+    memcpy(p->data, v->data, length*sizeof(v->data[0]));
+  }
+}
+static inline void ActiveFileSafepoints_destroy(const FileSafepoints* file) {
+  for (ActiveFileSafepoints **p = &active_file_safepoints, *q; (q = *p) != NULL; p = &q->next) {
+    if (q->file == file) {
+      *p = q->next;
+      free(q);
+      break;
+    }
+  }
 }
 
 // I/O interface and its implementation over files and sockets.
@@ -1828,9 +1884,12 @@ static bool request_setBreakpoints(const JSObject* request) {
       const char* path = JSObject_get_string_field(source, "path");
       FileSafepoints* safepoints = Safepoints_find_file(path);
       if (safepoints) {
+        ActiveFileSafepoints_destroy(safepoints);
         FileSafepoints_write(safepoints, NOP);  // Clear all safeponts in the file
         const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
         if (breakpoints) {
+          SafepointEntryVector v;
+          SafepointEntryVector_initialize(&v);
           for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
             if (p->kind == JS_OBJECT) {
               const JSObject* o = &p->u.o;
@@ -1840,12 +1899,17 @@ static bool request_setBreakpoints(const JSObject* request) {
               SafepointEntry* entry = FileSafepoints_find(safepoints, line);
               if (entry) {
                 line = entry->line;
-                AddressList_write(entry->address_list, INT3);
+                if (!SafepointEntryVector_find(&v, entry)) {
+                  *SafepointEntryVector_allocate(&v) = entry;
+                  AddressList_write(entry->address_list, INT3);
+                }
               }
               JSBuilder_next(&builder);
               JSBuilder_write_breakpoint(&builder, (uint64_t)entry, entry != NULL, path, line, 0);
             }
           }
+          ActiveFileSafepoints_create(safepoints, &v);
+          SafepointEntryVector_destroy(&v);
         }
       }
     }
