@@ -1066,16 +1066,16 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
   JSBuilder_send_and_destroy_event(&builder);
 }
 
-int64_t stanza_debugger_current_source_position(const void* p, const char** filename);
-//const char* current_file = NULL;
-//const int64_t current_line = stanza_debugger_current_source_position(breakpoint_id, &current_file);
-void send_thread_stopped_at_breakpoint(const void* pc) {
+void send_thread_stopped_at_safepoint(const void* pc) {
   char description[64];
   const uint64_t thread_id = 12345678;
-  uint64_t breakpoint = (uint64_t) ActiveFileSafepoints_find_entry(pc);
-  log_printf("!!! Hit a breakpoint at %p, id %" PRIu64 "\n", pc, breakpoint);
-  snprintf(description, sizeof description, "breakpoint %" PRIu64, breakpoint);
-  send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description, breakpoint);
+  const uint64_t breakpoint = (uint64_t) ActiveFileSafepoints_find_entry(pc);
+  StopReason reason = STOP_REASON_PAUSE;
+  if (breakpoint) {
+    snprintf(description, sizeof description, "breakpoint %" PRIu64, breakpoint);
+    reason = STOP_REASON_BREAKPOINT;
+  }
+  send_thread_stopped(thread_id, reason, description, breakpoint);
 }
 
 static void send_process_exited(uint64_t exit_code) {
@@ -2804,11 +2804,10 @@ static bool request_variables(const JSObject* request) {
 //   }]
 // }
 typedef DelayedRequest DelayedRequestContinue;
-int stanza_debugger_continue (void);
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
+  disable_all_safepoints();
   execution_paused = false;
   stack_trace_available = true;
-  stanza_debugger_continue();
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, req, NULL);
@@ -2869,24 +2868,15 @@ static bool request_continue(const JSObject* request) {
 //     acknowledgement, so no body field is required."
 //   }]
 // }s
-typedef DelayedRequest DelayedRequestPause;
-int stanza_debugger_pause(void);
-static void DelayedRequestPause_handle(DelayedRequest* request) {
-  // TODO: call LoStanza function here.
-  // Just to simuate the effect:
-  stanza_debugger_pause();
-  respond_to_delayed_request(request, NULL);
-  // TODO: must be sent from the actually paused stanza program.
-  send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", 0);
-}
-static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
-  return DelayedRequest_create(request, sizeof(DelayedRequestPause), &DelayedRequestPause_handle);
-}
 static bool request_pause(const JSObject* request) {
   // TODO: Do we really need this?
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
-  insert_to_request_queue(DelayedRequestPause_create(request));
+  respond_to_request(request, NULL);
+  if (execution_paused)
+    send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", 0);
+  else
+    enable_all_safepoints();
   return true;
 }
 
