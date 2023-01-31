@@ -176,13 +176,6 @@ static FileSafepoints* Safepoints_find_file(const char* file_name) {
   return result;
 }
 
-static inline void enable_all_safepoints(void) {
-  Safepoints_write(INT3);
-}
-static inline void disable_all_safepoints(void) {
-  Safepoints_write(NOP);
-}
-
 typedef struct {
   size_t length;
   size_t capacity;
@@ -249,6 +242,26 @@ static inline SafepointEntry* ActiveFileSafepoints_find_entry(const void* pc) {
       if (AddressList_find((*entry)->address_list, pc))
         return *entry;
   return NULL;
+}
+
+static bool all_sefapoints_enabled;
+static pthread_mutex_t safepoint_lock;
+static inline void enable_all_safepoints(void) {
+  pthread_mutex_lock(&safepoint_lock);
+  if (!all_sefapoints_enabled) {
+    Safepoints_write(INT3);
+    all_sefapoints_enabled = true;
+  }
+  pthread_mutex_unlock(&safepoint_lock);
+}
+static inline void disable_all_safepoints(void) {
+  pthread_mutex_lock(&safepoint_lock);
+  if (all_sefapoints_enabled) {
+    Safepoints_write(NOP);
+    all_sefapoints_enabled = false;
+    ActiveFileSafepoints_restore();
+  }
+  pthread_mutex_unlock(&safepoint_lock);
 }
 
 // I/O interface and its implementation over files and sockets.
@@ -1906,6 +1919,7 @@ static bool request_setBreakpoints(const JSObject* request) {
       const char* path = JSObject_get_string_field(source, "path");
       FileSafepoints* safepoints = Safepoints_find_file(path);
       if (safepoints) {
+        pthread_mutex_lock(&safepoint_lock);
         ActiveFileSafepoints_destroy(safepoints);
         FileSafepoints_write(safepoints, NOP);  // Clear all safeponts in the file
         const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
@@ -1923,7 +1937,8 @@ static bool request_setBreakpoints(const JSObject* request) {
                 line = entry->line;
                 if (!SafepointEntryVector_find(&v, entry)) {
                   *SafepointEntryVector_allocate(&v) = entry;
-                  SafepointEntry_write(entry, INT3);
+                  if (!all_sefapoints_enabled)
+                    SafepointEntry_write(entry, INT3);
                 }
               }
               JSBuilder_next(&builder);
@@ -1933,6 +1948,7 @@ static bool request_setBreakpoints(const JSObject* request) {
           ActiveFileSafepoints_create(safepoints, &v);
           SafepointEntryVector_destroy(&v);
         }
+        pthread_mutex_unlock(&safepoint_lock);
       }
     }
     JSBuilder_array_field_end(&builder); // breakpoints
@@ -3159,6 +3175,10 @@ int main(int argc, char** argv) {
   }
   if (pthread_mutex_init(&request_queue_lock, NULL)) {
     log_printf("error: initializing request queue mutex (%s)\n", current_error());
+    return EXIT_FAILURE;
+  }
+  if (pthread_mutex_init(&safepoint_lock, NULL)) {
+    log_printf("error: initializing safepoint mutex (%s)\n", current_error());
     return EXIT_FAILURE;
   }
 
