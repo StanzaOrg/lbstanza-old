@@ -117,11 +117,20 @@ static void AddressList_write(AddressList* list, const uint8_t inst) {
   for (SafepointAddress *p = list->addresses, *lim = p + list->length; p < lim; p++)
     *p->address = inst;
 }
+static inline SafepointAddress* AddressList_find(AddressList* list, const void* pc) {
+  for (SafepointAddress *p = list->addresses, *lim = p + list->length; p < lim; p++)
+    if (p->address == pc)
+      return p;
+  return NULL;
+}
 
 typedef const struct {
   const uint64_t line;
   AddressList* const address_list;
 } SafepointEntry;
+static inline void SafepointEntry_write(SafepointEntry* entry, const uint8_t inst) {
+  AddressList_write(entry->address_list, inst);
+}
 
 typedef const struct {
   const uint64_t num_entries;
@@ -130,7 +139,7 @@ typedef const struct {
 } FileSafepoints;
 static void FileSafepoints_write(FileSafepoints* file, const uint8_t inst) {
   for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++)
-    AddressList_write(entry->address_list, inst);
+    SafepointEntry_write(entry, inst);
 }
 static inline SafepointEntry* FileSafepoints_find(FileSafepoints* file, uint64_t line) {
   for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++)
@@ -228,6 +237,18 @@ static inline void ActiveFileSafepoints_destroy(const FileSafepoints* file) {
       break;
     }
   }
+}
+static inline void ActiveFileSafepoints_restore(void) {
+  for (const ActiveFileSafepoints* p = active_file_safepoints; p; p = p->next)
+    for (SafepointEntry* const* entry = p->data; *entry; entry++)
+      SafepointEntry_write(*entry, INT3);
+}
+static inline SafepointEntry* ActiveFileSafepoints_find_entry(const void* pc) {
+  for (const ActiveFileSafepoints* p = active_file_safepoints; p; p = p->next)
+    for (SafepointEntry* const* entry = p->data; *entry; entry++)
+      if (AddressList_find((*entry)->address_list, pc))
+        return *entry;
+  return NULL;
 }
 
 // I/O interface and its implementation over files and sockets.
@@ -1011,7 +1032,7 @@ static inline const char* stop_reason(const StopReason kind) {
   return names[kind];
 }
 
-static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description, const void* breakpoint) {
+static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description, uint64_t breakpoint) {
   execution_paused = true;
 
   JSBuilder builder;
@@ -1022,7 +1043,7 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
   if (breakpoint) {
     JSBuilder_array_field_begin(&builder, "hitBreakpointIds");
     JSBuilder_next(&builder);
-    JSBuilder_append_unsigned(&builder, (uint64_t) breakpoint);
+    JSBuilder_append_unsigned(&builder, breakpoint);
     JSBuilder_array_field_end(&builder);
   }
   JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
@@ -1035,12 +1056,13 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
 int64_t stanza_debugger_current_source_position(const void* p, const char** filename);
 //const char* current_file = NULL;
 //const int64_t current_line = stanza_debugger_current_source_position(breakpoint_id, &current_file);
-void send_thread_stopped_at_breakpoint(const void* breakpoint_id) {
+void send_thread_stopped_at_breakpoint(const void* pc) {
   char description[64];
   const uint64_t thread_id = 12345678;
-  log_printf("Hit a breakpoint at %p\n", breakpoint_id);
-  snprintf(description, sizeof description, "breakpoint %p", breakpoint_id);
-  send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description, breakpoint_id);
+  uint64_t breakpoint = (uint64_t) ActiveFileSafepoints_find_entry(pc);
+  log_printf("!!! Hit a breakpoint at %p, id %" PRIu64 "\n", pc, breakpoint);
+  snprintf(description, sizeof description, "breakpoint %" PRIu64, breakpoint);
+  send_thread_stopped(thread_id, STOP_REASON_BREAKPOINT, description, breakpoint);
 }
 
 static void send_process_exited(uint64_t exit_code) {
@@ -1658,7 +1680,7 @@ void next_debug_event(void) {
 }
 
 void stop_at_entry(void) {
-  send_thread_stopped(12345678, STOP_REASON_ENTRY, "Stopped at entry", NULL);
+  send_thread_stopped(12345678, STOP_REASON_ENTRY, "Stopped at entry", 0);
   next_debug_event();
 }
 
@@ -1901,7 +1923,7 @@ static bool request_setBreakpoints(const JSObject* request) {
                 line = entry->line;
                 if (!SafepointEntryVector_find(&v, entry)) {
                   *SafepointEntryVector_allocate(&v) = entry;
-                  AddressList_write(entry->address_list, INT3);
+                  SafepointEntry_write(entry, INT3);
                 }
               }
               JSBuilder_next(&builder);
@@ -2839,7 +2861,7 @@ static void DelayedRequestPause_handle(DelayedRequest* request) {
   stanza_debugger_pause();
   respond_to_delayed_request(request, NULL);
   // TODO: must be sent from the actually paused stanza program.
-  send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", NULL);
+  send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", 0);
 }
 static inline DelayedRequest* DelayedRequestPause_create(const JSObject* request) {
   return DelayedRequest_create(request, sizeof(DelayedRequestPause), &DelayedRequestPause_handle);
