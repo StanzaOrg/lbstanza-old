@@ -83,12 +83,21 @@ static void StringVector_append(StringVector* vector, const char* s) {
   //TODO: handle possible OOM
 }
 
+enum {
+  RUN_MODE_UNKNOWN,
+  RUN_MODE_RUNNING,
+  RUN_MODE_PAUSED,
+  RUN_MODE_STEP_IN,
+  RUN_MODE_STEP_OUT,
+  RUN_MODE_STEP_OVER
+};
+static uint8_t run_mode = RUN_MODE_UNKNOWN;
+
 static char* program_path;
 static pid_t program_pid;
 static bool terminated_event_sent;
-static bool stack_trace_available; // Stack trace is not available until VMState initialized
-static bool execution_paused;
 static pthread_mutex_t send_lock;
+static bool stack_trace_available; // Stack trace is not available until VMState initialized
 static const char* debug_adapter_path;
 
 static inline char* get_absolute_path(const char* s) {
@@ -176,6 +185,23 @@ static FileSafepoints* Safepoints_find_file(const char* file_name) {
   return result;
 }
 
+// For debugging only
+static void print_safepoint(const void* pc) {
+  SafepointTable* safepoints = app_safepoint_table;
+  if (safepoints) {
+    for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files; i++) {
+      FileSafepoints* file = safepoints->files[i];
+      for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++) {
+        if (AddressList_find(entry->address_list, pc)) {
+          log_printf("!!! Safepoint pc: %p file: %s line: %" PRIu64 "\n", pc, file->filename, entry->line);
+          return;
+        }
+      }
+    }
+  }
+  log_printf("!!! Safepoint not found for pc %p\n", pc);
+}
+
 typedef struct {
   size_t length;
   size_t capacity;
@@ -246,7 +272,7 @@ static inline SafepointEntry* ActiveFileSafepoints_find_entry(const void* pc) {
 
 static bool all_sefapoints_enabled;
 static pthread_mutex_t safepoint_lock;
-static inline void enable_all_safepoints(void) {
+static void enable_all_safepoints(void) {
   pthread_mutex_lock(&safepoint_lock);
   if (!all_sefapoints_enabled) {
     Safepoints_write(INT3);
@@ -1046,7 +1072,7 @@ static inline const char* stop_reason(const StopReason kind) {
 }
 
 static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description, uint64_t breakpoint) {
-  execution_paused = true;
+  run_mode = RUN_MODE_PAUSED;
 
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "stopped");
@@ -1064,18 +1090,6 @@ static void send_thread_stopped(int64_t thread_id, StopReason reason, const char
   //JSBuilder_write_bool_field(&builder, "preserveFocusHint", false);
   //JSBuilder_write_bool_field(&builder, "threadCausedFocus", true);
   JSBuilder_send_and_destroy_event(&builder);
-}
-
-void send_thread_stopped_at_safepoint(const void* pc) {
-  char description[64];
-  const uint64_t thread_id = 12345678;
-  const uint64_t breakpoint = (uint64_t) ActiveFileSafepoints_find_entry(pc);
-  StopReason reason = STOP_REASON_PAUSE;
-  if (breakpoint) {
-    snprintf(description, sizeof description, "breakpoint %" PRIu64, breakpoint);
-    reason = STOP_REASON_BREAKPOINT;
-  }
-  send_thread_stopped(thread_id, reason, description, breakpoint);
 }
 
 static void send_process_exited(uint64_t exit_code) {
@@ -1684,16 +1698,30 @@ static const char* get_string_array(const JSObject* object, const char* name, in
 
 int stanza_main(int argc, char** argv);
 
-void next_debug_event(void) {
+static void next_debug_event(void) {
   do {
     sleep(1);
     handle_pending_debug_requests();
     if (terminated_event_sent) break;
-  } while (execution_paused);
+  } while (run_mode == RUN_MODE_PAUSED);
 }
 
-void stop_at_entry(void) {
+void notify_stopped_at_entry(void) {
   send_thread_stopped(12345678, STOP_REASON_ENTRY, "Stopped at entry", 0);
+  next_debug_event();
+}
+
+void notify_stopped_at_safepoint(const void* pc) {
+  // print_safepoint(pc);
+  char description[64];
+  const uint64_t thread_id = 12345678;
+  const uint64_t breakpoint = (uint64_t) ActiveFileSafepoints_find_entry(pc);
+  StopReason reason = run_mode == RUN_MODE_RUNNING ? STOP_REASON_PAUSE : STOP_REASON_STEP;
+  if (breakpoint) {
+    snprintf(description, sizeof description, "breakpoint %" PRIu64, breakpoint);
+    reason = STOP_REASON_BREAKPOINT;
+  }
+  send_thread_stopped(thread_id, reason, description, breakpoint);
   next_debug_event();
 }
 
@@ -2806,7 +2834,7 @@ static bool request_variables(const JSObject* request) {
 typedef DelayedRequest DelayedRequestContinue;
 static void DelayedRequestContinue_handle(DelayedRequest* req) {
   disable_all_safepoints();
-  execution_paused = false;
+  run_mode = RUN_MODE_RUNNING;
   stack_trace_available = true;
 
   JSBuilder builder;
@@ -2873,10 +2901,66 @@ static bool request_pause(const JSObject* request) {
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
   respond_to_request(request, NULL);
-  if (execution_paused)
+  if (run_mode == RUN_MODE_PAUSED)
     send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", 0);
   else
     enable_all_safepoints();
+  return true;
+}
+
+// "StepInRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "StepIn request; value of command field is 'stepIn'. The
+//     request starts the debuggee to step into a function/method if possible.
+//     If it cannot step into a target, 'stepIn' behaves like 'next'. The debug
+//     adapter first sends the StepInResponse and then a StoppedEvent (event
+//     type 'step') after the step has completed. If there are multiple
+//     function/method calls (or other targets) on the source line, the optional
+//     argument 'targetId' can be used to control into which target the 'stepIn'
+//     should occur. The list of possible targets for a given source line can be
+//     retrieved via the 'stepInTargets' request.", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "stepIn" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/StepInArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "StepInArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'stepIn' request.",
+//   "properties": {
+//     "threadId": {
+//       "type": "integer",
+//       "description": "Execute 'stepIn' for this thread."
+//     },
+//     "targetId": {
+//       "type": "integer",
+//       "description": "Optional id of the target to step into."
+//     }
+//   },
+//   "required": [ "threadId" ]
+// },
+// "StepInResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'stepIn' request. This is just an
+//     acknowledgement, so no body field is required."
+//   }]
+// }
+static bool request_stepIn(const JSObject* request) {
+  // TODO: Do we really need this?
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+  respond_to_request(request, NULL);
+  enable_all_safepoints();
+  run_mode = RUN_MODE_STEP_IN;
+  stack_trace_available = true;
   return true;
 }
 
@@ -2958,6 +3042,7 @@ static bool request_disconnect(const JSObject* request) {
   def(setExceptionBreakpoints)\
   def(source)                 \
   def(stackTrace)             \
+  def(stepIn)                 \
   def(threads)                \
   def(variables)
 
