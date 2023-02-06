@@ -14,6 +14,8 @@ defpackage stz/type-equation-solver :
 ;============================================================
 
 ;Complete state of the solver in-between iterations.
+;- eqns: Tuple of all equations.
+;- sel-eqns: Fast access to selection equations.
 ;- solved: Each entry, V => VAL, means that the variable V
 ;  has been solved and has value VAL.
 ;- blocked: Each entry, V => (E1, E2, E3 ...), means that the
@@ -27,11 +29,15 @@ defpackage stz/type-equation-solver :
 ;  a SolvedType.
 public defstruct SolverState :
   hierarchy: TypeHierarchy
+  eqns: Tuple<TypeEqn>
+  sel-eqns: IntTable<TypeEqn>
   solved: IntTable<SolverValue> with:
     init => IntTable<SolverValue>()
+  guesses: IntTable<Tuple<True|False>> with:
+    init => IntTable<Tuple<True|False>>()
   blocked: IntTable<List<TypeEqn>> with:
     init => IntTable<List<TypeEqn>>(List())
-  eqns: Queue<TypeEqn> with:
+  active-eqns: Queue<TypeEqn> with:
     init => Queue<TypeEqn>()
   num-solved:Int with:
     init => 0
@@ -74,6 +80,12 @@ public defstruct SolvedType <: SolverValue :
 with:
   printer => true
 
+;The selection was solved.
+public defstruct SolvedSel <: SolverValue :
+  values:Tuple<True|False>
+with:
+  printer => true
+
 ;The variable cannot be solved because the constraints are
 ;unsatisfiable.
 public defstruct Unsatisfiable <: SolverValue
@@ -85,6 +97,17 @@ with:
 public defstruct Unprogressable <: SolverValue
 with:
   printer => true
+
+;============================================================
+;======================== Guesses ===========================
+;============================================================
+
+;Represents a guessed selection value.
+;- eqn: The equation with the selection variable that is being
+;  guessed.
+defstruct Guess :
+  values:Maybe<Tuple<True|False>>
+  eqn:TypeEqn
 
 ;============================================================
 ;======================= Formatting =========================
@@ -100,11 +123,16 @@ public defn format (f:TypeFormatter, v:SolverValue) :
 ;============================================================
 
 ;Create a new SolverState primed with the given equations.
-public defn SolverState (eqns:Seqable<TypeEqn>,
+public defn SolverState (input-eqns:Seqable<TypeEqn>,
                          hier:TypeHierarchy) -> SolverState :
-  val state = SolverState(hier)
-  do(push-eqn{state, _}, eqns)
-  state
+  val eqns = to-tuple(input-eqns)
+  val sel-eqns = to-inttable<TypeEqn> $
+    for e in eqns seq? :
+      match(e) :
+        (e:OverloadExpEqn) : One(sel(e) => e)
+        (e:OverloadCallEqn) : One(sel(e) => e)
+        (e) : None()
+  SolverState(hier, eqns, sel-eqns)
 
 ;Solve as many equations as possible.
 public defn solve (s:SolverState) -> False :
@@ -124,15 +152,11 @@ public defn solutions (s:SolverState) -> Tuple<KeyValue<Int,SolverValue>> :
 
 ;Return true if there are no more equations to solve.
 defn empty? (s:SolverState) -> True|False :
-  empty?(eqns(s))
+  empty?(active-eqns(s))
 
 ;Return the next equation to solve.
 defn next-eqn (s:SolverState) -> TypeEqn :
-  pop(eqns(s))
-
-;Returns the current number of equations in the active queue.
-defn num-eqns (s:SolverState) -> Int :
-  length(eqns(s))
+  pop(active-eqns(s))
 
 ;Returns all the blocked equations in the solver.
 defn blocked-eqns (s:SolverState) -> Seqable<TypeEqn> :
@@ -140,7 +164,7 @@ defn blocked-eqns (s:SolverState) -> Seqable<TypeEqn> :
 
 ;Push another equation to the solver.
 defn push-eqn (s:SolverState, e:TypeEqn) -> False :
-  add(eqns(s), e)
+  add(active-eqns(s), e)
 
 ;Return true if the given variable has already been solved.
 defn solved? (s:SolverState, v:Int) -> True|False :
@@ -205,21 +229,34 @@ defn set-var (s:SolverState, v:Int, given-value:SolverValue) -> False :
           for e in blocked-eqns do :
             push-eqn(s, e)
 
+;Fill the solved variables in the given equation.
+defn fill-solved (e:TypeEqn, s:SolverState) -> TypeEqn :
+  fill-solved(fill-solved-type{_, s}, e)
+
 ;Main loop.
 defn solve-until-empty (solve:(TypeEqn, SolverState) -> False,
                         s:SolverState) -> False :    
   ;Preprocess the equations.
   preprocess-eqns(s)
+
+  ;Iterative portion.
+  let iterative-solve () :
   
-  ;Begin dataflow solving.
-  while not empty?(s) :
-    val e = next-eqn(s)
-    if not solved?(s,e) :
-      debugln("solve-until-empty %_" % [debugfmt(e)])
-      within debug-indent() :
-        val filled-e = fill-solved(fill-solved-type{_, s}, e)
-        debugln("filled: %_" % [debugfmt(filled-e)])
-        solve-eqn(filled-e, s)
+    ;Solve all equations in active queue.
+    while not empty?(s) :
+      val e = next-eqn(s)
+      if not solved?(s,e) :
+        debugln("solve-until-empty %_" % [debugfmt(e)])
+        within debug-indent() :
+          val filled-e = fill-solved(e,s)
+          debugln("filled: %_" % [debugfmt(filled-e)])
+          solve-eqn(filled-e, s)
+
+    ;Make guesses.
+    val guessed? = make-guesses(s)
+
+    ;If guesses were made, then iterate again.
+    iterative-solve() when guessed?
       
   ;Indicate that blocked equations can no longer
   ;make progress.
@@ -421,8 +458,8 @@ defn preprocess-eqns (s:SolverState) -> False :
   val super-table = IntTable<List<Type>>(List())
 
   ;Iterate through equations and preprocess each in turn.
-  for i in 0 to num-eqns(s) do :
-    match(next-eqn(s)) :
+  for e in eqns(s) do :
+    match(e) :
       ;Convert CaptureAllEqn into individual CaptureEqn.
       (e:CaptureAllEqn) :
         val entries = capture-variance(ns(e), b(e))
@@ -482,30 +519,93 @@ defmethod solve-eqn (e:SubEqn, s:SolverState) -> False :
       set-var(s, n(e), Unsatisfiable())  
 
 defmethod solve-eqn (e:OverloadExpEqn, s:SolverState) -> False :
-  ;Compute which of the overloads are good.
-  val selections = for x in xs(e) map :
-    select-overload(x, y(e), hierarchy(s))
-  debugln("selections: %," % [seq(debugfmt,selections)])
-  ;Determine how many are remaining.
-  switch(count({_ is-not False}, selections)) :
-    ;Case: none of the overloads are appropriate.
-    0 :
-      set-var(s, n(e), Unsatisfiable())
-    ;Case: exactly one overload is appropriate.
-    1 :
-      val t = find!({_1 is-not False}, xs(e), selections)
-      set-var(s, n(e), SolvedType(t, Covariant, Unfilled()))
-    ;Case: more than one overload is appropriate.
-    else :
-      ;Case: Some selections are blocked.
-      if any?({_ is Blocked}, selections) :
-        val uvars = to-tuple(seq-cat(tvars, filter-by<Blocked>(selections)))
-        blocked(s, e, uvars)
-      ;Case: No selections are blocked.
+  ;If the selection was guessed, then use the guessed
+  ;value.
+  if key?(guesses(s), sel(e)) :
+    val values = guesses(s)[sel(e)]
+    val ts = to-tuple(filter({_1}, xs(e), values))
+    val mixed = mix-functions(ts)
+    set-var(s, n(e), SolvedType(mixed, Covariant, Unfilled()))
+
+  ;Otherwise, compute the selection ourselves.
+  else :
+    ;Compute which of the overloads are good.
+    val selections = for x in xs(e) map :
+      select-overload(x, y(e), hierarchy(s))
+    debugln("selections: %," % [seq(debugfmt,selections)])
+    ;Determine how many are remaining.
+    switch(count({_ is-not False}, selections)) :
+      ;Case: none of the overloads are appropriate.
+      0 :
+        set-var(s, n(e), Unsatisfiable())
+      ;Case: exactly one overload is appropriate.
+      1 :
+        val t = find!({_1 is-not False}, xs(e), selections)
+        set-var(s, n(e), SolvedType(t, Covariant, Unfilled()))
+      ;Case: more than one overload is appropriate.
       else :
-        val ts = to-tuple(filter({_1 is True}, xs(e), selections))
-        val mixed = mix-functions(ts)
-        set-var(s, n(e), SolvedType(mixed, Covariant, Unfilled()))
+        ;Case: Some selections are blocked.
+        if any?({_ is Blocked}, selections) :
+          val uvars = to-tuple(seq-cat(tvars, filter-by<Blocked>(selections)))
+          blocked(s, e, uvars)
+        ;Case: No selections are blocked.
+        else :
+          val ts = to-tuple(filter({_1 is True}, xs(e), selections))
+          val mixed = mix-functions(ts)
+          set-var(s, n(e), SolvedType(mixed, Covariant, Unfilled()))
+
+;============================================================
+;======================== Guess =============================
+;============================================================
+
+;Make guesses for overload equations.
+;These are intentionally conservative and need to be updated
+;after iterative process is over.
+defn make-guesses (s:SolverState) -> True|False :
+  ;Retrieve all the blocked overload equations.
+  val overload-eqns = to-tuple $
+    filter-by<OverloadExpEqn>(blocked-eqns(s))
+
+  ;Track whether any guesses were made.
+  var guesses-made:True|False = false
+
+  for e in overload-eqns do :
+    ;Compute the selection.
+    val sel = for x in xs(e) map :
+      select-overload(x, y(e), hierarchy(s))
+    ;If there are any 'true' selections, then we
+    ;can generate a guess.    
+    if any?({_ is True}, sel) :
+      ;Indicate that we are generating a guess for this equation.
+      debugln("guess: %_" % [debugfmt(e)])
+      ;Generate and store the guess.
+      val guess = map({_ is True}, sel)
+      guesses(s)[/sel(e)] = guess
+      guesses-made = true
+      ;Indicate the guess.
+      debugln("value: %_" % [guess])
+      ;Solve the resulting equation using the generated selection.
+      solve-eqn(e, s)
+
+  ;Return true if any guesses were made.
+  guesses-made
+
+;Check the previously made guesses.
+;defn check-guesses (s:SolverState) :
+;  val prev-guesses = to-tuple(values(guesses(s)))
+;
+;  for g in prev-guesses do :
+;    match(fill-solved(eqn(g),s)) :
+;      (eqn:OverloadExpEqn) :
+;        ;Compute the new selection.
+;        val sel = for x in xs(e) map :
+;          select-overload(x, y(e), hierarchy(s))
+;        ;Merge with the previous values.
+;        val new-values = for (new-v in sel, old-v in values(g)) map :
+;          old-v or (new-v is True)
+;        ;If the new values are different, then we need to restart
+;        ;the process with a new set of guesses.
+;        fatal("Not yet implemented")
 
 ;============================================================
 ;====================== Debugging ===========================
