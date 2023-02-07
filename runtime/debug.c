@@ -3131,6 +3131,13 @@ static inline void initialize_stanza_debugger(int argc, char** argv) {
   // TODO: if necessary, call initialization of stanza debugger here. It runs on communication thread.
 }
 
+static void initialize_mutex(pthread_mutex_t* lock, const char* name) {
+  if (pthread_mutex_init(lock, NULL)) {
+    log_printf("error: initializing %s mutex (%s)\n", name, current_error());
+    exit(EXIT_FAILURE);
+  }
+}
+
 int main(int argc, char** argv) {
   // Set line buffering mode to stdout and stderr
   setvbuf(stdout, NULL, _IONBF, 0);
@@ -3243,18 +3250,9 @@ int main(int argc, char** argv) {
     debug_adapter_write = &write_to_file;
   }
 
-  if (pthread_mutex_init(&send_lock, NULL)) {
-    log_printf("error: initializing send mutex (%s)\n", current_error());
-    return EXIT_FAILURE;
-  }
-  if (pthread_mutex_init(&request_queue_lock, NULL)) {
-    log_printf("error: initializing request queue mutex (%s)\n", current_error());
-    return EXIT_FAILURE;
-  }
-  if (pthread_mutex_init(&safepoint_lock, NULL)) {
-    log_printf("error: initializing safepoint mutex (%s)\n", current_error());
-    return EXIT_FAILURE;
-  }
+  initialize_mutex(&send_lock, "send");
+  initialize_mutex(&request_queue_lock, "request queue");
+  initialize_mutex(&safepoint_lock, "safepoint");
 
   // Initialize debugger with filtered argc, argv
   initialize_stanza_debugger(args.argc, args.argv);
@@ -3268,8 +3266,6 @@ int main(int argc, char** argv) {
 
     JSValue received;
     if (!parse_request(&received, data, length)) break;
-
-    // TODO: Handle the received object here
     JSValue_destroy(&received);
   }
 
