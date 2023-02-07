@@ -87,6 +87,7 @@ enum {
   RUN_MODE_UNKNOWN,
   RUN_MODE_RUNNING,
   RUN_MODE_PAUSED,
+  RUN_MODE_TERMINATED,
   RUN_MODE_STEP_IN,
   RUN_MODE_STEP_OUT,
   RUN_MODE_STEP_OVER
@@ -95,7 +96,6 @@ static uint8_t run_mode = RUN_MODE_UNKNOWN;
 
 static char* program_path;
 static pid_t program_pid;
-static bool terminated_event_sent;
 static pthread_mutex_t send_lock;
 static bool stack_trace_available; // Stack trace is not available until VMState initialized
 static const char* debug_adapter_path;
@@ -1100,8 +1100,8 @@ static void send_process_exited(uint64_t exit_code) {
 }
 
 static void send_terminated(void) {
-  if (!terminated_event_sent) {
-    terminated_event_sent = true;
+  if (run_mode != RUN_MODE_TERMINATED) {
+    run_mode = RUN_MODE_TERMINATED;
     send_simple_event("terminated");
   }
 }
@@ -1411,16 +1411,16 @@ static inline bool request_queue_not_empty(void) {
   return request_queue.next != &request_queue;
 }
 static inline void insert_to_request_queue(DelayedRequest* req) {
-  if (terminated_event_sent) return;
+  if (run_mode != RUN_MODE_TERMINATED) {
+    pthread_mutex_lock(&request_queue_lock);
 
-  pthread_mutex_lock(&request_queue_lock);
+    DoublyLinked* it = &req->link;
+    DoublyLinked* prev = request_queue.prev;
+    request_queue.prev = it; it->prev = prev;
+    prev->next = it; it->next = &request_queue;
 
-  DoublyLinked* it = &req->link;
-  DoublyLinked* prev = request_queue.prev;
-  request_queue.prev = it; it->prev = prev;
-  prev->next = it; it->next = &request_queue;
-
-  pthread_mutex_unlock(&request_queue_lock);
+    pthread_mutex_unlock(&request_queue_lock);
+  }
 }
 static inline DelayedRequest* remove_from_request_queue(void) {
   assert(request_queue_not_empty());
@@ -1702,7 +1702,6 @@ static void next_debug_event(void) {
   do {
     sleep(1);
     handle_pending_debug_requests();
-    if (terminated_event_sent) break;
   } while (run_mode == RUN_MODE_PAUSED);
 }
 
@@ -2339,7 +2338,7 @@ typedef struct {
 static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
   StackTrace_reset(&current_stack_trace);
-  if (!terminated_event_sent && stack_trace_available) create_stack_trace(req->format);
+  if (run_mode != RUN_MODE_TERMINATED && stack_trace_available) create_stack_trace(req->format);
   const int64_t total_frames = current_stack_trace.length;
 
   JSBuilder builder;
@@ -3263,7 +3262,7 @@ int main(int argc, char** argv) {
   redirect_output(stdout, STDOUT);
   //redirect_output(stderr, STDERR);
 
-  for (char* data; !terminated_event_sent; free(data)) {
+  for (char* data; run_mode != RUN_MODE_TERMINATED; free(data)) {
     const ssize_t length = read_packet(&data);
     if (!length) break;
 
