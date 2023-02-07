@@ -1696,6 +1696,60 @@ static const char* get_string_array(const JSObject* object, const char* name, in
   return NULL;
 }
 
+static inline void* untag(uint64_t x) {
+  assert((x & 7) == 1);
+  return (void*)(x - 1 + sizeof(void*));
+}
+
+typedef const struct STACK {
+  uint64_t size;            // long
+  uint64_t frames;          // ptr<StackFrame>
+  uint64_t stack_pointer;   // ptr<StackFrame>
+  uint64_t pc;              // long
+  const struct STACK* tail; // ptr<Stack>
+} Stack;
+
+typedef const struct {
+  uint64_t id;              // long
+  uint64_t stack;           // ref<Stack>
+  uint64_t parent;          // ref<False|RawCoroutine>
+  uint64_t status;          // ref<Int>
+  uint32_t num_winders;     // int
+  uint64_t crsp;            // long
+  uint64_t saved_winders;   // ref<SavedWinders>
+} RawCoroutine;
+
+// app_coroutine_refs[0] = &current_coroutine:ref<RawCoroutine>
+// app_coroutine_refs[1] = &stepping_coroutine:ref<False|RawCoroutine>
+uint64_t** app_coroutine_refs;
+static inline bool is_coroutine_closed(RawCoroutine* coroutine) {
+  return (coroutine->status >> 32) == 1;
+}
+
+extern uint64_t get_signal_handler_sp(void);
+static inline uint64_t current_stack_depth(RawCoroutine* current_coroutine) {
+  uint64_t sp = get_signal_handler_sp();
+  if (sp) {
+    Stack* stack = untag(current_coroutine->stack);
+    sp -= stack->frames;
+  }
+  return sp;
+}
+
+uint64_t false_ref;
+static uint64_t stepping_stack_depth;
+
+static void remember_stepping_coroutine_and_stack_depth(void) {
+  uint64_t* current_coroutine_ref_ptr = app_coroutine_refs[0];
+  uint64_t* stepping_coroutine_ref_ptr = app_coroutine_refs[1];
+  if (current_coroutine_ref_ptr) {
+    uint64_t current_coroutine_ref = *current_coroutine_ref_ptr;
+    *stepping_coroutine_ref_ptr = current_coroutine_ref;
+    RawCoroutine* current_coroutine = untag(current_coroutine_ref);
+    stepping_stack_depth = current_stack_depth(current_coroutine);
+  }
+}
+
 int stanza_main(int argc, char** argv);
 
 static void next_debug_event(void) {
@@ -1715,11 +1769,28 @@ void notify_stopped_at_safepoint(const void* pc) {
   char description[64];
   const uint64_t thread_id = 12345678;
   const uint64_t breakpoint = (uint64_t) ActiveFileSafepoints_find_entry(pc);
+  uint64_t* current_coroutine_ref_ptr = app_coroutine_refs[0];
+  uint64_t* stepping_coroutine_ref_ptr = app_coroutine_refs[1];
   StopReason reason = run_mode == RUN_MODE_RUNNING ? STOP_REASON_PAUSE : STOP_REASON_STEP;
   if (breakpoint) {
     snprintf(description, sizeof description, "breakpoint %" PRIu64, breakpoint);
     reason = STOP_REASON_BREAKPOINT;
+  } else if (stepping_coroutine_ref_ptr && run_mode >= RUN_MODE_STEP_OUT) {
+    uint64_t stepping_coroutine_ref = *stepping_coroutine_ref_ptr;
+    RawCoroutine* stepping_coroutine = untag(stepping_coroutine_ref);
+    if (!is_coroutine_closed(stepping_coroutine)) {
+      // If we are in different coroutine, continue stepping.
+      if (stepping_coroutine_ref != *current_coroutine_ref_ptr) return;
+
+      uint64_t stack_depth = current_stack_depth(stepping_coroutine);
+      if (stack_depth >= stepping_stack_depth) return;
+    }
   }
+
+  // Forget stepping coroutine
+  if (stepping_coroutine_ref_ptr)
+    *stepping_coroutine_ref_ptr = false_ref;
+
   send_thread_stopped(thread_id, reason, description, breakpoint);
   next_debug_event();
 }
@@ -2900,10 +2971,12 @@ static bool request_pause(const JSObject* request) {
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
   respond_to_request(request, NULL);
-  if (run_mode == RUN_MODE_PAUSED)
+  if (run_mode == RUN_MODE_PAUSED) {
     send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", 0);
-  else
+  } else {
+    run_mode = RUN_MODE_RUNNING;
     enable_all_safepoints();
+  }
   return true;
 }
 
@@ -2952,14 +3025,76 @@ static bool request_pause(const JSObject* request) {
 //     acknowledgement, so no body field is required."
 //   }]
 // }
+typedef DelayedRequest DelayedRequestStepIn;
+static void DelayedRequestStepIn_handle(DelayedRequest* req) {
+  enable_all_safepoints();
+  run_mode = RUN_MODE_STEP_IN;
+  stack_trace_available = true;
+  respond_to_delayed_request(req, NULL);
+}
+static inline DelayedRequest* DelayedRequestStepIn_create(const JSObject* request) {
+  return DelayedRequest_create(request, sizeof(DelayedRequestStepIn), &DelayedRequestStepIn_handle);
+}
 static bool request_stepIn(const JSObject* request) {
   // TODO: Do we really need this?
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
-  respond_to_request(request, NULL);
+  insert_to_request_queue(DelayedRequestStepIn_create(request));
+  return true;
+}
+
+// "StepOutRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "StepOut request; value of command field is 'stepOut'. The
+//     request starts the debuggee to run again for one step. The debug adapter
+//     first sends the StepOutResponse and then a StoppedEvent (event type
+//     'step') after the step has completed.", "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "stepOut" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/StepOutArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "StepOutArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'stepOut' request.",
+//   "properties": {
+//     "threadId": {
+//       "type": "integer",
+//       "description": "Execute 'stepOut' for this thread."
+//     }
+//   },
+//   "required": [ "threadId" ]
+// },
+// "StepOutResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'stepOut' request. This is just an
+//     acknowledgement, so no body field is required."
+//   }]
+// }
+typedef DelayedRequest DelayedRequestStepOut;
+static void DelayedRequestStepOut_handle(DelayedRequest* req) {
   enable_all_safepoints();
-  run_mode = RUN_MODE_STEP_IN;
+  remember_stepping_coroutine_and_stack_depth();
+  run_mode = RUN_MODE_STEP_OUT;
   stack_trace_available = true;
+  respond_to_delayed_request(req, NULL);
+}
+static inline DelayedRequest* DelayedRequestStepOut_create(const JSObject* request) {
+  return DelayedRequest_create(request, sizeof(DelayedRequestStepOut), &DelayedRequestStepOut_handle);
+}
+static bool request_stepOut(const JSObject* request) {
+  // TODO: Do we really need this?
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+  insert_to_request_queue(DelayedRequestStepOut_create(request));
   return true;
 }
 
@@ -3042,6 +3177,7 @@ static bool request_disconnect(const JSObject* request) {
   def(source)                 \
   def(stackTrace)             \
   def(stepIn)                 \
+  def(stepOut)                \
   def(threads)                \
   def(variables)
 
