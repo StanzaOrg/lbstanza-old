@@ -122,7 +122,7 @@ with:
 
 ;Represents either a mapper/doer clause.
 defstruct Clause :
-  x:Symbol
+  item:Symbol
   type
   body
 with:
@@ -135,14 +135,19 @@ with:
 defsyntax ast-lang2 :
 
   ;Imports
-  import (:!, type!, exp!, id!, id, type, exp) from core
+  import (:!, type!, exp!, id!, id, type, exp, exp4) from core
+
+  ;Extend core syntax
+  defrule exp4 = (?def:#defast) :
+    val compiled = compile(def)
+    parse-syntax[core / #exp](compiled)
 
   ;Overall defast production.
   public defproduction defast:DefAst
   defrule defast = (defast :
                       ?defs:#def! ...) :
     DefAst(to-tuple(defs))
-  
+
   ;Each type of definition.
   defproduction def:Def
 
@@ -216,10 +221,15 @@ defsyntax ast-lang2 :
                    nodes: (?nodes:#name! ...)) :
     MakeDoer(func-type, item-type, to-tuple(nodes))
 
+  ;Define an ignore
+  defrule def = (ignore :
+                   ?ts:#type! ...) :
+    Ignore(to-tuple(ts))
+
   ;Utility productions
   defproduction name: Symbol
   defrule name = (?x:#id) : unwrap-token(x)
- 
+
   ;Error productions.
   defproduction def!:Def
   defrule def! = (?x:#def)
@@ -256,10 +266,110 @@ defmethod print (o:OutputStream, e:ASTError) :
 ;==================== Compilation ===========================
 ;============================================================
 
-defn compile () :
+;------------------------------------------------------------
+;----------------- Type Handler Table -----------------------
+;------------------------------------------------------------
+
+;Represents either a mapper/doer type entry.
+defstruct TypeHandlerEntry :
+  name:Symbol
+  func:Symbol
+  func-type
+  item:Symbol
+  item-type
+  body
+
+;Collect all of the type handler entries into a single table.
+deftype TypeHandlerTable <: Collection<TypeHandlerEntry>
+
+;Ignore the item or not.
+defmulti ignore? (t:TypeHandlerTable, x) -> True|False
+
+;The mapper for a given function type and item type.
+defmulti mapper (t:TypeHandlerTable, func-type, item-type) -> TypeHandlerEntry
+
+;The doer for a given function type and item type.
+defmulti doer (t:TypeHandlerTable, func-type, item-type) -> TypeHandlerEntry
+
+;Pull out the type handler table from the ast.
+defn TypeHandlerTable (ast:DefAst) -> TypeHandlerTable :
+  ;Declare the tables for the entries.
+  val mappers = HashTable<[?,?],TypeHandlerEntry>()
+  val doers = HashTable<[?,?],TypeHandlerEntry>()
+  val ignores = HashSet<?>()
+
+  ;Creates the key for use in the tables.
+  defn item-key (func-type, item-type) :
+    [unwrap-all(func-type), unwrap-all(item-type)]
+
+  ;Collect all entries.
+  for def in defs(ast) do :
+    match(def) :
+      (def:DefMapper|DefDoer) :
+        for clause in clauses(def) do :
+          val key = item-key(func-type(def), type(clause))
+          val [base-name, table] = match(def) :
+            (def:DefMapper) : [`mapper, mappers]
+            (def:DefDoer) : [`doer, doers]
+          if key?(table,key) :
+            val msg = "Duplicate %_ for function type '%_' and item type '%_'."
+                    % [base-name, func-type(def), type(clause)]
+            throw(AE(false,msg))                       
+          else :
+            val entry = TypeHandlerEntry(
+                          gensym(base-name),
+                          func(def), func-type(def),
+                          item(clause), type(clause), body(clause))
+            table[key] = entry
+      (def:Ignore) :
+        for t in types(def) do :
+          add(ignores, unwrap-all(t))
+      (def) :
+        false
+
+  ;Return the table.
+  new TypeHandlerTable :
+    defmethod ignore? (this, type) :
+      ignores[unwrap-all(type)]
+
+    defmethod mapper (this, func-type, item-type) :
+      match(get?(mappers, item-key(func-type, item-type))) :
+        (e:TypeHandlerEntry) :
+          e
+        (f:False) :
+          val msg = "No mapper function declared for function type '%_' and item type '%_'."
+                  % [func-type, item-type]
+          throw(AE(false, msg))      
+
+    defmethod doer (this, func-type, item-type) :
+      match(get?(doers, item-key(func-type, item-type))) :
+        (e:TypeHandlerEntry) :
+          e
+        (f:False) :
+          val msg = "No doer function declared for function type '%_' and item type '%_'."
+                  % [func-type, item-type]
+          throw(AE(false, msg))
+
+    defmethod to-seq (this) :
+      cat(values(mappers), values(doers))
+
+;------------------------------------------------------------
+;------------------- Field Context --------------------------
+;------------------------------------------------------------
+
+deftype FieldContext
+defstruct MapperContext <: FieldContext : (func-type)
+defstruct DoerContext <: FieldContext : (func-type)
+
+;------------------------------------------------------------
+;------------------ Code Generation -------------------------
+;------------------------------------------------------------
+
+defn compile (ast:DefAst) -> ? :
+
   ;Generation template.
   val template = `(
-    nodetype{
+    nodetypes{
       ;Generate the overall type.
       deftype Type parent?{<: Parent}{}
 
@@ -271,7 +381,7 @@ defn compile () :
         common-options?{with : common-options}{}
       }
     }
-    
+
     mappers{
       defn map<?T> (func:FuncType, item:?T&ItemType) -> T :
         val result = match(item) :
@@ -302,68 +412,146 @@ defn compile () :
         false
     }
 
-    mapper-functions{
-      defn mapper (func:func-type, item:type) : body
-    }
-
-    doer-functions{
-      defn doer (func:func-type, item:type) : body
+    type-handlers{
+      defn handler (func:func-type, item:item-type) : body
     }
   )
 
-  template
+  ;Compute the type handler table first.
+  val type-handler-table = TypeHandlerTable(ast)
 
-  
+  ;Compile a DefNodes
+  defn compile (def:DefNodes) -> Tuple<KeyValue<Symbol,?>> :
+    [`Type => type(def)
+     `parent? => choice(not empty?(parent(def)))
+     `Parent => value?(parent(def))
+     `nodes => nested(compile-nodes(def, false))
+     `common-options? => choice(not empty?(common-options(def)))
+     `common-options => value?(common-options(def))]
 
-;============================================================
-;=================== Syntax Definition ======================
-;============================================================
+  ;Compile all the nodes under the given DefNodes.
+  defn compile-nodes (def:DefNodes, ctxt:FieldContext|False) -> Tuple<Tuple<KeyValue<Symbol,?>>> :
+    for node in nodes(def) map :
+      compile(node, common(def), ctxt)
 
-defsyntax stz/ast-lang2 :
-  import exp4 from core
+  ;Helper: Lookup the DefNodes definition of a given name.
+  defn lookup-defnodes (name:Symbol) -> DefNodes :
+    val x = find({type(_) == name}, filter-by<DefNodes>(defs(ast)))
+    match(x:DefNodes) : x
+    else : throw(AE(false, "No nodes definition with the name '%~'." % [name]))
 
-  defrule exp4 = (say-hello) :
-    val form = `(println("Hello everyone!"))
-    parse-syntax[core / #exp](form)
+  ;Compile a MakeMapper|MakeDoer.
+  defn compile (m:MakeMapper|MakeDoer) -> Tuple<KeyValue<Symbol,?>> :
+    val context = match(m) :
+      (m:MakeMapper) : MapperContext(func-type(m))
+      (m:MakeDoer) : DoerContext(func-type(m))
+    val compiled-nodes = to-tuple $
+      for type-name in nodes(m) seq-cat :
+        compile-nodes(lookup-defnodes(type-name), context)
+    [`T => gensym(`T)
+     `func => gensym(`func)
+     `item => gensym(`item)
+     `result => gensym(`result)
+     `FuncType => func-type(m)
+     `ItemType => item-type(m)
+     `nodes => nested(compiled-nodes)]
+
+  ;Compile type handler table.
+  defn compile (entry:TypeHandlerEntry) -> Tuple<KeyValue<Symbol,?>> :
+    [`handler => name(entry),
+     `func => func(entry)
+     `func-type => func-type(entry)
+     `item => item(entry)
+     `item-type => item-type(entry)
+     `body => body(entry)]
+
+  ;Compile a node.
+  defn compile (node:Node, common:Tuple<NodeField>, ctxt:FieldContext|False) -> Tuple<KeyValue<Symbol,?>> :
+    [`Node => name(node)
+     `all-fields => nested $ to-tuple $
+       seq(compile{_, ctxt}, cat(common, fields(node)))]
+
+  ;Compile all the entries of a single NodeField.
+  defn compile (field:NodeField, ctxt:FieldContext|False) -> Tuple<KeyValue<Symbol,?>> :
+    ;Is the field ignored?
+    val ignore-field? = ignore?(type-handler-table,type(field))
+    var mapper-name:Symbol|False = false
+    var doer-name:Symbol|False = false
+
+    ;Lookup mapper/doer from field context.
+    if not ignore-field? :
+      match(ctxt) :
+        (ctxt:MapperContext) :
+          mapper-name = name(mapper(type-handler-table, func-type(ctxt), type(field)))
+        (ctxt:DoerContext) :
+          doer-name = name(doer(type-handler-table, func-type(ctxt), type(field)))
+        (f:False) :
+          false
+        
+    [`name => name(field)
+     `type => type(field)
+     `options? => choice(not empty?(options(field)))
+     `options => value?(options(field))
+     `ignore? => choice(ignore-field?)
+     `mapper => mapper-name
+     `doer => doer-name]
+
+  ;Fill the template.
+  val defnodes = to-tuple(filter-by<DefNodes>(defs(ast)))
+  val mappers = to-tuple(filter-by<MakeMapper>(defs(ast)))
+  val doers = to-tuple(filter-by<MakeDoer>(defs(ast)))
+  fill-template(template, [
+    `nodetypes => nested $ map(compile, defnodes)
+    `mappers => nested $ map(compile, mappers)
+    `doers => nested $ map(compile, doers)
+    `type-handlers => nested $ to-tuple $
+      seq(compile, type-handler-table)])
 
 ;============================================================
 ;====================== Scratch =============================
 ;============================================================
 
-let :
-  within (package,sig) = set-stack-trace-filter() :
-    package != `core
-  val str = \<STR>
-    defast :
-      defnodes MyType <: Hashable&Equalable :
-        common :
-          info: FileInfo|False with: (as-method => true)
-        common-options :
-          printer => true
-          equalable => true
-        A :
-          field1: Type1
-          field2: Type2 with: (options ...)
-        B :
-          field1: Type1
-          field2: Type2 with: (options ...)
-
-      defmapper (f:TLItem -> TLItem) :
-        (x:List<TDefn>) : map({f(_) as TDefn}, x)
-        (x:List<TDefmethod>) : map({f(_) as TDefmethod}, x)
-
-      make-mapper :
-        func: TLItem -> TLItem
-        item: TLItem
-        nodes: (MyType)
-
-      make-doer :
-        func: TLItem -> ?
-        item: TLItem
-        nodes: (MyType)      
-  <STR>
-  val form = reader/read-all(str)
-  val parsed = parse-syntax[ast-lang2 / #defast](form)
-  println(parsed)
-
-println $ compile()
+;let :
+;  within (package,sig) = set-stack-trace-filter() :
+;    package != `core
+;  val str = \<STR>
+;    defast :
+;      defnodes MyType <: Hashable&Equalable :
+;        common :
+;          info: FileInfo|False with: (as-method => true)
+;        common-options :
+;          printer => true
+;          equalable => true
+;        A :
+;          field1: Type1
+;          field2: Type2 with: (setter => set-field2)
+;        B :
+;          field1: Type1
+;          field2: Type2 with: (options ...)
+;
+;      defmapper (f:TLItem -> TLItem) :
+;        (x:Type1) : f(x)
+;        (x:List<TDefn>) : map({f(_) as TDefn}, x)
+;        (x:List<TDefmethod>) : map({f(_) as TDefmethod}, x)
+;
+;      defdoer (f:TLItem -> ?) :
+;        (x:Type1) : f(x)
+;
+;      make-mapper :
+;        func: TLItem -> TLItem
+;        item: TLItem
+;        nodes: (MyType)
+;
+;      make-doer :
+;        func: TLItem -> ?
+;        item: TLItem
+;        nodes: (MyType)
+;        
+;      ignore :
+;        FileInfo|False
+;        Type2
+;  <STR>
+;  val form = reader/read-all(str)
+;  val parsed = parse-syntax[ast-lang2 / #defast](form)
+;  println(parsed)
+;  println(compile(parsed))
