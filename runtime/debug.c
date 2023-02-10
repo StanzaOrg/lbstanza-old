@@ -1727,6 +1727,7 @@ static inline bool is_coroutine_closed(RawCoroutine* coroutine) {
 }
 
 extern uint64_t get_signal_handler_sp(void);
+extern uint64_t get_signal_handler_ip(void);
 static inline uint64_t current_stack_depth(RawCoroutine* current_coroutine) {
   uint64_t sp = get_signal_handler_sp();
   if (sp) {
@@ -1736,10 +1737,29 @@ static inline uint64_t current_stack_depth(RawCoroutine* current_coroutine) {
   return sp;
 }
 
-uint64_t false_ref;
-static uint64_t stepping_stack_depth;
+static SafepointEntry* current_safepoint_position(void) {
+  const uint64_t pc = get_signal_handler_ip();
+  if (pc) {
+    // This implementation is O(number-of-safepoints) and so would not scale for large apps.
+    // Building a hashtable at each debugger start would be slow.
+    // Consider building a hashtable at app compile time.
+    SafepointTable* safepoints = app_safepoint_table;
+    if (safepoints) {
+      for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files; i++) {
+        FileSafepoints* file = safepoints->files[i];
+        for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++)
+          if (AddressList_find(entry->address_list, (const void*)pc)) return entry;
+      }
+    }
+  }
+  return NULL;
+}
 
-static void remember_stepping_coroutine_and_stack_depth(void) {
+enum { false_ref = 2 };
+static uint64_t stepping_stack_depth;
+static SafepointEntry* stepping_position;
+
+static void remember_stepping_context(void) {
   uint64_t* current_coroutine_ref_ptr = app_coroutine_refs[0];
   uint64_t* stepping_coroutine_ref_ptr = app_coroutine_refs[1];
   if (current_coroutine_ref_ptr) {
@@ -1747,6 +1767,7 @@ static void remember_stepping_coroutine_and_stack_depth(void) {
     *stepping_coroutine_ref_ptr = current_coroutine_ref;
     RawCoroutine* current_coroutine = untag(current_coroutine_ref);
     stepping_stack_depth = current_stack_depth(current_coroutine);
+    stepping_position = current_safepoint_position();
   }
 }
 
@@ -1775,7 +1796,7 @@ void notify_stopped_at_safepoint(const void* pc) {
   if (breakpoint) {
     snprintf(description, sizeof description, "breakpoint %" PRIu64, breakpoint);
     reason = STOP_REASON_BREAKPOINT;
-  } else if (stepping_coroutine_ref_ptr && run_mode >= RUN_MODE_STEP_OUT) {
+  } else if (run_mode >= RUN_MODE_STEP_OUT && stepping_coroutine_ref_ptr && *stepping_coroutine_ref_ptr != false_ref) {
     uint64_t stepping_coroutine_ref = *stepping_coroutine_ref_ptr;
     RawCoroutine* stepping_coroutine = untag(stepping_coroutine_ref);
     if (!is_coroutine_closed(stepping_coroutine)) {
@@ -1783,7 +1804,12 @@ void notify_stopped_at_safepoint(const void* pc) {
       if (stepping_coroutine_ref != *current_coroutine_ref_ptr) return;
 
       uint64_t stack_depth = current_stack_depth(stepping_coroutine);
-      if (stack_depth >= stepping_stack_depth) return;
+      if (run_mode == RUN_MODE_STEP_OUT) {
+        if (stack_depth >= stepping_stack_depth) return;
+      } else { // RUN_MODE_STEP_OVER
+        if (stack_depth > stepping_stack_depth) return;
+        if (stack_depth == stepping_stack_depth && stepping_position == current_safepoint_position()) return;
+      }
     }
   }
 
@@ -3082,7 +3108,7 @@ static bool request_stepIn(const JSObject* request) {
 typedef DelayedRequest DelayedRequestStepOut;
 static void DelayedRequestStepOut_handle(DelayedRequest* req) {
   enable_all_safepoints();
-  remember_stepping_coroutine_and_stack_depth();
+  remember_stepping_context();
   run_mode = RUN_MODE_STEP_OUT;
   stack_trace_available = true;
   respond_to_delayed_request(req, NULL);
@@ -3095,6 +3121,63 @@ static bool request_stepOut(const JSObject* request) {
   // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
   insert_to_request_queue(DelayedRequestStepOut_create(request));
+  return true;
+}
+
+// "NextRequest": {
+//   "allOf": [ { "$ref": "#/definitions/Request" }, {
+//     "type": "object",
+//     "description": "Next request; value of command field is 'next'. The
+//                     request starts the debuggee to run again for one step.
+//                     The debug adapter first sends the NextResponse and then
+//                     a StoppedEvent (event type 'step') after the step has
+//                     completed.",
+//     "properties": {
+//       "command": {
+//         "type": "string",
+//         "enum": [ "next" ]
+//       },
+//       "arguments": {
+//         "$ref": "#/definitions/NextArguments"
+//       }
+//     },
+//     "required": [ "command", "arguments"  ]
+//   }]
+// },
+// "NextArguments": {
+//   "type": "object",
+//   "description": "Arguments for 'next' request.",
+//   "properties": {
+//     "threadId": {
+//       "type": "integer",
+//       "description": "Execute 'next' for this thread."
+//     }
+//   },
+//   "required": [ "threadId" ]
+// },
+// "NextResponse": {
+//   "allOf": [ { "$ref": "#/definitions/Response" }, {
+//     "type": "object",
+//     "description": "Response to 'next' request. This is just an
+//                     acknowledgement, so no body field is required."
+//   }]
+// }
+typedef DelayedRequest DelayedRequestNext;
+static void DelayedRequestNext_handle(DelayedRequest* req) {
+  enable_all_safepoints();
+  remember_stepping_context();
+  run_mode = RUN_MODE_STEP_OVER;
+  stack_trace_available = true;
+  respond_to_delayed_request(req, NULL);
+}
+static inline DelayedRequest* DelayedRequestNext_create(const JSObject* request) {
+  return DelayedRequest_create(request, sizeof(DelayedRequestNext), &DelayedRequestNext_handle);
+}
+static bool request_next(const JSObject* request) {
+  // TODO: Do we really need this?
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+  insert_to_request_queue(DelayedRequestNext_create(request));
   return true;
 }
 
@@ -3171,6 +3254,7 @@ static bool request_disconnect(const JSObject* request) {
   def(initialize)             \
   def(launch)                 \
   def(pause)                  \
+  def(next)                   \
   def(scopes)                 \
   def(setBreakpoints)         \
   def(setExceptionBreakpoints)\
