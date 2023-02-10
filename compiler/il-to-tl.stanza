@@ -28,25 +28,30 @@ public defn to-tl (ipackages:Tuple<IPackage>,
   val namemap = NameMap(seq(namemap, ipackages),
                         exports)
 
-  ;Translate each package, and collect any assertions.
-  val asserts = Vector<Assert>()
-  val tpackages = let-var CURRENT-NAMEMAP = namemap :
-    within collect-assertions(asserts) :
+  ;Use the consolidated namemap.
+  let-var CURRENT-NAMEMAP = namemap :
+
+    ;Translate each package, and collect any assertions.
+    val asserts = Vector<Assert>()
+    val tpackages = within collect-assertions(asserts) :
       map(to-tpackage, ipackages)
 
-  ;Compute the type hierarchy.
-  val hier = within set-id-env(TypeIDEnv(namemap)) :
-    compute-type-hierarchy(tpackages, exports)
+    ;Compute the type relations.
+    val type-relations = within set-id-env(TypeIDEnv(namemap)) :
+      compute-type-relations(tpackages, exports)
 
-  ;Check for errors.
-  val errors = Vector<TypeError>()
-  check-valid-hierarchy(add{errors, _}, hier)
-  check-assertions(add{errors, _}, hier, asserts)
+    ;Check for errors.
+    val errors = Vector<TypeError>()
+    check-valid-relations(add{errors, _}, type-relations)
+    check-assertions(add{errors, _}, type-relations, asserts)
 
-  ;Return bundled packages and consolidated namemap, if
-  ;the program has no errors.
-  if empty?(errors) : TProg(hier, tpackages, namemap)
-  else : TypeErrors(to-tuple(errors))
+    ;Return bundled packages and consolidated namemap, if
+    ;the program has no errors.
+    if empty?(errors) :
+      val hier = TypeHierarchy(fill-type-relations(type-relations))
+      TProg(hier, tpackages, namemap)
+    else :
+      TypeErrors(to-tuple(errors))
 
 ;============================================================
 ;================= Namemap Consolidation ====================
@@ -902,8 +907,8 @@ defn destructure-args (args:List<IExp>, input-body:TExp) -> [Tuple<Int>, TExp] :
 
 ;Extract the type hierarchy from the given converted packages
 ;and exports.
-defn compute-type-hierarchy (tpackages:Collection<TPackage>,
-                             environment:Tuple<Export>) -> TypeHierarchy :
+defn compute-type-relations (tpackages:Collection<TPackage>,
+                             environment:Tuple<Export>) -> Tuple<TypeRelation> :
   ;Collect all type commands in packages and environment.
   val type-comms = Vector<TDefType|TLDefType>()
   for tpackage in tpackages do :
@@ -944,9 +949,15 @@ defn compute-type-hierarchy (tpackages:Collection<TPackage>,
       for c in children(c) do :
         ;Re-express the parent using the type variables used
         ;at definition time.
-        val env = to-tuple $
-          seq({_ => TVar(_)}, args(c), type-args[n(c)])
-        add-parent(n(c), sub(parent(c), env))
+        val env = IntTable<TVar>()
+        for (v in args(c), defv in type-args[n(c)]) do :
+          env[v] = TVar(defv)
+        val new-parent = let loop (t:Type = parent(c)) :
+          match(t) :
+            (t:TVar) : get?(env, n(t), t)
+            (t:TRaw) : t
+            (t) : stz/types/map(loop{_ as Type}, t)
+        add-parent(n(c), new-parent)
 
   ;Populate the 'special-types' table.
   defn calc-special-types () -> False :
@@ -969,26 +980,26 @@ defn compute-type-hierarchy (tpackages:Collection<TPackage>,
   calc-direct-parents()
   calc-child-parents()
   calc-special-types()
-  TypeHierarchy(calc-relations())
+  calc-relations()
 
 ;============================================================
 ;================== Hierarchy Checking ======================
 ;============================================================
 
 ;Check the type relations for any errors.
-defn check-valid-hierarchy (return:TypeError -> ?,
-                            hier:TypeHierarchy) -> False :
+defn check-valid-relations (return:TypeError -> ?,
+                            relations:Tuple<TypeRelation>) -> False :
 
   ;Retrieve all the class ids in the given type.
   defn classes (t:False|Type) -> List<Int> :
     match(t) :
-      (t:TOf) : List(n(t))
+      (t:TOf|TRaw) : List(n(t))
       (t:TAnd) : append(classes(a(t)), classes(b(t)))
       (t:False) : List()
 
   ;Create all the components.
   val components = strong-components $
-    for r in relations(hier) seq :
+    for r in relations seq :
       n(r) => classes(parent(r))
 
   ;Compute cycles.
@@ -1006,16 +1017,21 @@ defn type-loc (n:Int) -> DefinedType :
     (f:False) : DefinedType(name(ventry), ErrorLoc(PackageName(package(ventry))))
 
 ;============================================================
-;==================== Assertion Checking ====================
+;================== Assertion Checking ======================
 ;============================================================
 
 ;Check that the assertions are satisfied.
 defn check-assertions (return:TypeError -> ?,
-                       hier:TypeHierarchy,
+                       relations:Tuple<TypeRelation>,
                        assertions:Seqable<Assert>) -> False :
+  ;Compute the type arity table.
+  val type-arity = to-inttable<Int> $
+    for r in relations seq :
+      n(r) => length(args(r))
+
   for a in assertions do :
     match(a:CorrectTArity) :
-      val actual-arity = type-arity(hier,n(a))
+      val actual-arity = type-arity[n(a)]
       val num-args = length(targs(a))
       if num-args != actual-arity :
         return $ WrongTypeArity(
@@ -1023,6 +1039,40 @@ defn check-assertions (return:TypeError -> ?,
           get-defined-name(n(a)),
           map(format,targs(a))
           actual-arity)
+
+;============================================================
+;==================== Fill Type Relations ===================
+;============================================================
+
+;Fill the raw types in the given type relations.
+defn fill-type-relations (rs:Tuple<TypeRelation>) -> Tuple<TypeRelation> :
+  ;Compute the type arity table.
+  val type-arity = to-inttable<Int> $
+    for r in rs seq :
+      n(r) => length(args(r))
+
+  ;Return [?, ?, ?], with as many graduals as the arity
+  ;of the given class.
+  defn graduals (n:Int) -> Tuple<TGradual> :
+    to-tuple $ for i in 0 to type-arity[n] seq :
+      TGradual()
+
+  ;Fill the raws in the given type item.
+  defn fill (t:TypeItem) -> TypeItem :
+    match(t) :
+      (t:TRaw) : TOf(n(t), graduals(n(t)))
+      (t:TRawStruct) : StructT(n(t), graduals(n(t)))
+      (t) : map(fill, t)
+
+  ;Filling functions.
+  defn fill (f:False) : false
+  defn fill (f:HField) -> HField :
+    HField(name(f), fill(type(f)) as LSType, mutable?(f))
+  defn fill (r:TypeRelation) -> TypeRelation :
+    TypeRelation(n(r), special(r), args(r), fill(parent(r)) as Type|False, map(fill,fields(r)))
+
+  ;Launch!
+  map(fill,rs)
 
 ;============================================================
 ;====================== Utilities ===========================
