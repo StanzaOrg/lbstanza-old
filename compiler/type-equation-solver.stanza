@@ -33,8 +33,8 @@ public defstruct SolverState :
   sel-eqns: IntTable<TypeEqn>
   solved: IntTable<SolverValue> with:
     init => IntTable<SolverValue>()
-  guesses: IntTable<Tuple<True|False>> with:
-    init => IntTable<Tuple<True|False>>()
+  guesses: IntTable<Tuple<PredResult>> with:
+    init => IntTable<Tuple<PredResult>>()
   blocked: IntTable<List<TypeEqn>> with:
     init => IntTable<List<TypeEqn>>(List())
   active-eqns: Queue<TypeEqn> with:
@@ -506,13 +506,17 @@ defn fill-solved (f:Type -> Type, e:TypeEqn) -> TypeEqn :
   defn g (x:Tuple<FArg>) : map(g, x)
   defn g (e:KeyValue<Int,Type>) : key(e) => f(value(e))
   defn g (e:Tuple<KeyValue<Int,Type>>) : map(g,e)
+  defn g (i:Instantiation) : Instantiation(index(i), inst(i), g(arrow(i)) as TArrow)
+  defn g (xs:Tuple<Instantiation>) : map(g,xs)
+  defn g (xs:Maybe<Tuple<Instantiation>>) : None() when empty?(xs) else One(g(value!(xs)))
+  defn g2 (xs:Tuple<Type>) : map(f,xs)
   match(e) :
     (e:CaptureEqn) : CaptureEqn(n(e), variance(e), f(a(e)), b(e))
     (e:InferEqn) : InferEqn(n(e), g(a(e)), g(b(e)))
-    (e:OverloadExpEqn) : OverloadExpEqn(n(e), sel(e), g(xs(e)), f(y(e)))
-    (e:OverloadCallEqn) : OverloadCallEqn(n(e), sel(e), g(xs(e)), g(args(e)))
     (e:SubEqn) : SubEqn(n(e), g(x(e)), g(ys(e)))
     (e:EqualEqn) : EqualEqn(n(e), g(type(e)))
+    (e:OverloadExpEqn) : OverloadExpEqn(n(e), sel(e), inst(e), g(functions(e)), g(instantiations(e)), g(y(e)))
+    (e:OverloadCallEqn) : OverloadCallEqn(n(e), sel(e), g(xs(e)), g2(args(e)))
     (e) : fatal("%_ equation is not part of main solver loop." % [object-type(e)])
 
 ;============================================================
@@ -585,21 +589,21 @@ defmethod solve-eqn (e:SubEqn, s:SolverState) -> False :
     (f:False) :
       set-var(s, n(e), Unsatisfiable())
 
-defmethod solve-eqn (e:OverloadExpEqn, s:SolverState) -> False :
+defmethod solve-eqn (e:OverloadCallEqn, s:SolverState) -> False :
   ;If the selection was guessed, then use the guessed
   ;value.
   if key?(guesses(s), sel(e)) :
     val values = guesses(s)[sel(e)]
-    val ts = to-tuple(filter({_1}, xs(e), values))
-    val mixed = mix-functions(ts)
+    val mixed = mix-functions(xs(e), values)
     set-var(s, n(e), SolvedType(mixed, Covariant, Unfilled()))
 
   ;Otherwise, compute the selection ourselves.
   else :
     ;Compute which of the overloads are good.
     val selections = for x in xs(e) map :
-      select-overload(x, y(e), hierarchy(s))
+      select-overload-call(x, args(e), hierarchy(s))
     debugln("selections: %," % [seq(debugfmt,selections)])
+    
     ;Determine how many are remaining.
     switch(count({_ is-not False}, selections)) :
       ;Case: none of the overloads are appropriate.
@@ -617,8 +621,7 @@ defmethod solve-eqn (e:OverloadExpEqn, s:SolverState) -> False :
           blocked(s, e, uvars)
         ;Case: No selections are blocked.
         else :
-          val ts = to-tuple(filter({_1 is True}, xs(e), selections))
-          val mixed = mix-functions(ts)
+          val mixed = mix-functions(xs(e), selections)
           set-var(s, n(e), SolvedType(mixed, Covariant, Unfilled()))
 
 ;============================================================
@@ -631,7 +634,7 @@ defmethod solve-eqn (e:OverloadExpEqn, s:SolverState) -> False :
 defn make-guesses (s:SolverState) -> True|False :
   ;Retrieve all the blocked overload equations.
   val overload-eqns = to-tuple $
-    filter-by<OverloadExpEqn>(blocked-eqns(s))
+    filter-by<OverloadCallEqn>(blocked-eqns(s))
 
   ;Track whether any guesses were made.
   var guesses-made:True|False = false
@@ -640,14 +643,16 @@ defn make-guesses (s:SolverState) -> True|False :
     if not solved?(s,e) :
       ;Compute the selection.
       val sel = for x in xs(e) map :
-        select-overload(x, y(e), hierarchy(s))
-      ;If there are any 'true' selections, then we
+        select-overload-call(x, args(e), hierarchy(s))
+      ;If there are any 'true' or 'gradual' selections, then we
       ;can generate a guess.
-      if any?({_ is True}, sel) :
+      if any?({_ is True|GradualMatch}, sel) :
         ;Indicate that we are generating a guess for this equation.
         debugln("guess: %_" % [debugfmt(e)])
         ;Generate and store the guess.
-        val guess = map({_ is True}, sel)
+        val guess = for s in sel map :
+          match(s:Blocked) : false
+          else : s
         guesses(s)[/sel(e)] = guess
         guesses-made = true
         ;Indicate the guess.
@@ -666,14 +671,15 @@ defn update-guesses (s:SolverState) -> True|False :
   for guess in to-tuple(guesses(s)) do :
     val eqn = fill-solved(sel-eqns(s)[key(guess)], s)
     match(eqn) :
-      (eqn:OverloadExpEqn) :
+      (eqn:OverloadCallEqn) :
         ;Compute the new selection.
         val sel = for x in xs(eqn) map :
-          select-overload(x, y(eqn), hierarchy(s))
+          select-overload-call(x, args(eqn), hierarchy(s))
         ;Merge with the previous guess.
         val new-values = to-tuple $
           for (new-v in sel, old-v in value(guess)) seq :
-            old-v or (new-v is True)
+            match(old-v:False, new-v:True|GradualMatch) : new-v
+            else : old-v
         ;If the new values are different, then update the guess.
         if new-values != value(guess) :
           debugln("update-guess: %_" % [debugfmt(eqn)])
