@@ -84,7 +84,7 @@ What are the different cases?
 ;Calculate the given capture variable.
 public defn capture (cv:Int, variance:Variance, a:Type, b:Type, hier:TypeHierarchy) -> CaptureResult :
   val sresult = capture-search(cv, CapRight, a, b, hier)
-  match(simplify(sresult,true)) :
+  match(simplify(sresult,true,false)) :
     (r:Blocked) : r
     (r:NoSoln) : false  
     (r:Solved) : evaluate-constraint(constraint(r), variance)
@@ -92,7 +92,7 @@ public defn capture (cv:Int, variance:Variance, a:Type, b:Type, hier:TypeHierarc
 ;Calculate the given inference location.
 public defn infer (a:InferLoc|Type, b:InferLoc|Type, hier:TypeHierarchy) -> CaptureResult :
   val sresult = capture-search(a, b, hier)
-  match(simplify(sresult,true)) :
+  match(simplify(sresult,true,false)) :
     (r:Blocked) : r
     (r:NoSoln) : false
     (r:Solved) :
@@ -112,15 +112,20 @@ public deftype CaptureResult :
 ;passed to b.
 public defn select-overload (a:TArrow, b:Type, hier:TypeHierarchy) -> PredResult :
   val sresult = select-overload-search(a, b, hier)
-  match(simplify(sresult, false)) :
+  match(simplify(sresult,false,true)) :
     (r:Blocked) : r
     (r:NoSoln) : false
-    (r:Solved) : true
+    (r:Solved) : true when num-gradual-expansions(r) == 0 else GradualMatch()
 
 ;Compute whether the given arrow is appropriate to be called with the given
 ;arguments.
 public defn select-overload-call (a:TArrow, args:Tuple<Type>, hier:TypeHierarchy) -> PredResult :
-  fatal("Not yet implemented")
+  ;Form a dummy TArrow out of args. The return type is unused so it can be anything.
+  val sresult = select-overload-search(a, TArrow(args, TGradual()), hier)
+  match(simplify(sresult,false,true)) :
+    (r:Blocked) : r
+    (r:NoSoln) : false
+    (r:Solved) : true when num-gradual-expansions(r) == 0 else GradualMatch()
 
 ;Represents the result of a boolean predicate function.
 public deftype PredResult :
@@ -633,11 +638,12 @@ public defn format (f:TypeFormatter, c:SolnConstraint) :
 ;  solve in a few more cases, and also helps the partof? relation where
 ;  captured variables are solved before function mixing.
 public defn simplify (r:SearchResult,
-                      forced-top?:True|False) -> SimplifyResult :
+                      forced-top?:True|False,
+                      forced-free-graduals?:True|False) -> SimplifyResult :
   match(r) :
     (r:SAnd) :
-      match(simplify(a(r), forced-top?)
-            simplify(b(r), forced-top?)) :
+      match(simplify(a(r), forced-top?, forced-free-graduals?)
+            simplify(b(r), forced-top?, forced-free-graduals?)) :
         ;If either branch fails, then both fail.
         ;If this is a top-level conjunctive clause, then
         ;just force it to succeed.
@@ -653,8 +659,8 @@ public defn simplify (r:SearchResult,
           Solved(SimplifiedAndConstraint(constraint(sa), constraint(sb)),
                  num-gradual-expansions(sa) + num-gradual-expansions(sb))
     (r:SOr) :
-      match(simplify(a(r), false),
-            simplify(b(r), false)) :
+      match(simplify(a(r), false, forced-free-graduals?),
+            simplify(b(r), false, forced-free-graduals?)) :
         ;If one branch has no solution then choose the other.
         (sa:NoSoln, sb) : sb
         (sa, sb:NoSoln) : sa
@@ -671,10 +677,11 @@ public defn simplify (r:SearchResult,
             0 : Solved(SimplifiedOrConstraint(constraint(sa), constraint(sb))
                        num-gradual-expansions(sa))
     (r:SGradualExpansion) :
-      inc-gradual-expansions(simplify(result(r), forced-top?))
+      inc-gradual-expansions(simplify(result(r), forced-top?, forced-free-graduals?))
     (r:SSubtype) :
       if forced-top? : Solved(NoConstraint(), 0)
-      else : simplify(result(r), false)
+      else if forced-free-graduals? : zero-out-graduals(simplify(result(r), false, false))
+      else : simplify(result(r), false, false)
     (r:SBlocked) :
       Blocked(List(tvar(r)))
     (r:SSoln) :
@@ -715,6 +722,11 @@ defn unconstrained? (r:SimplifyResult) -> True|False :
 ;Helper: Increment the 'num-gradual-expansions' field in the result.
 defn inc-gradual-expansions (r:SimplifyResult) -> SimplifyResult :
   match(r:Solved) : Solved(constraint(r), num-gradual-expansions(r) + 1)
+  else : r
+
+;Helper: Set the number of gradual expansions to zero.
+defn zero-out-graduals (r:SimplifyResult) -> SimplifyResult :
+  match(r:Solved) : Solved(constraint(r), 0)
   else : r
 
 ;Helper: Append the type variables in the Blocked structs.
@@ -852,9 +864,27 @@ defn select-overload-search (x:TArrow, t:Type, hier:TypeHierarchy) -> SearchResu
 ;  Expecting: x|y -> c
 ;  So: x|y <: a|other
 defn partof-search (x:Type, y:Type, hier:TypeHierarchy) -> SearchResult :
-  match(x) :
-    (x:TOr) : SOr(partof-search(a(x), y, hier), partof-search(b(x), y, hier))
-    (x) : subtype-search(x, y, hier)
+  ;Sanity check.
+  if not user-type?(y, false) :
+    fatal("Right-hand type not a function argument type.")
+
+  ;Helper: Shorthand for calling partof-search
+  defn po (x:Type, y:Type) : partof-search(x, y, hier)
+  
+  match(x, y) :
+    ;Bottom and top type.
+    (x:TBot, y) : SSatisfied()
+    (x, y:TTop) : SSatisfied()
+    ;Combinatory types.
+    (x:TOr, y) : SOr(po(a(x),y), po(b(x),y))
+    (x, y:TAnd) : SAnd(po(x,a(y)), po(x,b(y)))
+    (x, y:TOr) : SOr(po(x, a(y)), po(x, b(y)))
+    (x:TAnd, y) : SOr(po(a(x), y), po(b(x), y))
+    ;Gradual types
+    (x:TGradual, y:TGradual) : SSatisfied()
+    (x:TGradual, y) : SGradualExpansion(po(expand-gradual(y), y))
+    ;Other.
+    (x, y) : SSubtype(subtype-search(x, y, hier))
 
 ;============================================================
 ;==================== Function Mixing =======================
