@@ -126,6 +126,12 @@ defn add-super? (a:Type, b:Type) -> False :
   match(a:TUVar) :
     add-equation(SuperEqn(n(a), b))
 
+;Helper: Generate an unsatisfiable equation if t
+;is a TUVar.
+defn add-unsatisfiable? (t:Type) -> False :
+  match(t:TUVar) :
+    add-equation(UnsatisfiableEqn(n(t)))
+
 ;============================================================
 ;================= Top Level Variables ======================
 ;============================================================
@@ -400,10 +406,24 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
       TLetRec(info(e), type!(new-body), ctxt, new-defns, new-body)
       
     (e:TFn) :
-
       ;Generate type variables
       val new-a1 = to-tuple(seq(gen-var, args(e), a1(e)))
       val new-a2 = or-var(a2(e))
+
+      ;Compute function arity.
+      val arity = length(a1(e))
+
+      ;Infer argument equations.      
+      match(ctxt) :
+        (ctxt:ExpCtxt) :
+          for (v in new-a1, i in 0 to false) do :
+            match(v:TUVar) :
+              add-equation $ InferEqn(n(v), ArgLoc(arity, i), expected(ctxt))
+        (ctxt:CallCtxt) :
+          if fixed-arity-call?(ctxt, length(new-a1)) :
+            do(add-equal?{_, type(_)}, new-a1, fargs(ctxt))
+          else :            
+            do(add-unsatisfiable?, new-a1)
 
       ;The body context has three cases.
       ;Case: When return type is explicitly provided.
@@ -417,7 +437,6 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
           ExpCtxt(a2)
         (a2:False, ctxt:ExpCtxt) :
           val r = fresh-tuvar()
-          val arity = length(a1(e))
           add-equation $ InferEqn(n(r), ReturnLoc(arity), expected(ctxt))
           ExpCtxt(r)
         (a2:False, ctxt:CallCtxt) :
@@ -521,17 +540,43 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
       ;Gen equations for func now that we have argument types.
       val func-ctxt = CallCtxt(targs(e), map(to-farg, new-args))
       val new-func = gen-equations(func(e), func-ctxt)
+      val ft = type!(new-func)
 
-      ;Infer return type from function type.
-      val ret-type = fresh-tuvar()
-      add-equation $ InferEqn(n(ret-type), type!(new-func), ReturnLoc(length(new-args)))
-      
-      ;Infer expected argument types from function type.
-      for (et in expected-arg-types, i in 0 to false) do :
-        add-equation $ InferEqn(n(et), type!(new-func), ArgLoc(length(new-args), i))
+      ;Compute the return type of the function call.
+      ;Case: func could not be instantiated properly, and we
+      ;just want to forcifully compute the return type.
+      match(ft:TFunction, ctxt:CallCtxt) :
+
+        ;Sanity check: Guaranteed by analysis of function.
+        if not same-length?(targs(ft), targs(ctxt)) or
+           not empty?(cargs(ft)) :
+          fatal("Type arity mismatch.")
+
+        ;Compute the return type by substituting targs.
+        val env = to-tuple $ seq(KeyValue, targs(ft), targs(ctxt))
+        val ret-type = match(a2(ft)) :
+          (a2:TUVar) :
+            val v = fresh-tuvar()
+            add-equation $ SubEqn(n(v), a2, env)
+            v
+          (a2:Type) :
+            sub(a2, env)
+
+        ;Return new data.
+        TDo(info(e), ret-type, ctxt, new-func, targs(e), new-args)
+
+      else :
+
+        ;Infer return type from function type.
+        val ret-type = fresh-tuvar()
+        add-equation $ InferEqn(n(ret-type), type!(new-func), ReturnLoc(length(new-args)))
         
-      ;Return new data.
-      TDo(info(e), ret-type, ctxt, new-func, targs(e), new-args)
+        ;Infer expected argument types from function type.
+        for (et in expected-arg-types, i in 0 to false) do :
+          add-equation $ InferEqn(n(et), type!(new-func), ArgLoc(length(new-args), i))
+          
+        ;Return new data.
+        TDo(info(e), ret-type, ctxt, new-func, targs(e), new-args)
       
     (e:TPrim) :
       fatal("gen-equations TPrim")
@@ -617,13 +662,23 @@ defn gen-equations (e:LSExp, ctxt:LSContext) -> LSExp :
     (e) :
       e
 
+;Return true if given call context passes exactly n
+;positional arguments.
+defn fixed-arity-call? (ctxt:CallCtxt, n:Int) -> True|False :
+  empty?(targs(ctxt)) and
+  all?({_ is PositionalArg}, fargs(ctxt)) and
+  length(fargs(ctxt)) == n    
+
 ;============================================================
 ;================= Function Equations =======================
 ;============================================================
 
 ;Generate the mixed function from the given reference.
 ;Assumes that the TRef refers to a function definition.
-defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix :
+;Returns TRef in the special case that the function cannot
+;be correctly instantiated, but we want to force a return
+;type anyway.
+defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix|TRef :
   match(func, ctxt) :
     ;Treat a single reference identically to a mix of one reference.
     (func:TRef, ctxt) :
@@ -640,17 +695,35 @@ defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix :
           instantiate(r, ctxt)
       val instfns = to-tuple(filter-by<InstantiatedFn>(instfns?))
 
-      ;Add the overloading equation to solve for the final mixed type.
-      val mixed-type = fresh-tuvar()
-      val mix-sel = fresh-svar()
-      add-equation $ OverloadCallEqn(
-        n(mixed-type),
-        n(mix-sel),
-        map(type,instfns),
-        map(type,fargs(ctxt)))
-          
-      ;Return the final mix.
-      TMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, InstFns(instfns))
+      ;If the call is incorrect, then attempt to get a return type
+      ;anyway.
+      if empty?(instfns) :
+        ;See whether a single ref exists.
+        val ref = single-function-ref?(typed-refs, ctxt)
+
+        ;Case: Return the ref directly and rely upon TDo to
+        ;grab return type.
+        match(ref:TRef) :
+          ref
+        ;Case: Cannot compute return type.
+        else :
+          val ret = unsatisfiable-tuvar()
+          TMix(info(func), ret, ctxt, typed-refs, fresh-svar(), InstFns([]))
+
+      ;Call may be correct, select the right one using an overload
+      ;equation.
+      else :
+        ;Add the overloading equation to solve for the final mixed type.
+        val mixed-type = fresh-tuvar()
+        val mix-sel = fresh-svar()
+        add-equation $ OverloadCallEqn(
+          n(mixed-type),
+          n(mix-sel),
+          map(type,instfns),
+          map(type,fargs(ctxt)))
+            
+        ;Return the final mix.
+        TMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, InstFns(instfns))
 
     ;Instantiate the mixed functions in an expression context.
     (func:TMix, ctxt:ExpCtxt) :
@@ -672,6 +745,30 @@ defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix :
 
       ;Return the final mix.
       TMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, inst-var)
+
+;Helper: Do our best to return a typed TRef.
+;Used in the special case where the TRef cannot be instantiated
+;with the given callctxt but we want to try and force a return type
+;out of the call anyway.
+defn single-function-ref? (refs:Tuple<TRef|False>, ctxt:CallCtxt) -> TRef|False :
+  ;If refs contains a single TRef then return it.
+  defn single-ref? () -> TRef|False :
+    if count({_ is TRef}, refs) == 1 :
+      find-by!<TRef>(refs)
+      
+  ;Returns true if TRef is a TFunction.
+  defn function-type? (r:TRef) -> True|False :
+    type(r) is TFunction
+    
+  ;Returns true if TRef has the right type arity.
+  defn correct-tarity? (r:TRef) -> True|False :
+    val ft = type(r) as TFunction
+    empty?(cargs(ft)) and same-length?(targs(ft), targs(ctxt))
+  
+  ;Launch!
+  val r = single-ref?()
+  match(r:TRef) :
+    r when function-type?(r) and correct-tarity?(r)
 
 ;Instantiate a function within a calling context.
 defn instantiate (f:TRef, ctxt:CallCtxt) -> InstantiatedFn|False :
