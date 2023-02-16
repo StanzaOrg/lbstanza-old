@@ -124,6 +124,11 @@ defn add-equal? (a:Type, b:Type) -> False :
   match(a:TUVar) :
     add-equation(EqualEqn(n(a), b))
 
+;Helper: Generate equality constraint a = b if a is a UVarT.
+defn add-lsequal? (a:LSType, b:LSType) -> False :
+  match(a:UVarT) :
+    add-equation(LSEqualEqn(n(a), b))
+
 ;Helper: Generate super constraint a :> b if a is a
 ;TUVar.
 defn add-super? (a:Type, b:Type) -> False :
@@ -343,16 +348,14 @@ defn gen-equations (c:TComm) -> TComm :
       for (a in args(c), farg in a1(c)) do :
         set-type(a, type-in-body(farg))
       ;Generate equations for body.
-      val body-ctxt = LSExpCtxt(a2(c))
-      val new-body = gen-equations(body(c), body-ctxt)
+      val new-body = gen-equations(body(c), One(a2(c)))
       sub-body(c, new-body)
 
     (c:TLExternFn) :
       ;Add arguments to the environmet.
       do(set-type, args(c), a1(c))
       ;Generate equations for body.
-      val body-ctxt = LSExpCtxt(a2(c))
-      val new-body = gen-equations(body(c), body-ctxt)
+      val new-body = gen-equations(body(c), One(a2(c)))
       sub-body(c, new-body)
 
     (c:TLDefmethod) :
@@ -360,12 +363,11 @@ defn gen-equations (c:TComm) -> TComm :
       for (a in args(c), farg in a1(c)) do :
         set-type(a, type-in-body(farg))
       ;Generate equations for body.
-      val body-ctxt = LSExpCtxt(a2(c))
-      val new-body = gen-equations(body(c), body-ctxt)
+      val new-body = gen-equations(body(c), One(a2(c)))
       sub-body(c, new-body)
 
     (c:TLInit) :
-      val new-comm = gen-equations(comm(c), LSBlankCtxt())
+      val new-comm = gen-equations(comm(c), None())
       TLInit(info(c), new-comm)
       
     (c) :
@@ -687,9 +689,106 @@ defn gen-method (m:TDefmethod, thist:Maybe<Type>) -> TDefmethod :
              new-a1, new-a2, args(m), new-body)
 
 ;Generate equations for the LoStanza command.
-defn gen-equations (c:LSComm, ctxt:LSContext) -> LSComm :
+;Return type is provided for analyzing LSReturn statements if the
+;command is used within a function.
+defn gen-equations (c:LSComm, return-type:Maybe<LSType>) -> LSComm :
   match(c) :
-    (c) :
+    (c:LSCall) :
+      val new-exp = gen-equations(exp(c), LSBlankCtxt())
+      LSCall(info(c), new-exp)
+
+    (c:LSSet) :
+      val new-exp = gen-equations(exp(c), LSBlankCtxt())
+      val new-value = gen-equations(value(c), LSExpCtxt(type!(new-exp)))
+      LSSet(info(c), new-exp, new-value)
+
+    (c:LSLabels) :
+      ;Put the block types in the environment.
+      for block in blocks(c) do :
+        set-type(n(block), BlockT(atypes(block)))
+      val new-blocks = for b in blocks(c) map :
+        gen-equations(b, return-type) as LSLabeledBlock
+      LSLabels(info(c), new-blocks)
+      
+    (c:LSLabeledBlock) :
+      do(set-type, args(c), atypes(c))
+      val new-body = gen-equations(body(c), return-type)
+      LSLabeledBlock(info(c), n(c), args(c), atypes(c), new-body)
+
+    (c:LSGoto) : ;(n:Int, args:Tuple<LSExp>)
+      ;Retrieve the branch types of the block.
+      val blockt = get-type(n(c)) as BlockT
+
+      ;Create the contexts for the arguments.
+      val arg-ctxts =
+        if same-length?(types(blockt), args(c)) :
+          map(LSExpCtxt,types(blockt))
+        else :
+          map(LSBlankCtxt{}, args(c))
+
+      ;Generate equations for the arguments in the right context.
+      val new-args = to-tuple $
+        seq(gen-equations, args(c), arg-ctxts)
+        
+      LSGoto(info(c), n(c), new-args)
+
+    (c:LSReturn) :
+      val new-exp = gen-equations(exp(c), LSExpCtxt(value!(return-type)))
+      LSReturn(info(c), new-exp)
+
+    (c:LSDef) : 
+      ;Generate type variables.
+      val new-type = or-lsvar(type(c))
+      set-type(n(c), new-type)
+      ;Create the context for the value.
+      val value-ctxt = match(type(c)) :
+                         (t:LSType) : LSExpCtxt(t)
+                         (f:False) : LSBlankCtxt()
+      val new-value = gen-equations(value(c), value-ctxt)
+      ;Add equality constraint
+      add-lsequal?(new-type, type!(new-value))
+      LSDef(info(c), n(c), new-type, new-value)
+
+    (c:LSDefVar) : 
+      ;Add to the environment.
+      set-type(n(c), type(c))
+      ;Generate the value equations.
+      val new-value = match(value(c)) :
+        (v:LSExp) : gen-equations(v, LSExpCtxt(type(c)))
+        (f:False) : false
+      ;Return definition.
+      LSDefVar(info(c), n(c), type(c), new-value)
+      
+    (c:LSSeq) : 
+      val new-a = gen-equations(a(c), return-type)
+      val new-b = gen-equations(b(c), return-type)
+      LSSeq(info(c), new-a, new-b)
+
+    (c:LSIf) : 
+      val new-pred = gen-equations(pred(c), LSExpCtxt(LongT()))
+      val new-conseq = gen-equations(conseq(c), return-type)
+      val new-alt = gen-equations(alt(c), return-type)
+      LSIf(info(c), new-pred, new-conseq, new-alt)
+
+    (c:LSMatch) : 
+      val new-args = map(gen-equations{_, LSBlankCtxt()}, args(c))
+      val new-branches = for branch in branches(c) map :
+        ;Compute new branch types by inheriting from arguments when
+        ;not given.
+        val new-atypes = to-tuple $
+          for (v in new-args, t in atypes(branch)) seq :
+            match(t:LSType) : t
+            else : type!(v)
+        ;Add arguments to the environment.
+        do(set-type, args(branch), new-atypes)
+        ;Analyze the body.
+        val new-body = gen-equations(body(branch), return-type)
+        ;Return the new branch.
+        LSBranch(info(branch), args(branch), new-atypes, new-body)
+      ;Return the new match.
+      LSMatch(info(c), new-args, new-branches)
+
+    (c:LSSkip) :
       c
 
 ;Generate equations for the given expression.
@@ -974,6 +1073,8 @@ defn fresh-instvar () -> InstVar :
 ;Create a fresh tuvar.
 defn fresh-tuvar () -> TUVar :
   TUVar(fresh-id())
+defn fresh-uvart () -> UVarT :
+  UVarT(fresh-id())
 defn fresh-tuvars (n:Int) -> Tuple<TUVar> :
   to-tuple(seq(fresh-tuvar{}, 0 to n))
 
@@ -995,6 +1096,10 @@ defn or-gradual (a:FArg?) : sub-type(a, or-gradual(type(a)))
 ;Return a type variable when false.
 defn or-var (f:False) : fresh-tuvar()
 defn or-var (t:Type) : t
+
+;Return a type variable when false.
+defn or-lsvar (f:False) : fresh-uvart()
+defn or-lsvar (t:LSType) : t
 
 ;Return a Top when false or TUVar.
 ;Used for generating contexts.
