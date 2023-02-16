@@ -1336,8 +1336,10 @@ static void send_output(const OutputType out, const char* data, size_t length) {
 }
 
 static void* redirect_output_loop(void* args) {
-  const int read_fd = ((const int*)args)[0];
-  const OutputType out = (OutputType)(((const int*)args)[1]);
+  const int read_fd = ((int*)args)[0];
+  const OutputType out = ((int*)args)[1];
+  free(args);
+
   while (true) {
     char buffer[4096];
     const int bytes_read = read(read_fd, &buffer, sizeof buffer);
@@ -1362,9 +1364,12 @@ static const char* redirect_fd(int fd, const OutputType out) {
     return error_buffer;
   }
 
-  int args[2] = {new_fd[0], (int)out};
+  // args must be heap-allocated, otherwise they can go out-of-scope before the created thread reads them.
+  int* args = malloc(2 * sizeof *args);
+  args[0] = new_fd[0];
+  args[1] = out;
   pthread_t thread;
-  if (pthread_create(&thread, NULL, &redirect_output_loop, &args)) {
+  if (pthread_create(&thread, NULL, &redirect_output_loop, args)) {
     snprintf(error_buffer, sizeof error_buffer, "Couldn't create the redirect thread for fd %d. %s", fd, current_error());
     return error_buffer;
   }
@@ -3478,7 +3483,7 @@ int main(int argc, char** argv) {
   initialize_stanza_debugger(args.argc, args.argv);
 
   redirect_output(stdout, STDOUT);
-  //redirect_output(stderr, STDERR);
+  redirect_output(stderr, STDERR);
 
   for (char* data; run_mode != RUN_MODE_TERMINATED; free(data)) {
     const ssize_t length = read_packet(&data);
