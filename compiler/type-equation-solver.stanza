@@ -8,6 +8,10 @@ defpackage stz/type-equation-solver :
   import stz/type-equations
   import stz/type-hierarchy
   import stz/type-formatter
+  import stz/type-instfns
+  import stz/type-instantiation
+  import stz/ids
+  import stz/type-utils
 
 ;============================================================
 ;====================== SolverState =========================
@@ -505,16 +509,17 @@ defn fill-solved (f:Type -> Type, e:TypeEqn) -> TypeEqn :
   defn g (x:Tuple<FArg>) : map(g, x)
   defn g (e:KeyValue<Int,Type>) : key(e) => f(value(e))
   defn g (e:Tuple<KeyValue<Int,Type>>) : map(g,e)
-  defn g (i:Instantiation) : Instantiation(index(i), inst(i), g(arrow(i)) as TArrow)
-  defn g (xs:Tuple<Instantiation>) : map(g,xs)
-  defn g (xs:Maybe<Tuple<Instantiation>>) : None() when empty?(xs) else One(g(value!(xs)))
+  defn g (i:InstFn) : InstFn(n(i), pattern(i), g2(capvars(i)), g(type(i)) as TArrow)
+  defn g (xs:Tuple<InstFn>) : map(g,xs)
+  defn g (xs:Maybe<Tuple<InstFn>>) : None() when empty?(xs) else One(g(value!(xs)))
   defn g2 (xs:Tuple<Type>) : map(f,xs)
+  defn g2 (xs:Tuple<KeyValue<Int,TFunction>>) : for x in xs map : key(x) => g(value(x)) as TFunction
   match(e) :
     (e:CaptureEqn) : CaptureEqn(n(e), variance(e), f(a(e)), b(e))
     (e:InferEqn) : InferEqn(n(e), g(a(e)), g(b(e)))
     (e:SubEqn) : SubEqn(n(e), g(x(e)), g(ys(e)))
     (e:EqualEqn) : EqualEqn(n(e), g(type(e)))
-    (e:OverloadExpEqn) : OverloadExpEqn(n(e), sel(e), inst(e), g(functions(e)), g(instantiations(e)), g(y(e)))
+    (e:OverloadExpEqn) : OverloadExpEqn(n(e), sel(e), inst(e), g2(functions(e)), g(instantiations(e)), g(y(e)))
     (e:OverloadCallEqn) : OverloadCallEqn(n(e), sel(e), g(xs(e)), g2(args(e)))
     (e:UnsatisfiableEqn) : e
     (e) : fatal("%_ equation is not part of main solver loop." % [object-type(e)])
@@ -562,7 +567,7 @@ defmethod solve-eqn (e:UnsatisfiableEqn, s:SolverState) -> False :
 
 defmethod solve-eqn (e:CaptureEqn, s:SolverState) -> False :
   match(capture(n(e), variance(e), a(e), b(e), hierarchy(s))) :
-    (b:Blocked) : blocked(s, e, tvars(b))
+    (b:Blocked) : blocked(s, e, vars(b))
     (f:False) : set-var(s, n(e), Unsatisfiable())
     (t:Type) : set-var(s, n(e), SolvedType(t, variance(e), Unfilled()))
 
@@ -571,7 +576,7 @@ defmethod solve-eqn (e:EqualEqn, s:SolverState) -> False :
 
 defmethod solve-eqn (e:InferEqn, s:SolverState) -> False :
   match(infer(a(e), b(e), hierarchy(s))) :
-    (b:Blocked) : blocked(s, e, tvars(b))
+    (b:Blocked) : blocked(s, e, vars(b))
     (f:False) : set-var(s, n(e), Unsatisfiable())
     (t:Type) :
       val variance = capture-variance(a(e),b(e))
@@ -612,25 +617,33 @@ defn instantiate-overload-eqn (return:OverloadCallEqn|OverloadExpEqn -> False,
   match(e) :
     (e:OverloadExpEqn) :
       if empty?(instantiations(e)) :
-
-        ;Attempt instantiation of all functions.
-        val instfns = Vector<Instantiation>()
-        val blocked-vars = IntSet()
-        for (f in functions(e), index in 0 to false) do :
-          match(instantiate(f, y(e))) :
-            (insts:Tuple<FnInst>) :
-              for inst in insts do :
-                val tuple-n = special-type(hierarchy(s), CoreTuple)
-                val arrow = arrow(f, inst, tuple-n)
-                add(instfns, Instantiation(index, inst, arrow))
-            (b:Blocked) :
-              add-all(blocked-vars, tvars(b))
-
-        ;Success if nothing was blocked.
-        if empty?(blocked-vars) :
-          return(sub-instantiations(e, One(to-tuple(instfns))))
-        else :
-          blocked(s, e, blocked-vars)
+        ;Create instantiator.
+        val instantiator = new Instantiator :
+          defmethod fresh-capvars (this, n:Int) -> Tuple<TUVar> :
+            to-tuple $ for i in 0 to n seq :
+              TUVar(fresh-id())
+          defmethod tuple-id (this) -> Int :
+            special-type(hierarchy(s), CoreTuple)
+          defmethod capture (this, capvars:Tuple<TUVar>, x:Type, y:Type) -> False :
+            push-eqn(s, CaptureAllEqn(map(n,capvars), x, y))
+          defmethod substitute (this, t:Type, env:Tuple<KeyValue<Int,Type>>) -> Type :
+            match(t:TUVar) :
+              val new-t = TUVar(fresh-id())
+              push-eqn(s, SubEqn(n(new-t), t, env))
+              new-t
+            else :
+              sub(t,env)
+        ;Instantiate the functions.
+        val result = instantiations(
+                       instantiator,
+                       functions(e),
+                       y(e))
+        ;If instantiated successfully, then use that as new equation.
+        match(result) :
+          (result:Tuple<InstFn>) :
+            return(sub-instantiations(e, One(result)))
+          (result:Blocked) :
+            blocked(s, e, vars(result))
       else :
         return(e)
     (e:OverloadCallEqn) :
@@ -656,7 +669,7 @@ defmethod solve-eqn (e:OverloadCallEqn|OverloadExpEqn, s:SolverState) -> False :
       ;Mix the output
       match(mix-selections(selections, xs(e))) :
         (r:SolverValue) : set-var(s, n(e), r)
-        (b:Blocked) : blocked(s, e, tvars(b))
+        (b:Blocked) : blocked(s, e, vars(b))
 
 ;Helper: Compute mixed type based upon selections.
 defn mix-selections (selections:Tuple<PredResult>, xs:Tuple<TArrow>) -> SolverValue|Blocked :
@@ -673,7 +686,7 @@ defn mix-selections (selections:Tuple<PredResult>, xs:Tuple<TArrow>) -> SolverVa
     else :
       ;Case: Some selections are blocked.
       if any?({_ is Blocked}, selections) :
-        val uvars = seq-cat(tvars, filter-by<Blocked>(selections))
+        val uvars = seq-cat(vars, filter-by<Blocked>(selections))
         Blocked(to-list(uvars))
       ;Case: No selections are blocked.
       else :
