@@ -1,0 +1,497 @@
+defpackage stz/type-instantiation :
+  import core
+  import collections
+  import stz/types
+  import stz/type-utils
+
+;============================================================
+;====== Representation of an Instantiated Function ==========
+;============================================================
+
+;Represents an instantiated function.
+;- n: An identifier used to indicate the original function that
+;  this instantiation is from.
+;- pattern: The pattern of instantiation. False if we forced
+;  an instantiation through that doesn't apply to the given arguments.
+;- capvars: The captured variables from the instantation. Initialized
+;  to Tuple<TCap> after instantiation. Expected to be filled in with
+;  TUVar after type equation generation.
+;- type: The resulting arrow type after instantiation.
+public defstruct InstFn :
+  n:Int
+  pattern:InstPattern
+  capvars:Tuple<Type>
+  type:TArrow
+
+;Represents an instantiated function.
+;- n: An identifier used to indicate the original function that
+;  this instantiation is from.
+;- pattern: The pattern of instantiation. 
+;- capvars: The captured variables from the instantation. Initialized
+;  to Tuple<TCap> after instantiation. Expected to be filled in with
+;  TUVar after type equation generation.
+;- type: The resulting arrow type after instantiation.
+public defstruct LSInstFn :
+  n:Int
+  pattern:InstPattern
+  capvars:Tuple<Type>
+  type:FnT
+
+;============================================================
+;======= Representation of an Instantiation Pattern =========
+;============================================================
+
+;Represents one particular pattern of instantiation of a TFunction or TLFunction.
+;If args[1] = 4, it means that the second argument passed to the
+;instantiated function actually corresponds to argument 5 in the original
+;function.
+public defstruct InstPattern :
+  args:Tuple<InstArg>
+with:
+  printer => true
+
+;Represents which function arg a value is provided to.
+public defstruct InstArg :
+  arg-index:Int|False
+  mode:ArgMode
+
+;Represents the mode in which a provided value is passed to
+;a function argument.
+;- BadArg: Represents a forced mismatch instantiation. Guaranteed
+;  not to be used in a good instantiation.
+public defenum ArgMode :
+  ToPositionalArg
+  ToVarArg
+  ToKeywordArg
+  ToKeywordVarArg
+  BadArg
+
+;============================================================
+;=================== Instantiator Callbacks =================
+;============================================================
+
+;Implement the necessary operations for creating new equations
+;and equation variables for the instantiation process.
+public deftype Instantiator
+
+;Create new capture variables.
+public defmulti fresh-capvars (inst:Instantiator, n:Int) -> Tuple<TUVar>
+
+;Return the identifier of the special Tuple type.
+public defmulti tuple-id (inst:Instantiator) -> Int
+
+;Create a new capture equation.
+public defmulti capture (inst:Instantiator, capvars:Tuple<TUVar>,
+                         x:Type, y:Type) -> False
+
+;Perform a substitution operation on the given type.
+public defmulti substitute (inst:Instantiator, t:Type, env:Tuple<KeyValue<Int,Type>>) -> Type
+
+;============================================================
+;======================= Drivers ============================
+;============================================================
+
+;Compute the instantiations of the given functions with the given
+;arguments.
+public defn instantiations (instantiator:Instantiator,
+                            functions:Tuple<KeyValue<Int,TFunction>>,
+                            targs:Tuple<Type>,
+                            args:Tuple<FArg>) -> Tuple<InstFn> :
+  ;Compute all appropriate instantiation patterns.
+  val instfns = Vector<InstFn>()
+  for entry in functions do :
+    val pat = instantiate(value(entry), length(targs), args)
+    match(pat:InstPattern) :
+      add(instfns, make-instfn(instantiator, key(entry), value(entry), pat, targs, args))
+  to-tuple(instfns)
+
+;Forcefully compute a single instantiation.
+public defn force-instantiation (instantiator:Instantiator,
+                                 functions:Tuple<KeyValue<Int,TFunction>>,
+                                 targs:Tuple<Type>,
+                                 args:Tuple<FArg>) -> InstFn|False :
+  if length(functions) == 1:
+    val entry = functions[0]
+    val pat = force-instantiate(value(entry), length(targs), args)
+    match(pat:InstPattern) :
+      make-instfn(instantiator, key(entry), value(entry), pat, targs, args)
+
+;Compute the instantiations of the given functions with the given
+;expected type. Returns Blocked if 'expected' is not sufficiently
+;resolved to instantiate the functions.
+public defn instantiations (instantiator:Instantiator,
+                            functions:Tuple<KeyValue<Int,TFunction>>,
+                            expected:Type) -> Tuple<InstFn>|Blocked :
+
+  ;Compute the unknown variables and arity specifiers.
+  val block-vars = IntSet()
+  val arity-specs = Vector<Int|AritySpecifier>()
+  let loop (t:Type = expected) :
+    match(t) :
+      (t:TUVar) :
+        add(block-vars, n(t))
+        add(arity-specs, UnknownArity)
+      (t:TAnd|TOr) : do(loop{_ as Type}, t)
+      (t:TGradual|TTop) : add(arity-specs, AllArities)
+      (t:TArrow) : add(arity-specs, length(a1(t)))
+      (t) : false
+
+  ;Try instantiating all the functions using those arity specifiers.
+  ;Return Blocked immediately if one of them could not be computed.
+  label<Blocked|Tuple<InstFn>> return :
+
+    ;Compute all instantiation patterns.
+    val instpats = Vector<[KeyValue<Int,TFunction>,Tuple<InstPattern>]>()
+    for entry in functions do :
+      val pats = instantiate(value(entry), arity-specs)
+      if empty?(pats) :
+        return(Blocked(to-list(block-vars)))
+      else :
+        add(instpats, [entry, value!(pats)])
+        
+    ;Create the instantiated functions.
+    to-tuple $ for [entry, pats] in instpats seq-cat :
+      for pat in pats seq :
+        make-instfn(instantiator, key(entry), value(entry), pat, expected)
+
+;============================================================
+;=========== Pattern Instantiation in Call Context ==========
+;============================================================
+
+;Instantiate a function to be called with the given arguments.
+public defn instantiate (func:TFunction, tarity:Int, args:Tuple<FArg>) -> InstPattern|False :
+  ;Compute the arities of the function.
+  val arities = arities(func)
+
+  ;Classify given arguments into positional and keywords arguments.
+  val given-pos-args = Vector<PositionalArg>()
+  val given-keyword-args = HashTable<Symbol,KeywordArg>()
+  for a in args do :
+    match(a) :
+      (a:PositionalArg) : add(given-pos-args, a)
+      (a:KeywordArg) : given-keyword-args[name(a)] = a
+
+  ;Classify expected arguments into positional and keyword arguments.
+  val expected-pos-args = Vector<PositionalArg>()
+  val expected-keyword-args = HashTable<Symbol,KeywordArg>()
+  var expected-vararg:VarArg|False = false
+  for a in a1(func) do :
+    match(a) :
+      (a:PositionalArg) : add(expected-pos-args, a)
+      (a:KeywordArg) : expected-keyword-args[name(a)] = a
+      (a:VarArg) : expected-vararg = a
+
+  ;Compute whether the function arity is correct.
+  defn correct-arity? () -> True|False :
+    ;Determine whether max-arity applies.
+    val max-arity-applies? = match(expected-vararg) :
+      (vararg:VarArg) : key?(given-keyword-args, name(vararg))
+      (f:False) : true
+    ;Ensure arity within range.
+    val n = length(given-pos-args)
+    if max-arity-applies? :
+      n >= min-arity(arities) and n <= max-arity(arities)
+    else :
+      n >= min-arity(arities)
+
+  ;Return true if 'name' is the name of the expected vararg.
+  defn vararg-name? (name:Symbol) -> True|False :
+    match(expected-vararg:VarArg) :
+      name == /name(expected-vararg)
+
+  ;Compute whether the correct keyword arguments are given.
+  defn correct-keywords? () -> True|False :
+    val required-is-given? =
+      for a in values(expected-keyword-args) all? :
+        optional?(a) or key?(given-keyword-args, name(a))
+    val given-is-expected? =
+      for a in values(given-keyword-args) all? :
+        key?(expected-keyword-args,name(a)) or vararg-name?(name(a))
+    required-is-given? and given-is-expected?
+
+  ;Compute the instantiated arguments.
+  defn compute-inst-args () -> Tuple<InstArg> :
+    ;Compute the vector of InstArg corresponding to the positional arguments.
+    val num-given = length(given-pos-args)
+    val num-used-optional = min(num-optional(arities), num-given - min-arity(arities))
+    val num-used-varargs = max(0, num-given - max-arity(arities))
+    val num-optional = to-seq(0 to false)
+    val vararg-index = index-when({_ is VarArg}, a1(func))
+    val pos-args = Vector<InstArg>()
+    for (a in a1(func), i in 0 to false) do :
+      match(a:PositionalArg) :
+        val used-arg? =
+          if optional?(a) : next(num-optional) < num-used-optional
+          else : true
+        add(pos-args, InstArg(i, ToPositionalArg)) when used-arg?
+    for i in 0 to num-used-varargs do :
+      add(pos-args, InstArg(vararg-index as Int, ToVarArg))
+
+    ;Compute the InstArgs corresponding to the given keyword arguments.
+    val keyword-args = HashTable<Symbol,InstArg>()
+    for (a in a1(func), i in 0 to false) do :
+      match(a:KeywordArg) :
+        if key?(given-keyword-args, name(a)) :
+          keyword-args[name(a)] = InstArg(i, ToKeywordArg)
+          
+    ;Add the vararg keyword argument if used.
+    match(expected-vararg:VarArg) :
+      if key?(given-keyword-args, name(expected-vararg)) :
+        keyword-args[name(expected-vararg)] = InstArg(vararg-index as Int, ToKeywordVarArg)
+
+    ;Finally iterate through the actual given arguments and read
+    ;off their corresponding function arguments.
+    val pos-arg-index = to-seq(0 to false)
+    for arg in args map :
+      match(arg) :
+        (arg:PositionalArg) : pos-args[next(pos-arg-index)]
+        (arg:KeywordArg) : keyword-args[name(arg)]
+    
+  ;Launch the overall algorithm.
+  if correct-arity?() and correct-keywords?() :
+    InstPattern(compute-inst-args())
+
+;============================================================
+;============== Forced Pattern Instantiation ================
+;============================================================
+
+;Force a pattern to be instantiated. 
+public defn force-instantiate (func:TFunction, tarity:Int, args:Tuple<FArg>) -> InstPattern|False :
+  if length(targs(func)) == tarity :
+    InstPattern $ for arg in args map :
+      InstArg(false, BadArg)
+
+;============================================================
+;========= Pattern Instantiation in Exp Context =============
+;============================================================
+
+;Represent the known arities that we need.
+public defenum AritySpecifier :
+  AllArities
+  UnknownArity
+
+;Instantiate a function with the given arities.
+;Returns None() if there is insufficient information to compute instantiations.
+;Otherwise returns the complete set of instantiations.
+public defn instantiate (func:TFunction, arity-specs:Collection<Int|AritySpecifier>) -> Maybe<Tuple<InstPattern>> :
+  ;Compute function arities.
+  val arities = arities(func)
+  
+  ;Compute whether function can be instantiated in this
+  ;context.
+  defn no-required-keywords? () -> True|False :
+    for a in a1(func) none? :
+      match(a:KeywordArg) : not optional?(a)
+  defn no-targs? () -> True|False :
+    targ-arity(arities) == 0
+
+  ;Compute set of all arities indicated by the given type,
+  ;or mark that we want all possible arities.
+  defn instantiated-arities () -> Maybe<Tuple<Int>> :
+    ;Case: Fixed arity functions can always be instantiated.
+    if fixed-arity?(arities) :
+      One([min-arity(arities)])
+    ;Case: Finite arity functions can always be instantiated if
+    ;AllArities is one of the specifiers.
+    else if not var-arity(arities) and contains?(arity-specs, AllArities) :
+      One(to-tuple(min-arity(arities) through max-arity(arities)))
+    ;Case: Otherwise, functions can be instantiated only if
+    ;the specifiers are known.
+    else if not contains?(arity-specs, UnknownArity) :
+      val arity-set = HashSet<Int>()
+      for spec in arity-specs do :
+        match(spec) :
+          (spec:Int) : add(arity-set, spec)
+          (spec:AllArities) : add-all(arity-set, min-arity(arities) through max-arity(arities))
+      One(to-tuple(arity-set))
+    ;Case: Insufficient information.
+    else :
+      None()
+
+  ;Return true if func supports n as an arity.
+  defn supports-arity? (n:Int) -> True|False :
+    if var-arity(arities) : n >= min-arity(arities)
+    else : n >= min-arity(arities) and n <= max-arity(arities)
+
+  ;Compute the instantiated function. Assumes it is supported.
+  defn instantiate-arity (n:Int) -> InstPattern :
+    val num-used-optional = min(num-optional(arities), n - min-arity(arities))
+    val num-optional = to-seq(0 to false)
+    val num-varargs = max(0, n - max-arity(arities))
+    val args = Vector<InstArg>()
+    for (a in a1(func), i in 0 to false) do :
+      match(a) :
+        (a:PositionalArg) :
+          if optional?(a) :
+            if next(num-optional) < num-used-optional :
+              add(args, InstArg(i, ToPositionalArg))
+          else :
+            add(args, InstArg(i, ToPositionalArg))
+        (a:VarArg) :
+          for j in 0 to num-varargs do :
+            add(args, InstArg(i, ToVarArg))
+        (a:KeywordArg) :
+          false
+    InstPattern(to-tuple(args))
+
+  ;Launch!
+  if no-required-keywords?() and no-targs?() :
+    val ns = instantiated-arities()
+    if empty?(ns) : None()
+    else : One(map(instantiate-arity, value!(ns)))
+  else :
+    One([])
+
+;============================================================
+;============== Making an InstFn From Pattern ===============
+;============================================================
+
+;Create the InstFn given the instantiation pattern in
+;a call context.
+defn make-instfn (instantiator:Instantiator, 
+                  fid:Int, t:TFunction, pat:InstPattern,
+                  type-args:Tuple<Type>, fargs:Tuple<FArg>) -> InstFn :
+
+  ;If it's a non-polymorphic function, then no capture and substitution
+  ;is necessary.
+  if empty?(targs(t)) and empty?(cargs(t)) :
+
+    ;Get the instantiated arrow type.
+    val arrow = pattern-type(t, pat, tuple-id(instantiator))
+
+    ;Create the InstFn.
+    InstFn(fid, pat, [], arrow)
+
+  else :
+
+    ;Create the capture vars.
+    val capvars = fresh-capvars(instantiator, length(cargs(t)))
+
+    ;Substitute the given types to get the actual argument types.
+    val env = to-tuple $ cat(seq(KeyValue, targs(t), type-args),
+                             seq({_ => n(_)}, cargs(t), capvars))
+
+    ;Get the instantiated arrow type.
+    val arrow = pattern-type(t, pat, tuple-id(instantiator))
+
+    ;Substitute env to compute new a1.
+    val cap-a1 = sub-caps(a1(arrow), env)
+
+    ;Perform any necessary capturing.
+    if not empty?(capvars) :
+      capture(instantiator, capvars,
+              TTuple(map(type,fargs)), TTuple(cap-a1))
+      
+    ;Perform substitution for the return type. If the
+    ;return type is a TUVar, then use a delayed substitution.
+    val subenv = to-tuple $ cat(seq(KeyValue, targs(t), type-args),
+                                seq(KeyValue, cargs(t), capvars))
+    val new-a1 = sub(map(uncap,a1(arrow)), subenv)
+    val new-a2 = substitute(instantiator, a2(arrow), subenv)
+
+    ;Create the InstFn.
+    InstFn(fid,
+           pat,
+           capvars,
+           TArrow(new-a1, new-a2))
+
+;Create the InstFn given the instantiation pattern in
+;an expression context.
+defn make-instfn (instantiator:Instantiator,
+                  fid:Int, t:TFunction, pat:InstPattern,
+                  expected:Type) -> InstFn :
+                  
+  ;If it's a non-polymorphic function, then no capture and substitution
+  ;is necessary.
+  if empty?(cargs(t)) :
+
+    ;Get the instantiated arrow type.
+    val arrow = pattern-type(t, pat, tuple-id(instantiator))
+
+    ;Create the InstFn
+    InstFn(fid, pat, [], arrow)
+
+  else :
+
+    ;Create the capture vars.
+    val capvars = fresh-capvars(instantiator, length(cargs(t)))
+
+    ;Substitute the given types to get the actual argument types.
+    val env = to-tuple $ seq({_ => n(_)}, cargs(t), capvars)
+
+    ;Get the instantiated arrow type.
+    val arrow = pattern-type(t, pat, tuple-id(instantiator))
+
+    ;Substitute env to compute new a1.
+    val cap-arrow = sub-caps(arrow, env)
+
+    ;Perform any necessary capturing.
+    capture(instantiator, capvars, cap-arrow, expected)
+      
+    ;Perform substitution for the return type. If the
+    ;return type is a TUVar, then use a delayed substitution.
+    val subenv = to-tuple $ seq(KeyValue, cargs(t), capvars)
+    val new-a1 = sub(map(uncap,a1(arrow)), subenv)
+    val new-a2 = substitute(instantiator, a2(arrow), subenv)
+
+    ;Create the InstFn.
+    InstFn(fid,
+           pat,
+           capvars,
+           TArrow(new-a1, new-a2))
+
+;============================================================
+;=============== Compute Type of a Pattern ==================
+;============================================================
+
+;Return the instantiated arrow for the given instantiation.
+defn pattern-type (t:TFunction, pat:InstPattern, tuple-n:Int) -> TArrow :
+  ;Retrieve the argument types.
+  val a1 = for arg in args(pat) map :
+    switch(mode(arg)) :
+      BadArg :
+        TTop()
+      ToKeywordVarArg :
+        val farg = a1(t)[arg-index(arg) as Int]
+        TOf(tuple-n, [type(farg)])
+      else :
+        val farg = a1(t)[arg-index(arg) as Int]
+        type(farg)
+  ;Form the resulting TArrow.
+  TArrow(a1, a2(t))
+
+;============================================================
+;===================== Compute Arities ======================
+;============================================================
+
+;Represent the arities of a function.
+defstruct FnArities :
+  targ-arity:Int
+  min-arity:Int
+  max-arity:Int
+  num-optional:Int
+  var-arity:True|False
+
+;Return true if FnArities represents a fixed arity function.
+defn fixed-arity? (a:FnArities) -> True|False :
+  num-optional(a) == 0 and not var-arity(a)
+
+;Compute the arities of a function.
+defn arities (func:TFunction) -> FnArities :
+  val num-required = to-seq(0 to false)
+  val num-optional = to-seq(0 to false)
+  var var-arity:True|False = false
+  for arg in a1(func) do :
+    match(arg) :
+      (arg:PositionalArg) :
+        if optional?(arg) : next(num-optional)
+        else : next(num-required)
+      (arg:KeywordArg) :
+        false
+      (arg:VarArg) :
+        var-arity = true
+  FnArities(length(targs(func)),
+            peek(num-required),
+            peek(num-required) + peek(num-optional),
+            peek(num-optional),
+            var-arity)
