@@ -134,7 +134,7 @@ defn add-lsequal? (a:LSType, b:LSType) -> False :
 
 ;Helper: Generate super constraint a :> b if a is a
 ;TUVar.
-defn add-super? (a:Type, b:Type) -> False :
+defn add-super? (a:Type|False, b:Type) -> False :
   match(a:TUVar) :
     add-equation(SuperEqn(n(a), b))
 
@@ -523,12 +523,13 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
       TNew(info(e), class(e), ctxt, class(e), new-methods)
 
     (e:TRef) :
-      if get-type(n(e)) is TFunction|TLSFunction :
-        gen-mix(e,ctxt)
+      val r = annotate-type(e,ctxt,LeaveFalse)
+      if type(r) is TFunction :
+        gen-mix(r,ctxt)
+      else if type(r) is False :
+        annotate-type(e,ctxt,UseUnsatisfiable)
       else :
-        match(typed-ref(e,ctxt)) :
-          (r:TRef) : r
-          (f:False) : TRef(info(e), unsatisfiable-tuvar(), ctxt, n(e))
+        r
 
     (e:TCast) :
       val new-exp = gen-equations(exp(e), ExpCtxt(TTop()))
@@ -540,27 +541,24 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
 
     (e:TSet) :
       ;Retrieve the ref of the variable.
-      val new-ref = typed-ref(ref(e), ExpCtxt(TTop()))
+      val new-ref = annotate-type(ref(e), ExpCtxt(TTop()), LeaveFalse)
 
       ;Process the value.
-      val value-ctxt =
-        match(new-ref:TRef) : ExpCtxt(or-top(type!(new-ref)))
-        else : ExpCtxt(TTop())
+      val value-ctxt = ExpCtxt(or-top(type(new-ref)))
       val new-value = gen-equations(value(e), value-ctxt)
 
       ;Generate the super constraint.
-      match(new-ref:TRef) :
-        add-super?(type!(new-ref), type!(new-value))
+      add-super?(type(new-ref), type!(new-value))
 
       ;Create the false type
       val false-n = special-type(type-hierarchy(), CoreFalse)
       val false-type = TOf(false-n, [])
 
       ;Return the new data.
-      match(new-ref:TRef) :
+      if type(new-ref) is-not False :
         TSet(info(e), false-type, ctxt, new-ref, new-value)
       else :
-        val new-ref = TRef(info(ref(e)), unsatisfiable-tuvar(), ExpCtxt(TTop()), n(ref(e)))
+        val new-ref = annotate-type(ref(e), ExpCtxt(TTop()), UseUnsatisfiable)
         TSet(info(e), false-type, ctxt, new-ref, new-value)
 
     (e:TDo) :
@@ -801,7 +799,11 @@ defn gen-equations (e:LSExp,
                     return-type:Maybe<LSType>) -> LSExp :
   match(e) :
     (e:LSVar) :
-      fatal("Look up typed ref algorithm")
+      val new-e = annotate-type(e, ctxt)
+      if type!(new-e) is TLSFunction :
+        gen-mix(new-e,ctxt)
+      else :
+        new-e
 
     (e:LSNew):
       val fields = fields(type-hierarchy(), n(e))
@@ -974,15 +976,11 @@ defn type-in-body (farg:LSFArg) -> LSType :
       wrap-tuple(uncap(type(farg)))
 
 ;============================================================
-;================= Function Equations =======================
+;========== Reference to Function From HiStanza =============
 ;============================================================
 
 ;Generate the mixed function from the given reference.
-;Assumes that the TRef refers to a function definition.
-;Returns TRef in the special case that the function cannot
-;be correctly instantiated, but we want to force a return
-;type anyway.
-defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix|TRef :
+defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix :
   match(func, ctxt) :
     ;Treat a single reference identically to a mix of one reference.
     (func:TRef, ctxt) :
@@ -991,7 +989,7 @@ defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix|TRef :
     ;Instantiate the mixed functions in a calling context.
     (func:TMix, ctxt:CallCtxt) :
       ;Annotate each of the refs with types.
-      val typed-refs = map(typed-ref?{_, ctxt}, refs(func))
+      val typed-refs = map(annotate-type{_, ctxt, LeaveFalse}, refs(func))
 
       ;Compute the function entries from the typed-refs.
       val functions = to-tuple $ for r in typed-refs seq? :
@@ -1034,11 +1032,10 @@ defn gen-mix (func:TRef|TMix, ctxt:Context) -> TMix|TRef :
         ;Return the final mix.
         TMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, InstFns(instfns))
 
-
     ;Instantiate the mixed functions in an expression context.
     (func:TMix, ctxt:ExpCtxt) :
       ;Annotate each of the refs with types.
-      val typed-refs = map(typed-ref?{_, ctxt}, refs(func))
+      val typed-refs = map(annotate-type{_, ctxt, LeaveFalse}, refs(func))
 
       ;Compute the function entries from the typed-refs.
       val functions = to-tuple $ for r in typed-refs seq? :
@@ -1079,22 +1076,50 @@ defn function-instantiator () -> Instantiator :
       else :
         sub(t,env)
 
-;Retrieve the HiStanza type of a curried ref.
-;Type is allowed to be a TFunction.
-;Returns false if ref cannot be referenced from a HiStanza context.
-defn typed-ref (e:TRef, ctxt:Context) -> TRef|False :
-  match(get-type(n(e))) :
-    (t:Type) :
-      TRef(info(e), t, ctxt, n(e))
-    (t:LSType) :
-      fatal("Not yet implemented")
+;============================================================
+;============== References to Variables =====================
+;============================================================
 
-;Returns the typed ref of e. If it cannot be referenced from a
-;HiStanza context, then returns the original ref.
-defn typed-ref? (e:TRef, ctxt:Context) -> TRef :
-  match(typed-ref(e,ctxt)) :
-    (r:TRef) : r
-    (f:False) : e
+;Option that determines what to do if the variable cannot be
+;referenced from a HiStanza context.
+defenum InvalidRefTypeOption :
+  LeaveFalse
+  UseUnsatisfiable
+
+;Annotate the given reference with its type and context
+defn annotate-type (e:TRef, ctxt:Context, option:InvalidRefTypeOption) -> TRef :
+  val ref-type = match(get-type(n(e))) :
+    (t:Type) :
+      t
+    (t:LSType) :
+      match(to-histanza(t)) :
+        (t:Type) : 
+          t
+        (f:False) :
+          switch(option) :
+            LeaveFalse : false
+            UseUnsatisfiable : unsatisfiable-tuvar()
+  TRef(info(e), ref-type, ctxt, n(e))
+
+;Annotate the given reference with its type and context.
+defn annotate-type (v:LSVar, ctxt:LSContext) -> LSVar :
+  val var-type = match(get-type(n(v))) :
+    (t:TFunction) : to-lostanza(t)
+    (t:Type) : RefT(t)
+    (t:LSType) : t
+  LSVar(info(v), var-type, ctxt, n(v))
+
+;============================================================
+;=========== Reference to Function from LoStanza ============
+;============================================================
+
+;Generate the mixed function from the given reference.
+defn gen-mix (func:LSVar|LSMix, ctxt:LSContext) -> LSMix :
+  match(func) :
+    (func:LSVar) :
+      gen-mix(LSMix(info(func), false, false, [func], false, false), ctxt)
+    (func:LSMix) :
+      fatal("Not yet implemented")
 
 ;============================================================
 ;================ Temporary Structures ======================
