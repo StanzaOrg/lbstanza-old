@@ -623,7 +623,10 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
         TDo(info(e), ret-type, ctxt, new-func, targs(e), new-args)
 
     (e:TPrim) :
-      fatal("gen-equations TPrim")
+      val result-type = fresh-tuvar()
+      val new-args = map(gen-equations{_, ExpCtxt(TTop())}, args(e))
+      add-equation $ PrimEqn(n(result-type), op(e), map(type!, new-args))
+      TPrim(info(e), result-type, ctxt, op(e), new-args)
 
     (e:TLiteral) :
       ;Retrieve the SpecialType that the value corresponds to.
@@ -918,7 +921,18 @@ defn gen-equations (e:LSExp,
       LSCast(info(e), targ(e), ctxt, new-exp, targ(e))
 
     (e:LSLiteral):
-      val type = fatal("Compute literal type.")
+      ;Compute the LoStanza literal type of the value.
+      val type = match(value(e)) :
+        (v:Byte) : ByteT()
+        (v:Char) : ByteT()
+        (v:Int) : IntT()
+        (v:Long) : LongT()
+        (v:Float) : FloatT()
+        (v:Double) : DoubleT()
+        (v:String) : PtrT(ByteT())
+        (v:True) : RefT(TOf(special-type(type-hierarchy(), CoreTrue), []))
+        (v:False) : RefT(TOf(special-type(type-hierarchy(), CoreFalse), []))
+        (v) : fatal("Unsupported Lostanza literal %~." % [v])
       LSLiteral(info(e), type, ctxt, value(e))
 
     (e:LSAnd):
@@ -1087,6 +1101,8 @@ defn function-instantiator () -> Instantiator :
       special-type(type-hierarchy(), CoreTuple)
     defmethod capture (this, capvars:Tuple<TUVar>, x:Type, y:Type) :
       add-equation $ CaptureAllEqn(map(n,capvars), x, y)
+    defmethod capture (this, capvars:Tuple<TUVar>, x:LSType, y:LSType) :
+      add-equation $ LSCaptureAllEqn(map(n,capvars), x, y)
     defmethod substitute (this, t:Type, env:Tuple<KeyValue<Int,Type>>) :
       match(t:TUVar) :
         val ret = fresh-tuvar()
@@ -1134,11 +1150,88 @@ defn annotate-type (v:LSVar, ctxt:LSContext) -> LSVar :
 
 ;Generate the equations for the function reference in the given context.
 defn gen-function-reference (func:LSVar|LSMix, ctxt:LSContext) -> LSMix :
-  match(func) :
-    (func:LSVar) :
-      gen-function-reference(LSMix(info(func), false, false, [func], false, false), ctxt)
-    (func:LSMix) :
-      fatal("Not yet implemented")
+  match(func, ctxt) :
+    ;Case: Just create a mix and treat it in the following branches.
+    (func:LSVar, ctxt) :
+      val mix = LSMix(info(func), false, false, [func], false, false)
+      gen-function-reference(mix, ctxt)
+      
+    ;Case: Instantiate the function to make the call.
+    (func:LSMix, ctxt:LSCallCtxt) :
+      ;Annotate each of the refs with types.
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+
+      ;Compute the function entries from the typed-refs.
+      val functions = to-tuple $ for r in typed-refs seq? :
+        match(type(r)) :
+          (t:TLSFunction) : One(n(r) => t)
+          (f:False) : None()
+
+      ;Instantiate the functions.
+      val instfns = instantiations(function-instantiator(),
+                                   functions,
+                                   targs(ctxt),
+                                   fargs(ctxt))
+
+      ;Case: There are no valid instantiations, so try
+      ;forcefully creating one.
+      if empty?(instfns) :
+        ;Forcefully instantiate the function.
+        val instfn = force-instantiation(function-instantiator(),
+                                         functions,
+                                         targs(ctxt),
+                                         fargs(ctxt))
+        match(instfn:LSInstFn) :
+          LSMix(info(func), type(instfn), ctxt,
+                typed-refs, fresh-svar(), LSInstFns([instfn]))
+        else :
+          LSMix(info(func), unsatisfiable-uvart(), ctxt,
+                typed-refs, fresh-svar(), LSInstFns([]))
+
+      ;Case: There are valid instantiations.
+      else :
+        ;Create the OverloadCallEqn.
+        val mixed-type = fresh-uvart()
+        val mix-sel = fresh-svar()
+        add-equation $ LSOverloadCallEqn(
+          n(mixed-type)
+          n(mix-sel),
+          map(type, instfns),
+          map(type, fargs(ctxt)))
+        ;Return the final mix.
+        LSMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, LSInstFns(instfns))
+    
+    ;Case: Instantiate the ones that we can take the address of.
+    (func:LSMix, ctxt:LSAddrCtxt) :
+      ;Annotate each of the refs with types.
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+
+      ;Compute the function entries from the typed-refs.
+      val functions = to-tuple $ for r in typed-refs seq? :
+        match(type(r)) :
+          (t:TLSFunction) : One(n(r) => t)
+          (f:False) : None()
+
+      ;Instantiate the functions.
+      val instfns = addr-instantiations(function-instantiator(),
+                                        functions)
+                                        
+      ;Create the OverloadEqns.
+      val result-type = fresh-uvart()
+      val result-sel = fresh-svar()
+      add-equation $ LSOverloadAddrEqn(
+        n(result-type),
+        n(result-sel),
+        map(type, instfns),
+        expected(ctxt))
+
+      ;Return the final selected function.
+      LSMix(info(func), result-type, ctxt, typed-refs, result-sel, LSInstFns(instfns))
+      
+    ;Case: Cannot directly refer to function from this context.
+    (func:LSMix, ctxt) :
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+      LSMix(info(func), unsatisfiable-uvart(), ctxt, typed-refs, fresh-svar(), false)
 
 ;============================================================
 ;============= Expansion of Field Types =====================
@@ -1264,10 +1357,10 @@ defn unsatisfiable-var () -> Int :
   val v = fresh-id()
   add-equation $ UnsatisfiableEqn(v)
   v
-
-;Create a uvar with an unsatisfiable equation.
 defn unsatisfiable-tuvar () -> TUVar :
   TUVar(unsatisfiable-var())
+defn unsatisfiable-uvart () -> UVarT :
+  UVarT(unsatisfiable-var())
 
 ;Return a gradual when false.
 defn or-gradual (f:False) : TGradual()
