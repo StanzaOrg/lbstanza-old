@@ -151,9 +151,10 @@ static void FileSafepoints_write(FileSafepoints* file, const uint8_t inst) {
     SafepointEntry_write(entry, inst);
 }
 static inline SafepointEntry* FileSafepoints_find(FileSafepoints* file, uint64_t line) {
-  for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++)
-    if (entry->line >= line)
-      return entry;
+  if (file)
+    for (SafepointEntry *entry = file->entries, *lim = entry + file->num_entries; entry < lim; entry++)
+      if (entry->line >= line)
+        return entry;
   return NULL;
 }
 
@@ -171,17 +172,19 @@ static void Safepoints_write(const uint8_t inst) {
 static FileSafepoints* Safepoints_find_file(const char* file_name) {
   const char* file_path = get_absolute_path(file_name);
   FileSafepoints* result = NULL;
-  SafepointTable* safepoints = app_safepoint_table;
-  if (safepoints) {
-    for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files && !result; i++) {
-      FileSafepoints* p = safepoints->files[i];
-      const char* path = get_absolute_path(p->filename);
-      if (!strcmp(path, file_path))
-        result = p;
-      free_path(path);
+  if (file_path) {
+    SafepointTable* safepoints = app_safepoint_table;
+    if (safepoints) {
+      for (uint64_t i = 0, num_files = app_safepoint_table->num_files; i < num_files && !result; i++) {
+        FileSafepoints* p = safepoints->files[i];
+        const char* path = get_absolute_path(p->filename);
+        if (path && !strcmp(path, file_path))
+          result = p;
+        free_path(path);
+      }
     }
+    free_path(file_path);
   }
-  free_path(file_path);
   return result;
 }
 
@@ -2047,38 +2050,41 @@ static bool request_setBreakpoints(const JSObject* request) {
       const JSObject* source = JSObject_get_object_field(arguments, "source");
       const char* path = JSObject_get_string_field(source, "path");
       FileSafepoints* safepoints = Safepoints_find_file(path);
+      // We cannot just send empty set of breakpoints if there is no safepoints in given file.
+      // If a requested breakpoint cannot be set, it must be reported as unreachable.
       if (safepoints) {
         pthread_mutex_lock(&safepoint_lock);
         ActiveFileSafepoints_destroy(safepoints);
         FileSafepoints_write(safepoints, NOP);  // Clear all safeponts in the file
-        const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
-        if (breakpoints) {
-          SafepointEntryVector v;
-          SafepointEntryVector_initialize(&v);
-          for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
-            if (p->kind == JS_OBJECT) {
-              const JSObject* o = &p->u.o;
-              uint64_t line = JSObject_get_integer_field(o, "line", 0);
-              // const int64_t column = JSObject_get_integer_field(o, "column", 0);
-              // TODO: get optional condition, hitCondition and logMessage fields.
-              SafepointEntry* entry = FileSafepoints_find(safepoints, line);
-              if (entry) {
-                line = entry->line;
-                if (!SafepointEntryVector_find(&v, entry)) {
-                  *SafepointEntryVector_allocate(&v) = entry;
-                  if (!all_sefapoints_enabled)
-                    SafepointEntry_write(entry, INT3);
-                }
-              }
-              JSBuilder_next(&builder);
-              JSBuilder_write_breakpoint(&builder, (uint64_t)entry, entry != NULL, path, line, 0);
-            }
-          }
-          ActiveFileSafepoints_create(safepoints, &v);
-          SafepointEntryVector_destroy(&v);
-        }
-        pthread_mutex_unlock(&safepoint_lock);
       }
+      const JSArray* breakpoints = JSObject_get_array_field(arguments, "breakpoints");
+      if (breakpoints) {
+        SafepointEntryVector v;
+        SafepointEntryVector_initialize(&v);
+        for (const JSValue *p = breakpoints->data, *const limit = p + breakpoints->length; p < limit; p++) {
+          if (p->kind == JS_OBJECT) {
+            const JSObject* o = &p->u.o;
+            uint64_t line = JSObject_get_integer_field(o, "line", 0);
+            // const int64_t column = JSObject_get_integer_field(o, "column", 0);
+            // TODO: get optional condition, hitCondition and logMessage fields.
+            SafepointEntry* entry = FileSafepoints_find(safepoints, line);
+            if (entry) {
+              line = entry->line;
+              if (!SafepointEntryVector_find(&v, entry)) {
+                *SafepointEntryVector_allocate(&v) = entry;
+                if (!all_sefapoints_enabled)
+                  SafepointEntry_write(entry, INT3);
+              }
+            }
+            JSBuilder_next(&builder);
+            JSBuilder_write_breakpoint(&builder, (uint64_t)entry, entry != NULL, path, line, 0);
+          }
+        }
+        ActiveFileSafepoints_create(safepoints, &v);
+        SafepointEntryVector_destroy(&v);
+      }
+      if (safepoints)
+        pthread_mutex_unlock(&safepoint_lock);
     }
     JSBuilder_array_field_end(&builder); // breakpoints
   }
