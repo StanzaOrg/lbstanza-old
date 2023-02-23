@@ -100,6 +100,9 @@ static pthread_mutex_t send_lock;
 static bool stack_trace_available; // Stack trace is not available until VMState initialized
 static const char* debug_adapter_path;
 
+// Client IDE capabilities
+static bool client_supports_invalidated_event;
+
 static inline char* get_absolute_path(const char* s) {
   // Use GetFullPathName on Windows
   return realpath(s, NULL);
@@ -1636,6 +1639,9 @@ static inline void define_capabilities(JSBuilder* builder) {
   #endif
 }
 static bool request_initialize(const JSObject* request) {
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  client_supports_invalidated_event = JSObject_get_bool_field(arguments, "supportsInvalidatedEvent", false);
+
   // TODO: initialize debugger here.
   JSBuilder builder;
   JSBuilder_initialize_response(&builder, request, NULL);
