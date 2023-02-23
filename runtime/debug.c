@@ -1066,7 +1066,6 @@ typedef enum { // Extendable - please add custom stop reasons as necessary.
   STOP_REASON_PAUSE,
   STOP_REASON_ENTRY
 } StopReason;
-
 static inline const char* stop_reason(const StopReason kind) {
   static const char* const names[] = {
     "step",
@@ -1076,6 +1075,15 @@ static inline const char* stop_reason(const StopReason kind) {
     "entry"
   };
   return names[kind];
+}
+
+static inline void send_invalidate_thread(void) {
+  if (client_supports_invalidated_event) {
+    JSBuilder builder;
+    JSBuilder_initialize_event(&builder, "invalidated");
+    JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
+    JSBuilder_send_and_destroy_event(&builder);
+  }
 }
 
 static void send_thread_stopped(StopReason reason, const char* description, uint64_t breakpoint) {
@@ -1099,14 +1107,14 @@ static void send_thread_stopped(StopReason reason, const char* description, uint
   JSBuilder_send_and_destroy_event(&builder);
 }
 
-static void send_process_exited(uint64_t exit_code) {
+static inline void send_process_exited(uint64_t exit_code) {
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "exited");
   JSBuilder_write_unsigned_field(&builder, "exitCode", exit_code);
   JSBuilder_send_and_destroy_event(&builder);
 }
 
-static void send_terminated(void) {
+static inline void send_terminated(void) {
   if (run_mode != RUN_MODE_TERMINATED) {
     run_mode = RUN_MODE_TERMINATED;
     send_simple_event("terminated");
