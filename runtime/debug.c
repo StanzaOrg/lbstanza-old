@@ -99,6 +99,7 @@ static pid_t program_pid;
 static pthread_mutex_t send_lock;
 static bool stack_trace_available; // Stack trace is not available until VMState initialized
 static const char* debug_adapter_path;
+static const uint64_t thread_id = 12345678;
 
 // Client IDE capabilities
 static bool client_supports_invalidated_event;
@@ -1077,7 +1078,7 @@ static inline const char* stop_reason(const StopReason kind) {
   return names[kind];
 }
 
-static void send_thread_stopped(int64_t thread_id, StopReason reason, const char* description, uint64_t breakpoint) {
+static void send_thread_stopped(StopReason reason, const char* description, uint64_t breakpoint) {
   run_mode = RUN_MODE_PAUSED;
 
   JSBuilder builder;
@@ -1795,14 +1796,13 @@ static void next_debug_event(void) {
 }
 
 void notify_stopped_at_entry(void) {
-  send_thread_stopped(12345678, STOP_REASON_ENTRY, "Stopped at entry", 0);
+  send_thread_stopped(STOP_REASON_ENTRY, "Stopped at entry", 0);
   next_debug_event();
 }
 
 void notify_stopped_at_safepoint(const void* pc) {
   // print_safepoint(pc);
   char description[64];
-  const uint64_t thread_id = 12345678;
   const uint64_t breakpoint = (uint64_t) ActiveFileSafepoints_find_entry(pc);
   uint64_t* current_coroutine_ref_ptr = app_coroutine_refs[0];
   uint64_t* stepping_coroutine_ref_ptr = app_coroutine_refs[1];
@@ -1831,7 +1831,7 @@ void notify_stopped_at_safepoint(const void* pc) {
   if (stepping_coroutine_ref_ptr)
     *stepping_coroutine_ref_ptr = false_ref;
 
-  send_thread_stopped(thread_id, reason, description, breakpoint);
+  send_thread_stopped(reason, description, breakpoint);
   next_debug_event();
 }
 
@@ -2444,7 +2444,6 @@ int32_t create_stack_trace(const uint64_t format) ;
 
 typedef struct {
   DelayedRequest parent;
-  int64_t thread_id;
   int64_t start_frame;
   int64_t max_frames;
   uint64_t format;
@@ -2488,7 +2487,7 @@ static inline DelayedRequest* DelayedRequestStackTrace_create(const JSObject* re
   DelayedRequestStackTrace* req = DelayedRequest_create(request, sizeof(DelayedRequestStackTrace), &DelayedRequestStackTrace_handle);
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
   // Stanza implementatin is single-threaded. Interpret thread_id as coroutine_id?
-  req->thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
+  // req->thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
   req->start_frame = JSObject_get_integer_field(arguments, "startFrame", 0);
   req->max_frames = JSObject_get_integer_field(arguments, "levels", INT64_MAX);
   req->format = parse_stack_frame_format(JSObject_get_object_field(arguments, "format"));
@@ -3015,7 +3014,7 @@ static bool request_pause(const JSObject* request) {
   // const int64_t thread_id = JSObject_get_integer_field(arguments, "threadId", INVALID_THREAD_ID);
   respond_to_request(request, NULL);
   if (run_mode == RUN_MODE_PAUSED) {
-    send_thread_stopped(12345678, STOP_REASON_PAUSE, "Paused", 0);
+    send_thread_stopped(STOP_REASON_PAUSE, "Paused", 0);
   } else {
     run_mode = RUN_MODE_RUNNING;
     enable_all_safepoints();
