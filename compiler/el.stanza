@@ -8,6 +8,7 @@ defpackage stz/el :
   import stz/ehier
   import stz/el-var-table
   import stz/el-utils
+  import stz/el-reordering
   import stz/el-infer
   import stz/dyn-tree
   import stz/conversion-utils
@@ -92,6 +93,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     run-pass("Create Closures", create-closures, "closures", false)
     run-pass("Convert Mixes", convert-mixes, "mixes", false)
     run-pass("Insert Guards", insert-guards, "guarded", false)
+    run-pass("Convert to Positional Calls", conv-to-positional-calls, "conv-pos-calls", false)
     run-pass("Elide Checks", elide-checks, "elided", false)
     run-pass("Annotate Live", annotate-live, "live", false)
     if not optimize? :
@@ -296,90 +298,6 @@ defn collapse (epackages:Tuple<EPackage>) :
 ;============================================================
 ;============ Positional Argument Conversion ================
 ;============================================================
-
-;------------------------------------------------------------
-;--------------- General Argument Ordering ------------------
-;------------------------------------------------------------
-
-;- num-non-dispatch: The number of optional/vararg arguments
-;  in front that do not participate in multi dispatch.
-;- indices: E.g. indices[2] = 4 means that the new argument 2
-;  corresponds to the previous argument 4.
-;- args: The reordered arguments, with postprocessed types.
-defstruct OrderedArgs :
-  num-non-dispatch:Int
-  indices:Tuple<Int>
-  args:Tuple<FArg<EType>>
-
-;Returns true if the arguments needs to be reordered or processed.
-defn requires-ordering? (args:Tuple<FArg<EType>>) -> True|False :
-  for arg in args any? :
-    match(arg) :
-      (arg:PositionalArg) : optional?(arg)
-      (arg:KeywordArg) : true
-      (arg:VarArg) : true
-
-;Compute the new ordering of the given arguments.
-defn reorder-args (args:Tuple<FArg<EType>>,
-                   wrap-maybe:EType -> EType,
-                   wrap-tuple:EType -> EType) -> OrderedArgs :
-  ;Classify arguments into groups:
-  ;- OPTIONAL POS ARGS
-  ;- OPTIONAL KEY ARGS
-  ;- VARARG?
-  ;- REQUIRED POS ARGS
-  ;- REQUIRED KEY ARGS
-  ;(Keyword arguments are always sorted by name within
-  ; their group.)
-  val optional-pos-args = Vector<Int>()
-  val optional-key-args = Vector<Int>()
-  var vararg:Int|False = false
-  val required-pos-args = Vector<Int>()
-  val required-key-args = Vector<Int>()
-  for (arg in args, i in 0 to false) do :
-    match(arg) :
-      (arg:PositionalArg<EType>) :
-        if optional?(arg) : add(optional-pos-args, i)
-        else : add(required-pos-args, i)
-      (arg:KeywordArg<EType>) :
-        if optional?(arg) : add(optional-key-args, i)
-        else : add(required-key-args, i)
-      (arg:VarArg<EType>) :
-        vararg = i
-        
-  ;Sort keyword arguments by name.
-  defn sort-keywords (vs:Vector<Int>) :
-    defn name! (i:Int) : name(args[i] as KeywordArg)
-    qsort!(name!, vs)
-  sort-keywords(optional-key-args)
-  sort-keywords(required-key-args)
-
-  ;Generate final ordering.
-  val new-indices = Vector<Int>()
-  val new-args = Vector<PositionalArg<EType>>()
-  defn identity (t:EType) : t
-  defn process-arg (f:EType -> EType, i:Int) :
-    add(new-indices, i)
-    add(new-args, PositionalArg<EType>(false, f(type(args[i]))))  
-  do(process-arg{wrap-maybe, _}, optional-pos-args)
-  do(process-arg{wrap-maybe, _}, optional-key-args)
-  match(vararg:Int) : process-arg(wrap-tuple, vararg)
-  do(process-arg{identity, _}, required-pos-args)
-  do(process-arg{identity, _}, required-key-args)
-
-  ;Bundle result in OrderedArgs.
-  val vararg-count = 1 when vararg is Int else 0
-  val num-non-dispatch = length(optional-pos-args)
-                       + length(optional-key-args)
-                       + vararg-count
-  OrderedArgs(num-non-dispatch,
-              to-tuple(new-indices),
-              to-tuple(new-args))
-
-;Reorder a tuple of items according to the indices in 'ordered'.
-defn reorder<?T> (ordered:OrderedArgs, xs:Tuple<?T>) -> Tuple<T> :
-  for i in indices(ordered) map :
-    xs[i]
 
 ;------------------------------------------------------------
 ;---------- Reorder Definitions in Package ------------------
@@ -747,21 +665,20 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
 
     ;Split a call into a dispatch branch
     defn make-dispatch (Call:(EVarLoc|False, EImm, Tuple<EImm>, CallGuarded, TraceInfo) -> EIns,
-                        x:EVarLoc|False, f:EMix, ys:Tuple<EImm>, info:TraceInfo, end?:True|False) :
+                        x:EVarLoc|False, f:EMix2, ys:Tuple<EImm>, info:TraceInfo, end?:True|False) :
       ;Construct branches and blocks
       val branches = Vector<EBranch>()
       val blocks = Vector<(() -> False)>()
-      val refmask = map(reftype?, a1) where :
-        val [a1, a2] = fn-types(vt, funcs(f)[0], length(ys))
+      val f0 = funcs(f)[0]
+      val refmask = map(reftype?, a1(f0))
       val end-lbl = uniqueid()
       for f in funcs(f) do :
-        val [a1, a2] = fn-types(vt, f, length(ys))
         val lbl = uniqueid()
-        add(branches, EBranch(select(a1,refmask), lbl, false))
+        add(branches, EBranch(select(a1(f),refmask), lbl, false))
         add{blocks, _} $ fn () :
           emit(buffer, ELabel(lbl))
-          emit(buffer, Call(x, f, ys, CallGuarded(a1, a2), info))
-          emit(buffer, EGoto(end-lbl)) when not end?
+          emit(buffer, Call(x, f, ys, CallGuarded(a1(f), a2(f)), info))
+          emit(buffer, EGoto(end-lbl)) when not end?        
       ;Yield branches
       emit(buffer, EDispatch(select(ys,refmask), to-tuple(branches), info))
       for b in blocks do : b()
@@ -770,15 +687,15 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
     ;Scan through instructions
     for i in ins(body) do :
       ;Dispatch needed?
-      val dispatch? = match(i:ECall|ETCall) : f(i) is EMix
+      val dispatch? = match(i:ECall|ETCall) : f(i) is EMix2
       if dispatch? :
         match(i) :
           (i:ECall) :
-            within (x, f, ys, g, info) = make-dispatch(x(i), f(i) as EMix, ys(i), info(i), false) :
+            within (x, f, ys, g, info) = make-dispatch(x(i), f(i) as EMix2, ys(i), info(i), false) :
               match(calltype(i):CallGuarded) : ECall(x, f, ys, g, info)
               else : ECall(x, f, ys, calltype(i), info)
           (i:ETCall) :
-            within (_, f, ys, g, info) = make-dispatch(false, f(i) as EMix, ys(i), info(i), true) :
+            within (_, f, ys, g, info) = make-dispatch(false, f(i) as EMix2, ys(i), info(i), true) :
               match(calltype(i):CallGuarded) : ETCall(f, ys, g, info)
               else : ETCall(f, ys, calltype(i), info)
       else :
@@ -952,30 +869,20 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
             emit(buffer, i)
         (ins:ECall|ETCall) :
           let :
-            if function?(f(ins)) :
-              val arity = length(ys(ins))
-              val [a1, a2] = fn-types(vt, f(ins) as EVar|ECurry, arity)
-              if lostanza-context? and lostanza-function?(f(ins)) :
-                unguarded-call(a2)
-              else : guard-call(a1, a2)
+            if f(ins) is EInstFn :
+              val f = f(ins) as EInstFn
+              if lostanza-context? and lostanza?(vt,n(f)) : unguarded-call(a2(f))
+              else : guard-call(a1(f), a2(f), false)
             else if calltype(ins) is CallGuarded :
               val ct = calltype(ins) as CallGuarded
               if lostanza-context? : unguarded-call(a2(ct))
-              else : guard-call(a1(ct), a2(ct))
+              else : guard-call(a1(ct), a2(ct), true)
             else : unguarded-call(EUnknown())
           where :
-            defn function? (e:EImm) :
-              match(e) :
-                (e:EVar) : /function?(vt, n(e))
-                (e:ECurry) : /function?(vt, n(x(e)))
-                (e) : false
-            defn lostanza-function? (f:EImm) :
-              match(f) :
-                (f:EVar) : lostanza?(vt, n(f))
-                (f:ECurry) : lostanza?(vt, n(x(f)))
-            defn guard-call (a1:Tuple<EType>, a2:EType) :
+            defn guard-call (a1:Tuple<EType>, a2:EType, guard-function?:True|False) :
               ;Sanity check
-              fatal("Incorrect call type") when calltype(ins) is-not CallGuarded
+              if calltype(ins) is-not CallGuarded :
+                fatal("Incorrect call type")
 
               match(ins) :
                 (ins:ECall) :
@@ -996,7 +903,7 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
                   for (y in ys(ins), t in a1) do :
                     emit(buffer, ECheck(y, t, ArgContext(), info(ins)))
                   ;Check function
-                  if not function?(f(ins)) :
+                  if guard-function? :
                     val t = EOf(n(iotable(vt), CORE-FN-ID))
                     emit(buffer, ECheck(f(ins), t, FuncContext(), info(ins)))
                   ;Make call
@@ -1009,7 +916,7 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
                   for (y in ys(ins), t in a1) do :
                     emit(buffer, ECheck(y, t, ArgContext(), info(ins)))
                   ;Check function
-                  if not function?(f(ins)) :
+                  if guard-function? :
                     val t = EOf(n(iotable(vt), CORE-FN-ID))
                     emit(buffer, ECheck(f(ins), t, FuncContext(), info(ins)))
                   ;Make call
@@ -1034,20 +941,20 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
     sub-body(f, to-body(buffer, true, false, false))
 
   defn guard-method (f:EFn, vt:VarTable, lostanza-context?:True|False, uninitialized-vars:IntSet) -> EFn :
-    fatal("TODO")
-;    val buffer = BodyBuffer(body(f))
-;    for f in localfns(body(f)) do :
-;      emit(buffer, guard-localfn(f,vt,uninitialized-vars))
-;    for o in localobjs(body(f)) do :
-;      emit(buffer, guard-localobj(o,vt,uninitialized-vars))
-;    if not lostanza-context? :
-;      for (v in args(f), t in a1(f)) do :
-;        if has-tvar?(t) :
-;          emit(buffer, ECheck(EVar(v), t, ArgContext(), info(f)))
-;    guard-body(body(f), buffer, vt, lostanza-context?, a2(f), info(f), uninitialized-vars)
-;    val body* = to-body(buffer, true, false, false)
-;    val a1* = map(remove-tvars, a1(f))
-;    EFn(tail?(f), targs(f), args(f), a1*, a2(f), body*, info(f))
+    val buffer = BodyBuffer(body(f))
+    for f in localfns(body(f)) do :
+      emit(buffer, guard-localfn(f,vt,uninitialized-vars))
+    for o in localobjs(body(f)) do :
+      emit(buffer, guard-localobj(o,vt,uninitialized-vars))
+    if not lostanza-context? :
+      for (v in args(f), t in a1(f)) do :
+        if has-tvar?(t) :
+          emit(buffer, ECheck(EVar(v), t, ArgContext(), info(f)))
+    guard-body(body(f), buffer, vt, lostanza-context?, a2(f), info(f), uninitialized-vars)
+    val body* = to-body(buffer, true, false, false)
+    val a1* = map(remove-tvars, a1(f))
+    f $> sub-body{_, body*}
+      $> sub-a1{_, a1*}
 
   defn map-fns<?T> (f:EFn -> EFn, x:?T&ELBigItem) -> T :
     val result = let loop (x:ELBigItem = x) :
@@ -1084,6 +991,127 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
       (e:EInit) : guard-init(e, vt, uninitialized-vars)
       (e) : e
   map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
+
+;============================================================
+;============== Positional Arguments Calls ==================
+;============================================================
+
+;Convert all calls to EInstFn in the package to simple
+;positional arguments using EVar/ECurry as the function.
+defn conv-to-positional-calls (e:EPackage, iotable:IOTable) -> EPackage :
+  defn process (x:ELBigItem) -> ELBigItem :
+    match(map(process,x)) :
+      (body:EBody) : conv-calls(body, iotable)
+      (x) : x
+  map(process, e)
+  
+;Convert all calls in body.
+;Does not recurse into nested bodies.
+defn conv-calls (body:EBody, iotable:IOTable) -> EBody :
+
+  val buffer = BodyBuffer(body)
+  
+  defn wrap-one (x:EImm) -> EImm :
+    val one-n = n(iotable, CORE-ONE-ID)
+    val n = uniqueid()
+    emit(buffer, ELocal(n, EOf(one-n), false))
+    emit(buffer, EObject(EVarLoc(n), one-n, [x], false))
+    EVar(n)
+    
+  defn wrap-none () -> EImm :
+    val none-n = n(iotable, CORE-NONE-ID)
+    val n = uniqueid()
+    emit(buffer, ELocal(n, EOf(none-n), false))
+    emit(buffer, EObject(EVarLoc(n), none-n, [], false))
+    EVar(n)
+    
+  defn wrap-tuple (xs:Tuple<EImm>) -> EImm :
+    val tuple-n = n(iotable, CORE-TUPLE-ID)
+    val n = uniqueid()
+    emit(buffer, ELocal(n, EOf(tuple-n), false))
+    emit(buffer, ETuple(EVarLoc(n), xs, false))
+    EVar(n)
+
+  defn emit-call (c:ECall|ETCall, f:EImm, ys:Tuple<EImm>) -> False :
+    match(c) :
+      (c:ECall) :
+        emit(buffer, ECall(x(c), f, ys, calltype(c), info(c)))
+      (c:ETCall) :
+        emit(buffer, ETCall(f, ys, calltype(c), info(c)))  
+
+  ;Process each of the instructions in the body, and
+  ;convert calls to EInstFn.
+  for ins in ins(body) do :
+    match(ins) :
+      (ins:ECall|ETCall) :
+        if f(ins) is EInstFn :
+          conv-call(f(ins) as EInstFn,
+                    ys(ins),
+                    wrap-one,
+                    wrap-none,
+                    wrap-tuple,
+                    emit-call{ins, _, _})
+        else :
+          emit(buffer, ins)
+      (ins) :
+        emit(buffer, ins)
+
+  ;Return the processed body.
+  to-body(buffer)
+
+;Convert the call to the instantiated function to use
+;purely positional arguments.
+defn conv-call (f:EInstFn,
+                args:Tuple<EImm>,
+                wrap-one:EImm -> EImm,
+                wrap-none:() -> EImm,
+                wrap-tuple:Tuple<EImm> -> EImm,
+                emit-call:(EImm, Tuple<EImm>) -> False) -> False :
+  ;Compute new rearranged arguments.
+  val ordered-args = reorder-args(/args(pattern(f)))
+  val new-args = for pat-arg in ordered-args map :
+    match(pat-arg) :
+    
+      (pa:PositionalArg|KeywordArg) :
+        ;Three cases:
+        ;  Case 1: Optional and given.
+        ;  Case 2: Optional and not given.
+        ;  Case 3: Required.
+        
+        ;Case 1:
+        if optional?(pa) and type(pa) is Int :
+          val i = type(pa) as Int
+          wrap-one(args[i])
+        ;Case 2:
+        else if optional?(pa) and type(pa) is False :
+          wrap-none()
+        ;Case 3:
+        else if not optional?(pa) :
+          val i = type(pa) as Int
+          args[i]
+        else :
+          fatal("Invalid case.")
+          
+      (pa:VarArg) :
+        ;Two cases:
+        ;  Case 1: Given as keyword.
+        ;  Case 2: Given as multi value.
+        match(type(pa)) :
+          ;Case 1:
+          (indices:Tuple<Int>) :
+            wrap-tuple(map({args[_]}, indices))
+          ;Case 2:
+          (i:Int) :
+            args[i]
+            
+  ;Emit the new call.
+  val new-func =
+    if empty?(capvars(f)) :
+      EVar(n(f), info(f), name(f))
+    else :
+      val v = EVar(n(f), info(f), name(f))
+      ECurry(v, capvars(f))
+  emit-call(new-func, new-args)
 
 ;============================================================
 ;===================== Liveness Annotation ==================
@@ -1279,56 +1307,55 @@ defn detect-loops (epackage:EPackage) -> EPackage :
 
     ;Transform the given function into a loop
     defn transform-loop (e:EFn, fid:Int) :
-      fatal("TODO")
-;      ;Precondition
-;      fatal("Illegal input function.") when not empty?(targs(e))
-;
-;      val farity = length(args(e))
-;      val buffer = BodyBuffer(body(e))
-;
-;      ;Create dummy arguments
-;      val args0 = map(uniqueid{}, args(e))
-;      val loop-lbl = uniqueid()
-;      for (a in args(e), t in a1(e)) do :
-;        emit(buffer, ELocal(a, t, false))
-;
-;      ;Create dummy locals for handling parallel assignment.
-;      val parallel-args = map(uniqueid{}, args(e))
-;      for (a in parallel-args, t in a1(e)) do :
-;        emit(buffer, ELocal(a, t, false))
-;
-;      ;Emit loop start and entry prologue
-;      for (a0 in args0, a in args(e)) do :
-;        emit(buffer, EDef(EVarLoc(a), EVar(a0)))
-;      emit(buffer, ELabel(loop-lbl))
-;
-;      ;Emit instructions and generate looping instructions
-;      ;for matching tail calls.
-;      for i in ins(body(e)) do :
-;        ;Classify the instruction into either a loop call
-;        ;or a standard instruction.
-;        defn* classify () :
-;          match(i:ETCall) :
-;            if matches-fid?(f(i), fid) and length(ys(i)) == farity :
-;              loop-call(f(i), ys(i))
-;            else : standard-ins()
-;          else : standard-ins()
-;        ;For standard instructions just emit them to the buffer
-;        defn standard-ins () :
-;          emit(buffer, i)
-;        ;For loop calls, generate the appropriate instructions.
-;        defn loop-call (f:EImm, ys:Tuple<EImm>) :
-;          for (a in parallel-args, y in ys) do :
-;            emit(buffer, EDef(EVarLoc(a), y))
-;          for (a in args(e), b in parallel-args) do :
-;            emit(buffer, EDef(EVarLoc(a), EVar(b)))
-;          emit(buffer, EGoto(loop-lbl))
-;        ;Start with classify
-;        classify()
-;
-;      ;Substitute the new body and arguments
-;      val body* = to-body(buffer)
-;      sub-args(sub-body(e, body*), args0)
+      ;Precondition
+      fatal("Illegal input function.") when not empty?(targs(e))
+
+      val farity = length(args(e))
+      val buffer = BodyBuffer(body(e))
+
+      ;Create dummy arguments
+      val args0 = map(uniqueid{}, args(e))
+      val loop-lbl = uniqueid()
+      for (a in args(e), t in a1(e)) do :
+        emit(buffer, ELocal(a, t, false))
+
+      ;Create dummy locals for handling parallel assignment.
+      val parallel-args = map(uniqueid{}, args(e))
+      for (a in parallel-args, t in a1(e)) do :
+        emit(buffer, ELocal(a, t, false))
+
+      ;Emit loop start and entry prologue
+      for (a0 in args0, a in args(e)) do :
+        emit(buffer, EDef(EVarLoc(a), EVar(a0)))
+      emit(buffer, ELabel(loop-lbl))
+
+      ;Emit instructions and generate looping instructions
+      ;for matching tail calls.
+      for i in ins(body(e)) do :
+        ;Classify the instruction into either a loop call
+        ;or a standard instruction.
+        defn* classify () :
+          match(i:ETCall) :
+            if matches-fid?(f(i), fid) and length(ys(i)) == farity :
+              loop-call(f(i), ys(i))
+            else : standard-ins()
+          else : standard-ins()
+        ;For standard instructions just emit them to the buffer
+        defn standard-ins () :
+          emit(buffer, i)
+        ;For loop calls, generate the appropriate instructions.
+        defn loop-call (f:EImm, ys:Tuple<EImm>) :
+          for (a in parallel-args, y in ys) do :
+            emit(buffer, EDef(EVarLoc(a), y))
+          for (a in args(e), b in parallel-args) do :
+            emit(buffer, EDef(EVarLoc(a), EVar(b)))
+          emit(buffer, EGoto(loop-lbl))
+        ;Start with classify
+        classify()
+
+      ;Substitute the new body and arguments
+      val body* = to-body(buffer)
+      sub-args(sub-body(e, body*), args0)
 
     ;Driver
     detect-loop(recurse())
