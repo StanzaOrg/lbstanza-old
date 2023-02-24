@@ -337,28 +337,39 @@ defn compile (e:EDefmulti, global-table:GlobalTable, iotable:IOTable, ehier:EHie
   val args = for t in a1(e) map : make-local(compiler, VMRef())
 
   ;Split arguments into non-dispatch and dispatch arguments.
-  val non-dispatch-args = to-tuple $ cat-all $ [
-    [false-obj(iotable)
-     NumConst(length(a1(e)))]
-    targs
-    take-n(num-non-dispatch(e), args)]
-  val dispatch-args = args[num-non-dispatch(e) to false]
+  val all-args = to-tuple $ cat-all $ [
+    [false-obj(iotable)          ;Closure
+     NumConst(length(a1(e)))]    ;Arity
+    targs                        ;Type arguments
+    args]                        ;Arguments
 
   ;Perform the method dispatch
-  method-dispatch(compiler, n(e), non-dispatch-args, dispatch-args, info(e))
+  method-dispatch(compiler,
+                  n(e),
+                  dispatch(e) as DispatchMask,
+                  all-args, info(e))
 
   ;Compile to function
-  val all-args = to-tuple $ cat-all $ [[VMLong(), VMLong()], targs, args]
-  val func = VMFunc(all-args, defs(compiler), ins(compiler))
+  val all-params = to-tuple $ cat-all $ [[VMLong(), VMLong()], targs, args]
+  val func = VMFunc(all-params, defs(compiler), ins(compiler))
 
   ;Add to top level
   add(progbuffer, VMDefn(n(e), func))
 
 defn compile (e:EDefmethod, global-table:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
+  ;Compile the function that implements the method.
   add(progbuffer, compile-efunction(true, n(e), false, func(e), global-table, iotable, ehier, progbuffer))
-  val types = map(to-typeset, a1(func(e)))
-  val instance-method? = instance-method?(global-table, n(e))
-  add(progbuffer, VMMethod(instance-method?, multi(e), types, n(e)))
+
+  ;Isolate the dispatch types for the method.
+  val dispatch-types = to-tuple $
+    filter({_1}, a1(func(e)), /dispatch(dispatch(e) as DispatchMask))
+
+  ;Calculate the typesets that the VM uses for dispatch.
+  val typesets = map(to-typeset, dispatch-types)
+
+  ;Add the VMMethod registration to the program.
+  val instance-method? = instance-method?(global-table, n(e))  
+  add(progbuffer, VMMethod(instance-method?, multi(e), typesets, n(e)))
 
 defn compile (e:EExternFn, global-table:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
   val f = func(e)
@@ -564,7 +575,7 @@ defmulti defs (c:Compiler) -> Tuple<VMDef>
 defmulti ins (c:Compiler) -> Tuple<VMIns>
 defmulti emit (c:Compiler, i:VMIns) -> False
 defmulti return-typeof (c:Compiler, x:VMImm, t:EType) -> False
-defmulti method-dispatch (c:Compiler, multi:Int, ys:Tuple<VMImm>, zs:Tuple<VMImm>, info:TraceInfo) -> False
+defmulti method-dispatch (c:Compiler, multi:Int, mask:DispatchMask, args:Tuple<VMImm>, info:TraceInfo) -> False
 defmulti empty? (c:Compiler) -> True|False
 
 defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuffer) :
@@ -846,27 +857,57 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
     for (y in ys, o in 8 to false by 8) do :
       emit(StoreIns(x, o, y, tuple-id))
 
-  ;Method dispatch
-  defn method-dispatch (multi:Int, ys:Tuple<VMImm>, zs:Tuple<VMImm>, info:TraceInfo) :
+  ;Method dispatch.
+  defn method-dispatch (multi:Int,
+                        mask:DispatchMask,
+                        args:Tuple<VMImm>,
+                        info:TraceInfo) :
+    ;Structure of args:
+    ;  Prelude args (closure, arity)
+    ;  Type arguments
+    ;  Standard arguments
+    ;DispatchMask is assumed to indicate length of
+    ;Standard arguments only.
+
+    ;Split up arguments into dispatch and non-dispatch arguments.
+    val non-dispatch-args = Vector<VMImm>()
+    val dispatch-args = Vector<VMImm>()
+    val num-non-standard = length(args) - length(dispatch(mask))
+    for (arg in args, i in 0 to false) do :
+      if i < num-non-standard : add(non-dispatch-args, arg)
+      else if dispatch(mask)[i - num-non-standard] : add(dispatch-args, arg)
+      else : add(non-dispatch-args, arg)
+
+    ;Perform the dispatch instruction.    
+    val default = make-label()
+    val amb = make-label()
+    emit(MethodDispatchIns(multi, to-tuple(non-dispatch-args), to-tuple(dispatch-args), default, amb))
+
+    ;Helper: Construct tuple of arguments.
+    defn arg-tuple () -> Local :
+      val tuple = makedef(VMRef())
+      val zs = for i in indices(mask) map :
+        args[num-non-standard + i]
+      ctuple(tuple, zs, info)
+      tuple
+
     ;Add name of multi to program
     val multi-name-id = uniqueid()
     val multi-name = string-join([package(e) "/" name(e)]) where :
       val e = id(iotable[multi])
     add(progbuffer, VMConst(multi-name-id, multi-name))
 
-    ;Construct tuple of arguments
-    defn arg-tuple () :
-      val tuple = makedef(VMRef())
-      ctuple(tuple, zs, info)
-      tuple
-    
-    val default = make-label()
-    val amb = make-label()
-    emit(MethodDispatchIns(multi, ys, zs, default, amb))
+    ;When no method matches, call 'no-method-error'.
     emit(LabelIns(default))
-    call-error(n(iotable, CORE-NO-METHOD-ERROR-ID), [ConstId(multi-name-id), arg-tuple()], info)
+    call-error(n(iotable, CORE-NO-METHOD-ERROR-ID),
+               [ConstId(multi-name-id), arg-tuple()],
+               info)
+               
+    ;When multiple method matches, call 'amb-method-error'.
     emit(LabelIns(amb))
-    call-error(n(iotable, CORE-AMB-METHOD-ERROR-ID), [ConstId(multi-name-id), arg-tuple()], info)
+    call-error(n(iotable, CORE-AMB-METHOD-ERROR-ID),
+               [ConstId(multi-name-id), arg-tuple()],
+               info)
 
   ;Compile instructions
   defn compile (ins:EIns) :
@@ -1361,8 +1402,12 @@ defn Compiler (gt:GlobalTable, iotable:IOTable, ehier:EHier, progbuffer:ProgBuff
       do(compile, ins)
     defmethod return-typeof (this, x:VMImm, t:EType) :
       return-ctypeof(x,t)
-    defmethod method-dispatch (this, multi:Int, ys:Tuple<VMImm>, zs:Tuple<VMImm>, trace-entry:False|StackTraceEntry) :
-      method-dispatch(multi, ys, zs, trace-entry)
+
+    ;Compile a dispatch prelude for a multi.
+    defmethod method-dispatch (this, multi:Int,
+                               mask:DispatchMask, args:Tuple<VMImm>,
+                               trace-entry:False|StackTraceEntry) :
+      method-dispatch(multi, mask, args, trace-entry)
 
     ;Retrieve results
     defmethod defs (this) : to-tuple(defs)
