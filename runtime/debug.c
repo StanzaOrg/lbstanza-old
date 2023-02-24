@@ -1087,6 +1087,8 @@ static inline void send_invalidate_thread(void) {
 }
 
 static void send_thread_stopped(StopReason reason, const char* description, uint64_t breakpoint) {
+  send_invalidate_thread();
+
   run_mode = RUN_MODE_PAUSED;
 
   JSBuilder builder;
@@ -2278,7 +2280,7 @@ static bool request_threads(const JSObject* request) {
       JSBuilder_next(&builder);
       JSBuilder_object_begin(&builder);
       {
-        JSBuilder_write_unsigned_field(&builder, "id", 12345678);
+        JSBuilder_write_unsigned_field(&builder, "id", thread_id);
         JSBuilder_write_raw_string_field(&builder, "name", "main");
       }
       JSBuilder_object_end(&builder); // an individual thread
