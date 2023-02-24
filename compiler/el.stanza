@@ -20,6 +20,7 @@ defpackage stz/el :
   import stz/verbose
   import core/stack-trace
   import stz/timing-log-api
+  import stz/type-fargs
 
 ;============================================================
 ;==================== Drivers ===============================
@@ -76,6 +77,8 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
       ;dump(cur-package, "logs", suffix)
       #if-not-defined(OPTIMIZE) :
         ensure-unique-identifiers!(cur-package)
+    defn run-pass (pass-name:String, f:(EPackage, IOTable) -> EPackage, suffix:String, update-tables?:True|False) :
+      run-pass(pass-name, f{_, iotable}, suffix, update-tables?)
     defn run-pass (pass-name:String, f:(EPackage, VarTable) -> EPackage, suffix:String, update-tables?:True|False) :
       run-pass(pass-name, f{_, global-vt}, suffix, update-tables?)
     defn run-pass (pass-name:String, f:(EPackage, EHier, VarTable) -> EPackage, suffix:String, update-tables?:True|False) :
@@ -83,6 +86,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
 
     ;Dump input
     ;dump(cur-package, "logs", "input")
+    run-pass("Convert To Positional Args", conv-to-positional-args, "conv-pos-args", true)
     run-pass("Map Methods", map-methods, "mapped-methods", false)
     run-pass("Create Closures", create-closures, "closures", false)
     run-pass("Convert Mixes", convert-mixes, "mixes", false)
@@ -289,6 +293,138 @@ defn collapse (epackages:Tuple<EPackage>) :
   driver()
 
 ;============================================================
+;============ Positional Argument Conversion ================
+;============================================================
+
+;------------------------------------------------------------
+;--------------- General Argument Ordering ------------------
+;------------------------------------------------------------
+
+;- num-non-dispatch: The number of optional/vararg arguments
+;  in front that do not participate in multi dispatch.
+;- indices: E.g. indices[2] = 4 means that the new argument 2
+;  corresponds to the previous argument 4.
+;- args: The reordered arguments, with postprocessed types.
+defstruct OrderedArgs :
+  num-non-dispatch:Int
+  indices:Tuple<Int>
+  args:Tuple<FArg<EType>>
+
+;Returns true if the arguments needs to be reordered or processed.
+defn requires-ordering? (args:Tuple<FArg<EType>>) -> True|False :
+  for arg in args any? :
+    match(arg) :
+      (arg:PositionalArg) : optional?(arg)
+      (arg:KeywordArg) : true
+      (arg:VarArg) : true
+
+;Compute the new ordering of the given arguments.
+defn reorder-args (args:Tuple<FArg<EType>>,
+                   wrap-maybe:EType -> EType,
+                   wrap-tuple:EType -> EType) -> OrderedArgs :
+  ;Classify arguments into groups:
+  ;- OPTIONAL POS ARGS
+  ;- OPTIONAL KEY ARGS
+  ;- VARARG?
+  ;- REQUIRED POS ARGS
+  ;- REQUIRED KEY ARGS
+  ;(Keyword arguments are always sorted by name within
+  ; their group.)
+  val optional-pos-args = Vector<Int>()
+  val optional-key-args = Vector<Int>()
+  var vararg:Int|False = false
+  val required-pos-args = Vector<Int>()
+  val required-key-args = Vector<Int>()
+  for (arg in args, i in 0 to false) do :
+    match(arg) :
+      (arg:PositionalArg<EType>) :
+        if optional?(arg) : add(optional-pos-args, i)
+        else : add(required-pos-args, i)
+      (arg:KeywordArg<EType>) :
+        if optional?(arg) : add(optional-key-args, i)
+        else : add(required-key-args, i)
+      (arg:VarArg<EType>) :
+        vararg = i
+        
+  ;Sort keyword arguments by name.
+  defn sort-keywords (vs:Vector<Int>) :
+    defn name! (i:Int) : name(args[i] as KeywordArg)
+    qsort!(name!, vs)
+  sort-keywords(optional-key-args)
+  sort-keywords(required-key-args)
+
+  ;Generate final ordering.
+  val new-indices = Vector<Int>()
+  val new-args = Vector<PositionalArg<EType>>()
+  defn identity (t:EType) : t
+  defn process-arg (f:EType -> EType, i:Int) :
+    add(new-indices, i)
+    add(new-args, PositionalArg<EType>(false, f(type(args[i]))))  
+  do(process-arg{wrap-maybe, _}, optional-pos-args)
+  do(process-arg{wrap-maybe, _}, optional-key-args)
+  match(vararg:Int) : process-arg(wrap-tuple, vararg)
+  do(process-arg{identity, _}, required-pos-args)
+  do(process-arg{identity, _}, required-key-args)
+
+  ;Bundle result in OrderedArgs.
+  val vararg-count = 1 when vararg is Int else 0
+  val num-non-dispatch = length(optional-pos-args)
+                       + length(optional-key-args)
+                       + vararg-count
+  OrderedArgs(num-non-dispatch,
+              to-tuple(new-indices),
+              to-tuple(new-args))
+
+;Reorder a tuple of items according to the indices in 'ordered'.
+defn reorder<?T> (ordered:OrderedArgs, xs:Tuple<?T>) -> Tuple<T> :
+  for i in indices(ordered) map :
+    xs[i]
+
+;------------------------------------------------------------
+;---------- Reorder Definitions in Package ------------------
+;------------------------------------------------------------
+
+;Convert and reorder all arguments for all multis and functions
+;to required positional arguments only.
+defn conv-to-positional-args (e:EPackage, iotable:IOTable) -> EPackage :
+
+  ;Call reorder-args with proper wrapping functions.
+  defn reorder-args (args:Tuple<FArg<EType>>) -> OrderedArgs :
+    val tuple-n = n(iotable, CORE-TUPLE-ID)
+    val maybe-n = n(iotable, CORE-MAYBE-ID)
+    /reorder-args(args,
+                  EOf{maybe-n},
+                  EOf{tuple-n})    
+
+  ;Convert all arguments in EFn to positional arguments.
+  defn conv-pos-args (e:EFn) -> EFn :
+    if requires-ordering?(a1-args(e)) :
+      val ordered = reorder-args(a1-args(e))
+      val new-args = reorder(ordered, args(e))
+      e $> sub-args{_, new-args}
+        $> sub-a1-args{_, args(ordered)}
+    else :
+      e
+
+  ;Convert all arguments in EDefmulti to positional arguments.
+  defn conv-pos-args (m:EDefmulti) -> EDefmulti :
+    if requires-ordering?(a1-args(m)) :
+      val ordered = reorder-args(a1-args(m))
+      m $> sub-a1-args{_, args(ordered)}
+        $> sub-num-non-dispatch{_, num-non-dispatch(ordered)}
+    else :
+      m
+
+  ;Recursively analyze all EDefmulti and EFn in
+  ;the package, and reorder the arguments.
+  defn loop (x:ELBigItem) :
+    match(map(loop,x)) :
+      (x:EDefmulti) : conv-pos-args(x)
+      (x:EFn) : conv-pos-args(x)
+      (x) : x
+  map(loop, e)
+
+;============================================================
 ;================== Method TArg Mapping =====================
 ;============================================================
 
@@ -351,27 +487,25 @@ defn map-methods (e:EPackage, gvt:VarTable) :
   defn loop (x:ELBigItem) :
     map{loop, _} $ match(x) :
       (m:EDefmethod) :
-        fatal("TODO")
-;        val arity = length(args(func(m)))
-;        val [targs*, tvals] = inverse-solve(targs(func(m)), targs(m))
-;        val mrt = multi-return-type(multi(m), arity, targs*)
-;        val mat = multi-arg-types(multi(m), arity, length(targs(m)))
-;        var func*:EFn = replace-tvars(func(m), targs(func(m)), tvals)
-;        func* = sub-targs(func*, targs*)
-;        func* = sub-a1(func*, to-tuple(seq(EAnd, a1(func*), mat)))
-;        func* = sub-a2(func*, EAnd(a2(func*), mrt))
-;        EDefmethod(n(m), multi(m), [], func*, lostanza?(m))
+        val arity = length(args(func(m)))
+        val [targs*, tvals] = inverse-solve(targs(func(m)), targs(m))
+        val mrt = multi-return-type(multi(m), arity, targs*)
+        val mat = multi-arg-types(multi(m), arity, length(targs(m)))
+        var func*:EFn = replace-tvars(func(m), targs(func(m)), tvals)
+        func* = sub-targs(func*, targs*)
+        func* = sub-a1(func*, to-tuple(seq(EAnd, a1(func*), mat)))
+        func* = sub-a2(func*, EAnd(a2(func*), mrt))
+        EDefmethod(n(m), multi(m), [], func*, lostanza?(m))
       (m:EMethod) :
-        fatal("TODO")
-;        val arity = length(args(func(m)))
-;        val [targs*, tvals] = inverse-solve(targs(func(m)), targs(m))
-;        val mrt = multi-return-type(multi(m), arity, targs*)
-;        val mat = multi-arg-types(multi(m), arity, length(targs(m)))
-;        var func*:EFn = replace-tvars(func(m), targs(func(m)), tvals)
-;        func* = sub-targs(func*, targs*)
-;        func* = sub-a1(func*, to-tuple(seq(EAnd, a1(func*), mat)))
-;        func* = sub-a2(func*, EAnd(a2(func*), mrt))
-;        EMethod(n(m), multi(m), [], thisn(m), func*)
+        val arity = length(args(func(m)))
+        val [targs*, tvals] = inverse-solve(targs(func(m)), targs(m))
+        val mrt = multi-return-type(multi(m), arity, targs*)
+        val mat = multi-arg-types(multi(m), arity, length(targs(m)))
+        var func*:EFn = replace-tvars(func(m), targs(func(m)), tvals)
+        func* = sub-targs(func*, targs*)
+        func* = sub-a1(func*, to-tuple(seq(EAnd, a1(func*), mat)))
+        func* = sub-a2(func*, EAnd(a2(func*), mrt))
+        EMethod(n(m), multi(m), [], thisn(m), func*)
       (x) :
         x
   map(loop, e)
