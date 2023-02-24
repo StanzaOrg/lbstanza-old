@@ -21,6 +21,7 @@ defpackage stz/el :
   import core/stack-trace
   import stz/timing-log-api
   import stz/type-fargs
+  import stz/dump-to-log
 
 ;============================================================
 ;==================== Drivers ===============================
@@ -74,7 +75,7 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
       within log-time(EL-TIMERS[pass-name], /suffix(name(epackage))) :
         cur-package = f(cur-package)
         update-tables() when update-tables?
-      ;dump(cur-package, "logs", suffix)
+      dump(cur-package, "logs", suffix)
       #if-not-defined(OPTIMIZE) :
         ensure-unique-identifiers!(cur-package)
     defn run-pass (pass-name:String, f:(EPackage, IOTable) -> EPackage, suffix:String, update-tables?:True|False) :
@@ -554,78 +555,32 @@ defn to-body (b:BodyBuffer) :
 ;============================================================
 ;=================== Closure Creation =======================
 ;============================================================
+
+;Functions cannot be referenced directly.
+;For each referenced function in expression position, create
+;a closure that wraps up the call.
 defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
-  ;Retrieve an info from the given immediate
-  defn first-info (f:EVar|ECurry|EMix) :
-    match(f) :
-      (f:EVar) : info(f)
-      (f:ECurry) : info(x(f))
-      (f:EMix) : find({_ is FileInfo}, seq(first-info, funcs(f)))
 
-  ;Key utilities for EVar|ECurry
-  defn var-hash (e:EVar|ECurry) :
-    match(e) :
-      (e:EVar) : n(e)
-      (e:ECurry) : 11 * n(x(e)) + hash(targs(e))
-  defn var-equal? (a:EVar|ECurry, b:EVar|ECurry) :
-    match(a, b) :
-      (a:EVar, b:EVar) : n(a) == n(b)
-      (a:ECurry, b:ECurry) : n(x(a)) == n(x(b)) and targs(a) == targs(b)
-      (a, b) : false
-  defn var-table<T> () :
-    HashTable<EVar|ECurry, T>(var-hash, var-equal?)
-
-  ;Create a trampoline function that calls the given immediate
-  ;with known arity.
-  defn trampoline-fn (f:EVar|ECurry|EMix, arity:Int, vt:VarTable) :
-    fatal("TODO")
-;    defn times<?T> (n:Int, f:() -> ?T) :
-;      to-tuple(repeatedly(f,n))
-;    val args = arity * uniqueid
-;    val [a1, a2] = match(f) :
-;      (f:EVar|ECurry) : fn-types(vt, f, arity)
-;      (f:EMix) : [arity * ETop, ETop()]
-;    EFn(true, [], args, arity * ETop, ETop(),
-;      EBody([], [], [], [], [
-;        ETCall(f, map(EVar,args), CallGuarded(a1,a2), first-info(f))])
-;      false)
-
-  ;Create a trampoline function that calls the given immediate
-  ;with unknown (and potentially multiple) arities.
-  defn trampoline-fn (f:EVar|ECurry|EMix, vt:VarTable) :
-    ;Gather all branches
-    val branches = Vector<KeyValue<Int,EVar|ECurry>>()
-    let loop (f:EImm = f) :
-      match(f) :
-        (f:EVar) :
-          for a in arities(vt,n(f)) do :
-            add(branches, a => f)
-        (f:ECurry) :
-          for a in arities(vt,n(x(f))) do :
-            add(branches, a => f)
-        (f:EMix) :
-          do(loop, funcs(f))
-
-    ;If there's only one
-    if length(branches) == 1 :
-      val b = branches[0]
-      trampoline-fn(value(b), key(b), vt)
-    else :
-      EMultifn $ to-tuple $
-        for group in group-by(key, value, branches) seq :
-          trampoline-fn{_, key(group), vt} $
-            switch(length(value(group))) :
-              1 : head(value(group))
-              else : EMix(to-tuple(value(group)))
-
-  ;Lift all first-class functions in body
+  ;Lift all first-class functions in body.
   defn analyze-body (top-body:EBody, vt:VarTable) :
 
-    ;Create trampoline table
-    val trampoline-table = var-table<Int>()
+    ;Create trampoline table.    
+    val trampoline-table = TrampolineTable()
+
+    ;Hold the list of trampolines created for each
+    ;function.
+    ;An entry, N => F1,F2, means that F1 and F2 are
+    ;trampolines to N. So they should be initialized
+    ;as soon as N is declared.
     val trampolines = IntListTable<ELocalFn>()
+
+    ;Track for which trampolines have we initialized
+    ;by generating an EInitClosures instruction.
     val initialized? = IntSet()
-    defn uninitialized-trampolines () :
+
+    ;Return all the trampolines in 'trampolines' that
+    ;haven't been marked as initialized.
+    defn uninitialized-trampolines () -> Seq<ELocalFn> :
       for entry in trampolines seq-cat :
         if initialized?[key(entry)] : []
         else : value(entry)
@@ -638,34 +593,29 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
           val buffer = BodyBuffer(e)
 
           ;Retrieve the wrapped identifier in EVar|ECurry
-          defn var-id (e:EVar) : n(e)
-          defn var-id (e:ECurry) : var-id(x(e))
-          defn lift (x:EVar|ECurry|EMix) -> EVar :
+          defn lift (x:EMix2) -> EVar :
             ;Closure is (conservatively) allocated at use-site if it is a EMix
             ;or if it curries over type variables.
-            val allocate-at-use-site? = match(x) :
-              (x:EMix) : true
-              (x:ECurry) : any?(has-tvar?, targs(x))
-              (x:EVar) : false
+            val allocate-at-use-site? = switch(length(funcs(x))) :
+              1 : not empty?(capvars(funcs(x)[0]))
+              else : true
+
             ;If at use-site, then init here, otherwise lift to trampoline table
             if allocate-at-use-site? :
               val v = uniqueid()
-              emit(buffer, ELocalFn(v, trampoline-fn(x, vt)))
-              emit(buffer, EInitClosures([EVarLoc(v)], first-info(x)))
+              emit(buffer, ELocalFn(v, trampoline-fn(x)))
+              emit(buffer, EInitClosures([EVarLoc(v)], info(funcs(x)[0])))
               EVar(v)
             else :
-              val x = x as EVar|ECurry
-              if not key?(trampoline-table, x) :
-                val v = uniqueid()
-                add(trampolines, var-id(x), ELocalFn(v, trampoline-fn(x, vt)))
-                trampoline-table[x] = v
-              EVar(trampoline-table[x])
+              val x = funcs(x)[0]
+              if make-trampoline(trampoline-table, x) :
+                add(trampolines, n(x), trampoline-table[n(x)])
+              EVar(n(trampoline-table[n(x)]))
 
           ;Analyze an immediate, lifting when necessary
           defn lift-imm (x:EImm) :
             match(x) :
-              (x:EVar) : lift(x) when function?(vt,n(x)) else x
-              (x:ECurry|EMix) : lift(x)
+              (x:EMix2) : lift(x)
               (x) : x
 
           ;Analyze all instructions
@@ -708,11 +658,82 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
     ;Driver
     lift-trampolines(top-body, true)
 
-  ;Recursive Analysis
+  ;Scan through the package and call analyze-body on
+  ;every 
   defn analyze (x:ELBigItem, vt:VarTable) :
     match(x:EBody) : analyze-body(x, vt)
     else : map(analyze{_, vt}, x)
   map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
+
+;Small trampoline table for avoiding redundantly creating
+;closures over and over for the same function.
+;TODO: Can be generalized to handle type arguments too.
+defstruct TrampolineTable :
+  table:IntTable<ELocalFn> with:
+    init => IntTable<ELocalFn>()
+
+;Create a new trampoline.
+;Returns true if a new trampoline was created.
+defn make-trampoline (t:TrampolineTable, f:EInstFn) -> True|False :
+  if not key?(table(t), n(f)) :
+    val func = uni-arity-trampoline-fn(f)
+    table(t)[n(f)] = ELocalFn(uniqueid(), func)
+    true
+
+;Retrieve a previously created trampoline.
+defn get (t:TrampolineTable, n:Int) -> ELocalFn :
+  table(t)[n]
+
+;Helper: Create a trampoline function that calls the given immediate.
+defn uni-arity-trampoline-fn (f:EMix2|EInstFn) -> EFn :
+
+  ;Retrieve the arity of the function to call.
+  ;Assume if it is a mix that they are all the same arity.
+  val arity = length $ match(f) :
+    (f:EInstFn) : a1(f)
+    (f:EMix2) : a1(funcs(f)[0])
+
+  ;Create fresh identifiers of the trampoline arguments.    
+  val args = arity * uniqueid
+
+  ;For the CallGuarded call type, retrieve the input/output
+  ;types. EMix will use ETop() as a placeholder.
+  val [a1, a2] = match(f) :
+    (f:EInstFn) : [a1(f), a2(f)]
+    (f:EMix2) : [arity * ETop, ETop()]
+
+  ;Create the tail-call expression.
+  val tcall = ETCall(f, argvars, call-type, info) where :
+    val argvars = map(EVar,args)
+    val call-type = CallGuarded(a1,a2)
+    val info = match(f) :
+      (f:EInstFn) : info(f)
+      (f:EMix2) : info(funcs(f)[0])
+
+  ;Create the EFn.
+  EFn(true, [], args, arity * PositionalArg<EType>{false,ETop()}, ETop(),
+    EBody([], [], [], [], [tcall])
+    false)
+
+;Create a trampoline function that calls the given immediate
+;with unknown (and potentially multiple) arities.
+defn trampoline-fn (f:EMix2) -> EFn|EMultifn :
+  ;Retrieve the arity of the given function.
+  defn arity (f:EInstFn) -> Int :
+    length(a1(f))
+    
+  ;Group by arity, and create a trampoline for each arity.
+  val groups = group-by(arity, funcs(f))
+  val trampolines = to-tuple $ for group in groups seq :
+    val fs = value(group)
+    val f = head(fs) when length(fs) == 1
+       else EMix2(to-tuple(fs))
+    uni-arity-trampoline-fn(f)
+
+  ;Either return a single trampoline, or group them
+  ;using EMultifn.
+  if length(trampolines) == 1 : trampolines[0]
+  else : EMultifn(trampolines)
 
 ;============================================================
 ;===================== Mix Conversion =======================
@@ -3940,3 +3961,11 @@ defn has-tvar? (t:EType) :
 
 defn select<?T> (xs:Tuple<?T>, mask:Tuple<True|False>) -> Tuple<T> :
   to-tuple(filter(xs, mask))
+
+;============================================================
+;===================== Small Utilities ======================
+;============================================================
+
+;Shorthand for calling 'repeatedly'.
+defn times<?T> (n:Int, f:() -> ?T) -> Tuple<T> :
+  to-tuple(repeatedly(f,n))
