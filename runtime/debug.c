@@ -1110,6 +1110,8 @@ static void send_thread_stopped(StopReason reason, const char* description, uint
 }
 
 static inline void send_process_exited(uint64_t exit_code) {
+  run_mode = RUN_MODE_TERMINATED;
+
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "exited");
   JSBuilder_write_unsigned_field(&builder, "exitCode", exit_code);
