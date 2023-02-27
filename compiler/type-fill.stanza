@@ -22,10 +22,16 @@ defpackage stz/type-fill :
 ;============================================================
 
 ;Fill the computed solutions in the Solver into the program.
-public defn fill-solution (prog:TProg, solns:SolverState) -> TProg :
-  val new-packages = for package in packages(prog) map :
-    fill-solution(package, solns)
-  sub-packages(prog, new-packages)
+public defn fill-solution (prog:TProg, solns:SolverState) -> TProg|TypeErrors :
+  val errors = Vector<TypeError>()
+  val new-prog = within with-implicits(errors,
+                                       hierarchy(prog),
+                                       namemap(prog)) :
+    val new-packages = for package in packages(prog) map :
+      fill-solution(package, solns)
+    sub-packages(prog, new-packages)
+  if empty?(errors) : new-prog
+  else : TypeErrors(to-tuple(errors))
 
 ;Fill all the solutions in the package commands.
 public defn fill-solution (package:TPackage, solns:SolverState) -> TPackage :
@@ -448,7 +454,16 @@ defn fill-exp (e:TExp, soln:SolverState, scope:List<Int>) -> TExp :
 
 ;Fill the solved types in the given command.
 defn fill-ls-comm (comm:LSComm, soln:SolverState, scope:List<Int>) -> LSComm :
-  match(comm) :
+
+  ;Run post-fill checks on the command.
+  defn post-checks (comm:LSComm) -> LSComm :
+    ;Ensure that subexpressions are bounded.
+    for item in comm do :
+      match(item:LSExp) :
+        check-bounded(item, true)
+    comm
+
+  post-checks $ match(comm) :
     (comm:LSCall) : ;[REVIEWED]
       val new-exp = fill-ls-exp(exp(comm), soln, scope)
       LSCall(info(comm), new-exp)
@@ -661,10 +676,6 @@ defn fill-ls-exp (e:LSExp, soln:SolverState, scope:List<Int>) -> LSExp :
       ;ERROR: Solver cannot deref value with given type.
       if type(e) is UVarT :
         add-type-error(BadDeref(result))
-
-      ;ERROR: Cannot deref unbounded type.
-      if not-bounded?(type!(e)) :
-        add-type-error(UnboundedDeref(result))
       
       result
 
@@ -679,9 +690,6 @@ defn fill-ls-exp (e:LSExp, soln:SolverState, scope:List<Int>) -> LSExp :
       ;ERROR: Bad index.
       if not-assignable?(type!(new-index), LongT()) :
         add-type-error(BadIndex(result))
-      ;ERROR: Cannot access unbounded type.
-      if not-bounded?(type!(e)) :
-        add-type-error(UnboundedDeslot(result))
 
       result
       
@@ -692,10 +700,6 @@ defn fill-ls-exp (e:LSExp, soln:SolverState, scope:List<Int>) -> LSExp :
       ;ERROR: Solver could not access field.
       if type(e) is UVarT :
         add-type-error(BadField(result))
-        
-      ;ERROR: Cannot access unbounded field.
-      if not-bounded?(type!(e)) :
-        add-type-error(UnboundedField(result))
 
       result
       
@@ -850,6 +854,65 @@ defn fill-ls-exp (e:LSExp, soln:SolverState, scope:List<Int>) -> LSExp :
     (e:LSFn) :
       val new-ref = fill-exp(ref(e), soln, scope)
       LSFn(info(e), type(e), ctxt(e), new-ref)
+
+;Ensure that the appropriate sub-expressions within e have bounded
+;types.
+defn check-bounded (e:LSExp, required-bounded?:True|False) -> False :
+  match(e) :
+    ;If context does not need to be bounded, then expression also
+    ;does not need to be bounded.
+    (e:LSDeref) :
+      check-bounded(exp(e), required-bounded?)
+      
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(type!(e)) :
+        add-type-error(UnboundedDeref(e))
+
+    ;Expression does not need to be bounded, as we are taking
+    ;its address.
+    (e:LSAddr) :
+      check-bounded(exp(e), false)
+
+    ;The expression does not need to be bounded because we
+    ;are retrieving a specific subfield anyway.
+    (e:LSField) :
+      check-bounded(exp(e), false)
+
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(type!(e)) :
+        add-type-error(UnboundedField(e))
+
+    ;If context needs to be bounded, then expression also
+    ;needs to be bounded.
+    (e:LSCast) :
+      check-bounded(exp(e), required-bounded?)
+
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(targ(e)) :
+        add-type-error(UnboundedCast(e))    
+
+    ;The expression does not need to be bounded because LSSlot
+    ;allows for it to be RestT type.
+    (e:LSSlot) :      
+      check-bounded(exp(e), false)
+      check-bounded(index(e), true)
+
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(type!(e)) :
+        add-type-error(UnboundedDeslot(e))
+
+    ;Propgate context into let expressions.
+    ;We assume recursion at the caller-side will handle the
+    ;nested LSComm.
+    (e:LSLetExp) :
+      check-bounded(exp(e), required-bounded?)
+    
+    ;By default, expressions are expected to have
+    ;bounded types.
+    (e) :
+      for item in e do :
+        match(item:LSExp) :
+          check-bounded(item, true)
 
 ;Generate error messages for bad return type.
 defn bad-return (e:TExp, a2:Type) -> False :
@@ -1257,35 +1320,38 @@ defn not-assignable? (a:LSType, b:LSType) -> True|False :
 ;Returns true if the given arrows, when called with args,
 ;are not disjoint. Arrows are homo-arity.
 defn not-disjoint? (xs:Tuple<TArrow>, args:Tuple<Type>) -> True|False :
-  if length(xs) > 1 :
+  if length(xs) >= 2 :
     disjoint?(map(a1,xs), args, current-hier()) is False
 
 ;Returns true if the given functions, when called with args,
 ;can be merged. 
 defn not-disjoint? (merged:FnT, xs:Tuple<FnT>, args:Tuple<LSType>) -> True|False :
-  ;Compute which arguments are RefT.
-  defn reftype? (t:LSType) : t is RefT
-  defn reftype! (t:LSType) : type(t as RefT)
-  
-  val arity = length(a(merged))
-  val ref-indices = to-tuple $ for i in 0 to arity filter :
-    reftype?(a(merged)[i])
+  if length(xs) >= 2 :
 
-  ;If no arguments are ref type, then not disjoint.
-  if empty?(ref-indices) :
-    true
+    ;Compute which arguments are RefT.
+    defn reftype? (t:LSType) : t is RefT
+    defn reftype! (t:LSType) : type(t as RefT)
+    
+    val arity = length(a(merged))
+    val ref-indices = to-tuple $ for i in 0 to arity filter :
+      reftype?(a(merged)[i])
 
-  ;Otherwise, check the ref types.
-  else :
-    ;Retrieve the argument types.
-    val arg-types = map({args[_]}, ref-indices)
+    ;If no arguments are ref type, then not disjoint.
+    if empty?(ref-indices) :
+      true
 
-    ;If all arguments are refs, then use disjoint algorithm:
-    if all?(reftype?, arg-types) :
-      val arg-refs = map(reftype!, arg-types)
-      val xs-refs = for x in xs map :
-        map(reftype!{a(x)[_]}, ref-indices)
-      disjoint?(xs-refs, arg-refs, current-hier()) is False  
+    ;Otherwise, check the ref types if there are at least two.
+    else :
+    
+      ;Retrieve the argument types.
+      val arg-types = map({args[_]}, ref-indices)
+
+      ;If all arguments are refs, then use disjoint algorithm:
+      if all?(reftype?, arg-types) :
+        val arg-refs = map(reftype!, arg-types)
+        val xs-refs = for x in xs map :
+          map(reftype!{a(x)[_]}, ref-indices)
+        disjoint?(xs-refs, arg-refs, current-hier()) is False  
 
 ;Returns true if the given arrows, when called with possible args,
 ;are not disjoint. Arrows are hetero-arity.
