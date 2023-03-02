@@ -52,46 +52,61 @@ public defn generate-type-equations (prog:TProg) -> [TProg, Vector<TypeEqn>] :
 ;============================================================
 
 ;Holds the type information of a specific variable.
-;- type: The type of the variable.
-;- afn-arg?: True if the argument is an argument for which
-;  we are inferring its type.
-defstruct VarTypeRecord :
-  type:Type|LSType
-  inferred-arg?:True|False
+deftype AbstractTypeRecord
+;Return the declared type of the given record.
+defmulti type (r:AbstractTypeRecord) -> Type|LSType
+
+;Normal type record for standard variables.
+defstruct VarTypeRecord <: AbstractTypeRecord :
+  type:Type|LSType with: (as-method => true)
+
+;Type record for inferred function arguments.
+;- exp-type: The type that the argument is expected to be,
+;  based upon its usage positions.
+defstruct InferredArgTypeRecord <: AbstractTypeRecord :
+  type:Type with: (as-method => true)
+  exp-type:Type
 
 ;Each entry, V => T, means that the variable V has type
 ;type T.
-var TYPE-ENV:IntTable<VarTypeRecord>|False = false
+var TYPE-ENV:IntTable<AbstractTypeRecord>|False = false
 
 ;Execute the body with an active type environment.
 defn with-type-env<?T> (body:() -> ?T) -> T :
-  let-var TYPE-ENV = IntTable<VarTypeRecord>() :
+  let-var TYPE-ENV = IntTable<AbstractTypeRecord>() :
     body()
 
 ;Retrieve the active type environment.
-defn type-env! () -> IntTable<VarTypeRecord> :
+defn type-env! () -> IntTable<AbstractTypeRecord> :
   if TYPE-ENV is False :
     fatal("No active type environment.")
-  TYPE-ENV as IntTable<VarTypeRecord>
+  TYPE-ENV as IntTable<AbstractTypeRecord>
 
 ;Set the type of a variable.
-defn set-type (n:Int, t:Type|LSType, inferred-arg?:True|False) -> False :
+defn set-type (n:Int, t:Type|LSType) -> False :
   val env = type-env!()
   if key?(env,n) :
     fatal("Type already set in environment for variable %_." % [n])
-  env[n] = VarTypeRecord(t, inferred-arg?)
+  env[n] = VarTypeRecord(t)
 
-;Set the type of a non-inferred argument.
-defn set-type (n:Int, t:Type|LSType) -> False :
-  set-type(n, t, false)
+;Set the type and expected type of an inferred argument.
+defn set-inferred-arg-type (n:Int, t:Type, exp-t:Type) -> False :
+  val env = type-env!()
+  if key?(env,n) :
+    fatal("Type already set in environment for variable %_." % [n])
+  env[n] = InferredArgTypeRecord(t,exp-t)
 
 ;Retrieve the HiStanza type of a variable.
 defn get-type (n:Int) -> Type|LSType :
   type(type-env!()[n])
 
+;Retrieve the expected type of the inferred argument.
+defn get-exp-type (n:Int) -> Type :
+  exp-type(type-env!()[n] as InferredArgTypeRecord)
+
 ;Return true if the given variable is an inferred argument.
 defn inferred-arg? (n:Int) -> True|False :
-  inferred-arg?(type-env!()[n])
+  type-env!()[n] is InferredArgTypeRecord
 
 ;============================================================
 ;=================== Type Hierarchy =========================
@@ -455,7 +470,8 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
             t
           else :
             val v = fresh-tuvar()
-            set-type(arg, v, true)
+            val exp-v = fresh-tuvar()
+            set-inferred-arg-type(arg, v, exp-v)
             v      
       val new-a2 = or-var(a2(e))
 
@@ -489,7 +505,7 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
           add-equation $ InferEqn(n(r), ReturnLoc(arity), expected(ctxt))
           ExpCtxt(r)
         (a2:False, ctxt:CallCtxt) :
-          ExpCtxt(TTop())
+          ExpCtxt(/a2(ctxt))
       val new-body = gen-equations(body(e), body-ctxt)
 
       ;Now we know the return type.
@@ -540,16 +556,21 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
     (e:TRef) :
       val r = annotate-type(e,ctxt)
 
-      ;Add bound equation if in the appropriate context.
+      ;Add bounds and expected types for inferred argument.
       if inferred-arg?(n(e)) :
-        val v = type(r) as TUVar
+        val v = get-type(n(e)) as TUVar
+        val exp-v = get-exp-type(n(e)) as TUVar
+
         match(ctxt) :
           (ctxt:ExpCtxt) :
             add-equation(SubBoundsEqn(n(v), expected(ctxt)))
+            add-equation(SuperEqn(n(exp-v), expected(ctxt)))
           (ctxt:CallCtxt) :
             if simple-positional-call?(ctxt) :
-              val arrow = TArrow(map(type, fargs(ctxt)), TTop())
+              ;For the bounds, we use Top as the return type s
+              val arrow = TArrow(map(type, fargs(ctxt)), a2(ctxt))
               add-equation(SubBoundsEqn(n(v), arrow))
+              add-equation(SuperEqn(n(v), arrow))
           (ctxt) :
             false        
 
@@ -597,7 +618,9 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
           map(gen-equations{_, ExpCtxt(et)}, arg)
 
       ;Gen equations for func now that we have argument types.      
-      val func-ctxt = CallCtxt(targs(e), map(map{type!,_}, new-args))
+      val func-ctxt = match(ctxt) :
+        (ctxt:ExpCtxt) : CallCtxt(targs(e), map(map{type!,_}, new-args), expected(ctxt))
+        (ctxt:CallCtxt) : CallCtxt(targs(e), map(map{type!,_}, new-args), a2(ctxt))
       val new-func = gen-equations(func(e), func-ctxt)
       val ft = type!(new-func)
 
@@ -605,9 +628,9 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
       val ret-type = fresh-tuvar()
       add-equation $ InferEqn(n(ret-type), type!(new-func), ReturnLoc(length(new-args)))
 
-      ;Infer expected argument types from function type.
+      ;Compute expected argument types from function type.
       for (et in expected-arg-types, i in 0 to false) do :
-        add-equation $ InferEqn(n(et), type!(new-func), ArgLoc(length(new-args), i))
+        compute-expected-arg-type(n(et), new-func, i, length(new-args))
 
       ;Return new data.
       TDo(info(e), ret-type, ctxt, new-func, targs(e), new-args)
@@ -662,6 +685,35 @@ defn gen-equations (e:TExp, ctxt:Context) -> TExp :
 
     (e:TMix) :
       gen-function-reference(e,ctxt)
+
+;Compute the expected arg type of calling the given function.
+;The typical case is simply inferring the arg type of the function.
+;The special case is if we are calling an anonymous function directly.
+defn compute-expected-arg-type (n:Int, func:TExp, arg-index:Int, arity:Int) -> False :
+  match(func) :
+    ;Forward to body.
+    (func:TLet|TLetVar|TLetTuple|TLetRec) :
+      compute-expected-arg-type(n, body(func), arg-index, arity)
+    ;Union all the branches together.
+    (func:TMatch) :
+      val branch-vars = Vector<TUVar>()
+      for b in branches(func) do :
+        val v = fresh-tuvar()
+        compute-expected-arg-type(/n(v), body(b), arg-index, arity)
+        add(branch-vars, v)
+      add-equation(EqualEqn(n, reduce(TOr, branch-vars)))
+    ;Special case.
+    (func:TFn) :
+      if length(args(func)) == arity :
+        val arg = args(func)[arg-index]
+        if inferred-arg?(arg) :
+          add-equation(EqualEqn(n, get-exp-type(arg)))
+        else :
+          val arg-type = a1(func)[arg-index] as Type
+          add-equation(EqualEqn(n, arg-type))
+    ;Typical case.
+    (func) :
+      add-equation(InferEqn(n, type!(func), ArgLoc(arity, arg-index)))
 
 ;Generate equations for the given method.
 defn gen-method (m:TDefmethod, thist:Maybe<Type>) -> TDefmethod :
