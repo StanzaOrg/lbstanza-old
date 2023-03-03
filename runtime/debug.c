@@ -94,6 +94,11 @@ enum {
 };
 static uint8_t run_mode = RUN_MODE_UNKNOWN;
 
+enum {
+  INVALID_THREAD_ID = -1,
+  INVALID_FRAME_ID = 0
+};
+
 static char* program_path;
 static pid_t program_pid;
 static pthread_mutex_t send_lock;
@@ -102,7 +107,7 @@ static const char* debug_adapter_path;
 static const uint64_t thread_id = 12345678;
 
 // Client IDE capabilities
-static bool client_supports_invalidated_event;
+// static bool client_supports_invalidated_event;
 
 static inline char* get_absolute_path(const char* s) {
   // Use GetFullPathName on Windows
@@ -1077,19 +1082,8 @@ static inline const char* stop_reason(const StopReason kind) {
   return names[kind];
 }
 
-static inline void send_invalidate_thread(void) {
-  if (client_supports_invalidated_event) {
-    JSBuilder builder;
-    JSBuilder_initialize_event(&builder, "invalidated");
-    JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
-    JSBuilder_send_and_destroy_event(&builder);
-  }
-}
-
 static void send_thread_stopped(StopReason reason, const char* description, uint64_t breakpoint) {
-  send_invalidate_thread();
-
-  run_mode = RUN_MODE_PAUSED;
+    run_mode = RUN_MODE_PAUSED;
 
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "stopped");
@@ -1098,8 +1092,10 @@ static void send_thread_stopped(StopReason reason, const char* description, uint
     JSBuilder_write_raw_string_field(&builder, "description", description);
   if (breakpoint) {
     JSBuilder_array_field_begin(&builder, "hitBreakpointIds");
-    JSBuilder_next(&builder);
-    JSBuilder_append_unsigned(&builder, breakpoint);
+    {
+      JSBuilder_next(&builder);
+      JSBuilder_append_unsigned(&builder, breakpoint);
+    }
     JSBuilder_array_field_end(&builder);
   }
   JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
@@ -1652,8 +1648,8 @@ static inline void define_capabilities(JSBuilder* builder) {
   #endif
 }
 static bool request_initialize(const JSObject* request) {
-  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  client_supports_invalidated_event = JSObject_get_bool_field(arguments, "supportsInvalidatedEvent", false);
+  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  // client_supports_invalidated_event = JSObject_get_bool_field(arguments, "supportsInvalidatedEvent", false);
 
   // TODO: initialize debugger here.
   JSBuilder builder;
@@ -2364,11 +2360,6 @@ static bool request_threads(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
-enum {
-  INVALID_THREAD_ID = -1,
-  INVALID_FRAME_ID = -1
-};
-
 #define DEFINE_STACK_FRAME_FORMAT(def)\
   def(0, hex)            \
   def(1, parameters)     \
@@ -2405,6 +2396,7 @@ typedef struct {
   int64_t column;       // 1-based, 0 denotes unknown
   uint64_t pc;
   uint64_t sp;
+  size_t scopes;        // Index in current environment, or 0 when unknown
 } StackTraceFrame;
 typedef struct {
   size_t length;
@@ -2438,6 +2430,115 @@ static inline StackTraceFrame* StackTrace_allocate(StackTrace* st) {
 }
 static StackTrace current_stack_trace;
 
+// Variable attributes (must be known to the debugger)
+enum {
+  VARIABLE_PUBLIC = 1,
+  VARIABLE_PRIVATE = 2,
+  VARIABLE_PROTECTED = 3,
+  VARIABLE_VISIBILITY_MASK = 3,
+  VARIABLE_CONSTANT = 1 << 2,
+  VARIABLE_KIND_LOCALS = 1 << 3,
+  VARIABLE_KIND_GLOBALS = 2 << 3,
+  VARIABLE_KIND_MASK = 3 << 3
+};
+static inline const char* variable_visibility(const unsigned variable_attributes) {
+  static const char* const names[] = {
+    NULL,
+    "public",
+    "private",
+    "protected"
+  };
+  return names[variable_attributes & VARIABLE_VISIBILITY_MASK];
+}
+
+typedef struct {
+  char* name;           // Owned by Variable
+  char* type;           // Owned by Variable
+  char* value;          // Owned by Variable
+  const void* ref;
+  size_t fields_count;
+  size_t fields_base;
+  uint8_t attributes;
+} Variable;
+static inline Variable* Variable_initialize(Variable* var, const void* ref, const char* name, size_t fields_count, uint8_t attributes) {
+  var->name = strdup(name);
+  var->type = NULL;
+  var->value = NULL;
+  var->ref = ref;
+  var->fields_count = fields_count;
+  var->fields_base = 0;
+  var->attributes = attributes;
+  return var;
+}
+static inline void Variable_destroy(const Variable* var) {
+  free(var->name);
+  free(var->type);
+  free(var->value);
+}
+static void JSBuilder_write_variable_fields_count(JSBuilder* builder, const Variable* var) {
+  JSBuilder_write_optional_unsigned_field(builder, "namedVariables", var->fields_count);
+}
+static inline void JSBuilder_write_variable(JSBuilder* builder, const Variable* var, const uint64_t var_id) {
+  JSBuilder_object_begin(builder);
+  {
+    // Variable with zero fields must have zero id.
+    JSBuilder_write_unsigned_field(builder, "variablesReference", var->fields_count ? var_id : 0);
+    JSBuilder_write_raw_string_field(builder, "name", var->name);
+    JSBuilder_write_optional_string_field(builder, "type", var->type);
+    JSBuilder_write_string_field(builder, "value", var->value);
+    JSBuilder_write_variable_fields_count(builder, var);
+
+    const unsigned attributes = var->attributes;
+    if (attributes) {
+      JSBuilder_object_field_begin(builder, "presentationHint");
+      {
+        if (attributes & VARIABLE_CONSTANT)
+          JSBuilder_write_raw_string_field(builder, "attributes", "constant");
+        JSBuilder_write_optional_raw_string_field(builder, "visibility", variable_visibility(attributes));
+      }
+      JSBuilder_object_field_end(builder);
+    }
+  }
+  JSBuilder_object_end(builder);
+}
+
+struct {
+  size_t length;
+  size_t capacity;
+  Variable* data;
+} current_env; // Belongs to the app thread
+
+static Variable* Environment_allocate(const void* ref, const char* name, size_t fields_count, uint8_t attributes) {
+  if (current_env.length == current_env.capacity) {
+    current_env.capacity <<= 1;
+    current_env.data = realloc(current_env.data, current_env.capacity * sizeof(Variable));
+    //TODO: handle possible OOM
+  }
+  return Variable_initialize(current_env.data + current_env.length++, ref, name, fields_count, attributes);
+}
+static inline Variable* Environment_get(uint64_t variable_id) {
+  assert(variable_id < current_env.length);
+  return current_env.data + variable_id;
+}
+static inline void Environment_initialize(void) {
+  current_env.length = 0;
+  current_env.capacity = 64;
+  current_env.data = malloc(current_env.capacity * sizeof(Variable));
+}
+static inline void Environment_destroy(void) {
+  // It is safe to destroy uninitialized Environment:
+  // by default all fields are zeroed
+  for (Variable *p = current_env.data, *limit = p + current_env.length; p < limit; p++)
+    Variable_destroy(p);
+  free(current_env.data);
+}
+static inline void Environment_reset(void) {
+  Environment_destroy();
+  Environment_initialize();
+  Environment_allocate(NULL, "Root scope", 2, 0);
+  StackTrace_reset(&current_stack_trace);
+}
+
 void append_stack_frame(uint64_t pc, uint64_t sp, const char* function_name,
                         const char* source_path, int64_t line, int64_t column) {
   StackTraceFrame* frame = StackTrace_allocate(&current_stack_trace);
@@ -2447,6 +2548,7 @@ void append_stack_frame(uint64_t pc, uint64_t sp, const char* function_name,
   frame->column = column;
   frame->pc = pc;
   frame->sp = sp;
+  frame->scopes = 0;
 }
 
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
@@ -2462,7 +2564,8 @@ typedef struct {
 } DelayedRequestStackTrace;
 static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
-  StackTrace_reset(&current_stack_trace);
+  Environment_reset();
+
   if (run_mode != RUN_MODE_TERMINATED && stack_trace_available) create_stack_trace(req->format);
   const int64_t total_frames = current_stack_trace.length;
 
@@ -2562,170 +2665,51 @@ static bool request_stackTrace(const JSObject* request) {
 //   }]
 // }
 
-// The debugger must be aware of the scope ids
-#define VARIABLE_SCOPES(def)\
-  def(LOCALS,     "Locals",     "locals"    )\
-  def(GLOBALS,    "Globals",    "globals"   )
-enum {
-  INITIAL_SCOPE,  // O.P: It looks like VSCode requires strictly positive scope id
-  #define DEF_SCOPE_ID(id, name, hint) SCOPE_ID_##id,
-    VARIABLE_SCOPES(DEF_SCOPE_ID)
-  #undef DEF_SCOPE_ID
-  NUMBER_OF_SCOPES
-};
-uint32_t number_of_variables_in_scope(const uint32_t scope_id, const uint64_t pc);
-
-// Varaiable attributes (must be knwn to the debugger)
-enum {
-  VARIABLE_PUBLIC = 1,
-  VARIABLE_PRIVATE = 2,
-  VARIABLE_PROTECTED = 3,
-  VARIABLE_VISIBILITY_MASK = 3,
-  VARIABLE_CONSTANT = 1 << 2
-};
-static inline const char* variable_visibility(const unsigned variable_attributes) {
-  static const char* const names[] = {
-    NULL,
-    "public",
-    "private",
-    "protected"
-  };
-  return names[variable_attributes & VARIABLE_VISIBILITY_MASK];
-}
-
-typedef struct {
-  char* name;           // Owned by Variable
-  char* type;           // Owned by Variable
-  char* value;          // Owned by Variable
-  const void* ref;
-  size_t fields_count;
-  size_t fields_base;
-  uint8_t attributes;
-} Variable;
-static inline Variable* Variable_initialize(Variable* var, const void* ref, const char* name, size_t fields_count) {
-  var->name = strdup(name);
-  var->type = NULL;
-  var->value = NULL;
-  var->ref = ref;
-  var->fields_count = fields_count;
-  var->fields_base = 0;
-  var->attributes = 0;
-  return var;
-}
-static inline void Variable_destroy(const Variable* var) {
-  free(var->name);
-  free(var->type);
-  free(var->value);
-}
-static void JSBuilder_write_variable_fields_count(JSBuilder* builder, const Variable* var) {
-  JSBuilder_write_optional_unsigned_field(builder, "namedVariables", var->fields_count);
-}
-static inline void JSBuilder_write_variable(JSBuilder* builder, const Variable* var, const uint64_t var_id) {
+static void JSBuilder_write_scope(JSBuilder* builder, const uint64_t scope_id, const char* hint) {
+  JSBuilder_next(builder);
   JSBuilder_object_begin(builder);
   {
-    // Variable with zero fields must have zero id.
-    JSBuilder_write_unsigned_field(builder, "variablesReference", var->fields_count ? var_id : 0);
+    JSBuilder_write_unsigned_field(builder, "variablesReference", scope_id);
+    const Variable* var = Environment_get(scope_id);
     JSBuilder_write_raw_string_field(builder, "name", var->name);
-    JSBuilder_write_optional_string_field(builder, "type", var->type);
-    JSBuilder_write_string_field(builder, "value", var->value);
     JSBuilder_write_variable_fields_count(builder, var);
-
-    const unsigned attributes = var->attributes;
-    if (attributes) {
-      JSBuilder_object_field_begin(builder, "presentationHint");
-      {
-        if (attributes & VARIABLE_CONSTANT)
-          JSBuilder_write_raw_string_field(builder, "attributes", "constant");
-        JSBuilder_write_optional_raw_string_field(builder, "visibility", variable_visibility(attributes));
-      }
-      JSBuilder_object_field_end(builder);
-    }
+    JSBuilder_write_raw_string_field(builder, "presentationHint", hint);
+    JSBuilder_write_bool_field(builder, "expensive", false);
   }
   JSBuilder_object_end(builder);
 }
 
-typedef struct {
-  size_t length;
-  size_t capacity;
-  Variable* data;
-} Environment;
-static inline void Environment_initialize(Environment* env) {
-  env->length = 0;
-  env->capacity = 64;
-  env->data = malloc(env->capacity * sizeof(Variable));
-}
-static void Environment_destroy(Environment* env) {
-  // It is safe to destroy uninitialized Environment:
-  // by default all fields are zeroed
-  for (Variable *p = env->data, *limit = p + env->length; p < limit; p++)
-    Variable_destroy(p);
-  free(env->data);
-}
-static inline void Environment_reset(Environment* env) {
-  Environment_destroy(env);
-  Environment_initialize(env);
-}
-static Variable* Environment_allocate(Environment* env, const void* ref, const char* name, size_t fields_count) {
-  if (env->length == env->capacity) {
-    env->capacity <<= 1;
-    env->data = realloc(env->data, env->capacity * sizeof(Variable));
-    //TODO: handle possible OOM
-  }
-  return Variable_initialize(env->data + env->length++, ref, name, fields_count);
-}
-
-static Environment current_frame_env; // Belongs to the app thread
-static int64_t current_frame_id = INVALID_FRAME_ID;
-static inline uint64_t current_pc(void) {
-  return current_frame_id != INVALID_FRAME_ID ? ((const StackTraceFrame*)current_frame_id)->pc : 0;
-}
-static inline uint64_t current_sp(void) {
-  return current_frame_id != INVALID_FRAME_ID ? ((const StackTraceFrame*)current_frame_id)->sp : 0;
-}
+uint32_t number_of_globals(void);
+uint32_t number_of_locals(uint64_t pc);
 
 typedef struct {
   DelayedRequest parent;
-  int64_t frame_id;
+  StackTraceFrame* frame;
 } DelayedRequestScopes;
 static void DelayedRequestScopes_handle(DelayedRequest* request) {
   const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
-  current_frame_id = req->frame_id;
-  Environment_reset(&current_frame_env);
-  Environment_allocate(&current_frame_env, NULL, "Root scope", NUMBER_OF_SCOPES);
+  StackTraceFrame* frame = req->frame;
+  if (!frame->scopes) {
+    frame->scopes = current_env.length;
+    Environment_allocate(frame, "Locals", number_of_locals(frame->pc), VARIABLE_KIND_LOCALS);
+    Environment_allocate(frame, "Globals", number_of_globals(), VARIABLE_KIND_GLOBALS);
+  }
+  const uint64_t scopes = frame->scopes;
 
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   {
     JSBuilder_array_field_begin(&builder, "scopes");
-    while (current_frame_env.length < NUMBER_OF_SCOPES) {
-      JSBuilder_next(&builder);
-      JSBuilder_object_begin(&builder);
-      {
-        static const struct {const char* name; const char* hint; } scope_attributes[] = {
-          #define DEF_SCOPE_ATTRIBUTES(id, name, hint) {name, hint},
-            VARIABLE_SCOPES(DEF_SCOPE_ATTRIBUTES)
-          #undef DEF_SCOPE_ATTRIBUTES
-        };
-        const size_t scope_id = current_frame_env.length;
-        const char* scope_name = scope_attributes[scope_id - 1].name;
-        const char* scope_hint = scope_attributes[scope_id - 1].hint;
-        Variable* var = Environment_allocate(&current_frame_env, (const void*)scope_id, scope_name,
-          number_of_variables_in_scope(scope_id, current_pc()));
-        JSBuilder_write_raw_string_field(&builder, "name", scope_name);
-        JSBuilder_write_raw_string_field(&builder, "presentationHint", scope_hint);
-        JSBuilder_write_unsigned_field(&builder, "variablesReference", scope_id);
-        JSBuilder_write_variable_fields_count(&builder, var);
-        JSBuilder_write_bool_field(&builder, "expensive", false);
-      }
-      JSBuilder_object_end(&builder);
+    {
+      JSBuilder_write_scope(&builder, scopes + 0, "locals");
+      JSBuilder_write_scope(&builder, scopes + 1, "globals");
     }
     JSBuilder_array_field_end(&builder);
   }
   JSBuilder_object_field_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
 }
-#undef VARIABLE_SCOPES
 
 static inline bool is_valid_stack_trace_frame_id(const uint64_t frame_id) {
   const uint64_t offset = frame_id - (uint64_t)current_stack_trace.data;
@@ -2741,7 +2725,7 @@ static inline DelayedRequest* DelayedRequestScopes_create(const JSObject* reques
   int64_t frame_id = JSObject_get_integer_field(arguments, "frameId", INVALID_FRAME_ID);
   if (frame_id != INVALID_FRAME_ID && !is_valid_stack_trace_frame_id(frame_id))
     frame_id = INVALID_FRAME_ID;
-  req->frame_id = frame_id;
+  req->frame = (StackTraceFrame*)frame_id;
   return (DelayedRequest*) req;
 }
 static bool request_scopes(const JSObject* request) {
@@ -2840,14 +2824,14 @@ static bool request_scopes(const JSObject* request) {
 // }
 void append_variable(const void* ref, const char* name, const char* type, const char* value,
                      uint64_t fields_count, uint8_t attributes) {
-  Variable* v = Environment_allocate(&current_frame_env, ref, name, fields_count);
+  Variable* v = Environment_allocate(ref, name, fields_count, attributes);
   v->type = strdup(type);
   v->value = strdup(value);
-  v->attributes = attributes;
   v->ref = ref;
 }
-void create_fields(const void* ref, const char* name, uint64_t fields_count, uint64_t hex,
-                   uint64_t pc, uint64_t sp);
+void create_globals(uint64_t hex);
+void create_locals(uint64_t pc, uint64_t sp, uint64_t hex);
+void create_fields(const void* ref, const char* name, uint64_t hex);
 
 typedef struct {
   DelayedRequest parent;
@@ -2858,19 +2842,31 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   const DelayedRequestVariables* req = (const DelayedRequestVariables*)request;
 
   const uint64_t variable_id = req->variable_id;
-  if (variable_id >= (uint64_t)current_frame_env.length) {  // Sanity check for variable id
+  if (variable_id >= (uint64_t)current_env.length) {  // Sanity check for variable id
     respond_to_delayed_request(request, "Invalid variable reference");
     return;
   }
 
-  Variable* var = current_frame_env.data + variable_id;
+  Variable* var = current_env.data + variable_id;
   size_t fields_base = var->fields_base;
   const uint64_t fields_count = var->fields_count;
   if (fields_count && !fields_base) {
-    fields_base = current_frame_env.length;
+    fields_base = current_env.length;
     var->fields_base = fields_base;
-    create_fields(var->ref, var->name, fields_count, req->hex, current_pc(), current_sp());
-    var = NULL; // Nuke 'var' as it could become invalid when 'env.data' expands.
+    const uint64_t hex = req->hex;
+    switch (var->attributes & VARIABLE_KIND_MASK) {
+      default:
+        create_fields(var->ref, var->name, hex);
+        break;
+      case VARIABLE_KIND_GLOBALS:
+        create_globals(hex);
+        break;
+      case VARIABLE_KIND_LOCALS:
+        const StackTraceFrame* frame = var->ref;
+        create_locals(frame->pc, frame->sp, hex);
+        break;
+    }
+    var = NULL; // Nuke 'var' as it could become invalid when 'current_env.data' expands.
   }
 
   JSBuilder builder;
@@ -2878,7 +2874,7 @@ static void DelayedRequestVariables_handle(DelayedRequest* request) {
   JSBuilder_object_field_begin(&builder, "body");
   {
     JSBuilder_array_field_begin(&builder, "variables");
-    const Variable* data = current_frame_env.data;
+    const Variable* data = current_env.data;
     for (uint64_t i = fields_base, limit = i + fields_count; i < limit; i++) {
       JSBuilder_next(&builder);
       JSBuilder_write_variable(&builder, data + i, i);
