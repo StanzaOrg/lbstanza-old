@@ -1,13 +1,15 @@
 defpackage stz/tl-to-el :
   import core
   import collections
+  import stz/types
+  import stz/type-utils
+  import stz/type-solver
   import stz/tl-ir
   import stz/el-ir
   import stz/dl-ir with:
     prefix(Child) => DL
   import stz/ids
   import stz/primitives
-  import stz/type-calculus
   import stz/tl-to-dl
   import stz/basic-ops
   import stz/namemap with :
@@ -15,6 +17,11 @@ defpackage stz/tl-to-el :
   import stz/algorithms
   import stz/timing-log-api
   import stz/visibility
+  import stz/tl-struct-table
+  import stz/type-hierarchy with:
+    prefix(Field) => TH
+  import stz/type-instfns
+  import stz/type-fargs
 
 ;============================================================
 ;====================== Timers ==============================
@@ -38,11 +45,14 @@ public defn to-el (p:TProg, transient-package?:True|False) -> Tuple<EPackage> :
       val struct-table = StructTable(packages(p), environment(p))
       to-tuple $ for package in packages(p) seq :
         within log-time(TL-TO-EL, suffix(name(package))) :
-          val compiled = compile(package, struct-table, namemap(p))
+          val compiled = compile(package, struct-table, namemap(p), hierarchy(p))
           val io = analyze-imports(compiled, export-table, transient-package?)
           sub-packageio(compiled, io)
 
-defn compile (p:TPackage, struct-table:StructTable, namemap:NameMap) :
+defn compile (p:TPackage,
+              struct-table:StructTable,
+              namemap:NameMap,
+              hier:TypeHierarchy) :
   val texps = Vector<ETExp>()
   defn emit (e:ETExp) : add(texps, e)
 
@@ -54,20 +64,17 @@ defn compile (p:TPackage, struct-table:StructTable, namemap:NameMap) :
         val parent = to-etype?(parent(c))
         val children = to-tuple(seq(n,children(c)))
         emit(EDefType(n(c), parent, children))
+        
       (c:TLDefType) :
-        val last-field-type = type(last(fields(c))) when not empty?(fields(c))
-        defn sfield (f:Field) : EDefField(mutable?(f), to-etype(type(f)))
-        val [base, items] = match(last-field-type) :
-          (t:RestT) :
-            val base = to-tuple(seq(sfield, but-last(fields(c))))
-            val items-field = last(fields(c))
-            val items = EDefField(mutable?(items-field), to-etype(type(t)))
-            [base, items]
-          (t) :
-            val base = to-tuple(seq(sfield, fields(c)))
-            [base, false]
+        defn conv-field (f:Field) -> EDefField :
+          EDefField(mutable?(f), to-etype(type(f)))
+        val [fs, lf] = split-rest-field(fields(c))
+        val base = map(conv-field, fs)
+        val items = match(lf:Field) :
+          conv-field(unwrap-rest(lf))
         val parent = to-etype?(parent(c))
         emit(EDefStruct(n(c), parent, base, items))
+        
       (c:TDef) :
         val etype = to-etype(type(c) as Type)
         emit(EDefGlobal(n(c), etype, false, false))
@@ -97,16 +104,18 @@ defn compile (p:TPackage, struct-table:StructTable, namemap:NameMap) :
           emit(EInit(body(compiler), false))
       (c:TDefn) :
         emit(EDefn(n(c), compile-function(c,struct-table,namemap), false))
+        
       (c:TDefmulti) :
         val targs* = to-tuple(cat(targs(c), cargs(c)))
-        val a1* = to-tuple(seq(to-etype, a1(c) as List<Type>))
+        val a1* = map(to-earg, a1(c))
         val a2* = to-etype(a2(c) as Type)
-        emit(EDefmulti(n(c), targs*, a1*, a2*, info(c)))
+        emit(EDefmulti(n(c), targs*, a1*, a2*, false, info(c)))
+        
       (c:TDefmethod) :
         val func = compile-function(c,struct-table,namemap)
-        val [multi, targs] = multi-args(multi(c))
-        val types = to-tuple(seq(to-etype, targs))
-        emit(EDefmethod(n(c), multi, types, func, false))
+        val [multi, capargs] = multi-args(multi(c))
+        val targs = to-tuple(cat(seq(ETVar,targs(c)), seq(to-etype,capargs)))
+        emit(EDefmethod(n(c), multi, targs, func, false, false))
       (c:TInit) :
         val compiler = Compiler(struct-table, namemap)
         compile(compiler, exp(c))
@@ -137,14 +146,14 @@ defn compile (p:TPackage, struct-table:StructTable, namemap:NameMap) :
         emit(EExternFn(n(c), exposed-lbl, func))
       (c:TLDefmethod) :
         val func = compile-function(c,struct-table,namemap)
-        val [multi, targs] = multi-args(multi(c))
-        val etargs = to-tuple(seq(to-etype, targs))
-        emit(EDefmethod(n(c), multi, etargs, func, true))
+        val [multi, capargs] = multi-args(multi(c))
+        val targs = to-tuple(cat(seq(ETVar,targs(c)), seq(to-etype,capargs)))
+        emit(EDefmethod(n(c), multi, targs, func, true, false))
       (c:TExtern) :
         emit(EExtern(n(c), lbl(c), to-etype(type(c))))
       (c:TLInit) :
         val compiler = Compiler(struct-table, namemap)
-        compile(compiler, comm(c), UnknownT(), false)
+        compile(compiler, comm(c), false)
         emit(EInit(body(compiler), true))
 
   ;Return compiled package
@@ -160,7 +169,8 @@ defn compile-function (e:TDefmethod, struct-table:StructTable, namemap:NameMap) 
   compile-function(targs(e), cargs(e), args(e), a1(e), a2(e), tail?(e), body(e), info(e), struct-table, namemap)
 
 defn compile-function (e:TFn, struct-table:StructTable, namemap:NameMap) :
-  compile-function([], [], args(e), a1(e), a2(e), tail?(e), body(e), info(e), struct-table, namemap)
+  val eargs = map(PositionalArg<Type|False>{false, _}, a1(e))
+  compile-function([], [], args(e), eargs, a2(e), tail?(e), body(e), info(e), struct-table, namemap)
 
 defn compile-function (e:TMulti, struct-table:StructTable, namemap:NameMap) :
   EMultifn(to-tuple(seq(compile-function{_, struct-table, namemap}, funcs(e))))
@@ -171,34 +181,34 @@ defn compile-function (e:TLDefn, struct-table:StructTable, namemap:NameMap) :
                    struct-table, namemap)
 
 defn compile-function (e:TLExternFn, struct-table:StructTable, namemap:NameMap) :
-  compile-function([], [], args(e), a1(e), a2(e), false, body(e), info(e), struct-table, namemap)
+  val a1-args = map(PositionalArg<LSType>{false, _}, a1(e))
+  compile-function([], [], args(e), a1-args, a2(e), false, body(e), info(e), struct-table, namemap)
 
 defn compile-function (e:TLDefmethod, struct-table:StructTable, namemap:NameMap) :
   compile-function(targs(e), cargs(e), args(e), a1(e), a2(e), tail?(e), body(e), info(e), struct-table, namemap)
 
 defn compile-function (targs:Seqable<Int>, cargs:Seqable<Int>, args:Seqable<Int>,
-                       a1:Seqable<False|Type>, a2:False|Type, tail?:True|False, fbody:TExp, info:False|FileInfo
+                       a1:Tuple<FArg<Type|False>>, a2:False|Type, tail?:True|False, fbody:TExp, info:False|FileInfo
                        struct-table:StructTable, namemap:NameMap) :
   val targs* = to-tuple(cat(targs, cargs))
   val args* = to-tuple(args)
-  val a1* = to-tuple(seq(to-etype{_ as Type}, a1))
+  val a1* = map(to-earg, a1)
   val a2* = to-etype(a2 as Type)
 
   val c = Compiler(struct-table, namemap)
   return(c, fbody, tail?)
   EFn(tail?, targs*, args*, a1*, a2*, body(c), info)
 
-defn compile-function (targs:Seqable<Int>, cargs:Seqable<Int>, args:Seqable<Int>,
-                       a1:Seqable<LSType>, a2:LSType, tail?:True|False, fbody:LSComm, info:False|FileInfo
+defn compile-function (targs:Tuple<Int>, cargs:Tuple<Int>, args:Tuple<Int>,
+                       a1:Tuple<FArg<LSType>>, a2:LSType, tail?:True|False, fbody:LSComm, info:False|FileInfo
                        struct-table:StructTable, namemap:NameMap) :
   val targs* = to-tuple(cat(targs, cargs))
-  val args* = to-tuple(args)
-  val a1* = to-tuple(seq(to-etype, a1))
+  val a1* = map(to-earg, a1)
   val a2* = to-etype(a2)
 
   val c = Compiler(struct-table, namemap)
-  compile(c, fbody, a2, tail?)
-  EFn(tail?, targs*, args*, a1*, a2*, body(c), info)
+  compile(c, fbody, tail?)
+  EFn(tail?, targs*, args, a1*, a2*, body(c), info)
 
 ;============================================================
 ;=============== Expression Compilation =====================
@@ -208,7 +218,7 @@ deftype Compiler
 defmulti compile (c:Compiler, e:TExp) -> EImm
 defmulti compile (c:Compiler, e:LSExp) -> EImm
 defmulti compile-upcast (c:Compiler, e:LSExp, t:LSType) -> EImm
-defmulti compile (c:Compiler, c:LSComm, ret-type:LSType, tail?:True|False) -> False
+defmulti compile (compiler:Compiler, c:LSComm, tail?:True|False) -> False
 defmulti return (c:Compiler, e:TExp, tail?:True|False) -> False
 defmulti body (c:Compiler) -> EBody
 defmulti emit (c:Compiler, l:ELocal) -> False
@@ -253,14 +263,15 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
       (e:TDo) :
         if tail? :
           ;Get types
-          val a1 = seq({type(ctxt(_) as CExp) as Type}, args(e))
-          val a2 = type(e) as Type
-          val ytypes = to-tuple(seq(to-etype, a1))
-          val xtype = to-etype(a2)
+          val a1 = map(expected{ctxt(type(_)) as ExpCtxt}, args(e))
+          val a2 = type!(e)
+          val e-a1 = map(to-etype, a1)
+          val e-a2 = to-etype(a2)
+          val e-targs = map(to-etype, targs(e))
           ;Make instruction
-          val func* = compile(func(e))
-          val args* = to-tuple(seq(compile,args(e)))
-          emit(ETCall(func*, args*, CallGuarded(ytypes, xtype), info(e)))
+          val func* = add-targs(compile(func(e)), e-targs)
+          val args* = map(compile{type(_)},args(e))
+          emit(ETCall(func*, args*, CallGuarded(e-a1, e-a2), info(e)))
         else :
           emit(EReturn(compile(e)))
       (e) :
@@ -284,8 +295,9 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
       (e:TNew) :
         val methods = to-tuple $ for m in methods(e) seq :
           val func = compile-function(m,struct-table,namemap)
-          val [multi, targs] = multi-args(multi(m))
-          EMethod(n(m), multi, to-tuple(seq(to-etype, targs)), thisn(m) as Int, func)
+          val [multi, capargs] = multi-args(multi(m))
+          val targs = to-tuple(cat(seq(ETVar,targs(m)), seq(to-etype,capargs)))
+          EMethod(n(m), multi, targs, thisn(m) as Int, func, false)
         val obj = fresh-id()
         emit(ELocalObj(obj, to-etype(class(e)), methods))
         val tmp = fresh-id()
@@ -302,19 +314,23 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
       (e:TSet) :
         emit(EStore(EVarLoc(n(ref(e))), compile(value(e)), info(e)))
         ELiteral(false)
+        
       (e:TDo) :
         ;Get types
-        val a1 = seq({type(ctxt(_) as CExp) as Type}, args(e))
-        val a2 = type(e) as Type
-        val ytypes = to-tuple(seq(to-etype, a1))
-        val xtype = to-etype(a2)
-        ;Make instruction
-        val func* = compile(func(e))
-        val args* = to-tuple(seq(compile,args(e)))
+        val a1 = map(expected{ctxt(type(_)) as ExpCtxt}, args(e))
+        val a2 = type!(e)
+        val e-a1 = map(to-etype, a1)
+        val e-a2 = to-etype(a2)
+        val e-targs = map(to-etype, targs(e))
+        ;Compile subexpressions.
+        val func* = add-targs(compile(func(e)), e-targs)
+        val args* = map(compile{type(_)},args(e))
+        ;Make instruction.
         val ret = fresh-id()
-        emit(ELocal(ret, xtype, false))
-        emit(ECall(EVarLoc(ret), func*, args*, CallGuarded(ytypes, xtype), info(e)))
+        emit(ELocal(ret, e-a2, false))
+        emit(ECall(EVarLoc(ret), func*, args*, CallGuarded(e-a1, e-a2), info(e)))
         EVar(ret,info(e))
+        
       (e:TPrim) :
         val ys = to-tuple(seq(compile, args(e)))
         val [op, type] = to-eop(op(e))
@@ -339,16 +355,16 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
           emit(ETuple(EVarLoc(ret), ys, info(e)))
         EVar(ret,info(e))
       (e:TMix) :
-        val exps* = select-all(sel(e) as SSel, exps(e))
-        if length(exps*) == 1 :
-          compile(head(exps*))
-        else :
-          val ys = seq({compile(_) as EVar|ECurry}, exps*)
-          EMix(to-tuple(ys))
-      (e:TCurry) :
-        val types = cat(targs(e), cargs(e) as List<Type>)
-        val targs = to-tuple(seq(to-etype, types))
-        ECurry(EVar(n(ref(e)), info(e), name?(n(ref(e)))), targs)
+        val funcs = for f in funcs(inst(e) as InstFns) map :
+          EInstFn(n(f),
+                  name?(n(f)),
+                  info(e),
+                  pattern(f),
+                  map(to-etype,capvars(f)),
+                  map(to-etype,a1(type(f))),
+                  to-etype(a2(type(f))))
+        if length(funcs) == 1 : funcs[0]
+        else : EMix(funcs)
 
   defn compile-match (f:TExp -> False, e:TMatch, end?:True|False) -> False :
     val ebranches = to-tuple $
@@ -422,7 +438,7 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
         emit(EDef(EVarLoc(tmp), compile(e), info(e)))
         EVarLoc(tmp)
 
-  defn compile (c:LSComm, ret-type:LSType, tail?:True|False) -> False :
+  defn compile (c:LSComm, tail?:True|False) -> False :
     val block-args = IntTable<[Tuple<Int>, Tuple<LSType>]>()
     let loop (c:LSComm = c) :
       match(c) :
@@ -467,20 +483,23 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
             else : std-return()
           where :
             defn std-return () :
-              emit(EReturn(compile-upcast(exp(c), ret-type)))
+              emit(EReturn(compile-upcast(exp(c))))
             defn tail-call (e:LSDo) :
-              ;Get types
-              val ft = type(func(e)) as FnT
-              val [a1, a2] = fn-types(args(e), ft)
-              val xtype = to-etype(a2)
-              val ytypes = to-tuple(seq(to-etype, a1))
+              ;Get types.
+              val a1 = map(expected{ctxt(type(_)) as LSExpCtxt}, args(e))
+              val a2 = type!(e)
+              val e-a1 = map(to-etype, a1)
+              val e-a2 = to-etype(a2)
 
               ;Sanity check
+              val ret-type = expected(ctxt(e) as LSExpCtxt)
               if primitive-size(a2) != primitive-size(ret-type) :
                 fatal("Tail call return type (%_) does not match declared return type (%_)!" % [a2, ret-type])
 
-              ;Compile arguments, and function
-              val ys = compile-upcast(args(e), a1)
+              ;Compile arguments.
+              val args* = map(compile-upcast{type(_)}, args(e))
+
+              ;Compile function.
               match(deref-all(func(e))) :
                 (f*:LSDeref) :
                   match(compile-loc(f*)) :
@@ -489,9 +508,10 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
                 (f*:LSExp) : call-stanza(compile(f*))
               where :
                 defn call-stanza (f:EImm) :
-                  emit(ETCall(f, ys, CallGuarded(ytypes,xtype), info(e)))
+                  emit(ETCall(f, args*, CallGuarded(e-a1,e-a2), info(e)))
                 defn call-ptr (f:EImm) :
-                  emit(ETCall(f, ys, CallPtr(), info(e)))
+                  emit(ETCall(f, args*, CallPtr(), info(e)))
+                  
         (c:LSDef) :
           val type = type(c) as LSType
           emit(ELocal(n(c), to-etype(type), false))
@@ -543,13 +563,13 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
       (e:LSVar) :
         EVar(n(e), info(e), name?(n(e)))
       (e:LSNew) :
-        val ys = compile-upcast(args(e), field-types(struct-table, n(e)))
+        val ys = map(compile-upcast, args(e))
         if array?(struct-table, n(e)) :
           to-local(EArray{_, n(e), ys, info(e)}, EOf(n(e)))
         else :
           to-local(EObject{_, n(e), ys, info(e)}, EOf(n(e)))
       (e:LSStruct) :
-        val ys = compile-upcast(args(e), field-types(struct-table, n(e)))
+        val ys = map(compile-upcast, args(e))
         to-local(EStruct{_, n(e), ys}, EStructT(n(e)))
       (e:LSAddr) :
         val loc = compile-loc(exp(e))
@@ -559,14 +579,17 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
         val loc = compile-loc(e)
         to-local(ELoad{_, etype, loc}, etype)
       (e:LSDo) :
-        ;Get types
-        val ft = type(func(e)) as FnT
-        val [a1, a2] = fn-types(args(e), ft)
-        val xtype = to-etype(a2)
-        val ytypes = to-tuple(seq(to-etype, a1))
+        ;Get types.
+        val a1 = map(expected{ctxt(type(_)) as LSExpCtxt}, args(e))
+        val a2 = type!(e)
+        val e-a1 = map(to-etype, a1)
+        val e-a2 = to-etype(a2)
+        val e-targs = map(to-etype, targs(e))
 
-        ;Compile arguments, and function
-        val ys = compile-upcast(args(e), a1)
+        ;Compile arguments.
+        val ys = map(compile-upcast{type(_)}, args(e))
+
+        ;Compile function.
         match(deref-all(func(e))) :
           (f*:LSDeref) :
             match(compile-loc(f*)) :
@@ -575,32 +598,44 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
           (f*:LSExp) : call-stanza(compile(f*))
         where :
           defn call-stanza (f:EImm) :
-            to-local(ECall{_, f, ys, CallGuarded(ytypes, xtype), info(e)}, xtype)
+            to-local(ECall{_, add-targs(f, e-targs), ys, CallGuarded(e-a1, e-a2), info(e)}, e-a2)
           defn call-ptr (f:EImm) :
-            to-local(ECall{_, f, ys, CallPtr(), info(e)}, xtype)
+            to-local(ECall{_, add-targs(f, e-targs), ys, CallPtr(), info(e)}, e-a2)
+            
       (e:LSCallC) :
-        ;Get types
-        val ft = type(func(e)) as FnT
-        val [a1, a2] = fn-types(args(e), ft)
-        val xtype = to-etype(a2)
-        val ytypes = to-tuple(seq(to-etype, a1))
+        ;Get types.
+        val a1 = map(expected{ctxt(type(_)) as LSExpCtxt}, args(e))
+        val a2 = type!(e)
+        val e-a1 = map(to-etype, a1)
+        val e-a2 = to-etype(a2)
 
-        ;Compile arguments, and function
-        val ys = compile-upcast(args(e), a1)
+        ;Compile arguments.
+        val ys = map(compile-upcast{type(_)}, args(e))
+
+        ;Compile function.
         val f* = match(deref-all(func(e))) :
           (f:LSDeref) : y(compile-loc(f) as EDeptr)
           (f:LSExp) : compile(f)
-        to-local(ECall{_, f*, ys, CallC(), info(e)}, xtype)
+        to-local(ECall{_, f*, ys, CallC(), info(e)}, e-a2)
+        
       (e:LSSizeof) :
         ESizeof(to-etype(targ(e)))
+        
       (e:LSTagof) :
         ETagof(n(e))
+        
       (e:LSCast) :
         val et = type(exp(e)) as LSType
         val xtype = to-etype(targ(e))
         val result = compile(exp(e))
-        if conv?(e) : to-local(EConv{_, result}, xtype)
-        else : to-local(EInterpret{_, result}, xtype)
+        to-local(EInterpret{_, result}, xtype)
+
+      (e:LSConv) :
+        val et = type(exp(e)) as LSType
+        val xtype = to-etype(targ(e))
+        val result = compile(exp(e))
+        to-local(EConv{_, result}, xtype)
+        
       (e:LSLiteral) :
         ELSLiteral(value(e))
       (e:LSAnd) :
@@ -634,16 +669,16 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
       (e:LSLetExp) :
         fatal("Deprecated")
       (e:LSMix) :
-        val exps* = select-all(sel(e) as SSel, exps(e))
-        if length(exps*) == 1 :
-          compile(head(exps*))
-        else :
-          val ys = seq({compile(_) as EVar|ECurry}, exps*)
-          EMix(to-tuple(ys))
-      (e:LSCurry) :
-        val types = cat(targs(e), cargs(e)) as Seq<Type>
-        val etypes = to-tuple(seq(to-etype, types))
-        ECurry(EVar(n(ref(e)), info(e), name?(n(ref(e)))), etypes)
+        val funcs = for f in funcs(inst(e) as LSInstFns) map :
+          EInstFn(n(f),
+                  name?(n(f)),
+                  info(e),
+                  pattern(f),
+                  map(to-etype,capvars(f)),
+                  map(to-etype,a(type(f))),
+                  to-etype(b(type(f))))
+        if length(funcs) == 1 : funcs[0]
+        else : EMix(funcs)
       (e:LSFn) :
         compile(ref(e))
       (e:LSPrim) :
@@ -841,20 +876,31 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
   defn compile? (e:TExp) : compile(e)
   defn compile? (e:False) : false
 
-  ;Compile an expression, upcasting if necessary to the given type
-  defn compile-upcast (e:LSExp, t:LSType) :
-    ;Expression type
-    val et = type(e) as LSType
-    ;Target type
-    val tt = match(t, et) :
-      (t:UnknownT, et:ByteT) : IntT()
-      (t:UnknownT, et:FloatT) : DoubleT()
-      (t, et) : t
-    ;Upcast expression
+  ;Compile an expression, upcasting if necessary to its expected type.
+  defn compile-upcast (e:LSExp) -> EImm :
+    val required-type = expected(ctxt(e) as LSExpCtxt)
+    compile-upcast(e, required-type)
+
+  ;Compile an expression, upcasting if necessary to the given target type.
+  defn compile-upcast (e:LSExp, desired-type:LSType) -> EImm :
+    ;Get the actual and expected type.
+    val actual-type = type!(e)
+    ;Compute the target type: the target type differs
+    ;from the required type when the required type is unknown, which happens
+    ;in the case of calling vararg functions.
+    val target-type = match(desired-type, actual-type) :
+      (dt:UnknownT, at:ByteT) : IntT()
+      (dt:UnknownT, at:FloatT) : DoubleT()
+      (dt, at) : dt      
+    ;Compile the expression.
     val result = compile(e)
-    if implicit-upcast?(et,tt) :
-      to-local(EConv{_, result}, to-etype(tt))
-    else : result
+    ;Upcast the expression if necessary.
+    if implicit-upcast?(actual-type, target-type) as True|False :
+      within v = to-local(to-etype(target-type)) :
+        EConv(v, result)
+    else :
+      result    
+
   ;Compile an expression, upcasting the result to a long.
   defn compile-long (e:LSExp) :
     compile-upcast(e, LongT())
@@ -871,8 +917,8 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
       compile(e)
     defmethod compile-upcast (this, e:LSExp, t:LSType) :
       compile-upcast(e,t)
-    defmethod compile (this, c:LSComm, ret-type:LSType, tail?:True|False) :
-      compile(c, ret-type, tail?)
+    defmethod compile (this, c:LSComm, tail?:True|False) :
+      compile(c, tail?)
     defmethod body (this) :
       EBody(to-tuple(locals),
             to-tuple(localtypes),
@@ -885,6 +931,21 @@ defn Compiler (struct-table:StructTable, namemap:NameMap) :
       emit(l)
     defmethod emit (this, l:EIns) :
       emit(l)
+
+;Helper: Add type arguments to the given function immediate.
+defn add-targs (f:EImm, targs:Tuple<EType>) -> EImm :
+  if empty?(targs) :
+    f
+  else :
+    match(f) :
+      (f:EMix) :
+        val new-funcs = map(add-targs{_, targs}, funcs(f)) as Tuple<EInstFn>
+        EMix(new-funcs)
+      (f:EInstFn) :
+        val new-targs = to-tuple(cat(targs, capvars(f)))
+        sub-capvars(f, new-targs)        
+      (f) :
+        fatal("Invalid function call with type arguments: %_" % [f])
 
 ;============================================================
 ;==================== Primitives ============================
@@ -955,76 +1016,15 @@ defn to-etype (t:Type) :
     (t:TVar) : ETVar(n(t))
     (t:TArrow) : EOf(env-id(CORE-FN-ID))
     (t:TGradual) : ETop()
+    (t:TTop) : ETop()
     (t:TBot) : EBot()
+
+defn to-earg (a:FArg<Type|LSType|False>) -> FArg<EType> :
+  map(to-etype, a as FArg<Type|LSType>)
 
 defn to-etype? (t:False) : false
 defn to-etype? (t:LSType) : to-etype(t)
 defn to-etype? (t:Type) : to-etype(t)
-
-;============================================================
-;==================== StructTable ===========================
-;============================================================
-
-deftype StructTable
-defmulti field-index (st:StructTable, n:Int, name:Symbol) -> Int
-defmulti field-types (st:StructTable, n:Int) -> Seqable<LSType>
-defmulti array? (st:StructTable, n:Int) -> True|False
-
-defn StructTable (pkgs:Seqable<TPackage>, environment:Tuple<Export>) :
-  ;Table for holding struct and field information
-  val struct-table = IntTable<StructEntry>()
-  val field-table = HashTable<[Int,Symbol],Int>()
-
-  ;Find all TLDefType expressions, and add to table
-  val env-deftypes = for e in environment seq? :
-      match(rec(e)) :
-        (r:StructRec) : One(to-deftype(r))
-        (r) : None()
-  val tldeftypes = filter-by<TLDefType>(cat(
-                     seq-cat(comms, pkgs)
-                     env-deftypes))
-  for c in tldeftypes do :
-    categorize-type() where :
-      defn* categorize-type () :
-        if empty?(fields(c)) :
-          object-struct(fields(c))
-        else :
-          val lf = last(fields(c))
-          match(type(lf)) :
-            (t:RestT) : array-struct(but-last(fields(c)), lf)
-            (t:LSType) : object-struct(fields(c))
-
-      defn* object-struct (fields:List<Field>) :
-        val base-types = to-tuple(seq(type, fields))
-        struct-table[n(c)] = StructEntry(base-types, false)
-        for (f in fields, i in 0 to false) do :
-          field-table[field-key(f)] = i
-
-      defn* array-struct (fields:List<Field>, rfield:Field) :
-        val base-types = to-tuple(seq(type, fields))
-        val item-type = type(rfield)
-        struct-table[n(c)] = StructEntry(base-types, item-type)
-        for (f in fields, i in 0 to false) do :
-          field-table[field-key(f)] = i
-        field-table[field-key(rfield)] = length(base-types)
-
-      defn field-key (f:Field) :
-        [n(c), name(f)]
-
-  new StructTable :
-    defmethod field-index (this, n:Int, name:Symbol) :
-      field-table[[n, name]]
-    defmethod field-types (this, n:Int) :
-      val e = struct-table[n]
-      match(item-type(e)) :
-        (t:LSType) : cat(base-types(e), repeat(t))
-        (t:False) : base-types(e)
-    defmethod array? (this, n:Int) :
-      item-type(struct-table[n]) is LSType
-
-defstruct StructEntry :
-  base-types: Tuple<LSType>
-  item-type: LSType|False
 
 ;============================================================
 ;==================== Import Analysis =======================
@@ -1069,6 +1069,7 @@ defn scan-usages (use:Int -> ?, x:ELItem) :
       ;Immediates and Locations
       (e:EVar|EVarLoc) : use(n(e))
       (e:ETagof) : use(n(e))
+      (e:EInstFn) : use(n(e))
       ;Instructions
       (e:EField) : use(n(e))
       (e:ENew) : use(n(e))
@@ -1216,11 +1217,14 @@ defn analyze-imports (p:EPackage, export-table:ExportTable, transient-package?:T
 ;===================== Utilities ============================
 ;============================================================
 
-defn multi-args (e:TExp) -> [Int, List<Type>] :
-  match(e) :
-    (e:TRef) : [n(e), List()]
-    (e:TCurry) : [n(ref(e)), append(targs(e), cargs(e)) as List<Type>]
-    (e:TMix) : multi-args(select-1(sel(e) as SSel, exps(e)))
+;Assumes 'e' is a well-formed expression in a multi position.
+;Returns [n, capargs], the identifier of the multi, and the
+;captured types.
+defn multi-args (e:TExp) -> [Int, Tuple<Type>] :
+  val m = e as TMix
+  val fs = funcs(inst(m) as InstFns)
+  val f = fs[0]
+  [n(f), capvars(f)]
 
 defn select-1<?T> (ss:SSel, xs:List<?T>) -> T :
   for (x in xs, s in sels(ss)) find! :
@@ -1231,29 +1235,23 @@ defn select-all<?T> (ss:SSel, xs:List<?T>) -> List<T> :
   for (x in xs, s in sels(ss)) filter :
     s is-not False
 
-defn* deref-all (e:LSExp) :
+defn* deref-all (e:LSExp) -> LSExp :
   match(type(e)) :
     (et:PtrT) :
-      deref-all(LSDeref(e, type(et), false, false, info(e)))
+      deref-all(LSDeref(info(e), type(et), false, e))
     (et:RefT) :
       val t* = match(type(et)) :
-        (t:TOf) : StructT(n(t), type(t))
-        (t:TArrow) :
-          val args = types(a(t) as TTuple)
-          FnT(map(RefT,args), false, RefT(b(t)))
-      LSDeref(e, t*, false, false, info(e))
+        (t:TOf) : StructT(n(t), args(t))
+        (t:TArrow) : FnT(map(RefT,a1(t)), false, RefT(a2(t)))
+      LSDeref(info(e), t*, false, e)
     (et) :
       e
 
-defn fn-types (args:List<LSExp>, t:FnT) -> [Tuple<LSType>, LSType] :
-  defn ex (ts:List<LSType>, r:False|LSType) :
-    match(r:LSType) : cat(ts, repeat(r))
-    else : ts
-  val a* = take-n(length(args), ex(a(t), r(t)))
-  [to-tuple(a*), b(t)]
-
-defn max-cast (x:LSType, y:LSType) :
-  y when implicit-upcast?(x, y) else x
+;Assumes either x upcasts to y, or vice versa.
+;Returns the wider of the two types.
+defn max-cast (x:LSType, y:LSType) -> LSType :
+  val x-to-y? = implicit-upcast?(x, y) as True|False
+  y when x-to-y? else x
 
 defn max-cast (xs:Seqable<LSType>) :
   reduce(max-cast, xs)

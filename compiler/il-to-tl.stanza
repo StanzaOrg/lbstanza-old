@@ -1,0 +1,1170 @@
+defpackage stz/il-to-tl :
+  import core
+  import collections
+  import stz/il-ir
+  import stz/dl-ir with:
+    prefix(Child) => DL
+  import stz/tl-ir
+  import stz/type-fargs
+  import stz/types
+  import stz/namemap
+  import stz/ids
+  import stz/primitives
+  import stz/type-variance
+  import stz/type-hierarchy with:
+    prefix(Field) => H
+  import stz/tl-to-dl
+  import stz/type-formatter
+  import stz/type-errors
+  import stz/algorithms
+  import stz/type-utils
+
+;============================================================
+;===================== Driver ===============================
+;============================================================
+
+;Convert all IPackages to TL-IR.
+public defn to-tl (ipackages:Tuple<IPackage>,
+                   exports:Tuple<Export>) -> TProg|TypeErrors :
+
+  ;Create consolidated namemap.
+  val namemap = NameMap(seq(namemap, ipackages),
+                        exports)
+
+  ;Use the consolidated namemap.
+  let-var CURRENT-NAMEMAP = namemap :
+    within set-id-env(TypeIDEnv(namemap)) :
+
+      ;Collect type errors.
+      val errors = Vector<TypeError>()
+      within collect-type-errors(errors) :
+
+        ;Compute the type arities.
+        within with-type-arity-table(ipackages, exports) :
+
+          ;Translate packages.
+          val tpackages = map(to-tpackage, ipackages)
+
+          ;Compute the type hierarchy.
+          val hier = compute-type-hierarchy(tpackages, exports)
+
+          ;Check that hierarchy is valid.
+          check-valid-hierarchy(hier)
+
+          ;Return bundled packages and consolidated namemap, if
+          ;the program has no errors.
+          if empty?(errors) :
+            TProg(hier, tpackages, exports, namemap)
+          else :
+            TypeErrors(to-tuple(errors))
+
+;============================================================
+;================= Namemap Consolidation ====================
+;============================================================
+
+;Create a single NameMap containing all the given namemaps,
+;and exports.
+defn NameMap (nms:Seqable<NameMap>, exports:Tuple<Export>) -> NameMap :
+  val namemap = NameMap()
+  for nm in nms do :
+    do(add{namemap, _}, nm)
+  for e in exports do :
+    add(namemap, VEntry(e))
+  namemap
+
+;Extract DL identifier environment from NameMap.
+;Used for to-deftype function.
+defn TypeIDEnv (namemap:NameMap) -> IDEnv :
+  val table = to-hashtable<TypeId,Int> $
+    for e in toplevel(namemap) seq? :
+      if type(e) is TypeE|LTypeE :
+        One(TypeId(package(e), name(e)) => n(e))
+      else :
+        None()
+  new IDEnv :
+    defmethod get (this, id:TypeId) : table[id]
+
+;============================================================
+;=================== Type Arity Table =======================
+;============================================================
+
+;A table holding the arities of all types.
+var TYPE-ARITY-TABLE:IntTable<Int>|False = false
+
+;Compute the type arities and then call body.
+defn with-type-arity-table<?T> (body:() -> ?T,
+                                ipackages:Tuple<IPackage>
+                                environment:Tuple<Export>) -> T :
+  ;Compute the arity table.
+  val arity-table = IntTable<Int>()
+
+  ;Add arities from definitions in ipackages.
+  for exp in seq-cat(exps, ipackages) do :
+    for exp in top-level-exps(exp) do :
+      match(exp) :
+        (e:IDefType) : arity-table[n!(class(e))] = length(args(e))
+        (e:ILSDefType) : arity-table[n!(name(e))] = length(args(e))
+        (e) : false
+
+  ;Add arities from definitions in exports.
+  val type-recs = filter-by<StructRec|TypeRec>(seq(rec,environment))
+  for r in type-recs do :
+    val n = env-id(id(r))
+    arity-table[n] = ntargs(r)
+
+  ;Set the arities, and then execute the body.
+  let-var TYPE-ARITY-TABLE = arity-table :
+    body()
+
+;Retrieve the type arity of the given class.
+defn type-arity (n:Int) -> Int :
+  match(TYPE-ARITY-TABLE) :
+    (table:IntTable<Int>) : table[n]
+    (f:False) : fatal("No active type arity table.")
+
+;Return a tuple of TGradual corresponding to the
+;number of type args for the given class.
+defn gradual-targs (n:Int) -> Tuple<TGradual> :
+  to-tuple $ for i in 0 to type-arity(n) seq :
+    TGradual()
+
+;============================================================
+;=================== Error Collection =======================
+;============================================================
+
+;A vector holding all detected type errors.
+var ERRORS:Vector<TypeError>|False = false
+
+;Execute the body while collecting type errors.
+defn collect-type-errors<?T> (body:() -> ?T, errors:Vector<TypeError>) :
+  let-var ERRORS = errors :
+    body()
+
+;Add a new type error.
+defn add-type-error (e:TypeError) -> False :
+  match(ERRORS) :
+    (es:Vector<TypeError>) : add(es,e)
+    (f:False) : fatal("No active error list.")
+
+;============================================================
+;================= Conversion Functions =====================
+;============================================================
+
+;Convert an IPackage to a TPackage.
+defn to-tpackage (ipackage:IPackage) -> TPackage :
+  val tcomms = Vector<TComm>()
+  for e in exps(ipackage) do :
+    within comm = to-tcomm(e) :
+      add(tcomms, comm)
+  TPackage(to-packageio(ipackage), to-tuple(tcomms))
+
+;Create a blank PackageIO.
+;The imported/exported entries will be populated
+;after type inference.
+defn to-packageio (ipackage:IPackage) -> PackageIO :
+  val imports = to-tuple(seq(package, imports(ipackage)))
+  val doc? = match(documentation?(ipackage)) :
+    (d:IDoc) : value(string(d) as ILiteral) as String
+    (f:False) : false
+  PackageIO(name(ipackage), imports, [], [], doc?)
+
+;============================================================
+;=============== Conversion Functions =======================
+;============================================================
+
+;Convert an expression into multiple TComms.
+;Namemap is required for retrieving labels of externs.
+defn to-tcomm (return:TComm -> ?,
+               e:IExp) -> False :
+  match(e) :
+    ;Iteratively scan through each begin.
+    (e:IBegin) :
+      for e in exps(e) do :
+        to-tcomm(return, e)
+    ;Discard visibility. Already used during resolution.
+    (e:IVisibility) :
+      to-tcomm(return, exp(e))
+    ;Create a TDefType.
+    (e:IDefType) :
+      return $ TDefType(
+        info(e)
+        n!(class(e))
+        ns!(args(e))
+        to-type(parent(e))
+        to-tuple(seq(to-child{_ as IDefChild}, children(e))))
+    ;Destructure any nested tuples in IDef.
+    (e:IDef) :
+      destructure-def(return, e)
+    ;Create a TDefVar.
+    (e:IDefVar) :
+      return $ TDefVar(
+        info(e),
+        n!(name(e)),
+        to-type(type(e)),
+        to-exp(value(e)) when value(e) is-not INone)
+    ;Create a TDefn.
+    (e:IDefn) :
+      val [targs, cargs] = split-targs(targs(e))
+      val tbody = to-exp(body(e))
+      val [args, fargs] = to-fargs(args(e), a1(e))
+      check-capture-positions(fargs)
+      val [new-args, new-body] = destructure-args(args, tbody)
+      return $ TDefn(
+        info(e),
+        tail?(e),
+        n!(name(e)),
+        targs, cargs,
+        fargs,
+        to-type(a2(e)),
+        new-args
+        new-body)
+    ;Create a TDefmulti
+    (e:IDefmulti) :
+      val [targs, cargs] = split-targs(targs(e))
+      val [args, fargs] = to-fargs(args(e), a1(e))
+      check-capture-positions(fargs)
+      return $ TDefmulti(
+        info(e),
+        n!(name(e)),
+        targs, cargs,
+        fargs,
+        to-type(a2(e)))
+    ;Create a TDefmethod
+    (e:IDefmethod) :
+      val [targs, cargs] = split-targs(targs(e))
+      val tbody = to-exp(body(e))
+      val [args, fargs] = to-fargs(args(e), a1(e))
+      check-capture-positions(fargs)
+      val [new-args, new-body] = destructure-args(args, tbody)
+      return $ TDefmethod(
+        info(e),
+        tail?(e),
+        fresh-id(),
+        to-exp(multi(e)),
+        thisn(e),
+        targs,
+        cargs,
+        fargs,
+        to-type(a2(e)),
+        new-args,
+        new-body)
+    ;HiStanza expression.
+    (e:IFn|IMulti|IBegin|IMatch|INew|
+       VarN|ICast|IUpCast|ISet|IDo|IPrim|ILiteral|ITuple|ILet|Mix) :
+      return $ TInit(info(e), to-exp(e))
+    ;LoStanza definition
+    (e:ILSDef) :
+      return $ TLDef(
+        info(e),
+        n!(name(e)),
+        to-lstype!(type(e)),
+        to-lsexp(exp(e)))
+    ;LoStanza variable
+    (e:ILSDefVar) :
+      return $ TLDefVar(
+        info(e),
+        n!(name(e)),
+        to-lstype!(type(e)),
+        to-lsexp(exp(e)) when exp(e) is-not INone)
+    ;LoStanza type definition.
+    (e:ILSDefType) :
+      ;Convert all the fields, including the RField at
+      ;the end.
+      val field-list = Vector<Field>()
+      for f in fields(e) do :
+        add(field-list, to-field(f as ILSDefField))
+      if rfield(e) is-not INone :
+        add(field-list, to-rfield(rfield(e) as ILSDefField))
+
+      return $ TLDefType(
+        info(e),
+        n!(name(e)),
+        ns!(args(e)),
+        to-type(parent(e)),
+        to-tuple(field-list))
+    ;Extern definition.
+    (e:ILSExtern) :
+      val n = n!(name(e))
+      return $ TExtern(
+        info(e),
+        n,
+        to-lstype!(type(e)),
+        get-defined-name(n))
+    ;LoStanza function.
+    (e:ILSDefn) :
+      val [targs, cargs] = split-targs(targs(e))
+      val [args, fargs] = to-lsfargs(args(e), a1(e))
+      check-capture-positions(fargs)
+      return $ TLDefn(
+        info(e),
+        tail?(e),
+        n!(name(e)),
+        targs,
+        cargs,
+        fargs,
+        to-lstype!(a2(e)),
+        ns!(args),
+        to-lscomm(body(e)))
+    ;LoStanza extern function.
+    (e:ILSExternFn) :
+      val n = n!(name(e))
+      return $ TLExternFn(
+        info(e),
+        n,
+        to-lstypes!(a1(e)),
+        to-lstype!(a2(e)),
+        ns!(args(e)),
+        to-lscomm(body(e)),
+        get-defined-name(n))
+    ;LoStanza method.
+    (e:ILSDefmethod) :
+      val [targs, cargs] = split-targs(targs(e))
+      val [args, fargs] = to-lsfargs(args(e), a1(e))
+      check-capture-positions(fargs)
+      return $ TLDefmethod(
+        info(e),
+        tail?(e),
+        fresh-id(),
+        to-exp(multi(e)),
+        targs,
+        cargs,
+        fargs,
+        to-lstype!(a2(e)),
+        ns!(args),
+        to-lscomm(body(e)))
+    ;LoStanza commands.
+    (e:ILSSet|ILSLabels|ILSLet|
+       ILSIf|ILSMatch|
+       ILSDo|ILSPrim|ILSCallC) :
+      return $ TLInit(
+        info(e)
+        to-lscomm(e))
+    ;Documentation
+    (e:IDoc) :
+      val str = value(string(e) as ILiteral) as String
+      return $ TDoc(info(e), str)
+    ;Errors.
+    (e) :
+      fatal("%_ is not a valid top-level command." % [object-type(e)])
+
+;Helper: Create a child specifier.
+defn to-child (e:IDefChild) -> Child :
+  val arg-ns = ns!(args(e))
+  ensure-correct-tarity(info(e), n!(name(e)), map(TVar,arg-ns))
+  Child(
+    n!(name(e)),
+    arg-ns,
+    to-type!(parent(e)))
+
+;Create a Type.
+;Returns false if e is INone.
+defn to-type (e:IExp) -> Type|False :
+  match(e) :
+    (e:IOf) :
+      val n = n!(class(e))
+      val targs = to-types!(args(e))
+      ensure-correct-tarity(info(e), n, targs)
+      TOf(n, targs)
+    (e:ITuple) : TTuple(to-types!(exps(e)))
+    (e:IAnd) : TAnd(to-type!(a(e)), to-type!(b(e)))
+    (e:IOr) : TOr(to-type!(a(e)), to-type!(b(e)))
+    (e:IArrow) : TArrow(to-types!(a1(e)), to-type!(a2(e)))
+    (e:ICap) : TCap(n!(name(e)), false)
+    (e:IGradual) : TGradual()
+    (e:IVoid) : TBot()
+    (e:VarN) : TVar(n(e))
+    (e:Raw) :
+      val n = n!(class(e))
+      TOf(n, gradual-targs(n))
+    (e:INone) : false
+
+;Create a LoStanza type.
+defn to-lstype (e:IExp) -> LSType|False :
+  match(e) :
+    (e:ILSOfT) :
+      val n = n!(class(e))
+      val targs = to-types!(args(e))
+      ensure-correct-tarity(info(e), n, targs)
+      StructT(n, targs)
+    (e:ILSByteT) : ByteT()
+    (e:ILSIntT) : IntT()
+    (e:ILSLongT) : LongT()
+    (e:ILSFloatT) : FloatT()
+    (e:ILSDoubleT) : DoubleT()
+    (e:ILSUnknownT) : UnknownT()
+    (e:ILSPtrT) : PtrT(to-lstype!(type(e)))
+    (e:ILSRefT) : RefT(to-type!(type(e)))
+    (e:ILSFnT) : FnT(to-lstypes!(a1(e)), to-lstype(ar(e)), to-lstype!(a2(e)))
+    (e:Raw) :
+      val n = n!(class(e))
+      StructT(n, gradual-targs(n))
+    (e:INone) : false
+    (e) : fatal("%_ is not a supported LoStanza type." % [object-type(e)])
+
+;Create an expression.
+defn to-exp (e:IExp) -> TExp :
+  match(e) :
+    ;Create a HiStanza function.
+    (e:IFn) :
+      val tbody = to-exp(body(e))
+      val [new-args, new-body] = destructure-args(args(e), tbody)
+      TFn(
+        info(e),
+        false,
+        tail?(e),
+        to-types(a1(e)),
+        to-type(a2(e)),
+        new-args,
+        new-body)
+    ;Multiple-arity function.
+    (e:IMulti) :
+      TMulti(info(e),
+             false,
+             to-exps(funcs(e)) as Tuple<TFn>)
+    ;Sequence of expressions.
+    (e:IBegin) :
+      fatal("Empty begin") when empty?(exps(e))
+      if empty?(tail(exps(e))) :
+        to-exp(head(exps(e)))
+      else :
+        val rest = IBegin(tail(exps(e)),
+                          info(exps(e)[1]))
+        TSeq(info(e),
+             false,
+             to-exp(head(exps(e))),
+             to-exp(rest))
+    ;Match expression.
+    (e:IMatch) :
+      TMatch(info(e),
+             false,
+             to-exps(args(e)),
+             to-exps(branches(e)) as Tuple<TBranch>)
+    ;IBranch within IMatch.
+    (e:IBranch) :
+      val tbody = to-exp(body(e))
+      val [new-args, new-body] = destructure-args(args(e), tbody)
+      TBranch(info(e),
+              false,
+              new-args,
+              to-types(types(e)),
+              new-body)
+    ;New object.
+    (e:INew) :
+      val methods = to-tuple $
+        for m in methods(e) seq :
+          to-single-tcomm(m as IDefmethod) as TDefmethod
+      TNew(info(e),
+           false,
+           to-type!(class(e)),
+           methods)
+    ;Cast expression.
+    (e:ICast) :
+      TCast(info(e),
+            false,
+            to-exp(exp(e)),
+            to-type!(type(e)))
+    ;Upcast expression.
+    (e:IUpCast) :
+      TUpCast(info(e),
+              false,
+              to-exp(exp(e)),
+              to-type!(type(e)))
+    ;Set a variable.
+    (e:ISet) :
+      TSet(info(e),
+           false,
+           to-exp(name(e)) as TRef
+           to-exp(value(e)))
+    ;Calling a function.
+    (e:IDo) :
+      val [type-args, func] = to-func-exp(func(e))
+      TDo(info(e),
+          false,
+          func,
+          type-args,
+          to-targs(args(e)))
+    ;Calling a primitive.
+    (e:IPrim) :
+      TPrim(info(e),
+            false,
+            primitive!(name!(op(e))),
+            to-exps(args(e)))
+    ;Creating a literal.
+    (e:ILiteral) :
+      TLiteral(info(e), false, value(e))
+    ;Creating a tuple.
+    (e:ITuple) :
+      TTupleExp(info(e), false, to-exps(exps(e)))
+    ;Scoping is handled by now during resolution.
+    (e:ILet) :
+      to-exp(exp(e))
+    ;Reference to variable.
+    (e:VarN) :
+      TRef(info(e), false, n(e))
+    ;Reference to overloaded function.
+    (e:Mix) :
+      val refs = to-exps(exps(e)) as Tuple<TRef>
+      TMix(info(e), false, false, refs, false, false)
+    ;Local variable definition.
+    (e:Let) :
+      destructure-let(e)
+    ;Local function definitions.
+    (e:LetRec) :
+      val defns = to-tuple $
+        for e in defns(e) seq :
+          to-single-tcomm(e as IDefn) as TDefn
+      TLetRec(info(e),
+              false,
+              defns,
+              to-exp(body(e)))
+    ;Set variable.
+    (e:ISet) :
+      TSet(info(e),
+           false,
+           to-exp(name(e)) as TRef,
+           to-exp(value(e)))
+    ;Unsupported expression.
+    (e) :
+      fatal("%_ is not a supported HiStanza expression." % [object-type(e)])
+
+;Convert an expression in the function calling position.
+;Returns [TArgs, TExp].
+;IOf is converted to TCurry.
+defn to-func-exp (e:IExp) -> [Tuple<Type>, TExp] :
+  ;Cases:
+  ;  1. f<t1,t2>
+  ;  2. {f1,f2}<t1,t2>
+  ;  3. {f1,f2}
+  ;  4. exp
+  match(e) :
+    (e:IOf) :
+      defn mix (e:IExp) -> TRef|TMix :
+        match(e) :
+          ;Case 1: f<t1,t2>
+          (e:VarN) :
+            to-exp(e) as TRef
+          ;Case 2: {f1,f2}<t1,t2>
+          (e:Mix) :
+            val refs = to-exps(exps(e)) as Tuple<TRef>
+            TMix(info(e), false, false, refs, false, false)
+      [to-types!(args(e)), mix(class(e))]
+    ;Case 3 and 4.
+    (e) :
+      [[], to-exp(e)]
+
+;Convert an expression in the function calling position.
+;IOf is converted to LSCurry.
+defn to-lsfunc-exp (e:IExp) -> [Tuple<Type>, LSExp] :
+  ;Cases:
+  ;  1. f<t1,t2>
+  ;  2. {f1,f2}<t1,t2>
+  ;  3. {f1,f2}
+  ;  4. exp
+  match(e) :
+    (e:ILSOfT) :
+      defn mix (e:IExp) -> LSVar|LSMix :
+        match(e) :
+          ;Case 1: f<t1,t2>
+          (e:VarN) :
+            to-lsexp(e) as LSVar
+          ;Case 2: {f1,f2}<t1,t2>
+          (e:Mix) :
+            val refs = to-lsexps(exps(e)) as Tuple<LSVar>
+            LSMix(info(e), false, false, refs, false, false)
+      [to-types!(args(e)), mix(class(e))]
+    ;Case 3 and 4.
+    (e) :
+      [[], to-lsexp(e)]
+
+;Create a LoStanza expression.
+defn to-lsexp (e:IExp) -> LSExp :
+  match(e) :
+    (e:ILSNew) :
+      val [n, targs] = to-lsclass+targs(type(e))
+      if empty?(targs) :
+        LSNew(info(e), false, n, gradual-targs(n), to-lsexps(args(e)))
+      else :
+        ensure-correct-tarity(info(e), n, value!(targs))
+        LSNew(info(e), false, n, value!(targs), to-lsexps(args(e)))
+    (e:ILSStruct) :
+      val [n, targs] = to-lsclass+targs(type(e))
+      if empty?(targs) :
+        LSStruct(info(e), false, n, gradual-targs(n), to-lsexps(args(e)))
+      else :
+        ensure-correct-tarity(info(e), n, value!(targs))
+        LSStruct(info(e), false, n, value!(targs), to-lsexps(args(e)))
+    (e:ILSAddr) :
+      LSAddr(info(e), false, to-lsexp(exp(e)), unstable?(e))
+    (e:ILSDeref) :
+      LSDeref(info(e), false, to-lsexp(exp(e)))
+    (e:ILSSlot) :
+      LSSlot(info(e), false, to-lsexp(exp(e)), to-lsexp(index(e)))
+    (e:ILSField) :
+      LSField(info(e), false, to-lsexp(exp(e)), name!(name(e)))
+    (e:ILSDo) :
+      val [type-args, func] = to-lsfunc-exp(func(e))
+      LSDo(info(e), false, func, type-args, to-lsargs(args(e)))
+    (e:ILSCallC) :
+      val [type-args, func] = to-lsfunc-exp(func(e))
+      fatal("Unexpected type arguments in CallC.") when not empty?(type-args)        
+      LSCallC(info(e), false, func, to-lsargs(args(e)))
+    (e:ILSPrim) :
+      LSPrim(info(e),
+             false,
+             ls-primitive!(name!(op(e))),
+             to-lsexps(args(e)))
+    (e:ILSSizeof) :
+      LSSizeof(info(e), false, to-lstype!(type(e)))
+    (e:ILSTagof) :
+      LSTagof(info(e), false, n!(name(e)))
+    (e:ILSAs) :
+      LSCast(info(e), false, to-lsexp(exp(e)), to-lstype!(type(e)))
+    (e:ILSAnd) :
+      LSAnd(info(e), false, to-lsexp(a(e)), to-lsexp(b(e)))
+    (e:ILSOr) :
+      LSOr(info(e), false, to-lsexp(a(e)), to-lsexp(b(e)))
+    (e:ILSLetExp) :
+      LSLetExp(info(e), false, to-lscomm(comm(e)), to-lsexp(exp(e)))
+    (e:ILSFn) :
+      LSFn(info(e), false, to-exp(ref(e)))
+    (e:VarN) :
+      LSVar(info(e), false, n!(e))
+    (e:ILiteral) :
+      LSLiteral(info(e), false, value(e))
+    (e:Mix) :
+      val refs = to-lsexps(exps(e)) as Tuple<LSVar>
+      LSMix(info(e), false, refs, false, false)
+    (e) :
+      fatal("%_ is an unsupported LoStanza expression." % [object-type(e)])
+
+;Helper: Extract the class identifier and type arguments
+;from the given expression.
+defn to-lsclass+targs (e:IExp) -> [Int, Maybe<Tuple<Type>>] :
+  match(e) :
+    (e:ILSOfT) : [n!(class(e)), One(to-types!(args(e)))]
+    (e:Raw) : [n!(class(e)), None()]
+
+;Create a LoStanza command.
+defn to-lscomm (e:IExp) -> LSComm :
+  match(e) :
+    (e:IBegin) :
+      if empty?(exps(e)) :
+        LSSkip(info(e))
+      else if empty?(tail(exps(e))) :
+        to-lscomm(head(exps(e)))
+      else :
+        val rest = IBegin(tail(exps(e)),
+                          info(exps(e)[1]))
+        LSSeq(
+          info(e)
+          to-lscomm(head(exps(e)))
+          to-lscomm(rest))
+    (e:ILSSet) :
+      LSSet(info(e), to-lsexp(exp(e)), to-lsexp(value(e)))
+    (e:ILSLabels) :
+      val blocks = to-tuple $
+        for b in blocks(e) seq :
+          to-lscomm(b as ILSLabeledBlock) as LSLabeledBlock
+      LSLabels(info(e), blocks)
+    (e:ILSLabeledBlock) :
+      LSLabeledBlock(info(e),
+                     n!(name(e)),
+                     ns!(args(e)),
+                     to-lstypes!(types(e)),
+                     to-lscomm(body(e)))
+    (e:ILSGoto) :
+      LSGoto(info(e),
+             n!(name(e)),
+             to-lsexps(args(e)))
+    (e:ILSReturn) :
+      LSReturn(info(e),
+               to-lsexp(exp(e)))
+    (e:ILSLet) :
+      to-lscomm(comm(e))
+    (e:ILSIf) :
+      LSIf(info(e),
+           to-lsexp(pred(e)),
+           to-lscomm(conseq(e)),
+           to-lscomm(alt(e)))
+    (e:ILSMatch) :
+      val branches = to-tuple $ for b in branches(e) seq :
+        to-lscomm(b as ILSBranch) as LSBranch
+      LSMatch(info(e), to-lsexps(args(e)), branches)
+    (e:ILSBranch) :
+      LSBranch(info(e),
+               ns!(args(e)),
+               to-lstypes(types(e)),
+               to-lscomm(body(e)))
+    (e:ILSDef) :
+      LSDef(info(e),
+            n!(name(e)),
+            to-lstype(type(e)),
+            to-lsexp(exp(e)))
+    (e:ILSDefVar) :
+      LSDefVar(info(e),
+               n!(name(e)),
+               to-lstype!(type(e)),
+               to-lsexp(exp(e)) when exp(e) is-not INone)
+    (e:ILSDo|ILSPrim|ILSCallC) :
+      LSCall(info(e), to-lsexp(e))
+    (e) :
+      fatal("%_ is not a supported LoStanza command." % [object-type(e)])
+
+;Create an argument expression.
+defn to-targ (e:IExp) -> FArg<TExp> :
+  match(e) :
+    (e:IKeywordArg) : KeywordArg<TExp>(name(name(e) as IVar), false, to-exp(value(e)))
+    (e) : PositionalArg<TExp>(false, to-exp(e))
+
+;Create a LoStanza argument expression.
+defn to-lsarg (e:IExp) -> FArg<LSExp> :
+  match(e) :
+    (e:IKeywordArg) : KeywordArg<LSExp>(name(name(e) as IVar), false, to-lsexp(value(e)))
+    (e) : PositionalArg<LSExp>(false, to-lsexp(e))
+
+;Create an argument specifier.
+defn to-farg (a:IExp, t:IExp) -> [IExp, FArg<Type|False>] :
+
+  ;Convert the type first.
+  val type = to-type(t)
+
+  ;Convert the argument specifier.
+  match(a) :
+    (a:IOptional) :
+      [name(a), PositionalArg<Type|False>(true, type)]
+    (a:IKeyword) :
+      val keyword = get-defined-name(n!(name(a)))
+      [name(a), KeywordArg<Type|False>(keyword, false, type)]
+    (a:IOptionalKeyword) :
+      val keyword = get-defined-name(n!(name(a)))
+      [name(a), KeywordArg<Type|False>(keyword, true, type)]
+    (a:IRest) :
+      val keyword = get-defined-name(n!(name(a)))
+      [name(a), VarArg<Type|False>(keyword,type)]
+    (a:VarN|ITuple) :
+      [a, PositionalArg<Type|False>(false, type)]
+
+;Create an argument specifier.
+defn to-lsfarg (a:IExp, t:IExp) -> [IExp, FArg<LSType>] :
+
+  ;Convert the type first.
+  val type = to-lstype!(t)
+
+  ;Convert the argument specifier.
+  match(a) :
+    (a:IOptional) :
+      [name(a), PositionalArg<LSType>(true, type)]
+    (a:IKeyword) :
+      val keyword = get-defined-name(n!(name(a)))
+      [name(a), KeywordArg<LSType>(keyword, false, type)]
+    (a:IOptionalKeyword) :
+      val keyword = get-defined-name(n!(name(a)))
+      [name(a), KeywordArg<LSType>(keyword, true, type)]
+    (a:IRest) :
+      val keyword = get-defined-name(n!(name(a)))
+      [name(a), VarArg<LSType>(keyword, type)]
+    (a:VarN) :
+      [a, PositionalArg<LSType>(false,type)]
+
+;Convert a Lostanza struct field.
+defn to-field (e:ILSDefField) -> Field :
+  val mutable? = value(mut(e) as ILiteral) as True|False
+  Field(name!(name(e)),
+        to-lstype!(type(e)),
+        mutable?)
+
+;Convert a LoStanza struct rest field.
+defn to-rfield (e:ILSDefField) -> Field :
+  val mutable? = value(mut(e) as ILiteral) as True|False
+  Field(name!(name(e)),
+        RestT(to-lstype!(type(e))),
+        mutable?)
+
+;Helper: Extract the type and captured arguments.
+defn split-targs (es:List<IExp>) -> [Tuple<Int>, Tuple<Int>] :
+  val targs = Vector<Int>()
+  val cargs = Vector<Int>()
+  for e in es do :
+    match(e) :
+      (e:VarN) : add(targs, n(e))
+      (e:ICap) : add(cargs, n!(name(e)))
+  [to-tuple(targs), to-tuple(cargs)]
+
+;============================================================
+;================== Convenience Conversions =================
+;============================================================
+
+;Convert the given expression into a single TComm.
+defn to-single-tcomm (e:IExp) -> TComm :
+  var comm:TComm|False = false
+  within c = to-tcomm(e) :
+    if comm is-not False :
+      fatal("Unexpected more than one command.")
+    comm = c
+  match(comm) :
+    (comm:TComm) : comm
+    (f:False) : fatal("Missing top-level command.")
+
+;Forcifully create a type.
+defn to-type! (e:IExp) -> Type :
+  val t = to-type(e)
+  fatal("Unexpected absent type.") when t is False
+  t as Type
+
+;Forcifully create a tuple of types.
+defn to-types! (es:Seqable<IExp>) -> Tuple<Type> :
+  to-tuple(seq(to-type!, es))
+
+;Create a tuple of LoStanza types.
+defn to-lstypes! (es:Seqable<IExp>) -> Tuple<LSType> :
+  to-tuple(seq(to-lstype!, es))
+
+;Create a LoStanza type forcifully.
+defn to-lstype! (e:IExp) -> LSType :
+  match(to-lstype(e)) :
+    (t:LSType) : t
+    (f:False) : fatal("Unexpected absent type.")
+
+;Create a tuple of LoStanza types.
+defn to-lstypes (es:Seqable<IExp>) -> Tuple<LSType|False> :
+  to-tuple(seq(to-lstype, es))
+
+;Create a tuple of types.
+defn to-types (es:Seqable<IExp>) -> Tuple<Type|False> :
+  to-tuple(seq(to-type,es))
+
+;Create a tuple of argument expressions.
+defn to-targs (es:Seqable<IExp>) -> Tuple<FArg<TExp>> :
+  to-tuple(seq(to-targ, es))
+
+;Create a tuple of LoStanza argument expressions.
+defn to-lsargs (es:Seqable<IExp>) -> Tuple<FArg<LSExp>> :
+  to-tuple(seq(to-lsarg, es))
+
+;Create a tuple of expressions.
+defn to-exps (es:Seqable<IExp>) -> Tuple<TExp> :
+  to-tuple(seq(to-exp,es))
+
+;Create a tuple of LoStanza expressions.
+defn to-lsexps (es:Seqable<IExp>) -> Tuple<LSExp> :
+  to-tuple(seq(to-lsexp, es))
+
+;Convert multiple argument specifiers.
+defn to-fargs (args:Seqable<IExp>, ts:Seqable<IExp>) -> [Tuple<IExp>, Tuple<FArg<Type|False>>] :
+  val arglist = Vector<IExp>()
+  val farglist = Vector<FArg<Type|False>>()
+  for (arg in args, t in ts) do :
+    val [wrapped-arg, farg] = to-farg(arg,t)
+    add(arglist, wrapped-arg)
+    add(farglist, farg)
+  [to-tuple(arglist), to-tuple(farglist)]
+
+;Convert multiple argument specifiers.
+defn to-lsfargs (args:Seqable<IExp>, ts:Seqable<IExp>) -> [Tuple<IExp>, Tuple<FArg<LSType>>] :
+  val arglist = Vector<IExp>()
+  val farglist = Vector<FArg<LSType>>()
+  for (arg in args, t in ts) do :
+    val [wrapped-arg, farg] = to-lsfarg(arg,t)
+    add(arglist, wrapped-arg)
+    add(farglist, farg)
+  [to-tuple(arglist), to-tuple(farglist)]
+
+;============================================================
+;====================== Namemap =============================
+;============================================================
+
+;Hold the currently active namemap.
+var CURRENT-NAMEMAP:NameMap|False = false
+
+;Retrieve the defined name for the given identifier.
+defn get-defined-name (n:Int) -> Symbol :
+  name(get-var-entry(n))
+
+;Retrieve the VEntry for the given variable.
+defn get-var-entry (n:Int) -> VEntry :
+  match(CURRENT-NAMEMAP) :
+    (nm:NameMap) : nm[n]
+    (f:False) : fatal("No namemap is set.")
+
+;Format the given type in human-readable way.
+defn format (t:Type) -> String :
+  val formatter = TypeFormatter(get-defined-name)
+  to-string(format(formatter, t))
+
+;============================================================
+;====================== Destructuring =======================
+;============================================================
+
+;Given: [e1,e2]:type = v,
+;Destructure the tuple into:
+;  [tmp1,tmp2]:type = v
+;  [x,y] = tmp1
+;  [w,z] = tmp2
+defn destructure-nested-tuple (
+       return:(Tuple<Int>, VarN) -> ?
+       name:ITuple,
+       value:VarN) -> False :
+  val tuple-vars = Vector<Int>()
+  val kont = Vector<KeyValue<ITuple,VarN>>()
+  for exp in exps(name) do :
+    match(exp) :
+      (exp:VarN) :
+        add(tuple-vars, n!(exp))
+      (exp:ITuple) :
+        val v = VarN(fresh-id(),false)
+        add(tuple-vars, n!(v))
+        add(kont, exp => v)
+  return(to-tuple(tuple-vars), value)
+  for entry in kont do :
+    destructure-nested-tuple(return, key(entry), /value(entry))
+
+;Destructure an IDef into multiple TDef and TDefTuple.
+;Input cases:
+;  v = f()
+;  [a,b,c]:type = f()
+;  [a,b,c]:type = v
+defn destructure-def (return:TDef|TDefTuple -> ?, def:IDef) -> False :
+  match(name(def), type(def), value(def)) :
+    ;Case: [a,b,c] = v
+    (name:ITuple, type:INone, v:VarN) :
+      within (tuple-vars, v) = destructure-nested-tuple(name, v) :
+        val tuple-type = map({false}, tuple-vars)
+        return $ TDefTuple(info(def), tuple-vars, tuple-type, to-exp(v))
+    ;Case: [a,b,c]:type = f()
+    (name:ITuple, type, v) :
+      ;First assign to tmp.
+      val tmp = fresh-id()
+      return $ TDef(info(def), tmp, to-type(type), to-exp(v))
+      ;Then destructure tmp.
+      within (tuple-vars, v) = destructure-nested-tuple(name, VarN(tmp,false)) :
+        val tuple-type = map({false}, tuple-vars)
+        return $ TDefTuple(info(def), tuple-vars, tuple-type, to-exp(v))
+    ;Case: v = f()
+    (name:VarN, type, v) :
+      return $ TDef(info(def), n!(name), to-type(type), to-exp(v))
+
+;Destructure a Let into multiple lets and let tuples.
+;Same input cases as for IDef.
+;Input cases:
+;  v = f()
+;  [a,b,c]:type = f()
+;  [a,b,c]:type = v
+defn destructure-let (lete:Let) -> TExp :
+  match(def(lete)) :
+    (def:IDefVar) :
+      TLetVar(info(def),
+              false,
+              n!(name(def)),
+              to-type(type(def)),
+              to-exp(value(def)) when value(def) is-not INone,
+              to-exp(body(lete)))
+    (def:IDef) :
+      ;Destructure the definitions as if they were at top-level.
+      val tdefs = Vector<TDef|TDefTuple>()
+      destructure-def(add{tdefs, _}, def)
+      ;Convert top-level definitions into local let expressions.
+      var body:TExp = to-exp(body(lete))
+      for def in in-reverse(tdefs) do :
+        match(def) :
+          (e:TDef) :
+            body = TLet(info(e), false, n(e), type(e), value(e), body)
+          (e:TDefTuple) :
+            body = TLetTuple(info(e), false, ns(e), types(e), value(e), body)
+      ;Return the new body
+      body
+
+;Handle nested tuples in the argument list by pushing destructuring
+;statements into the body.
+defn destructure-args (args:Seqable<IExp>, input-body:TExp) -> [Tuple<Int>, TExp] :
+  ;Compute the new arguments to use.
+  ;Introduce temporary variables as necessary for destructuring.
+  val new-args = Vector<Int>()
+  val entries = Vector<[FileInfo|False,Tuple<Int>,VarN]>()
+  for arg in args do :
+    match(arg:ITuple) :
+      val tmp = VarN(fresh-id(),false)
+      within (tuple-vars, v) = destructure-nested-tuple(arg, tmp) :
+        add(entries, [info(arg), tuple-vars, v])
+      add(new-args, n!(tmp))
+    else :
+      add(new-args, n!(arg))
+
+  ;Compute the new body.
+  var body:TExp = input-body
+  for [info, tvars, value] in in-reverse(entries) do :
+    val tuple-type = map({false}, tvars)
+    body = TLetTuple(info,
+                     false,
+                     tvars,
+                     tuple-type,
+                     to-exp(value)
+                     body)
+
+  ;Return the new arguments and new body.
+  [to-tuple(new-args), body]
+
+;============================================================
+;================ Illegal Capture Detection =================
+;============================================================
+
+;Check the given arguments, and ensure that captured type variables appear
+;in the right places.
+defn check-capture-positions (args:Seqable<FArg<Type|LSType|False>>) -> False :
+  val types = for arg in args seq? :
+    match(type(arg)) :
+      (t:Type|LSType) : One(t)
+      (f:False) : None()
+  for entry in variances(types, Covariant) do :
+    if value(entry) is Bivariant :      
+      val nm-entry = get-var-entry(key(entry))
+      add-type-error(BivariantCapture(info(nm-entry), name(nm-entry)))
+
+;============================================================
+;=================== Hierarchy Creation =====================
+;============================================================
+
+;Extract the type hierarchy from the given converted packages
+;and exports.
+defn compute-type-hierarchy (tpackages:Collection<TPackage>,
+                             environment:Tuple<Export>) -> TypeHierarchy :
+  ;Collect all type commands in packages and environment.
+  val type-comms = Vector<TDefType|TLDefType>()
+  for tpackage in tpackages do :
+    add-all(type-comms, filter-by<TDefType|TLDefType>(comms(tpackage)))
+  add-all(type-comms, seq(to-deftype, type-recs)) where :
+    val type-recs = filter-by<StructRec|TypeRec>(seq(rec, environment))
+
+  ;Each entry, C => P, means that P is the parent type of class C.
+  ;If P is false, then C has no parent.
+  val parents = IntTable<False|Type>()
+
+  ;Each entry, C => [T,S] means that T,S are the type arguments for
+  ;the class C.
+  val type-args = IntTable<Tuple<Int>>()
+
+  ;Each entry, C => ST, means that C corresponds to the special type
+  ;ST.
+  val special-types = IntTable<SpecialType>()
+
+  ;Populate 'parents' and 'type-args' using the direct deftype
+  ;relationship.
+  defn calc-direct-parents () -> False :
+    for c in type-comms do :
+      parents[n(c)] = parent(c)
+      type-args[n(c)] = args(c)
+
+  ;Helper: Add 't' as another parent under class n.
+  defn add-parent (n:Int, t:Type) -> False :
+    val new-parent = match(parents[n]) :
+      (p:Type) : TAnd(p,t)
+      (p:False) : t
+    parents[n] = new-parent
+
+  ;Modify 'parents' table such that child relationships are
+  ;included.
+  defn calc-child-parents () -> False :
+    for c in filter-by<TDefType>(type-comms) do :
+      for c in children(c) do :
+        ;Re-express the parent using the type variables used
+        ;at definition time.
+        val env = seq({_ => TVar(_)}, args(c), type-args[n(c)])
+        val new-parent = sub(parent(c), env)
+        add-parent(n(c), new-parent)
+
+  ;Populate the 'special-types' table.
+  defn calc-special-types () -> False :
+    val core-ids = [CORE-TUPLE-ID => CoreTuple,
+                    CORE-BYTE-ID => CoreByte,
+                    CORE-CHAR-ID => CoreChar,
+                    CORE-INT-ID => CoreInt,
+                    CORE-LONG-ID => CoreLong,
+                    CORE-FLOAT-ID => CoreFloat,
+                    CORE-DOUBLE-ID => CoreDouble,
+                    CORE-STRING-ID => CoreString,
+                    CORE-SYMBOL-ID => CoreSymbol,
+                    CORE-LIST-ID => CoreList,
+                    CORE-TRUE-ID => CoreTrue,
+                    CORE-FALSE-ID => CoreFalse
+                    CORE-MAYBE-ID => CoreMaybe
+                    CORE-NONE-ID => CoreNone
+                    CORE-ONE-ID => CoreOne
+                    CORE-STACK-ID => CoreStack
+                    CORE-FN-ID => CoreFn]
+    for entry in core-ids do :
+      special-types[env-id(key(entry))] = value(entry)
+
+  ;Helper: Translate to hierarchy fields.
+  defn to-hfield (f:Field) -> HField :
+    HField(name(f), type(f), mutable?(f))
+
+  ;Calculate the hierarchy relations.
+  defn calc-relations () -> Tuple<TypeRelation> :
+    to-tuple $ for c in type-comms seq :
+      val special = get?(special-types, n(c))
+      val parent = parents[n(c)]
+      val fields = match(c:TLDefType) : One(map(to-hfield, fields(c)))
+                   else : None()
+      TypeRelation(n(c), special, args(c), parent, fields)
+
+  ;Launch!
+  calc-direct-parents()
+  calc-child-parents()
+  calc-special-types()
+  TypeHierarchy(calc-relations())
+
+;============================================================
+;================== Hierarchy Checking ======================
+;============================================================
+
+;Check the type relations for any errors.
+defn check-valid-hierarchy (hier:TypeHierarchy) -> False :
+
+  ;Retrieve all the class ids in the given type.
+  defn classes (t:False|Type) -> List<Int> :
+    match(t) :
+      (t:TOf) : List(n(t))
+      (t:TAnd) : append(classes(a(t)), classes(b(t)))
+      (t:False) : List()
+
+  ;Create all the components.
+  val components = strong-components $
+    for r in relations(hier) seq :
+      n(r) => classes(parent(r))
+
+  ;Compute cycles.
+  val cycles = filter-by<List<Int>>(components)
+
+  ;Generate errors for the cycles.
+  for cycle in cycles do :
+    add-type-error(TypeCycle(to-tuple(seq(type-loc, cycle))))
+
+;Helper: Retrieve the error location for the given type.
+defn type-loc (n:Int) -> DefinedType :
+  val ventry = get-var-entry(n)
+  match(info(ventry)) :
+    (info:FileInfo) : DefinedType(name(ventry), DefLoc(info))
+    (f:False) : DefinedType(name(ventry), DefLoc(PackageName(package(ventry))))
+
+;============================================================
+;================== Assertion Checking ======================
+;============================================================
+
+;Add a type error if the given class doesn't have the right type
+;arity.
+defn ensure-correct-tarity (info:FileInfo|False, n:Int, targs:Tuple<Type>) -> False :
+  val actual-arity = type-arity(n)
+  val num-args = length(targs)
+  if num-args != actual-arity :
+    add-type-error $ WrongTypeArity(
+      info,
+      get-defined-name(n),
+      map(format,targs)
+      actual-arity)
+
+;============================================================
+;====================== Utilities ===========================
+;============================================================
+
+;Assume IExp is VarN (from resolution) and retrieve id.
+defn n! (e:IExp) : n(e as VarN)
+defn ns! (es:Seqable<IExp>) : to-tuple(seq(n!,es))
