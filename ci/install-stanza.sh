@@ -17,23 +17,24 @@ STANZA_DOWNLOAD_BASEURL="http://lbstanza.org/resources/stanza"
 
 
 # Required env var inputs
-echo "STANZA_BUILD_PLATFORM:" "${STANZA_BUILD_PLATFORM:?Usage: ${USAGE}}"  # linux|macos|windows
 echo "     STANZA_BUILD_VER:" "${STANZA_BUILD_VER:?Usage: ${USAGE}}"       # 0.17.56
 echo "   STANZA_INSTALL_DIR:" "${STANZA_INSTALL_DIR:?Usage: ${USAGE}}"     # where the stanza binaries will be installed
 echo "        STANZA_CONFIG:" "${STANZA_CONFIG:?Usage: ${USAGE}}"          # directory where .stanza config file will be stored, as in normal stanza behavior
 
+# Defaulted env var inputs - can override if necessary
+echo "STANZA_BUILD_PLATFORM:" "${STANZA_BUILD_PLATFORM:=$(uname -s)}"  # linux|macos|Darwin|windows|MINGW64
 
 # var input validation
 case "${STANZA_BUILD_PLATFORM}" in
-    linux* | ubuntu*)
+    Linux* | linux* | ubuntu*)
         STANZA_BUILD_PLATFORM=linux
         STANZA_DOWNLOAD_PLATFORMCHAR="l"
     ;;
-    mac* | os-x)
+    Darwin | mac* | os-x)
         STANZA_BUILD_PLATFORM=os-x
         STANZA_DOWNLOAD_PLATFORMCHAR=""
     ;;
-    win*)
+    MINGW* | win*)
         STANZA_BUILD_PLATFORM=windows
         STANZA_DOWNLOAD_PLATFORMCHAR="w"
     ;;
