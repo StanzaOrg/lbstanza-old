@@ -16,6 +16,9 @@ echo "    CREATE_ARCHIVE:" "${CREATE_ARCHIVE:=false}"
 echo "    CREATE_PACKAGE:" "${CREATE_PACKAGE:=false}"
 echo "               VER:" "${VER:=$(git -C ${REPODIR} describe --tags --abbrev=0)}"
 
+# special case - if STANZA_CONFIG starts with "./", then replace it with the full path
+[[ ${STANZA_CONFIG::2} == "./" ]] && STANZA_CONFIG=${PWD}/${STANZA_CONFIG:2}
+
 # Calculated env vars
 STANZADIR=$(grep ^install-dir $STANZA_CONFIG/.stanza | cut -f2 -d\")
 
