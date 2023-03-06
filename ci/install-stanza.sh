@@ -41,6 +41,10 @@ case "${STANZA_BUILD_PLATFORM}" in
         printf "\n\n*** ERROR: STANZA_BUILD_PLATFORM input \"$STANZA_BUILD_PLATFORM\" not one of linux, macos, windows\n\n\n" && exit -2
     ;;
 esac
+# special case - if STANZA_INSTALL_DIR or STANZA_CONFIG start with "./", then replace it with the full path
+[[ ${STANZA_INSTALL_DIR::2} == "./" ]] && STANZA_INSTALL_DIR=${PWD}/${STANZA_INSTALL_DIR:2}
+[[ ${STANZA_CONFIG::2} == "./" ]] && STANZA_CONFIG=${PWD}/${STANZA_CONFIG:2}
+# verify full paths
 [[ ${STANZA_INSTALL_DIR::1} != "/" ]] && printf "\n\n*** ERROR: STANZA_INSTALL_DIR must be a full path starting with \"/\"\n\n\n" && exit -2
 [[ ${STANZA_CONFIG::1} != "/" ]] && printf "\n\n*** ERROR: STANZA_CONFIG must be a full path starting with \"/\"\n\n\n" && exit -2
 mkdir -p "${STANZA_CONFIG}"
