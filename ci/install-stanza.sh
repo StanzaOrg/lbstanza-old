@@ -56,7 +56,7 @@ STANZA_DOWNLOAD_URL="${STANZA_DOWNLOAD_BASEURL}/${STANZA_DOWNLOAD_FILE}"
 TOP="${PWD}"
 
 # download zip to a tmp dir, unzip, install, and clean up tmp dir
-TMP="$(mktemp --tmpdir="$PWD" -d stanza.XXXXXXXXXX)"
+TMP="$(mktemp -d ./stanza.XXXXXXXXXX)"
 (
     set -Eeuxo pipefail
     trap "rm -rf \"$TMP\"" ERR EXIT
