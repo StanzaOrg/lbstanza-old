@@ -29,7 +29,7 @@ case "$STANZA_BUILD_PLATFORM" in
         STANZA_BUILD_PLATFORM=linux
         STANZA_PLATFORMCHAR="l"
     ;;
-    Darwin | mac* | os-x))
+    Darwin | mac* | os-x)
         STANZA_BUILD_PLATFORM=os-x
         STANZA_PLATFORMCHAR=""
     ;;
