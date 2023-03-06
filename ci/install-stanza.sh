@@ -29,8 +29,8 @@ case "${STANZA_BUILD_PLATFORM}" in
         STANZA_BUILD_PLATFORM=linux
         STANZA_DOWNLOAD_PLATFORMCHAR="l"
     ;;
-    mac*)
-        STANZA_BUILD_PLATFORM=macos
+    mac* | os-x)
+        STANZA_BUILD_PLATFORM=os-x
         STANZA_DOWNLOAD_PLATFORMCHAR=""
     ;;
     win*)
