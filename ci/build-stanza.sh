@@ -50,7 +50,7 @@ mkdir -p build
 mkdir -p bin
 # copy asmjit.a from stanza install into repository bin directory
 # so it can be linked into the bootstrap compiler
-cp -a ${STANZA_CONFIG}/bin/libasmjit.a ${REPODIR}/bin/libasmjit.a
+cp -a ${STANZADIR}/bin/libasmjit.a ${REPODIR}/bin/libasmjit.a
 
 ${STANZADIR}/stanza build-stanza.proj stz/driver -o stanzatemp -flags BOOTSTRAP -optimize -verbose
 # verify that expected output file exists
