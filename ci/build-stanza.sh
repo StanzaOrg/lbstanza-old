@@ -62,7 +62,35 @@ scripts/${STANZA_PLATFORMCHAR}finish.sh
 
 
 if [ "$CREATE_PACKAGE" == "true" ] ; then
-  ci/zipstanza.sh ${VER//./_}  # convert dots to underscores
+  VERU=${VER//./_}  # convert dots to underscores
+  STANZA_EXT=""
+  [[ "${STANZA_PLATFORMCHAR}" == "w" ]] && STANZA_EXT=".exe"
+
+  FILES="docs \
+         bin \
+         include \
+         ${STANZA_PLATFORMCHAR}pkgs \
+         ${STANZA_PLATFORMCHAR}stanza${STANZA_EXT} \
+         core \
+         compiler \
+         examples \
+         runtime \
+         stanza.proj \
+         License.txt \
+         ChangeLog.txt"
+
+  mkdir -p ${TOP}/workdir/build
+  cp -r ${FILES} ${TOP}/workdir/
+
+  cd ${TOP}/workdir
+
+  # rename "lstanza" to "stanza" and "wstanza.exe" to "stanza.exe"
+  [[ "${STANZA_PLATFORMCHAR}stanza" != "stanza" ]] \
+      && mv ${STANZA_PLATFORMCHAR}stanza${STANZA_EXT} stanza${STANZA_EXT} \
+      && mv ${STANZA_PLATFORMCHAR}pkgs pkgs
+
+  zip -r ../${STANZA_PLATFORMCHAR}stanza_${VERU}.zip *
+
 fi
 
 if [ "$CREATE_ARCHIVE" == "true" ] ; then

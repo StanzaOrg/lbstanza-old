@@ -60,7 +60,7 @@ TOP="${PWD}"
 TMP="$(mktemp -d ./stanza.XXXXXXXXXX)"
 (
     set -Eeuxo pipefail
-    trap "rm -rf \"$TMP\"" ERR EXIT
+    trap "rm -rf \"${TMP}\"" ERR EXIT
     cd "${TMP}"
     echo "Downloading ${STANZA_DOWNLOAD_URL} to ${TMP}/${STANZA_DOWNLOAD_FILE}"
     curl -L "${STANZA_DOWNLOAD_URL}" -o "${STANZA_DOWNLOAD_FILE}"
