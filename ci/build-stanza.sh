@@ -93,10 +93,10 @@ if [ "$CREATE_PACKAGE" == "true" ] ; then
 
 fi
 
-if [ "$CREATE_ARCHIVE" == "true" ] ; then
-  #zip -r -9 -q stanza-build-${PLATFORM}-${VER}.zip \
-  #    .conan \
-  #    .stanza \
-  #    CMakeUserPresets.json \
-  #    build
-fi
+# if [ "$CREATE_ARCHIVE" == "true" ] ; then
+#   zip -r -9 -q stanza-build-${PLATFORM}-${VER}.zip \
+#      .conan \
+#      .stanza \
+#      CMakeUserPresets.json \
+#      build
+# fi
