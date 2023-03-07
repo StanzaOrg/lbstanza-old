@@ -58,7 +58,10 @@ ls stanzatemp
 
 scripts/make.sh ./stanzatemp ${STANZA_BUILD_PLATFORM} compile-clean-without-finish
 
-scripts/${STANZA_PLATFORMCHAR}finish.sh
+# call ?finish sh or bat
+FINISH_EXT="sh"
+[[ "${STANZA_PLATFORMCHAR}" == "w" ]] && FINISH_EXT="bat"
+scripts/${STANZA_PLATFORMCHAR}finish.${FINISH_EXT}
 
 
 if [ "$CREATE_PACKAGE" == "true" ] ; then
