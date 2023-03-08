@@ -107,7 +107,7 @@ static const char* debug_adapter_path;
 static const uint64_t thread_id = 12345678;
 
 // Client IDE capabilities
-// static bool client_supports_invalidated_event;
+static bool client_supports_invalidated_event;
 
 static inline char* get_absolute_path(const char* s) {
   // Use GetFullPathName on Windows
@@ -1082,8 +1082,20 @@ static inline const char* stop_reason(const StopReason kind) {
   return names[kind];
 }
 
+static inline void send_invalidate_thread(void) {
+  if (client_supports_invalidated_event) {
+    JSBuilder builder;
+    JSBuilder_initialize_event(&builder, "invalidated");
+    JSBuilder_write_unsigned_field(&builder, "threadId", thread_id);
+    JSBuilder_send_and_destroy_event(&builder);
+  }
+}
+
+static inline void Environment_reset(void);
 static void send_thread_stopped(StopReason reason, const char* description, uint64_t breakpoint) {
-    run_mode = RUN_MODE_PAUSED;
+  send_invalidate_thread();
+  Environment_reset();
+  run_mode = RUN_MODE_PAUSED;
 
   JSBuilder builder;
   JSBuilder_initialize_event(&builder, "stopped");
@@ -1648,8 +1660,8 @@ static inline void define_capabilities(JSBuilder* builder) {
   #endif
 }
 static bool request_initialize(const JSObject* request) {
-  // const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  // client_supports_invalidated_event = JSObject_get_bool_field(arguments, "supportsInvalidatedEvent", false);
+  const JSObject* arguments = JSObject_get_object_field(request, "arguments");
+  client_supports_invalidated_event = JSObject_get_bool_field(arguments, "supportsInvalidatedEvent", false);
 
   // TODO: initialize debugger here.
   JSBuilder builder;
@@ -2564,9 +2576,9 @@ typedef struct {
 } DelayedRequestStackTrace;
 static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
-  Environment_reset();
 
-  if (run_mode != RUN_MODE_TERMINATED && stack_trace_available) create_stack_trace(req->format);
+  if (run_mode != RUN_MODE_TERMINATED && stack_trace_available && !current_stack_trace.length)
+    create_stack_trace(req->format);
   const int64_t total_frames = current_stack_trace.length;
 
   JSBuilder builder;
@@ -2687,21 +2699,20 @@ typedef struct {
   StackTraceFrame* frame;
 } DelayedRequestScopes;
 static void DelayedRequestScopes_handle(DelayedRequest* request) {
-  const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
-  StackTraceFrame* frame = req->frame;
-  if (!frame->scopes) {
-    frame->scopes = current_env.length;
-    Environment_allocate(frame, "Locals", number_of_locals(frame->pc), VARIABLE_KIND_LOCALS);
-    Environment_allocate(frame, "Globals", number_of_globals(), VARIABLE_KIND_GLOBALS);
-  }
-  const uint64_t scopes = frame->scopes;
-
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   {
     JSBuilder_array_field_begin(&builder, "scopes");
-    {
+    const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
+    StackTraceFrame* frame = req->frame;
+    if (frame) {
+      if (!frame->scopes) {
+        frame->scopes = current_env.length;
+        Environment_allocate(frame, "Locals", number_of_locals(frame->pc), VARIABLE_KIND_LOCALS);
+        Environment_allocate(frame, "Globals", number_of_globals(), VARIABLE_KIND_GLOBALS);
+      }
+      const uint64_t scopes = frame->scopes;
       JSBuilder_write_scope(&builder, scopes + 0, "locals");
       JSBuilder_write_scope(&builder, scopes + 1, "globals");
     }
