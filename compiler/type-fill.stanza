@@ -1,0 +1,1525 @@
+defpackage stz/type-fill :
+  import core
+  import collections
+  import stz/types
+  import stz/type-equation-solver
+  import stz/tl-ir
+  import stz/type-match
+  import stz/type-errors
+  import stz/type-instfns
+  import stz/type-solver
+  import stz/type-utils
+  import stz/type-fargs
+  import stz/type-hierarchy with:
+    prefix(Field) => H
+  import stz/namemap
+  import stz/primitives
+  import stz/type-instantiation
+  import stz/utils
+
+;============================================================
+;===================== Fill Solution ========================
+;============================================================
+
+;Fill the computed solutions in the Solver into the program.
+public defn fill-solution (prog:TProg, solns:SolverState) -> TProg|TypeErrors :
+  val errors = Vector<TypeError>()
+  val new-prog = within with-implicits(errors,
+                                       hierarchy(prog),
+                                       namemap(prog)) :
+    val new-packages = for package in packages(prog) map :
+      fill-solution(package, solns)
+    sub-packages(prog, new-packages)
+  if empty?(errors) : new-prog
+  else : TypeErrors(to-tuple(errors))
+
+;Fill all the solutions in the package commands.
+public defn fill-solution (package:TPackage, solns:SolverState) -> TPackage :
+  val new-comms = for comm in comms(package) map :
+    fill-comm(comm, solns, List())
+  sub-comms(package, new-comms)
+
+;============================================================
+;================== Detailed Substitution ===================
+;============================================================
+
+;Fill the solved types in the given top-level command.
+defn fill-comm (comm:TComm, soln:SolverState, scope:List<Int>) -> TComm :
+  match(comm) :
+  
+    (comm:TDefType) : 
+      comm
+      
+    (comm:TDef) : 
+      val new-type = fill-type!(type(comm), soln)
+      val new-value = fill-exp(value(comm), soln, scope)
+      val new-comm = TDef(info(comm), n(comm), new-type, new-value)
+
+      ;ERROR: Cannot infer definition type.
+      if type(comm) is TUVar :
+        if not resolved?(new-type) :
+          add-type-error(NoInferredType(new-comm))
+      ;ERROR: Bad assignment.
+      else :
+        if not-subtype?(type!(new-value), new-type) :
+          add-type-error(BadAssign(new-comm))
+          
+      new-comm
+      
+    (comm:TDefTuple) : 
+      val new-types = fill-types!(types(comm), soln)
+      val new-value = fill-exp(value(comm), soln, scope)
+      val new-comm = TDefTuple(info(comm), ns(comm), new-types, new-value)
+
+      ;ERROR: Cannot detuple type.
+      ;ERROR: Cannot infer.
+      if all?({_ is TUVar}, types(comm)) :
+        val tuple-top = TTuple(map(TTop{}, types(comm)))
+        if not-subtype?(type!(new-value), tuple-top) :
+          add-type-error(BadDetuple(new-comm))
+        if not all?(resolved?, new-types) :
+          add-type-error(NoInferredType(new-comm))
+          
+      ;ERROR: Bad assignment.
+      else :
+        if not-subtype?(type!(new-value), TTuple(new-types)) :
+          add-type-error(BadAssign(new-comm))
+        
+      new-comm
+
+    (comm:TDefVar) : 
+      val new-type = fill-type!(type(comm), soln)
+      val new-value = fill-exp?(value(comm), soln, scope)
+      val new-comm = TDefVar(info(comm), n(comm), new-type, new-value)
+
+      ;ERROR: Variable type not inferred, or out of scope.
+      if type(comm) is TUVar :
+        if not (resolved?(new-type) and in-scope?(new-type,scope)) :
+          add-type-error(NoInferredType(new-comm))
+      ;ERROR: Bad assignment.
+      else :
+        match(new-value:TExp) :
+          if not-subtype?(type!(new-value), new-type) :
+            add-type-error(BadAssign(new-comm))
+      
+      new-comm
+
+    (comm:TDefn) : 
+      val tvars = to-list $ cat(targs(comm), cargs(comm), scope)
+      val new-a2 = fill-type!(a2(comm), soln)
+      val new-body = fill-exp(body(comm), soln, tvars)
+      val new-comm = TDefn(info(comm), tail?(comm), n(comm), targs(comm), cargs(comm),
+                           a1(comm), new-a2, args(comm), new-body)
+      
+      ;ERROR: Return type not inferred.
+      if a2(comm) is TUVar :
+        if not resolved?(new-a2) :
+          add-type-error(NoInferredReturn(new-comm))
+      ;ERROR: Bad return.
+      else :
+        if not-subtype?(type!(new-body), new-a2) :
+          bad-return(new-body, new-a2)
+
+      new-comm
+
+    (comm:TDefmulti) : 
+      comm
+      
+    (comm:TDefmethod) : 
+      fill-method(comm, None(), soln, scope)
+
+    (comm:TInit) : 
+      val new-exp = fill-exp(exp(comm), soln, scope)
+      TInit(info(comm), new-exp)
+      
+    (comm:TLDefType) : 
+      comm
+      
+    (comm:TLDef) : 
+      val new-value = fill-ls-exp(value(comm), soln, scope)
+      val new-comm = TLDef(info(comm), n(comm), type(comm), new-value)
+
+      ;ERROR: Bad assignment.
+      if not-assignable?(type!(new-value), type(new-comm)) :
+        add-type-error(BadAssign(new-comm))
+        
+      ;ERROR: Bad unbounded declared type.
+      if not-bounded?(type(new-comm)) :
+        add-type-error(UnboundedDef(new-comm))
+
+      new-comm
+      
+    (comm:TLDefVar) : 
+      val new-value = fill-ls-exp?(value(comm), soln, scope)
+      val new-comm = TLDefVar(info(comm), n(comm), type(comm), new-value)
+
+      ;ERROR: Bad assignment.
+      if value(comm) is-not False :
+        if not-assignable?(type!(new-value as LSExp), type(new-comm)) :
+          add-type-error(BadAssign(new-comm))
+
+      ;ERROR: Bad unbounded declared type.
+      if not-bounded?(type(new-comm)) :
+        add-type-error(UnboundedDef(new-comm))
+          
+      new-comm 
+
+    (comm:TLDefn) :  
+      val tvars = to-list $ cat(targs(comm), cargs(comm), scope)
+      val new-body = fill-ls-comm(body(comm), soln, tvars)
+      val new-comm = TLDefn(info(comm), tail?(comm), n(comm), targs(comm), cargs(comm),
+                            a1(comm), a2(comm), args(comm), new-body)
+
+      ;ERROR: Bad unbounded argument type.
+      for (arg in args(comm), t in a1(comm)) do :
+        if not-bounded?(type(t)) :
+          add-type-error(UnboundedArg(new-comm, arg))
+          
+      ;ERROR: Bad unbounded return type.
+      if not-bounded?(a2(comm)) :
+        add-type-error(UnboundedReturn(new-comm))
+
+      ;ERROR: Bad optional arg.
+      for (arg in args(comm), t in a1(comm)) do :
+        if bad-optional-arg?(t) :
+          add-type-error(InvalidOptionalArg(new-comm, arg))
+
+      new-comm
+
+    (comm:TLExternFn) : 
+      val new-body = fill-ls-comm(body(comm), soln, scope)
+      val new-comm = TLExternFn(info(comm), n(comm), a1(comm), a2(comm), args(comm), new-body, lbl(comm))
+
+      ;ERROR: Bad externfn argument type.
+      for (arg in args(comm), t in a1(comm)) do :
+        if not externfn-type?(t) :
+          add-type-error(BadExternfnArg(new-comm, arg))
+          
+      ;ERROR: Bad externfn return type.
+      if not externfn-type?(a2(comm)) :
+        add-type-error(BadExternfnReturn(new-comm))
+      
+      new-comm
+
+    (comm:TLDefmethod) : 
+      val new-multi = fill-multi(multi(comm) as TMix, soln)
+      val tvars = to-list $ cat(targs(comm), cargs(comm), scope)
+      val new-body = fill-ls-comm(body(comm), soln, tvars)
+      val new-comm = TLDefmethod(info(comm), tail?(comm), n(comm), new-multi, targs(comm), cargs(comm),
+                                 a1(comm), a2(comm), args(comm), new-body)
+
+      ;ERROR: Bad unbounded argument type.
+      for (arg in args(comm), t in a1(comm)) do :
+        if not-bounded?(type(t)) :
+          add-type-error(UnboundedArg(new-comm, arg))
+          
+      ;ERROR: Bad unbounded return type.
+      if not-bounded?(a2(comm)) :
+        add-type-error(UnboundedReturn(new-comm))
+
+      ;ERROR: Bad optional arg.
+      for (arg in args(comm), t in a1(comm)) do :
+        if bad-optional-arg?(t) :
+          add-type-error(InvalidOptionalArg(new-comm, arg))
+
+      ;ERROR: Check submethod.
+      val multi-type = type!(new-multi)
+      if resolved?(multi-type) :
+        if not-submethod?(multi-type as TArrow, a1(comm), a2(comm)) :
+          add-type-error(BadSubmethod(new-comm))
+
+      new-comm
+                  
+    (comm:TExtern) : 
+      comm
+      
+    (comm:TLInit) : 
+      val new-comm = fill-ls-comm(/comm(comm), soln, scope)
+      TLInit(info(comm), new-comm)
+      
+    (comm:TDoc) : 
+      comm
+
+;Fill the solved types in the given expression.
+defn fill-exp (e:TExp, soln:SolverState, scope:List<Int>) -> TExp :
+  match(fill-exp-common(e, soln)) :
+  
+    (e:TLet) : 
+      val new-ntype = fill-type!(ntype(e), soln)
+      val new-value = fill-exp(value(e), soln, scope)
+      val new-body = fill-exp(body(e), soln, scope)
+      val result = TLet(info(e), type(e), ctxt(e), n(e), new-ntype, new-value, new-body)
+
+      ;ERROR: Cannot infer definition type.
+      if ntype(e) is TUVar :
+        if not resolved?(new-ntype) :
+          add-type-error(NoInferredType(result))
+      ;ERROR: Bad assignment.
+      else :
+        if not-subtype?(type!(new-value), new-ntype) :
+          add-type-error(BadAssign(result))
+
+      result
+      
+    (e:TLetVar) : 
+      val new-ntype = fill-type!(ntype(e), soln)
+      val new-value = fill-exp?(value(e), soln, scope)
+      val new-body = fill-exp(body(e), soln, scope)
+      val result = TLetVar(info(e), type(e), ctxt(e), n(e), new-ntype, new-value, new-body)
+
+      ;ERROR: Variable type not inferred, or out of scope.
+      if ntype(e) is TUVar :
+        if not (resolved?(new-ntype) and in-scope?(new-ntype,scope)) :
+          add-type-error(NoInferredType(result))
+      ;ERROR: Bad assignment.
+      else :
+        match(new-value:TExp) :
+          if not-subtype?(type!(new-value), new-ntype) :
+            add-type-error(BadAssign(result))
+
+      result
+
+    (e:TLetTuple) : 
+      val new-ntypes = fill-types!(ntypes(e), soln)
+      val new-value = fill-exp(value(e), soln, scope)
+      val new-body = fill-exp(body(e), soln, scope)
+      val result = TLetTuple(info(e), type(e), ctxt(e), ns(e), new-ntypes, new-value, new-body)
+
+      ;ERROR: Cannot detuple type.
+      ;ERROR: Cannot infer.
+      if all?({_ is TUVar}, ntypes(e)) :    
+        val tuple-top = TTuple(map(TTop{}, ntypes(e)))
+        if not-subtype?(type!(new-value), tuple-top) :
+          add-type-error(BadDetuple(result))
+        if not all?(resolved?, new-ntypes) :
+          add-type-error(NoInferredType(result))
+      ;ERROR: Bad assignment.
+      else :
+        if not-subtype?(type!(new-value), TTuple(new-ntypes)) :
+          add-type-error(BadAssign(result))  
+      
+      result
+      
+    (e:TLetRec) : 
+      val new-defns = fill-comms(defns(e), soln, scope) as Tuple<TDefn>
+      val new-body = fill-exp(body(e), soln, scope)
+      TLetRec(info(e), type(e), ctxt(e), new-defns, new-body)
+      
+    (e:TFn) : 
+      val new-a1 = fill-types!(a1(e), soln)
+      val new-a2 = fill-type!(a2(e), soln)
+      val new-body = fill-exp(body(e), soln, scope)
+      val result = TFn(info(e), type(e), ctxt(e), tail?(e), new-a1, new-a2, args(e), new-body)
+
+      ;ERROR: Cannot infer arguments.
+      for (a in args(result), t in new-a1) do :
+        if not resolved?(t) :
+          add-type-error(NoInferredArg(result, a))
+      ;ERROR: Cannot infer return type.
+      if a2(e) is TUVar :
+        if not resolved?(new-a2) :
+          add-type-error(NoInferredReturn(result))
+      ;ERROR: Bad return.
+      else :
+        if not-subtype?(type!(new-body), new-a2) :
+          bad-return(new-body, new-a2)
+
+      result
+      
+    (e:TMulti) : 
+      val new-funcs = fill-exps(funcs(e), soln, scope) as Tuple<TFn>
+      TMulti(info(e), type(e), ctxt(e), new-funcs)
+      
+    (e:TSeq) : 
+      val new-a = fill-exp(a(e), soln, scope)
+      val new-b = fill-exp(b(e), soln, scope)
+      TSeq(info(e), type(e), ctxt(e), new-a, new-b)
+      
+    (e:TMatch) : 
+      val new-args = fill-exps(args(e), soln, scope)
+      val new-branches = fill-exps(branches(e), soln, scope) as Tuple<TBranch>
+      val result = TMatch(info(e), type(e), ctxt(e), new-args, new-branches)
+
+      ;Test each axis separately.
+      for (arg in new-args, axis in 0 to false) do :
+        val ma = type!(arg)
+        val ts = map({atypes(_)[axis] as Type}, new-branches)
+        for branch in 0 to length(new-branches) do :
+          if branch-arg?(ma, branch, ts, current-hier()) is False :
+            add-type-error(BadBranchArg(result, branch, axis))
+      
+      result
+      
+    (e:TBranch) : 
+      val new-atypes = fill-types!(atypes(e), soln)
+      val new-body = fill-exp(body(e), soln, scope)
+      TBranch(info(e), type(e), ctxt(e), args(e), new-atypes, new-body)
+      
+    (e:TNew) : 
+      val new-methods = fill-methods(methods(e), One(class(e)), soln, scope)
+      TNew(info(e), type(e), ctxt(e), class(e), new-methods)
+
+    (e:TRef) : 
+      if type(e) is False :
+        add-type-error(BadHiStanzaRef(e))
+      fill-true-type(e, soln)
+      
+    (e:TCast) : 
+      val new-exp = fill-exp(exp(e), soln, scope)
+      val result = TCast(info(e), type(e), ctxt(e), new-exp, targ(e))
+
+      if castable?(type!(new-exp), targ(e), current-hier()) is False :
+        add-type-error(BadCast(result))
+
+      result
+      
+    (e:TUpCast) : 
+      val new-exp = fill-exp(exp(e), soln, scope)
+      val result = TUpCast(info(e), type(e), ctxt(e), new-exp, targ(e))
+
+      ;ERROR: BadUpCast
+      if not-subtype?(type!(exp(e)), targ(e)) :
+        add-type-error(BadUpCast(result))
+
+      result
+
+    (e:TSet) : 
+      val new-ref = fill-exp(ref(e), soln, scope) as TRef
+      val new-value = fill-exp(value(e), soln, scope)
+      val result = TSet(info(e), type(e), ctxt(e), new-ref, new-value)
+
+      ;ERROR: BadSet: Variable cannot be referenced from HiStanza.
+      if type(new-ref) is False :
+        add-type-error(BadSetRef(result))
+      ;ERROR: Bad type assigned to variable.
+      else :
+        if not-subtype?(type!(new-value), type!(new-ref)) :
+          add-type-error(BadSetValue(result))
+
+      result      
+
+    (e:TDo) : 
+      val new-func = fill-exp(func(e), soln, scope)
+      val new-args = fill-args(args(e), soln, scope)
+      val result = TDo(info(e), type(e), ctxt(e), new-func, targs(e), new-args)
+
+      ;Compute whether the func is of a type that
+      ;can be called with the given arity.
+      val check-args = check-args(ctxt(new-func) as CallCtxt)
+      val good-call? = all?(resolved?, check-args)
+      if good-call? :
+        check-against-arg-types(BadArgTypes{result, _}, new-args, check-args)
+
+      ;ERROR: Value cannot be called as function.
+      else if new-func is-not TMix :
+        add-type-error(NotFunction(result))        
+
+      result
+
+    (e:TPrim) : 
+      val new-args = fill-exps(args(e), soln, scope)
+      val result = TPrim(info(e), type(e), ctxt(e), op(e), new-args)
+
+      ;ERROR: Bad primitive
+      if not-callable?(op(e), map(type!,new-args)) :
+        add-type-error(BadPrimitive(result))
+
+      result
+
+    (e:TLiteral) : 
+      e
+      
+    (e:TTupleExp) : 
+      val new-exps = fill-exps(exps(e), soln, scope)
+      TTupleExp(info(e), type(e), ctxt(e), new-exps)
+      
+    (e:TMix) :
+      val new-exp-args = fill-types!(exp-args(e), soln)
+      val new-sel = fill-sel(sel(e) as Selection, soln)
+      val new-inst = fill-inst(inst(e) as Instantiation, soln)
+      val [pruned-sel, pruned-inst] = select(new-sel, new-inst)
+      val filled-refs = map(fill-true-type{_, soln}, refs(e))
+      val new-refs = instantiated(filled-refs, pruned-inst)
+      val result = TMix(info(e), type(e), ctxt(e), new-refs, pruned-sel, pruned-inst, new-exp-args)
+
+      ;ERROR: Ambiguous mixture of functions.
+      if new-sel is SVar :
+        add-type-error(AmbMix(result))
+      ;ERROR: No appropriate function.
+      else if empty?(pruned-inst) :
+        add-type-error(NoMix(result))
+      ;ERROR: Multiple appropriate functions.
+      else :
+        val funcs = funcs(pruned-inst as InstFns)
+        val arrows = map(type, funcs)
+        val not-disjoint? = match(ctxt(e)) :
+          (ctxt:ExpCtxt) :
+            match(expected-arg-types(expected(ctxt))) :
+              (ets:Blocked) : not-disjoint-multiarity?(arrows, [])
+              (ets:Tuple<Tuple<Type>>) : not-disjoint-multiarity?(arrows, ets)
+          (ctxt:CallCtxt) :
+            not-disjoint?(arrows, map(type, fargs(ctxt)))
+        if not-disjoint? :
+          add-type-error(AmbMix(result))
+      
+      result
+      
+
+;Fill the solved types in the given command.
+defn fill-ls-comm (comm:LSComm, soln:SolverState, scope:List<Int>) -> LSComm :
+
+  ;Run post-fill checks on the command.
+  defn post-checks (comm:LSComm) -> LSComm :
+    ;Ensure that subexpressions are bounded.
+    for item in comm do :
+      match(item:LSExp) :
+        check-bounded(item, true)
+    comm
+
+  post-checks $ match(comm) :
+    (comm:LSCall) : 
+      val new-exp = fill-ls-exp(exp(comm), soln, scope)
+      LSCall(info(comm), new-exp)
+      
+    (comm:LSSet) : 
+      val new-exp = fill-ls-exp(exp(comm), soln, scope)
+      val new-value = fill-ls-exp(value(comm), soln, scope)
+      val result = LSSet(info(comm), new-exp, new-value)
+
+      ;ERROR: Not LValue.
+      if not-lvalue?(new-exp) :
+        add-type-error(BadLValue(result))
+        
+      ;ERROR: Bad Set.
+      else :
+        if not-assignable?(type!(new-value), type!(new-exp)) :
+          add-type-error(BadSetValue(result))
+
+      result
+      
+    (comm:LSLabels) : 
+      val new-blocks = fill-ls-comms(blocks(comm), soln, scope) as Tuple<LSLabeledBlock>
+      LSLabels(info(comm), new-blocks)
+
+    (comm:LSLabeledBlock) : 
+      val new-body = fill-ls-comm(body(comm), soln, scope)
+      LSLabeledBlock(info(comm), n(comm), args(comm), atypes(comm), new-body)
+      
+    (comm:LSGoto) : 
+      val new-args = fill-ls-exps(args(comm), soln, scope)
+      val result = LSGoto(info(comm), n(comm), new-args)
+
+      ;Compute whether the goto is valid (right arity).
+      val good-goto? = good-exp-ctxts?(new-args)
+
+      ;ERROR: Bad goto arguments.
+      if good-goto? :
+        check-against-exp-types(BadGotoArgs{result, _}, new-args)
+        
+      ;ERROR: Bad arity for goto.
+      else :
+        add-type-error(BadGotoArity(result))
+
+      result
+
+    (comm:LSReturn) : ;[Reviewed]
+      val new-exp = fill-ls-exp(exp(comm), soln, scope)
+      val result = LSReturn(info(comm), new-exp)
+
+      ;Determine whether the return-type is specified.
+      val good-return? = good-exp-ctxt?(new-exp)
+        
+      ;ERROR: Bad return value.p
+      if good-return? :
+        val et = expected(ctxt(new-exp) as LSExpCtxt)
+        if not-assignable?(type!(new-exp), et) :
+          add-type-error(BadLSReturn(result))
+
+      ;Return result
+      result
+      
+    (comm:LSDef) : 
+      val new-type = fill-ls-type!(type(comm), soln)
+      val new-value = fill-ls-exp(value(comm), soln, scope)
+      val result = LSDef(info(comm), n(comm), new-type, new-value)
+
+      ;ERROR: No inferred type.
+      if type(comm) is UVarT :
+        if not resolved?(new-type) :
+          add-type-error(NoInferredType(result))
+      ;ERROR: Bad assignment.
+      else :
+        if not-assignable?(type!(new-value), new-type) :
+          add-type-error(BadAssign(result))
+        
+      result
+      
+    (comm:LSDefVar) : 
+      val new-value = fill-ls-exp?(value(comm), soln, scope)
+      val result = LSDefVar(info(comm), n(comm), type(comm), new-value)
+
+      ;ERROR: Bad assignment.
+      match(new-value:LSExp) :
+        if not-assignable?(type!(new-value), type(comm)) :
+          add-type-error(BadAssign(result))
+
+      result
+      
+    (comm:LSSeq) : 
+      val new-a = fill-ls-comm(a(comm), soln, scope)
+      val new-b = fill-ls-comm(b(comm), soln, scope)
+      LSSeq(info(comm), new-a, new-b)
+
+    (comm:LSIf) : 
+      val new-pred = fill-ls-exp(pred(comm), soln, scope)
+      val new-conseq = fill-ls-comm(conseq(comm), soln, scope)
+      val new-alt = fill-ls-comm(alt(comm), soln, scope)
+      val result = LSIf(info(comm), new-pred, new-conseq, new-alt)
+
+      ;ERROR: Bad value used as predicate.
+      if not-assignable?(type!(new-pred), LongT()) :
+        add-type-error(BadIfPred(new-pred))
+
+      result
+
+    (comm:LSMatch) : 
+      val new-args = fill-ls-exps(args(comm), soln, scope)
+      val new-branches = fill-ls-comms(branches(comm), soln, scope) as Tuple<LSBranch>
+      val result = LSMatch(info(comm), new-args, new-branches)
+
+      ;Detect any non-ref types in match and branches.
+      ;Track whether any arguments are unresolved.
+      var args-blocked:True|False = false
+      for (arg in new-args, axis in 0 to false) do :
+        match(ref-type?(type!(arg))) :
+          (b:Blocked) : args-blocked = true
+          (b:False) : add-type-error(BadMatchArg(result,axis))
+          (b:True) : false
+
+      ;If the arguments are good, then check the branches.
+      if not args-blocked :
+        for (branch in new-branches, bi in 0 to false) do :
+          for (type in atypes(branch), axis in 0 to false) do :
+            match(ref-type?(type as LSType)) :
+              (b:Blocked) : args-blocked = true
+              (b:False) : add-type-error(BadBranchArg(result, bi, axis))
+              (b:True) : false
+              
+      ;If all ref types, then test the actual argument.
+      defn reft! (t:LSType|False) : type(t as RefT)
+      if not args-blocked :
+        for (arg in new-args, axis in 0 to false) do :
+          val ma = reft!(type!(arg))
+          val ts = map(reft!{atypes(_)[axis]}, new-branches)
+          for branch in 0 to length(new-branches) do :
+            if branch-arg?(ma, branch, ts, current-hier()) is False :
+              add-type-error(BadBranchArg(result, branch, axis))            
+
+      result
+      
+    (comm:LSBranch) : 
+      val new-atypes = fill-ls-types!(atypes(comm), soln)
+      val new-body = fill-ls-comm(body(comm), soln, scope)
+      LSBranch(info(comm), args(comm), new-atypes, new-body)
+
+    (comm:LSSkip) : 
+      comm
+
+;Fill the solved types in the given expression.
+defn fill-ls-exp (e:LSExp, soln:SolverState, scope:List<Int>) -> LSExp :
+  match(fill-ls-exp-common(e, soln)) :
+    (e:LSVar) : 
+      fill-true-type(e, soln)
+      
+    (e:LSNew) : 
+      val new-args = fill-ls-exps(args(e), soln, scope)
+      val result = LSNew(info(e), type(e), ctxt(e), n(e), targs(e), new-args)
+
+      ;Is the arity well-formed?
+      val good-new? = good-exp-ctxts?(new-args)
+      if good-new? :
+        check-against-exp-types(BadObjectArgs{result, _}, new-args)
+      else :
+        if length(targs(e)) != type-arity(current-hier(), n(e)) :
+          add-type-error(BadObjectTArity(result))
+        else :
+          add-type-error(BadObjectArity(result))
+
+      ;If the type does not support new.
+      if not supports-new?(n(e)) :
+        add-type-error(UnsupportedNew(result))
+
+      result
+      
+    (e:LSStruct) : 
+      val new-args = fill-ls-exps(args(e), soln, scope)
+      val result = LSStruct(info(e), type(e), ctxt(e), n(e), targs(e), new-args)
+
+      ;Is the arity well-formed?
+      val good-new? = good-exp-ctxts?(new-args)
+      if good-new? :
+        check-against-exp-types(BadObjectArgs{result, _}, new-args)
+      else :
+        if length(targs(e)) != type-arity(current-hier(), n(e)) :
+          add-type-error(BadObjectTArity(result))
+        else :
+          add-type-error(BadObjectArity(result))
+
+      ;Is the type bounded?
+      if not-bounded?(n(e)) :
+        add-type-error(UnboundedStruct(result))
+      
+      result
+
+    (e:LSAddr) : 
+      val new-exp = fill-ls-exp(exp(e), soln, scope)
+      val result = LSAddr(info(e), type(e), ctxt(e), new-exp, unstable?(e))
+
+      ;ERROR: Access unstable location.
+      if not unstable?(e) :
+        if heap-loc?(new-exp) is True :
+          add-type-error(UnstableAddr(result))
+
+      result
+
+    (e:LSDeref) : 
+      val new-exp = fill-ls-exp(exp(e), soln, scope)
+      val result = LSDeref(info(e), type(e), ctxt(e), new-exp)
+
+      ;ERROR: Solver cannot deref value with given type.
+      if type(e) is UVarT :
+        add-type-error(BadDeref(result))
+      
+      result
+
+    (e:LSSlot) : 
+      val new-exp = fill-ls-exp(exp(e), soln, scope)
+      val new-index = fill-ls-exp(index(e), soln, scope)
+      val result = LSSlot(info(e), type(e), ctxt(e), new-exp, new-index)
+
+      ;ERROR: Solver cannot deslot the given type.
+      if type(e) is UVarT  :
+        add-type-error(BadDeslot(result))
+      ;ERROR: Bad index.
+      if not-assignable?(type!(new-index), LongT()) :
+        add-type-error(BadIndex(result))
+
+      result
+      
+    (e:LSField) : 
+      val new-exp = fill-ls-exp(exp(e), soln, scope)
+      val result = LSField(info(e), type(e), ctxt(e), new-exp, name(e))
+
+      ;ERROR: Solver could not access field.
+      if type(e) is UVarT :
+        add-type-error(BadField(result))
+
+      result
+      
+    (e:LSDo) : 
+      val new-func = fill-ls-exp(func(e), soln, scope)
+      val new-args = fill-ls-args(args(e), soln, scope)
+      val result = LSDo(info(e), type(e), ctxt(e), new-func, targs(e), new-args)
+
+      ;Compute whether the function is of a type that
+      ;can be called with the given arity.
+      val check-args = check-args(ctxt(new-func) as LSCallCtxt)
+      val good-call? = all?(resolved?, check-args)
+      if good-call? :
+        check-against-arg-types(BadArgTypes{result, _}, new-args, check-args)
+      ;ERROR: Value cannot be called as function.
+      else if new-func is-not LSMix :
+        add-type-error(NotFunction(result))
+
+      result
+
+    (e:LSCallC) : 
+      val new-func = fill-ls-exp(func(e), soln, scope)
+      val new-args = fill-ls-args(args(e), soln, scope)
+      val result = LSCallC(info(e), type(e), ctxt(e), new-func, new-args)
+
+      ;Compute whether the function is of a type that
+      ;can be called with the given arity.
+      val check-args = check-args(ctxt(new-func) as LSCallCtxt)
+      val good-call? = all?(resolved?, check-args)
+      if good-call? :
+        check-against-arg-types(BadArgTypes{result, _}, new-args, check-args)
+      ;ERROR: Value cannot be called as function.
+      else if new-func is-not LSMix :
+        add-type-error(NotFunction(result))
+
+      result
+
+    (e:LSPrim) : 
+      val new-args = fill-ls-exps(args(e), soln, scope)
+      val result = LSPrim(info(e), type(e), ctxt(e), op(e), new-args)
+
+      ;ERROR: Bad primitive
+      val arg-types = map(type!, new-args)
+      if callable?(op(e), arg-types, current-hier()) is False :
+          add-type-error(BadPrimitive(result))      
+
+      result
+      
+    (e:LSSizeof) : 
+      if has-size?(targ(e)) is False :
+        add-type-error(BadSize(e))
+      e
+      
+    (e:LSTagof) : 
+      e
+
+    (e:LSCast) : 
+      val new-exp = fill-ls-exp(exp(e), soln, scope)
+
+      ;Convert into LSConv if its a conversion operation.
+      val conv? = convert?(type!(new-exp), targ(e)) is True
+      if conv? :
+        LSConv(info(e), type(e), ctxt(e), new-exp, targ(e))
+
+      ;Otherwise convert into a LSCast if its a reinterpretation operation.
+      else :
+        val result = LSCast(info(e), type(e), ctxt(e), new-exp, targ(e))
+
+        ;ERROR: Bad cast.
+        if castable?(type!(exp(e)), targ(e), current-hier()) is False :
+          add-type-error(BadCast(result))
+
+        result
+      
+    (e:LSLiteral) : 
+      e
+      
+    (e:LSAnd) : 
+      val new-a = fill-ls-exp(a(e), soln, scope)
+      val new-b = fill-ls-exp(b(e), soln, scope)
+      val result = LSAnd(info(e), type(e), ctxt(e), new-a, new-b)
+
+      ;ERROR: Bad value used as branches.
+      if not-assignable?(type!(new-a), LongT()) :
+        add-type-error(BadAndArg(new-a))
+      if not-assignable?(type!(new-b), LongT()) :
+        add-type-error(BadAndArg(new-b))
+
+      result
+      
+    (e:LSOr) : 
+      val new-a = fill-ls-exp(a(e), soln, scope)
+      val new-b = fill-ls-exp(b(e), soln, scope)
+      val result = LSOr(info(e), type(e), ctxt(e), new-a, new-b)
+
+      ;ERROR: Bad value used as branches.
+      if not-assignable?(type!(new-a), LongT()) :
+        add-type-error(BadOrArg(new-a))
+      if not-assignable?(type!(new-b), LongT()) :
+        add-type-error(BadOrArg(new-b))
+
+      result
+      
+    (e:LSLetExp) : 
+      val new-comm = fill-ls-comm(comm(e), soln, scope)
+      val new-exp = fill-ls-exp(exp(e), soln, scope)
+      LSLetExp(info(e), type(e), ctxt(e), new-comm, new-exp)
+      
+    (e:LSMix) :
+      ;Fill the selection, instances, and refs.
+      val new-exp-args = fill-ls-types!(exp-args(e), soln)
+      val new-sel = fill-sel(sel(e) as Selection, soln)
+      val new-inst = fill-inst(inst(e) as LSInstFns, soln)
+      val [pruned-sel, pruned-insts] = ls-select(new-sel, new-inst)
+      val filled-refs = map(fill-true-type{_, soln}, refs(e))
+      val pruned-refs = instantiated(filled-refs, pruned-insts)
+      val result = LSMix(info(e), type(e), ctxt(e), pruned-refs, pruned-sel, pruned-insts, new-exp-args)
+
+      ;Only bother when the ctxt is correct.
+      if ctxt(e) is LSCallCtxt|LSAddrCtxt :
+        
+        ;Issue error if selection is unsolved.
+        if new-sel is SVar :
+          add-type-error(AmbMix(result))
+        else if empty?(funcs(pruned-insts)) :
+          add-type-error(NoMix(result))
+        else :
+          match(ctxt(e)) :
+            ;Check function mixing if in LSCallCtxt.
+            (ctxt:LSCallCtxt) :
+              ;If solver could not successfully merge the functions.
+              if type(e) is UVarT :
+                add-type-error(AmbMix(result))
+              else :
+                val fnts = map(type, funcs(pruned-insts))
+                if not-disjoint?(type(e) as FnT, fnts, map(type, fargs(ctxt))) :
+                  add-type-error(AmbMix(result))
+                  
+            ;Check single selection if in LSAddrCtxt.
+            (ctxt:LSAddrCtxt) :
+              ;If successfully selected the function then return that LSVar.
+              if length(pruned-refs) > 1 :
+                add-type-error(AmbMix(result))
+
+        ;Return the variable directly if in addr context.
+        if ctxt(e) is LSAddrCtxt and length(pruned-refs) == 1 :
+          pruned-refs[0]
+        ;Otherwise, return the LSMix.
+        else :
+          result
+        
+      else :
+        if ctxt(e) is-not LSBadCtxt :
+          add-type-error(FunctionRefInInvalidCtxt(result))
+        result
+        
+    (e:LSFn) :
+      val new-ref = fill-exp(ref(e), soln, scope)
+      LSFn(info(e), type(e), ctxt(e), new-ref)
+
+;Ensure that the appropriate sub-expressions within e have bounded
+;types.
+defn check-bounded (e:LSExp, required-bounded?:True|False) -> False :
+  match(e) :
+    ;Expression needs to be a ptr/ref. Always needs to be
+    ;bounded.
+    (e:LSDeref) :
+      check-bounded(exp(e), true)
+      
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(type!(e)) :
+        add-type-error(UnboundedDeref(e))
+
+    ;Expressions in function position to not need to be
+    ;bounded.
+    (e:LSDo|LSCallC) :
+      check-bounded(func(e), false)
+      do(check-bounded{type(_), true}, args(e))
+
+    ;Expression does not need to be bounded, as we are taking
+    ;its address.
+    (e:LSAddr) :
+      check-bounded(exp(e), false)
+
+    ;The expression does not need to be bounded because we
+    ;are retrieving a specific subfield anyway.
+    (e:LSField) :
+      check-bounded(exp(e), false)
+
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(type!(e)) :
+        add-type-error(UnboundedField(e))
+
+    ;If context needs to be bounded, then expression also
+    ;needs to be bounded.
+    (e:LSCast) :
+      check-bounded(exp(e), required-bounded?)
+
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(targ(e)) :
+        add-type-error(UnboundedCast(e))    
+
+    ;The expression does not need to be bounded because LSSlot
+    ;allows for it to be RestT type.
+    (e:LSSlot) :      
+      check-bounded(exp(e), false)
+      check-bounded(index(e), true)
+
+      ;Ensure that output is bounded if necessary.
+      if required-bounded? and not-bounded?(type!(e)) :
+        add-type-error(UnboundedDeslot(e))
+
+    ;Propgate context into let expressions.
+    ;We assume recursion at the caller-side will handle the
+    ;nested LSComm.
+    (e:LSLetExp) :
+      check-bounded(exp(e), required-bounded?)
+    
+    ;By default, expressions are expected to have
+    ;bounded types.
+    (e) :
+      for item in e do :
+        match(item:LSExp) :
+          check-bounded(item, true)
+
+;Generate error messages for bad return type.
+defn bad-return (e:TExp, a2:Type) -> False :
+  match(e) :
+    (e:TLet|TLetVar|TLetTuple|TLetRec|TBranch) :
+      bad-return(body(e), a2)
+    (e:TSeq) :
+      bad-return(b(e), a2)
+    (e:TMatch) :
+      do(bad-return{_, a2}, branches(e))
+    (e) :
+      if not-subtype?(type!(e), a2) :
+        add-type-error(BadReturn(e, a2))
+
+;Fill the solution for the given method.
+defn fill-method (m:TDefmethod, new-t:Maybe<Type>, soln:SolverState, scope:List<Int>) -> TDefmethod :
+  val new-multi = fill-multi(multi(m) as TMix, soln)
+  val tvars = to-list $ cat(targs(m), cargs(m))
+  val new-a2 = fill-type!(a2(m), soln)
+  val new-body = fill-exp(body(m), soln, tvars)
+  val result = TDefmethod(info(m), tail?(m), n(m), new-multi, thisn(m), targs(m), cargs(m),
+                          a1(m), new-a2, args(m), new-body)
+                          
+  ;ERROR: Return type not inferred.
+  if a2(m) is TUVar :
+    if not resolved?(new-a2) :
+      add-type-error(NoInferredReturn(result))
+  ;ERROR: Bad return.
+  else :
+    if not-subtype?(type!(new-body), new-a2) :
+      bad-return(new-body, new-a2)
+
+  ;ERROR: Check submethod.
+  val multi-type = type!(new-multi)
+  if resolved?(multi-type) :
+    if not-submethod?(multi-type as TArrow, a1(m) as Tuple<FArg<Type>>, new-a2) :
+      add-type-error(BadSubmethod(result))
+
+  ;ERROR: Check 'this' type.
+  if not empty?(new-t) :
+    val this-index = index-of!(args(m), thisn(m))
+    val this-type = type(a1(m)[this-index]) as Type
+    if not this-type?(this-type, value!(new-t), current-hier()) :
+      add-type-error(BadThisType(result, value!(new-t)))
+
+  result  
+
+;Fill the true-type field in the given reference.
+defn fill-true-type<?T> (r:?T&(TRef|LSVar), soln:SolverState) -> T :
+  match(r) :
+    (r:TRef) :
+      val t = fill-type-lstype(true-type(r) as Type|LSType, soln)
+      sub-true-type(r, t) as TRef&T
+    (r:LSVar) : 
+      val t = fill-type-lstype(true-type(r) as Type|LSType, soln)
+      sub-true-type(r, t) as LSVar&T
+
+;Fill the solution for the given multi.
+defn fill-multi (multis:TMix, soln:SolverState) -> TMix :
+  val m = fill-exp-common(multis, soln) as TMix
+  val new-exp-args = fill-types!(exp-args(multis), soln)
+  val new-sel = fill-sel(sel(m) as Selection, soln)
+  val new-inst = fill-inst(inst(m) as Instantiation, soln)
+  val [pruned-sel, pruned-inst] = select(new-sel, new-inst)
+  val filled-refs = map(fill-true-type{_, soln}, refs(m))
+  val pruned-refs = instantiated(filled-refs, pruned-inst)
+  val result = TMix(info(m), type(m), ctxt(m), pruned-refs, pruned-sel, pruned-inst, new-exp-args)
+
+  ;ERROR: No appropriate multi
+  if empty?(pruned-inst) :
+    add-type-error(NoMulti(result))
+  ;ERROR: Multiple multis.
+  else if new-sel is SVar or length(pruned-refs) > 1 :
+    add-type-error(AmbMulti(result))
+
+  result  
+
+;Fill only the common fields of the given expression.
+;Currently, the 'type' and the 'ctxt'.
+defn fill-exp-common (e:TExp, soln:SolverState) -> TExp :
+  val new-type = fill-type!(type(e), soln)
+  val new-ctxt = fill-ctxt(ctxt(e) as Context, soln)
+  e $> sub-type{_, new-type}
+    $> sub-ctxt{_, new-ctxt}
+
+;Fill only the common fields of the given expression.
+;Currently, the 'type' and 'ctxt' fields.
+defn fill-ls-exp-common (e:LSExp, soln:SolverState) -> LSExp :
+  val new-type = fill-ls-type!(type(e), soln)
+  val new-ctxt = fill-ls-ctxt(ctxt(e) as LSContext, soln)
+  e $> sub-type{_, new-type}
+    $> sub-ctxt{_, new-ctxt}
+
+;Fill the solved types with the solutions.
+;Any unsolved variables remain as TUVar and UVarT.
+defn fill-type-lstype (t:Type|LSType, soln:SolverState) -> Type|LSType :
+  val result = let loop (t:TypeItem = t) :
+    match(t:TUVar|UVarT) :
+      match(soln[n(t)]) :
+        (t:SolvedType) : value(t)
+        (v) : t
+    else :
+      map(loop, t)
+  result as Type|LSType
+
+;Fill the given context with the solutions.
+defn fill-ctxt (ctxt:Context, soln:SolverState) -> Context :
+  val result = let loop (item:TLItem = ctxt) :
+    match(item:Type) : fill-type!(item, soln)
+    else : map(loop, item)
+  result as Context
+
+;Fill the given LoStanza context with the solutions.
+defn fill-ls-ctxt (ctxt:LSContext, soln:SolverState) -> LSContext :
+  val result = let loop (item:TLItem = ctxt) :
+    match(item:Type|LSType) : fill-type-lstype(item, soln)
+    else : map(loop, item)
+  result as LSContext
+
+;Fill the given Selection with the values.
+defn fill-sel (s:Selection, soln:SolverState) -> Selection :
+  match(s:SVar) :
+    match(soln[n(s)]) :
+      (x:SolvedSel) :
+        if all?({_ is True|False|PartialMatch}, values(x)) :
+          SSel(values(x) as Tuple<True|False|PartialMatch>)
+        else : s
+      (x) : s
+  else : s
+
+;Fill the given instantiation with the solved values.
+defn fill-inst (i:Instantiation, soln:SolverState) -> Instantiation :
+  match(i) :
+    (i:InstVar) :
+      match(soln[n(i)]) :
+        (x:SolvedInstantiation) : InstFns(funcs(x))
+        (x) : i
+    (i:InstFns) :
+      InstFns $ for f in funcs(i) map :
+        map(fill-type!{_, soln}, f)
+
+;Fill the given LoStanza instantiations with their solved types.
+defn fill-inst (instfns:LSInstFns, soln:SolverState) -> LSInstFns :
+  LSInstFns $ for func in funcs(instfns) map :
+    map(fill-type-lstype{_, soln}, func)
+
+;Select the chosen instantiations.
+defn select (s:Selection, i:Instantiation) -> [Selection, Instantiation] :
+  match(s:SSel, i:InstFns) :
+    ;Sanity check.
+    if length(sels(s)) != length(funcs(i)) :
+      fatal("Mismatch between selection and instantiation.")
+
+    ;Prune the false matches from the instantiation.
+    val new-sels = Vector<True|PartialMatch>()
+    val new-funcs = Vector<InstFn>()
+    for (s in sels(s), f in funcs(i)) do :
+      match(s:True|PartialMatch) :
+        add(new-sels,s)
+        add(new-funcs,f)
+        
+    ;Return the new selection and insts
+    [SSel(to-tuple(new-sels)), InstFns(to-tuple(new-funcs))]
+  else :
+    [s, i]
+
+;Select the chosen instantiations.
+defn ls-select (s:Selection, insts:LSInstFns) -> [Selection, LSInstFns] :
+  match(s:SSel) :
+    ;Sanity check.
+    if length(sels(s)) != length(funcs(insts)) :
+      fatal("Mismatch between selection and instantiation.")
+
+    ;Prune the false matches from the instantiation.
+    val new-sels = Vector<True|PartialMatch>()
+    val new-funcs = Vector<LSInstFn>()
+    for (s in sels(s), f in funcs(insts)) do :
+      match(s:True|PartialMatch) :
+        add(new-sels, s)
+        add(new-funcs, f)
+
+    ;Return the new selection and insts
+    [SSel(to-tuple(new-sels)), LSInstFns(to-tuple(new-funcs))]
+  else :
+    [s, insts]
+
+;Returns true if i represents InstFns with no funcs.
+defn empty? (i:Instantiation) -> True|False :
+  empty?(funcs(i as InstFns))
+
+;Return the set of TRef that is actually instantiated.
+;If instantiation is unsolved, then return false.
+defn instantiated (rs:Tuple<TRef>, i:Instantiation) -> Tuple<TRef> :
+  match(i:InstFns) :
+    if empty?(funcs(i)) :
+      rs
+    else :
+      val ns = to-intset(seq(n, funcs(i)))
+      to-tuple $ for r in rs filter :
+        ns[n(r)]
+  else :
+    rs
+
+;Return the set of LSVar that is actually instantiated.
+;If inst is empty, then the given rs is returned unchanged so that
+;error messages can be created.
+defn instantiated (rs:Tuple<LSVar>, inst:LSInstFns) -> Tuple<LSVar> :
+  if empty?(funcs(inst)) :
+    rs
+  else :
+    val ns = to-intset(seq(n, funcs(inst)))
+    to-tuple $ for r in rs filter :
+      ns[n(r)]
+
+;Returns true if e is in expression context with
+;resolved type.
+defn good-exp-ctxt? (e:TExp) -> True|False :
+  match(ctxt(e)) :
+    (ctxt:ExpCtxt) : resolved?(expected(ctxt))
+    (ctxt) : false
+
+;Returns true if e is in expression context with
+;resolved type.
+defn good-exp-ctxt? (e:LSExp) -> True|False :
+  match(ctxt(e)) :
+    (ctxt:LSExpCtxt) : resolved?(expected(ctxt))
+    (ctxt) : false
+
+;Returns true if all es are in expression contexts with
+;resolved types.
+defn good-exp-ctxts? (es:Seqable<TExp>) -> True|False :
+  all?(good-exp-ctxt?,es)
+defn good-exp-ctxts? (es:Seqable<FArg<TExp>>) -> True|False :
+  good-exp-ctxts?(seq(type,es))
+
+;Returns true if all es are in expression contexts with
+;resolved types.  
+defn good-exp-ctxts? (es:Seqable<LSExp>) -> True|False :
+  all?(good-exp-ctxt?,es)
+defn good-exp-ctxts? (es:Seqable<FArg<LSExp>>) -> True|False :
+  good-exp-ctxts?(seq(type,es))
+
+;Helper: Check given expressions against their argument types, and collect the
+;indices of the ones that do not. If it is not empty, then use Error to create a new type error.
+defn check-against-arg-types (Error:Tuple<Int> -> TypeError, es:Tuple<TExp>, ts:Tuple<Type>) -> False :
+  val idx = for i in 0 to length(es) filter :
+    not-subtype?(type!(es[i]), ts[i])
+  if not empty?(idx) :
+    add-type-error(Error(to-tuple(idx)))
+
+defn check-against-arg-types (Error:Tuple<Int> -> TypeError, es:Tuple<FArg<TExp>>, ts:Tuple<Type>) -> False :
+  check-against-arg-types(Error, map(type,es), ts)
+
+;Helper: Check given expressions against their argument types, and collect the
+;indices of the ones that do not. If it is not empty, then use Error to create a new type error.
+defn check-against-arg-types (Error:Tuple<Int> -> TypeError, es:Tuple<LSExp>, ts:Tuple<LSType>) -> False :
+  val idx = for i in 0 to length(es) filter :
+    not-assignable?(type!(es[i]), ts[i])
+  if not empty?(idx) :
+    add-type-error(Error(to-tuple(idx)))
+
+defn check-against-arg-types (Error:Tuple<Int> -> TypeError, es:Tuple<FArg<LSExp>>, ts:Tuple<LSType>) -> False :
+  check-against-arg-types(Error, map(type,es), ts)
+
+;Helper: Check given expressions against their expected types, and collect the
+;indices of the ones that do not. If it is not empty, then use Error to create a new type error.
+defn check-against-exp-types (Error:Tuple<Int> -> TypeError, es:Tuple<TExp>) -> False :
+  val idx = for (i in 0 to false, e in es) filter :
+    val et = expected(ctxt(e) as ExpCtxt)
+    not-subtype?(type!(e), et)
+  if not empty?(idx) :
+    add-type-error(Error(to-tuple(idx)))   
+
+;Helper: Check given expressions against their expected types, and collect the
+;indices of the ones that do not. If it is not empty, then use Error to create a new type error.
+defn check-against-exp-types (Error:Tuple<Int> -> TypeError, es:Tuple<LSExp>) -> False :
+  val idx = for (i in 0 to false, e in es) filter :
+    val et = expected(ctxt(e) as LSExpCtxt)
+    not-assignable?(type!(e), et)
+  if not empty?(idx) :
+    add-type-error(Error(to-tuple(idx)))
+
+;============================================================
+;================= Convenience Fillers ======================
+;============================================================
+
+;Type-casted versions of fill-type-lstype.
+defn fill-type! (t:Type|False, soln:SolverState) -> Type :
+  fill-type-lstype(t as Type, soln) as Type
+defn fill-ls-type! (t:LSType|False, soln:SolverState) -> LSType :
+  fill-type-lstype(t as LSType, soln) as LSType    
+
+;Fill a function argument.
+defn fill-arg (a:FArg<TExp>, soln:SolverState, scope:List<Int>) -> FArg<TExp> :
+  map(fill-exp{_, soln, scope}, a)
+defn fill-ls-arg (a:FArg<LSExp>, soln:SolverState, scope:List<Int>) -> FArg<LSExp> :
+  map(fill-ls-exp{_, soln, scope}, a)
+
+;Fill multiple function arguments.
+defn fill-args (xs:Tuple<FArg<TExp>>, soln:SolverState, scope:List<Int>) -> Tuple<FArg<TExp>> :
+  map(fill-arg{_, soln, scope}, xs)
+defn fill-ls-args (xs:Tuple<FArg<LSExp>>, soln:SolverState, scope:List<Int>) -> Tuple<FArg<LSExp>> :
+  map(fill-ls-arg{_, soln, scope}, xs)
+
+;Fill multiple commands
+defn fill-comms (cs:Tuple<TComm>, soln:SolverState, scope:List<Int>) -> Tuple<TComm> :
+  map(fill-comm{_, soln, scope}, cs)
+
+;Fill multiple types.
+defn fill-types! (ts:Tuple<Type|False>, soln:SolverState) -> Tuple<Type> :
+  map(fill-type!{_, soln}, ts)
+defn fill-ls-types! (ts:Tuple<LSType|False>, soln:SolverState) -> Tuple<LSType> :
+  map(fill-ls-type!{_, soln}, ts)
+
+;Fill an optional expression.
+defn fill-exp? (e:TExp|False, soln:SolverState, scope:List<Int>) -> TExp|False :
+  match(e:TExp) :
+    fill-exp(e, soln, scope)
+
+;Fill multiple expressions.
+defn fill-exps (es:Tuple<TExp>, soln:SolverState, scope:List<Int>) -> Tuple<TExp> :
+  map(fill-exp{_, soln, scope}, es)
+
+;Fill multiple lostanza expressions.
+defn fill-ls-exps (es:Tuple<LSExp>, soln:SolverState, scope:List<Int>) -> Tuple<LSExp> :
+  map(fill-ls-exp{_, soln, scope}, es)
+
+;Fill multiple lostanza commands.
+defn fill-ls-comms (cs:Tuple<LSComm>, soln:SolverState, scope:List<Int>) -> Tuple<LSComm> :
+  map(fill-ls-comm{_, soln, scope}, cs)
+
+;Fill an optional Lostanza expression.
+defn fill-ls-exp? (e:LSExp|False, soln:SolverState, scope:List<Int>) -> LSExp|False :
+  match(e:LSExp) :
+    fill-ls-exp(e, soln, scope)
+
+;Fill multiple methods.
+defn fill-methods (ms:Tuple<TDefmethod>, thist:Maybe<Type>,
+                   soln:SolverState, scope:List<Int>) -> Tuple<TDefmethod> :
+  map(fill-method{_, thist, soln, scope}, ms)
+
+;============================================================
+;============= Resolved Predicates for Checking =============
+;============================================================
+
+;Returns true if the given expression is a proper LValue.
+;Must be called with a syntactically-valid lvalue.
+defn lvalue? (e:LSExp) -> PredResult :
+  match(e) :
+    (e:LSVar) :
+      mutable-var?(n(e))
+    (e:LSField) :
+      mutable-field?(type!(exp(e)), name(e))
+    (e:LSDeref) :
+      match(type!(exp(e))) :
+        (t:PtrT) : true
+        (t:UVarT) : Blocked(n(t))
+        (t) : false
+    (e:LSSlot) :
+      match(type!(exp(e))) :
+        (t:UVarT) : Blocked(n(t))
+        (t:RestT) : lvalue?(exp(e) as LSField)
+        (t) : true
+    (e) :
+      fatal("%_ is not syntactically an LValue." % [object-type(e)])
+
+;Return true if the given expression is not an LValue.
+defn not-lvalue? (e:LSExp) -> True|False :
+  lvalue?(e) is False
+
+;Returns true if the given expression is a location on the Stanza heap.
+defn heap-loc? (e:LSExp) -> PredResult :
+  match(e) :
+    (e:LSVar) :
+      false
+    (e:LSField) :
+      match(deref-obj(type!(exp(e)), current-hier())) :
+        (b:Blocked) : b
+        (t:TOf) : true
+        (t:StructT) : false
+        (f:False) : false
+    (e:LSDeref) :
+      match(type!(exp(e))) :
+        (t:UVarT) : Blocked(n(t))
+        (t:PtrT) : false
+        (t:RefT) : true
+        (t) : false        
+    (e:LSSlot) :
+      match(type!(exp(e))) :
+        (t:UVarT) : Blocked(n(t))
+        (t:RestT) : heap-loc?(exp(e) as LSField)
+        (t) : false
+    (e) :
+      fatal("%_ is not syntactically an LValue." % [object-type(e)])
+
+;Returns true if n references a mutable variable.
+defn mutable-var? (n:Int) -> True|False :
+  val nm = current-namemap()
+  if key?(nm,n) :
+    val e = nm[n]
+    type(e) is VarE|LVarE
+
+;Returns true if the given field is mutable.
+defn mutable-field? (t:LSType, name:Symbol) -> PredResult :
+  match(get-field(t,name,current-hier())) :
+    (f:HField) : mutable?(f)
+    (b:Blocked|False) : b
+
+;Returns true if a is not a subtype of b.
+defn not-subtype? (a:Type, b:Type) -> True|False :
+  subtype(a,b,current-hier()) is False
+defn not-subtype? (a:LSType, b:LSType) -> True|False :
+  subtype(a,b,current-hier()) is False
+
+;Returns true if the given LoStanza argument is not wellformed.
+defn bad-optional-arg? (a:FArg<LSType>) -> True|False :
+  val requires-ref? = match(a) :
+    (a:PositionalArg<LSType>|KeywordArg<LSType>) : optional?(a)
+    (a:VarArg<LSType>) : true
+  requires-ref? and type(a) is-not RefT
+
+;Returns true if a1 -> a2, is not a submethod of multi.
+defn not-submethod? (multi:TArrow, a1:Tuple<FArg<Type>>, a2:Type) -> True|False :
+  ;[TODO] Use narrowing
+  submethod?(a1, a2, multi, current-hier()) is False
+
+;Returns true if the given method is not a submethod of mt.
+defn not-submethod? (multi:TArrow, a1:Tuple<FArg<LSType>>, a2:LSType) -> True|False :
+  ;Check whether all types are known and refs.
+  defn known? (t:LSType) : t is-not UVarT
+  defn reftype? (t:LSType) : t is RefT
+  defn reftype! (t:LSType) : type(t as RefT)
+  defn all-types-are (f:LSType -> True|False) : all?(f{type(_)},a1) and f(a2)
+
+  if all-types-are(known?) :
+    if all-types-are(reftype?) :
+      val hs-a1 = map(map{reftype!, _}, a1)
+      val hs-a2 = reftype!(a2)
+      submethod?(hs-a1, hs-a2, multi, current-hier()) is False
+    else :
+      true
+
+;Returns true if a is not assignable to b.
+defn not-assignable? (a:LSType, b:LSType) -> True|False :
+  assignable?(a,b,current-hier()) is False
+
+;Returns true if the given arrows, when called with args,
+;are not disjoint. Arrows are homo-arity.
+defn not-disjoint? (xs:Tuple<TArrow>, args:Tuple<Type>) -> True|False :
+  if length(xs) >= 2 :
+    disjoint?(map(a1,xs), args, current-hier()) is False
+
+;Returns true if the given functions, when called with args,
+;can be merged. 
+defn not-disjoint? (merged:FnT, xs:Tuple<FnT>, args:Tuple<LSType>) -> True|False :
+  if length(xs) >= 2 :
+
+    ;Compute which arguments are RefT.
+    defn reftype? (t:LSType) : t is RefT
+    defn reftype! (t:LSType) : type(t as RefT)
+    
+    val arity = length(a(merged))
+    val ref-indices = to-tuple $ for i in 0 to arity filter :
+      reftype?(a(merged)[i])
+
+    ;If no arguments are ref type, then not disjoint.
+    if empty?(ref-indices) :
+      true
+
+    ;Otherwise, check the ref types if there are at least two.
+    else :
+    
+      ;Retrieve the argument types.
+      val arg-types = map({args[_]}, ref-indices)
+
+      ;If all arguments are refs, then use disjoint algorithm:
+      if all?(reftype?, arg-types) :
+        val arg-refs = map(reftype!, arg-types)
+        val xs-refs = for x in xs map :
+          map(reftype!{a(x)[_]}, ref-indices)
+        disjoint?(xs-refs, arg-refs, current-hier()) is False  
+
+;Returns true if the given arrows, when called with possible args,
+;are not disjoint. Arrows are hetero-arity.
+defn not-disjoint-multiarity? (xs:Tuple<TArrow>, args:Tuple<Tuple<Type>>) -> True|False :
+  ;Group arrows by arity.
+  val grouped = group-by(length{a1(_)}, xs)
+  
+  ;Classify args by arity.
+  val args-table = to-inttable(length, args)
+  defn args-with-arity (n:Int) -> Tuple<Type> :
+    if key?(args-table, n) : args-table[n]
+    else : to-tuple(repeat(TTop(), n))
+
+  ;Return true if any of the arities are not disjoint.
+  for entry in grouped any? :
+    val arity = key(entry)
+    val arrows = to-tuple(value(entry))
+    not-disjoint?(arrows, args-with-arity(arity))
+
+;Returns true if t is not a bounded type.
+defn not-bounded? (t:LSType) -> True|False :
+  bounded?(t, current-hier()) is False
+defn not-bounded? (n:Int) -> True|False :
+  not bounded-type?(n, current-hier())
+
+;Returns true if the object supports the 'new' operator.
+;Vararg objects must have a long as its first field.
+defn supports-new? (n:Int) -> True|False :
+  val hier = current-hier()
+  val fs = fields(hier, n)
+  if not empty?(fs) :
+    val fields = value!(fs)
+    val num-fields = length(fields)
+    val rest? = num-fields > 0 and type(fields[num-fields - 1]) is RestT
+    if rest? : type(fields[0]) is LongT
+    else : true
+
+;Returns true if the given type is a good externfn type.
+defn externfn-type? (t:LSType) -> True|False :
+  bounded?(t, current-hier()) is True and
+  t is-not RefT
+
+;Returns true if the given operation is not callable by the given types.
+defn not-callable? (op:Primitive, ts:Tuple<Type>) -> True|False :
+  callable?(op, ts, current-hier()) is False
+
+;Returns true if the given type only access type variables
+;that are defined in the given scope.
+defn in-scope? (t:Type|LSType, scope:List<Int>) -> True|False :
+  let loop (t:TypeItem = t) :
+    match(t:TVar) : contains?(scope, n(t))
+    else : all?(loop,t)
+
+;============================================================
+;================ Implicit Definitions ======================
+;============================================================
+
+;Accumulate a list of type errors.
+var TYPE-ERRORS:Vector<TypeError>|False = false
+
+;For accessing the type hierarchy.
+var CURRENT-HIER:TypeHierarchy|False = false
+
+;For accessing the definitions of variables and check whether
+;they are mutable.
+var CURRENT-NAMEMAP:NameMap|False = false
+
+;Retrieve the current hierarchy.
+defn current-hier () -> TypeHierarchy :
+  if CURRENT-HIER is False :
+    fatal("Current hierarchy is not set.")
+  CURRENT-HIER as TypeHierarchy
+
+;Retrieve the current namemap.
+defn current-namemap () -> NameMap :
+  if CURRENT-NAMEMAP is False :
+    fatal("Current namemap is not set.")
+  CURRENT-NAMEMAP as NameMap
+
+;Execute the given body with the given implicit definitions.
+defn with-implicits<?T> (body:() -> ?T,
+                         errors:Vector<TypeError>,
+                         hier:TypeHierarchy,
+                         namemap:NameMap) -> T :
+  let-var TYPE-ERRORS = errors :
+    let-var CURRENT-HIER = hier :
+      let-var CURRENT-NAMEMAP = namemap :
+        body()
+
+;============================================================
+;================= Collect Type Errors ======================
+;============================================================
+
+;Add the given type error to TYPE-ERRORS.
+defn add-type-error (e:TypeError) -> False :
+  val es = TYPE-ERRORS as Vector<TypeError>
+  add(es, e)
+
+;============================================================
+;==================== Small Utilities =======================
+;============================================================
+
+;Three-argument cat.
+defn cat<?T> (xs:Seqable<?T>, ys:Seqable<?T>, zs:Seqable<?T>) -> Seq<T> :
+  cat(xs, cat(ys, zs))

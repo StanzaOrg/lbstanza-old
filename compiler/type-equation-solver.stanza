@@ -1,0 +1,1362 @@
+defpackage stz/type-equation-solver :
+  import core
+  import collections
+  import stz/types
+  import stz/type-locs
+  import stz/type-solver
+  import stz/type-variance
+  import stz/type-equations
+  import stz/type-hierarchy
+  import stz/type-formatter
+  import stz/type-instfns
+  import stz/type-instantiation
+  import stz/type-capside
+  import stz/ids
+  import stz/type-utils
+  import stz/primitives
+  import stz/type-match
+  import stz/type-fargs
+
+;============================================================
+;====================== SolverState =========================
+;============================================================
+
+;Complete state of the solver in-between iterations.
+;- eqns: Tuple of all equations.
+;- sel-eqns: Fast access to selection equations.
+;- solved: Each entry, V => VAL, means that the variable V
+;  has been solved and has value VAL.
+;- blocked: Each entry, V => (E1, E2, E3 ...), means that the
+;  equations E1, E2, E3 cannot make progress, and that V is
+;  one of the variables that could be holding it up. An equation
+;  E is allowed to appear under multiple V, and even under the same
+;  V multiple times.
+;- eqns: The list of active equations to solve until queue
+;  is empty.
+;- num-solved: The number of variables in 'solved' that holds
+;  a SolvedType.
+public defstruct SolverState :
+  hierarchy: TypeHierarchy
+  eqns: Tuple<TypeEqn>
+  sel-eqns: IntTable<TypeEqn>
+  solved: IntTable<SolverValue> with:
+    init => IntTable<SolverValue>()
+  guesses: IntTable<Tuple<PredResult>> with:
+    init => IntTable<Tuple<PredResult>>()
+  blocked: IntTable<List<TypeEqn>> with:
+    init => IntTable<List<TypeEqn>>(List())
+  bounds: IntTable<TypeBounds> with:
+    init => IntTable<TypeBounds>()
+  active-eqns: Queue<TypeEqn> with:
+    init => Queue<TypeEqn>()
+  num-solved:Int with:
+    init => 0
+    setter => set-num-solved
+
+;============================================================
+;====================== Checkpoint ==========================
+;============================================================
+
+;The solver needs to backtrack to a safe point before it
+;can try out a different set of guesses for the overloaded
+;equations.
+
+defstruct Checkpoint :
+  solved:Tuple<KeyValue<Int,SolverValue>>
+  bounds:Tuple<KeyValue<Int,TypeBounds>>
+  eqns:Tuple<TypeEqn>
+  num-solved:Int
+
+;Save the current state of the solver state in a checkpoint.
+defn save-checkpoint (state:SolverState) -> Checkpoint :
+  Checkpoint(
+    to-tuple(solved(state))
+    to-tuple(bounds(state))
+    to-tuple(cat(active-eqns(state),
+                 blocked-eqns(state)))
+    num-solved(state))
+
+;Restore the solver to the given state.
+defn restore-checkpoint (state:SolverState, cp:Checkpoint) :
+  clear(solved(state))
+  clear(bounds(state))
+  clear(blocked(state))
+  clear(active-eqns(state))
+  for entry in solved(cp) do :
+    solved(state)[key(entry)] = value(entry)
+  for entry in bounds(cp) do :
+    bounds(state)[key(entry)] = value(entry)
+  for e in eqns(cp) do :
+    push-eqn(state,e)
+  set-num-solved(state, num-solved(cp))
+
+;============================================================
+;===================== Solver Values ========================
+;============================================================
+
+;The possible values that a solver variable can take on.
+public deftype SolverValue
+
+;Fill status: Indicates the properties of a solved type.
+deftype FillStatus
+
+;The type contains no TUVar anymore.
+defstruct FilledCompletely <: FillStatus
+with:
+  printer => true
+
+;The type contains no TUVar to an already-solved
+;variable, at the time when 'num-solved' variables
+;were solved.
+defstruct FilledWithSolved <: FillStatus :
+  num-solved:Int
+with:
+  printer => true
+
+;The type may contain TUVar to an already-solved
+;variable.
+defstruct Unfilled <: FillStatus
+with:
+  printer => true
+
+;The variable was solved.
+public defstruct SolvedType <: SolverValue :
+  value:Type|LSType
+  variance:Variance
+  fill-status:FillStatus
+with:
+  printer => true
+
+;The selection was solved.
+public defstruct SolvedSel <: SolverValue :
+  values:Tuple<PredResult>
+with:
+  printer => true
+
+;The instantiation was solved.
+public defstruct SolvedInstantiation <: SolverValue :
+  funcs:Tuple<InstFn>
+with:
+  printer => true
+
+;The variable cannot be solved because the constraints are
+;unsatisfiable.
+public defstruct Unsatisfiable <: SolverValue
+with:
+  printer => true
+
+;The variable cannot be solved because it depends upon a
+;variable that is either unsatisfiable or unprogressable.
+public defstruct Unprogressable <: SolverValue
+with:
+  printer => true
+
+;============================================================
+;======================== Guesses ===========================
+;============================================================
+
+;Represents a guessed selection value.
+;- eqn: The equation with the selection variable that is being
+;  guessed.
+defstruct Guess :
+  values:Maybe<Tuple<True|False>>
+  eqn:TypeEqn
+
+;============================================================
+;===================== Public API ===========================
+;============================================================
+
+;Create a new SolverState primed with the given equations.
+public defn SolverState (input-eqns:Seqable<TypeEqn>,
+                         hier:TypeHierarchy) -> SolverState :
+  val eqns = to-tuple(input-eqns)
+  debugln("Type Equations:")
+  within debug-indent() :
+    do(debugln{debugfmt(_)},eqns)
+
+  val sel-eqns = to-inttable<TypeEqn> $
+    for e in eqns seq? :
+      match(e) :
+        (e:OverloadExpEqn) : One(sel(e) => e)
+        (e:OverloadCallEqn) : One(sel(e) => e)
+        (e) : None()
+  SolverState(hier, eqns, sel-eqns)
+
+;Solve as many equations as possible.
+public defn solve (s:SolverState) -> False :
+  solve-until-empty(solve-eqn, s)
+
+;Return the solution for the given variable.
+public defn get (s:SolverState, v:Int) -> SolverValue :
+  solved(s)[v]
+
+;Return all the solutions.
+public defn solutions (s:SolverState) -> Tuple<KeyValue<Int,SolverValue>> :
+  to-tuple(solved(s))
+
+;============================================================
+;======================== Solve =============================
+;============================================================
+
+;Return true if there are no more equations to solve.
+defn empty? (s:SolverState) -> True|False :
+  empty?(active-eqns(s))
+
+;Return the next equation to solve.
+defn next-eqn (s:SolverState) -> TypeEqn :
+  pop(active-eqns(s))
+
+;Returns all the blocked equations in the solver.
+defn blocked-eqns (s:SolverState) -> Seqable<TypeEqn> :
+  cat-all(values(blocked(s)))
+
+;Push another equation to the solver.
+defn push-eqn (s:SolverState, e:TypeEqn) -> False :
+  add(active-eqns(s), e)
+
+;Return true if the given variable has already been solved.
+defn solved? (s:SolverState, v:Int) -> True|False :
+  key?(solved(s), v)
+
+;Return true if all output variables in the given equation are solved.
+defn solved? (s:SolverState, e:TypeEqn) -> True|False :
+  match(primary-output-var(e)) :
+    (v:Int) : solved?(s, v)
+    (f:False) : false
+
+;Indicate that the equation is blocked on a set of
+;variables.
+defn blocked (s:SolverState, eqn:TypeEqn, vars:Collection<Int>) -> False :
+  debugln("blocked on (%,): %_" % [debugfmt(vars), debugfmt(eqn)])
+  for v in to-intset(vars) do :
+    update(blocked(s), cons{eqn, _}, v)
+
+;Set the status of a variable.
+defn set-var (s:SolverState, v:Int, given-value:SolverValue) -> False :
+  ;Trace the message.
+  debugln("set-var %_ = %_" % [debugfmt(v), debugfmt(given-value)])
+
+  ;Sanity check: Ensure that the given variable hasn't already been solved.
+  if solved?(s,v) :
+    fatal("Variable V%_ has already been solved." % [v])
+
+  ;First preprocess the given value by removing cycles.
+  val value =
+    match(given-value:SolvedType)  :
+      match(remove-cycle(v, variance(given-value), value(given-value))) :
+        (new-t:Type|LSType) : SolvedType(new-t, variance(given-value), fill-status(given-value))
+        (f:False) : Unsatisfiable()
+    else :
+      given-value
+
+  ;Set the variable as solved.
+  solved(s)[v] = value
+
+  ;Increment the number of solved
+  if value is SolvedType :
+    set-num-solved(s, num-solved(s) + 1)
+
+  ;Put the equations that were blocked by this variable
+  ;back in the active queue.
+  if value is-not Unsatisfiable|Unprogressable :    
+    val blocked-eqns = blocked(s)[v]
+    remove(blocked(s),v)
+    do(push-eqn{s, _}, blocked-eqns)
+
+;Fill the solved variables in the given equation.
+defn fill-solved (e:TypeEqn, s:SolverState) -> TypeEqn :
+  val filled-e = match(e) :
+    (e:OverloadExpEqn) :
+      match(get?(solved(s), inst(e))) :
+        (s:SolvedInstantiation) : sub-instantiations(e, One(funcs(s)))
+        (f:False) : e
+    (e) : e
+  fill-solved(fill-solved-type{_, s}, filled-e)
+
+;Main loop.
+defn solve-until-empty (solve:(TypeEqn, SolverState) -> False,
+                        s:SolverState) -> False :
+  ;Preprocess the equations.
+  preprocess-eqns(s)
+
+  ;Store our current checkpoint.
+  var checkpoint:False|Checkpoint = false
+
+  ;Iteratively solve equations until the active
+  ;queue is empty.
+  defn* solve-all-equations-in-active-queue () :
+    ;Solve all equations in active queue.
+    while not empty?(s) :
+      val e = next-eqn(s)
+      if not solved?(s,e) :
+        debugln("solve-until-empty %_" % [debugfmt(e)])
+        within debug-indent() :
+          val filled-e = fill-solved(e,s)
+          debugln("filled: %_" % [debugfmt(filled-e)])
+          solve-eqn(filled-e, s)
+
+    ;After solving the equations, take guesses to make
+    ;progress
+    guess-selection-variables()
+
+  ;For any blocked selection variables, take a guess
+  ;at them.
+  defn* guess-selection-variables () :
+    ;Save the solver state if it hasn't been saved already.
+    if checkpoint is False :
+      checkpoint = save-checkpoint(s)
+
+    ;Make the guesses
+    val guessed? = make-guesses(s)
+
+    ;If guesses were made, then continue solving
+    ;the equations.
+    if guessed? : solve-all-equations-in-active-queue()
+    else : check-and-update-guesses()
+
+  ;We finished solving as much as possible with the
+  ;current set of guesses. Check and update them.
+  defn* check-and-update-guesses () :
+    val updated? = update-guesses(s)
+
+    ;If guesses are all good, then we're done.
+    ;Otherwise, backtrack to the checkpoint and
+    ;try solving again.
+    if updated? :
+      debugln("restart solver from checkpoint.")
+      restore-checkpoint(s, checkpoint as Checkpoint)
+      solve-all-equations-in-active-queue()
+
+  ;Mark any equations that are still blocked as unprogressable.
+  defn* give-up-on-blocked-eqns () :
+    for e in blocked-eqns(s) do :
+      debugln("remaining eqn: %_" % [debugfmt(e)])      
+      for v in output-vars(e) do :
+        if not solved?(s,v) :
+          set-var(s, v, Unprogressable())
+
+  ;Backsubstitute all the solved variables.
+  defn* backsubstitute-knowns () :
+    val solved-vars = to-tuple(keys(solved(s)))
+    for v in solved-vars do :
+      val value = solved(s)[v]
+      debugln("backsubstitution for %_ = %_ :" % [debugfmt(v), debugfmt(value)])
+      within debug-indent() :
+        get-filled-solved(v, s)
+
+  ;Print solutions
+  defn print-solutions () :
+    debugln("Solutions:")
+    for entry in solved(s) do :
+      debugln("  %_ = %_" % [debugfmt(key(entry)), debugfmt(value(entry))])
+
+  ;Launch!
+  solve-all-equations-in-active-queue()
+  give-up-on-blocked-eqns()
+  backsubstitute-knowns()
+  print-solutions()
+
+;============================================================
+;================ Cycle Removal/Detection ===================
+;============================================================
+
+;Remove a cycle around uvar from the given type.
+;Returns false if the cycle cannot be removed.
+defn remove-cycle (uvar:Int, variance:Variance, t:Type) -> Type|False :
+  switch(variance) :
+    Covariant : remove-covariant-cycle(uvar, t)
+    Contravariant : remove-contravariant-cycle(uvar, t)
+
+;Remove a cycle around uvar from the given type.
+;Returns false if the cycle cannot be removed.
+defn remove-cycle (uvar:Int, variance:Variance, t:LSType) -> LSType|False :
+  match(t) :
+    (t:UVarT) :
+      t when n(t) != uvar
+    (t:RefT) :
+      match(remove-cycle(uvar, variance, type(t))) :
+        (t:Type) : RefT(t)
+        (f:False) : false
+    (t) :
+      t
+
+;Perform the covariant case of cycle removal.
+defn remove-covariant-cycle (uvar:Int, t:Type) -> Type|False :
+  label<Type|False> return :
+    val ts = Vector<Type>()
+    let loop (t:Type = simplify(t)) :
+      match(t) :
+        (t:TOr) :
+          loop(a(t))
+          loop(b(t))
+        (t:TUVar) :
+          add(ts,t) when n(t) != uvar
+        (t) :
+          if occurs?(uvar,t) : return(false)
+          else : add(ts, t)
+    if not empty?(ts) : 
+      reduce(TOr,ts)
+
+;Perform the contravariant case of cycle removal.
+defn remove-contravariant-cycle (uvar:Int, t:Type) -> Type|False :
+  label<Type|False> return :
+    val ts = Vector<Type>()
+    let loop (t:Type = simplify(t)) :
+      match(t) :
+        (t:TAnd) :
+          loop(a(t))
+          loop(b(t))
+        (t:TUVar) :
+          add(ts,t) when n(t) != uvar
+        (t) :
+          if occurs?(uvar,t) : return(false)
+          else : add(ts, t)
+    if not empty?(ts) :
+      reduce(TAnd,ts)
+
+;Return true if the given type contains the given unification
+;variable.
+defn occurs? (uvar:Int, t:Type) -> True|False :
+  match(t:TUVar) :
+    n(t) == uvar
+  else :
+    any?(occurs?{uvar, _ as Type}, t)
+
+;============================================================
+;================== Output Variables ========================
+;============================================================
+
+;Retrieve the output variables for the given equation.
+defn primary-output-var (e:TypeEqn) -> Int|False :
+  match(e) :
+    (e:CaptureEqn) : n(e)
+    (e:LSCaptureEqn) : n(e)
+    (e:InferEqn) : n(e)
+    (e:LSInferEqn) : n(e)
+    (e:OverloadExpEqn) : n(e)
+    (e:LSOverloadAddrEqn) : n(e)
+    (e:OverloadCallEqn) : n(e)
+    (e:LSOverloadCallEqn) : n(e)
+    (e:SelectMultiEqn) : n(e)
+    (e:SubEqn) : n(e)
+    (e:EqualEqn) : n(e)
+    (e:LSEqualEqn) : n(e)
+    (e:UnsatisfiableEqn) : n(e)
+    (e:PrimEqn) : n(e)
+    (e:LSPrimEqn) : n(e)
+    (e:TypeOperationEqn) : n(e)
+    (e:LSCaptureAllEqn) : false
+    (e:CaptureAllEqn) : false
+    (e) : fatal("%_ is not part of main solver loop." % [object-type(e)])
+
+;Retrieve all output variables for the given equation.
+defn output-vars (e:TypeEqn) -> Tuple<Int> :
+  match(e) :
+    (e:OverloadExpEqn) : [n(e), sel(e), inst(e)]
+    (e:LSOverloadAddrEqn) : [n(e), sel(e)]
+    (e:OverloadCallEqn) : to-tuple(cat([n(e), sel(e)], exp-ns(e)))
+    (e:LSOverloadCallEqn) : to-tuple(cat([n(e), sel(e)], exp-ns(e)))
+    (e:SelectMultiEqn) : [n(e), sel(e)]
+    (e:LSCaptureAllEqn) : ns(e)
+    (e:CaptureAllEqn) : ns(e)
+    (e) : [primary-output-var(e) as Int]
+
+;============================================================
+;==================== Fill Solved Type ======================
+;============================================================
+
+;Based upon the unalready solved variables, fill in the missing
+;TUVars.
+defn fill-solved (type:Type|LSType, s:SolverState) -> [Type|LSType, FillStatus] :
+  ;Status variables
+
+  ;Turns to true if output is not the same as the
+  ;input type.
+  var changed?:True|False = false
+
+  ;Turns to true if output contains at least one TUVar|UVarT.
+  var has-tuvar?:True|False = false
+
+  ;Compute the filled type, and adjust the status
+  ;variables appropriately.
+  defn fill (t:TypeItem) -> TypeItem :
+    match(map(fill,t)) :
+      (t:TUVar|UVarT) :
+        match(get-filled-solved(n(t), s)) :
+          (t:SolvedType) :
+            ;Successfully filled the TUVar.
+            changed? = true
+            match(fill-status(t)) :
+              (s:FilledCompletely) :
+                value(t)
+              (s:FilledWithSolved) :
+                ;Still contains some remaining TUVar.
+                has-tuvar? = true
+                value(t)
+          (f:Unsatisfiable|False) :
+            ;Couldn't fill the TUVar, so set the flag.
+            has-tuvar? = true
+            t        
+      (t) :
+        t
+
+  ;Compute the new filled type.
+  val new-type = let :
+    val filled = fill(type) as Type|LSType
+    simplify(filled) when changed? else type
+
+  ;Compute the new status.
+  val new-status =
+    if has-tuvar? : FilledWithSolved(num-solved(s))
+    else : FilledCompletely()
+
+  ;Return the bundled result.
+  [new-type, new-status]
+
+;Retrieve the solved type for variable v.
+;Or false if v is not solved.
+defn get-filled-solved (v:Int, state:SolverState) -> SolverValue|False :
+  match(get?(solved(state), v)) :
+    (t:SolvedType) :
+      ;Compute whether we need to continue recursively
+      ;filling the returned type.
+      val done? = match(fill-status(t)) :
+        (s:FilledCompletely) : true
+        (s:Unfilled) : false
+        (s:FilledWithSolved) : num-solved(s) == num-solved(state)
+
+      ;Either continue or return.
+      if done? :
+        t
+      else :
+        val [new-t, new-fill] = fill-solved(value(t),state)
+        val processed-t = remove-cycle(v, variance(t), new-t)
+        val new-value =
+          match(processed-t:Type|LSType) : SolvedType(processed-t, variance(t), new-fill)
+          else : Unsatisfiable()
+        debugln("update variable: %_ = %_" % [debugfmt(v), debugfmt(new-value)])
+        solved(state)[v] = new-value
+        new-value
+    (t:SolvedInstantiation) :
+      val new-funcs = for f in funcs(t) map :
+        map({fill-solved-type(_, state) as Type}, f)
+      val new-value = SolvedInstantiation(new-funcs)
+      solved(state)[v] = new-value
+      new-value
+    (f) :
+      false
+
+;Extract the type of a fill result.
+defn fill-solved-type (type:Type|LSType, s:SolverState) -> Type|LSType :
+  val [new-type, fill-status] = fill-solved(type,s)
+  new-type
+
+;============================================================
+;================= Fill Solved Equation =====================
+;============================================================
+
+;Fill the solved variables in the given equation.
+defn fill-solved (f:Type|LSType -> Type|LSType, e:TypeEqn) -> TypeEqn :
+  defn g (t:Type) : f(t) as Type
+  defn g (t:LSType) : f(t) as LSType
+  defn g (x:InferLoc) : x
+  defn g (x:Tuple<TFunction>) : map({f(_) as TFunction},x)
+  defn g (x:Tuple<TArrow>) : map({f(_) as TArrow},x)
+  defn g (x:FArg<Type>) : map(g,x)
+  defn g (x:Tuple<FArg<Type>>) : map(g,x)
+  defn g (x:Tuple<FnT>) : map({f(_) as FnT}, x)
+  defn g (e:KeyValue<Int,Type>) : key(e) => g(value(e))
+  defn g (e:Tuple<KeyValue<Int,Type>>) : map(g,e)
+  defn g (i:InstFn) : InstFn(n(i), pattern(i), g2(capvars(i)), g(type(i)) as TArrow, g2(exp-args(i)))
+  defn g (xs:Tuple<InstFn>) : map(g,xs)
+  defn g (xs:Maybe<Tuple<InstFn>>) : None() when empty?(xs) else One(g(value!(xs)))
+  defn g2 (x:TArrow) : g(x) as TArrow
+  defn g2 (xs:Tuple<Type>) : map(g,xs)
+  defn g2 (xs:Tuple<Tuple<Type>>) : map(g2,xs)
+  defn g2 (xs:Tuple<LSType>) : map(g,xs)
+  defn g2 (xs:Tuple<Tuple<LSType>>) : map(g2,xs)
+  defn g2 (xs:Tuple<KeyValue<Int,TFunction>>) : for x in xs map : key(x) => g(value(x)) as TFunction
+  match(e) :
+    (e:CaptureAllEqn) : CaptureAllEqn(ns(e), side(e), g2(a(e)), g2(b(e)))
+    (e:LSCaptureAllEqn) : LSCaptureAllEqn(ns(e), side(e), g2(a(e)), g2(b(e)))
+    (e:CaptureEqn) : CaptureEqn(n(e), side(e), variance(e), g2(a(e)), g2(b(e)))
+    (e:LSCaptureEqn) : LSCaptureEqn(n(e), side(e), variance(e), g2(a(e)), g2(b(e)))
+    (e:InferEqn) : InferEqn(n(e), g(a(e)), g(b(e)), type-as-constraint?(e))
+    (e:LSInferEqn) : LSInferEqn(n(e), g(a(e)), b(e), type-as-constraint?(e))
+    (e:SubEqn) : SubEqn(n(e), g(x(e)), g(ys(e)))
+    (e:EqualEqn) : EqualEqn(n(e), g(type(e)))
+    (e:LSEqualEqn) : LSEqualEqn(n(e), g(type(e)))
+    (e:OverloadExpEqn) : OverloadExpEqn(n(e), sel(e), inst(e), g2(functions(e)), g(instantiations(e)), g(y(e)))
+    (e:LSOverloadAddrEqn) : LSOverloadAddrEqn(n(e), sel(e), g(xs(e)), g(y(e)))
+    (e:OverloadCallEqn) : OverloadCallEqn(n(e), exp-ns(e), sel(e), g(xs(e)), g2(exp-xs(e)), g2(args(e)))
+    (e:LSOverloadCallEqn) : LSOverloadCallEqn(n(e), exp-ns(e), sel(e), g(xs(e)), g2(exp-xs(e)), g2(args(e)))
+    (e:SelectMultiEqn) : SelectMultiEqn(n(e), sel(e), g(xs(e)), g(a1(e)), g(a2(e)))
+    (e:UnsatisfiableEqn) : e
+    (e:PrimEqn) : PrimEqn(n(e), op(e), g2(args(e)))
+    (e:LSPrimEqn) : LSPrimEqn(n(e), op(e), g2(args(e)))
+    (e:TypeOperationEqn) : TypeOperationEqn(n(e), operation(e), g(type(e)))
+    (e) : fatal("%_ equation is not part of main solver loop." % [object-type(e)])
+
+;============================================================
+;=================== Preprocessing Stage ====================
+;============================================================
+
+;Preprocess the CaptureAllEqn and SuperEqn equations.
+defn preprocess-eqns (s:SolverState) -> False :
+  ;Gather all the super constraints.
+  val super-table = IntTable<List<Type>>(List())
+
+  ;Gather all the sub bounds.
+  val bounds-table = IntTable<List<Type>>(List())
+
+  ;Iterate through equations and preprocess each in turn.
+  for e in eqns(s) do :
+    match(e) :
+      ;Gather SuperEqn and output as equal eqn.
+      (e:SuperEqn) :
+        update(super-table, cons{x(e), _}, n(e))
+      ;Gather SubBoundsEqn and save into bounds table.
+      (e:SubBoundsEqn) :
+        update(bounds-table, cons{x(e), _}, n(e))
+      ;All other equations are unprocessed.
+      (e) :
+        push-eqn(s,e)
+
+  ;Add the new bounds to the state bounds table.
+  for entry in bounds-table do :
+    val type = UpperBound(reduce(TAnd,value(entry)))
+    bounds(s)[key(entry)] = type
+
+  ;Push the new super constraints.
+  for entry in super-table do :
+    val n = key(entry)
+    val t = reduce(TOr, value(entry))
+    push-eqn(s, EqualEqn(n,t))
+
+;============================================================
+;====================== Solve ===============================
+;============================================================
+
+defmulti solve-eqn (e:TypeEqn, s:SolverState) -> False
+
+defmethod solve-eqn (e:CaptureAllEqn, s:SolverState) -> False :
+  val entries = switch(side(e)) :
+    CapLeft : capture-variance(ns(e), a(e), CapLeft)
+    CapRight : capture-variance(ns(e), b(e), CapRight)
+  for entry in entries do :
+    val n = key(entry)
+    val variance = value(entry)
+    val new-eqn = CaptureEqn(n, side(e), variance, a(e), b(e))
+    debugln("decompose into: %_" % [debugfmt(new-eqn)])
+    push-eqn(s, new-eqn)  
+
+defmethod solve-eqn (e:LSCaptureAllEqn, s:SolverState) -> False :
+  val entries = switch(side(e)) :
+    CapLeft : capture-variance(ns(e), a(e), CapLeft)
+    CapRight : capture-variance(ns(e), b(e), CapRight)
+  for entry in entries do :
+    val n = key(entry)
+    val variance = value(entry)
+    push-eqn(s, LSCaptureEqn(n, side(e), variance, a(e), b(e)))
+
+defmethod solve-eqn (e:UnsatisfiableEqn, s:SolverState) -> False :
+  set-var(s, n(e), Unsatisfiable())
+
+defmethod solve-eqn (e:CaptureEqn, s:SolverState) -> False :
+  match(capture(n(e), variance(e), side(e), a(e), b(e), hierarchy(s))) :
+    (b:Blocked) : blocked(s, e, vars(b))
+    (f:False) : set-var(s, n(e), Unsatisfiable())
+    (t:Type) : set-var(s, n(e), SolvedType(t, variance(e), Unfilled()))
+
+defmethod solve-eqn (e:LSCaptureEqn, s:SolverState) -> False :
+  match(ls-capture(n(e), variance(e), side(e), a(e), b(e), hierarchy(s))) :
+    (b:Blocked) : blocked(s, e, vars(b))
+    (f:False) : set-var(s, n(e), Unsatisfiable())
+    (t:Type) : set-var(s, n(e), SolvedType(t, variance(e), Unfilled()))
+
+defmethod solve-eqn (e:TypeOperationEqn, s:SolverState) -> False :
+  ;Compute the operation 'op' upon type 't'.
+  defn* solve (op:TypeOperation, t:LSType) -> False :
+    match(op, t) :
+      ;Blocked on an unknown variable.
+      (op, t:UVarT) :
+        blocked(n(t))
+
+      ;Retrieve the field of a given type.
+      (op:GetField, t) :
+        match(get-field-type(t, name(op), hierarchy(s))) :
+          (t:LSType) : solved(t)
+          (b:Blocked) : blocked(vars(b))
+          (f:False) : unsatisfiable()
+
+      ;Retrieve the type within the ptr<T>.
+      (op:Deptr, t:PtrT) :
+        solved(type(t))
+      (op:Deptr, t) :
+        unsatisfiable()
+
+      ;Retrieve the type within the ptr<T> or rest<T>.
+      (op:Deslot, t:PtrT|RestT) :
+        solved(type(t))
+      (op:Deslot, t) :
+        unsatisfiable()
+
+      ;Retrieve the type within the ptr<T>|ref<T>.
+      (op:DerefDeptr, t) :
+        match(deref-deptr(t, hierarchy(s))) :
+          (t:LSType) : solved(t)
+          (t:Blocked) : blocked(vars(t))
+          (f:False) : unsatisfiable()
+
+      ;Retrieve the address of the given type.
+      (op:PtrTo, t:RestT) :
+        solved(PtrT(type(t)))
+      (op:PtrTo, t) :
+        solved(PtrT(t))
+
+      ;Retrieve the wrapped HiStanza type.
+      (op:ToHistanza, t:RefT) :
+        solved(type(t))
+      (op:ToHistanza, t) :
+        unsatisfiable()
+
+  ;Convert to LoStanza struct.
+  defn to-struct (n:Int, targs:Tuple<Type>) :
+    val fs = fields(hierarchy(s), n)
+    if empty?(fs) : unsatisfiable()
+    else : solved(StructT(n, targs))
+
+  ;Called when the operation is performed successfully.
+  defn solved (t:LSType|Type) :
+    set-var(s, n(e), SolvedType(t, Covariant, Unfilled()))
+  ;Called when the operation cannot be computed.
+  defn unsatisfiable () :
+    set-var(s, n(e), Unsatisfiable())
+  ;Called when the operation is blocked.
+  defn blocked (n:Int) :
+    /blocked(s, e, [n])
+  defn blocked (ns:List<Int>) :
+    /blocked(s, e, ns)
+
+  ;Launch
+  solve(operation(e), type(e))
+
+defmethod solve-eqn (e:EqualEqn, s:SolverState) -> False :
+  set-var(s, n(e), SolvedType(type(e), Covariant, Unfilled()))
+
+defmethod solve-eqn (e:LSEqualEqn, s:SolverState) -> False :
+  set-var(s, n(e), SolvedType(type(e), Covariant, Unfilled()))
+
+defmethod solve-eqn (e:InferEqn, s:SolverState) -> False :
+  match(infer(a(e), b(e), type-as-constraint?(e), hierarchy(s))) :
+    (b:Blocked) : blocked(s, e, vars(b))
+    (f:False) : set-var(s, n(e), Unsatisfiable())
+    (t:Type) :
+      val variance = capture-variance(a(e),b(e))
+      set-var(s, n(e), SolvedType(t, variance, Unfilled()))
+
+defmethod solve-eqn (e:LSInferEqn, s:SolverState) -> False :
+  match(ls-infer(a(e), b(e))) :
+    (b:Blocked) : blocked(s, e, vars(b))
+    (f:False) : set-var(s, n(e), Unsatisfiable())
+    (t:LSType) :
+      val variance = capture-variance(a(e),b(e))
+      set-var(s, n(e), SolvedType(t, variance, Unfilled()))
+
+defmethod solve-eqn (e:SubEqn, s:SolverState) -> False :
+  match(remove-cycle(n(e), Covariant, x(e))) :
+    (xtype:Type|LSType) :
+      val ys-table = to-inttable<Type>(ys(e))
+      val uvars = Vector<Int>()
+      val new-x = let loop (t:TypeItem = xtype) :
+        match(t) :
+          (t:TUVar|UVarT) : (add(uvars,n(t)), t)
+          (t:TVar) : get?(ys-table, n(t), t)
+          (t) : map(loop, t)
+      if empty?(uvars) :
+        val result = SolvedType(new-x as Type|LSType, Covariant, Unfilled())
+        set-var(s, n(e), result)
+      else :
+        blocked(s, e, uvars)
+    (f:False) :
+      set-var(s, n(e), Unsatisfiable())
+
+defmethod solve-eqn (e:LSPrimEqn, s:SolverState) -> False :
+  val uvars = filter-by<UVarT>(args(e))
+  if not empty?(uvars) :
+    blocked(s, e, to-list(seq(n,uvars)))
+  else :
+    match(primitive-op(op(e), args(e))) :
+      (t:Type|LSType) : set-var(s, n(e), SolvedType(t, Covariant, Unfilled()))
+      (f:False) : set-var(s, n(e), Unsatisfiable())
+
+defmethod solve-eqn (e:PrimEqn, s:SolverState) -> False :
+  val uvars = filter-by<TUVar>(args(e))
+  if not empty?(uvars) :
+    blocked(s, e, to-list(seq(n,uvars)))
+  else :
+    match(primitive-op(op(e), args(e), s)) :
+      (t:Type|LSType) : set-var(s, n(e), SolvedType(t, Covariant, Unfilled()))
+      (f:False) : set-var(s, n(e), Unsatisfiable())
+
+defmethod solve-eqn (e:OverloadEqn&TypeEqn, s:SolverState) -> False :
+
+  ;Step 1: First instantiate the equation.
+  defn* instantiate () -> False :
+    if instantiated?(e) :
+      select(e)
+    else :
+      match(compute-instantiation(e,s)) :
+        (e:OverloadEqn&TypeEqn) : select(e)
+        (b:Blocked) : blocked(s, e, vars(b))
+
+  ;Step 2: Compute the selection.
+  defn* select (e:OverloadEqn&TypeEqn) -> False :
+    if num-options(e) <= 1 :
+      val forced-sel = to-tuple(repeat(true, num-options(e)))
+      choose-selection(e, forced-sel)
+    else if key?(guesses(s), selection-var(e)) :
+      choose-selection(e, guesses(s)[selection-var(e)])
+    else :
+      choose-selection(e, compute-selections(e, s))
+
+  ;Step 3: Choose the result given the selection.
+  defn* choose-selection (e:OverloadEqn&TypeEqn, sel:Tuple<PredResult>) -> False :
+    ;Get type variable.
+    val v = primary-output-var(e) as Int
+
+    ;Determine how many are remaining.
+    switch(count({_ is-not False}, sel)) :
+      ;Case: none of the overloads are appropriate.
+      0 :
+        set-var(s, selection-var(e), SolvedSel(sel))
+        for v in output-vars(e) do :
+          if not solved?(s,v) :
+            set-var(s, v, Unsatisfiable())
+      ;Case: exactly one overload is appropriate.
+      1 :
+        val i = index-when!({_ is-not False}, sel)
+        val r = SolvedType(pick-result(e, i, s), Covariant, Unfilled())
+        val values = map({_ is-not False}, sel)
+        set-var(s, selection-var(e), SolvedSel(values))
+        set-var(s, v, r)
+      ;Case: more than one overload is appropriate.
+      else :
+        ;Case: Some selections are blocked.
+        if any?({_ is Blocked}, sel) :
+          val uvars = seq-cat(vars, filter-by<Blocked>(sel))
+          blocked(s, e, to-list(uvars))
+        ;Case: No selections are blocked.
+        else :
+          set-var(s, selection-var(e), SolvedSel(sel))
+          val t = compute-result(e,sel,s)
+          match(t:LSType|Type) :
+            val r = SolvedType(t, Covariant, Unfilled())
+            set-var(s, v, r)
+          else :
+            set-var(s, v, Unsatisfiable())
+
+  ;Launch!
+  instantiate()
+
+;============================================================
+;============== Solve Overload Equations ====================
+;============================================================
+
+;Listing of overload equations.
+deftype OverloadEqn :
+  OverloadCallEqn <: OverloadEqn
+  OverloadExpEqn <: OverloadEqn
+  LSOverloadCallEqn <: OverloadEqn
+  SelectMultiEqn <: OverloadEqn
+  LSOverloadAddrEqn <: OverloadEqn
+
+;Multis that need to be implemented by each overload equation.
+defmulti selection-var (e:OverloadEqn) -> Int
+defmulti instantiated? (e:OverloadEqn) -> True|False
+defmulti compute-instantiation (e:OverloadEqn, s:SolverState) -> OverloadEqn|Blocked
+defmulti num-options (e:OverloadEqn) -> Int
+defmulti compute-selections (e:OverloadEqn, s:SolverState) -> Tuple<PredResult>
+defmulti pick-result (e:OverloadEqn, index:Int, s:SolverState) -> Type|LSType
+defmulti compute-result (e:OverloadEqn, sel:Tuple<PredResult>, s:SolverState) -> Type|LSType|False
+defmulti guess? (e:OverloadEqn) -> True|False
+
+;------------------------------------------------------------
+;-------------------- Bound Annotations ---------------------
+;------------------------------------------------------------
+
+;Substitute the known bounds into the given equation.
+defn fill-bounds (e:OverloadEqn&TypeEqn, s:SolverState) -> OverloadEqn&TypeEqn :
+  fill-solved({fill-bounds(_, s) as Type|LSType} , e) as OverloadEqn&TypeEqn
+
+;Substitute known bounds into the given type.
+defn fill-bounds (t:TypeItem, s:SolverState) -> TypeItem :
+  defn sub (t:TypeItem) -> TypeItem :
+    match(t:TUVar) :
+      match(get?(bounds(s), n(t))) :
+        (b:TypeBounds) : fill-solved-type(sub-bounds(t, b), s)
+        (b) : t
+    else :
+      map(sub, t)
+  sub(t)
+
+;------------------------------------------------------------
+;----------------- OverloadCallEqn --------------------------
+;------------------------------------------------------------
+
+defmethod selection-var (e:OverloadCallEqn) : sel(e)
+
+defmethod instantiated? (e:OverloadCallEqn) : true
+
+defmethod num-options (e:OverloadCallEqn) : length(xs(e))
+
+defmethod compute-selections (input-e:OverloadCallEqn, s:SolverState) :
+  val e = fill-bounds(input-e, s) as OverloadCallEqn
+  debugln("filled-bounds: %_" % [debugfmt(e)])
+  for x in xs(e) map :
+    select-overload-call(x, args(e), hierarchy(s))
+
+defmethod pick-result (e:OverloadCallEqn, i:Int, s:SolverState) :
+  val exp-args = exp-xs(e)[i]
+  for (n in exp-ns(e), t in exp-args) do :
+    set-var(s, n, SolvedType(t, Covariant, Unfilled()))
+  xs(e)[i]
+
+defmethod compute-result (e:OverloadCallEqn, sel:Tuple<PredResult>, s:SolverState) :
+  val exp-arrows = map(TArrow{_, TGradual()}, exp-xs(e))
+  val exp-mixed = mix-functions(exp-arrows, sel) as TArrow
+  for (n in exp-ns(e), t in a1(exp-mixed)) do :
+    set-var(s, n, SolvedType(t, Covariant, Unfilled()))
+
+  mix-functions(xs(e), sel)
+
+defmethod guess? (e:OverloadCallEqn) : true
+
+;------------------------------------------------------------
+;------------------ OverloadExpEqn --------------------------
+;------------------------------------------------------------
+
+defmethod selection-var (e:OverloadExpEqn) : sel(e)
+
+defmethod instantiated? (e:OverloadExpEqn) :
+  not empty?(instantiations(e))
+
+defmethod compute-instantiation (e:OverloadExpEqn, s:SolverState) :
+  ;Instantiate the functions.
+  val result = instantiations(function-instantiator(s), functions(e), y(e))
+
+  ;If instantiated successfully, then use that as new equation.
+  match(result) :
+    (result:Tuple<InstFn>) :
+      set-var(s, inst(e), SolvedInstantiation(result))
+      bounds(s)[n(e)] = MixBound(map(type,result))
+      sub-instantiations(e, One(result))
+    (result:Blocked) :
+      result
+
+defmethod num-options (e:OverloadExpEqn) : length(xs(e))
+
+defmethod compute-selections (e:OverloadExpEqn, s:SolverState) :
+  for x in xs(e) map :
+    select-overload(x, y(e), hierarchy(s))
+
+defmethod pick-result (e:OverloadExpEqn, i:Int, s:SolverState) :
+  xs(e)[i]
+
+defmethod compute-result (e:OverloadExpEqn, sel:Tuple<PredResult>, s:SolverState) :
+  mix-functions(xs(e), sel)
+
+defmethod guess? (e:OverloadExpEqn) : true
+
+;------------------------------------------------------------
+;------------------- LSOverloadCallEqn ----------------------
+;------------------------------------------------------------
+
+defmethod selection-var (e:LSOverloadCallEqn) : sel(e)
+
+defmethod instantiated? (e:LSOverloadCallEqn) : true
+
+defmethod num-options (e:LSOverloadCallEqn) : length(xs(e))
+
+defmethod compute-selections (input-e:LSOverloadCallEqn, s:SolverState) :
+  val e = fill-bounds(input-e, s) as LSOverloadCallEqn
+  for x in xs(e) map :
+    select-overload-call(x, args(e), hierarchy(s))
+
+defmethod pick-result (e:LSOverloadCallEqn, i:Int, s:SolverState) :
+  val exp-args = exp-xs(e)[i]
+  for (n in exp-ns(e), t in exp-args) do :
+    set-var(s, n, SolvedType(t, Covariant, Unfilled()))
+    
+  xs(e)[i]
+
+defmethod compute-result (e:LSOverloadCallEqn, sel:Tuple<PredResult>, s:SolverState) :
+  val exp-fnts = map(FnT{_, false, UnknownT()}, exp-xs(e))
+  val exp-mixed = mix-ls-functions(exp-fnts, sel) as FnT
+  for (n in exp-ns(e), t in a(exp-mixed)) do :
+    set-var(s, n, SolvedType(t, Covariant, Unfilled()))
+
+  mix-ls-functions(xs(e), sel)
+
+defmethod guess? (e:LSOverloadCallEqn) : true
+
+;------------------------------------------------------------
+;-------------------- SelectMultiEqn ------------------------
+;------------------------------------------------------------
+
+defmethod selection-var (e:SelectMultiEqn) : sel(e)
+
+defmethod instantiated? (e:SelectMultiEqn) : true
+
+defmethod num-options (e:SelectMultiEqn) : length(xs(e))
+
+defmethod compute-selections (e:SelectMultiEqn, s:SolverState) :
+  for x in xs(e) map :
+    submethod?(a1(e), a2(e), x, hierarchy(s))
+
+defmethod pick-result (e:SelectMultiEqn, i:Int, s:SolverState) :
+  xs(e)[i]
+
+defmethod compute-result (e:SelectMultiEqn, sel:Tuple<PredResult>, s:SolverState) :
+  false
+
+defmethod guess? (e:SelectMultiEqn) : false
+
+;------------------------------------------------------------
+;-------------------- LSOverloadAddrEqn ---------------------
+;------------------------------------------------------------
+
+defmethod selection-var (e:LSOverloadAddrEqn) : sel(e)
+
+defmethod instantiated? (e:LSOverloadAddrEqn) : true
+
+defmethod num-options (e:LSOverloadAddrEqn) : length(xs(e))
+
+defmethod compute-selections (e:LSOverloadAddrEqn, s:SolverState) :
+  for x in xs(e) map :
+    subtype(x, y(e), hierarchy(s))
+
+defmethod pick-result (e:LSOverloadAddrEqn, i:Int, s:SolverState) :
+  xs(e)[i]
+
+defmethod compute-result (e:LSOverloadAddrEqn, sel:Tuple<PredResult>, s:SolverState) :
+  false
+
+defmethod guess? (e:LSOverloadAddrEqn) :
+  false
+
+;============================================================
+;======================== Guess =============================
+;============================================================
+
+;Return true if e is an overload equation that should be
+;solved using the fixed-point guess system.
+defn guess-overload-eqn? (e:TypeEqn) -> True|False :
+  match(e:OverloadEqn&TypeEqn) :
+    guess?(e)
+
+;Make guesses for overload equations.
+;These are intentionally conservative and need to be updated
+;after iterative process is over.
+defn make-guesses (s:SolverState) -> True|False :
+  ;Retrieve all the blocked overload equations.
+  val overload-eqns = to-tuple $
+    filter(guess-overload-eqn?, blocked-eqns(s)) as Seq<OverloadEqn&TypeEqn>
+
+  ;Track whether any guesses were made.
+  var guesses-made:True|False = false
+
+  for e in overload-eqns do :
+    if not solved?(s,e) and instantiated?(e) :
+      ;Compute the selection.
+      val sel = compute-selections(e, s)
+
+      ;We can generate a guess if there are any 'true' or 'gradual' selections.
+      val can-guess? = any?({_ is True|PartialMatch}, sel)
+
+      ;Guess!
+      if can-guess? :
+        ;Indicate that we are generating a guess for this equation.
+        debugln("guess: %_" % [debugfmt(e)])
+        ;Generate and store the guess.
+        val guess = for s in sel map :
+          match(s:Blocked) : false
+          else : s
+        guesses(s)[selection-var(e)] = guess
+        guesses-made = true
+        ;Indicate the guess.
+        debugln("value: %_" % [guess])
+        ;Solve the resulting equation using the generated selection.
+        solve-eqn(e, s)
+
+  ;Return true if any guesses were made.
+  guesses-made
+
+;Check and update the previously made guesses.
+defn update-guesses (s:SolverState) -> True|False :
+  ;Track whether any guesses were updated.
+  var guesses-updated:True|False = false
+
+  for guess in to-tuple(guesses(s)) do :
+
+    ;Fill and instantiate the original equation.
+    val filled = fill-solved(sel-eqns(s)[key(guess)], s) as OverloadEqn&TypeEqn
+    val e = if instantiated?(filled) : filled
+            else : compute-instantiation(filled, s) as OverloadEqn&TypeEqn
+
+    ;Compute the selection
+    val sel = compute-selections(e, s)
+
+    ;Merge with the previous guess.
+    val new-values = to-tuple $
+      seq(merge, value(guess), sel)
+
+    ;If the new values are different, then update the guess.
+    if new-values != value(guess) :
+      within debug-indent() :
+        debugln("old-guess: %_" % [value(guess)])
+        debugln("new-guess: %_" % [new-values])
+      guesses(s)[key(guess)] = new-values
+      guesses-updated = true
+
+  ;Returns true if any guesses were updated.
+  guesses-updated
+
+;Return a more specific PredResult.
+defn merge (a:PredResult, b:PredResult) -> PredResult :
+  match(a, b) :
+    (a:False, b:PartialMatch|True) : b
+    (a:PartialMatch, b:True) : b
+    (a, b) : a
+
+;============================================================
+;================= Function Instantiation ===================
+;============================================================
+
+;Create a function instantiator for creating necessary
+;type equations during instantiation.
+defn function-instantiator (s:SolverState) -> Instantiator :
+  new Instantiator :
+    defmethod fresh-capvars (this, n:Int) -> Tuple<TUVar> :
+      to-tuple $ for i in 0 to n seq :
+        TUVar(fresh-id())
+    defmethod tuple-id (this) -> Int :
+      special-type(hierarchy(s), CoreTuple)
+    defmethod capture-right (this, capvars:Tuple<TUVar>, xs:Tuple<Type>, ys:Tuple<Type>) :
+      push-eqn(s, CaptureAllEqn(map(n, capvars), CapRight, xs, ys))
+    defmethod capture-left (this, capvars:Tuple<TUVar>, x:Type, y:Type) :
+      push-eqn(s, CaptureAllEqn(map(n, capvars), CapLeft, [x], [y]))
+    defmethod capture-right (this, capvars:Tuple<TUVar>, xs:Tuple<LSType>, ys:Tuple<LSType>) :
+      push-eqn(s, LSCaptureAllEqn(map(n, capvars), CapRight, xs, ys))
+    defmethod substitute (this, t:Type|LSType, env:Tuple<KeyValue<Int,Type>>) -> Type|LSType :
+      ;Return true if t is a type variable and substitution needs to be
+      ;delayed. The ref<T> case occurs when a HiStanza function is referenced
+      ;from a LoStanza context.
+      val delayed? = not resolved?(t)    
+      if delayed? :
+        val new-t = TUVar(fresh-id()) when t is Type else UVarT(fresh-id())
+        push-eqn(s, SubEqn(n(new-t), t, env))
+        new-t
+      else :
+        sub(t,env)
+
+;============================================================
+;====================== Primitives ==========================
+;============================================================
+
+;Compute LoStanza primitive operation.
+defn primitive-op (op:LSPrimitive, args:Tuple<LSType>) -> Type|LSType|False :
+
+  ;If two arguments given, then call 'body' to compute the resulting type.
+  defn binop (body:(LSType,LSType) -> Type|LSType|False) :
+    if length(args) == 2 :
+      body(args[0], args[1])
+
+  ;If one argument given, then call 'body' to compute the resulting type.
+  defn unaop (body:LSType -> Type|LSType|False) :
+    if length(args) == 1 :
+      body(args[0])
+
+  ;Assume binop between two numbers. Return widest one.
+  defn max-num () :
+    within (x,y) = binop() :
+      match(x, y) :
+        (x:ByteT|IntT|LongT|FloatT|DoubleT, y:ByteT|IntT|LongT|FloatT|DoubleT) :
+          if x == y :
+            x
+          else :          
+            match(implicit-upcast?(y,x), implicit-upcast?(x,y)) :
+              (a:True, b) : x
+              (a, b:True) : y
+              (a:False, b:False) : false
+        (x, y) :
+          false
+
+  ;Assume binop between two ints. Return widest one.
+  defn max-int () :
+    within (x,y) = binop() :
+      match(x, y) :
+        (x:ByteT|IntT|LongT, y:ByteT|IntT|LongT) :
+          if x == y :
+            x
+          else :
+            match(implicit-upcast?(y,x), implicit-upcast?(x,y)) :
+              (a:True, b) : x
+              (a, b:True) : y
+              (a:False, b:False) : false
+        (x, y) :
+          false
+
+  ;Assume unaop with one int. Return the same int.
+  defn same-int () :
+    within x = unaop() :
+      match(x:ByteT|IntT|LongT) : x
+
+  ;Assume unaop with one num. Return the same num.
+  defn same-num () :
+    within x = unaop() :
+      match(x:ByteT|IntT|LongT|FloatT|DoubleT) : x
+
+  switch(op) :
+    LS-ADD-OP :
+      within (x,y) = binop() :
+        match(x, y) :
+          (x:PtrT, y) : x
+          (x, y) : max-num()
+    LS-SUB-OP :
+      within (x,y) = binop() :
+        match(x, y) :
+          (x:PtrT, y:PtrT) : LongT()
+          (x:PtrT, y) : x
+          (x, y) : max-num()
+    LS-MUL-OP : max-num()
+    LS-DIV-OP : max-num()
+    LS-MOD-OP : max-int()
+    LS-AND-OP : max-int()
+    LS-OR-OP : max-int()
+    LS-XOR-OP : max-int()
+    LS-SHL-OP : max-int()
+    LS-SHR-OP : max-int()
+    LS-ASHR-OP : max-int()
+    LS-EQ-OP : LongT()
+    LS-NE-OP : LongT()
+    LS-LT-OP : LongT()
+    LS-GT-OP : LongT()
+    LS-LE-OP : LongT()
+    LS-GE-OP : LongT()
+    LS-ULT-OP : LongT()
+    LS-UGT-OP : LongT()
+    LS-ULE-OP : LongT()
+    LS-UGE-OP : LongT()
+    LS-NOT-OP : same-int()
+    LS-NEG-OP : same-num()
+    LS-LOWEST-ZERO-BIT-COUNT-OP : same-int()
+    LS-SET-BIT-OP : LongT()
+    LS-CLEAR-BIT-OP : LongT()
+    LS-TEST-BIT-OP : LongT()
+    LS-TEST-AND-SET-BIT-OP : LongT()
+    LS-TEST-AND-CLEAR-BIT-OP : LongT()
+    LS-SET-BIT-OP : LongT()
+    LS-CLEAR-BIT-OP : LongT()
+    LS-BITS-OP :
+      within x = unaop() :
+        match(x) :
+          (x:FloatT) : IntT()
+          (x:DoubleT) : LongT()
+          (x) : false
+    LS-FNUM-OP :
+      within x = unaop() :
+        match(x) :
+          (x:IntT) : FloatT()
+          (x:LongT) : DoubleT()
+          (x) : false
+    LS-YIELD-OP : RefT(TGradual())
+    LS-ENTER-STACK-OP : RefT(TGradual())
+    FLUSH-VM-OP : PtrT(UnknownT())
+    GC-OP : LongT()
+    PRINT-STACK-TRACE-OP : LongT()
+    COLLECT-STACK-TRACE-OP : PtrT(UnknownT())
+    LS-CRSP-OP : PtrT(UnknownT())
+    else : fatal("Unhandled primitive: %_" % [op])
+
+;Compute HiStanza primitive operation.
+defn primitive-op (op:Primitive, args:Tuple<Type>, s:SolverState) -> Type|LSType|False :
+  defn TOf (t:SpecialType) :
+    /TOf(special-type(hierarchy(s), t), [])
+  switch(op) :
+    ADD-OP : TOf(CoreInt)
+    SUB-OP : TOf(CoreInt)
+    MUL-OP : TOf(CoreInt)
+    DIV-OP : TOf(CoreInt)
+    MOD-OP : TOf(CoreInt)
+    AND-OP : TOf(CoreInt)
+    OR-OP : TOf(CoreInt)
+    XOR-OP : TOf(CoreInt)
+    SHL-OP : TOf(CoreInt)
+    SHR-OP : TOf(CoreInt)
+    ASHR-OP : TOf(CoreInt)
+    EQ-OP : TOr(TOf(CoreTrue), TOf(CoreFalse))
+    NE-OP : TOr(TOf(CoreTrue), TOf(CoreFalse))
+    LT-OP : TOr(TOf(CoreTrue), TOf(CoreFalse))
+    GT-OP : TOr(TOf(CoreTrue), TOf(CoreFalse))
+    LE-OP : TOr(TOf(CoreTrue), TOf(CoreFalse))
+    GE-OP : TOr(TOf(CoreTrue), TOf(CoreFalse))
+    NOT-OP : TOf(CoreInt)
+    NEG-OP : TOf(CoreInt)      
+    IDENTICAL-OP : TOr(TOf(CoreTrue), TOf(CoreFalse))
+
+;============================================================
+;======================= Formatting =========================
+;============================================================
+
+public defn format (f:TypeFormatter, v:SolverValue) :
+  match(v) :
+    (v:SolvedType) : "SolvedType(%_, %_)" % [format(f,value(v)), fill-status(v)]
+    (v) : v
+
+;============================================================
+;====================== Debugging ===========================
+;============================================================
+
+var DEBUG-TRACE:True|False = false
+var DEBUG-FORMATTER:TypeFormatter|False = false
+
+public defn set-debug-formatter (f:TypeFormatter) -> False :
+  DEBUG-FORMATTER = f
+
+defn debug-indent<?T> (body:() -> ?T) -> T :
+  if DEBUG-TRACE :
+    indented(body)
+  else :
+    body()
+
+defn debugfmt (x:TypeEqn) :
+  match(DEBUG-FORMATTER:TypeFormatter) : format(DEBUG-FORMATTER,x)
+  else : x
+
+defn debugfmt (x:Int) :
+  match(DEBUG-FORMATTER:TypeFormatter) : format(DEBUG-FORMATTER,TVar(x,false))
+  else : x
+
+defn debugfmt (xs:Collection<Int>) :
+  seq(debugfmt, xs)
+
+defn debugfmt (x:Type) :
+  match(DEBUG-FORMATTER:TypeFormatter) : format(DEBUG-FORMATTER,x)
+  else : x
+
+defn debugfmt (v:SolverValue) :
+  match(DEBUG-FORMATTER:TypeFormatter) : format(DEBUG-FORMATTER,v)
+  else : v
+
+defn debugfmt (v:PredResult) :
+  match(DEBUG-FORMATTER:TypeFormatter) :
+    match(v) :
+      (v:True|False) : v
+      (v:Blocked) : format(DEBUG-FORMATTER,v)
+  else :
+    v
+
+defn debugln (msg) :
+  if DEBUG-TRACE :
+    println(msg)

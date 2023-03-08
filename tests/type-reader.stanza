@@ -1,0 +1,360 @@
+defpackage stz-test-suite/type-reader :
+  import core
+  import collections
+  import stz/types
+  import stz/type-locs
+  import stz/printing-utils
+  import stz/type-equations
+  import stz-test-suite/type-test-ir
+
+;============================================================
+;=================== Entry Point ============================
+;============================================================
+
+public defn read-test-type-program (filename:String) -> TestTypeProgram :
+  val forms = reader/read-file(filename)
+  val prog = parse-syntax[type-syntax / #type-program](forms)
+  resolve(prog)
+
+;============================================================
+;===================== Local Scope ==========================
+;============================================================
+
+;Recover the name in a scope.
+defstruct NameScope :
+  names:HashTable<Symbol,Int> with:
+    init => HashTable<Symbol,Int>()
+    
+;============================================================
+;==================== Quick Resolver ========================
+;============================================================
+
+defn resolve (prog:TestTypeProgram) -> TestTypeProgram :
+  ;Create the names table.
+  val names = TypeNames()
+
+  ;Class ids
+  val classes = HashTable<Symbol,[Int,Int]>()
+
+  ;Create an id for the given class.
+  defn make-class-id (name:Symbol, arity:Int) -> Int :
+    val id = /make-id(names, name)
+    classes[name] = [id, arity]
+    id
+
+  ;Lookup a class id by name.
+  defn lookup-class-id (name:Symbol) -> Int :
+    if not key?(classes,name) :
+      throw(TSE(false, "No class with name '%_'." % [name]))
+    val [id,arity] = classes[name]
+    id
+
+  ;Lookup a class by name.
+  defn lookup-class (name:Symbol) -> TOf :
+    if not key?(classes,name) :
+      throw(TSE(false, "No class with name '%_'." % [name]))
+    val [id,arity] = classes[name]
+    val args = to-tuple(repeat(TGradual(), arity))
+    TOf(id, args)
+
+  ;Create a new name in the scope.
+  defn make-id (scope:NameScope, name:Symbol) -> Int :
+    if key?(/names(scope), name) :
+      fatal("Duplicate entry for variable '%~'." % [name])
+    val id = /make-id(names, name)
+    /names(scope)[name] = id
+    id
+
+  ;Create a new new if it hasn't already been created.
+  defn make-id? (scope:NameScope, name:Symbol) -> Int :
+    match(lookup?(scope, name)) :
+      (n:Int) : n
+      (f:False) : make-id(scope,name)
+
+  ;Retrieve the name in a scope.
+  defn lookup? (scope:NameScope, name:Symbol) -> Int|False :
+    get?(/names(scope), name)
+
+  ;Force retrieve a name.
+  defn lookup (scope:NameScope, name:Symbol) -> Int :
+    match(lookup?(scope, name)) :
+      (i:Int) : i
+      (f:False) : throw(TSE(false, "Could not resolve '%_'." % [name]))
+
+  ;Generate names for all the declared types.
+  for r in hierarchy(prog) do :
+    match(child(r)) :
+      (c:TVar) : make-class-id(name(c) as Symbol, 0)
+      (c:TNamedOf) : make-class-id(name(c) as Symbol, length(args(c)))
+
+  ;Resolve a hierarchy relation.
+  defn resolve (r:TRelation) -> TRelation :
+    val scope = NameScope()
+    val child = match(child(r)) :
+      (c:TVar) :
+        TOf(lookup-class-id(name(c) as Symbol), [])
+      (c:TNamedOf) :
+        val new-args = for a in args(c) map :
+          val name = name(a as TVar)
+          val n = make-id(scope, name as Symbol)
+          TVar(n, name)
+        TOf(lookup-class-id(name(c) as Symbol), new-args)
+    val parent = match(parent(r)) :
+      (p:Type) : resolve(p, scope)
+      (f:False) : false
+    TRelation(child, parent)
+
+  ;Resolve the given type under the given scope.
+  defn resolve (t:Type, scope:NameScope) -> Type :
+    match(t) :
+      (t:TNamedOf) :
+        val args* = map(resolve{_, scope}, args(t))
+        val n = lookup-class-id(name(t) as Symbol)
+        TOf(n, args*)
+      (t:TCap) :
+        val n = lookup(scope, name(t) as Symbol)
+        TCap(n, name(t))
+      (t:TVar) :
+        val name = name(t) as Symbol
+        if prefix?(name, "$") :
+          match(lookup?(scope,name)) :
+            (n:Int) : TUVar(n)
+            (f:False) : TUVar(make-id(scope,name))
+        else :
+          match(lookup?(scope, name)) :
+            (n:Int) : TVar(n, name)
+            (f:False) : lookup-class(name)
+      (t) :
+        map(resolve{_ as Type, scope}, t)
+
+  ;Resolve the given statement.
+  defn resolve (s:TypeStmt) -> TypeStmt :
+    match(s) :
+      (s:Capture) :
+        val scope = NameScope()
+        val new-args = map(make-id{scope, _ as Symbol}, args(s))
+        Capture(new-args,
+                resolve(a(s), scope)
+                resolve(b(s), scope))
+      (s:Subtype) :
+        val scope = NameScope()
+        Subtype(resolve(a(s), scope)
+                resolve(b(s), scope))
+      (s:Infer) :
+        val scope = NameScope()
+        defn resolve? (l:InferLoc) : l
+        defn resolve? (t:Type) : resolve(t,scope)        
+        Infer(resolve?(a(s)), resolve?(b(s)))
+      (s:Solve) :
+        val scope = NameScope()
+        val eqns = eqns(s) as Tuple<NamedTypeEqn>
+        for e in eqns do :
+          for name in e as NamedTypeEqn do-named-vars :
+            make-id?(scope,name)
+            false
+        val new-eqns = for e in eqns map :
+          val new-e = map(resolve{_,scope}, e)          
+          replace-names(lookup{scope, _}, new-e)
+        Solve(new-eqns)        
+
+  ;Launch!
+  val new-hier = map(resolve, hierarchy(prog))
+  val new-stmts = map(resolve, stmts(prog))
+  TestTypeProgram(new-hier, names, new-stmts)
+
+;============================================================
+;===================== Type Syntax ==========================
+;============================================================
+
+defsyntax type-syntax :
+
+  ;----------------------------------------------------------
+  ;---------------------- Type Program ----------------------
+  ;----------------------------------------------------------
+  public defproduction type-program: TestTypeProgram
+  
+  defrule type-program = (?relations:#type-rel ...
+                          ?stmts:#type-stmt! ...) :
+    val prog = TestTypeProgram(to-tuple(relations), false, to-tuple(stmts))
+    prog
+
+  ;----------------------------------------------------------
+  ;---------------------- Type Relations --------------------
+  ;----------------------------------------------------------
+  defproduction type-rel:TRelation
+  
+  defrule type-rel = (deftype ?c:#type <: ?p:#type) :
+    ensure-child-type(closest-info(), c)
+    ensure-parent-type(closest-info(), p)
+    TRelation(c, p)
+    
+  defrule type-rel = (deftype ?c:#type) :
+    ensure-child-type(closest-info(), c)
+    TRelation(c, false)
+
+  defn ensure-child-type (info:FileInfo|False, t:Type) :
+    match(t) :
+      (t:TVar) :
+        false
+      (t:TNamedOf) :
+        if not all?({_ is TVar}, args(t)) :
+          throw(TSE(info, "Type %_ cannot be used as child specifier." % [t]))
+      (t) :
+        throw(TSE(info, "Type %_ cannot be used as child specifier." % [t]))
+
+  defn ensure-parent-type (info:FileInfo|False, t:Type) :
+    match(t) :
+      (t:TNamedOf) :
+        false
+      (t:TAnd) :
+        ensure-parent-type(info, a(t))
+        ensure-parent-type(info, b(t))
+      (t:TVar) :
+        false
+      (t) :
+        throw(TSE(info, "Type %_ cannot be used as parent specifier." % [t]))
+
+  ;----------------------------------------------------------
+  ;---------------------- Test Statement --------------------
+  ;----------------------------------------------------------
+  defproduction type-stmt: TypeStmt
+  
+  defrule type-stmt = (capture(?args:#id ...) ?x:#type! <: ?y:#type!) :
+    Capture(to-tuple(args), x, y)
+
+  defrule type-stmt = (subtype ?x:#type! <: ?y:#type!) :
+    Subtype(x,y)
+
+  defrule type-stmt = (infer ?x:#loc <: ?y:#type!) :
+    Infer(x, y)
+
+  defrule type-stmt = (infer ?x:#type! <: ?y:#loc) :
+    Infer(x, y)
+
+  defrule type-stmt = (solve : (?es:#type-eqn! ...)) :
+    Solve(to-tuple(es))
+
+  ;----------------------------------------------------------
+  ;-------------------- Locations ---------------------------
+  ;----------------------------------------------------------
+  defproduction loc:InferLoc
+  defrule loc = (tuple-slot(?index:#int of ?arity:#int)) :
+    TupleLoc(arity, index)
+  defrule loc = (arg(?index:#int of ?arity:#int)) :
+    ArgLoc(arity, index)
+  defrule loc = (ret(?arity:#int)) :
+    ReturnLoc(arity)
+
+  ;----------------------------------------------------------
+  ;-------------------- Type Productions --------------------
+  ;----------------------------------------------------------
+
+  defproduction type: Type
+  defproduction type0: Type
+  defproduction type1: Type
+
+  defrule type = (?x:#type0 -> ?y:#type!) : TArrow([x], y)
+  defrule type = (() -> ?y:#type!) : TArrow([], y)
+  defrule type = ((?x0:#type ?xs:#types!) -> ?y:#type!) : TArrow(to-tuple(cons(x0,xs)), y)
+  defrule type = (?x:#type0)
+
+  defrule type0 = (?x:#type0 & ?y:#type1!) : TAnd(x,y)
+  defrule type0 = (?x:#type0 ~ | ?y:#type1!) : TOr(x,y)
+  defrule type0 = (?x:#type1)
+
+  defrule type1 = ((~ @cap ?x:#id)) : TCap(0,x)
+  defrule type1 = ([?xs:#types!]) : TTuple(to-tuple(xs))
+  defrule type1 = ((?x:#type))
+  defrule type1 = (?x:#id<?ys:#types!>) : TNamedOf(x,to-tuple(ys))
+  defrule type1 = (Void) : TBot()
+  defrule type1 = (?) : TGradual()
+  defrule type1 = (?x:#id) : TVar(0,x)
+
+  ;----------------------------------------------------------
+  ;----------------------- Type Equations -------------------
+  ;----------------------------------------------------------
+
+  defproduction type-eqn: TypeEqn
+  
+  defrule type-eqn = (capture(?args:#id ...) ?x:#type! <: ?y:#type!) :
+    NamedCaptureAllEqn(to-tuple(args), x, y)
+
+  defrule type-eqn = (infer ?v:#id ?x:#loc <: ?y:#type!) :
+    NamedInferEqn(v, x, y)
+
+  defrule type-eqn = (infer ?v:#id ?x:#type! <: ?y:#loc) :
+    NamedInferEqn(v, x, y)
+
+  defrule type-eqn = (sub ?v:#id = ?x:#type [?ys:#sub-entry ...]) :
+    NamedSubEqn(v, x, to-tuple(ys))
+
+  defrule type-eqn = (var ?v:#id :> ?t:#type!) :
+    NamedSuperEqn(v,t)
+
+  defrule type-eqn = (var ?v:#id = ?t:#type!) :
+    NamedEqualEqn(v,t)
+
+  defrule type-eqn = (overload(?v:#id, sel: ?sel:#id) (?xs:#type ...) <: ?y:#type) :
+    for x in xs do :
+      if x is-not TArrow :
+        throw(TSE(closest-info(), "Overloaded functions are expected to be arrows."))
+    NamedOverloadExpEqn(v,sel,to-tuple(xs) as Tuple<TArrow>,y)
+
+  defrule type-eqn = (overload(?v:#id, sel: ?sel:#id) call (?xs:#type ...) with ?y:#type) :
+    for x in xs do :
+      if x is-not TArrow :
+        throw(TSE(closest-info(), "Overloaded functions are expected to be arrows."))
+    NamedOverloadExpEqn(v,sel,to-tuple(xs) as Tuple<TArrow>,y)
+
+  defproduction sub-entry: KeyValue<Symbol,Type>
+  defrule sub-entry = (?v:#id => ?t:#type!) : v => t
+
+  ;----------------------------------------------------------
+  ;----------------------- Errors ---------------------------
+  ;----------------------------------------------------------
+
+  defproduction type!: Type
+  defproduction type1!: Type
+  defproduction type$: Type
+  defproduction types!: List<Type>
+  defproduction type-stmt!: TypeStmt
+  defproduction type-eqn!: TypeEqn
+  defrule type! = (?x:#type)
+  fail-if type! = () : TSE(closest-info(), "Type expected here.")
+  defrule type1! = (?x:#type1)
+  fail-if type1! = () : TSE(closest-info(), "Type expected here.")
+  defrule type$ = (?x:#type! (! _))
+  fail-if type$ = () : TSE(closest-info(), "Expected a single type here.")      
+  defrule types! = (?x:#type! ...)
+  defrule type-stmt! = (?x:#type-stmt)
+  fail-if type-stmt! = () : TSE(closest-info(), "Invalid syntax for type testing statement.")
+  defrule type-eqn! = (?x:#type-eqn)
+  fail-if type-eqn! = () : TSE(closest-info(), "Invalid syntax for type equation.")
+
+  ;----------------------------------------------------------
+  ;----------------------- Primitives -----------------------
+  ;----------------------------------------------------------
+
+  defproduction id:Symbol
+  defrule id = (?x) when unwrap-token(x) is Symbol :
+    unwrap-token(x)
+
+  defproduction int:Int
+  defrule int = (?x) when unwrap-token(x) is Int :
+    unwrap-token(x)
+
+;============================================================
+;====================== Error Definitions ===================
+;============================================================
+
+defstruct TypeSyntaxError <: Exception :
+  info:FileInfo|False
+  message
+with:
+  constructor => TSE
+
+defmethod print (o:OutputStream, e:TypeSyntaxError) :
+  print(o, "%_%_" % [info-str(info(e)), message(e)])
+
+defn info-str (i:FileInfo|False) :
+  "" when i is False else "%_: " % [i]

@@ -8,6 +8,7 @@ defpackage stz/el :
   import stz/ehier
   import stz/el-var-table
   import stz/el-utils
+  import stz/el-reordering
   import stz/el-infer
   import stz/dyn-tree
   import stz/conversion-utils
@@ -20,6 +21,8 @@ defpackage stz/el :
   import stz/verbose
   import core/stack-trace
   import stz/timing-log-api
+  import stz/type-fargs
+  import stz/dump-to-log
 
 ;============================================================
 ;==================== Drivers ===============================
@@ -28,7 +31,10 @@ defpackage stz/el :
 public defn lower-optimized (epackages:Tuple<EPackage>) -> EPackage :
   vprintln("EL: Lower optimized packages: %," % [seq(name, epackages)])
   val epackages* = map(fill-stack-trace-entries, epackages)
-  lower(collapse(epackages*), true)
+  ;do(dump{_, "logs", "input"}, epackages*)
+  val collapsed = collapse(epackages*)
+  ;dump(collapsed, "logs", "collapsed")
+  lower(collapsed, true)
 
 public defn lower-unoptimized (epackage:EPackage) -> EPackage :
   vprintln("EL: Lower unoptimized package: %_" % [name(epackage)])
@@ -58,14 +64,12 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
     var cur-package:EPackage = epackage
 
     ;Necessary tables
-    var iotable:IOTable
+    val iotable:IOTable = IOTable(packageio(epackage))
     var global-vt:VarTable
     var ehier:EHier
     defn update-tables () :
-      iotable = IOTable(packageio(cur-package))
       global-vt = GlobalVarTable(cur-package, iotable)
       ehier = EHier(cur-package)
-    update-tables()
 
     ;Run pass
     defn run-pass (pass-name:String, f:EPackage -> EPackage, suffix:String, update-tables?:True|False) :
@@ -76,6 +80,8 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
       ;dump(cur-package, "logs", suffix)
       #if-not-defined(OPTIMIZE) :
         ensure-unique-identifiers!(cur-package)
+    defn run-pass (pass-name:String, f:(EPackage, IOTable) -> EPackage, suffix:String, update-tables?:True|False) :
+      run-pass(pass-name, f{_, iotable}, suffix, update-tables?)
     defn run-pass (pass-name:String, f:(EPackage, VarTable) -> EPackage, suffix:String, update-tables?:True|False) :
       run-pass(pass-name, f{_, global-vt}, suffix, update-tables?)
     defn run-pass (pass-name:String, f:(EPackage, EHier, VarTable) -> EPackage, suffix:String, update-tables?:True|False) :
@@ -83,10 +89,12 @@ defn lower (epackage:EPackage, optimize?:True|False) -> EPackage :
 
     ;Dump input
     ;dump(cur-package, "logs", "input")
+    run-pass("Convert To Positional Args", conv-to-positional-args, "conv-pos-args", true)
     run-pass("Map Methods", map-methods, "mapped-methods", false)
     run-pass("Create Closures", create-closures, "closures", false)
     run-pass("Convert Mixes", convert-mixes, "mixes", false)
     run-pass("Insert Guards", insert-guards, "guarded", false)
+    run-pass("Convert to Positional Calls", conv-to-positional-calls, "conv-pos-calls", false)
     run-pass("Elide Checks", elide-checks, "elided", false)
     run-pass("Annotate Live", annotate-live, "live", false)
     if not optimize? :
@@ -275,6 +283,8 @@ defn collapse (epackages:Tuple<EPackage>) :
         (e:ETypeof) : sub-n2(sub-n1(e, new-id(n1(e))), new-id(n2(e)))
         (e:EBranch) : sub-n(e, new-id(n(e)))
         (e:EClosure) : sub-n(e, new-id(n(e)))
+        ;InstFns
+        (e:EInstFn) : sub-n(e, new-id(n(e)))
         ;Doesn't exist
         (e:EDefClosure) : fatal("Not handled")
         (e:EDefObject) : fatal("Not handled")
@@ -287,6 +297,86 @@ defn collapse (epackages:Tuple<EPackage>) :
 
   ;Launch
   driver()
+
+;============================================================
+;============ Positional Argument Conversion ================
+;============================================================
+
+;------------------------------------------------------------
+;---------- Reorder Definitions in Package ------------------
+;------------------------------------------------------------
+
+;Convert and reorder all arguments for all multis and functions
+;to required positional arguments only.
+defn conv-to-positional-args (e:EPackage, iotable:IOTable) -> EPackage :
+
+  ;Call reorder-args with proper wrapping functions.
+  defn reorder-args (args:Tuple<FArg<EType>>) -> OrderedArgs :
+    val tuple-n = n(iotable, CORE-TUPLE-ID)
+    val maybe-n = n(iotable, CORE-MAYBE-ID)
+    /reorder-args(args,
+                  EOf{maybe-n},
+                  EOf{tuple-n})    
+  
+  ;Convert a function and return the computed dispatch mask.
+  defn conv-fn (e:EFn) -> [EFn, DispatchMask|False] :
+    if requires-ordering?(a1-args(e)) :
+      val ordered = reorder-args(a1-args(e))
+      val new-args = reorder(ordered, args(e))
+      val new-e = e
+               $> sub-args{_, new-args}
+               $> sub-a1-args{_, args(ordered)}
+      [new-e, dispatch(ordered)]
+    else :
+      [e, false]    
+
+  ;Convert all arguments in EFn to positional arguments.
+  defn conv-pos-args (e:EFn) -> EFn :
+    val [new-e, mask] = conv-fn(e)
+    new-e
+
+  ;Helper: Create a trivial DispatchMask, assuming that only
+  ;simple positional arguments are used.
+  defn trivial-dispatch (n:Int) -> DispatchMask :
+    val mask = to-tuple(repeat(true, n))
+    val indices = to-tuple(0 to n)
+    DispatchMask(mask, indices)
+
+  ;Convert all arguments in EDefmulti to positional arguments.
+  defn conv-pos-args (m:EDefmulti) -> EDefmulti :
+    if requires-ordering?(a1-args(m)) :
+      val ordered = reorder-args(a1-args(m))
+      m $> sub-a1-args{_, args(ordered)}
+        $> sub-dispatch{_, dispatch(ordered)}
+    else :
+      sub-dispatch(m, trivial-dispatch(length(a1-args(m))))
+
+  ;Convert all arguments in EDefmethod to positional arguments.
+  defn conv-pos-args (e:EDefmethod|EMethod) -> EDefmethod|EMethod :
+    val [f, mask] = conv-fn(func(e))
+    match(mask:DispatchMask) :
+      e $> sub-func{_, f}
+        $> sub-dispatch{_, mask}
+    else :
+      val arity = length(a1-args(func(e)))
+      sub-dispatch(e, trivial-dispatch(arity))
+
+  ;Helper: Call 'f' on any nested ELBigItem within e.
+  ;EDefmethod|EMethod treats its EFn as one atomic item.
+  defn map-nested (f:ELBigItem -> ELBigItem, e:ELBigItem) -> ELBigItem :
+    match(e) :
+      (e:EDefmethod|EMethod) : sub-func(e, map(f, func(e)))
+      (e) : map(f, e)
+
+  ;Recursively analyze all EDefmulti and EFn in
+  ;the package, and reorder the arguments.
+  defn loop (x:ELBigItem) :
+    match(map-nested(loop,x)) :
+      (x:EDefmulti) : conv-pos-args(x)
+      (x:EDefmethod|EMethod) : conv-pos-args(x)
+      (x:EFn) : conv-pos-args(x)
+      (x) : x
+  map(loop, e)
 
 ;============================================================
 ;================== Method TArg Mapping =====================
@@ -359,7 +449,7 @@ defn map-methods (e:EPackage, gvt:VarTable) :
         func* = sub-targs(func*, targs*)
         func* = sub-a1(func*, to-tuple(seq(EAnd, a1(func*), mat)))
         func* = sub-a2(func*, EAnd(a2(func*), mrt))
-        EDefmethod(n(m), multi(m), [], func*, lostanza?(m))
+        EDefmethod(n(m), multi(m), [], func*, lostanza?(m), dispatch(m))
       (m:EMethod) :
         val arity = length(args(func(m)))
         val [targs*, tvals] = inverse-solve(targs(func(m)), targs(m))
@@ -369,7 +459,7 @@ defn map-methods (e:EPackage, gvt:VarTable) :
         func* = sub-targs(func*, targs*)
         func* = sub-a1(func*, to-tuple(seq(EAnd, a1(func*), mat)))
         func* = sub-a2(func*, EAnd(a2(func*), mrt))
-        EMethod(n(m), multi(m), [], thisn(m), func*)
+        EMethod(n(m), multi(m), [], thisn(m), func*, dispatch(m))
       (x) :
         x
   map(loop, e)
@@ -418,77 +508,32 @@ defn to-body (b:BodyBuffer) :
 ;============================================================
 ;=================== Closure Creation =======================
 ;============================================================
+
+;Functions cannot be referenced directly.
+;For each referenced function in expression position, create
+;a closure that wraps up the call.
 defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
-  ;Retrieve an info from the given immediate
-  defn first-info (f:EVar|ECurry|EMix) :
-    match(f) :
-      (f:EVar) : info(f)
-      (f:ECurry) : info(x(f))
-      (f:EMix) : find({_ is FileInfo}, seq(first-info, funcs(f)))
 
-  ;Key utilities for EVar|ECurry
-  defn var-hash (e:EVar|ECurry) :
-    match(e) :
-      (e:EVar) : n(e)
-      (e:ECurry) : 11 * n(x(e)) + hash(targs(e))
-  defn var-equal? (a:EVar|ECurry, b:EVar|ECurry) :
-    match(a, b) :
-      (a:EVar, b:EVar) : n(a) == n(b)
-      (a:ECurry, b:ECurry) : n(x(a)) == n(x(b)) and targs(a) == targs(b)
-      (a, b) : false
-  defn var-table<T> () :
-    HashTable<EVar|ECurry, T>(var-hash, var-equal?)
-
-  ;Create a trampoline function that calls the given immediate
-  ;with known arity.
-  defn trampoline-fn (f:EVar|ECurry|EMix, arity:Int, vt:VarTable) :
-    defn times<?T> (n:Int, f:() -> ?T) :
-      to-tuple(repeatedly(f,n))
-    val args = arity * uniqueid
-    val [a1, a2] = match(f) :
-      (f:EVar|ECurry) : fn-types(vt, f, arity)
-      (f:EMix) : [arity * ETop, ETop()]
-    EFn(true, [], args, arity * ETop, ETop(),
-      EBody([], [], [], [], [
-        ETCall(f, map(EVar,args), CallGuarded(a1,a2), first-info(f))])
-      false)
-
-  ;Create a trampoline function that calls the given immediate
-  ;with unknown (and potentially multiple) arities.
-  defn trampoline-fn (f:EVar|ECurry|EMix, vt:VarTable) :
-    ;Gather all branches
-    val branches = Vector<KeyValue<Int,EVar|ECurry>>()
-    let loop (f:EImm = f) :
-      match(f) :
-        (f:EVar) :
-          for a in arities(vt,n(f)) do :
-            add(branches, a => f)
-        (f:ECurry) :
-          for a in arities(vt,n(x(f))) do :
-            add(branches, a => f)
-        (f:EMix) :
-          do(loop, funcs(f))
-
-    ;If there's only one
-    if length(branches) == 1 :
-      val b = branches[0]
-      trampoline-fn(value(b), key(b), vt)
-    else :
-      EMultifn $ to-tuple $
-        for group in group-by(key, value, branches) seq :
-          trampoline-fn{_, key(group), vt} $
-            switch(length(value(group))) :
-              1 : head(value(group))
-              else : EMix(to-tuple(value(group)))
-
-  ;Lift all first-class functions in body
+  ;Lift all first-class functions in body.
   defn analyze-body (top-body:EBody, vt:VarTable) :
 
-    ;Create trampoline table
-    val trampoline-table = var-table<Int>()
+    ;Create trampoline table.    
+    val trampoline-table = TrampolineTable()
+
+    ;Hold the list of trampolines created for each
+    ;function.
+    ;An entry, N => F1,F2, means that F1 and F2 are
+    ;trampolines to N. So they should be initialized
+    ;as soon as N is declared.
     val trampolines = IntListTable<ELocalFn>()
+
+    ;Track for which trampolines have we initialized
+    ;by generating an EInitClosures instruction.
     val initialized? = IntSet()
-    defn uninitialized-trampolines () :
+
+    ;Return all the trampolines in 'trampolines' that
+    ;haven't been marked as initialized.
+    defn uninitialized-trampolines () -> Seq<ELocalFn> :
       for entry in trampolines seq-cat :
         if initialized?[key(entry)] : []
         else : value(entry)
@@ -501,34 +546,32 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
           val buffer = BodyBuffer(e)
 
           ;Retrieve the wrapped identifier in EVar|ECurry
-          defn var-id (e:EVar) : n(e)
-          defn var-id (e:ECurry) : var-id(x(e))
-          defn lift (x:EVar|ECurry|EMix) -> EVar :
+          defn lift (x:EMix|EInstFn) -> EVar :
             ;Closure is (conservatively) allocated at use-site if it is a EMix
             ;or if it curries over type variables.
             val allocate-at-use-site? = match(x) :
               (x:EMix) : true
-              (x:ECurry) : any?(has-tvar?, targs(x))
-              (x:EVar) : false
+              (x:EInstFn) : not empty?(capvars(x))
+
             ;If at use-site, then init here, otherwise lift to trampoline table
             if allocate-at-use-site? :
               val v = uniqueid()
-              emit(buffer, ELocalFn(v, trampoline-fn(x, vt)))
-              emit(buffer, EInitClosures([EVarLoc(v)], first-info(x)))
+              val info = match(x) :
+                (x:EMix) : info(funcs(x)[0])
+                (x:EInstFn) : info(x)
+              emit(buffer, ELocalFn(v, trampoline-fn(x)))
+              emit(buffer, EInitClosures([EVarLoc(v)], info))
               EVar(v)
             else :
-              val x = x as EVar|ECurry
-              if not key?(trampoline-table, x) :
-                val v = uniqueid()
-                add(trampolines, var-id(x), ELocalFn(v, trampoline-fn(x, vt)))
-                trampoline-table[x] = v
-              EVar(trampoline-table[x])
+              val x = x as EInstFn
+              if make-trampoline(trampoline-table, x) :
+                add(trampolines, n(x), trampoline-table[n(x)])
+              EVar(n(trampoline-table[n(x)]))
 
           ;Analyze an immediate, lifting when necessary
           defn lift-imm (x:EImm) :
             match(x) :
-              (x:EVar) : lift(x) when function?(vt,n(x)) else x
-              (x:ECurry|EMix) : lift(x)
+              (x:EMix|EInstFn) : lift(x)
               (x) : x
 
           ;Analyze all instructions
@@ -571,11 +614,88 @@ defn create-closures (epackage:EPackage, gvt:VarTable) -> EPackage :
     ;Driver
     lift-trampolines(top-body, true)
 
-  ;Recursive Analysis
+  ;Scan through the package and call analyze-body on
+  ;every 
   defn analyze (x:ELBigItem, vt:VarTable) :
     match(x:EBody) : analyze-body(x, vt)
     else : map(analyze{_, vt}, x)
   map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
+
+;Small trampoline table for avoiding redundantly creating
+;closures over and over for the same function.
+;TODO: Can be generalized to handle type arguments too.
+defstruct TrampolineTable :
+  table:IntTable<ELocalFn> with:
+    init => IntTable<ELocalFn>()
+
+;Create a new trampoline.
+;Returns true if a new trampoline was created.
+defn make-trampoline (t:TrampolineTable, f:EInstFn) -> True|False :
+  if not key?(table(t), n(f)) :
+    val func = uni-arity-trampoline-fn(f)
+    table(t)[n(f)] = ELocalFn(uniqueid(), func)
+    true
+
+;Retrieve a previously created trampoline.
+defn get (t:TrampolineTable, n:Int) -> ELocalFn :
+  table(t)[n]
+
+;Helper: Create a trampoline function that calls the given immediate.
+defn uni-arity-trampoline-fn (f:EMix|EInstFn) -> EFn :
+
+  ;Retrieve the arity of the function to call.
+  ;Assume if it is a mix that they are all the same arity.
+  val arity = length $ match(f) :
+    (f:EInstFn) : a1(f)
+    (f:EMix) : a1(funcs(f)[0])
+
+  ;Create fresh identifiers of the trampoline arguments.    
+  val args = arity * uniqueid
+
+  ;For the CallGuarded call type, retrieve the input/output
+  ;types. EMix will use ETop() as a placeholder.
+  val [a1, a2] = match(f) :
+    (f:EInstFn) : [a1(f), a2(f)]
+    (f:EMix) : [arity * ETop, ETop()]
+
+  ;Create the tail-call expression.
+  val tcall = ETCall(f, argvars, call-type, info) where :
+    val argvars = map(EVar,args)
+    val call-type = CallGuarded(a1,a2)
+    val info = match(f) :
+      (f:EInstFn) : info(f)
+      (f:EMix) : info(funcs(f)[0])
+
+  ;Create the EFn.
+  EFn(true, [], args, arity * PositionalArg<EType>{false,ETop()}, ETop(),
+    EBody([], [], [], [], [tcall])
+    false)
+
+;Create a trampoline function that calls the given immediate
+;with unknown (and potentially multiple) arities.
+defn trampoline-fn (f:EMix|EInstFn) -> EFn|EMultifn :
+  ;Complex case: Multiple functions.
+  match(f:EMix) :
+    ;Retrieve the arity of the given function.
+    defn arity (f:EInstFn) -> Int :
+      length(a1(f))
+      
+    ;Group by arity, and create a trampoline for each arity.
+    val groups = group-by(arity, funcs(f))
+    val trampolines = to-tuple $ for group in groups seq :
+      val fs = value(group)
+      val f = head(fs) when length(fs) == 1
+         else EMix(to-tuple(fs))
+      uni-arity-trampoline-fn(f)
+
+    ;Either return a single trampoline, or group them
+    ;using EMultifn.
+    if length(trampolines) == 1 : trampolines[0]
+    else : EMultifn(trampolines)
+
+  ;Simple case: Only a single function.
+  else :
+    uni-arity-trampoline-fn(f as EInstFn)
 
 ;============================================================
 ;===================== Mix Conversion =======================
@@ -593,17 +713,16 @@ public defn convert-mixes (epackage:EPackage, gvt:VarTable) :
       ;Construct branches and blocks
       val branches = Vector<EBranch>()
       val blocks = Vector<(() -> False)>()
-      val refmask = map(reftype?, a1) where :
-        val [a1, a2] = fn-types(vt, funcs(f)[0], length(ys))
+      val f0 = funcs(f)[0]
+      val refmask = map(reftype?, a1(f0))
       val end-lbl = uniqueid()
       for f in funcs(f) do :
-        val [a1, a2] = fn-types(vt, f, length(ys))
         val lbl = uniqueid()
-        add(branches, EBranch(select(a1,refmask), lbl, false))
+        add(branches, EBranch(select(a1(f),refmask), lbl, false))
         add{blocks, _} $ fn () :
           emit(buffer, ELabel(lbl))
-          emit(buffer, Call(x, f, ys, CallGuarded(a1, a2), info))
-          emit(buffer, EGoto(end-lbl)) when not end?
+          emit(buffer, Call(x, f, ys, CallGuarded(a1(f), a2(f)), info))
+          emit(buffer, EGoto(end-lbl)) when not end?        
       ;Yield branches
       emit(buffer, EDispatch(select(ys,refmask), to-tuple(branches), info))
       for b in blocks do : b()
@@ -794,30 +913,20 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
             emit(buffer, i)
         (ins:ECall|ETCall) :
           let :
-            if function?(f(ins)) :
-              val arity = length(ys(ins))
-              val [a1, a2] = fn-types(vt, f(ins) as EVar|ECurry, arity)
-              if lostanza-context? and lostanza-function?(f(ins)) :
-                unguarded-call(a2)
-              else : guard-call(a1, a2)
+            if f(ins) is EInstFn :
+              val f = f(ins) as EInstFn
+              if lostanza-context? and lostanza?(vt,n(f)) : unguarded-call(a2(f))
+              else : guard-call(a1(f), a2(f), false)
             else if calltype(ins) is CallGuarded :
               val ct = calltype(ins) as CallGuarded
               if lostanza-context? : unguarded-call(a2(ct))
-              else : guard-call(a1(ct), a2(ct))
+              else : guard-call(a1(ct), a2(ct), true)
             else : unguarded-call(EUnknown())
           where :
-            defn function? (e:EImm) :
-              match(e) :
-                (e:EVar) : /function?(vt, n(e))
-                (e:ECurry) : /function?(vt, n(x(e)))
-                (e) : false
-            defn lostanza-function? (f:EImm) :
-              match(f) :
-                (f:EVar) : lostanza?(vt, n(f))
-                (f:ECurry) : lostanza?(vt, n(x(f)))
-            defn guard-call (a1:Tuple<EType>, a2:EType) :
+            defn guard-call (a1:Tuple<EType>, a2:EType, guard-function?:True|False) :
               ;Sanity check
-              fatal("Incorrect call type") when calltype(ins) is-not CallGuarded
+              if calltype(ins) is-not CallGuarded :
+                fatal("Incorrect call type")
 
               match(ins) :
                 (ins:ECall) :
@@ -838,7 +947,7 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
                   for (y in ys(ins), t in a1) do :
                     emit(buffer, ECheck(y, t, ArgContext(), info(ins)))
                   ;Check function
-                  if not function?(f(ins)) :
+                  if guard-function? :
                     val t = EOf(n(iotable(vt), CORE-FN-ID))
                     emit(buffer, ECheck(f(ins), t, FuncContext(), info(ins)))
                   ;Make call
@@ -851,7 +960,7 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
                   for (y in ys(ins), t in a1) do :
                     emit(buffer, ECheck(y, t, ArgContext(), info(ins)))
                   ;Check function
-                  if not function?(f(ins)) :
+                  if guard-function? :
                     val t = EOf(n(iotable(vt), CORE-FN-ID))
                     emit(buffer, ECheck(f(ins), t, FuncContext(), info(ins)))
                   ;Make call
@@ -888,7 +997,8 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
     guard-body(body(f), buffer, vt, lostanza-context?, a2(f), info(f), uninitialized-vars)
     val body* = to-body(buffer, true, false, false)
     val a1* = map(remove-tvars, a1(f))
-    EFn(tail?(f), targs(f), args(f), a1*, a2(f), body*, info(f))
+    f $> sub-body{_, body*}
+      $> sub-a1{_, a1*}
 
   defn map-fns<?T> (f:EFn -> EFn, x:?T&ELBigItem) -> T :
     val result = let loop (x:ELBigItem = x) :
@@ -925,6 +1035,134 @@ defn insert-guards (epackage:EPackage, gvt:VarTable) :
       (e:EInit) : guard-init(e, vt, uninitialized-vars)
       (e) : e
   map-with-var-table({analyze(_, _) as ETExp}, gvt, epackage)
+
+;============================================================
+;============== Positional Arguments Calls ==================
+;============================================================
+
+;Convert all calls to EInstFn in the package to simple
+;positional arguments using EVar/ECurry as the function.
+defn conv-to-positional-calls (e:EPackage, iotable:IOTable) -> EPackage :
+  defn process (x:ELBigItem) -> ELBigItem :
+    match(map(process,x)) :
+      (body:EBody) : conv-calls(body, iotable)
+      (x) : x
+  map(process, e)
+  
+;Convert all calls in body.
+;Does not recurse into nested bodies.
+defn conv-calls (body:EBody, iotable:IOTable) -> EBody :
+
+  val buffer = BodyBuffer(body)
+  
+  defn wrap-one (x:EImm) -> EImm :
+    val one-n = n(iotable, CORE-ONE-ID)
+    val n = uniqueid()
+    emit(buffer, ELocal(n, EOf(one-n), false))
+    emit(buffer, EObject(EVarLoc(n), one-n, [x], false))
+    EVar(n)
+    
+  defn wrap-none () -> EImm :
+    val none-n = n(iotable, CORE-NONE-ID)
+    val n = uniqueid()
+    emit(buffer, ELocal(n, EOf(none-n), false))
+    emit(buffer, EObject(EVarLoc(n), none-n, [], false))
+    EVar(n)
+    
+  defn wrap-tuple (xs:Tuple<EImm>) -> EImm :
+    val tuple-n = n(iotable, CORE-TUPLE-ID)
+    val n = uniqueid()
+    emit(buffer, ELocal(n, EOf(tuple-n), false))
+    emit(buffer, ETuple(EVarLoc(n), xs, false))
+    EVar(n)
+
+  defn emit-call (c:ECall|ETCall, f:EImm, ys:Tuple<EImm>) -> False :
+    match(c) :
+      (c:ECall) :
+        emit(buffer, ECall(x(c), f, ys, calltype(c), info(c)))
+      (c:ETCall) :
+        emit(buffer, ETCall(f, ys, calltype(c), info(c)))  
+
+  ;Process each of the instructions in the body, and
+  ;convert calls to EInstFn.
+  for ins in ins(body) do :
+    match(ins) :
+      (ins:ECall|ETCall) :
+        if f(ins) is EInstFn :
+          conv-call(f(ins) as EInstFn,
+                    ys(ins),
+                    wrap-one,
+                    wrap-none,
+                    wrap-tuple,
+                    emit-call{ins, _, _})
+        else :
+          emit(buffer, ins)
+      (ins) :
+        emit(buffer, ins)
+
+  ;Return the processed body.
+  to-body(buffer)
+
+;Convert the call to the instantiated function to use
+;purely positional arguments.
+defn conv-call (f:EInstFn,
+                args:Tuple<EImm>,
+                wrap-one:EImm -> EImm,
+                wrap-none:() -> EImm,
+                wrap-tuple:Tuple<EImm> -> EImm,
+                emit-call:(EImm, Tuple<EImm>) -> False) -> False :
+  ;Compute new rearranged arguments.
+  val ordered-args = reorder-args(/args(pattern(f)))
+  
+  val new-args = Vector<EImm>()
+  for pat-arg in ordered-args do :
+    match(pat-arg) :
+    
+      (pa:PositionalArg<ArgUsage>|KeywordArg<ArgUsage>) :
+        ;Three cases:
+        ;  Case 1: Optional and given.
+        ;  Case 2: Optional and not given.
+        ;  Case 3: Required.
+        
+        ;Case 1:
+        if optional?(pa) and type(pa) is GivenArg :
+          val u = type(pa) as GivenArg
+          add(new-args, wrap-one(args[index(u)]))
+        ;Case 2:
+        else if optional?(pa) and type(pa) is MissingArg :
+          add(new-args, wrap-none())
+        ;Case 3:
+        else if not optional?(pa) :
+          val u = type(pa) as GivenArg
+          add(new-args, args[index(u)])
+        else :
+          fatal("Invalid case.")
+          
+      (pa:VarArg<ArgUsage>) :
+        ;Two cases:
+        ;  Case 1: Given as keyword.
+        ;  Case 2: Given as multi value.
+        match(type(pa)) :
+          ;Case 1:
+          (u:GivenArgs) :
+            add(new-args, wrap-tuple(map({args[_]}, indices(u))))
+          ;Case 2:
+          (u:GivenArg) :
+            add(new-args, args[index(u)])
+            
+      (pa:RestArg<ArgUsage>) :
+        val u = type(pa) as GivenArgs
+        for i in indices(u) do :
+          add(new-args, args[i])
+            
+  ;Emit the new call.
+  val new-func =
+    if empty?(capvars(f)) :
+      EVar(n(f), info(f), name(f))
+    else :
+      val v = EVar(n(f), info(f), name(f))
+      ECurry(v, capvars(f))
+  emit-call(new-func, to-tuple(new-args))
 
 ;============================================================
 ;===================== Liveness Annotation ==================
@@ -2555,8 +2793,9 @@ defn lift-objects (epackage:EPackage, gvt:VarTable) -> EPackage :
       for (x in args(f), t in a1(f)) seq :
         EOf(obj-n) when x == thisn(m) else remove-tvars(t)
     val a2* = remove-tvars(a2(f))
+
     val f* = EFn(tail?(f), targs(f), args(f), a1*, a2*, to-body(buffer, true, false, false), info(f))
-    add(new-texps, EDefmethod(n(m), multi(m), [], f*, false))
+    add(new-texps, EDefmethod(n(m), multi(m), [], f*, false, dispatch(m)))
     n(m)
 
   ;Sweep through the body and lift out declarations of local objects.
@@ -2621,6 +2860,7 @@ defn lift-objects (epackage:EPackage, gvt:VarTable) -> EPackage :
 ;  can dispatch to.
 ;- targets: Holds the labels corresponding to each method.
 defstruct MethodDag :
+  mask: Tuple<True|False>
   dag: Dag
   targets: Tuple<Int>
 
@@ -2635,6 +2875,7 @@ defstruct BranchDag :
 defmethod print (o:OutputStream, dag:MethodDag) :
   val o2 = IndentedStream(o)
   print(o, "MethodDag:")
+  lnprint(o2, "mask: %_" % [mask(dag)])
   lnprint(o2, "dag:")
   lnprint(o2, Indented(/dag(dag)))
   lnprint(o2, "targets: %," % [targets(dag)])
@@ -2669,8 +2910,9 @@ defn DispatchTable (epackage:EPackage) -> DispatchTable :
   ;Overall algorithm
   defn driver () :
     val class-tree = make-class-tree()
+    val multi-table = create-multi-table()
     val method-table = create-method-table()
-    val dag-table = create-method-dag-table(class-tree, method-table)
+    val dag-table = create-method-dag-table(class-tree, multi-table, method-table)
     build-dispatch-table(class-tree, dag-table)
 
   ;Create a class tree
@@ -2692,20 +2934,34 @@ defn DispatchTable (epackage:EPackage) -> DispatchTable :
           (e:EDefObject): One(NodeState(n(e), parent-ids(parent(e)), [], true))
           (e) : None()
 
+  ;Create multi table.
+  defn create-multi-table () -> IntTable<EDefmulti> :
+    to-inttable(n, filter-by<EDefmulti>(exps(epackage)))
+
   ;Create method table.
   defn create-method-table () -> HashTable<Int,List<EDefmethod>> :
     val methods = filter-by<EDefmethod>(exps(epackage))
     group-by(multi, methods)
 
   ;Create a single method dag.
-  defn create-method-dag (class-tree:DynTree, ms:Tuple<EDefmethod>) -> MethodDag :
-    defn to-branch (m:EDefmethod) :
+  defn create-method-dag (class-tree:DynTree, multi:EDefmulti, ms:Tuple<EDefmethod>) -> MethodDag :
+    ;Compute dispatch mask.
+    val mask = dispatch(dispatch(multi) as DispatchMask)
+
+    ;Helper: Convert a method into a branch for computing the dispatch DAG.
+    defn to-branch (m:EDefmethod) -> Branch :
       val method-types = a1(func(m))
-      val args* = map(etype-to-arg{class-tree, _, true}, method-types)
+      fatal("Mismatched mask.") when length(method-types) != length(mask)
+      val dispatch-types = to-tuple(filter({_1}, method-types, mask))
+      val args* = map(etype-to-arg{class-tree, _, true}, dispatch-types)
       Branch(args*)
+
+    ;Compute the dispatch dag.
     val branch-table = BranchTable(map(to-branch, ms), non-leaves(class-tree))
     val dag = compute-dispatch-dag(branch-table, true)
-    MethodDag(dag, map(n,ms))
+
+    ;Return the computed MethodDag.
+    MethodDag(mask, dag, map(n,ms))
 
   ;Create a single branch dag.
   defn create-branch-dag (class-tree:DynTree, bs:Tuple<EBranch>, topological?:True|False) -> BranchDag :
@@ -2717,14 +2973,21 @@ defn DispatchTable (epackage:EPackage) -> DispatchTable :
     BranchDag(dag, bs)
 
   ;Create the method dag table.
-  defn create-method-dag-table (class-tree:DynTree, method-table:HashTable<Int,List<EDefmethod>>) -> IntTable<MethodDag> :
+  defn create-method-dag-table (class-tree:DynTree,
+                                multi-table:IntTable<EDefmulti>,
+                                method-table:HashTable<Int,List<EDefmethod>>) -> IntTable<MethodDag> :
     to-inttable<MethodDag> $ for entry in method-table seq :
-      key(entry) => create-method-dag(class-tree, to-tuple(value(entry)))
+      val multi = multi-table[key(entry)]
+      val methods = to-tuple(value(entry))
+      key(entry) => create-method-dag(class-tree, multi, methods)
 
   ;Resolve through dag
-  defn resolve-method (class-tree:DynTree, dag-table:IntTable<MethodDag>, multi:Int, types:Tuple<EType>) -> Int|False :
+  defn resolve-method (class-tree:DynTree, dag-table:IntTable<MethodDag>,
+                       multi:Int, types:Tuple<EType>) -> Int|False :
     val mdag = dag-table[multi]
-    val args = map(etype-to-arg{class-tree, _, false}, types)
+    fatal("Mismatched mask.") when length(types) != length(mask(mdag))
+    val dispatch-types = to-tuple(filter({_1}, types, mask(mdag)))
+    val args = map(etype-to-arg{class-tree, _, false}, dispatch-types)
     val solns = all-solns(dag(mdag), args, false)
     if length(solns) == 1 :
       val i = index(solns[0] as UniqueSoln)
@@ -3778,9 +4041,9 @@ defn rename-vars+tvars<?T> (e:ELItem&?T, table:IntTable<Int>) -> T :
     defn f (x:Int) : get?(table, x, x)
     match(map(rename,e)) :
       (e:EDefClosure) : EDefClosure(n(e), f(closure(e)), ntargs(e), nargs(e), func(e))
-      (e:EDefmulti) : EDefmulti(n(e), map(f,targs(e)), a1(e), a2(e), info(e))
-      (e:EFn) : EFn(tail?(e), map(f,targs(e)), map(f,args(e)), a1(e), a2(e), body(e), info(e), free?(e))
-      (e:EMethod) : EMethod(n(e), multi(e), targs(e), f(thisn(e)), func(e))
+      (e:EDefmulti) : EDefmulti(n(e), map(f,targs(e)), a1-args(e), a2(e), dispatch(e), info(e))
+      (e:EFn) : EFn(tail?(e), map(f,targs(e)), map(f,args(e)), a1-args(e), a2(e), body(e), info(e), free?(e))
+      (e:EMethod) : EMethod(n(e), multi(e), targs(e), f(thisn(e)), func(e), dispatch(e))
       (e:EVar) : EVar(f(n(e)))
       (e:EVarLoc) : EVarLoc(f(n(e)))
       (e:ETVar) : ETVar(f(n(e)))
@@ -3798,3 +4061,11 @@ defn has-tvar? (t:EType) :
 
 defn select<?T> (xs:Tuple<?T>, mask:Tuple<True|False>) -> Tuple<T> :
   to-tuple(filter(xs, mask))
+
+;============================================================
+;===================== Small Utilities ======================
+;============================================================
+
+;Shorthand for calling 'repeatedly'.
+defn times<?T> (n:Int, f:() -> ?T) -> Tuple<T> :
+  to-tuple(repeatedly(f,n))
