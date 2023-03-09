@@ -114,10 +114,10 @@ if [ "$CREATE_PACKAGE" == "true" ] ; then
          License.txt \
          ChangeLog.txt"
 
-  mkdir -p ${TOP}/workdir/build
-  cp -r ${FILES} ${TOP}/workdir/
+  mkdir -p ziptmp/build
+  cp -r ${FILES} ziptmp/
 
-  cd ${TOP}/workdir
+  cd ziptmp
 
   # rename "lstanza" to "stanza" and "wstanza.exe" to "stanza.exe"
   [[ "${STANZA_PLATFORMCHAR}stanza" != "stanza" ]] \
