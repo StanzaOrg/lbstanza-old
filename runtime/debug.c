@@ -1093,7 +1093,7 @@ static inline void send_invalidate_thread(void) {
 
 static inline void Environment_reset(void);
 static void send_thread_stopped(StopReason reason, const char* description, uint64_t breakpoint) {
-  send_invalidate_thread();
+  //send_invalidate_thread();
   Environment_reset();
   run_mode = RUN_MODE_PAUSED;
 
@@ -2414,6 +2414,7 @@ typedef struct {
   size_t length;
   size_t capacity;
   StackTraceFrame* data;
+  uint64_t format;
 } StackTrace;
 static inline void StackTrace_initialize(StackTrace* st) {
   st->length = 0;
@@ -2566,7 +2567,11 @@ void append_stack_frame(uint64_t pc, uint64_t sp, const char* function_name,
 // Create stack trace for given thread_id starting at start level with no more than max_frames frames.
 // Frames not visible to the debugger can be skipped.
 // Returns total number of frames in thread_id stack or -1 when no thread with given thread_id thread_is found.
-int32_t create_stack_trace(const uint64_t format) ;
+void create_stack_trace(const uint64_t format) ;
+void need_stack_trace(void) {
+  if (run_mode != RUN_MODE_TERMINATED && stack_trace_available && !current_stack_trace.length)
+    create_stack_trace(current_stack_trace.format);
+}
 
 typedef struct {
   DelayedRequest parent;
@@ -2576,9 +2581,11 @@ typedef struct {
 } DelayedRequestStackTrace;
 static void DelayedRequestStackTrace_handle(DelayedRequest* request) {
   const DelayedRequestStackTrace* req = (const DelayedRequestStackTrace*)request;
-
-  if (run_mode != RUN_MODE_TERMINATED && stack_trace_available && !current_stack_trace.length)
-    create_stack_trace(req->format);
+  if (req->format != current_stack_trace.format) {
+    current_stack_trace.format = req->format;
+    StackTrace_reset(&current_stack_trace);
+  }
+  need_stack_trace();
   const int64_t total_frames = current_stack_trace.length;
 
   JSBuilder builder;
@@ -2694,18 +2701,32 @@ static void JSBuilder_write_scope(JSBuilder* builder, const uint64_t scope_id, c
 uint32_t number_of_globals(void);
 uint32_t number_of_locals(uint64_t pc);
 
+static inline StackTraceFrame* validate_stack_trace_frame(StackTraceFrame* frame) {
+  if (frame) {
+    const uint64_t offset = (uint64_t)frame - (uint64_t)current_stack_trace.data;
+    if (offset % sizeof(StackTraceFrame) == 0) {
+      const uint64_t index = offset / sizeof(StackTraceFrame);
+      if (index < (uint64_t)current_stack_trace.length)
+        return frame;
+    }
+  }
+  return NULL;
+}
+
 typedef struct {
   DelayedRequest parent;
   StackTraceFrame* frame;
 } DelayedRequestScopes;
 static void DelayedRequestScopes_handle(DelayedRequest* request) {
+  need_stack_trace();
+
   JSBuilder builder;
   JSBuilder_initialize_delayed_response(&builder, request, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   {
     JSBuilder_array_field_begin(&builder, "scopes");
     const DelayedRequestScopes* req = (const DelayedRequestScopes*)request;
-    StackTraceFrame* frame = req->frame;
+    StackTraceFrame* frame = validate_stack_trace_frame(req->frame);
     if (frame) {
       if (!frame->scopes) {
         frame->scopes = current_env.length;
@@ -2722,21 +2743,10 @@ static void DelayedRequestScopes_handle(DelayedRequest* request) {
   JSBuilder_send_and_destroy_response(&builder);
 }
 
-static inline bool is_valid_stack_trace_frame_id(const uint64_t frame_id) {
-  const uint64_t offset = frame_id - (uint64_t)current_stack_trace.data;
-  if (offset % sizeof(StackTraceFrame) == 0) {
-    const uint64_t index = offset / sizeof(StackTraceFrame);
-    return index < (uint64_t)current_stack_trace.length;
-  }
-  return false;
-}
 static inline DelayedRequest* DelayedRequestScopes_create(const JSObject* request) {
   DelayedRequestScopes* req = DelayedRequest_create(request, sizeof(DelayedRequestScopes), &DelayedRequestScopes_handle);
   const JSObject* arguments = JSObject_get_object_field(request, "arguments");
-  int64_t frame_id = JSObject_get_integer_field(arguments, "frameId", INVALID_FRAME_ID);
-  if (frame_id != INVALID_FRAME_ID && !is_valid_stack_trace_frame_id(frame_id))
-    frame_id = INVALID_FRAME_ID;
-  req->frame = (StackTraceFrame*)frame_id;
+  req->frame = (StackTraceFrame*)JSObject_get_integer_field(arguments, "frameId", INVALID_FRAME_ID);
   return (DelayedRequest*) req;
 }
 static bool request_scopes(const JSObject* request) {
