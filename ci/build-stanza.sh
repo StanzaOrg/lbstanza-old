@@ -24,18 +24,50 @@ echo "                  VER:" "${VER:=$(git -C ${REPODIR} describe --tags --abbr
 # Calculated env vars
 STANZADIR=$(grep ^install-dir $STANZA_CONFIG/.stanza | cut -f2 -d\")
 
+PLATFORM_DESC="unknown"
 case "$STANZA_BUILD_PLATFORM" in
     Linux* | linux* | ubuntu*)
         STANZA_BUILD_PLATFORM=linux
         STANZA_PLATFORMCHAR="l"
+        PLATFORM_DESC="$(grep ^ID= /etc/os-release | cut -f2 -d=)-$(grep ^VERSION_CODENAME= /etc/os-release | cut -f2 -d=)"
     ;;
     Darwin | mac* | os-x)
         STANZA_BUILD_PLATFORM=os-x
         STANZA_PLATFORMCHAR=""
+        PLATFORM_DESC="macos-unknown"
+        case "$(sw_vers -productVersion)" in
+            13.*)
+                PLATFORM_DESC="macos-ventura"
+            ;;
+            12.*)
+                PLATFORM_DESC="macos-monterey"
+            ;;
+            11.*)
+                PLATFORM_DESC="macos-bigsur"
+            ;;
+            10.15.*)
+                PLATFORM_DESC="macos-catalina"
+            ;;
+            10.14.*)
+                PLATFORM_DESC="macos-mojave"
+            ;;
+            10.13.*)
+                PLATFORM_DESC="macos-highsierra"
+            ;;
+            10.12.*)
+                PLATFORM_DESC="macos-sierra"
+            ;;
+        esac
     ;;
     MINGW* | win*)
         STANZA_BUILD_PLATFORM=windows
         STANZA_PLATFORMCHAR="w"
+        PLATFORM_DESC="windows-unknown"
+        case "$(uname -s)" in
+            MINGW64*)
+                PLATFORM_DESC="windows-mingw64"
+            ;;
+        esac
     ;;
     *)
         printf "\n\n*** ERROR: unknown build platform \"${STANZA_BUILD_PLATFORM}\"\n\n\n" && exit -2
@@ -65,7 +97,7 @@ scripts/${STANZA_PLATFORMCHAR}finish.${FINISH_EXT}
 
 
 if [ "$CREATE_PACKAGE" == "true" ] ; then
-  VERU=${VER//./_}  # convert dots to underscores
+  #VERU=${VER//./_}  # convert dots to underscores
   STANZA_EXT=""
   [[ "${STANZA_PLATFORMCHAR}" == "w" ]] && STANZA_EXT=".exe"
 
@@ -92,7 +124,8 @@ if [ "$CREATE_PACKAGE" == "true" ] ; then
       && mv ${STANZA_PLATFORMCHAR}stanza${STANZA_EXT} stanza${STANZA_EXT} \
       && mv ${STANZA_PLATFORMCHAR}pkgs pkgs
 
-  zip -r ../${STANZA_PLATFORMCHAR}stanza_${VERU}.zip *
+  #zip -r ../${STANZA_PLATFORMCHAR}stanza_${VERU}.zip *
+  zip -r ../stanza-${PLATFORM_DESC}_${VER}.zip *
 
 fi
 
