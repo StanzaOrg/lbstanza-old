@@ -1,0 +1,1925 @@
+defpackage stz/type-solver :
+  import core
+  import collections
+  import stz/types
+  import stz/type-formatter
+  import stz/type-locs
+  import stz/type-variance
+  import stz/type-hierarchy
+  import stz/printing-utils
+  import stz/utils
+  import stz/type-utils
+  import stz/type-capside
+  import stz/type-match
+  import stz/type-fargs
+  import stz/primitives
+
+;<doc>=======================================================
+;======================= Reasoning ==========================
+;============================================================
+
+# Separating constraints #
+
+  Suppose there's an equation with multiple type variables:
+
+    Find x, y, z: s.t. T1 <: T2
+
+  Is it possible to separate that equation, and solve for
+  each of the variables separately?
+
+  Ultimately, during the proof search for T1 <: T2, we will
+  find some leaf clause:
+
+    T <: ?x, or
+    T <: ?y
+
+  By definition, these clauses will be true. We are solving
+  for the variables such that they are true. So there's
+  nothing stopping us from just regarding them as true independently,
+  and then collecting the constraints at the end.
+
+  Why is this easier than just jointly solving for all of them?
+
+  Because, these are joint equations, and as long as we have
+  enough information to solve for one of the variables, we want
+  to know the answer as soon as possible, and plug it in.
+
+  So the summary is, we can break up that equation into the
+  following:
+
+    Find x: s.t. T1 <: T2
+    Find y: s.t. T1 <: T2
+    Find z: s.t. T1 <: T2
+
+  And during the solve, if we hit:
+
+    T <: ?y
+
+  We can just regard it as true, and not even bother collecting
+  the constraint for ?y unless ?y is the variable we are
+  attempting to solve for.
+
+# What does the capture algorithm return? #
+
+What are the different cases?
+
+  Case: The algorithm completed.
+
+    Case: There is a solution.
+
+      Then return:
+      - The number of gradual assertions required in the proof tree.
+      - The final leaf constraint imposed upon the variable.
+
+    Case: There is no solution.
+
+  Case: The algorithm could not complete.
+
+    There is a vital relation that we do not know the answer
+    to, because it depends upon a variable that has not yet
+    been solved.
+
+;============================================================
+;=======================================================<doc>
+
+;============================================================
+;====================== Capture API =========================
+;============================================================
+
+;Calculate the given capture variable.
+public defn capture (cv:Int, variance:Variance, side:CapSide,
+                     a:Tuple<Type>, b:Tuple<Type>, hier:TypeHierarchy) -> CaptureResult :
+  eval-capture-result(capture-search(cv, side, a, b, hier), variance)
+
+;Calculate the given capture variable.
+public defn ls-capture (cv:Int, variance:Variance, side:CapSide,
+                        a:Tuple<LSType>, b:Tuple<LSType>, hier:TypeHierarchy) -> CaptureResult :
+  eval-capture-result(capture-search(cv, side, a, b, hier), variance)
+
+;Represents the result of a capturing/inference function.
+;- Type: captured successfully.
+;- Blocked: blocked on some variable.
+;- False: unsatisfiable.
+public deftype CaptureResult :
+  False <: CaptureResult
+  Blocked <: CaptureResult
+  Type <: CaptureResult
+
+;Helper: Simplify and evaluate constraints.
+defn eval-capture-result (sresult:SearchResult, variance:Variance) -> CaptureResult :
+  match(simplify(sresult,true,false)) :
+    (r:Blocked) : r
+    (r:NoSoln) : false  
+    (r:Solved) : solve-constraint(constraint(r), variance)
+
+;============================================================
+;====================== Infer API ===========================
+;============================================================
+
+;Calculate the given inference location.
+public defn infer (a:InferLoc|Type, b:InferLoc|Type,
+                   type-as-constraint?:True|False, hier:TypeHierarchy) -> CaptureResult :
+  val sresult = capture-search(a, b, hier)
+  match(simplify(sresult,true,false)) :
+    (r:Blocked) : r
+    (r:NoSoln) : false
+    (r:Solved) :
+      val variance = capture-variance(a,b)
+      if type-as-constraint? : constraint-as-type(constraint(r), variance)
+      else : solve-constraint(constraint(r), variance)
+
+;Calculate the given inference location.
+public defn ls-infer (a:LSType, b:InferLoc) -> LSInferResult :
+  capture(a, b)
+
+;Represents the result of a LoStanza inference function.
+;- LSType: inferred successfully.
+;- Blocked: blocked on some variable.
+;- False: unsatisfiable.
+public deftype LSInferResult :
+  False <: LSInferResult
+  Blocked <: LSInferResult
+  LSType <: LSInferResult
+
+;============================================================
+;======================= Overload API =======================
+;============================================================
+
+;Compute whether the given overloaded arrow is appropriate to be
+;passed to b.
+public defn select-overload (a:TArrow, b:Type, hier:TypeHierarchy) -> PredResult :
+  eval-gradual-match-result(select-overload-search(a, b, hier))
+
+;Compute whether the given arrow is appropriate to be called with the given
+;arguments.
+public defn select-overload-call (a:TArrow, args:Tuple<Type>, hier:TypeHierarchy) -> PredResult :
+  eval-gradual-match-result(select-overload-search(a, TArrow(args, TTop()), hier))
+
+;Compute whether the given Fnt is appropriate to be called with the given
+;arguments.
+public defn select-overload-call (a:FnT, args:Tuple<LSType>, hier:TypeHierarchy) -> PredResult :
+  eval-gradual-match-result(select-overload-search(a, args, hier))  
+
+;Helper: Simplify and evaluate the predicate result.
+defn eval-gradual-match-result (sresult:SearchResult) -> PredResult :
+  match(simplify(sresult,false,true)) :
+    (r:Blocked) : r
+    (r:NoSoln) : false
+    (r:Solved) : true when num-gradual-expansions(r) == 0 else PartialMatch()
+
+;Represents the result of a boolean predicate function.
+public deftype PredResult :
+  True <: PredResult
+  False <: PredResult
+  Blocked <: PredResult
+  PartialMatch <: PredResult
+
+;============================================================
+;===================== Subtype/Upcast =======================
+;============================================================
+
+;Returns True|False|Blocked representing whether a is a subtype of b.
+public defn subtype (a:LSType, b:LSType, hier:TypeHierarchy) -> PredResult :
+  eval-pred-result(subtype-search(a, b, hier))
+
+;Returns True|False|Blocked representing whether a is a subtype of b.
+public defn subtype (a:Type, b:Type, hier:TypeHierarchy) -> PredResult :
+  eval-pred-result(subtype-search(a, b, hier))
+
+;Returns True|False|Blocked representing whether a is a submethod of b.
+public defn submethod? (a1:Tuple<FArg<Type>>, a2:Type, b:TArrow, hier:TypeHierarchy) -> PredResult :
+  eval-pred-result(submethod-search(a1, a2, b, hier))
+
+;Return True|False|Blocked representing whether a can be implicitly upcast to b.
+public defn implicit-upcast? (a:LSType, b:LSType) -> PredResult :
+  eval-pred-result(implicit-upcast-search(a,b))
+
+;Return True|False|Blocked representing whether a can be assigned to b.
+public defn assignable? (a:LSType, b:LSType, hier:TypeHierarchy) -> PredResult :
+  eval-pred-result(assignable-search(a,b,hier))
+
+;Return True|False|Blocked representing whether a can be cast to b.
+public defn castable? (a:Type, b:Type, hier:TypeHierarchy) -> PredResult :
+  eval-pred-result(castable-search(b,a,hier))
+
+;Helper: Simplify and evaluate the predicate result.
+defn eval-pred-result (sresult:SearchResult) -> PredResult :
+  match(simplify(sresult,false,false)) :
+    (r:Blocked) : r
+    (r:NoSoln) : false
+    (r:Solved) : true
+
+;============================================================
+;====================== Search Tree =========================
+;============================================================
+
+public deftype SearchResult
+
+;Represents a conjunction in the search tree.
+public defstruct SAnd <: SearchResult :
+  a: SearchResult
+  b: SearchResult
+
+;Represents a disjunction in the search tree.
+public defstruct SOr <: SearchResult :
+  a: SearchResult
+  b: SearchResult
+
+;Represents a successful search. The captured variable, x,
+;must satisfy x <: type (if x is in covariant position.)
+public defstruct SSoln <: SearchResult :
+  type:Type
+with: (printer => true)
+
+;Represents a failed search. The search has failed because
+;'tvar' is unknown.
+public defstruct SBlocked <: SearchResult :
+  tvar:Int
+with: (printer => true)
+
+;Represents a satisfied search. Most often used for the subtyping
+;relation. Used in a capture search to indicate that a
+;capture is trivially satisfied and the capture variable
+;is unconstrained.
+public defstruct SSatisfied <: SearchResult
+with: (printer => true)
+
+;Represents a failed search. The relation is unsatisfiable.
+public defstruct SFail <: SearchResult
+with: (printer => true)
+
+;Represents the use of the gradual expansion rule during
+;the search.
+public defstruct SGradualExpansion <: SearchResult :
+  result: SearchResult
+
+;Represents the use of the subtype relation during
+;computing variable capturing.
+public defstruct SSubtype <: SearchResult :
+  result: SearchResult
+
+;Represents a failed search only if result is not SFail.
+;If result is SFail, then this result simplifies to SFail.
+public defstruct SBlockedIf <: SearchResult :
+  tvar:Int
+  result: SearchResult
+with: (printer => true)
+
+;Construct SAnd from multiple results.
+public defn SAnd (rs:Seqable<SearchResult>) -> SearchResult :
+  val rs-seq = to-seq(rs)
+  if empty?(rs-seq) : SSatisfied()
+  else : reduce(SAnd, rs-seq)
+
+;Construct SOr from multiple results.
+public defn SOr (rs:Seqable<SearchResult>) -> SearchResult :
+  val rs-seq = to-seq(rs)
+  if empty?(rs-seq) : SFail()
+  else : reduce(SOr, rs-seq)
+
+;------------------------------------------------------------
+;------------------ Search Tree Printing --------------------
+;------------------------------------------------------------
+
+defmethod print (o:OutputStream, s:SAnd) :
+  print(o, "SAnd(%_)" % [indented-field-list([a(s), b(s)])])
+
+defmethod print (o:OutputStream, s:SOr) :
+  print(o, "SOr(%_)" % [indented-field-list([a(s), b(s)])])
+
+defmethod print (o:OutputStream, s:SGradualExpansion) :
+  print(o, "SGradualExpansion(%_)" % [indented-field-list([result(s)])])
+
+defmethod print (o:OutputStream, s:SSubtype) :
+  print(o, "SSubtype(%_)" % [indented-field-list([result(s)])])
+
+;------------------------------------------------------------
+;------------------- Search Tree Formatting -----------------
+;------------------------------------------------------------
+
+public defn format (f:TypeFormatter, s:SearchResult) :
+  defn fmt (n:Int) : fmt(TVar(n,false))
+  defn fmt (t:Type) : format(f,t)
+  defn fmt (s:SearchResult) : format(f,s)  
+  match(s) :
+    (s:SAnd) : "SAnd(%_)" % [indented-field-list([fmt(a(s)), fmt(b(s))])]
+    (s:SOr) : "SOr(%_)" % [indented-field-list([fmt(a(s)), fmt(b(s))])]
+    (s:SGradualExpansion) : "SGradualExpansion(%_)" % [indented-field-list([fmt(result(s))])]
+    (s:SSubtype) : "SSubtype(%_)" % [indented-field-list([fmt(result(s))])]
+    (s:SSoln) : "SSoln(%_)" % [fmt(type(s))]
+    (s:SBlocked) : "SBlocked(%_)" % [fmt(tvar(s))]
+    (s:SSatisfied) : s
+    (s:SFail) : s
+
+;============================================================
+;=================== Capture Variance =======================
+;============================================================
+
+;Computes the capture variance of the given capture variables in the type.
+public defn capture-variance (cvs:Tuple<Int>, ts:Tuple<Type|LSType>, side:CapSide) -> Tuple<KeyValue<Int,Variance>> :
+  val initial-variance = switch(side) :
+    CapRight : Covariant
+    CapLeft : Contravariant
+  val variances = variances(ts, initial-variance)
+  for v in cvs map :
+    v => variances[v] as Variance
+
+;Return the variance of an inference location.
+public defn capture-variance (a:InferLoc|Type, b:InferLoc|Type) -> Variance :
+  match(a, b) :
+    (a:Type, b:TupleLoc|ReturnLoc) : Covariant
+    (a:TupleLoc|ReturnLoc, b:Type) : Contravariant
+    (a:Type, b:ArgLoc) : Contravariant
+    (a:ArgLoc, b:Type) : Covariant
+
+;Return the variance of an inference location.
+public defn capture-variance (a:LSType, b:InferLoc) -> Variance :
+  match(b) :
+    (b:ReturnLoc) : Covariant
+    (b:ArgLoc) : Contravariant
+
+;============================================================
+;=================== Capture Algorithm ======================
+;============================================================
+
+;Main capturing algorithm.
+;Returns the search tree corresponding to capturing cv such that x is a subtype of y.
+public defn capture-search (cv:Int, side:CapSide, x:Type, y:Type, hier:TypeHierarchy) -> SearchResult :
+  ;Sanity check.
+  switch(side) :
+    CapRight :
+      if not captures-type?(y, cv) :
+        fatal("Right-hand type (%_) does not capture variable V%_." % [y,cv])
+      if not user-type?(x, true) :
+        fatal("Left-hand type is not a user-type.")
+    CapLeft :
+      if not captures-type?(x, cv) :
+        fatal("Left-hand type (%_) does not capture variable V%_." % [x,cv])
+      if not user-type?(y, true) :
+        fatal("Right-hand type is not a user-type.")
+
+  ;Convenience: Call cap(cv, side, x, y) expecting the same side
+  ;to continue containing the capture variable. If it does not,
+  ;then call subtype instead.
+  defn* cap (x:Type, y:Type) -> SearchResult :
+    val t = x when side == CapLeft else y
+    if captures-type?(t,cv) : capture-search(cv, side, x, y, hier)
+    else : SSubtype(subtype-search(x, y, hier))
+
+  ;Convenience: Call cap(cv, opp(side), x, y) expecting the opposite
+  ;side to contain the capture variable. If it does not, then
+  ;call subtype instead.
+  defn* cap-inv (x:Type, y:Type) -> SearchResult :
+    val opp-side = opp(side)
+    val t = x when opp-side == CapLeft else y
+    if captures-type?(t,cv) : capture-search(cv, opp-side, x, y, hier)
+    else : SSubtype(subtype-search(x, y, hier))
+
+  ;Syntax-directed capture algorithm.
+  match(x, y) :
+    ;Capture.
+    (x, y:TCap) :
+      fatal("Cap var does not match cv.") when n(y) != cv
+      SSoln(x)
+    (x:TCap, y) :
+      fatal("Cap var does not match cv.") when n(x) != cv
+      SSoln(y)
+    ;Bottom and top type: Fast paths.
+    (x:TBot, y) : SSatisfied()
+    (x, y:TTop) : SSatisfied()
+    ;Combinatory type.
+    (x:TOr|TAnd, y) : search-tor-tand(cap, x, y, ConjunctiveLeftOr)
+    (x, y:TOr|TAnd) : search-tor-tand(cap, x, y, ConjunctiveLeftOr)
+    ;Unitary types.
+    (x:TOf, y:TOf) : search-tof(cap, x, y, hier)
+    (x:TTuple, y:TTuple|TOf) : search-ttuple(cap, x, y, hier)
+    (x:TArrow, y:TArrow) : search-tarrow(cap, cap-inv, x, y)
+    ;Unsolved types.    
+    (x:TUVar, y) : search-tuvar(cap, x, y)
+    (x, y:TUVar) : search-tuvar(cap, x, y)
+    ;Gradual Type.
+    (x:TGradual, y) : search-tgradual(cap, x, y)
+    (x, y:TGradual) : search-tgradual(cap, x, y)
+    ;Fall through
+    (x, y) : SFail()
+
+;Perform on multiple types.
+public defn capture-search (cv:Int, side:CapSide, xs:Tuple<Type>, ys:Tuple<Type>, hier:TypeHierarchy) -> SearchResult :
+  SAnd $ for (x in xs, y in ys) seq :
+    val t = x when side == CapLeft else y
+    if captures-type?(t,cv) : capture-search(cv, side, x, y, hier)
+    else : SSubtype(subtype-search(x, y, hier))
+
+;LoStanza capturing algorithm.
+public defn capture-search (cv:Int, side:CapSide, x:LSType, y:LSType, hier:TypeHierarchy) -> SearchResult :
+  ;Sanity check.
+  switch(side) :
+    CapRight :
+      if not captures-type?(y, cv) :
+        fatal("Right-hand type (%_) does not capture variable V%_." % [y,cv])
+    CapLeft :
+      if not captures-type?(x, cv) :
+        fatal("Left-hand type (%_) does not capture variable V%_." % [x,cv])
+
+  ;Convenience: Call cap(cv, side, x, y) expecting the same side
+  ;to continue containing the capture variable. If it does not,
+  ;then call subtype instead.
+  defn* cap (x:LSType, y:LSType) -> SearchResult :
+    val t = x when side == CapLeft else y
+    if captures-type?(t,cv) : capture-search(cv, side, x, y, hier)
+    else : SSubtype(subtype-search(x, y, hier))
+
+  ;Convenience: Call HiStanza capture-search expecting the same side
+  ;to continue.
+  defn cap (x:Type, y:Type) -> SearchResult :
+    capture-search(cv, side, x, y, hier)
+
+  ;Convenience: Call cap(cv, opp(side), x, y) expecting the opposite
+  ;side to contain the capture variable. If it does not, then
+  ;call subtype instead.
+  defn* cap-inv (x:LSType, y:LSType) -> SearchResult :
+    val opp-side = opp(side)
+    val t = x when opp-side == CapLeft else y
+    if captures-type?(t,cv) : capture-search(cv, opp-side, x, y, hier)
+    else : SSubtype(subtype-search(x, y, hier))
+
+  ;Syntax directed capture algorithm.
+  match(x, y) :
+    ;Unknown fast path.
+    (x:UnknownT, y) : SSatisfied()
+    (x, y:UnknownT) : SSatisfied()
+    ;Parametric types.
+    (x:PtrT, y:PtrT) : cap(type(x), type(y))
+    (x:RefT, y:RefT) : cap(type(x), type(y))
+    (x:StructT, y:StructT) :
+      if n(x) == n(y) : SAnd(seq(cap, args(x), args(y)))
+      else : SFail()
+    (x:FnT, y:FnT) :
+      SAnd(extended(cap-inv, a(y), r(y), a(x), r(x))
+           cap(b(x), b(y)))
+    ;Type variables.
+    (x:UVarT, y) : SBlocked(n(x))
+    (x, y:UVarT) : SBlocked(n(y))
+    ;Fall through
+    (x, y) : SFail()
+
+;Perform on multiple types.
+public defn capture-search (cv:Int, side:CapSide, xs:Tuple<LSType>, ys:Tuple<LSType>, hier:TypeHierarchy) -> SearchResult :
+  SAnd $ for (x in xs, y in ys) seq :
+    val t = x when side == CapLeft else y
+    if captures-type?(t,cv) : capture-search(cv, side, x, y, hier)
+    else : SSubtype(subtype-search(x, y, hier))
+
+;============================================================
+;================== Inference Algorithm =====================
+;============================================================
+;Note about ArgLoc and ReturnLoc:
+;  When used in CapLeft position, we are using it for argument inference, and
+;  expected return type inference. If part of a multifn function, then we
+;  may be matching a branch against a wrong-arity expectation, and trusting the
+;  TOr/TAnd rules to handle it.
+;  Thus we make sure to return SSubtype(Fail) so that the 'forced-top?' option
+;  on simplify allows us to force a solution through.
+
+public defn capture-search (x:InferLoc|Type, y:InferLoc|Type, hier:TypeHierarchy) -> SearchResult :
+  ;Sanity check.
+  match(x, y) :
+    (x:Type, y:Type) : fatal("Must be passed one InferLoc and one Type.")
+    (x:InferLoc, y:InferLoc) : fatal("Must be passed one InferLoc and one Type.")
+    (x, y) : false
+
+  ;Helper: Call capture-search(x, y, hier)
+  defn cap (x:InferLoc|Type, y:InferLoc|Type) :
+    capture-search(x, y, hier)
+    
+  ;Syntax directed search.
+  match(x, y) :
+    ;Bottom type.
+    (x:TBot, y) : SSatisfied()
+    (x, y:TTop) : SSatisfied()
+    ;Combinatory type.
+    (x:TOr, y) : SAnd(cap(a(x),y), cap(b(x),y))
+    (x, y:TAnd) : SAnd(cap(x,a(y)), cap(x,b(y)))
+    (x, y:TOr) : SOr(cap(x,a(y)),cap(x,b(y)))
+    (x:TAnd, y) : SOr(cap(a(x),y), cap(b(x),y))
+    ;Unitary types.
+    (x:TTuple, y:TupleLoc) :
+      if length(args(x)) == arity(y) : SSoln(args(x)[index(y)])
+      else : SFail()
+    (x:TupleLoc, y:TTuple) :
+      if arity(x) == length(args(y)) : SSoln(args(y)[index(x)])
+      else : SFail()
+    (x:TupleLoc, y:TOf) :
+      capture-search(0, CapLeft, collapse-tuple(x,hier), y, hier)
+    (x:TArrow, y:ArgLoc) :
+      if length(a1(x)) == arity(y) : SSoln(a1(x)[index(y)])
+      else : SFail()
+    (x:ArgLoc, y:TArrow) :
+      if length(a1(y)) == arity(x) : SSoln(a1(y)[index(x)])
+      else : SSubtype(SFail())
+    (x:TArrow, y:ReturnLoc) :
+      if length(a1(x)) == arity(y) : SSoln(a2(x))
+      else : SFail()
+    (x:ReturnLoc, y:TArrow) :
+      if length(a1(y)) == arity(x) : SSoln(a2(y))
+      else : SSubtype(SFail())
+    ;Unsolved types.
+    (x:TUVar, y) : SBlocked(n(x))
+    (x, y:TUVar) : SBlocked(n(y))
+    ;Gradual type.
+    (x:TGradual, y) : SSoln(TGradual())
+    (x, y:TGradual) : SSoln(TGradual())
+    ;Fall through
+    (x, y) : SFail()
+
+;Collapse a tuple into a variable-arity tuple.
+public defn collapse-tuple (t:TupleLoc, hier:TypeHierarchy) -> TOf :
+  val n = special-type(hier, CoreTuple)
+  TOf(n, [TCap(0,false)])
+
+;============================================================
+;=================== LoStanza Inference =====================
+;============================================================
+
+;Return the inferred type specified by the given location.
+public defn capture (x:LSType, y:InferLoc) -> LSType|Blocked|False :
+  ;Sanity check.
+  if y is-not ReturnLoc|ArgLoc :
+    fatal("Unsupported inference location.")
+
+  ;Helper: Does the given function support the given arity.
+  defn match-arity? (f:FnT, n:Int) -> True|False :
+    if r(f) is False : length(a(f)) == n
+    else : length(a(f)) <= n
+    
+  match(x, y) :
+    (x:FnT, y:ArgLoc) :
+      if match-arity?(x, arity(y)) :
+        if index(y) < length(a(x)) : a(x)[index(y)]
+        else : r(x) as LSType
+    (x:FnT, y:ReturnLoc) :
+      if match-arity?(x, arity(y)) :
+        b(x)
+    (x:UVarT, y) :
+      Blocked(List(n(x)))
+    (x, y) :
+      false
+
+;============================================================
+;=================== Subtyping Algorithm ====================
+;============================================================
+
+;Main subtyping algorithm.
+;Returns the search tree corresponding to calculating whether x is a subtype of y.
+public defn subtype-search (x:Type, y:Type, hier:TypeHierarchy) -> SearchResult :
+;  ;Sanity checks.
+;  if not (user-type?(x, true) or fnarg-type?(x,true)) :
+;    fatal("Left-hand type is not a user-type: %_" % [x])
+;  if not (user-type?(y, true) or fnarg-type?(y,true)) :
+;    fatal("Right-hand type is not a user-type: %_" % [y])
+
+  ;Helper: Call subtype-search(x,y,hier)
+  defn st (x:Type, y:Type) -> SearchResult :
+    subtype-search(x, y, hier)
+
+  ;Syntax-directed subtype algorithm.
+  match(x, y) :
+    ;Irrelevant capture variables.
+    (x:TCap, y) : SSatisfied()
+    (x, y:TCap) : SSatisfied()
+    ;Bottom type.
+    (x:TBot, y) : SSatisfied()
+    (x, y:TTop) : SSatisfied()
+    ;Combinatory type.
+    (x:TOr|TAnd, y) : search-tor-tand(st, x, y, ConjunctiveLeftOr)
+    (x, y:TOr|TAnd) : search-tor-tand(st, x, y, ConjunctiveLeftOr)
+    ;Unitary types.
+    (x:TOf, y:TOf) : search-tof(st, x, y, hier)
+    (x:TTuple, y:TTuple|TOf) : search-ttuple(st, x, y, hier)
+    (x:TArrow, y:TArrow) : search-tarrow(st, st, x, y)
+    ;Ground types.
+    (x:TVar, y:TVar) :
+      if n(x) == n(y) : SSatisfied()
+      else : SFail()
+    ;Unsolved types.
+    (x:TUVar, y) : search-tuvar(st, x, y)
+    (x, y:TUVar) : search-tuvar(st, x, y)
+    ;Gradual Type.
+    (x:TGradual, y) : search-tgradual(st, x, y)
+    (x, y:TGradual) : search-tgradual(st, x, y)
+    ;Fall through.
+    (x, y) : SFail()
+
+;LoStanza subtyping algorithm.
+public defn subtype-search (x:LSType, y:LSType, hier:TypeHierarchy) -> SearchResult :
+  ;Sanity checks
+  ;[TODO]
+
+  ;Helper: Call subtype-search(x, y, hier)
+  defn st (x:LSType, y:LSType) -> SearchResult :
+    subtype-search(x, y, hier)
+  defn st (x:Type, y:Type) -> SearchResult :
+    subtype-search(x, y, hier)
+
+  ;Syntax directed subtype search.
+  match(x, y) :
+    ;Unknown fast path.
+    (x:UnknownT, y) : SSatisfied()
+    (x, y:UnknownT) : SSatisfied()
+    ;Primitive types.
+    (x:ByteT, y:ByteT) : SSatisfied()
+    (x:IntT, y:IntT) : SSatisfied()
+    (x:LongT, y:LongT) : SSatisfied()
+    (x:FloatT, y:FloatT) : SSatisfied()
+    (x:DoubleT, y:DoubleT) : SSatisfied()
+    ;Parametric types.
+    (x:PtrT, y:PtrT) : st(type(x), type(y))
+    (x:RefT, y:RefT) : st(type(x), type(y))
+    (x:StructT, y:StructT) :
+      if n(x) == n(y) : SAnd(seq(st, args(x), args(y)))
+      else : SFail()
+    (x:FnT, y:FnT) :
+      SAnd(extended(st, a(y), r(y), a(x), r(x))
+           st(b(x), b(y)))
+    ;Type variables.
+    (x:UVarT, y:UVarT) :
+      if n(x) == n(y) : SSatisfied()
+      else : SAnd(SBlocked(n(x)), SBlocked(n(y)))
+    (x:UVarT, y) : SBlocked(n(x))
+    (x, y:UVarT) : SBlocked(n(y))
+    ;Fall through
+    (x, y) : SFail()
+
+;Submethod search.
+public defn submethod-search (a1:Tuple<FArg<Type>>, a2:Type, y:TArrow, hier:TypeHierarchy) -> SearchResult :
+  defn st (x:Type, y:Type) : subtype-search(x, y, hier)
+  defn eq (x:Type, y:Type) : SAnd(st(x,y), st(y,x))
+
+  ;Returns true if the given argument participates in dispatch.
+  defn dispatch? (x:FArg) -> True|False :
+    match(x:PositionalArg|KeywordArg) :
+      not optional?(x)
+
+  ;Compute whether x is a good arg for expected type y.
+  defn arg? (x:FArg<Type>, y:Type) -> SearchResult :
+    st(type(x),y) when dispatch?(x) else eq(type(x),y)
+
+  ;Launch!
+  if same-length?(a1, /a1(y)) :
+    SAnd(SAnd(seq(arg?, a1, /a1(y))),
+         st(a2, /a2(y)))
+  else :
+    SFail()
+
+;------------------------------------------------------------
+;------------------ Helpers for Subscenarios ----------------
+;------------------------------------------------------------
+
+;Choose the behaviour of how a left-hand OR is treated.
+defenum LeftOrBehaviour :
+  ConjunctiveLeftOr
+  DisjunctiveLeftOr
+
+;Note about if either x or y is TUVar:
+;- The possible search results involving TUVar is:
+;  Case True: The search is satisfied trivially, via Bot or identical TUVar.
+;  Case Blocked: We cannot infer anything more due to missing information.
+;  Case False: A TUVar is bounded, and based upon the bound the search
+;  fails.
+;  In all cases, it is valid to disregard the cases where the TUVar may
+;  represent a TOr or TAnd case. 
+defn search-tor-tand (search:(Type, Type) -> SearchResult,
+                      x:Type,
+                      y:Type,
+                      left-or:LeftOrBehaviour) -> SearchResult :
+  switch(left-or) :
+    ConjunctiveLeftOr :
+
+      match(x, y) :
+        ;Conjunctions.
+        (x:TOr, y) : SAnd(search(a(x), y), search(b(x), y))
+        (x, y:TAnd) : SAnd(search(x, a(y)), search(x, b(y)))
+        ;Disjunctions.
+        (x:TAnd, y:TOr) : SOr(SOr(search(x, a(y)), search(x, b(y)))
+                              SOr(search(a(x), y), search(b(x), y)))
+        (x:TAnd, y) : SOr(search(a(x), y), search(b(x), y))
+        (x, y:TOr) : SOr(search(x, a(y)), search(x, b(y)))
+
+    DisjunctiveLeftOr :
+
+      match(x, y) :
+        ;Conjunctions.
+        (x, y:TAnd) : SAnd(search(x, a(y)), search(x, b(y)))
+        ;Disjunctions.
+        (x:TAnd|TOr, y:TOr) : SOr(SOr(search(x, a(y)), search(x, b(y)))
+                                  SOr(search(a(x), y), search(b(x), y)))
+        (x:TAnd|TOr, y) : SOr(search(a(x), y), search(b(x), y))
+        (x, y:TOr) : SOr(search(x, a(y)), search(x, b(y)))
+
+;Perform a search over TOf types.
+defn search-tof (search:(Type, Type) -> SearchResult,
+                 x:TOf,
+                 y:TOf,
+                 hier:TypeHierarchy) -> SearchResult :
+  if n(x) == n(y) :
+    fatal("Unexpected differing lengths.") when not same-length?(args(x), args(y))
+    SAnd(seq(search, args(x), args(y)))
+  else :
+    val xparents = parents(hier, x, n(y))
+    if empty?(xparents) : SFail()
+    else : SAnd(seq(search{_, y}, xparents))
+
+;Perform a search over TUVar types.
+defn search-tuvar (search:(Type, Type) -> SearchResult,
+                   x:Type, y:Type) -> SearchResult :
+  match(x, y) :
+    (x:TUVar, y:TUVar) :
+      if n(x) == n(y) : SSatisfied()
+      else : SAnd(SBlocked(n(x)), SBlocked(n(y)))
+    (x:TUVar, y) :
+      match(bounds(x)) :
+        (b:MixBound) :
+          val rs = seq(search{_, y}, types(b))
+          reduce(SOr, rs)
+        (b) :
+          SBlocked(n(x))
+    (x, y:TUVar) :
+      match(bounds(y)) :
+        (b:UpperBound) :
+          SBlockedIf(n(y), search(x, type(b)))
+        (b) :
+          SBlocked(n(y))
+    (x, y) :
+      fatal("Illegal arguments to search-tuvar.")
+
+;Perform a search over TTuple types.
+defn search-ttuple (search:(Type, Type) -> SearchResult,
+                    x:TTuple,
+                    y:TTuple|TOf,
+                    hier:TypeHierarchy) -> SearchResult :
+  match(x, y) :
+    (x:TTuple, y:TTuple) :
+      if same-length?(args(x), args(y)) :
+        SAnd(seq(search, args(x), args(y)))
+      else :
+        SFail()
+    (x:TTuple, y:TOf) :
+      search(collapse-tuple(x, hier), y)
+
+;Perform a search over TArrow types.
+defn search-tarrow (search:(Type, Type) -> SearchResult,
+                    search-inv:(Type, Type) -> SearchResult,
+                    x:TArrow,
+                    y:TArrow) -> SearchResult :
+  if same-length?(a1(x), a1(y)) :
+    SAnd(SAnd(seq(search-inv, a1(y), a1(x)))
+         search(a2(x), a2(y)))
+  else :
+    SFail()
+
+;Perform a search by expanding graduals.
+defn search-tgradual (search:(Type, Type) -> SearchResult,
+                      x:Type,
+                      y:Type) -> SearchResult :
+  match(x, y) :
+    (x:TGradual, y:TGradual) : SSatisfied()
+    (x, y:TGradual) : SGradualExpansion(search(x, expand-gradual(x)))
+    (x:TGradual, y) : SGradualExpansion(search(expand-gradual(y), y))
+
+;Expand a gradual type.
+defn expand-gradual (t:Type) -> Type :
+  defn graduals (ts:Tuple<Type>) -> Tuple<TGradual> :
+    map(TGradual{}, ts)
+  match(t) :
+    (t:TOf) : TOf(n(t), graduals(args(t)))
+    (t:TTuple) : TTuple(graduals(args(t)))
+    (t:TArrow) : TArrow(graduals(a1(t)), TGradual())
+    (t:TVar) : t
+    (t:TBot) : t
+    (t:TTop) : t
+    (t) : fatal("Gradual expansion not supported for %_." % [t])
+
+;Collapse a tuple into a variable-arity tuple.
+public defn collapse-tuple (t:TTuple, hier:TypeHierarchy) -> TOf :
+  val n = special-type(hier, CoreTuple)
+  val argt = TBot() when empty?(args(t))
+        else simplify(reduce(TOr,args(t)))
+  TOf(n, [argt])
+
+;Call 'search' with 'a' and 'b' extended with rest types.
+defn extended (search:(LSType, LSType) -> SearchResult,
+               a:Tuple<LSType>, ar:LSType|False,
+               b:Tuple<LSType>, br:LSType|False) -> SearchResult :
+
+  ;Helper: If r is not false, then extend t with r at the end.
+  defn extend (t:Tuple<LSType>, r:LSType|False) -> Seq<LSType> :
+    match(r:LSType) : cat(t, repeat(r))
+    else : to-seq(t)
+
+  match(ar, br) :
+    (ar:False, br:False) :
+      if same-length?(a,b) : SAnd(seq(search,a,b))
+      else : SFail()
+    (ar, br) :
+      val n = max(length(a), length(b))
+      val ex-a = extend(a,ar)
+      val ex-b = extend(b,br)
+      SAnd(take-n(n, seq(search, ex-a, ex-b)))
+
+;============================================================
+;==================== Assignable Relation ===================
+;============================================================
+
+;Returns SearchResult computing whether x can be implicitly upcast converted
+;to y.g
+public defn implicit-upcast-search (x:LSType, y:LSType) -> SearchResult :
+  ;Sanity check
+  ;[TODO] y should not contain UVarT.
+
+  match(x, y) :
+    ;Blocked because x is not resolved.
+    (x:UVarT, y) : SBlocked(n(x))
+    ;Otherwise:
+    (x:ByteT|IntT|LongT, y:ByteT|IntT|LongT) :
+      if primitive-size(x) < primitive-size(y) : SSatisfied()
+      else : SFail()
+    (x:FloatT|DoubleT, y:FloatT|DoubleT) :    
+      if primitive-size(x) < primitive-size(y) : SSatisfied()
+      else : SFail()
+    (x, y) :
+      SFail()
+
+;Returns SearchResult computing whether x can be assigned/passed to y.
+public defn assignable-search (x:LSType, y:LSType, hier:TypeHierarchy) -> SearchResult :
+  SOr(implicit-upcast-search(x,y),
+      subtype-search(x,y,hier))
+
+;============================================================
+;============== Simplifying the Search Tree =================
+;============================================================
+
+;The result of simplifying a search tree.
+public deftype SimplifyResult :
+  Blocked <: SimplifyResult
+
+;Reached the end leaf constraint.
+;Contains the number of gradual expansions required
+;to reach it.
+public defstruct Solved <: SimplifyResult :
+  constraint:SolnConstraint
+  num-gradual-expansions:Int
+
+;Solution is not satisfiable.
+public defstruct NoSoln <: SimplifyResult
+with: (printer => true)
+
+;Represents the final set of constraints
+;for a variable.
+public deftype SolnConstraint
+
+;Represents a union of constraints from a search
+;disjunctive clause.
+public defstruct OrConstraint <: SolnConstraint :
+  a:SolnConstraint
+  b:SolnConstraint
+
+;Represents an intersection of constraints from a
+;search conjunctive clause.
+public defstruct AndConstraint <: SolnConstraint :
+  a:SolnConstraint
+  b:SolnConstraint
+
+;Represents one constraint.
+public defstruct OneConstraint <: SolnConstraint :
+  type:Type
+with: (printer => true)
+
+;Represents the absence of any constraint.
+;Arises during trivial solutions, e.g. bot <: tau.
+public defstruct NoConstraint <: SolnConstraint
+with: (printer => true)
+
+;------------------------------------------------------------
+;-------------------- Printing ------------------------------
+;------------------------------------------------------------
+
+defmethod print (o:OutputStream, c:OrConstraint) :
+  print(o, "OrConstraint(%_)" % [indented-field-list([a(c), b(c)])])
+
+defmethod print (o:OutputStream, c:AndConstraint) :
+  print(o, "AndConstraint(%_)" % [indented-field-list([a(c), b(c)])])
+
+defmethod print (o:OutputStream, s:Solved) :
+  val items = [
+    simple-field("constraint", constraint(s))
+    simple-field("num-gradual-expansions", num-gradual-expansions(s))]
+  print(o, "Solved(%_)" % [indented-field-list(items)])
+
+;------------------------------------------------------------
+;---------------------- Formatting --------------------------
+;------------------------------------------------------------
+
+public defn format (f:TypeFormatter, r:SimplifyResult) :
+  defn fmt (c:SolnConstraint) : format(f,c)
+  defn fmt (n:Int) : format(f,TVar(n,false))
+  match(r) :
+    (r:Blocked) :
+      "Blocked(%,)" % [seq(fmt,vars(r))]
+    (r:NoSoln) :
+      r
+    (r:Solved) :
+      val items = [
+        simple-field("constraint", fmt(constraint(r)))
+        simple-field("num-gradual-expansions", num-gradual-expansions(r))]
+      "Solved(%_)" % [indented-field-list(items)]
+
+public defn format (f:TypeFormatter, c:SolnConstraint) :
+  defn fmt (c:SolnConstraint) : format(f,c)
+  defn fmt (t:Type) : format(f,t)
+  match(c) :
+    (c:OrConstraint) : "OrConstraint(%_)" % [indented-field-list([fmt(a(c)), fmt(b(c))])]
+    (c:AndConstraint) : "AndConstraint(%_)" % [indented-field-list([fmt(a(c)), fmt(b(c))])]
+    (c:OneConstraint) : "OneConstraint(%_)" % [fmt(type(c))]
+    (c:NoConstraint) : c
+
+;------------------------------------------------------------
+;--------------------- Implementation -----------------------
+;------------------------------------------------------------
+
+;- forced-top?: When this is true then top-level conjunctive subtype
+;  relations are forced to be true. This helps cyclic capture relations
+;  solve in a few more cases, and also helps the partof? relation where
+;  captured variables are solved before function mixing.
+;- forced-free-graduals?: When this is true, SSubtype search results
+;  forcefully have 'num-gradual-expansions' reset to 0. Used for partof
+;  search to eliminate contribution of Subtype relation towards whether
+;  True match or PartialMatch.
+public defn simplify (r:SearchResult,
+                      forced-top?:True|False,
+                      forced-free-graduals?:True|False) -> SimplifyResult :
+  match(r) :
+    (r:SAnd) :
+      match(simplify(a(r), forced-top?, forced-free-graduals?)
+            simplify(b(r), forced-top?, forced-free-graduals?)) :
+        ;If either branch fails, then both fail.
+        ;If this is a top-level conjunctive clause, then
+        ;just force it to succeed.
+        (sa:NoSoln, sb) : sb when forced-top? else NoSoln()
+        (sa, sb:NoSoln) : sa when forced-top? else NoSoln()
+        ;If branches are blocked then return blocked.
+        (sa:Blocked, sb:Blocked): append(sa,sb)
+        (sa:Blocked, sb) : sa
+        (sa, sb:Blocked) : sb
+        ;If both solved, then join their information.
+        ;Add the total number of gradual expansions together.
+        (sa:Solved, sb:Solved) :
+          Solved(SimplifiedAndConstraint(constraint(sa), constraint(sb)),
+                 num-gradual-expansions(sa) + num-gradual-expansions(sb))
+    (r:SOr) :
+      match(simplify(a(r), false, forced-free-graduals?),
+            simplify(b(r), false, forced-free-graduals?)) :
+        ;If one branch has no solution then choose the other.
+        (sa:NoSoln, sb) : sb
+        (sa, sb:NoSoln) : sa
+        ;If branches are blocked then return this information.
+        (sa:Blocked, sb:Blocked) : append(sa, sb)
+        (sa:Blocked, sb) : sb when unconstrained?(sb) else sa
+        (sa, sb:Blocked) : sa when unconstrained?(sa) else sb
+        ;If both branches are solved, choose the one with the
+        ;smaller number of gradual expansions.
+        (sa:Solved, sb:Solved) :
+          switch(compare(num-gradual-expansions(sa), num-gradual-expansions(sb))) :
+            -1 : sa
+            1 : sb
+            0 : Solved(SimplifiedOrConstraint(constraint(sa), constraint(sb))
+                       num-gradual-expansions(sa))
+    (r:SGradualExpansion) :
+      inc-gradual-expansions(simplify(result(r), forced-top?, forced-free-graduals?))
+    (r:SSubtype) :
+      if forced-top? : Solved(NoConstraint(), 0)
+      else if forced-free-graduals? : zero-out-graduals(simplify(result(r), false, false))
+      else : simplify(result(r), false, false)
+    (r:SBlocked) :
+      Blocked(List(tvar(r)))
+    (r:SBlockedIf) :
+      match(simplify(result(r), forced-top?, forced-free-graduals?)) :
+        (sr:NoSoln) : NoSoln()
+        (sr:Solved) : Blocked(List(tvar(r)))
+        (sr:Blocked) : Blocked(cons(tvar(r), vars(sr)))
+    (r:SSoln) :
+      Solved(OneConstraint(type(r)), 0)
+    (r:SSatisfied) :
+      Solved(NoConstraint(), 0)
+    (r:SFail) :
+      NoSoln()
+
+;Create a simplified AndConstraint from two simplified constraints.
+;- NoConstraint exists only at top-level.
+;- AndConstraint is right-leaning.
+defn SimplifiedAndConstraint (a:SolnConstraint, b:SolnConstraint) -> SolnConstraint :
+  match(a, b) :
+    (a:NoConstraint, b) : b
+    (a, b:NoConstraint) : a
+    (x:AndConstraint, y) : AndConstraint(/a(x), AndConstraint(/b(x), y))
+    (a, b) : AndConstraint(a, b)
+
+;Create a simplified AndConstraint from two simplified constraints.
+;- NoConstraint exists only at top-level.
+;- OrConstraint is right-leaning.
+defn SimplifiedOrConstraint (a:SolnConstraint, b:SolnConstraint) -> SolnConstraint :
+  match(a, b) :
+    (a:NoConstraint, b) : a
+    (a, b:NoConstraint) : b
+    (x:OrConstraint, y) : OrConstraint(/a(x), OrConstraint(/b(x), y))
+    (a, b) : OrConstraint(a, b)
+
+;Helper: Return true if r is Solved, unconstrained, and no gradual expansions were used..
+;This sort of result always takes precedence when in a SOr search, even if the other
+;branch is Blocked.
+defn unconstrained? (r:SimplifyResult) -> True|False :
+  match(r:Solved) :
+    num-gradual-expansions(r) == 0 and
+    constraint(r) is NoConstraint
+
+;Helper: Increment the 'num-gradual-expansions' field in the result.
+defn inc-gradual-expansions (r:SimplifyResult) -> SimplifyResult :
+  match(r:Solved) : Solved(constraint(r), num-gradual-expansions(r) + 1)
+  else : r
+
+;Helper: Set the number of gradual expansions to zero.
+defn zero-out-graduals (r:SimplifyResult) -> SimplifyResult :
+  match(r:Solved) : Solved(constraint(r), 0)
+  else : r
+
+;============================================================
+;============= Evaluating the Search Tree ===================
+;============================================================
+
+;Evaluate the given set of constraints to get the final type
+;for a captured variable of the given variance.
+;Returns the "most accurate" type that satisfies the constraint.
+public defn solve-constraint (c:SolnConstraint,
+                              variance:Variance) -> Type :
+  defn eval (c:SolnConstraint) -> Type :
+    match(c) :
+      (c:OneConstraint) :
+        type(c)
+      (c:NoConstraint) :
+        TGradual()
+      (c:AndConstraint) :
+        switch(variance) :
+          Covariant : TOr(eval(a(c)), eval(b(c)))
+          Contravariant : TAnd(eval(a(c)), eval(b(c)))
+      (c:OrConstraint) :
+        switch(variance) :
+          Covariant : TOr(eval(a(c)), eval(b(c)))
+          Contravariant : TAnd(eval(a(c)), eval(b(c)))
+  simplify(eval(c))
+
+;============================================================
+;============ Representing Constraints using Types ==========
+;============================================================
+
+;Meaning of contravariant:
+;  Goal: Find T to represent constraint C upon variable x as: x <: T
+;Meaning of covariant:
+;  Goal: Find T to represent constraint C upon variable x as: T <: x
+public defn constraint-as-type (c:SolnConstraint,
+                                variance:Variance) -> Type :
+  defn conv (c:SolnConstraint) -> Type :
+    match(c) :
+      (c:OneConstraint) :
+        type(c)
+      (c:NoConstraint) :
+        switch(variance) :
+          Contravariant: TTop()
+          Covariant: TBot()
+      (c:AndConstraint) :
+        switch(variance) :
+          Contravariant: TAnd(conv(a(c)), conv(b(c)))
+          Covariant: TOr(conv(a(c)), conv(b(c)))
+      (c:OrConstraint) :
+        switch(variance) :
+          Contravariant: TOr(conv(a(c)), conv(b(c)))
+          Covariant: TAnd(conv(a(c)), conv(b(c)))
+  simplify(conv(c))
+
+;============================================================
+;================== Overload Selection ======================
+;============================================================  
+
+;Returns success if the overloaded function 'x' should be selected
+;given that the expected type is 't'.
+;To use this function, 'x' is expected to have its type arguments properly filled in.
+;NOTE: The return type of the arrow is not used during overload selection. This is
+;meant to be consistent with the behaviour of overloaded functions in function
+;call position: we do not use the expected return type to select the overloaded function.
+defn select-overload-search (x:TArrow, t:Type, hier:TypeHierarchy) -> SearchResult :
+  ;Sanity checks.
+  if not overload-type?(t) : fatal("Right-hand type is not a user-type: %_" % [t])
+  if not user-type?(x, true) : fatal("Left-hand type is not a user-type: %_" % [x])
+
+  ;Convenience.
+  defn so (a:TArrow, b:Type) : select-overload-search(a, b, hier)
+  defn pt (a:Type, b:Type) : partof-search(a, b, hier)
+
+  ;Syntax-directed subtype algorithm.
+  match(t) :
+    ;Top type.
+    (t:TTop) : SSatisfied()
+    ;Combinatory type.
+    (t:TOr|TAnd) : SOr(so(x, a(t)), so(x, b(t)))
+    ;Unitary types.
+    (t:TArrow) :
+      if same-length?(a1(x), a1(t)) : SAnd(seq(pt, a1(t), a1(x)))
+      else : SFail()
+    ;Unsolved types.
+    (t:TUVar) : SBlocked(n(t))
+    ;Gradual Type.
+    (t:TGradual) : so(x, expand-gradual(x))
+    ;Fall through.
+    (t) : SFail()
+
+;The argument type 'y' (as part of a mixed function) is going to be passed values of type 'x'.
+;Return success if this is allowed.
+;  Passing: a|other -> b|other
+;  Expecting: x|y -> c
+;  So: x|y <: a|other
+defn partof-search (x:Type, y:Type, hier:TypeHierarchy) -> SearchResult :
+  ;Sanity check.
+  if not overload-type?(y) :
+    fatal("Right-hand type not a function argument type.")
+
+  ;Helper: Shorthand for calling partof-search
+  defn po (x:Type, y:Type) : partof-search(x, y, hier)
+  
+  match(x, y) :
+    ;Bottom and top type.
+    (x:TBot, y) : SSatisfied()
+    (x, y:TTop) : SSatisfied()
+    ;Combinatory types.
+    (x:TOr|TAnd, y) : search-tor-tand(po, x, y, DisjunctiveLeftOr)
+    (x, y:TOr|TAnd) : search-tor-tand(po, x, y, DisjunctiveLeftOr)
+    ;Unsolved types.
+    (x:TUVar, y) : search-tuvar(po, x, y)
+    (x, y:TUVar) : search-tuvar(po, x, y)
+    ;Gradual types
+    (x:TGradual, y:TGradual) : SSatisfied()
+    (x:TGradual, y) : SGradualExpansion(po(expand-gradual(y), y))
+    ;Other.
+    (x, y) : SSubtype(subtype-search(x, y, hier))
+
+;Use the HiStanza partof search when both are RefT, otherwise
+;use standard SSubtype search.
+public defn partof-search (x:LSType, y:LSType, hier:TypeHierarchy) -> SearchResult :
+  match(x:RefT, y:RefT) : partof-search(type(x), type(y), hier)
+  else : SSubtype(subtype-search(x, y, hier))
+
+;Returns the search result testing whether the given function can be
+;called with the given arguments.
+defn select-overload-search (f:FnT, args:Tuple<LSType>, hier:TypeHierarchy) -> SearchResult :
+  ;Helper: Is x passable to y?
+  defn passable? (x:LSType, y:LSType) -> SearchResult :
+    SOr(implicit-upcast-search(x,y),
+        partof-search(x,y,hier))
+
+  ;Compute whether f has the right arity.
+  val matches-arity? =
+    if r(f) is False : length(a(f)) == length(args)
+    else : length(a(f)) <= length(args)
+  if matches-arity? :
+    val atypes = match(r(f)) :
+      (r:LSType) : cat(a(f), repeat(r))
+      (r:False) : to-seq(a(f))
+    SAnd(seq(passable?, args, atypes))
+  else :
+    SFail()
+
+;============================================================
+;=================== Castable Search ========================
+;============================================================
+
+;Returns the search tree corresponding to whether y can be cast to x.
+;Note the order of the arguments. It is arranged this way to more closely
+;mirror the subtype search algorithm.
+public defn castable-search (x:Type, y:Type, hier:TypeHierarchy) -> SearchResult :
+  defn cs (x:Type, y:Type) -> SearchResult :
+    match(x, y) :
+      ;Fast paths
+      (x:TBot|TGradual|TTop, y) : SSatisfied()
+      (x, y:TBot|TGradual|TTop) : SSatisfied()    
+      ;Conjunctive combinatory types.
+      (x:TOr, y) : SAnd(cs(a(x), y), cs(b(x), y))
+      ;Disjunctive combinatory types.
+      (x:TAnd, y:TAnd|TOr) : SOr(SOr(cs(a(x), y), cs(b(x), y))
+                                 SOr(cs(x, a(y)), cs(x, b(y))))
+      (x:TAnd, y) : SOr(cs(a(x), y), cs(b(x), y))
+      (x, y:TAnd|TOr) : SOr(cs(x, a(y)), cs(x, b(y)))
+      ;Unsolved types.
+      (x:TUVar, y) : SBlocked(n(x))
+      (x, y:TUVar) : SBlocked(n(y))
+      ;Unitary types.
+      (x:TOf, y:TOf) :
+        if n(x) == n(y) :
+          SAnd(seq(cs, args(x), args(y)))
+        else :
+          val xparents = parents(hier, x, n(y))
+          val yparents = parents(hier, y, n(x))
+          match(empty?(xparents), empty?(yparents)) :
+            (ex:True, ey:True) : SFail()
+            (ex:True, ey:False) : SAnd(seq(cs{x, _}, yparents))
+            (ex:False, ey:True) : SAnd(seq(cs{_, y}, xparents))
+      ;Tuples.
+      (x:TTuple, y:TTuple) :
+        if same-length?(args(x), args(y)) : SAnd(seq(cs, args(x), args(y)))
+        else : SFail()
+      (x:TOf, y:TTuple) :
+        cs(x, collapse-tuple(y,hier))
+      (x:TTuple, y:TOf) :
+        cs(collapse-tuple(x,hier), y)
+      ;Arrows.
+      (x:TArrow, y:TArrow) :
+        if same-length?(a1(x), a1(y)) :
+          SAnd(SAnd(seq(cs, a1(y), a1(x))), cs(a2(x), a2(y)))
+        else : SFail()      
+      ;Fall through
+      (x, y) : SFail()
+  cs(remove-tvar(x), remove-tvar(y))
+
+;Remove all type variables from the given type.
+;Necessary because we want type variables to have no effect on
+;castability relation.
+defn remove-tvar (t:Type) -> Type :
+  ;If t is a TVar then return None(), otherwise return One().
+  defn remove? (t:Type) -> Maybe<Type> :
+    match(t) :
+      (t:TVar) :
+        None()
+      (t:TAnd) :
+        val new-a = remove?(a(t))
+        val new-b = remove?(b(t))
+        match(empty?(new-a), empty?(new-b)) :
+          (ea:True, eb:True) : None()
+          (ea:True, eb:False) : new-b
+          (ea:False, eb:True) : new-a
+          (ea:False, eb:False) : One(TAnd(value!(new-a), value!(new-b)))
+      (t:TOr) :
+        val new-a = remove?(a(t))
+        val new-b = remove?(b(t))
+        match(empty?(new-a), empty?(new-b)) :
+          (ea:True, eb:True) : None()
+          (ea:True, eb:False) : new-b
+          (ea:False, eb:True) : new-a
+          (ea:False, eb:False) : One(TOr(value!(new-a), value!(new-b)))
+      (t) :
+        One(map(remove!{_ as Type}, t))
+  ;Return ? if remove? returns None.
+  defn remove! (t:Type) -> Type :
+    val r = remove?(t)
+    value?(r, TGradual())
+  ;Launch!
+  remove!(t)
+
+;============================================================
+;================= Disjoint Predicates ======================
+;============================================================
+
+;Returns True|False|Blocked to determine whether t is the bottom type.
+defn bottom? (t:Type) -> PredResult :
+  eval-pred-result(bottom-search?(t))
+
+;Returns search result to determine whether t is the bottom type.
+defn bottom-search? (t:Type) -> SearchResult :
+  match(t) :
+    (t:TOr) : SAnd(bottom-search?(a(t)), bottom-search?(b(t)))
+    (t:TAnd) : SOr(bottom-search?(a(t)), bottom-search?(b(t)))
+    (t:TUVar) : SBlocked(n(t))
+    (t:TBot) : SSatisfied()
+    (t) : SFail()
+
+;Returns search result to determine whether x and y overlaps
+;after erasure.
+defn overlap-search? (x:Type y:Type, hier:TypeHierarchy) -> SearchResult :
+  ;[TODO] Sanity check.
+  ;Used for function arguments with explicit types, so
+  ;Void and Top are not expected to be in the list of types.
+  
+  ;Syntax-directed overlap algorithm.
+  defn ov (x:Type, y:Type) -> SearchResult :
+    match(x, y) :
+      ;Gradual types: Fast Path
+      (x:TGradual, y) : SSatisfied()
+      (x, y:TGradual) : SSatisfied()
+      ;Combinatory types.
+      (x:TOr|TAnd, y) : SOr(ov(a(x), y), ov(b(x), y))
+      (x, y:TOr|TAnd) : SOr(ov(x, a(y)), ov(x, b(y)))
+      ;Unitary types.    
+      (x:TOf, y:TOf) :
+        if n(x) == n(y) :
+          SSatisfied()
+        else :
+          val xparents = parents(hier, x, n(y))
+          val yparents = parents(hier, y, n(x))
+          if empty?(xparents) and empty?(yparents) : SFail()
+          else : SSatisfied()
+      ;UVars
+      (x:TUVar, y:TUVar) :
+        if n(x) == n(y) : SSatisfied()
+        else : SAnd(SBlocked(n(x)), SBlocked(n(y)))
+      (x:TUVar, y) : SBlocked(n(x))
+      (x, y:TUVar) : SBlocked(n(y))
+      ;Fall through
+      (x, y) : SFail()
+
+  ;Launch!
+  ov(erase(x,hier), erase(y,hier))
+
+;Erase parametric properties of type and retain only its tag.
+defn erase (t:Type, hier:TypeHierarchy) -> Type :
+  match(t) :
+    (t:TOf) : TOf(n(t), map(TTop{}, args(t)))
+    (t:TTuple) : TOf(special-type(hier,CoreTuple), [TTop()])
+    (t:TArrow) : TOf(special-type(hier,CoreFn), [])
+    (t:TVar) : TTop()
+    (t) : map-type(erase{_, hier}, t)
+
+;Returns True|False|Blocked to indicate whether the given xss branches are disjoint
+;under the given arguments.
+public defn disjoint? (xss:Tuple<Tuple<Type>>, args:Tuple<Type>, hier:TypeHierarchy) -> PredResult :
+  ;Sanity check the lengths.
+  if length(xss) < 2 : fatal("Expecting at least two branches.")
+  if empty?(args) : fatal("Expecting at least one argument.")
+
+  ;Check whether any of the arguments are Bot.
+  ;If so, then types can be considered disjoint.
+  defn any-bot? () -> PredResult :
+    reduce(or-pred, seq(bottom?, args))
+
+  ;For axis 'axis', compare branch 'i' against branch 'j'.
+  ;Returns:
+  ;- Blocked: Cannot tell whether disjoint.
+  ;- False: The two branches are not disjoint along this axis.
+  ;- True: The two branches are disjoint along this axis.
+  defn disjoint? (exss:Tuple<Tuple<Type>>, eargs:Tuple<Type>, i:Int, j:Int, axis:Int) -> PredResult :
+    ;Compute whether there is any overlap.
+    val soverlap = overlap-search?(exss[i][axis], exss[j][axis], hier)
+    match(eval-pred-result(soverlap)) :
+      ;Case: Cannot tell whether there is overlap.
+      (r:Blocked) : r
+      ;Case: There is overlap, so therefore not disjoint.
+      (r:True) : false
+      ;Case: There is no overlap, so therefore check args-to-xs.
+      (r:False) : /disjoint?(exss[i][axis], exss[j][axis], eargs[axis], hier)
+
+  ;Determine whether branch i and j are disjoint along any axis.
+  defn disjoint? (exss:Tuple<Tuple<Type>>, eargs:Tuple<Type>, i:Int, j:Int) -> PredResult :
+    val rs = for axis in 0 to length(eargs) seq :
+      disjoint?(exss,eargs,i,j,axis)
+    reduce(or-pred, rs)
+
+  ;Determine whether all pairs are disjoint.
+  defn all-pairs-disjoint? (exss:Tuple<Tuple<Type>>, eargs:Tuple<Type>) -> PredResult :
+    val rs = for i in 0 to length(exss) seq-cat :
+      for j in (i + 1) to length(exss) seq :
+        disjoint?(exss,eargs,i,j)
+    reduce(and-pred, rs)
+
+  ;Erase all types
+  defn erase-xss () -> Tuple<Tuple<Type>> :
+    for xs in xss map :
+      map(erase{_, hier}, xs)
+
+  defn erase-args () -> Tuple<Type> :
+    map(erase{_, hier}, args)
+
+  ;Launch!
+  match(any-bot?()) :
+    (r:Blocked|True) : r
+    (r:False) : all-pairs-disjoint?(erase-xss(), erase-args())
+
+;Returns True|False|Blocked indicating whether x and y are disjoint under u.
+defn disjoint? (x:Type, y:Type, u:Type, hier:TypeHierarchy) -> PredResult :
+  val ssearch = not-disjoint-search(x, y, u, hier)
+  match(eval-gradual-match-result(ssearch)) :
+    (r:Blocked) : r
+    (r:True) : false
+    (r:PartialMatch) : true
+    (r:False) : true
+
+;Search for whether x and y are not disjoint under u.
+;Assumes that x, y, u, are erased.
+;TAnd case is nuanced:
+;  Suppose type hierarchy:
+;    Animal
+;      Dog
+;      Cat
+;  With multis:
+;    defn f (Dog)
+;    defn f (Cat)
+;
+;  This needs to be classified as ambiguous:
+;    f(x as Dog&Cat)
+;  This needs to be classified as unambiguous:
+;    f(x as ?)
+;  This needs to be classified as unambiguous:
+;    f(x as Dog|Cat)
+;  This needs to be classified as unambiguous:
+;    f(x as (Dog|Cat)&Animal)
+;  This needs to be classified as ambiguous:
+;    f(x as (Dog&Cat)|Animal)
+defn not-disjoint-search (x:Type, y:Type, u:Type, hier:TypeHierarchy) -> SearchResult :
+  match(u) :
+    (u:TOr) :
+      SOr(not-disjoint-search(x, y, a(u), hier)
+          not-disjoint-search(x, y, b(u), hier))
+    (u:TAnd) :
+      val us = outer-product-and(a(u), b(u))
+      if length(us) == 1 :
+        SAnd(partial-subtype-search(u,x,hier)
+             partial-subtype-search(u,y,hier))        
+      else :
+        reduce(SOr, seq(not-disjoint-search{x, y, _, hier}, us))
+    (u) :
+      SAnd(partial-subtype-search(u,x,hier)
+           partial-subtype-search(u,y,hier))
+
+;Expands A & (B|C|D) into (A&B | A&C | A&D).
+defn outer-product-and (a:Type, b:Type) -> Tuple<Type> :
+  val ax = simplified-or-types(a as TOr) when a is TOr else [a]
+  val bx = simplified-or-types(b as TOr) when b is TOr else [b]
+  to-tuple $ 
+    for ai in ax seq-cat :
+      for bi in bx seq :
+        TAnd(ai,bi)
+
+;Acts exactly like subtype-search except that recursing into nested parametric
+;types surrounds the search result with SSubtype so that the num-gradual-expansions
+;can be disregarded when classifying match as True or PartialMatch.
+defn partial-subtype-search (x:Type, y:Type, hier:TypeHierarchy) -> SearchResult :
+  ;Sanity check.
+  if not overload-type?(y) :
+    fatal("Right-hand type not a function argument type.")
+
+  ;Helper: Shorthand for calling partof-search
+  defn pss (x:Type, y:Type) : partial-subtype-search(x, y, hier)
+  
+  match(x, y) :
+    ;Bottom and top type.
+    (x:TBot, y) : SSatisfied()
+    (x, y:TTop) : SSatisfied()
+    ;Combinatory types.
+    (x:TOr|TAnd, y) : search-tor-tand(pss, x, y, ConjunctiveLeftOr)
+    (x, y:TOr|TAnd) : search-tor-tand(pss, x, y, ConjunctiveLeftOr)
+    ;Unsolved types.
+    (x:TUVar, y) : search-tuvar(pss, x, y)
+    (x, y:TUVar) : search-tuvar(pss, x, y)
+    ;Gradual types
+    (x:TGradual, y:TGradual) : SSatisfied()
+    (x:TGradual, y) : SGradualExpansion(pss(expand-gradual(y), y))
+    ;Other.
+    (x, y) : SSubtype(subtype-search(x, y, hier))
+
+;Helper: Compute an OR of two PredResult.
+defn or-pred (a:PredResult, b:PredResult) -> PredResult :
+  match(a, b) :
+    (a:Blocked, b:Blocked) : append(a,b)
+    (a:Blocked, b) : a
+    (a, b:Blocked) : b
+    (a:True, b) : a
+    (a, b:True) : b
+    (a, b) : false
+
+;Helper: Compute an AND of two PredResult.
+defn and-pred (a:PredResult, b:PredResult) -> PredResult :
+  match(a, b) :
+    (a:False, b) : false
+    (a, b:False) : false
+    (a:Blocked, b:Blocked) : append(a,b)
+    (a:Blocked, b) : a
+    (a, b:Blocked) : b
+    (a, b) : true    
+
+;============================================================
+;================== 'This' Type =============================
+;============================================================
+
+;Used for the user-annotated types for the 'this' argument
+;in instance methods.
+;Returns true if it is a valid type, when compared against the
+;type to the 'new' operator.
+public defn this-type? (this:Type, obj:Type, hier:TypeHierarchy) -> True|False :
+  fatal("Invalid type: %~" % [this]) when this is-not TOf|TAnd
+  fatal("Invalid type: %~" % [obj]) when obj is-not TOf|TAnd
+
+  match(this, obj) :
+    (x, y:TAnd) : this-type?(x, a(y), hier) and this-type?(x, b(y), hier)
+    (x:TAnd, y) : this-type?(a(x), y, hier) or this-type?(b(x), y, hier)
+    (x:TOf, y:TOf) :
+      if n(x) == n(y) :
+        subtype(uncap(x), y, hier) as True|False
+    (x, y) :
+      false
+
+;============================================================
+;==================== Function Mixing =======================
+;============================================================
+
+;Mix the given HiStanza functions together.
+public defn mix-functions (xs:Tuple<TArrow>, sel:Tuple<PredResult>) -> Type :
+  ;Helper: Select the arrow if indicated by PredResult. Remove return
+  ;type if using MatchGradual.
+  defn select? (x:TArrow, s:PredResult) -> Maybe<TArrow> :
+    match(s) :
+      (s:True) : One(x)
+      (s:PartialMatch) : One(TArrow(a1(x), TGradual()))
+      (s:False) : None()
+
+  ;Helper: Mix homogenous-arity arrows together.
+  defn mix-homo (xs:List<TArrow>) -> TArrow :
+    if length(xs) == 1 :
+      head(xs)
+    else :
+      val a1* = reduce(mix-a1, seq(a1,xs))
+      val a2* = reduce(TOr, seq(a2,xs))
+      TArrow(map(simplify,a1*), simplify(a2*))
+
+  ;Helper: Mix the arg types of a bunch of functions.
+  defn mix-a1 (a:Tuple<Type>, b:Tuple<Type>) -> Tuple<Type> :
+    to-tuple(seq(TOr, a, b))
+
+  ;Group by arity, and mix each arity separately.
+  defn arity (a:TArrow) : length(a1(a))
+  val arrows = seq?(select?, xs, sel)
+  val table = group-by(arity, arrows)
+  reduce(TAnd, seq(mix-homo, values(table)))
+
+;Mix the given LoStanza functions together.
+public defn mix-ls-functions (xs:Tuple<FnT>, sel:Tuple<PredResult>) -> FnT|False :
+  ;Sanity check: Only called with instantiated functions so all
+  ;arities must match.
+  val arities = to-list $ seq(length{a(_)}, xs)
+  if not all-equal?(arities) :
+    fatal("Input functions do not share same arity.")
+
+  ;Helper: Select the FnT if indicated by PredResult. Remove return
+  ;type if using MatchGradual.
+  defn select? (x:FnT, s:PredResult) -> Maybe<FnT> :
+    match(s) :
+      (s:True) : One(x)
+      (s:False) : None()
+      (s:PartialMatch) :
+        match(b(x)) :
+          (b:RefT) : One(FnT(a(x), r(x), RefT(TGradual())))
+          (b) : One(x)
+
+  ;Called to merge two argument types.
+  ;If the two types are not mergeable, then fail() is called.
+  defn merge (x:LSType, y:LSType, fail:() -> Void) -> LSType :
+    match(x, y) :
+      ;Unknowns are more general.
+      (x:UnknownT, y) : x
+      (x, y:UnknownT) : y
+      ;The wider primitives are more general.
+      ;NOTE: After the top-level, we expect the primitives
+      ;to always match.
+      (x:ByteT|IntT|LongT, y:ByteT|IntT|LongT) :
+        if primitive-size(x) < primitive-size(y) : y
+        else : x
+      (x:FloatT|DoubleT, y:FloatT|DoubleT) :
+        if primitive-size(x) < primitive-size(y) : y
+        else : x
+      ;Refs are unioned together.
+      (x:RefT, y:RefT) :
+        RefT(TOr(type(x), type(y)))
+      ;Other parametric types are just element-wise merged.
+      (x:PtrT, y:PtrT) :
+        PtrT(merge(type(x), type(y), fail))
+      (x:StructT, y:StructT) :
+        StructT(n(x), to-tuple(seq(TOr, args(x), args(y))))
+      (x:FnT, y:FnT) :
+        merge-fnt(merge{_, _, fail}, x, y)
+      ;Other.
+      (x, y) :
+        fail()
+
+  ;Launch!
+  val funcs = seq?(select?, xs, sel)
+  attempt : reduce(merge{_, _, fail}, funcs) as FnT       
+
+;Helper: Merge two FnT with correct handling of Rest type.
+defn merge-fnt (merge:(LSType,LSType) -> LSType,
+                x:FnT, y:FnT) -> FnT :
+
+  ;Helper: If r is not false, then extend t with r at the end.
+  defn extend (t:Tuple<LSType>, r:LSType|False) -> Seq<LSType> :
+    match(r:LSType) : cat(t, repeat(r))
+    else : to-seq(t)
+
+  ;Call merge if both are types.
+  defn merge? (a:LSType|False, b:LSType|False) -> LSType|False :
+    match(a, b) :
+      (a:LSType, b:LSType) : merge(a, b)
+      (a:LSType, b:False) : a
+      (a:False, b:LSType) : b
+      (a:False, b:False) : false
+
+  ;Sanity check the arity.
+  val good-arity? = match(r(x), r(y)) :
+    (rx:LSType, ry:LSType) : true
+    (rx:LSType, ry:False) : length(a(x)) <= length(a(y))
+    (rx:False, ry:LSType) : length(a(y)) <= length(a(x))
+    (rx:False, ry:False) : length(a(x)) == length(a(y))
+  if not good-arity? :
+    fatal("Mismatched function arities.")
+
+  ;Extend the arguments on each function.
+  val n = max(length(a(x)), length(a(y)))
+  val ea-x = extend(a(x), r(x))
+  val ea-y = extend(a(y), r(y))
+  val new-a = to-tuple $ take-n(n, seq(merge, ea-x, ea-y))
+  val new-r = merge?(r(x),r(y))
+  val new-b = merge(b(x), b(y))
+  FnT(new-a, new-r, new-b)
+
+;============================================================
+;=================== HiStanza Primitives ====================
+;============================================================
+
+;Check whether the given primitives can be called with the given types.
+public defn callable? (op:Primitive, args:Tuple<Type>, hier:TypeHierarchy) -> PredResult :
+  ;Helper: Int type.
+  val int = TOf(special-type(hier,CoreInt), [])
+  ;Helper: Top type.
+  val any = TTop()
+
+  ;Helper: Do the arguments match the given type?
+  defn args? (ts:Tuple<Type>) -> PredResult :
+    if length(args) == length(ts) :
+      for (a in args, t in ts) all? :
+        subtype(a, t, hier) as True|False
+
+  match(blocked?(args)) :
+    (b:Blocked) :
+      b
+    (f:False) :
+      switch(op) :
+        ADD-OP : args?([int int])
+        SUB-OP : args?([int int])
+        MUL-OP : args?([int int])
+        DIV-OP : args?([int int])
+        MOD-OP : args?([int int])
+        AND-OP : args?([int int])
+        OR-OP : args?([int int])
+        XOR-OP : args?([int int])
+        SHL-OP : args?([int int])
+        SHR-OP : args?([int int])
+        ASHR-OP : args?([int int])
+        EQ-OP : args?([int int])
+        NE-OP : args?([int int])
+        LT-OP : args?([int int])
+        GT-OP : args?([int int])
+        LE-OP : args?([int int])
+        GE-OP : args?([int int])
+        NOT-OP : args?([int])
+        NEG-OP : args?([int])
+        IDENTICAL-OP : args?([any any])    
+
+;Check whether the given primitive can be called with the given types.
+public defn callable? (op:LSPrimitive, args:Tuple<LSType>, hier:TypeHierarchy) -> PredResult :
+  ;Helper: Ref<Stack>
+  val stk-type = RefT(TOf(special-type(hier, CoreStack), []))
+
+  ;Single type predicates.
+  defn int (x:LSType) : x is ByteT|IntT|LongT
+  defn stk (x:LSType) : assignable?(x, stk-type, hier) as True|False
+  defn ptr (x:LSType) : x is PtrT
+  defn top (x:LSType) : true
+  defn fnum (x:LSType) : x is FloatT|DoubleT
+  defn snum (x:LSType) : x is FloatT|DoubleT|IntT|LongT
+  defn sint (x:LSType) : x is IntT|LongT
+  defn ref (x:LSType) : x is RefT
+
+  ;Predicates on arglist.
+  defn zeroop? () :
+    length(args) == 0
+  defn unaop? (f:LSType -> True|False) :
+    length(args) == 1 and f(args[0])
+  defn binop? (a:LSType -> True|False, b:LSType -> True|False) :
+    length(args) == 2 and a(args[0]) and b(args[1])
+  defn minop? (n:Int) :
+    length(args) >= n
+  defn binop-nums? () :
+    length(args) == 2 and
+    match(args[0], args[1]) :
+      (a:ByteT|IntT|LongT, b:ByteT|IntT|LongT) : true
+      (a:FloatT|DoubleT, b:FloatT|DoubleT) : true
+      (a, b) : false
+  defn binop-ints? () :
+    length(args) == 2 and
+    match(args[0], args[1]) :
+      (a:ByteT|IntT|LongT, b:ByteT|IntT|LongT) : true
+      (a, b) : false
+  
+  match(blocked?(args)) :
+    (b:Blocked) :
+      b
+    (f:False) :
+      ;Launch! Dispatch based upon operation type.
+      switch(op) :
+        FLUSH-VM-OP : zeroop?()
+        GC-OP : unaop?(int)
+        LS-CRSP-OP : zeroop?()
+        PRINT-STACK-TRACE-OP : unaop?(stk)
+        COLLECT-STACK-TRACE-OP : unaop?(stk)
+        LS-YIELD-OP : binop?(stk, top)
+        LS-ENTER-STACK-OP : minop?(1)
+        LS-ADD-OP : binop?(ptr, int) or binop-nums?()
+        LS-SUB-OP : binop?(ptr, ptr) or binop?(ptr, int) or binop-nums?()
+        LS-MUL-OP : binop-nums?()
+        LS-DIV-OP : binop-nums?()
+        LS-MOD-OP : binop-ints?()
+        LS-AND-OP : binop-ints?()
+        LS-OR-OP : binop-ints?()
+        LS-XOR-OP : binop-ints?()
+        LS-SHL-OP : binop-ints?()
+        LS-SHR-OP : binop-ints?()
+        LS-ASHR-OP : binop-ints?()
+        LS-EQ-OP : binop?(ptr, ptr) or binop?(ref, ref) or binop-nums?()
+        LS-NE-OP : binop?(ptr, ptr) or binop?(ref, ref) or binop-nums?()
+        LS-LT-OP : binop?(ptr,ptr) or binop-nums?()
+        LS-GT-OP : binop?(ptr,ptr) or binop-nums?()
+        LS-LE-OP : binop?(ptr,ptr) or binop-nums?()
+        LS-GE-OP : binop?(ptr,ptr) or binop-nums?()
+        LS-ULT-OP : binop-ints?()
+        LS-UGT-OP : binop-ints?()
+        LS-ULE-OP : binop-ints?()
+        LS-UGE-OP : binop-ints?()
+        LS-LOWEST-ZERO-BIT-COUNT-OP : unaop?(int)    
+        LS-TEST-BIT-OP : binop?(int,ptr)
+        LS-TEST-AND-SET-BIT-OP : binop?(int,ptr)
+        LS-TEST-AND-CLEAR-BIT-OP : binop?(int,ptr)
+        LS-SET-BIT-OP : binop?(int,ptr)
+        LS-CLEAR-BIT-OP : binop?(int,ptr)
+        LS-NOT-OP : unaop?(int)
+        LS-NEG-OP : unaop?(snum)
+        LS-BITS-OP : unaop?(fnum)
+        LS-FNUM-OP : unaop?(sint)
+        else : fatal("Unhandled primitive: %_" % [op])  
+
+;============================================================
+;================= Checker Predicates =======================
+;============================================================
+;These predicates are used by the checker during type filling
+;and error generation.
+
+;Returns true if a cast of x to y requires a numerical conversion,
+;and is not simply a reinterpretation. 
+public defn convert? (x:LSType, y:LSType) -> PredResult :
+  within (x, y) = when-not-uvar?(x, y) :
+    match(x, y) :
+      (x:ByteT|IntT|LongT|FloatT|DoubleT, y:ByteT|IntT|LongT|FloatT|DoubleT) : true
+      (x, y) : false
+
+;Returns true if a cast of x to y is just a static reinterpretation
+;of the bits.
+public defn reinterpret? (x:LSType, y:LSType, hier:TypeHierarchy) -> PredResult :
+  within (x, y) = when-not-uvar?(x, y) :
+    match(x, y) :
+      (x:RefT, y:RefT) : castable?(type(x), type(y), hier)
+      (x:PtrT|LongT|RefT, y:PtrT|LongT|RefT) : true
+      (x, y) : false
+
+;Returns true if x is allowed to be cast to y.
+public defn castable? (x:LSType, y:LSType, hier:TypeHierarchy) -> PredResult :
+  or-pred(reinterpret?(x,y,hier), convert?(x,y))
+
+;Compute the derefed/deptred version of the given LSType.
+public defn deref-deptr (t:LSType, hier:TypeHierarchy) -> Blocked|LSType|False :
+  let loop (t:Type|LSType = t) :
+    match(t) :
+      (t:PtrT) : type(t)
+      (t:RefT) : loop(type(t))
+      (t:TOf) : StructT(n(t), args(t))
+      (t:TTuple) : loop(collapse-tuple(t, hier))
+      (t:TArrow) : FnT(map(RefT,a1(t)), false, RefT(a2(t)))
+      (t:TUVar|UVarT) : Blocked(n(t))      
+      (t) : false
+
+;Retrieve the named field within a type.
+;Returns:
+;- Blocked: If there is insufficient information to compute.
+;- Field: If we can access the field.
+;- False: If there is no such field.
+public defn get-field (t:LSType, name:Symbol, hier:TypeHierarchy) -> Blocked|Field|False :
+  match(deref-obj(t, hier)) :
+    (t:TOf|StructT) : lookup-field(n(t), name, hier)
+    (b:Blocked) : b
+    (f:False) : false
+
+;Retrieve the type of the field with the given name.
+;Returns:
+;- Blocked: If there is insufficient information to compute.
+;- LSType: If we can access the field.
+;- False: If there is no such field.
+public defn get-field-type (t:LSType, name:Symbol, hier:TypeHierarchy) -> Blocked|LSType|False :
+  match(deref-obj(t,hier)) :
+    (t:TOf|StructT) :
+      match(lookup-field(n(t), name, hier)) :
+        (f:Field) : type(f, args(t))
+        (f:False) : false
+    (b:Blocked) : b
+    (f:False) : false  
+
+;Lookup the field with the given name in the given type.
+defn lookup-field (n:Int, name:Symbol, hier:TypeHierarchy) -> Field|False :
+  val fs = fields(hier, n)
+  if not empty?(fs) :
+    find({/name(_) == name}, value!(fs))
+
+;Helper: Retrieve the wrapped TOf|StructT in the given type.
+public defn deref-obj (t:LSType, hier:TypeHierarchy) -> Blocked|TOf|StructT|False :
+  let loop (t:Type|LSType = t) :
+    match(t) :
+      (t:UVarT|TUVar) : Blocked(n(t))
+      (t:RefT|PtrT) : loop(type(t))
+      (t:TOf|StructT) : t
+      (t:TTuple) : collapse-tuple(t, hier)
+      (t) : false
+
+;Return true if type t can be used in the sizeof expression.
+public defn has-size? (t:LSType) -> PredResult :
+  match(t) :
+    (t:UVarT) : Blocked(n(t))    
+    (t:UnknownT|FnT) : false
+    (t) : true
+
+;Returns true if the given type can be represented using a fixed
+;size.
+public defn bounded? (t:LSType, hier:TypeHierarchy) -> PredResult :
+  match(t) :
+    (t:TLSFunction) : fatal("Unexpected argument.")
+    (t:ByteT|IntT|LongT|FloatT|DoubleT|PtrT|RefT) : true
+    (t:UnknownT|RestT|FnT) : false
+    (t:StructT) : bounded-type?(n(t), hier)
+    (t:UVarT) : Blocked(n(t))
+    (t) : fatal("Invalid type: %_" % [object-type(t)])
+
+;Returns true if the given type can be represented using a known
+;fixed size.
+public defn bounded-type? (n:Int, hier:TypeHierarchy) -> True|False :
+  ;Retrieve the LoStanza fields.
+  val fields = value!(fs) where :
+    val fs = fields(hier, n)
+    if empty?(fs) :
+      fatal("Function must be called on LoStanza type.")
+
+  ;Type is bounded if it does not end with a rest Field.
+  val num-fields = length(fields)
+  if num-fields == 0 :
+    true
+  else :
+    val last-field = fields[num-fields - 1]
+    type(last-field) is-not RestT
+
+;Returns true if ts[i] is a valid branch type given the match argument has type 'ma'.
+public defn branch-arg? (ma:Type, i:Int, ts:Tuple<Type>, hier:TypeHierarchy) -> PredResult :
+  ;[TODO] Improve this using narrowing.
+  castable?(ma, ts[i], hier)
+
+;Return whether the given type is appropriate for use in a match.
+public defn ref-type? (t:LSType) -> PredResult :
+  match(t) :
+    (t:UVarT) : Blocked(n(t))
+    (t:RefT) : true
+    (t) : false
+
+;============================================================
+;==================== Small Utilities =======================
+;============================================================
+
+;Helper: If either x or y is UVarT, then return Blocked.
+;Otherwise return whatever is returned by the given function.
+defn when-not-uvar?<?T> (return:(LSType, LSType) -> ?T, x:LSType, y:LSType) -> T|Blocked :
+  match(x, y) :
+    (x:UVarT, y:UVarT) : Blocked(List(n(x), n(y)))
+    (x:UVarT, y) : Blocked(n(x))
+    (x, y:UVarT) : Blocked(n(y))
+    (x, y) : return(x, y)
+
+;Returns true if all the items in the list are equal to each other.
+defn all-equal? (vs:List<Equalable>) -> True|False :
+  if empty?(vs) :
+    true
+  else :
+    for v in tail(vs) all? :
+      v == head(vs)
+
+;Returns true if the given type captures cv.
+defn captures-type? (t:Type|LSType, cv:Int) -> True|False :
+  let loop (t:TypeItem = t) :
+    match(t:TCap) : n(t) == cv
+    else : any?(loop, t)
+
+;Returns true if the two tuples have the same length.
+defn same-length? (a:Tuple, b:Tuple) -> True|False :
+  length(a) == length(b)
