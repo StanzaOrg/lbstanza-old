@@ -864,14 +864,17 @@ static void JSBuilder_write_quoted_text(JSBuilder* builder, const char* data, si
       case '\"': *s = '\"'; break;
       case '\\': *s = '\\'; break;
       case '\b': *s = 'b'; break;
+      case '\f': *s = 'f'; break;
       case '\t': *s = 't'; break;
       case '\n': *s = 'n'; break;
       case '\r': *s = 'r'; break;
       default:
-        *s = 'x';
-        s = JSBuilder_allocate(builder, 2);
-        s[1] = hex_nybble(c);
-        s[0] = hex_nybble(c >> 4);
+        *s = 'u';
+        s = JSBuilder_allocate(builder, 4);
+        s[3] = hex_nybble(c >> 0);
+        s[2] = hex_nybble(c >> 4);
+        s[1] = hex_nybble(c >> 8);
+        s[0] = hex_nybble(c >> 12);
     }
   }
   JSBuilder_append_quotes(builder);
