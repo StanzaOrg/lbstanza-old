@@ -2277,28 +2277,34 @@ static bool request_source(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
-static bool request_threads(const JSObject* request) {
-  // TODO: Maybe report coroutines instead of threads?
+typedef DelayedRequest DelayedRequestThreads;
+static void DelayedRequestThreads_handle(DelayedRequest* req) {
   JSBuilder builder;
   // TODO: If no active stack exists, pass an error message instead of NULL here.
-  JSBuilder_initialize_response(&builder, request, NULL);
+  JSBuilder_initialize_delayed_response(&builder, req, NULL);
   JSBuilder_object_field_begin(&builder, "body");
   {
     // TODO: Should we list coroutines here?
     JSBuilder_array_field_begin(&builder, "threads");
     {
       JSBuilder_next(&builder);
-      JSBuilder_object_begin(&builder);
+      JSBuilder_object_begin(&builder); // an individual thread
       {
         JSBuilder_write_unsigned_field(&builder, "id", thread_id);
         JSBuilder_write_raw_string_field(&builder, "name", "main");
       }
       JSBuilder_object_end(&builder); // an individual thread
     }
-    JSBuilder_array_field_end(&builder); // threads
+    JSBuilder_array_field_end(&builder);
   }
-  JSBuilder_object_end(&builder); // body
+  JSBuilder_object_field_end(&builder); // body
   JSBuilder_send_and_destroy_response(&builder);
+}
+static inline DelayedRequest* DelayedRequestThreads_create(const JSObject* request) {
+  return DelayedRequest_create(request, sizeof(DelayedRequestThreads), &DelayedRequestThreads_handle);
+}
+static bool request_threads(const JSObject* request) {
+  insert_to_request_queue(DelayedRequestThreads_create(request));
   return true;
 }
 
