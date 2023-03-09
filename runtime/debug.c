@@ -1091,10 +1091,8 @@ static inline void send_invalidate_thread(void) {
   }
 }
 
-static inline void Environment_reset(void);
 static void send_thread_stopped(StopReason reason, const char* description, uint64_t breakpoint) {
   //send_invalidate_thread();
-  Environment_reset();
   run_mode = RUN_MODE_PAUSED;
 
   JSBuilder builder;
@@ -2277,8 +2275,11 @@ static bool request_source(const JSObject* request) {
 //     "required": [ "body" ]
 //   }]
 // }
+static inline void Environment_reset(void);
 typedef DelayedRequest DelayedRequestThreads;
 static void DelayedRequestThreads_handle(DelayedRequest* req) {
+  Environment_reset();
+
   JSBuilder builder;
   // TODO: If no active stack exists, pass an error message instead of NULL here.
   JSBuilder_initialize_delayed_response(&builder, req, NULL);
