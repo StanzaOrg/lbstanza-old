@@ -124,8 +124,8 @@ if [ "$CREATE_PACKAGE" == "true" ] ; then
       && mv ${STANZA_PLATFORMCHAR}stanza${STANZA_EXT} stanza${STANZA_EXT} \
       && mv ${STANZA_PLATFORMCHAR}pkgs pkgs
 
-  #zip -r ../${STANZA_PLATFORMCHAR}stanza_${VERU}.zip *
-  zip -r ../stanza-${PLATFORM_DESC}_${VER}.zip *
+  #zip -r ${STANZA_PLATFORMCHAR}stanza_${VERU}.zip *
+  zip -r stanza-${PLATFORM_DESC}_${VER}.zip *
 
 fi
 
