@@ -629,6 +629,297 @@ defn gen-defstruct (sname:Token|Symbol,
     `meta-utils? => choice(meta-utils?)])
 
 ;============================================================
+;===================== Function Header ======================
+;============================================================
+
+;------------------------------------------------------------
+;--------------------- Parse Structures ---------------------
+;------------------------------------------------------------
+
+;Examples of various arguments.
+;
+;  defn func<T> (a:Int,
+;                [b,c]:Int = 0,
+;                c:Int
+;                d:String,
+;                e:String = ?,
+;                rest ...) -> Type :
+;    body
+
+;Represent the argument specifiers and return type of
+;a 'defn' header.
+defstruct DefnHeader :
+  info:FileInfo|False
+  args:Tuple<ArgBinding>
+  a2:Maybe  
+with:
+  constructor => #DefnHeader
+
+;Construct the Defn header.
+defn DefnHeader (info:FileInfo|False,
+                 args:Tuple<ArgBinding|ArgSeparator>,
+                 a2:Maybe) -> DefnHeader :
+  ;Sanity check argument list.
+  val num-separators = count({_ is ArgSeparator}, args)
+  val num-varargs = count({_ is VarArg}, args)
+  if num-separators > 1 :
+    throw(CSE(info, "Argument list should contain only a single '--' separator."))
+  if num-varargs > 1 :
+    throw(CSE(info, "Argument list can only at most a single vararg argument."))
+  if num-varargs == 1 :
+    val n = length(args)
+    if args[n - 1] is-not VarArg :
+      throw(CSE(info, "Vararg argument must be last in the argument list."))
+
+  ;Create final argument list.
+  var after-separator?:True|False = false
+  val new-args = to-tuple $
+    for (arg in args, i in 0 to false) seq? :
+      match(arg) :
+        (arg:PositionalArg) :
+          if after-separator? :
+            if unwrap-token(name(arg)) is-not Symbol :
+              throw(CSE(info, "Keyword argument does not allow destructuring."))
+            One(KeywordArg(name(arg), type(arg),
+                optional?(arg), default(arg)))
+          else :
+            One(arg)
+        (arg:VarArg) :
+          One(arg)
+        (arg:ArgSeparator) :
+          after-separator? = true
+          None()
+        (arg:KeywordArg) :
+          fatal("Unexpected keyword arg.")
+
+  ;Create argument names for positional arguments if they
+  ;don't already have one.
+  for arg in new-args do :
+    match(arg:PositionalArg) :
+      if unwrap-token(arg-name(arg)) is-not Symbol :
+        set-arg-name(arg, gensym(`arg))
+
+  ;Create header.
+  #DefnHeader(info, new-args, a2)
+
+;Represents each of the argument binding.
+deftype ArgBinding
+
+;Retrieve the optional type specifier of the binding.
+defmulti name (b:ArgBinding) -> ?
+defmulti type (b:ArgBinding) -> Maybe
+
+;Example: c:Int = 30
+defstruct PositionalArg <: ArgBinding :
+  name with: (as-method => true)
+  type:Maybe with: (as-method => true)
+  optional?:True|False
+  default:Maybe
+  arg-name with: (default => name, setter => set-arg-name)
+
+;Example: param c:Int = 30
+defstruct KeywordArg <: ArgBinding :
+  name with: (as-method => true)
+  type:Maybe with: (as-method => true)
+  optional?:True|False
+  default:Maybe
+
+;Example: rest:Int ...
+defstruct VarArg <: ArgBinding :
+  name with: (as-method => true)
+  type:Maybe with: (as-method => true)
+
+;Represents / used to separate positional and
+;keyword arguments.
+defstruct ArgSeparator  
+
+;------------------------------------------------------------
+;----------------------- Errors -----------------------------
+;------------------------------------------------------------
+
+;Ensure that the header does not provide default values.
+;Used to ensure that defmulti definitions are proper.
+defn ensure-no-default-values! (h:DefnHeader) -> False :
+  for arg in args(h) do :
+    match(arg:PositionalArg|KeywordArg) :
+      if not empty?(default(arg)) :
+        CSE(info(h),
+            "Default values are supported for methods, but not multis. Use '%_ = ?' to \
+             indicate that a multi argument is optional." % [
+             name(arg)])
+
+;------------------------------------------------------------
+;--------------------- Compilation --------------------------
+;------------------------------------------------------------
+
+;Example of simple function.
+;
+;  ($defn ($of myfunc T ($cap S)) (a, b, ($tuple a c)) (Int, String) ($none)
+;    ($body1)
+;    ($body2))
+;
+;Other argument specifiers.
+;
+;  ($optional a)
+;  ($keyword a)
+;  ($optional-keyword a)
+;  ($rest a)
+
+;Preprocessing is required if default values are supplied.
+defn preprocessing-required? (h:DefnHeader) -> True|False :
+  for arg in args(h) any? :
+    match(arg:PositionalArg|KeywordArg) :
+      not empty?(default(arg))
+
+;Retrieved the compiled list of argument specifiers in the header.
+defn compile-args (h:DefnHeader) -> List :
+  val preprocessing? = preprocessing-required?(h)
+  to-list $ for arg in args(h) seq :
+    match(arg) :
+      (arg:PositionalArg) :
+        val name = arg-name(arg) when preprocessing? else name(arg)
+        if optional?(arg) : qquote($optional ~ name)
+        else : name
+      (arg:KeywordArg) :
+        if optional?(arg) : qquote($optional-keyword ~(name(arg)))
+        else : qquote($keyword ~(name(arg)))
+      (arg:VarArg) :
+        qquote($rest ~(name(arg)))
+
+;Retrieved the compiled list of argument types in the header.
+defn compile-a1 (h:DefnHeader) -> List :
+  to-list $ for arg in args(h) seq :
+    if empty?(type(arg)) : `($none)
+    else : value!(type(arg))
+
+;Retrieve the compiled return type of the header.
+defn compile-a2 (h:DefnHeader) -> ? :
+  if empty?(a2(h)) : `($none)
+  else : value!(a2(h))
+
+;Retrieve just the args and types.
+defn compile-args-a1-a2 (h:DefnHeader) -> [List, List, ?] :
+  [compile-args(h),
+   compile-a1(h),
+   compile-a2(h)]
+
+;Compile the body prefixed with the preprocessing required for the
+;given header.
+defn compile-body (h:DefnHeader, body) -> ? :
+
+  ;Case: There is preprocessing required.
+  if preprocessing-required?(h) :
+    ;Define the template to use.
+    val template = `(
+      let :
+        args{
+          default-value?{
+            destructure?{
+              val tmp =
+                if core/empty?(arg-name) : (default-value) type?{upcast-as type}{}
+                else : core/value!(arg-name)
+              ($def name ($none) tmp)
+            }{
+              val name =
+                if core/empty?(arg-name) : (default-value) type?{upcast-as type}{}
+                else : core/value!(arg-name)
+            }
+          }{
+            ($def name ($none) arg-name)
+          }
+        }
+        body
+    )
+
+    ;Compile the bindings for the given argument.
+    defn bindings (a:ArgBinding) :
+      val default-value = match(a:PositionalArg|KeywordArg) : default(a)
+                          else : None()        
+      val destructure? = unwrap-token(name(a)) is-not Symbol
+      val arg-name = match(a:PositionalArg) : arg-name(a)
+                     else : name(a)
+      [
+        `default-value? => choice(not empty?(default-value))
+        `default-value => value?(default-value)        
+        `destructure? => choice(destructure?)
+        `tmp => gensym-from-symbol?(name(a))
+        `name => name(a)
+        `arg-name => arg-name
+        `type? => choice(not empty?(type(a)))
+        `type => value?(type(a))
+      ]
+
+    ;Compile the given header.
+    defn bindings (h:DefnHeader) :
+      [`args => nested(map(bindings, args(h)))
+       `body => body]
+
+    ;Launch!
+    val filled = fill-template(template, bindings(h))
+    parse-syntax[core / #exp](List(filled))
+
+  ;Otherwise: Just return the body directly.
+  else :
+    body
+
+;Compile the LoStanza prelude of the given header.
+defn compile-ls-body (h:DefnHeader, body) -> ? :
+  ;Case: There is preprocessing required.
+  if preprocessing-required?(h) :
+    ;Define the template to use.
+    val template = `(
+      let :
+        args{
+          default-value?{
+            var tmp:type
+            if core/empty?(arg-name) == true :
+              tmp = default-value
+            else :
+              tmp = core/value!(arg-name)
+            val name = tmp
+          }{
+            val name = arg-name
+          }
+        }
+        body
+    )
+
+    ;Compile the bindings for the given argument.
+    defn bindings (a:ArgBinding) :
+      val default-value = match(a:PositionalArg|KeywordArg) : default(a)
+                          else : None()        
+      val arg-name = match(a:PositionalArg) : arg-name(a)
+                     else : name(a)
+      [
+        `default-value? => choice(not empty?(default-value))
+        `default-value => value?(default-value)        
+        `tmp => gensym-from-symbol?(name(a))
+        `name => name(a)
+        `type => value!(type(a))
+        `arg-name => arg-name
+      ]
+
+    ;Compile the bindings for the given header.
+    defn bindings (h:DefnHeader) :
+      [`args => nested(map(bindings, args(h)))
+       `body => body]
+
+    ;Launch!
+    val filled = fill-template(template, bindings(h))
+    parse-syntax[core / #ls-stmt](List(filled))
+
+  ;Otherwise: Just return the body directly.    
+  else :
+    body
+
+;Helper: If x is a symbol, then gensym a new symbol using it
+;as the base. 
+defn gensym-from-symbol? (x) :
+  match(unwrap-token(x)) :
+    (x:Symbol) : gensym(x)
+    (x) : gensym(`arg)
+
+;============================================================
 ;==================== Enum Compilation ======================
 ;============================================================
 
@@ -712,8 +1003,8 @@ defsyntax core :
       $ls-slot $ls-field $ls-do $ls-call-c $ls-prim $ls-sizeof $ls-tagof $ls-as
       $ls-letexp $ls-and $ls-or $ls-set $ls-labels $ls-block $ls-goto $ls-return
       $ls-let $ls-if $ls-match $ls-branch $ls-func $ls-def $ls-defvar $ls-deftype $ls-deffield
-      $ls-defn $ls-defn* $ls-defmethod $ls-defmethod* $ls-extern $ls-extern-fn $ls-byte $ls-int $ls-long $ls-float $ls-double
-      $ls-? $ls-of $ls-ptr $ls-ref $ls-fn) do :
+      $ls-defn $ls-defn* $ls-defmethod $ls-defmethod* $ls-extern $ls-extern-fn $ls-byte $ls-int
+      $ls-long $ls-float $ls-double $ls-? $ls-of $ls-ptr $ls-ref $ls-fn) do :
       add(TAG-TABLE, tag)
 
    public defproduction stanza-tag: Symbol|Token
@@ -929,7 +1220,12 @@ defsyntax core :
 
    ;                Function Call
    ;                =============
-   defrule exp4 = (?x:#exp4(?ys:#exps!)) : qquote($do ~ x ~@ ys)
+   defrule exp4 = (?x:#exp4(?ys:#callarg! ...)) : qquote($do ~ x ~@ ys)
+
+   ;Named Arguments.
+   defproduction callarg!
+   defrule callarg! = (?keyword:#id = ?e:#exp!) : qquote($keywordarg ~ keyword ~ e)
+   defrule callarg! = (?e:#exp!)
 
    ;               Type Application
    ;               ================
@@ -942,8 +1238,8 @@ defsyntax core :
 
    ;                  Set and Get
    ;                  ===========
-   defrule exp4 = (?x:#exp4[?es:#exps!] = ?v:#exp!) : qquote($do set ~ x ~@ es ~ v)
-   defrule exp4 = (?x:#exp4[?es:#exps!]) : qquote($do get ~ x ~@ es)
+   defrule exp4 = (?x:#exp4[?es:#callarg! ...] = ?v:#exp!) : qquote($do set ~ x ~@ es ~ v)
+   defrule exp4 = (?x:#exp4[?es:#callarg! ...]) : qquote($do get ~ x ~@ es)
 
    ;                   Casts
    ;                   =====
@@ -961,6 +1257,87 @@ defsyntax core :
    defrule exp4 = (?x:#exp4 as ?t:#type!) : qquote($as ~ x ~ t)
    defrule exp4 = (?x:#exp4 upcast-as ?t:#type!) : qquote($as? ~ x ~ t)
    defrule id != (as | upcast-as | as?)
+
+   ;                 Defn Headers
+   ;                 ============
+
+   ;Represents the optional type following an argument.
+   defproduction argtype?: Maybe
+   defrule argtype? = (: ?t:#type!) : One(t)
+   defrule argtype? = () : None()
+
+   ;Represents the default value following an argument.
+   defproduction arg-default?: Maybe
+   defrule arg-default? = (= ?) : One(`?)
+   defrule arg-default? = (= ?e:#exp!) : One(e)
+   defrule arg-default? = () : None()
+
+   ;Represents a single argument binding.
+   defproduction fnargbinding: ArgBinding
+   defrule fnargbinding = (?name:#id ?type:#argtype? ~ ...) :
+     VarArg(name, type)
+   defrule fnargbinding = (?name:#$binder ?type:#argtype? ?arg-default:#arg-default?) :
+     val optional? = not empty?(arg-default)
+     val default-value = None() when value?(arg-default) == `? else arg-default
+     PositionalArg(name, type, optional?, default-value)
+
+   ;Represents an optional return type.
+   defproduction return-type?: Maybe
+   defrule return-type? = (-> ?t:#type!) : One(t)
+   defrule return-type? = () : None()
+
+   ;Error production.
+   defproduction fnargbinding!: ArgBinding|ArgSeparator
+   defrule fnargbinding! = (--) : ArgSeparator()
+   defrule fnargbinding! = (?x:#fnargbinding)
+   fail-if fnargbinding! = () : CSE(closest-info(), "Invalid argument specifier.")
+     
+   ;Represents the entire defn header.
+   defproduction defnheader:DefnHeader
+   defrule defnheader = ((?args:#fnargbinding! ...) ?a2:#return-type?) :
+     DefnHeader(closest-info(), to-tuple(args), a2)
+
+   ;Error production
+   defproduction defnheader!:DefnHeader
+   fail-if defnheader! = ((@do _ ...)) : CSE(closest-info(), BAD-ARGLIST-MSG)
+   defrule defnheader! = (?x:#defnheader)
+   fail-if defnheader! = () : CSE(closest-info(), "Invalid syntax for function arguments.")
+
+   ;                 LoStanza Defn Headers
+   ;                 =====================
+
+   ;Represents the default value following an argument.
+   defproduction ls-arg-default?: Maybe
+   defrule ls-arg-default? = (= ?) : One(`?)
+   defrule ls-arg-default? = (= ?e:#ls-exp!) : One(e)
+   defrule ls-arg-default? = () : None()
+
+   ;Represents a single argument binding.
+   defproduction lsfnargbinding: ArgBinding
+   defrule lsfnargbinding = (?name:#id : ?type:#ls-type! ~ ...) :
+     VarArg(name, One(type))
+   defrule lsfnargbinding = (?name:#id : ?type:#ls-type! ?arg-default:#ls-arg-default?) :
+     val optional? = not empty?(arg-default)
+     val default-value = None() when value?(arg-default) == `? else arg-default
+     PositionalArg(name, One(type), optional?, default-value)
+
+   ;Error production.
+   defproduction lsfnargbinding!: ArgBinding|ArgSeparator
+   defrule lsfnargbinding! = (--) : ArgSeparator()
+   defrule lsfnargbinding! = (?x:#lsfnargbinding)
+   fail-if lsfnargbinding! = () : CSE(closest-info(), "Invalid argument specifier.")
+     
+   ;Represents the entire defn header.
+   defproduction lsdefnheader:DefnHeader
+   defrule lsdefnheader = ((?args:#lsfnargbinding! ...) #->! ?a2:#ls-type!) :
+     DefnHeader(closest-info(), to-tuple(args), One(a2))
+
+   ;Error production
+   defproduction lsdefnheader!:DefnHeader
+   fail-if lsdefnheader! = ((@do _ ...)) : CSE(closest-info(), BAD-ARGLIST-MSG)
+   defrule lsdefnheader! = (?x:#lsdefnheader)
+   fail-if lsdefnheader! = () : CSE(closest-info(), "Invalid syntax for function arguments.")
+   
 
    ;                   Functions
    ;                   =========
@@ -1012,33 +1389,37 @@ defsyntax core :
    defproduction fn-name!   
    defrule fn-name! = (?x:#id<?ts:#type-arg! ...>) : qquote($of ~ x ~@ ts)
    defrule fn-name! = (?x:#id)
-   fail-if fn-name! = () : CSE(closest-info(), "Expected a function name here.")
+   fail-if fn-name! = () : CSE(closest-info(), "Expected a function name here.")   
 
    defproduction defn-tag: Symbol
    defrule defn-tag = (defn) : `$defn
    defrule defn-tag = (defn*) : `$defn*
-   defrule exp4 = (?tag:#defn-tag ?name:#fn-name! ?header:#fnheader! #:! ?body:#exp!) :
-      val [xs, a1, a2] = header
-      qquote(~ tag ~ name ~ xs ~ a1 ~ a2 ~ body)
+   defrule exp4 = (?tag:#defn-tag ?name:#fn-name! ?header:#defnheader! #:! ?body:#exp!) :
+     val [xs, a1, a2] = compile-args-a1-a2(header)
+     val new-body = compile-body(header, body)
+     qquote(~ tag ~ name ~ xs ~ a1 ~ a2 ~ new-body)
 
    defproduction defmethod-tag: Symbol
    defrule defmethod-tag = (defmethod) : `$defmethod
    defrule defmethod-tag = (defmethod*) : `$defmethod*
    defproduction defmethod
-   defrule defmethod = (?tag:#defmethod-tag ?name:#fn-name! ?header:#fnheader! #:! ?body:#exp!) :
-      val [xs, a1, a2] = header
-      qquote(~ tag ~ name ~ xs ~ a1 ~ a2 ~ body)
+   defrule defmethod = (?tag:#defmethod-tag ?name:#fn-name! ?header:#defnheader! #:! ?body:#exp!) :
+      val [xs, a1, a2] = compile-args-a1-a2(header)
+      val new-body = compile-body(header, body)      
+      qquote(~ tag ~ name ~ xs ~ a1 ~ a2 ~ new-body)
    defrule exp4 = inline #defmethod
 
-   defrule exp4 = (defmulti ?name:#fn-name! ?header:#fnheader! : ?body:#exp!) :
-      val [xs, a1, a2] = header
+   defrule exp4 = (defmulti ?name:#fn-name! ?header:#defnheader! : ?body:#exp!) :
+      val [xs, a1, a2] = compile-args-a1-a2(header)
+      val new-body = compile-body(header, body)
       qquote($begin
-        ($defmulti ~ name ~ a1 ~ a2)
-        ($defmethod ~ name ~ xs ~ a1 ~ a2 ~ body))
+        ($defmulti ~ name ~ a1 ~ a2 ~ xs)
+        ($defmethod ~ name ~ xs ~ a1 ~ a2 ~ new-body))
 
-   defrule exp4 = (defmulti ?name:#fn-name! ?header:#fnheader!) :
-      val [xs, a1, a2] = header
-      qquote($defmulti ~ name ~ a1 ~ a2)
+   defrule exp4 = (defmulti ?name:#fn-name! ?header:#defnheader!) :
+      ensure-no-default-values!(header)
+      val [xs, a1, a2] = compile-args-a1-a2(header)
+      qquote($defmulti ~ name ~ a1 ~ a2 ~ xs)
 
    defproduction multifn-tag
    defrule multifn-tag = (multifn) : `$fn
@@ -2077,12 +2458,16 @@ defsyntax core :
    defrule ls-defn-tag = (defn) : `$ls-defn
    defrule ls-defn-tag = (defn*) : `$ls-defn*
    
-   defrule exp4 = (lostanza ?tag:#ls-defn-tag ?name:#id!<?targs:#type-arg! ...>
-                      ((?xs:#id! #:! ?ts:#ls-type!) @...) #->! ?rt:#ls-type! #:! ?c:#ls-stmt!) :
-      qquote(~ tag ($ls-of ~ name ~@ targs) ~ xs ~ ts ~ rt ~ c)
-   defrule exp4 = (lostanza ?tag:#ls-defn-tag ?name:#id!
-                      ((?xs:#id! #:! ?ts:#ls-type!) @...) #->! ?rt:#ls-type! #:! ?c:#ls-stmt!) :
-      qquote(~ tag ~ name ~ xs ~ ts ~ rt ~ c)
+   defrule exp4 = (lostanza ?tag:#ls-defn-tag ?name:#id!<?targs:#type-arg! ...> ?header:#lsdefnheader! #:!
+                     ?c:#ls-stmt!) :
+      val [xs, a1, a2] = compile-args-a1-a2(header)
+      val new-body = compile-ls-body(header, c)
+      qquote(~ tag ($ls-of ~ name ~@ targs) ~ xs ~ a1 ~ a2 ~ new-body)
+   defrule exp4 = (lostanza ?tag:#ls-defn-tag ?name:#id! ?header:#lsdefnheader! #:!
+                     ?c:#ls-stmt!) :
+      val [xs, a1, a2] = compile-args-a1-a2(header)
+      val new-body = compile-ls-body(header, c)
+      qquote(~ tag ~ name ~ xs ~ a1 ~ a2 ~ new-body)
 
    ;                        LoStanza Defmethod
    ;                        ==================
@@ -2090,13 +2475,17 @@ defsyntax core :
    defrule ls-defmethod-tag = (defmethod) : `$ls-defmethod
    defrule ls-defmethod-tag = (defmethod*) : `$ls-defmethod*
    
-   defrule exp4 = (lostanza ?tag:#ls-defmethod-tag ?multi:#id!<?targs:#type-arg! ...>
-                      ((?xs:#id! #:! ?ts:#ls-type!) @...) #->! ?rt:#ls-type! #:! ?c:#ls-stmt!) :
-      qquote(~ tag ($ls-of ~ multi ~@ targs) ~ xs ~ ts ~ rt ~ c)
+   defrule exp4 = (lostanza ?tag:#ls-defmethod-tag ?multi:#id!<?targs:#type-arg! ...> ?header:#lsdefnheader! #:!
+                     ?c:#ls-stmt!) :
+      val [xs, a1, a2] = compile-args-a1-a2(header)
+      val new-body = compile-ls-body(header, c)
+      qquote(~ tag ($ls-of ~ multi ~@ targs) ~ xs ~ a1 ~ a2 ~ new-body)
 
-   defrule exp4 = (lostanza ?tag:#ls-defmethod-tag ?multi:#id!
-                      ((?xs:#id! #:! ?ts:#ls-type!) @...) #->! ?rt:#ls-type! #:! ?c:#ls-stmt!) :
-      qquote(~ tag ~ multi ~ xs ~ ts ~ rt ~ c)
+   defrule exp4 = (lostanza ?tag:#ls-defmethod-tag ?multi:#id! ?header:#lsdefnheader! #:!
+                     ?c:#ls-stmt!) :
+      val [xs, a1, a2] = compile-args-a1-a2(header)
+      val new-body = compile-ls-body(header, c)
+      qquote(~ tag ~ multi ~ xs ~ a1 ~ a2 ~ new-body)
 
    ;                        LoStanza Vars
    ;                        =============
@@ -2186,8 +2575,12 @@ defsyntax core :
       val a = but-last(xs)
       val r = last(xs)
       qquote($ls-fn ~ a ~ r ~ b)
-   defrule ls-type = ((?a:#ls-types!) -> ?b:#ls-type!) : qquote($ls-fn ~ a ($none) ~ b)
+   defrule ls-type = (?a:#ls-type-list -> ?b:#ls-type!) : qquote($ls-fn ~ a ($none) ~ b)
    defrule ls-type = (?x:#ls-type0)
+
+   defproduction ls-type-list:List
+   defrule ls-type-list = ((?t:#ls-type ?ts:#ls-types!)) : cons(t,ts)
+   defrule ls-type-list = (()) : List()
 
    ;Precedence level 0
    defrule ls-type0 = (?x:(#stanza-tag _ ...))
@@ -2258,9 +2651,14 @@ defsyntax core :
    defrule ls-exp4 = (?x:#ls-exp4 as ?t:#ls-type!) : qquote($ls-as ~ x ~ t)
    defrule ls-exp4 = (?x:#ls-exp4[?i:#ls-exp!]) : qquote($ls-slot ~ x ~ i)
    defrule ls-exp4 = (?x:#ls-exp4 . ?f:#id!) : qquote($ls-field ~ x ~ f)
-   defrule ls-exp4 = (?x:#ls-exp4(?ys:#ls-exps!)) : qquote($ls-do ~ x ~@ ys)
-   defrule ls-exp4 = (?x:#ls-exp4<?ts:#types!>(?ys:#ls-exps!)) : qquote($ls-do ($ls-of ~ x ~@ ts) ~@ ys)
+   defrule ls-exp4 = (?x:#ls-exp4(?ys:#ls-callarg! ...)) : qquote($ls-do ~ x ~@ ys)
+   defrule ls-exp4 = (?x:#ls-exp4<?ts:#types!>(?ys:#ls-callarg! ...)) : qquote($ls-do ($ls-of ~ x ~@ ts) ~@ ys)
    defrule ls-exp4 = (?x:#ls-exp5)
+
+   ;Named Arguments.
+   defproduction ls-callarg!
+   defrule ls-callarg! = (?keyword:#id = ?e:#ls-exp!) : qquote($keywordarg ~ keyword ~ e)
+   defrule ls-callarg! = (?e:#ls-exp!)
 
    ;                    Prefix Operators
    ;                    ================
@@ -2294,7 +2692,6 @@ defsyntax core :
    fail-if ls-exp5 = (fn) : CSE(closest-info(), "Expected identifier of referenced function after fn keyword.")
    
    defrule ls-exp5 = (let #:! ?c:#ls-stmt! in ?e:#ls-exp!) : qquote($ls-letexp ~ c ~ e)
-   fail-if ls-exp5 = (let #:! ?c:#ls-stmt! ?rest ...) : CSE(closest-info(rest), "Expected the in keyword here.")
 
    defrule ls-exp5 = ([?x:#ls-exp$]) : qquote($ls-deref ~ x)
    defrule ls-exp5 = ((- ?x:#ls-exp$)) : qquote($ls-prim neg ~ x)
@@ -2302,7 +2699,6 @@ defsyntax core :
    defrule ls-exp5 = ((?x:#ls-exp))
    defrule ls-exp5 = (?x:#literal)
    defrule ls-exp5 = (?x:#id)
-
 
    ;                     LoStanza Statements
    ;                     ===================
@@ -2352,6 +2748,7 @@ defsyntax core :
    ;                        Let
    ;                        ===
    defrule ls-stmt = (let #:! ?c:#ls-stmt!) : qquote($ls-let ~ c)
+
 
    ;                        If
    ;                        ==

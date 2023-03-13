@@ -1,0 +1,1484 @@
+defpackage stz/type-gen-equations :
+  import core
+  import collections
+  import stz/types
+  import stz/tl-ir
+  import stz/il-to-tl
+  import stz/dl-ir
+  import stz/tl-to-dl
+  import stz/type-equations
+  import stz/namemap
+  import stz/ids
+  import stz/tl-formatter
+  import stz/type-locs
+  import stz/type-hierarchy
+  import stz/type-utils
+  import stz/type-instfns
+  import stz/type-instantiation
+  import stz/type-capside
+  import stz/type-fargs
+
+;============================================================
+;================== Main Entry Point ========================
+;============================================================
+
+;Generate the type equations for the program.
+public defn generate-type-equations (prog:TProg) -> [TProg, Vector<TypeEqn>] :
+
+  ;List to hold generated type equations.
+  val type-eqns = Vector<TypeEqn>()
+  
+  within with-implicits(namemap(prog), hierarchy(prog), type-eqns) :
+  
+    ;Add top level definitions to typing environment.
+    val packages-with-top-vars = map(add-top-level-variables, packages(prog))
+
+    ;Add environment definitions to typing environment.
+    add-environment-types(environment(prog))
+
+    ;Generate equations for all packages.
+    val packages-with-eqns = map(gen-equations, packages-with-top-vars)
+
+    ;Return the new annotated program and equations.
+    val new-prog = sub-packages(prog, packages-with-eqns)
+
+    ;Return bundled annotated program and equations.
+    [new-prog, type-eqns]
+
+;Execute the body with the given implicits.
+defn with-implicits<?T> (body:() -> ?T,
+                         nm:NameMap,
+                         hier:TypeHierarchy,
+                         eqns:Vector<TypeEqn>) -> T :
+  within with-type-env() :
+    within set-id-env(TypeIDEnv(nm)) :
+      within with-namemap(nm) :
+        let-var ACTIVE-TYPE-HIERARCHY = hier :
+          within collect-type-equations(eqns) :
+            body()
+
+;============================================================
+;=================== Type Environment =======================
+;============================================================
+
+;Holds the type information of a specific variable.
+deftype AbstractTypeRecord
+;Return the declared type of the given record.
+defmulti type (r:AbstractTypeRecord) -> Type|LSType
+
+;Normal type record for standard variables.
+defstruct VarTypeRecord <: AbstractTypeRecord :
+  type:Type|LSType with: (as-method => true)
+
+;Type record for inferred function arguments.
+;- exp-type: The type that the argument is expected to be,
+;  based upon its usage positions.
+defstruct InferredArgTypeRecord <: AbstractTypeRecord :
+  type:Type with: (as-method => true)
+  exp-type:Type
+
+;Each entry, V => T, means that the variable V has type
+;type T.
+var TYPE-ENV:IntTable<AbstractTypeRecord>|False = false
+
+;Execute the body with an active type environment.
+defn with-type-env<?T> (body:() -> ?T) -> T :
+  let-var TYPE-ENV = IntTable<AbstractTypeRecord>() :
+    body()
+
+;Retrieve the active type environment.
+defn type-env! () -> IntTable<AbstractTypeRecord> :
+  if TYPE-ENV is False :
+    fatal("No active type environment.")
+  TYPE-ENV as IntTable<AbstractTypeRecord>
+
+;Set the type of a variable.
+defn set-type (n:Int, t:Type|LSType) -> False :
+  val env = type-env!()
+  if key?(env,n) :
+    fatal("Type already set in environment for variable %_." % [n])
+  env[n] = VarTypeRecord(t)
+
+;Set the type and expected type of an inferred argument.
+defn set-inferred-arg-type (n:Int, t:Type, exp-t:Type) -> False :
+  val env = type-env!()
+  if key?(env,n) :
+    fatal("Type already set in environment for variable %_." % [n])
+  env[n] = InferredArgTypeRecord(t,exp-t)
+
+;Retrieve the HiStanza type of a variable.
+defn get-type (n:Int) -> Type|LSType :
+  type(type-env!()[n])
+
+;Retrieve the expected type of the inferred argument.
+defn get-exp-type (n:Int) -> Type :
+  exp-type(type-env!()[n] as InferredArgTypeRecord)
+
+;Return true if the given variable is an inferred argument.
+defn inferred-arg? (n:Int) -> True|False :
+  type-env!()[n] is InferredArgTypeRecord
+
+;============================================================
+;=================== Type Hierarchy =========================
+;============================================================
+
+;The currently active type hierarchy.
+var ACTIVE-TYPE-HIERARCHY:TypeHierarchy|False = false
+
+;Retrieve the currently active type hierarchy.
+defn type-hierarchy () -> TypeHierarchy :
+  match(ACTIVE-TYPE-HIERARCHY) :
+    (h:TypeHierarchy) : h
+    (f:False) : fatal("No active type hierarchy set.")
+
+;============================================================
+;================ Collect Type Equations ====================
+;============================================================
+
+;Hold all the generated type equations.
+var TYPE-EQNS:Vector<TypeEqn>|False = false
+
+;Execute a body with an active type equation list.
+defn collect-type-equations<?T> (body:() -> ?T, eqns:Vector<TypeEqn>) -> T :
+  let-var TYPE-EQNS = eqns :
+    body()
+
+;Add a new type equation to solve.
+defn add-equation (eqn:TypeEqn) -> False :
+  match(TYPE-EQNS) :
+    (eqns:Vector<TypeEqn>) : add(eqns, eqn)
+    (f:False) : fatal("No active type equation list.")
+
+;Helper: Generate equality constraint a = b if a is a
+;TUVar.
+defn add-equal? (a:Type, b:Type) -> False :
+  match(a:TUVar) :
+    add-equation(EqualEqn(n(a), b))
+
+;Helper: Generate equality constraint a = b if a is a UVarT.
+defn add-lsequal? (a:LSType, b:LSType) -> False :
+  match(a:UVarT) :
+    add-equation(LSEqualEqn(n(a), b))
+
+;Helper: Generate super constraint a :> b if a is a
+;TUVar.
+defn add-super? (a:Type|False, b:Type) -> False :
+  match(a:TUVar) :
+    add-equation(SuperEqn(n(a), b))
+
+;Helper: Generate a super constraint a :> HiStanza{b} if a is
+;a ref<TUVar>.
+defn add-super? (a:LSType, b:LSType) -> False :
+  match(a:RefT) :
+    val t = type(a)
+    match(t:TUVar) :
+      val hb = hs-type-operation(ToHistanza(),b)
+      add-equation(SuperEqn(n(t), hb))
+
+;Helper: Generate an unsatisfiable equation if t
+;is a TUVar.
+defn add-unsatisfiable? (t:Type) -> False :
+  match(t:TUVar) :
+    add-equation(UnsatisfiableEqn(n(t)))
+
+;Helper: Generate a type operation equation.
+defn type-operation (op:TypeOperation, t:LSType) -> UVarT :
+  val v = fresh-uvart()
+  add-equation(TypeOperationEqn(n(v), op, t))
+  v
+
+;Helper: Generate a type operation equation that returns a HiStanza type.
+defn hs-type-operation (op:TypeOperation, t:LSType) -> TUVar :
+  val v = fresh-tuvar()
+  add-equation(TypeOperationEqn(n(v), op, t))
+  v
+
+;Helper: Perform a substitution on the given type. If type needs to
+;be solved, then delay the substitution.
+defn delayed-sub (t:Type|LSType, env:Tuple<KeyValue<Int,Type>>) -> Type|LSType :
+  ;Return true if t is a type variable and substitution needs to be
+  ;delayed. The ref<T> case occurs when a HiStanza function is referenced
+  ;from a LoStanza context.
+  val delayed? = not resolved?(t)
+  if delayed? :
+    val ret = fresh-tuvar() when t is Type else fresh-uvart()
+    add-equation $ SubEqn(n(ret), t, env)
+    ret
+  else :
+    sub(t,env)
+
+;============================================================
+;================= Top Level Variables ======================
+;============================================================
+
+;Simultaneously adds type variables to top-level commands,
+;and also adds types to the type environment.
+defn add-top-level-variables (p:TPackage) -> TPackage :
+  sub-comms(p, map(add-top-level-variables, comms(p)))
+
+;Simultaneously adds type variables to top-level commands,
+;and also adds types to the type environment.
+defn add-top-level-variables (comm:TComm) -> TComm :
+  match(comm) :
+    (c:TDef) :
+      sub-type(c, gen-var(n(c), type(c)))
+    (c:TDefTuple) :
+      val new-types = seq(gen-var, ns(c), types(c))
+      sub-types(c, to-tuple(new-types))
+    (c:TDefVar) :
+      sub-type(c, gen-var(n(c), type(c)))
+    (c:TDefn) :
+      val new-a1 = map(or-gradual, a1(c))
+      val new-a2 = or-var(a2(c))
+      val new-type = TFunction(targs(c), cargs(c), new-a1, new-a2)
+      set-type(n(c), new-type)
+      c $> sub-a1{_, new-a1}
+        $> sub-a2{_, new-a2}
+    (c:TDefmulti) :
+      val new-a1 = map(or-gradual, a1(c))
+      val new-a2 = or-gradual(a2(c))
+      val new-type = TFunction(targs(c), cargs(c), new-a1, new-a2)
+      set-type(n(c), new-type)
+      c $> sub-a1{_, new-a1}
+        $> sub-a2{_, new-a2}
+    (c:TLDef) :
+      set-type(n(c), type(c))
+      c
+    (c:TLDefVar) :
+      set-type(n(c), type(c))
+      c
+    (c:TLDefn) :
+      val type = TLSFunction(targs(c), cargs(c), a1(c), a2(c))
+      set-type(n(c), type)
+      c
+    (c:TLExternFn) :
+      val a1-args = map(PositionalArg<LSType>{false, _}, a1(c))
+      val type = TLSFunction([], [], a1-args, a2(c))
+      set-type(n(c), type)
+      c
+    (c:TExtern) :
+      set-type(n(c), type(c))
+      c
+    (c) :
+      c
+
+;============================================================
+;====== Use Namemap to Classify Function Definitions ========
+;============================================================
+
+;Store the currently active namemap.
+var CURRENT-NAMEMAP:NameMap|False = false
+
+;Execute the body with the given namemap.
+defn with-namemap<?T> (body:() -> ?T, nm:NameMap) -> T :
+  let-var CURRENT-NAMEMAP = nm :
+    body()
+
+;Return true if the given identifier references a function.
+defn function-reference? (n:Int) -> True|False :
+  val nm = CURRENT-NAMEMAP as NameMap
+  if key?(nm,n) :
+    val e = nm[n]
+    type(e) is MultiE|FnE|LFnE
+
+;============================================================
+;==== Add Environment Definitions to Type Environment =======
+;============================================================
+
+;Add the types of the environment definitions to the type
+;environment.
+defn add-environment-types (env:Tuple<Export>) -> False :
+  for e in env do :
+    val type = to-type(rec(e))
+    match(type:Type|LSType) :
+      set-type(n(e), type)
+
+;Extract DL identifier environment from NameMap.
+;Used for to-deftype function.
+defn TypeIDEnv (namemap:NameMap) -> IDEnv :
+  val table = to-hashtable<TypeId,Int> $
+    for e in toplevel(namemap) seq? :
+      if type(e) is TypeE|LTypeE :
+        One(TypeId(package(e), name(e)) => n(e))
+      else :
+        None()
+  new IDEnv :
+    defmethod get (this, id:TypeId) : table[id]
+
+;============================================================
+;================ Generate Type Equations ===================
+;============================================================
+
+;Generate equations for the given package.
+defn gen-equations (p:TPackage) -> TPackage :
+  val new-comms = map(gen-equations, comms(p))
+  sub-comms(p, new-comms)
+
+;Generate equations for the given command.
+defn gen-equations (c:TComm) -> TComm :
+  match(c) :
+
+    (c:TDef) :
+      val value-ctxt = ExpCtxt(or-gradual(type(c) as Type))
+      val new-value = gen-equations(value(c), value-ctxt)
+      add-equal?(type(c) as Type, type!(new-value))
+      TDef(info(c), n(c), type(c), new-value)
+
+    (c:TDefTuple) :
+      ;Sanity check: either all types are given, or none are given.
+      if not (all?({_ is TUVar}, types(c)) or
+              none?({_ is TUVar}, types(c))) :
+        fatal("Illegal type annotations on tuple.")
+
+      ;Are types inferred or explicit?
+      val inferred? = all?({_ is TUVar}, types(c))
+
+      ;If inferred types, then generate equations.
+      if inferred? :
+        val value-ctxt = ExpCtxt(TGradual())
+        val new-value = gen-equations(value(c), value-ctxt)
+        val arity = length(ns(c))
+        for (v in types(c), i in 0 to false) do :
+          add-equation $ InferEqn(n(v as TUVar),
+                                  type!(new-value), TupleLoc(arity, i), false)
+        TDefTuple(info(c), ns(c), types(c), new-value)
+
+      ;Otherwise, it's easy.
+      else :
+        val value-ctxt = ExpCtxt(TTuple(types(c) as Tuple<Type>))
+        val new-value = gen-equations(value(c), value-ctxt)
+        TDefTuple(info(c), ns(c), types(c), new-value)
+
+    (c:TDefVar) :
+      val new-value = match(value(c)) :
+        (v:TExp) :
+          val value-ctxt = ExpCtxt(or-gradual(type(c) as Type))
+          val new-v = gen-equations(v, value-ctxt)
+          add-super?(type(c) as Type, type!(new-v))
+          new-v
+        (f:False) :
+          false
+      TDefVar(info(c), n(c), type(c), new-value)
+
+    (c:TDefn) :
+      ;Add arguments to the environment.
+      for (a in args(c), farg in a1(c)) do :
+        set-type(a, type-in-body(farg))
+      ;Generate equations for body.
+      val body-ctxt = ExpCtxt(or-gradual(a2!(c)))
+      val new-body = gen-equations(body(c), body-ctxt)
+      add-equal?(a2!(c), type!(new-body))
+      sub-body(c, new-body)
+
+    (c:TDefmethod) :
+      gen-method(c, None())
+
+    (c:TInit) :
+      val new-exp = gen-equations(exp(c), ExpCtxt(TGradual()))
+      TInit(info(c), new-exp)
+
+    (c:TLDef) :
+      val value-ctxt = LSExpCtxt(type(c))
+      val new-value = gen-equations(value(c), value-ctxt, None())
+      TLDef(info(c), n(c), type(c), new-value)
+
+    (c:TLDefVar) :
+      val value-ctxt = LSExpCtxt(type(c))
+      val new-value = match(value(c)) :
+        (v:LSExp) : gen-equations(v, value-ctxt, None())
+        (f:False) : false
+      TLDefVar(info(c), n(c), type(c), new-value)
+
+    (c:TLDefn) :
+      ;Add arguments to the environment.
+      for (a in args(c), farg in a1(c)) do :
+        set-type(a, type-in-body(farg))
+      ;Generate equations for body.
+      val new-body = gen-equations(body(c), One(a2(c)))
+      sub-body(c, new-body)
+
+    (c:TLExternFn) :
+      ;Add arguments to the environmet.
+      do(set-type, args(c), a1(c))
+      ;Generate equations for body.
+      val new-body = gen-equations(body(c), One(a2(c)))
+      sub-body(c, new-body)
+
+    (c:TLDefmethod) :
+      ;Create the context for analyzing the multi.
+      val uncapped-a1 = for a in a1(c) map :
+        map(uncap,a)
+      val multi-targs = map(TVar, targs(c))
+      val multi-ctxt = LSMultiCtxt(multi-targs, uncapped-a1, a2(c))
+      val new-multi = gen-function-reference(multi(c) as TRef|TMix, multi-ctxt)
+      
+      ;Add arguments to the environment.
+      for (a in args(c), farg in a1(c)) do :
+        set-type(a, type-in-body(farg))
+      ;Generate equations for body.
+      val new-body = gen-equations(body(c), One(a2(c)))
+      c $> sub-body{_, new-body}
+        $> sub-multi{_, new-multi}
+
+    (c:TLInit) :
+      val new-comm = gen-equations(comm(c), None())
+      TLInit(info(c), new-comm)
+
+    (c) :
+      c
+
+;Generate equations for the given expression.
+defn gen-equations (e:TExp, ctxt:Context) -> TExp :
+  match(e) :
+
+    (e:TLet) :
+      val new-type = gen-var(n(e), ntype(e))
+      val value-ctxt = ExpCtxt(or-gradual(ntype(e)))
+      val new-value = gen-equations(value(e), value-ctxt)
+      add-equal?(new-type, type!(new-value))
+      val new-body = gen-equations(body(e), ctxt)
+      TLet(info(e), type!(new-body), ctxt,
+           n(e), new-type, new-value, new-body)
+
+    (e:TLetVar) :
+      val new-type = gen-var(n(e), ntype(e))
+      val new-value = match(value(e)) :
+        (v:TExp) :
+          val value-ctxt = ExpCtxt(or-gradual(ntype(e)))
+          val new-v = gen-equations(v, value-ctxt)
+          add-super?(new-type, type!(new-v))
+          new-v
+        (f:False) :
+          false
+      val new-body = gen-equations(body(e), ctxt)
+      TLetVar(info(e), type!(new-body), ctxt,
+              n(e), new-type, new-value, new-body)
+
+    (e:TLetTuple) :
+      ;Sanity check: either all types are given, or none are given.
+      if not all?({_ is Type}, ntypes(e)) and
+         not all?({_ is False}, ntypes(e)) :
+        fatal("Illegal type annotations on tuple.")
+
+      ;Are types inferred or explicit?
+      val inferred? = any?({_ is False}, ntypes(e))
+
+      ;If inferred types, then generate equations.
+      if inferred? :
+        val new-types = to-tuple(seq(gen-var, ns(e), ntypes(e))) as Tuple<TUVar>
+        val new-value = gen-equations(value(e), ExpCtxt(TGradual()))
+        val new-body = gen-equations(body(e), ctxt)
+        val arity = length(ns(e))
+        for (v in new-types, i in 0 to false) do :
+          add-equation $ InferEqn(n(v), type!(new-value), TupleLoc(arity,i), false)
+        TLetTuple(info(e), type!(new-body), ctxt, ns(e), new-types, new-value, new-body)
+
+      ;Otherwise, it's easy.
+      else :
+        val value-ctxt = ExpCtxt(TTuple(ntypes(e) as Tuple<Type>))
+        val new-value = gen-equations(value(e), value-ctxt)
+        val new-body = gen-equations(body(e), ctxt)
+        TLetTuple(info(e), type!(new-body), ctxt, ns(e), ntypes(e), new-value, new-body)
+
+    (e:TLetRec) :
+      ;Add the defn types to the environment.
+      val defns* = map({add-top-level-variables(_) as TDefn}, defns(e))
+      ;Generate equations for bodies of defns.
+      val new-defns = map({gen-equations(_) as TDefn}, defns*)
+      ;Generate equations for body.
+      val new-body = gen-equations(body(e), ctxt)
+      ;Return new letrec
+      TLetRec(info(e), type!(new-body), ctxt, new-defns, new-body)
+
+    (e:TFn) :
+      ;Generate type variables.
+      val new-a1 = to-tuple $
+        for (arg in args(e), t in a1(e)) seq :
+          match(t:Type) :
+            set-type(arg, t)
+            t
+          else :
+            val v = fresh-tuvar()
+            val exp-v = fresh-tuvar()
+            set-inferred-arg-type(arg, v, exp-v)
+            v      
+      val new-a2 = or-var(a2(e))
+
+      ;Compute function arity.
+      val arity = length(a1(e))
+
+      ;Infer argument equations.
+      match(ctxt) :
+        (ctxt:ExpCtxt) :
+          for (v in new-a1, i in 0 to false) do :
+            match(v:TUVar) :
+              add-equation $ InferEqn(n(v), ArgLoc(arity, i), expected(ctxt), false)
+        (ctxt:CallCtxt) :
+          if fixed-arity-call?(ctxt, length(new-a1)) :
+            do(add-equal?{_, type(_)}, new-a1, fargs(ctxt))
+          else :
+            do(add-unsatisfiable?, new-a1)
+
+      ;The body context has three cases.
+      ;Case: When return type is explicitly provided.
+      ;  Then context is ExpCtxt(a2)
+      ;Case: When return type is inferred, and the current context is ExpCtxt(T).
+      ;  Then context is ExpCtxt(R) where R is inferred from 'T'.
+      ;Case: When return type is inferred, and the current context is CallCtxt.
+      ;  Then context is ExpCtxt(expected(ctxt)).
+      val body-ctxt = match(a2(e), ctxt) :
+        (a2:Type, ctxt) :
+          ExpCtxt(a2)
+        (a2:False, ctxt:ExpCtxt) :
+          val r = fresh-tuvar()
+          add-equation $ InferEqn(n(r), ReturnLoc(arity), expected(ctxt), true)
+          ExpCtxt(r)
+        (a2:False, ctxt:CallCtxt) :
+          ExpCtxt(expected(ctxt))
+      val new-body = gen-equations(body(e), body-ctxt)
+
+      ;Now we know the return type.
+      add-equal?(new-a2, type!(new-body))
+
+      ;Return the function
+      val new-type = TArrow(new-a1, new-a2)
+      TFn(info(e), new-type, ctxt,
+          tail?(e), new-a1, new-a2, args(e), new-body)
+
+    (e:TMulti) :
+      val new-funcs = for f in funcs(e) map :
+        gen-equations(f, ctxt) as TFn
+      val new-type = reduce(TAnd, seq(type!, new-funcs))
+      TMulti(info(e), new-type, ctxt, new-funcs)
+
+    (e:TSeq) :
+      val new-a = gen-equations(a(e), ExpCtxt(TGradual()))
+      val new-b = gen-equations(b(e), ctxt)
+      TSeq(info(e), type!(new-b), ctxt, new-a, new-b)
+
+    (e:TMatch) :
+      ;Analyze the arguments first.
+      val new-args = for a in args(e) map :
+        gen-equations(a, ExpCtxt(TGradual()))
+
+      ;For each branch, compute the body.
+      val new-branches = for b in branches(e) map :
+        ;Put the argument types in the environment.
+        val arg-types = to-tuple $ for (a in args(b), t in atypes(b), ma in new-args) seq :
+          val new-type = gen-var(a, t)
+          add-equal?(new-type, type!(ma))
+          new-type
+        ;Analyze the body
+        val new-body = gen-equations(body(b), ctxt)
+        ;Form the new branch.
+        TBranch(info(b), type!(new-body), ctxt, args(b), arg-types, new-body)
+
+      ;Form the match.
+      val new-type = reduce(TOr, seq(type!, new-branches))
+      TMatch(info(e), new-type, ctxt, new-args, new-branches)
+
+    (e:TNew) :
+      val new-methods = for m in methods(e) map :
+        gen-method(m, One(class(e)))
+      TNew(info(e), class(e), ctxt, class(e), new-methods)
+
+    (e:TRef) :
+      val r = annotate-type(e,ctxt)
+
+      ;Add bounds and expected types for inferred argument.
+      if inferred-arg?(n(e)) :
+        val v = get-type(n(e)) as TUVar
+        val exp-v = get-exp-type(n(e)) as TUVar
+
+        match(ctxt) :
+          (ctxt:ExpCtxt) :
+            add-equation(SubBoundsEqn(n(v), expected(ctxt)))
+            add-equation(SuperEqn(n(exp-v), expected(ctxt)))
+          (ctxt:CallCtxt) :
+            if simple-positional-call?(ctxt) :
+              val arrow = TArrow(map(type, fargs(ctxt)), expected(ctxt))
+              add-equation(SubBoundsEqn(n(v), arrow))
+              add-equation(SuperEqn(n(exp-v), arrow))
+          (ctxt) :
+            false        
+
+      ;Case: It's a reference to a function.
+      if function-reference?(n(e)) : 
+        gen-function-reference(r,ctxt)
+      ;Case: It's an invalid reference (to LoStanza).
+      else if type(r) is False :
+        sub-type(e, unsatisfiable-tuvar())
+      ;Case: It's a good reference.
+      else :
+        r
+
+    (e:TCast) :
+      val new-exp = gen-equations(exp(e), ExpCtxt(TGradual()))
+      TCast(info(e), targ(e), ctxt, new-exp, targ(e))
+
+    (e:TUpCast) :
+      val new-exp = gen-equations(exp(e), ExpCtxt(targ(e)))
+      TUpCast(info(e), targ(e), ctxt, new-exp, targ(e))
+
+    (e:TSet) :
+      ;Retrieve the ref of the variable.
+      val new-ref = annotate-type(ref(e), ExpCtxt(TGradual()))
+
+      ;Process the value.
+      val value-ctxt = ExpCtxt(or-gradual(type(new-ref)))
+      val new-value = gen-equations(value(e), value-ctxt)
+
+      ;Generate the super constraint.
+      add-super?(type(new-ref), type!(new-value))
+
+      ;Create the false type
+      val false-n = special-type(type-hierarchy(), CoreFalse)
+      val false-type = TOf(false-n, [])
+
+      ;Return the new data.
+      TSet(info(e), false-type, ctxt, new-ref, new-value)
+
+    (e:TDo) :
+      ;Gen equations for arguments using tuvar for expected types.
+      val expected-arg-types = fresh-tuvars(length(args(e)))
+      val check-arg-types = fresh-tuvars(length(args(e)))
+      val new-args = to-tuple $
+        for (arg in args(e), et in expected-arg-types) seq :
+          map(gen-equations{_, ExpCtxt(et)}, arg)
+
+      ;Gen equations for func now that we have argument types.      
+      val func-ctxt = CallCtxt(targs(e),
+                               map(map{type!,_}, new-args),
+                               expected(ctxt as ExpCtxt|CallCtxt),
+                               check-arg-types)
+      val new-func = gen-equations(func(e), func-ctxt)
+      val ft = type!(new-func)
+
+      ;Infer return type from function type.
+      val ret-type = fresh-tuvar()
+      add-equation $ InferEqn(n(ret-type), type!(new-func), ReturnLoc(length(new-args)), false)
+
+      ;Compute expected argument types from function type.
+      for (et in expected-arg-types, ct in check-arg-types, i in 0 to false) do :
+        val arity = length(new-args)
+        compute-expected-arg-type(n(et), new-func, i, arity)
+        add-equation(InferEqn(n(ct), type!(new-func), ArgLoc(arity, i), true))
+
+      ;Return new data.
+      TDo(info(e), ret-type, ctxt, new-func, targs(e), new-args)
+
+    (e:TPrim) :
+      val result-type = fresh-tuvar()
+      val new-args = map(gen-equations{_, ExpCtxt(TGradual())}, args(e))
+      add-equation $ PrimEqn(n(result-type), op(e), map(type!, new-args))
+      TPrim(info(e), result-type, ctxt, op(e), new-args)
+
+    (e:TLiteral) :
+      ;Retrieve the SpecialType that the value corresponds to.
+      val special = match(value(e)) :
+        (v:Byte) : CoreByte
+        (v:Char) : CoreChar
+        (v:Int) : CoreInt
+        (v:Long) : CoreLong
+        (v:Float) : CoreFloat
+        (v:Double) : CoreDouble
+        (v:String) : CoreString
+        (v:Symbol) : CoreSymbol
+        (v:List) : CoreList
+        (v:True) : CoreTrue
+        (v:False) : CoreFalse
+        (v) : fatal("%_ is an unsupported literal type." % [object-type(v)])
+      ;Create the type.
+      val hier = type-hierarchy()
+      val n = special-type(hier, special)
+      val arity = type-arity(hier, n)
+      val value-type = TOf(n, to-tuple(repeat(TGradual(), arity)))
+      ;Return bundled data.
+      TLiteral(info(e), value-type, ctxt, value(e))
+
+    (e:TTupleExp) :
+      ;Generate contexts for the individual expressions.
+      val arity = length(exps(e))
+      val exp-ctxts = match(ctxt) :
+        (ctxt:ExpCtxt) :
+          val vars = fresh-tuvars(arity)
+          for (v in vars, i in 0 to false) do :
+            add-equation $ InferEqn(n(v), TupleLoc(arity,i), expected(ctxt), true)
+          map(ExpCtxt, vars)
+        (ctxt:CallCtxt) :
+          to-tuple(repeat(ExpCtxt(TGradual()), arity))
+      ;Generate equations for expressions.
+      val new-exps = to-tuple $
+        for (e in exps(e), ctxt in exp-ctxts) seq :
+          gen-equations(e, ctxt)
+      ;Return new data.
+      val new-type = TTuple(map(type!, new-exps))
+      TTupleExp(info(e), new-type, ctxt, new-exps)
+
+    (e:TMix) :
+      gen-function-reference(e,ctxt)
+
+;Compute the expected arg type of calling the given function.
+;The typical case is simply inferring the arg type of the function.
+;The special case is if we are calling an anonymous function directly.
+defn compute-expected-arg-type (n:Int, func:TExp, arg-index:Int, arity:Int) -> False :
+  match(func) :
+    ;Forward to body.
+    (func:TLet|TLetVar|TLetTuple|TLetRec) :
+      compute-expected-arg-type(n, body(func), arg-index, arity)
+    ;Union all the branches together.
+    (func:TMatch) :
+      val branch-vars = Vector<TUVar>()
+      for b in branches(func) do :
+        val v = fresh-tuvar()
+        compute-expected-arg-type(/n(v), body(b), arg-index, arity)
+        add(branch-vars, v)
+      add-equation(EqualEqn(n, reduce(TOr, branch-vars)))
+    ;Special case.
+    (func:TFn) :
+      if length(args(func)) == arity :
+        val arg = args(func)[arg-index]
+        if inferred-arg?(arg) :
+          add-equation(EqualEqn(n, get-exp-type(arg)))
+        else :
+          val arg-type = a1(func)[arg-index] as Type
+          add-equation(EqualEqn(n, arg-type))
+    ;Instantiated function.
+    (func:TMix) :
+      if length(exp-args(func)) == arity :
+        add-equation(EqualEqn(n, exp-args(func)[arg-index]))
+    ;Typical case.
+    (func) :
+      add-equation(InferEqn(n, type!(func), ArgLoc(arity, arg-index), true))
+
+;Generate equations for the given method.
+defn gen-method (m:TDefmethod, thist:Maybe<Type>) -> TDefmethod :
+  ;Compute the a1 types.
+  val new-a1 = to-tuple $
+    for (arg in args(m), farg in a1(m)) seq :
+      val new-type =
+        if arg == thisn(m) :
+          match(type(farg)) :
+            (t:Type) : t
+            (f:False) : value!(thist)
+        else :
+          or-gradual(type(farg))
+      sub-type(farg,new-type)
+
+  ;Compute the a2 type.
+  val new-a2 = or-var(a2(m))
+
+  ;Store the args into the type environment.
+  for (a in args(m), farg in new-a1) do :
+    set-type(a, type-in-body(farg))
+
+  ;Compute the body in the right context.
+  val body-ctxt = ExpCtxt(or-gradual(new-a2))
+  val new-body = gen-equations(body(m), body-ctxt)
+  add-equal?(new-a2, type!(new-body))
+
+  ;Create the context for analyzing the multi.
+  val uncapped-a1 = for a in new-a1 map :
+    map(uncap, a)
+  val multi-targs = map(TVar, targs(m))
+  val multi-ctxt = MultiCtxt(multi-targs, uncapped-a1, new-a2)
+  val new-multi = gen-function-reference(multi(m) as TRef|TMix, multi-ctxt)
+
+  ;Return new method with filled types.
+  TDefmethod(info(m), tail?(m), n(m), new-multi,
+             thisn(m), targs(m), cargs(m),
+             new-a1, new-a2, args(m), new-body)
+
+;Generate equations for the LoStanza command.
+;Return type is provided for analyzing LSReturn statements if the
+;command is used within a function.
+defn gen-equations (c:LSComm, return-type:Maybe<LSType>) -> LSComm :
+  match(c) :
+    (c:LSCall) :
+      val new-exp = gen-equations(exp(c), LSBlankExpCtxt(), return-type)
+      LSCall(info(c), new-exp)
+
+    (c:LSSet) :
+      val new-exp = gen-equations(exp(c), LSBlankExpCtxt(), return-type)
+      val new-value = gen-equations(value(c), LSExpCtxt(type!(new-exp)), return-type)
+      add-super?(type!(new-exp), type!(new-value))
+      LSSet(info(c), new-exp, new-value)
+
+    (c:LSLabels) :
+      ;Put the block types in the environment.
+      for block in blocks(c) do :
+        set-type(n(block), BlockT(atypes(block)))
+      val new-blocks = for b in blocks(c) map :
+        gen-equations(b, return-type) as LSLabeledBlock
+      LSLabels(info(c), new-blocks)
+
+    (c:LSLabeledBlock) :
+      do(set-type, args(c), atypes(c))
+      val new-body = gen-equations(body(c), return-type)
+      LSLabeledBlock(info(c), n(c), args(c), atypes(c), new-body)
+
+    (c:LSGoto) :
+      ;Retrieve the branch types of the block.
+      val blockt = get-type(n(c)) as BlockT
+
+      ;Create the contexts for the arguments.
+      val arg-ctxts =
+        if same-length?(types(blockt), args(c)) : map(LSExpCtxt,types(blockt))
+        else : map(LSBadCtxt{}, args(c))
+
+      ;Generate equations for the arguments in the right context.
+      val new-args = to-tuple $
+        for (arg in args(c), ctxt in arg-ctxts) seq :
+          gen-equations(arg, ctxt, return-type)
+
+      LSGoto(info(c), n(c), new-args)
+
+    (c:LSReturn) :
+      val new-exp = gen-equations(exp(c), LSExpCtxt(value!(return-type)), return-type)
+      LSReturn(info(c), new-exp)
+
+    (c:LSDef) :
+      ;Generate type variables.
+      val new-type = or-lsvar(type(c))
+      set-type(n(c), new-type)
+      ;Create the context for the value.
+      val value-ctxt = match(type(c)) :
+                         (t:LSType) : LSExpCtxt(t)
+                         (f:False) : LSBlankExpCtxt()
+      val new-value = gen-equations(value(c), value-ctxt, return-type)
+      ;Add equality constraint
+      add-lsequal?(new-type, type!(new-value))
+      LSDef(info(c), n(c), new-type, new-value)
+
+    (c:LSDefVar) :
+      ;Add to the environment.
+      set-type(n(c), type(c))
+      ;Generate the value equations.
+      val new-value = match(value(c)) :
+        (v:LSExp) : gen-equations(v, LSExpCtxt(type(c)), return-type)
+        (f:False) : false
+      ;Return definition.
+      LSDefVar(info(c), n(c), type(c), new-value)
+
+    (c:LSSeq) :
+      val new-a = gen-equations(a(c), return-type)
+      val new-b = gen-equations(b(c), return-type)
+      LSSeq(info(c), new-a, new-b)
+
+    (c:LSIf) :
+      val new-pred = gen-equations(pred(c), LSExpCtxt(LongT()), return-type)
+      val new-conseq = gen-equations(conseq(c), return-type)
+      val new-alt = gen-equations(alt(c), return-type)
+      LSIf(info(c), new-pred, new-conseq, new-alt)
+
+    (c:LSMatch) :
+      val new-args = map(gen-equations{_, LSBlankExpCtxt(), return-type}, args(c))
+      val new-branches = for branch in branches(c) map :
+        ;Compute new branch types by inheriting from arguments when
+        ;not given.
+        val new-atypes = to-tuple $
+          for (v in new-args, t in atypes(branch)) seq :
+            match(t:LSType) : t
+            else : type!(v)
+        ;Add arguments to the environment.
+        do(set-type, args(branch), new-atypes)
+        ;Analyze the body.
+        val new-body = gen-equations(body(branch), return-type)
+        ;Return the new branch.
+        LSBranch(info(branch), args(branch), new-atypes, new-body)
+      ;Return the new match.
+      LSMatch(info(c), new-args, new-branches)
+
+    (c:LSSkip) :
+      c
+
+;Generate equations for the given expression.
+defn gen-equations (e:LSExp,
+                    ctxt:LSContext,
+                    return-type:Maybe<LSType>) -> LSExp :
+  match(e) :
+    (e:LSVar) :
+      val new-e = annotate-type(e, ctxt)
+      if function-reference?(n(e)) :
+        gen-function-reference(new-e, ctxt)
+      else :
+        new-e
+
+    (e:LSNew):
+      ;Generate equations for arguments.
+      val arg-ctxts = field-contexts(n(e), targs(e), length(args(e)))
+      val new-args = to-tuple $ for (arg in args(e), ctxt in arg-ctxts) seq :
+        gen-equations(arg, ctxt, return-type)
+      ;Create the new type.
+      val new-type = RefT(TOf(n(e), targs(e)))
+      ;Return new expression.
+      LSNew(info(e), new-type, ctxt, n(e), targs(e), new-args)
+
+    (e:LSStruct):
+      ;Generate equations for arguments.
+      val arg-ctxts = field-contexts(n(e), targs(e), length(args(e)))
+      val new-args = to-tuple $ for (arg in args(e), ctxt in arg-ctxts) seq :
+        gen-equations(arg, ctxt, return-type)
+      ;Create the new type.
+      val new-type = StructT(n(e), targs(e))
+      ;Return new expression.
+      LSStruct(info(e), new-type, ctxt, n(e), targs(e), new-args)
+
+    (e:LSAddr):
+      ;Compute context of nested expression.
+      val exp-ctxt = match(ctxt) :
+        (ctxt:LSExpCtxt) : LSAddrCtxt(type-operation(Deptr(), expected(ctxt)))
+        (ctxt:LSBlankExpCtxt) : LSAddrCtxt(UnknownT())
+        (ctxt:LSBadCtxt) : ctxt
+        (ctxt) : fatal("Not possible. Addr expression not allowed in %_ context." % [object-type(ctxt)])
+      val new-exp = gen-equations(exp(e), exp-ctxt, return-type)
+
+      ;Retrieve the address
+      val new-type = type-operation(PtrTo(), type!(new-exp))
+      LSAddr(info(e), new-type, ctxt, new-exp, unstable?(e))
+
+    (e:LSDeref):
+      ;Generate equations for the new expression.
+      val new-exp  = gen-equations(exp(e), LSBlankExpCtxt(), return-type)
+      ;Compute the dereferenced type.
+      val ret = type-operation(DerefDeptr(), type!(new-exp))
+      LSDeref(info(e), ret, ctxt, new-exp)
+
+    (e:LSSlot):
+      val new-exp = gen-equations(exp(e), LSBlankExpCtxt(), return-type)
+      val new-index = gen-equations(index(e), LSExpCtxt(LongT()), return-type)
+      val new-type = type-operation(Deslot(), type!(new-exp))
+      LSSlot(info(e), new-type, ctxt, new-exp, new-index)
+
+    (e:LSField):
+      val new-exp = gen-equations(exp(e), LSBlankExpCtxt(), return-type)
+      val new-type = type-operation(GetField(name(e)), type!(new-exp))
+      LSField(info(e), new-type, ctxt, new-exp, name(e))
+
+    (e:LSDo|LSCallC):
+      ;Wrap new function and arguments in either LSDo or LSCallC.
+      defn LSFuncCall (type:LSType, func:LSExp, args:Tuple<FArg<LSExp>>) -> LSDo|LSCallC :
+        match(e) :
+          (e:LSDo) : LSDo(info(e), type, ctxt, func, targs(e), args)
+          (e:LSCallC) : LSCallC(info(e), type, ctxt, func, args)
+
+      ;Generate equations for arguments using uvart for expected types.
+      val expected-arg-types = fresh-uvarts(length(args(e)))
+      val check-arg-types = fresh-uvarts(length(args(e)))
+      val new-args = to-tuple $
+        for (arg in args(e), et in expected-arg-types) seq :
+          map(gen-equations{_, LSExpCtxt(et), return-type}, arg)
+
+      ;Generate equations for func now that we have argument types.
+      val targs? = match(e:LSDo) : targs(e)
+                   else : []
+      val func-ctxt = LSCallCtxt(targs?, map(map{type!, _}, new-args), check-arg-types)
+      val new-func = gen-equations(func(e), func-ctxt, return-type)
+      val ft = type!(new-func)
+
+      ;Infer return type from function type.
+      val ret-type = fresh-uvart()
+      add-equation $ LSInferEqn(n(ret-type), ft, ReturnLoc(length(args(e))), false)
+
+      ;Infer expected argument types from function type.
+      for (et in expected-arg-types, ct in check-arg-types, i in 0 to false) do :
+        val arity = length(args(e))
+        compute-expected-arg-type(n(et), new-func, i, arity)
+        add-equation(LSInferEqn(n(ct), ft, ArgLoc(arity, i), true))
+
+      ;Return new data.
+      LSFuncCall(ret-type, new-func, new-args)
+
+    (e:LSPrim):
+      ;Generate equations for arguments.
+      val new-args = map(gen-equations{_, LSBlankExpCtxt(), return-type},
+                         args(e))
+      val ret = fresh-uvart()
+      add-equation $ LSPrimEqn(n(ret), op(e), map(type!, new-args))
+      LSPrim(info(e), ret, ctxt, op(e), new-args)
+
+    (e:LSSizeof):
+      LSSizeof(info(e), LongT(), ctxt, targ(e))
+
+    (e:LSTagof):
+      LSTagof(info(e), LongT(), ctxt, n(e))
+
+    (e:LSCast):
+      val new-exp = gen-equations(exp(e), LSBlankExpCtxt(), return-type)
+      LSCast(info(e), targ(e), ctxt, new-exp, targ(e))
+
+    (e:LSLiteral):
+      ;Compute the LoStanza literal type of the value.
+      val type = match(value(e)) :
+        (v:Byte) : ByteT()
+        (v:Char) : ByteT()
+        (v:Int) : IntT()
+        (v:Long) : LongT()
+        (v:Float) : FloatT()
+        (v:Double) : DoubleT()
+        (v:String) : PtrT(ByteT())
+        (v:True) : RefT(TOf(special-type(type-hierarchy(), CoreTrue), []))
+        (v:False) : RefT(TOf(special-type(type-hierarchy(), CoreFalse), []))
+        (v) : fatal("Unsupported Lostanza literal %~." % [v])
+      LSLiteral(info(e), type, ctxt, value(e))
+
+    (e:LSAnd):
+      val new-a = gen-equations(a(e), LSExpCtxt(LongT()), return-type)
+      val new-b = gen-equations(b(e), LSExpCtxt(LongT()), return-type)
+      LSAnd(info(e), LongT(), ctxt, new-a, new-b)
+
+    (e:LSOr):
+      val new-a = gen-equations(a(e), LSExpCtxt(LongT()), return-type)
+      val new-b = gen-equations(b(e), LSExpCtxt(LongT()), return-type)
+      LSOr(info(e), LongT(), ctxt, new-a, new-b)
+
+    (e:LSLetExp):
+      val new-comm = gen-equations(comm(e), return-type)
+      val new-exp = gen-equations(exp(e), ctxt, return-type)
+      LSLetExp(info(e), type!(new-exp), ctxt, new-comm, new-exp)
+
+    (e:LSMix):
+      gen-function-reference(e, ctxt)
+
+    (e:LSFn):
+      ;Compute the expression context.
+      val exp-ctxt = match(ctxt) :
+        (ctxt:LSExpCtxt) :
+          ExpCtxt(hs-type-operation(ToHistanza(), expected(ctxt)))
+        (ctxt:LSBlankExpCtxt|LSBadCtxt) :
+          ExpCtxt(TGradual())
+        (ctxt:LSAddrCtxt|LSCallCtxt) :
+          fatal("LSFn is not a valid expression within a %_ context." % [object-type(ctxt)])
+      val new-e = gen-function-reference(ref(e) as TRef|TMix, exp-ctxt)
+      val new-type = RefT(type!(new-e))
+      LSFn(info(e), new-type, ctxt, new-e)
+
+;Compute the expected arg type of calling the given function.
+;The typical case is simply inferring the arg type of the function.
+;The special case is if we are calling an anonymous function directly.
+defn compute-expected-arg-type (n:Int, func:LSExp, arg-index:Int, arity:Int) -> False :
+  match(func) :
+    ;Forward to body.
+    (func:LSLetExp) :
+      compute-expected-arg-type(n, exp(func), arg-index, arity)
+    ;Instantiated function.
+    (func:LSMix) :
+      if length(exp-args(func)) == arity :
+        add-equation(LSEqualEqn(n, exp-args(func)[arg-index]))
+    ;Typical case.
+    (func) :
+      add-equation(LSInferEqn(n, type!(func), ArgLoc(arity, arg-index), true))
+
+;Return true if given call context passes exactly n
+;positional arguments.
+defn fixed-arity-call? (ctxt:CallCtxt, n:Int) -> True|False :
+  empty?(targs(ctxt)) and
+  all?({_ is PositionalArg}, fargs(ctxt)) and
+  length(fargs(ctxt)) == n
+
+;Return true if given call context passes only positional
+;arguments.
+defn simple-positional-call? (ctxt:CallCtxt) -> True|False :
+  empty?(targs(ctxt)) and
+  all?({_ is PositionalArg}, fargs(ctxt))
+
+;Return the type of the given FArg? when referenced
+;from within the function body.
+defn type-in-body (farg:FArg<Type|False>) -> Type :
+  val uncapped = uncap(type!(farg))
+  match(farg) :
+    (farg:PositionalArg|KeywordArg) :
+      wrap-maybe(optional?(farg), uncapped)
+    (farg:VarArg) :
+      wrap-tuple(uncapped)
+
+;Return the type of the given LSFArg when referenced
+;from within the function body.
+;If it's an appropriate optional arg, it returns the type
+;without wrapping, and relies upon later checks to issue
+;the error.
+defn type-in-body (farg:FArg<LSType>) -> LSType :
+  match(farg) :
+    (farg:PositionalArg<LSType>|KeywordArg<LSType>) :
+      if optional?(farg) :
+        if type(farg) is RefT : wrap-maybe(uncap(type(farg)))
+        else : uncap(type(farg))
+      else :
+        uncap(type(farg))
+    (farg:VarArg<LSType>) :
+      if type(farg) is RefT : wrap-tuple(uncap(type(farg)))
+      else : uncap(type(farg))
+      
+;============================================================
+;========== Reference to Function From HiStanza =============
+;============================================================
+
+;Generate the mixed function from the given reference.
+defn gen-function-reference (func:TRef|TMix, ctxt:Context) -> TMix :
+  match(func, ctxt) :
+    ;Treat a single reference identically to a mix of one reference.
+    (func:TRef, ctxt) :
+      val mix = TMix(info(func), false, [func], false, false, [])
+      gen-function-reference(mix, ctxt)
+
+    ;Instantiate the mixed functions in a calling context.
+    (func:TMix, ctxt:CallCtxt) :
+      ;Annotate each of the refs with types.
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+
+      ;Compute the function entries from the typed-refs.
+      val functions = to-tuple $ for r in typed-refs seq? :
+        match(type(r)) :
+          (t:TFunction) : One(n(r) => t)
+          (f:False) : None()
+
+      ;Instantiate the functions.
+      val instfns = instantiations(function-instantiator(),
+                                   functions,
+                                   targs(ctxt),
+                                   fargs(ctxt))
+
+      ;Create the OverloadCallEqn.
+      val mixed-type = fresh-tuvar()
+      val exp-arg-vars = fresh-tuvars(length(fargs(ctxt)))
+      val mix-sel = fresh-svar()
+      add-equation $ OverloadCallEqn(
+        n(mixed-type),
+        map(n,exp-arg-vars),
+        n(mix-sel),
+        map(type, instfns),
+        map(exp-args, instfns)
+        map(type, fargs(ctxt)))
+      ;Return the final mix.
+      TMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, InstFns(instfns), exp-arg-vars)
+
+    ;Instantiate the mixed functions in an expression context.
+    (func:TMix, ctxt:ExpCtxt) :
+      ;Annotate each of the refs with types.
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+
+      ;Compute the function entries from the typed-refs.
+      val functions = to-tuple $ for r in typed-refs seq? :
+        match(type(r)) :
+          (t:TFunction) : One(n(r) => t)
+          (f:False) : None()
+
+      ;Add the overloading equation to solve for the final mixed type.
+      val mixed-type = fresh-tuvar()
+      val mix-sel = fresh-svar()
+      val inst-var = fresh-instvar()
+      add-equation $ OverloadExpEqn(
+        n(mixed-type),
+        n(mix-sel),
+        n(inst-var),
+        functions,
+        None(),
+        expected(ctxt))
+
+      ;Return the final mix.
+      TMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, inst-var, [])
+
+    ;Instantiate the mixed functions in a multi context.
+    (func:TMix, ctxt:MultiCtxt) :
+      gen-multi-reference(info(func), refs(func), ctxt)
+
+    ;Instantiate the mixed functions in a LoStanza multi context.
+    (func:TMix, ctxt:LSMultiCtxt) :
+      ;Determine whether all arguments are HiStanza arguments.
+      defn reft? (t:LSType) : t is RefT
+      defn reft? (a:FArg<LSType>) : reft?(type(a))
+      val histanza-args? = reft?(a2(ctxt)) and all?(reft?,fargs(ctxt))
+      if histanza-args? :
+        gen-multi-reference(info(func), refs(func), ctxt)
+      else :
+        ;No valid instantiation.
+        val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+        TMix(info(func), unsatisfiable-tuvar(), ctxt,
+             typed-refs, unsatisfiable-svar(), InstFns([]), [])        
+
+;Generate instantiated mix of reference to multi.
+defn gen-multi-reference (info:FileInfo|False,
+                          refs:Tuple<TRef>,
+                          ctxt:MultiCtxt|LSMultiCtxt) -> TMix :
+  ;Annotate each of the refs with types.
+  val typed-refs = map(annotate-type{_, ctxt}, refs)
+
+  ;Compute the function entries from the typed-refs.
+  val functions = to-tuple $ for r in typed-refs seq? :
+    match(type(r)) :
+      (t:TFunction) : One(n(r) => t)
+      (f:False) : None()
+
+  ;Instantiate the functions.
+  defn ref-type! (t:LSType) : type(t as RefT)
+  val [fargs, a2] = match(ctxt) :
+    (ctxt:MultiCtxt) : [fargs(ctxt), a2(ctxt)]
+    (ctxt:LSMultiCtxt) : [map(map{ref-type!, _}, fargs(ctxt)), ref-type!(a2(ctxt))]
+  val instfns = multi-instantiations(function-instantiator(),
+                                     functions,
+                                     targs(ctxt),
+                                     fargs)
+
+  ;Case: There are no valid instantiations.
+  if empty?(instfns) :
+    TMix(info, unsatisfiable-tuvar(), ctxt,
+         typed-refs, unsatisfiable-svar(), InstFns([]), [])
+
+  ;Case: There are valid instantiations.
+  else :
+    ;Create the SelectMultiEqn.
+    val sel-type = fresh-tuvar()
+    val mix-sel = fresh-svar()
+    add-equation $ SelectMultiEqn(n(sel-type), n(mix-sel),
+                                  map(type, instfns),
+                                  fargs, a2)
+    ;Return the final mix.
+    TMix(info, sel-type, ctxt, typed-refs, mix-sel, InstFns(instfns), [])  
+
+;Helper: Create the function instantiator for creating type
+;equations.
+defn function-instantiator () -> Instantiator :
+  new Instantiator :
+    defmethod fresh-capvars (this, n:Int) :
+      fresh-tuvars(n)
+    defmethod tuple-id (this) :
+      special-type(type-hierarchy(), CoreTuple)
+    defmethod capture-right (this, capvars:Tuple<TUVar>, xs:Tuple<Type>, ys:Tuple<Type>) :
+      add-equation $ CaptureAllEqn(map(n, capvars), CapRight, xs, ys)
+    defmethod capture-left (this, capvars:Tuple<TUVar>, x:Type, y:Type) :
+      add-equation $ CaptureAllEqn(map(n, capvars), CapLeft, [x], [y])
+    defmethod capture-right (this, capvars:Tuple<TUVar>, xs:Tuple<LSType>, ys:Tuple<LSType>) :
+      add-equation $ LSCaptureAllEqn(map(n, capvars), CapRight, xs, ys)
+    defmethod substitute (this, t:Type|LSType, env:Tuple<KeyValue<Int,Type>>) :
+      delayed-sub(t, env)
+
+;============================================================
+;============== References to Variables =====================
+;============================================================
+
+;Annotate the given reference with its type and context
+defn annotate-type (e:TRef, ctxt:Context) -> TRef :
+  val true-type = get-type(n(e))
+  val ref-type = match(true-type) :
+    (t:Type) : t
+    (t:LSType) : to-histanza(t)
+  TRef(info(e), ref-type, ctxt, n(e), true-type)
+
+;Annotate the given reference with its type and context.
+defn annotate-type (v:LSVar, ctxt:LSContext) -> LSVar :
+  val true-type = get-type(n(v))
+  val var-type = match(true-type) :
+    (t:TFunction) : to-lostanza(t)
+    (t:Type) : RefT(t)
+    (t:LSType) : t
+  LSVar(info(v), var-type, ctxt, n(v), true-type)
+
+;============================================================
+;=========== Reference to Function from LoStanza ============
+;============================================================
+
+;Generate the equations for the function reference in the given context.
+defn gen-function-reference (func:LSVar|LSMix, ctxt:LSContext) -> LSMix :
+  match(func, ctxt) :
+    ;Case: Just create a mix and treat it in the following branches.
+    (func:LSVar, ctxt) :
+      val mix = LSMix(info(func), false, false, [func], false, false, [])
+      gen-function-reference(mix, ctxt)
+
+    ;Case: Instantiate the function to make the call.
+    (func:LSMix, ctxt:LSCallCtxt) :
+      ;Annotate each of the refs with types.
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+
+      ;Compute the function entries from the typed-refs.
+      val functions = to-tuple $ for r in typed-refs seq? :
+        match(type(r)) :
+          (t:TLSFunction|FnT) : One(n(r) => t)
+          (f:False) : None()
+
+      ;Instantiate the functions.
+      val instfns = instantiations(function-instantiator(),
+                                   functions,
+                                   targs(ctxt),
+                                   fargs(ctxt))
+
+      ;Create the OverloadCallEqn.
+      val mixed-type = fresh-uvart()
+      val exp-arg-vars = fresh-uvarts(length(fargs(ctxt)))
+      val mix-sel = fresh-svar()
+      add-equation $ LSOverloadCallEqn(
+        n(mixed-type),
+        map(n,exp-arg-vars),
+        n(mix-sel),
+        map(type, instfns),
+        map(exp-args, instfns)
+        map(type, fargs(ctxt)))
+      ;Return the final mix.
+      LSMix(info(func), mixed-type, ctxt, typed-refs, mix-sel, LSInstFns(instfns), exp-arg-vars)
+
+    ;Case: Instantiate the ones that we can take the address of.
+    (func:LSMix, ctxt:LSAddrCtxt) :
+      ;Annotate each of the refs with types.
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+
+      ;Compute the function entries from the typed-refs.
+      val functions = to-tuple $ for r in typed-refs seq? :
+        match(type(r)) :
+          (t:TLSFunction|FnT) : One(n(r) => t)
+          (f:False) : None()
+
+      ;Instantiate the functions.
+      val instfns = addr-instantiations(function-instantiator(),
+                                        functions)
+
+      ;Create the OverloadEqns.
+      val result-type = fresh-uvart()
+      val result-sel = fresh-svar()
+      add-equation $ LSOverloadAddrEqn(
+        n(result-type),
+        n(result-sel),
+        map(type, instfns),
+        expected(ctxt))
+
+      ;Return the final selected function.
+      LSMix(info(func), result-type, ctxt, typed-refs, result-sel, LSInstFns(instfns), [])
+
+    ;Case: Cannot directly refer to function from this context.
+    (func:LSMix, ctxt) :
+      val typed-refs = map(annotate-type{_, ctxt}, refs(func))
+      LSMix(info(func), unsatisfiable-uvart(), ctxt, typed-refs, unsatisfiable-svar(), false, [])
+
+;============================================================
+;============= Expansion of Field Types =====================
+;============================================================
+
+;If the given arity is appropriate, returns the corresponding
+;types of the fields. The rest type is handled appropriately using
+;expansion.
+defn field-types (n:Int, targs:Tuple<Type>, arity:Int) -> Maybe<Tuple<LSType>> :
+  label<Maybe<Tuple<LSType>>> return :
+    ;Check type arity.
+    if type-arity(type-hierarchy(), n) != length(targs) :
+      return(None())
+
+    ;Retrieve fields from hierarchy.
+    val fields = fields(type-hierarchy(), n)
+    return(None()) when empty?(fields)
+    val field-types = map(type{_, targs}, value!(fields))    
+
+    ;Compute whether it's a vararg object or not.
+    val num-fields = length(field-types)
+    val rest? = num-fields > 0 and field-types[num-fields - 1] is RestT
+
+    ;Gather the arg types.
+    if rest? :
+      return(None()) when arity < num-fields - 1
+      val rest-type = type(field-types[num-fields - 1] as RestT)
+      One(to-tuple(take-n(arity, cat(field-types, repeat(rest-type)))))
+    else :
+      return(None()) when arity != num-fields
+      One(field-types)
+
+;Return the contexts for the fields of the given struct.
+defn field-contexts (n:Int, targs:Tuple<Type>, arity:Int) -> Seqable<LSContext> :
+  val types = field-types(n, targs, arity)
+  if empty?(types) : seq(LSBadCtxt{}, 0 to arity)
+  else : seq(LSExpCtxt, value!(types))
+
+;============================================================
+;================ Temporary Structures ======================
+;============================================================
+
+;Represents the branch types of a LSLabeledBlock for use by
+;the type equation generator in generating the equations for
+;LSGoto.
+defstruct BlockT <: LSType :
+  types:Tuple<LSType>
+
+;============================================================
+;======== Small Variable Generation Utilities ===============
+;============================================================
+
+;Wrap the given type in the Maybe<T> type.
+defn wrap-maybe (t:Type) -> TOf :
+  val n = special-type(type-hierarchy(), CoreMaybe)
+  TOf(n, [t])
+
+;Wrap the given type in the Maybe<T> type.
+;Assumes t is a RefT.
+defn wrap-maybe (t:LSType) -> LSType :
+  RefT(wrap-maybe(type(t as RefT)))
+
+;Wrap the given type in the Maybe<T> type only
+;when wrap? is true.
+defn wrap-maybe (wrap?:True|False, t:LSType) -> LSType :
+  wrap-maybe(t) when wrap? else t
+
+;Wrap the given type in the Maybe<T> type only
+;when wrap? is true.
+defn wrap-maybe (wrap?:True|False, t:Type) -> Type :
+  wrap-maybe(t) when wrap? else t
+
+;Wrap the given type in the Tuple<T> type.
+defn wrap-tuple (t:Type) -> TOf :
+  val n = special-type(type-hierarchy(), CoreTuple)
+  TOf(n, [t])
+
+;Wrap the given type in the Tuple<T> type.
+;Assumes t is a RefT.
+defn wrap-tuple (t:LSType) -> LSType :
+  RefT(wrap-tuple(type(t as RefT)))
+
+;Returns true if a and b have the same length.
+defn same-length? (a:Tuple, b:Tuple) -> True|False :
+  length(a) == length(b)
+
+;Create a fresh selection variable.
+defn fresh-svar () -> SVar :
+  SVar(fresh-id())
+
+;Create a fresh instantiation variable.
+defn fresh-instvar () -> InstVar :
+  InstVar(fresh-id())
+
+;Create a fresh tuvar.
+defn fresh-tuvar () -> TUVar :
+  TUVar(fresh-id())
+defn fresh-uvart () -> UVarT :
+  UVarT(fresh-id())
+defn fresh-tuvars (n:Int) -> Tuple<TUVar> :
+  to-tuple(seq(fresh-tuvar{}, 0 to n))
+defn fresh-uvarts (n:Int) -> Tuple<UVarT> :
+  to-tuple(seq(fresh-uvart{}, 0 to n))
+
+;Create an id with an unsatisfiable equation.
+defn unsatisfiable-var () -> Int :
+  val v = fresh-id()
+  add-equation $ UnsatisfiableEqn(v)
+  v
+defn unsatisfiable-tuvar () -> TUVar :
+  TUVar(unsatisfiable-var())
+defn unsatisfiable-svar () -> SVar :
+  SVar(unsatisfiable-var())
+defn unsatisfiable-uvart () -> UVarT :
+  UVarT(unsatisfiable-var())
+
+;Return a gradual when false or TUVar.
+defn or-gradual (f:False) : TGradual()
+defn or-gradual (t:Type) : TGradual() when t is TUVar else t
+defn or-gradual (a:FArg<Type|False>) : sub-type(a, or-gradual(type(a)))
+
+;Return a type variable when false.
+defn or-var (f:False) : fresh-tuvar()
+defn or-var (t:Type) : t
+
+;Return a type variable when false.
+defn or-lsvar (f:False) : fresh-uvart()
+defn or-lsvar (t:LSType) : t
+
+;Generate a type variable for 't', and also
+;set it in the type environment.
+defn gen-var (n:Int, t:Type|False) -> Type :
+  val new-type = or-var(t)
+  set-type(n, new-type)
+  new-type
