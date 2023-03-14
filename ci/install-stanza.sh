@@ -17,11 +17,18 @@ STANZA_DOWNLOAD_BASEURL="http://lbstanza.org/resources/stanza"
 
 
 # Required env var inputs
-echo "     STANZA_BUILD_VER:" "${STANZA_BUILD_VER:?Usage: ${USAGE}}"       # 0.17.56
 echo "   STANZA_INSTALL_DIR:" "${STANZA_INSTALL_DIR:?Usage: ${USAGE}}"     # where the stanza binaries will be installed
 echo "        STANZA_CONFIG:" "${STANZA_CONFIG:?Usage: ${USAGE}}"          # directory where .stanza config file will be stored, as in normal stanza behavior
 
 # Defaulted env var inputs - can override if necessary
+# find and read build-stanza-version.txt
+# find the directory where this script is stored
+THISDIR=$(dirname $(readlink -e $0))
+BSVTXT="${THISDIR}/build-stanza-version.txt"
+# extract the version from first non-comment line of the file
+BSTZVER=$(grep -v ^\# "${BSVTXT}" | head -1 | awk '{ print $1}')
+echo "Using existing stanza version $BSTZVER"
+echo "     STANZA_BUILD_VER:" "${STANZA_BUILD_VER:=${BSTZVER}}"        # 0.17.56
 echo "STANZA_BUILD_PLATFORM:" "${STANZA_BUILD_PLATFORM:=$(uname -s)}"  # linux|macos|Darwin|windows|MINGW64
 
 # var input validation
