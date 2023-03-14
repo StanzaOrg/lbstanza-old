@@ -84,7 +84,8 @@ mkdir -p bin
 # so it can be linked into the bootstrap compiler
 cp -a ${STANZADIR}/bin/libasmjit.a bin/libasmjit.a
 
-${STANZADIR}/stanza build-stanza.proj stz/driver -o stanzatemp -flags BOOTSTRAP -optimize -verbose
+# call the script to build the bootstrap compiler
+ci/bootstrap-stanza.sh
 # verify that expected output file exists
 ls stanzatemp
 
