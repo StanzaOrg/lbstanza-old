@@ -52,7 +52,7 @@ ${STANZA} compile-macros \
   compiler/message-lang.stanza \
   compiler/ast-printer-lang.stanza \
   compiler/reader-lang.stanza \
-  -o bootstrap-macros 
+  -o bootstrap.macros 
 
-${STANZA} build-stanza.proj stz/driver -o stanzatemp -macros bootstrap-macros -flags BOOTSTRAP -optimize
+${STANZA} build-stanza.proj stz/driver -o stanzatemp -macros bootstrap.macros -flags BOOTSTRAP -optimize
 
