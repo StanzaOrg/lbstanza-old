@@ -23,7 +23,7 @@ echo "        STANZA_CONFIG:" "${STANZA_CONFIG:?Usage: ${USAGE}}"          # dir
 # Defaulted env var inputs - can override if necessary
 # find and read build-stanza-version.txt
 # find the directory where this script is stored
-THISDIR=$(dirname $(readlink -e $0))
+THISDIR=$(dirname $(readlink -f $0))
 BSVTXT="${THISDIR}/build-stanza-version.txt"
 # extract the version from first non-comment line of the file
 BSTZVER=$(grep -v ^\# "${BSVTXT}" | head -1 | awk '{ print $1}')
